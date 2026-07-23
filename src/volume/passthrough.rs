@@ -174,6 +174,7 @@ impl Mountable for PassthroughVolume {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{File, OpenOptions};
 
     /// Create a unique scratch directory under the system temp dir without
     /// pulling in extra crates.
@@ -246,6 +247,59 @@ mod tests {
             vol.mkdir(Path::new("file")),
             Err(CortexError::AlreadyExists)
         ));
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn random_access_ops() {
+        let base = scratch("randomio");
+        let vol = PassthroughVolume::new(&base);
+        vol.write(Path::new("f"), b"0123456789").unwrap();
+
+        assert_eq!(vol.stat(Path::new("f")).unwrap().size, 10);
+        assert_eq!(vol.read_at(Path::new("f"), 3, 4).unwrap(), b"3456");
+
+        // Overwrite in place, then grow past EOF (zero-filled gap).
+        assert_eq!(vol.write_at(Path::new("f"), 3, b"XY").unwrap(), 2);
+        vol.write_at(Path::new("f"), 12, b"Z").unwrap();
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"012XY56789\0\0Z");
+
+        vol.truncate(Path::new("f"), 3).unwrap();
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"012");
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn truncate_grows_with_zero_fill() {
+        let base = scratch("truncgrow");
+        let vol = PassthroughVolume::new(&base);
+        vol.write(Path::new("f"), b"abc").unwrap();
+
+        vol.truncate(Path::new("f"), 6).unwrap();
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"abc\0\0\0");
+        assert_eq!(vol.stat(Path::new("f")).unwrap().size, 6);
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn file_handle_over_disk() {
+        let base = scratch("filehandle");
+        let vol = PassthroughVolume::new(&base);
+
+        // Cursor writes + seek land on the real file.
+        let mut f = File::open(&vol, "f", OpenOptions::new().write(true).create(true)).unwrap();
+        f.write_all(b"hello world").unwrap();
+        f.seek(SeekFrom::Start(6)).unwrap();
+        f.write_all(b"rust!").unwrap();
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"hello rust!");
+
+        // Append mode reopens and writes at the end.
+        let mut a = File::open(&vol, "f", OpenOptions::new().append(true)).unwrap();
+        a.write_all(b"?").unwrap();
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"hello rust!?");
 
         fs::remove_dir_all(&base).unwrap();
     }

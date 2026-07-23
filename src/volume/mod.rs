@@ -78,3 +78,75 @@ pub trait Mountable {
         self.write(path, &data)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    /// A minimal backend implementing only the five required ops, so the
+    /// default data-plane impls (stat/read_at/write_at/truncate) are exercised.
+    #[derive(Default)]
+    struct BlobVolume {
+        files: RefCell<HashMap<String, Vec<u8>>>,
+    }
+
+    fn key(path: &Path) -> String {
+        path.to_str().unwrap().to_string()
+    }
+
+    impl Mountable for BlobVolume {
+        fn list(&self, _path: &Path) -> Result<Vec<Dirent>> {
+            Ok(Vec::new())
+        }
+        fn mkdir(&self, _path: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn unlink(&self, path: &Path) -> Result<()> {
+            self.files
+                .borrow_mut()
+                .remove(&key(path))
+                .map(|_| ())
+                .ok_or(CortexError::NotFound)
+        }
+        fn read(&self, path: &Path) -> Result<Vec<u8>> {
+            self.files
+                .borrow()
+                .get(&key(path))
+                .cloned()
+                .ok_or(CortexError::NotFound)
+        }
+        fn write(&self, path: &Path, data: &[u8]) -> Result<()> {
+            self.files.borrow_mut().insert(key(path), data.to_vec());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_data_plane_uses_read_write() {
+        let vol = BlobVolume::default();
+        vol.write(Path::new("f"), b"hello").unwrap();
+
+        // Default stat: file kind + size from whole-file read.
+        let st = vol.stat(Path::new("f")).unwrap();
+        assert_eq!(st.kind, DirentKind::File);
+        assert_eq!(st.size, 5);
+
+        // Default read_at slices the whole-file read (clamped at EOF).
+        assert_eq!(vol.read_at(Path::new("f"), 1, 3).unwrap(), b"ell");
+        assert_eq!(vol.read_at(Path::new("f"), 4, 10).unwrap(), b"o");
+
+        // Default write_at: read-modify-write, in place then zero-extend.
+        assert_eq!(vol.write_at(Path::new("f"), 3, b"XY").unwrap(), 2);
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"helXY");
+
+        // write_at on a missing file creates it, zero-filling the gap.
+        vol.write_at(Path::new("g"), 2, b"Z").unwrap();
+        assert_eq!(vol.read(Path::new("g")).unwrap(), b"\0\0Z");
+
+        // Default truncate: read-modify-write.
+        vol.truncate(Path::new("f"), 2).unwrap();
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"he");
+    }
+}

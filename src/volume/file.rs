@@ -166,3 +166,153 @@ impl Seek for File<'_> {
         Ok(self.pos)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{InMemVolume, Workspace};
+
+    #[test]
+    fn open_routes_through_workspace_mount() {
+        let mut ws = Workspace::new();
+        ws.mount("data", Box::new(InMemVolume::new())).unwrap();
+
+        // A File opened on the workspace writes into the mounted volume, seen
+        // through the workspace at the same path.
+        let mut f = ws
+            .open("data/log", OpenOptions::new().append(true).create(true))
+            .unwrap();
+        f.write_all(b"a").unwrap();
+        f.write_all(b"b").unwrap();
+        assert_eq!(ws.read(Path::new("data/log")).unwrap(), b"ab");
+    }
+
+    #[test]
+    fn seek_and_partial_write() {
+        let vol = InMemVolume::new();
+        let mut f = File::open(&vol, "log", OpenOptions::new().write(true).create(true)).unwrap();
+        f.write_all(b"hello world").unwrap();
+
+        // Overwrite "world" -> "rust!" via an explicit seek.
+        f.seek(SeekFrom::Start(6)).unwrap();
+        f.write_all(b"rust!").unwrap();
+        assert_eq!(vol.read(Path::new("log")).unwrap(), b"hello rust!");
+
+        // Read back from the start with the std toolbox.
+        let mut f = File::open(&vol, "log", OpenOptions::new().read(true)).unwrap();
+        let mut s = String::new();
+        f.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello rust!");
+    }
+
+    #[test]
+    fn append_always_writes_at_end() {
+        let vol = InMemVolume::new();
+        let opts = OpenOptions::new().append(true).create(true);
+
+        let mut a = File::open(&vol, "log", opts).unwrap();
+        a.write_all(b"one\n").unwrap();
+        // A stale seek must not move an append write off the end.
+        a.seek(SeekFrom::Start(0)).unwrap();
+        a.write_all(b"two\n").unwrap();
+        assert_eq!(vol.read(Path::new("log")).unwrap(), b"one\ntwo\n");
+    }
+
+    #[test]
+    fn seek_from_end_and_io_copy() {
+        let vol = InMemVolume::new();
+        vol.write(Path::new("src"), b"0123456789").unwrap();
+
+        let mut src = File::open(&vol, "src", OpenOptions::new().read(true)).unwrap();
+        src.seek(SeekFrom::End(-3)).unwrap();
+        let mut dst = File::open(&vol, "dst", OpenOptions::new().write(true).create(true)).unwrap();
+        io::copy(&mut src, &mut dst).unwrap();
+
+        assert_eq!(vol.read(Path::new("dst")).unwrap(), b"789");
+    }
+
+    #[test]
+    fn open_flags() {
+        let vol = InMemVolume::new();
+        assert!(matches!(
+            File::open(&vol, "missing", OpenOptions::new().read(true)),
+            Err(CortexError::NotFound)
+        ));
+
+        File::open(&vol, "f", OpenOptions::new().create_new(true)).unwrap();
+        assert!(matches!(
+            File::open(&vol, "f", OpenOptions::new().create_new(true)),
+            Err(CortexError::AlreadyExists)
+        ));
+
+        vol.write(Path::new("f"), b"stale").unwrap();
+        File::open(&vol, "f", OpenOptions::new().write(true).truncate(true)).unwrap();
+        assert_eq!(vol.read(Path::new("f")).unwrap(), b"");
+    }
+
+    #[test]
+    fn seek_current_and_position() {
+        let vol = InMemVolume::new();
+        vol.write(Path::new("f"), b"abcdef").unwrap();
+        let mut f = File::open(&vol, "f", OpenOptions::new().read(true)).unwrap();
+
+        assert_eq!(f.seek(SeekFrom::Current(2)).unwrap(), 2);
+        let mut two = [0u8; 2];
+        f.read_exact(&mut two).unwrap();
+        assert_eq!(&two, b"cd");
+        assert_eq!(f.position(), 4);
+
+        // Relative rewind, then read forward again.
+        assert_eq!(f.seek(SeekFrom::Current(-1)).unwrap(), 3);
+        let mut one = [0u8; 1];
+        f.read_exact(&mut one).unwrap();
+        assert_eq!(&one, b"d");
+    }
+
+    #[test]
+    fn negative_seek_errors() {
+        let vol = InMemVolume::new();
+        vol.write(Path::new("f"), b"abc").unwrap();
+        let mut f = File::open(&vol, "f", OpenOptions::new().read(true)).unwrap();
+
+        let err = f.seek(SeekFrom::Current(-5)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(f.position(), 0); // position is unchanged on a rejected seek
+    }
+
+    #[test]
+    fn read_past_eof_returns_zero() {
+        let vol = InMemVolume::new();
+        vol.write(Path::new("f"), b"abc").unwrap();
+        let mut f = File::open(&vol, "f", OpenOptions::new().read(true)).unwrap();
+
+        f.seek(SeekFrom::End(0)).unwrap();
+        let mut buf = [0u8; 8];
+        assert_eq!(f.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn create_keeps_existing_and_makes_missing() {
+        let vol = InMemVolume::new();
+        vol.write(Path::new("keep"), b"data").unwrap();
+
+        // `create` (not `create_new`, not `truncate`) must not clobber contents.
+        File::open(&vol, "keep", OpenOptions::new().write(true).create(true)).unwrap();
+        assert_eq!(vol.read(Path::new("keep")).unwrap(), b"data");
+
+        // ...but a missing file is created empty.
+        File::open(&vol, "fresh", OpenOptions::new().write(true).create(true)).unwrap();
+        assert_eq!(vol.read(Path::new("fresh")).unwrap(), b"");
+    }
+
+    #[test]
+    fn directory_io_surfaces_error() {
+        let vol = InMemVolume::new();
+        vol.mkdir(Path::new("d")).unwrap();
+
+        // A directory can be opened, but byte IO on it is an io::Error, not a panic.
+        let mut f = File::open(&vol, "d", OpenOptions::new().read(true)).unwrap();
+        let mut buf = [0u8; 4];
+        assert_eq!(f.read(&mut buf).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+}
