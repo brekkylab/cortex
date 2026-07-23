@@ -53,4 +53,23 @@ impl From<std::io::Error> for CortexError {
     }
 }
 
+/// Lets a [`File`](crate::File) surface Cortex errors through the `std::io` traits.
+impl From<CortexError> for std::io::Error {
+    fn from(e: CortexError) -> Self {
+        use std::io::ErrorKind::*;
+        match e {
+            CortexError::Io(io) => io,
+            other => {
+                let kind = match &other {
+                    CortexError::NotFound => NotFound,
+                    CortexError::AlreadyExists => AlreadyExists,
+                    CortexError::Unsupported => Unsupported,
+                    _ => InvalidInput,
+                };
+                std::io::Error::new(kind, other)
+            }
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, CortexError>;

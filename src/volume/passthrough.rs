@@ -7,9 +7,10 @@
 //! escape the root.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
-use crate::{Dirent, Result, CortexError, Mountable};
+use crate::{CortexError, Dirent, DirentKind, Mountable, Result, Stat};
 
 /// A volume backed by a real on-disk directory.
 pub struct PassthroughVolume {
@@ -104,6 +105,68 @@ impl Mountable for PassthroughVolume {
             }
         }
         fs::write(&real, data)?;
+        Ok(())
+    }
+
+    fn stat(&self, path: &Path) -> Result<Stat> {
+        let real = self.real_path(path)?;
+        let meta = fs::symlink_metadata(&real)?;
+        let kind = if meta.is_dir() {
+            DirentKind::Dir
+        } else {
+            DirentKind::File
+        };
+        let mut stat = Stat::new(kind, meta.len());
+        stat.mtime = meta.modified().ok();
+        stat.atime = meta.accessed().ok();
+        stat.created = meta.created().ok();
+        Ok(stat)
+    }
+
+    fn read_at(&self, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let real = self.real_path(path)?;
+        if fs::symlink_metadata(&real)?.is_dir() {
+            return Err(CortexError::IsADirectory);
+        }
+        let mut file = fs::File::open(&real)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        let mut read = 0;
+        while read < len {
+            match file.read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        buf.truncate(read);
+        Ok(buf)
+    }
+
+    fn write_at(&self, path: &Path, offset: u64, buf: &[u8]) -> Result<usize> {
+        let real = self.real_path(path)?;
+        if let Ok(meta) = fs::symlink_metadata(&real) {
+            if meta.is_dir() {
+                return Err(CortexError::IsADirectory);
+            }
+        }
+        // Writing past EOF leaves a zero-filled (sparse) gap, matching the
+        // zero-extend semantics of the default `write_at`.
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&real)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn truncate(&self, path: &Path, size: u64) -> Result<()> {
+        let real = self.real_path(path)?;
+        let file = fs::OpenOptions::new().write(true).open(&real)?;
+        file.set_len(size)?;
         Ok(())
     }
 }

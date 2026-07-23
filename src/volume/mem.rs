@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use crate::{Dirent, Result, Mountable, CortexError};
+use crate::{CortexError, Dirent, DirentKind, Mountable, Result, Stat};
 
 type Link = Rc<RefCell<Node>>;
 
@@ -259,6 +259,104 @@ impl Mountable for InMemVolume {
                         Ok(())
                     }
                     Node::File { .. } => Err(CortexError::NotADirectory),
+                }
+            },
+        )
+    }
+
+    fn stat(&self, path: &Path) -> Result<Stat> {
+        let comps = components(path)?;
+        self.dispatch(
+            &comps,
+            |volume, rel| volume.stat(rel),
+            || {
+                let link = self.navigate(&comps)?;
+                let stat = match &*link.borrow() {
+                    Node::File { data } => Stat::new(DirentKind::File, data.len() as u64),
+                    Node::Dir { .. } => Stat::new(DirentKind::Dir, 0),
+                };
+                Ok(stat)
+            },
+        )
+    }
+
+    fn read_at(&self, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let comps = components(path)?;
+        self.dispatch(
+            &comps,
+            |volume, rel| volume.read_at(rel, offset, len),
+            || {
+                let link = self.navigate(&comps)?;
+                match &*link.borrow() {
+                    Node::File { data } => {
+                        let start = (offset as usize).min(data.len());
+                        let end = start.saturating_add(len).min(data.len());
+                        Ok(data[start..end].to_vec())
+                    }
+                    Node::Dir { .. } => Err(CortexError::IsADirectory),
+                }
+            },
+        )
+    }
+
+    fn write_at(&self, path: &Path, offset: u64, buf: &[u8]) -> Result<usize> {
+        let comps = components(path)?;
+        self.dispatch(
+            &comps,
+            |volume, rel| volume.write_at(rel, offset, buf),
+            || {
+                let (parent, name) = split_last(&comps)?;
+                let dir = self.navigate(parent)?;
+                // Resolve (or create) the target file node, then mutate its bytes
+                // in place — no whole-file copy, so append loops stay linear.
+                let file = {
+                    let mut node = dir.borrow_mut();
+                    let children = match &mut *node {
+                        Node::Dir { children } => children,
+                        Node::File { .. } => return Err(CortexError::NotADirectory),
+                    };
+                    match children.get(name) {
+                        Some(existing) => {
+                            if matches!(&*existing.borrow(), Node::Dir { .. }) {
+                                return Err(CortexError::IsADirectory);
+                            }
+                            existing.clone()
+                        }
+                        None => {
+                            let link = Node::new_file(Vec::new());
+                            children.insert(name.clone(), link.clone());
+                            link
+                        }
+                    }
+                };
+                let mut node = file.borrow_mut();
+                let Node::File { data } = &mut *node else {
+                    return Err(CortexError::IsADirectory);
+                };
+                let off = offset as usize;
+                let end = off + buf.len();
+                if data.len() < end {
+                    data.resize(end, 0);
+                }
+                data[off..end].copy_from_slice(buf);
+                Ok(buf.len())
+            },
+        )
+    }
+
+    fn truncate(&self, path: &Path, size: u64) -> Result<()> {
+        let comps = components(path)?;
+        self.dispatch(
+            &comps,
+            |volume, rel| volume.truncate(rel, size),
+            || {
+                let link = self.navigate(&comps)?;
+                match &mut *link.borrow_mut() {
+                    Node::File { data } => {
+                        data.resize(size as usize, 0);
+                        Ok(())
+                    }
+                    Node::Dir { .. } => Err(CortexError::IsADirectory),
                 }
             },
         )

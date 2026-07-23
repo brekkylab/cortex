@@ -1,5 +1,6 @@
-use crate::error::{Result, CortexError};
-use crate::volume::{Dirent, InMemVolume, Mountable};
+use crate::error::{CortexError, Result};
+use crate::stat::Stat;
+use crate::volume::{Dirent, File, InMemVolume, Mountable, OpenOptions};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -55,6 +56,13 @@ impl Workspace {
         self.mounts
             .iter()
             .map(|(path, volume)| (path.as_path(), volume.as_ref()))
+    }
+
+    /// Open `path` as a cursor-carrying [`File`] handle, so a consumer can
+    /// read/write/seek/append like it would with [`std::fs::File`]. The handle
+    /// borrows the workspace and routes each op through the owning mount.
+    pub fn open(&self, path: impl AsRef<Path>, opts: OpenOptions) -> Result<File<'_>> {
+        File::open(self, path.as_ref(), opts)
     }
 
     /// Resolve a request path to the volume that owns it (longest-prefix
@@ -121,5 +129,25 @@ impl Mountable for Workspace {
     fn write(&self, path: &Path, data: &[u8]) -> Result<()> {
         let (volume, sub) = self.resolve(path)?;
         volume.write(&sub, data)
+    }
+
+    fn stat(&self, path: &Path) -> Result<Stat> {
+        let (volume, sub) = self.resolve(path)?;
+        volume.stat(&sub)
+    }
+
+    fn read_at(&self, path: &Path, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let (volume, sub) = self.resolve(path)?;
+        volume.read_at(&sub, offset, len)
+    }
+
+    fn write_at(&self, path: &Path, offset: u64, buf: &[u8]) -> Result<usize> {
+        let (volume, sub) = self.resolve(path)?;
+        volume.write_at(&sub, offset, buf)
+    }
+
+    fn truncate(&self, path: &Path, size: u64) -> Result<()> {
+        let (volume, sub) = self.resolve(path)?;
+        volume.truncate(&sub, size)
     }
 }
