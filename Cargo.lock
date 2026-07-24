@@ -5,6 +5,9 @@ version = 4
 [[package]]
 name = "cortex"
 version = "0.1.0"
+dependencies = [
+ "cortex-rpc",
+]
 
 [[package]]
 name = "cortex-rpc"

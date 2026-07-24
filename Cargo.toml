@@ -5,5 +5,10 @@ edition = "2024"
 
 [dependencies]
 
+[dev-dependencies]
+# Cycle through dev-deps only: the integration test drives the reference
+# transport, but the `cortex` library itself does not depend on it.
+cortex-rpc = { path = "cortex-rpc" }
+
 [workspace]
 members = ["cortex-rpc", "wsx"]
