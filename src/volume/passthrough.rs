@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{Dirent, Result, VfsError, Mountable};
+use crate::{Dirent, Result, CortexError, Mountable};
 
 /// A volume backed by a real on-disk directory.
 pub struct PassthroughVolume {
@@ -37,7 +37,7 @@ impl PassthroughVolume {
                 Component::RootDir | Component::CurDir => {}
                 Component::Normal(name) => real.push(name),
                 Component::ParentDir | Component::Prefix(_) => {
-                    return Err(VfsError::InvalidName);
+                    return Err(CortexError::InvalidName);
                 }
             }
         }
@@ -49,7 +49,7 @@ impl Mountable for PassthroughVolume {
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let real = self.real_path(path)?;
         if !fs::symlink_metadata(&real)?.is_dir() {
-            return Err(VfsError::NotADirectory);
+            return Err(CortexError::NotADirectory);
         }
         let mut out = Vec::new();
         for entry in fs::read_dir(&real)? {
@@ -68,7 +68,7 @@ impl Mountable for PassthroughVolume {
         let real = self.real_path(path)?;
         match fs::symlink_metadata(&real) {
             Ok(meta) if meta.is_dir() => Ok(()),
-            Ok(_) => Err(VfsError::AlreadyExists),
+            Ok(_) => Err(CortexError::AlreadyExists),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 fs::create_dir(&real)?;
                 Ok(())
@@ -91,7 +91,7 @@ impl Mountable for PassthroughVolume {
     fn read(&self, path: &Path) -> Result<Vec<u8>> {
         let real = self.real_path(path)?;
         if fs::symlink_metadata(&real)?.is_dir() {
-            return Err(VfsError::IsADirectory);
+            return Err(CortexError::IsADirectory);
         }
         Ok(fs::read(&real)?)
     }
@@ -100,7 +100,7 @@ impl Mountable for PassthroughVolume {
         let real = self.real_path(path)?;
         if let Ok(meta) = fs::symlink_metadata(&real) {
             if meta.is_dir() {
-                return Err(VfsError::IsADirectory);
+                return Err(CortexError::IsADirectory);
             }
         }
         fs::write(&real, data)?;
@@ -117,7 +117,7 @@ mod tests {
     fn scratch(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();
         dir.push(format!(
-            "vfs-passthrough-test-{}-{}",
+            "cortex-passthrough-test-{}-{}",
             std::process::id(),
             tag
         ));
@@ -154,7 +154,7 @@ mod tests {
         vol.unlink(Path::new("hello.txt")).unwrap();
         assert!(matches!(
             vol.read(Path::new("hello.txt")),
-            Err(VfsError::NotFound)
+            Err(CortexError::NotFound)
         ));
 
         fs::remove_dir_all(&base).unwrap();
@@ -169,19 +169,19 @@ mod tests {
 
         assert!(matches!(
             vol.read(Path::new("dir")),
-            Err(VfsError::IsADirectory)
+            Err(CortexError::IsADirectory)
         ));
         assert!(matches!(
             vol.write(Path::new("dir"), b"y"),
-            Err(VfsError::IsADirectory)
+            Err(CortexError::IsADirectory)
         ));
         assert!(matches!(
             vol.list(Path::new("file")),
-            Err(VfsError::NotADirectory)
+            Err(CortexError::NotADirectory)
         ));
         assert!(matches!(
             vol.mkdir(Path::new("file")),
-            Err(VfsError::AlreadyExists)
+            Err(CortexError::AlreadyExists)
         ));
 
         fs::remove_dir_all(&base).unwrap();
@@ -193,7 +193,7 @@ mod tests {
         let vol = PassthroughVolume::new(&base);
         assert!(matches!(
             vol.read(Path::new("../secret")),
-            Err(VfsError::InvalidName)
+            Err(CortexError::InvalidName)
         ));
         fs::remove_dir_all(&base).unwrap();
 
@@ -201,6 +201,6 @@ mod tests {
         let missing = scratch("missing");
         fs::remove_dir_all(&missing).unwrap();
         let vol = PassthroughVolume::new(&missing);
-        assert!(matches!(vol.list(Path::new("")), Err(VfsError::NotFound)));
+        assert!(matches!(vol.list(Path::new("")), Err(CortexError::NotFound)));
     }
 }

@@ -1,8 +1,8 @@
-//! Error type and result alias shared by all VFS backends.
+//! Error type and result alias shared by all Cortex backends.
 
-/// Errors that any VFS backend can produce.
+/// Errors that any Cortex backend can produce.
 #[derive(Debug)]
-pub enum VfsError {
+pub enum CortexError {
     /// No entry exists at the requested name.
     NotFound,
     /// Expected a directory but found a file.
@@ -19,38 +19,38 @@ pub enum VfsError {
     Io(std::io::Error),
 }
 
-impl std::fmt::Display for VfsError {
+impl std::fmt::Display for CortexError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            VfsError::NotFound => write!(f, "no such entry"),
-            VfsError::NotADirectory => write!(f, "not a directory"),
-            VfsError::IsADirectory => write!(f, "is a directory"),
-            VfsError::AlreadyExists => write!(f, "entry already exists"),
-            VfsError::InvalidName => write!(f, "invalid name"),
-            VfsError::Unsupported => write!(f, "operation not supported"),
-            VfsError::Io(e) => write!(f, "io error: {e}"),
+            CortexError::NotFound => write!(f, "no such entry"),
+            CortexError::NotADirectory => write!(f, "not a directory"),
+            CortexError::IsADirectory => write!(f, "is a directory"),
+            CortexError::AlreadyExists => write!(f, "entry already exists"),
+            CortexError::InvalidName => write!(f, "invalid name"),
+            CortexError::Unsupported => write!(f, "operation not supported"),
+            CortexError::Io(e) => write!(f, "io error: {e}"),
         }
     }
 }
 
-impl std::error::Error for VfsError {
+impl std::error::Error for CortexError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            VfsError::Io(e) => Some(e),
+            CortexError::Io(e) => Some(e),
             _ => None,
         }
     }
 }
 
-impl From<std::io::Error> for VfsError {
+impl From<std::io::Error> for CortexError {
     fn from(e: std::io::Error) -> Self {
         use std::io::ErrorKind;
         match e.kind() {
-            ErrorKind::NotFound => VfsError::NotFound,
-            ErrorKind::AlreadyExists => VfsError::AlreadyExists,
-            _ => VfsError::Io(e),
+            ErrorKind::NotFound => CortexError::NotFound,
+            ErrorKind::AlreadyExists => CortexError::AlreadyExists,
+            _ => CortexError::Io(e),
         }
     }
 }
 
-pub type Result<T> = std::result::Result<T, VfsError>;
+pub type Result<T> = std::result::Result<T, CortexError>;

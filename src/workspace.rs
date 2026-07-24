@@ -1,4 +1,4 @@
-use crate::error::{Result, VfsError};
+use crate::error::{Result, CortexError};
 use crate::volume::{Dirent, InMemVolume, Mountable};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -42,7 +42,7 @@ impl Workspace {
     pub fn mount(&mut self, path: impl AsRef<Path>, mountable: Box<dyn Mountable>) -> Result<()> {
         let key = normalize(path.as_ref())?;
         if self.mounts.contains_key(&key) {
-            return Err(VfsError::AlreadyExists);
+            return Err(CortexError::AlreadyExists);
         }
         self.mounts.insert(key, mountable);
         Ok(())
@@ -79,10 +79,10 @@ fn normalize(path: &Path) -> Result<PathBuf> {
             Component::CurDir => {}
             Component::ParentDir => {
                 if !out.pop() {
-                    return Err(VfsError::InvalidName);
+                    return Err(CortexError::InvalidName);
                 }
             }
-            Component::RootDir | Component::Prefix(_) => return Err(VfsError::InvalidName),
+            Component::RootDir | Component::Prefix(_) => return Err(CortexError::InvalidName),
         }
     }
     Ok(out)

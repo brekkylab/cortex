@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use crate::{Dirent, Result, Mountable, VfsError};
+use crate::{Dirent, Result, Mountable, CortexError};
 
 type Link = Rc<RefCell<Node>>;
 
@@ -69,16 +69,16 @@ impl InMemVolume {
             Node::Dir { children } => {
                 if let Some(existing) = children.get(name) {
                     if matches!(&*existing.borrow(), Node::File { .. }) {
-                        return Err(VfsError::NotADirectory);
+                        return Err(CortexError::NotADirectory);
                     }
                 }
             }
-            Node::File { .. } => return Err(VfsError::NotADirectory),
+            Node::File { .. } => return Err(CortexError::NotADirectory),
         }
 
         let mut mounts = self.mounts.borrow_mut();
         if mounts.contains_key(&comps) {
-            return Err(VfsError::AlreadyExists);
+            return Err(CortexError::AlreadyExists);
         }
         mounts.insert(comps, volume);
         Ok(())
@@ -90,7 +90,7 @@ impl InMemVolume {
         self.mounts
             .borrow_mut()
             .remove(&comps)
-            .ok_or(VfsError::NotFound)
+            .ok_or(CortexError::NotFound)
     }
 
     /// Walk from the root to the node addressed by `comps`. Every intermediate
@@ -100,9 +100,9 @@ impl InMemVolume {
         for name in comps {
             let next = match &*cur.borrow() {
                 Node::Dir { children } => {
-                    children.get(name).cloned().ok_or(VfsError::NotFound)?
+                    children.get(name).cloned().ok_or(CortexError::NotFound)?
                 }
-                Node::File { .. } => return Err(VfsError::NotADirectory),
+                Node::File { .. } => return Err(CortexError::NotADirectory),
             };
             cur = next;
         }
@@ -161,7 +161,7 @@ impl Mountable for InMemVolume {
                             Node::File { .. } => Dirent::File(name.clone()),
                         })
                         .collect()),
-                    Node::File { .. } => Err(VfsError::NotADirectory),
+                    Node::File { .. } => Err(CortexError::NotADirectory),
                 }
             },
         )?;
@@ -192,14 +192,14 @@ impl Mountable for InMemVolume {
                     Node::Dir { children } => match children.get(name) {
                         Some(existing) => match &*existing.borrow() {
                             Node::Dir { .. } => Ok(()),
-                            Node::File { .. } => Err(VfsError::AlreadyExists),
+                            Node::File { .. } => Err(CortexError::AlreadyExists),
                         },
                         None => {
                             children.insert(name.clone(), Node::new_dir());
                             Ok(())
                         }
                     },
-                    Node::File { .. } => Err(VfsError::NotADirectory),
+                    Node::File { .. } => Err(CortexError::NotADirectory),
                 }
             },
         )
@@ -216,9 +216,9 @@ impl Mountable for InMemVolume {
                 let mut node = dir.borrow_mut();
                 match &mut *node {
                     Node::Dir { children } => {
-                        children.remove(name).map(|_| ()).ok_or(VfsError::NotFound)
+                        children.remove(name).map(|_| ()).ok_or(CortexError::NotFound)
                     }
-                    Node::File { .. } => Err(VfsError::NotADirectory),
+                    Node::File { .. } => Err(CortexError::NotADirectory),
                 }
             },
         )
@@ -233,7 +233,7 @@ impl Mountable for InMemVolume {
                 let link = self.navigate(&comps)?;
                 match &*link.borrow() {
                     Node::File { data } => Ok(data.clone()),
-                    Node::Dir { .. } => Err(VfsError::IsADirectory),
+                    Node::Dir { .. } => Err(CortexError::IsADirectory),
                 }
             },
         )
@@ -252,13 +252,13 @@ impl Mountable for InMemVolume {
                     Node::Dir { children } => {
                         if let Some(existing) = children.get(name) {
                             if matches!(&*existing.borrow(), Node::Dir { .. }) {
-                                return Err(VfsError::IsADirectory);
+                                return Err(CortexError::IsADirectory);
                             }
                         }
                         children.insert(name.clone(), Node::new_file(data.to_vec()));
                         Ok(())
                     }
-                    Node::File { .. } => Err(VfsError::NotADirectory),
+                    Node::File { .. } => Err(CortexError::NotADirectory),
                 }
             },
         )
@@ -274,11 +274,11 @@ fn components(path: &Path) -> Result<Vec<String>> {
         match comp {
             Component::RootDir | Component::CurDir => {}
             Component::Normal(name) => {
-                let name = name.to_str().ok_or(VfsError::InvalidName)?;
+                let name = name.to_str().ok_or(CortexError::InvalidName)?;
                 out.push(name.to_string());
             }
             Component::ParentDir | Component::Prefix(_) => {
-                return Err(VfsError::InvalidName);
+                return Err(CortexError::InvalidName);
             }
         }
     }
@@ -290,7 +290,7 @@ fn components(path: &Path) -> Result<Vec<String>> {
 fn split_last(comps: &[String]) -> Result<(&[String], &String)> {
     match comps.split_last() {
         Some((name, parent)) => Ok((parent, name)),
-        None => Err(VfsError::InvalidName),
+        None => Err(CortexError::InvalidName),
     }
 }
 
@@ -324,7 +324,7 @@ mod tests {
         vol.unlink(Path::new("/hello.txt")).unwrap();
         assert!(matches!(
             vol.read(Path::new("/hello.txt")),
-            Err(VfsError::NotFound)
+            Err(CortexError::NotFound)
         ));
     }
 
@@ -336,19 +336,19 @@ mod tests {
 
         assert!(matches!(
             vol.read(Path::new("/dir")),
-            Err(VfsError::IsADirectory)
+            Err(CortexError::IsADirectory)
         ));
         assert!(matches!(
             vol.write(Path::new("/dir"), b"y"),
-            Err(VfsError::IsADirectory)
+            Err(CortexError::IsADirectory)
         ));
         assert!(matches!(
             vol.list(Path::new("/file")),
-            Err(VfsError::NotADirectory)
+            Err(CortexError::NotADirectory)
         ));
         assert!(matches!(
             vol.mkdir(Path::new("/file")),
-            Err(VfsError::AlreadyExists)
+            Err(CortexError::AlreadyExists)
         ));
     }
 
@@ -357,7 +357,7 @@ mod tests {
         let vol = InMemVolume::new();
         assert!(matches!(
             vol.mkdir(Path::new("/a/../b")),
-            Err(VfsError::InvalidName)
+            Err(CortexError::InvalidName)
         ));
     }
 
@@ -390,11 +390,11 @@ mod tests {
         // Cannot shadow a file, and the parent must exist.
         assert!(matches!(
             root.mount("/afile", Box::new(InMemVolume::new())),
-            Err(VfsError::NotADirectory)
+            Err(CortexError::NotADirectory)
         ));
         assert!(matches!(
             root.mount("/missing/deep", Box::new(InMemVolume::new())),
-            Err(VfsError::NotFound)
+            Err(CortexError::NotFound)
         ));
 
         // Mounting twice at the same point is rejected.
@@ -402,7 +402,7 @@ mod tests {
         root.mount("/m", Box::new(InMemVolume::new())).unwrap();
         assert!(matches!(
             root.mount("/m", Box::new(InMemVolume::new())),
-            Err(VfsError::AlreadyExists)
+            Err(CortexError::AlreadyExists)
         ));
     }
 
@@ -431,7 +431,7 @@ mod tests {
         root.write(Path::new("/m/f"), b"z").unwrap();
 
         root.unmount("/m").unwrap();
-        assert!(matches!(root.unmount("/m"), Err(VfsError::NotFound)));
+        assert!(matches!(root.unmount("/m"), Err(CortexError::NotFound)));
         // With the mount gone, `/m` is just an empty local directory again.
         assert_eq!(names(&root, "/m"), Vec::<String>::new());
     }

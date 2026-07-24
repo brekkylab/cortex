@@ -1,6 +1,6 @@
 # Architecture
 
-`vfs`는 작고 합성 가능한 가상 파일시스템입니다.
+`cortex`는 작고 합성 가능한 가상 파일시스템입니다.
 
 모든 것이 하나의 [`Volume`](src/volume/mod.rs) trait을 중심으로 구성되며, 더 큰 파일시스템은 여러 volume을 조합해서 만들어집니다.
 
