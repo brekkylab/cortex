@@ -21,7 +21,7 @@ impl Dirent {
     }
 }
 
-pub trait Volume {
+pub trait Mountable {
     fn list(&self, path: &Path) -> Result<Vec<Dirent>>;
 
     fn mkdir(&self, path: &Path) -> Result<()>;

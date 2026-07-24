@@ -1,4 +1,4 @@
-//! A [`Volume`] backend that passes every operation straight through to the
+//! A [`Mountable`] backend that passes every operation straight through to the
 //! real local filesystem via `std::fs`.
 //!
 //! A `PassthroughVolume` is anchored at a `root` directory on disk. Every
@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{Dirent, Result, VfsError, Volume};
+use crate::{Dirent, Result, VfsError, Mountable};
 
 /// A volume backed by a real on-disk directory.
 pub struct PassthroughVolume {
@@ -45,7 +45,7 @@ impl PassthroughVolume {
     }
 }
 
-impl Volume for PassthroughVolume {
+impl Mountable for PassthroughVolume {
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let real = self.real_path(path)?;
         if !fs::symlink_metadata(&real)?.is_dir() {
@@ -126,7 +126,7 @@ mod tests {
         dir
     }
 
-    fn names(vol: &dyn Volume, path: &str) -> Vec<String> {
+    fn names(vol: &dyn Mountable, path: &str) -> Vec<String> {
         let mut names: Vec<_> = vol
             .list(Path::new(path))
             .unwrap()

@@ -1,5 +1,5 @@
 use crate::error::{Result, VfsError};
-use crate::volume::{Dirent, InMemVolume, Volume};
+use crate::volume::{Dirent, InMemVolume, Mountable};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -11,7 +11,7 @@ pub struct Workspace {
     /// all keys that are a prefix of a request, the longest is also the
     /// lexicographically greatest — so a longest-prefix lookup is a reverse
     /// range scan (see [`Workspace::resolve`]).
-    mounts: BTreeMap<PathBuf, Box<dyn Volume>>,
+    mounts: BTreeMap<PathBuf, Box<dyn Mountable>>,
 }
 
 impl Workspace {
@@ -19,7 +19,7 @@ impl Workspace {
         Self {
             mounts: BTreeMap::from([(
                 PathBuf::new(),
-                Box::new(InMemVolume::new()) as Box<dyn Volume>,
+                Box::new(InMemVolume::new()) as Box<dyn Mountable>,
             )]),
         }
     }
@@ -28,29 +28,29 @@ impl Workspace {
     ///
     /// Panics if `path` escapes the workspace root; intended for setup code
     /// where the mount points are known to be valid.
-    pub fn try_with_volume(
+    pub fn try_with_mountable(
         mut self,
         path: impl AsRef<Path>,
-        volume: Box<dyn Volume>,
+        mountable: Box<dyn Mountable>,
     ) -> Result<Self> {
-        self.mounts.insert(normalize(path.as_ref())?, volume);
+        self.mounts.insert(normalize(path.as_ref())?, mountable);
         Ok(self)
     }
 
     /// Mount `volume` at `at` (root-relative). Fails if the path escapes the
     /// workspace root or another volume is already mounted there.
-    pub fn mount(&mut self, path: impl AsRef<Path>, volume: Box<dyn Volume>) -> Result<()> {
+    pub fn mount(&mut self, path: impl AsRef<Path>, mountable: Box<dyn Mountable>) -> Result<()> {
         let key = normalize(path.as_ref())?;
         if self.mounts.contains_key(&key) {
             return Err(VfsError::AlreadyExists);
         }
-        self.mounts.insert(key, volume);
+        self.mounts.insert(key, mountable);
         Ok(())
     }
 
     /// Resolve a request path to the volume that owns it (longest-prefix
     /// match) together with the path re-based onto that volume's mount point.
-    fn resolve(&self, path: &Path) -> Result<(&dyn Volume, PathBuf)> {
+    fn resolve(&self, path: &Path) -> Result<(&dyn Mountable, PathBuf)> {
         let key = normalize(path)?;
         // Every key <= `key`, walked from the greatest downward; the first one
         // that is a prefix of `key` is the longest match. The empty root key is
@@ -88,7 +88,7 @@ fn normalize(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
-impl Volume for Workspace {
+impl Mountable for Workspace {
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let (volume, sub) = self.resolve(path)?;
         volume.list(&sub)

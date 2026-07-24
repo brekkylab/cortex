@@ -1,10 +1,10 @@
-//! An in-memory [`Volume`] backend.
+//! An in-memory [`Mountable`] backend.
 //!
 //! The whole tree lives behind `Rc<RefCell<..>>` links so that every operation
 //! shares one store through `&self`. It is single-threaded (not `Send`/`Sync`)
 //! — enough for tests, scratch space, and prototyping.
 //!
-//! In addition to the plain tree, an `InMemVolume` can have other [`Volume`]s
+//! In addition to the plain tree, an `InMemVolume` can have other [`Mountable`]s
 //! [mounted][`InMemVolume::mount`] at specific directories. Any path that falls
 //! under a mount point is transparently delegated to the mounted volume, with
 //! the path rewritten to be relative to the mount root.
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
-use crate::{Dirent, Result, Volume, VfsError};
+use crate::{Dirent, Result, Mountable, VfsError};
 
 type Link = Rc<RefCell<Node>>;
 
@@ -40,7 +40,7 @@ pub struct InMemVolume {
     root: Link,
     /// Mount points keyed by their normalized path components. The longest
     /// matching prefix wins when a request path could belong to more than one.
-    mounts: RefCell<HashMap<Vec<String>, Box<dyn Volume>>>,
+    mounts: RefCell<HashMap<Vec<String>, Box<dyn Mountable>>>,
 }
 
 impl InMemVolume {
@@ -59,7 +59,7 @@ impl InMemVolume {
     /// a local directory (its contents are shadowed while mounted) but must not
     /// be a file, and must not already have a volume mounted on it. The root
     /// cannot be mounted over.
-    pub fn mount(&self, at: impl AsRef<Path>, volume: Box<dyn Volume>) -> Result<()> {
+    pub fn mount(&self, at: impl AsRef<Path>, volume: Box<dyn Mountable>) -> Result<()> {
         let comps = components(at.as_ref())?;
         let (parent, name) = split_last(&comps)?;
 
@@ -85,7 +85,7 @@ impl InMemVolume {
     }
 
     /// Remove the mount registered at `at`, returning the detached volume.
-    pub fn unmount(&self, at: impl AsRef<Path>) -> Result<Box<dyn Volume>> {
+    pub fn unmount(&self, at: impl AsRef<Path>) -> Result<Box<dyn Mountable>> {
         let comps = components(at.as_ref())?;
         self.mounts
             .borrow_mut()
@@ -117,7 +117,7 @@ impl InMemVolume {
     fn dispatch<T>(
         &self,
         comps: &[String],
-        on_mount: impl FnOnce(&dyn Volume, &Path) -> Result<T>,
+        on_mount: impl FnOnce(&dyn Mountable, &Path) -> Result<T>,
         on_local: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let mounts = self.mounts.borrow();
@@ -145,7 +145,7 @@ impl Default for InMemVolume {
     }
 }
 
-impl Volume for InMemVolume {
+impl Mountable for InMemVolume {
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let comps = components(path)?;
         let mut entries = self.dispatch(
@@ -298,7 +298,7 @@ fn split_last(comps: &[String]) -> Result<(&[String], &String)> {
 mod tests {
     use super::*;
 
-    fn names(vol: &dyn Volume, path: &str) -> Vec<String> {
+    fn names(vol: &dyn Mountable, path: &str) -> Vec<String> {
         let mut names: Vec<_> = vol
             .list(Path::new(path))
             .unwrap()
