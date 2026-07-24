@@ -1,32 +1,59 @@
-//! [`Executable`]: a unit of work that runs against a [`Workspace`].
+//! [`Executable`]: a named unit of work that runs against a [`Workspace`].
+//!
+//! An `Executable` is designed to run **identically on the Rust host and from
+//! inside a microsandbox VM**. In the VM it is not run directly: the guest `wsx`
+//! CLI forwards `exec` to the host, the host executes it against the shared
+//! `Workspace`, and the [`ExecOutput`] is returned. So an `Executable` is
+//! workspace-agnostic — the workspace is passed into [`exec`](Executable::exec)
+//! per call — which lets a host [`ExecutableRegistry`](crate::ExecutableRegistry)
+//! store many of them as `Box<dyn Executable>` and serve each request against
+//! the workspace that request is scoped to.
 
 use crate::error::Result;
+use crate::workspace::Workspace;
 
-/// Something that runs against a [`Workspace`](crate::Workspace).
+pub use crate::wire::ExecOutput;
+
+/// Something that runs against a [`Workspace`] and returns process-like output.
 ///
-/// An implementor holds a borrow of one workspace and, in [`run`](Executable::run),
-/// inspects the volumes mounted in it (via
-/// [`Workspace::mounts`](crate::Workspace::mounts)) and drives them through the
-/// [`Mountable`](crate::Mountable) interface. Because `Mountable` takes `&self`, `run`
-/// needs only `&self` even when it writes.
+/// Object-safe so a registry can hold `Box<dyn Executable>`. Alongside [`exec`],
+/// each implementor carries the metadata used to expose it to a VM agent: a
+/// [`name`](Executable::name) (the registry key / `wsx <name>`) and a
+/// [`skill`](Executable::skill) (the `SKILL.md` teaching the agent how to call it).
 ///
 /// ```ignore
-/// struct Cat<'a> { ws: &'a Workspace }
-///
-/// impl Executable for Cat<'_> {
-///     type Output = Vec<u8>;
-///     fn run(&self, args: Vec<String>) -> Result<Vec<u8>> {
-///         self.ws.read(Path::new(&args[0]))
+/// struct Cat;
+/// impl Executable for Cat {
+///     fn name(&self) -> &str { "cat" }
+///     fn skill(&self) -> String { "# cat\n`wsx cat <path>` — print a file".into() }
+///     fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
+///         Ok(ExecOutput::ok(ws.read(Path::new(&args[0]))?))
 ///     }
 /// }
 /// ```
 pub trait Executable {
-    /// What a successful run produces: an exit code, captured output, `()`, …
-    /// Each implementor picks its own.
-    type Output;
+    /// Stable identifier the VM addresses this executable by — the registry key
+    /// and the `<name>` in `wsx <name> [args]`.
+    fn name(&self) -> &str;
 
-    /// Run with `args`, operating on the workspace the implementor holds.
-    fn run(&self, args: Vec<String>) -> Result<Self::Output>;
+    /// One-line summary, listed in `AGENT.md`.
+    fn summary(&self) -> &str {
+        ""
+    }
+
+    /// Argument usage, e.g. `"<path>"`, surfaced in the skill / `AGENT.md`.
+    fn usage(&self) -> &str {
+        ""
+    }
+
+    /// The `SKILL.md` body documenting how a VM agent invokes this executable
+    /// (via its bash tool + `wsx`). One skill per executable.
+    fn skill(&self) -> String;
+
+    /// Run against `ws` with `args`. Returns process-like [`ExecOutput`]; a
+    /// non-zero `code` reports the executable's own failure, while `Err` is for
+    /// infrastructure failures (bad path, backend error).
+    fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput>;
 }
 
 #[cfg(test)]
@@ -35,28 +62,34 @@ mod tests {
     use crate::{Mountable, Workspace};
     use std::path::{Path, PathBuf};
 
-    /// Reads `args[0]` from the workspace and returns its bytes.
-    struct Cat<'a> {
-        ws: &'a Workspace,
-    }
+    /// Prints `args[0]` from the workspace to stdout.
+    struct Cat;
 
-    impl Executable for Cat<'_> {
-        type Output = Vec<u8>;
-        fn run(&self, args: Vec<String>) -> Result<Vec<u8>> {
-            self.ws.read(Path::new(&args[0]))
+    impl Executable for Cat {
+        fn name(&self) -> &str {
+            "cat"
+        }
+        fn skill(&self) -> String {
+            "# cat\n`wsx cat <path>` — print a file".into()
+        }
+        fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
+            Ok(ExecOutput::ok(ws.read(Path::new(&args[0]))?))
         }
     }
 
-    /// Creates an empty file at `args[0]`; `Output = ()` proves the associated
-    /// type is per-implementor, and `&self` proves a run may mutate volumes.
-    struct Touch<'a> {
-        ws: &'a Workspace,
-    }
+    /// Creates an empty file at `args[0]`; returns the default (code 0) output.
+    struct Touch;
 
-    impl Executable for Touch<'_> {
-        type Output = ();
-        fn run(&self, args: Vec<String>) -> Result<()> {
-            self.ws.write(Path::new(&args[0]), b"")
+    impl Executable for Touch {
+        fn name(&self) -> &str {
+            "touch"
+        }
+        fn skill(&self) -> String {
+            "# touch\n`wsx touch <path>` — create an empty file".into()
+        }
+        fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
+            ws.write(Path::new(&args[0]), b"")?;
+            Ok(ExecOutput::default())
         }
     }
 
@@ -65,11 +98,12 @@ mod tests {
         let ws = Workspace::new();
         ws.write(Path::new("greeting"), b"hi").unwrap();
 
-        let cat = Cat { ws: &ws };
-        assert_eq!(cat.run(vec!["greeting".into()]).unwrap(), b"hi");
+        let out = Cat.exec(&ws, vec!["greeting".into()]).unwrap();
+        assert_eq!(out.stdout, b"hi");
+        assert_eq!(out.code, 0);
 
-        Touch { ws: &ws }.run(vec!["blank".into()]).unwrap();
-        assert_eq!(cat.run(vec!["blank".into()]).unwrap(), b"");
+        Touch.exec(&ws, vec!["blank".into()]).unwrap();
+        assert_eq!(Cat.exec(&ws, vec!["blank".into()]).unwrap().stdout, b"");
     }
 
     #[test]
