@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "cortex",
 ]
+
+[[package]]
+name = "wsx"
+version = "0.1.0"
+dependencies = [
+ "cortex-rpc",
+]
