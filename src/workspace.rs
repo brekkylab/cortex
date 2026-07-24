@@ -48,6 +48,15 @@ impl Workspace {
         Ok(())
     }
 
+    /// Iterate over every mount point and the volume mounted there, so an
+    /// [`Executable`](crate::Executable) can see what the workspace is composed
+    /// of. The root mount has an empty path.
+    pub fn mounts(&self) -> impl Iterator<Item = (&Path, &dyn Mountable)> {
+        self.mounts
+            .iter()
+            .map(|(path, volume)| (path.as_path(), volume.as_ref()))
+    }
+
     /// Resolve a request path to the volume that owns it (longest-prefix
     /// match) together with the path re-based onto that volume's mount point.
     fn resolve(&self, path: &Path) -> Result<(&dyn Mountable, PathBuf)> {
