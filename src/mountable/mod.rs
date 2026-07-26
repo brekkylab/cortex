@@ -1,8 +1,10 @@
-//! A path-addressed backend ([`MountableV2`]) and the adapters that expose it
+//! A path-addressed backend ([`Mountable`]) and the adapters that expose it
 //! to the outside world.
 
 mod adapters;
-mod mountable;
+mod impls;
+mod r#trait;
 
 pub use adapters::*;
-pub use mountable::*;
+pub use impls::*;
+pub use r#trait::*;

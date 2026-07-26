@@ -5,23 +5,24 @@
 //! errors/metadata into the `stat64`/errno shapes the guest kernel expects.
 
 use std::ffi::CStr;
-use std::io::Result;
+use std::io::{Read, Result, Seek, SeekFrom, Write};
 use std::time::Duration;
 
 use msb_krun::{
     DynFileSystem,
-    backends::fs::{Context, Entry, FsOptions, stat64},
+    backends::fs::{Context, DirEntry, Entry, FsOptions, stat64},
 };
 
 use super::PosixAdapter;
-use crate::mountable::MountableV2;
-use crate::{CortexError, DirentKind, Stat};
+use crate::mountable::{FileExt, FileHandle, Mountable};
+use crate::{CortexError, Dirent, DirentKind, Stat};
 
 // The guest kernel is always Linux, so every reply must carry Linux errno
 // numbers. The host's `libc` values differ (e.g. ENOSYS is 78 on macOS but 38
 // on Linux) and would be misread by the guest.
 const LINUX_ENOENT: i32 = 2;
 const LINUX_EIO: i32 = 5;
+const LINUX_EBADF: i32 = 9;
 const LINUX_EEXIST: i32 = 17;
 const LINUX_ENOTDIR: i32 = 20;
 const LINUX_EISDIR: i32 = 21;
@@ -63,7 +64,7 @@ fn to_stat64(inode: u64, stat: &Stat) -> stat64 {
     st
 }
 
-impl<T: MountableV2> DynFileSystem for PosixAdapter<T> {
+impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
     fn init(&self, _capable: FsOptions) -> Result<FsOptions> {
         Ok(FsOptions::empty())
     }
@@ -216,12 +217,20 @@ impl<T: MountableV2> DynFileSystem for PosixAdapter<T> {
 
     fn open(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         inode: u64,
-        kill_priv: bool,
-        flags: u32,
+        _kill_priv: bool,
+        _flags: u32,
     ) -> std::io::Result<(Option<u64>, msb_krun::backends::fs::OpenOptions)> {
-        Ok((None, msb_krun::backends::fs::OpenOptions::empty()))
+        let path = {
+            let table = self.inodes.lock().unwrap();
+            table.path_of(inode).ok_or_else(|| errno(LINUX_ENOENT))?
+        };
+        // Do the backend open (expensive setup happens once here), then park the
+        // handle in the table and hand the kernel its `fh`.
+        let handle = self.mountable.open(&path).map_err(to_errno)?;
+        let fh = self.handles.lock().unwrap().insert(handle);
+        Ok((Some(fh), msb_krun::backends::fs::OpenOptions::empty()))
     }
 
     fn create(
@@ -244,52 +253,105 @@ impl<T: MountableV2> DynFileSystem for PosixAdapter<T> {
 
     fn read(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
         handle: u64,
         w: &mut dyn msb_krun::backends::fs::ZeroCopyWriter,
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
-        flags: u32,
+        _lock_owner: Option<u64>,
+        _flags: u32,
     ) -> std::io::Result<usize> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        let file = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(handle)
+            .ok_or_else(|| errno(LINUX_EBADF))?;
+
+        // The kernel owns the position and hands us the exact (offset, size)
+        // window, so a single `read_at` on the open handle serves the request.
+        let mut data = vec![0u8; size as usize];
+        let n = file.read_at(&mut data, offset)?;
+        data.truncate(n);
+        if data.is_empty() {
+            return Ok(0);
+        }
+
+        // `ZeroCopyWriter` copies out of a file descriptor, not a `&[u8]`, so we
+        // stage the bytes in a temp file and hand it that fd. A backend that
+        // already holds an fd could skip this copy.
+        let mut staging = tempfile::tempfile()?;
+        staging.write_all(&data)?;
+        // Disambiguate: `File` now also impls our `FileHandle::flush`, so name
+        // the std `Write::flush` we want on the staging temp file explicitly.
+        Write::flush(&mut staging)?;
+        w.write_all_from(&mut staging, data.len(), 0)?;
+        Ok(data.len())
     }
 
     fn write(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
         handle: u64,
         r: &mut dyn msb_krun::backends::fs::ZeroCopyReader,
         size: u32,
         offset: u64,
-        lock_owner: Option<u64>,
-        delayed_write: bool,
-        kill_priv: bool,
-        flags: u32,
+        _lock_owner: Option<u64>,
+        _delayed_write: bool,
+        _kill_priv: bool,
+        _flags: u32,
     ) -> std::io::Result<usize> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        let file = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(handle)
+            .ok_or_else(|| errno(LINUX_EBADF))?;
+
+        // `ZeroCopyReader` delivers bytes into a file descriptor, so stage the
+        // window in a temp file, read it back, then hand it to the backend.
+        let mut staging = tempfile::tempfile()?;
+        r.read_exact_to(&mut staging, size as usize, 0)?;
+        staging.seek(SeekFrom::Start(0))?;
+        let mut buf = vec![0u8; size as usize];
+        staging.read_exact(&mut buf)?;
+
+        let n = file.write_at(&buf, offset)?;
+        Ok(n)
     }
 
     fn flush(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
         handle: u64,
-        lock_owner: u64,
+        _lock_owner: u64,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        let file = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(handle)
+            .ok_or_else(|| errno(LINUX_EBADF))?;
+        file.flush().map_err(to_errno)
     }
 
     fn fsync(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        datasync: bool,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _datasync: bool,
         handle: u64,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        let file = self
+            .handles
+            .lock()
+            .unwrap()
+            .get(handle)
+            .ok_or_else(|| errno(LINUX_EBADF))?;
+        file.flush().map_err(to_errno)
     }
 
     fn fallocate(
@@ -306,15 +368,20 @@ impl<T: MountableV2> DynFileSystem for PosixAdapter<T> {
 
     fn release(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        flags: u32,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _flags: u32,
         handle: u64,
-        flush: bool,
-        flock_release: bool,
-        lock_owner: Option<u64>,
+        _flush: bool,
+        _flock_release: bool,
+        _lock_owner: Option<u64>,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        // Drop the table's reference and commit. Outstanding `Arc` clones from
+        // in-flight reads keep the handle alive until they finish.
+        if let Some(file) = self.handles.lock().unwrap().remove(handle) {
+            file.flush().map_err(to_errno)?;
+        }
+        Ok(())
     }
 
     fn statfs(
@@ -390,19 +457,64 @@ impl<T: MountableV2> DynFileSystem for PosixAdapter<T> {
 
     fn readdir_for_each(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         inode: u64,
-        handle: u64,
-        size: u32,
+        _handle: u64,
+        _size: u32,
         offset: u64,
         add_entry: &mut msb_krun::backends::fs::AddDirEntry<'_>,
     ) -> std::io::Result<()> {
-        let entries = self.readdir(ctx, inode, handle, size, offset)?;
-        for entry in entries {
-            match add_entry(entry) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(e) => return Err(e),
+        let dir_path = {
+            let table = self.inodes.lock().unwrap();
+            table.path_of(inode).ok_or_else(|| errno(LINUX_ENOENT))?
+        };
+        let children = self.mountable.list(&dir_path).map_err(to_errno)?;
+
+        // Entries stream in a fixed order with 1-based offsets (0 means "from
+        // the beginning"); the kernel resumes by giving us the last offset it
+        // consumed, so we skip anything at or before it. `.`/`..` occupy the
+        // first two slots. We hold the inode lock for the whole stream so the
+        // numbers we assign stay consistent; `add_entry` only copies into the
+        // kernel's buffer, never back into us.
+        let mut table = self.inodes.lock().unwrap();
+        let mut cursor = 0u64;
+
+        // `..` should point at the parent, but resolving it is unnecessary for
+        // traversal, so both dots reuse this directory's inode.
+        for name in [b".".as_slice(), b"..".as_slice()] {
+            cursor += 1;
+            if cursor <= offset {
+                continue;
+            }
+            let entry = DirEntry {
+                ino: inode,
+                offset: cursor,
+                type_: libc::DT_DIR as u32,
+                name,
+            };
+            if add_entry(entry)? == 0 {
+                return Ok(());
+            }
+        }
+
+        for child in &children {
+            cursor += 1;
+            if cursor <= offset {
+                continue;
+            }
+            let ino = table.number_for(dir_path.join(child.name()));
+            let type_ = match child {
+                Dirent::Dir(_) => libc::DT_DIR,
+                Dirent::File(_) => libc::DT_REG,
+            };
+            let entry = DirEntry {
+                ino,
+                offset: cursor,
+                type_: type_ as u32,
+                name: child.name().as_bytes(),
+            };
+            if add_entry(entry)? == 0 {
+                break;
             }
         }
         Ok(())

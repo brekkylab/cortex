@@ -1,4 +1,4 @@
-use crate::error::{Result, CortexError};
+use crate::error::{CortexError, Result};
 use crate::volume::{Dirent, InMemVolume, Mountable};
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};

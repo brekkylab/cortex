@@ -19,8 +19,14 @@
 //! so you should see `Hello from cortex toy FUSE!` on stdout before the process
 //! exits with the guest's exit code.
 
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+use cortex::{
+    CortexError, Dirent, DirentKind, FileExt, FileHandle, Mountable, PosixAdapter, Result, Stat,
+};
+use msb_krun::VmBuilder;
 
 /// Guest is aarch64 (libkrun on Apple Silicon), so the rootfs must match.
 const ALPINE_URL: &str = "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz";
@@ -134,6 +140,43 @@ fn resolve_kernel() -> PathBuf {
         })
 }
 
+/// Boot a microVM with the toy [`ToyMountable`] served as a virtio-fs share,
+/// tagged `cortex`. Inside the guest:
+///
+/// ```text
+/// mount -t virtiofs cortex /mnt && cat /mnt/hello.txt
+/// ```
+///
+/// [`ToyMountable`] is a path-addressed [`Mountable`](cortex::Mountable)
+/// backend; [`PosixAdapter`] wraps it into the FUSE-shaped
+/// `Box<dyn DynFileSystem + Send + Sync>` that `FsBuilder::custom` attaches to
+/// the guest — so the toy is served straight from this process, no daemon, no
+/// host mount.
+///
+/// A real boot also needs a populated `rootfs` and a matching libkrunfw
+/// `kernel` firmware, both of which this binary provisions.
+fn boot_with_toy_fs(
+    rootfs: impl AsRef<Path>,
+    kernel: impl AsRef<Path>,
+) -> msb_krun::Result<std::convert::Infallible> {
+    VmBuilder::new()
+        .machine(|m| m.vcpus(1).memory_mib(512))
+        .kernel(|k| k.krunfw_path(kernel.as_ref()))
+        .fs(|fs| {
+            // Mount 0: the guest root filesystem (host passthrough).
+            // Mount 1: our toy, reachable inside the guest at virtio-fs tag `cortex`.
+            fs.root(rootfs.as_ref())
+                .tag("cortex")
+                .custom(Box::new(PosixAdapter::new(ToyMountable::new())))
+        })
+        .exec(|e| {
+            e.path("/bin/sh")
+                .args(["-c", "mount -t virtiofs cortex /mnt && cat /mnt/hello.txt"])
+        })
+        .build()?
+        .enter()
+}
+
 fn main() {
     let rootfs = match std::env::var("CORTEX_TEST_ROOTFS") {
         Ok(r) => PathBuf::from(r),
@@ -151,8 +194,116 @@ fn main() {
     // toy file, and libkrun `_exit()`s this process with the guest's exit code.
     // So the only way control reaches here is a pre-launch error. The `Ok`
     // variant holds `Infallible`, matched with the empty `match` below.
-    match cortex::krun::boot_with_toy_fs(rootfs, kernel) {
+    match boot_with_toy_fs(rootfs, kernel) {
         Ok(never) => match never {},
         Err(e) => fail(format!("boot failed before entering the VM: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The toy backend served into the guest.
+// ---------------------------------------------------------------------------
+
+/// A minimal read-only [`Mountable`] toy: a single file at the root.
+///
+/// ```text
+/// /             (dir)
+/// └── hello.txt -> "Hello from cortex toy FUSE!\n"
+/// ```
+struct ToyMountable;
+
+impl ToyMountable {
+    fn new() -> Self {
+        ToyMountable
+    }
+}
+
+const FILE_NAME: &str = "hello.txt";
+const FILE_CONTENT: &[u8] = b"Hello from cortex toy FUSE!\n";
+
+/// What a path points at within the toy's fixed tree.
+enum Target {
+    Root,
+    File,
+    Missing,
+}
+
+/// Resolve a path to a [`Target`], rejecting `..`/prefixes/non-UTF-8 names.
+fn resolve(path: &Path) -> Result<Target> {
+    let mut comps = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(n) => comps.push(n.to_str().ok_or(CortexError::InvalidName)?),
+            Component::ParentDir | Component::Prefix(_) => return Err(CortexError::InvalidName),
+        }
+    }
+    Ok(match comps.as_slice() {
+        [] => Target::Root,
+        [one] if *one == FILE_NAME => Target::File,
+        _ => Target::Missing,
+    })
+}
+
+impl Mountable for ToyMountable {
+    type Handle = ToyHandle;
+
+    fn stat(&self, path: &Path) -> Result<Stat> {
+        match resolve(path)? {
+            Target::Root => Ok(Stat::new(DirentKind::Dir, 0)),
+            Target::File => Ok(Stat::new(DirentKind::File, FILE_CONTENT.len() as u64)),
+            Target::Missing => Err(CortexError::NotFound),
+        }
+    }
+
+    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+        match resolve(path)? {
+            Target::Root => Ok(vec![Dirent::File(FILE_NAME.to_string())]),
+            Target::File => Err(CortexError::NotADirectory),
+            Target::Missing => Err(CortexError::NotFound),
+        }
+    }
+
+    fn mkdir(&self, _path: &Path) -> Result<()> {
+        Err(CortexError::Unsupported)
+    }
+
+    fn unlink(&self, _path: &Path) -> Result<()> {
+        Err(CortexError::Unsupported)
+    }
+
+    fn open(&self, path: &Path) -> Result<Self::Handle> {
+        match resolve(path)? {
+            Target::File => Ok(ToyHandle),
+            Target::Root => Err(CortexError::IsADirectory),
+            Target::Missing => Err(CortexError::NotFound),
+        }
+    }
+}
+
+/// The open handle: a cursor-free, read-only view of the single file's static
+/// bytes. Nothing to fetch, nothing to flush.
+struct ToyHandle;
+
+impl FileExt for ToyHandle {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let start = (offset as usize).min(FILE_CONTENT.len());
+        let src = &FILE_CONTENT[start..];
+        let n = src.len().min(buf.len());
+        buf[..n].copy_from_slice(&src[..n]);
+        Ok(n)
+    }
+
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "toy filesystem is read-only",
+        ))
+    }
+}
+
+impl FileHandle for ToyHandle {
+    fn truncate(&self, _size: u64) -> Result<()> {
+        Err(CortexError::Unsupported)
     }
 }
