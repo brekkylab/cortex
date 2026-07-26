@@ -12,10 +12,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PROFILE_DIR="debug"
-BIN="target/${PROFILE_DIR}/boot_toy_fs"
+BIN="target/${PROFILE_DIR}/apply_krun"
 
-echo "==> building boot_toy_fs"
-cargo build --features krun --bin boot_toy_fs "$@"
+echo "==> building apply_krun"
+cargo build --features krun --bin apply_krun "$@"
 
 echo "==> codesigning with hypervisor entitlement"
 codesign --entitlements macos-entitlements.plist -s - --force "$BIN"

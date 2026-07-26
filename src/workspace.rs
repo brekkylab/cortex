@@ -40,23 +40,28 @@ impl Workspace {
     /// Builder-style mount that overwrites any backend already at `path`.
     ///
     /// Fails only if `path` escapes the workspace root.
-    pub fn try_with_mount(
-        mut self,
-        path: impl AsRef<Path>,
-        backend: Box<dyn DynMountable>,
-    ) -> Result<Self> {
-        self.mounts.insert(normalize(path.as_ref())?, backend);
+    pub fn try_with_mount<M>(mut self, path: impl AsRef<Path>, backend: M) -> Result<Self>
+    where
+        M: Mountable + 'static,
+        M::Handle: 'static,
+    {
+        self.mounts
+            .insert(normalize(path.as_ref())?, Box::new(backend));
         Ok(self)
     }
 
     /// Mount `backend` at `path` (root-relative). Fails if the path escapes the
     /// workspace root or another backend is already mounted there.
-    pub fn mount(&mut self, path: impl AsRef<Path>, backend: Box<dyn DynMountable>) -> Result<()> {
+    pub fn mount<M>(&mut self, path: impl AsRef<Path>, backend: M) -> Result<()>
+    where
+        M: Mountable + 'static,
+        M::Handle: 'static,
+    {
         let key = normalize(path.as_ref())?;
         if self.mounts.contains_key(&key) {
             return Err(CortexError::AlreadyExists);
         }
-        self.mounts.insert(key, backend);
+        self.mounts.insert(key, Box::new(backend));
         Ok(())
     }
 
@@ -169,9 +174,9 @@ mod tests {
         fs::write(data_dir.join("inner.txt"), b"inner").unwrap();
 
         let ws = Workspace::new()
-            .try_with_mount("", Box::new(PassthroughVolume::new(&root_dir)))
+            .try_with_mount("", PassthroughVolume::new(&root_dir))
             .unwrap()
-            .try_with_mount("data", Box::new(PassthroughVolume::new(&data_dir)))
+            .try_with_mount("data", PassthroughVolume::new(&data_dir))
             .unwrap();
 
         // Both `Mountable` and `DynMountable` (blanket impl) are in scope, so
@@ -216,14 +221,13 @@ mod tests {
     fn mount_rejects_duplicates_and_escapes() {
         let dir = scratch("dup");
         let mut ws = Workspace::new();
-        ws.mount("m", Box::new(PassthroughVolume::new(&dir)))
-            .unwrap();
+        ws.mount("m", PassthroughVolume::new(&dir)).unwrap();
         assert!(matches!(
-            ws.mount("m", Box::new(PassthroughVolume::new(&dir))),
+            ws.mount("m", PassthroughVolume::new(&dir)),
             Err(CortexError::AlreadyExists)
         ));
         assert!(matches!(
-            ws.mount("../escape", Box::new(PassthroughVolume::new(&dir))),
+            ws.mount("../escape", PassthroughVolume::new(&dir)),
             Err(CortexError::InvalidName)
         ));
         fs::remove_dir_all(&dir).unwrap();
