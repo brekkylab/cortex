@@ -51,6 +51,62 @@ pub trait Mountable: Send + Sync {
     fn open(&self, path: &Path) -> Result<Self::Handle>;
 }
 
+/// The object-safe face of [`Mountable`].
+///
+/// [`Mountable`] carries an associated `Handle` type, so `dyn Mountable` is
+/// illegal — yet a heterogeneous mount table (see [`Workspace`]) needs to store
+/// backends of different concrete types behind one pointer. `DynMountable`
+/// erases the handle to `Box<dyn FileHandle>`: every method mirrors `Mountable`,
+/// and a blanket impl makes *every* `Mountable` a `DynMountable` automatically,
+/// so callers never implement it by hand.
+///
+/// [`Workspace`]: crate::Workspace
+pub trait DynMountable: Send + Sync {
+    /// See [`Mountable::stat`].
+    fn stat(&self, path: &Path) -> Result<Stat>;
+
+    /// See [`Mountable::list`].
+    fn list(&self, path: &Path) -> Result<Vec<Dirent>>;
+
+    /// See [`Mountable::mkdir`].
+    fn mkdir(&self, path: &Path) -> Result<()>;
+
+    /// See [`Mountable::unlink`].
+    fn unlink(&self, path: &Path) -> Result<()>;
+
+    /// See [`Mountable::open`], with the concrete handle boxed behind a trait
+    /// object.
+    fn open(&self, path: &Path) -> Result<Box<dyn FileHandle>>;
+}
+
+/// Every [`Mountable`] is a [`DynMountable`] once its handle is boxed. The
+/// `'static` bound lets the erased handle become a `Box<dyn FileHandle>`.
+impl<T> DynMountable for T
+where
+    T: Mountable,
+    T::Handle: 'static,
+{
+    fn stat(&self, path: &Path) -> Result<Stat> {
+        Mountable::stat(self, path)
+    }
+
+    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+        Mountable::list(self, path)
+    }
+
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        Mountable::mkdir(self, path)
+    }
+
+    fn unlink(&self, path: &Path) -> Result<()> {
+        Mountable::unlink(self, path)
+    }
+
+    fn open(&self, path: &Path) -> Result<Box<dyn FileHandle>> {
+        Ok(Box::new(Mountable::open(self, path)?))
+    }
+}
+
 /// A stateful, open-file handle over some backend.
 ///
 /// The data plane is [`FileExt`]: offset-addressed (not
@@ -86,6 +142,27 @@ impl FileHandle for std::fs::File {
     fn truncate(&self, size: u64) -> Result<()> {
         self.set_len(size)?;
         Ok(())
+    }
+}
+
+/// A boxed handle is itself a handle, so it can serve as the `Handle` of an
+/// erased backend (e.g. [`Workspace`](crate::Workspace), whose handle is exactly
+/// `Box<dyn FileHandle>`). Every call forwards to the inner handle.
+impl FileExt for Box<dyn FileHandle> {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        (**self).read_at(buf, offset)
+    }
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        (**self).write_at(buf, offset)
+    }
+}
+
+impl FileHandle for Box<dyn FileHandle> {
+    fn truncate(&self, size: u64) -> Result<()> {
+        (**self).truncate(size)
+    }
+    fn flush(&self) -> Result<()> {
+        (**self).flush()
     }
 }
 
