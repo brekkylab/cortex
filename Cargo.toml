@@ -3,4 +3,20 @@ name = "cortex"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "apply_krun"
+required-features = ["krun"]
+
 [dependencies]
+# The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
+# `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
+# backend to the guest — the one thing the upstream libkrun C API and the
+# high-level microsandbox SDK do not offer.
+msb_krun = { version = "0.1", optional = true }
+libc = { version = "0.2", optional = true }
+tempfile = { version = "3", optional = true }
+
+[features]
+default = ["krun"]
+# Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
+krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
