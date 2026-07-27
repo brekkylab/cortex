@@ -3,11 +3,11 @@
 # linker driver on a macOS build host) rejects the GNU-style flags rustc emits
 # for these targets.
 #
-# Kept as target rustflags (not RUSTFLAGS) so a direct
-# `cargo build --target …` picks it up.
+# Scoped to the wsx crate: Cargo discovers config by walking up from the CWD, so
+# build wsx from this directory for these flags to apply.
 #
-#   cargo build -p wsx --release --target aarch64-unknown-linux-musl
-#   cargo build -p wsx --release --target x86_64-unknown-linux-musl
+#   cd wsx && cargo build --release --target aarch64-unknown-linux-musl
+#   cd wsx && cargo build --release --target x86_64-unknown-linux-musl
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "linker-flavor=ld.lld"]
 

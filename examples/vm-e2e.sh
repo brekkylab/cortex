@@ -44,9 +44,9 @@ fail() { printf '\n\342\235\214 FAIL: %s\n' "$*" >&2; [ -s "$LOG" ] && { echo "-
 printf '\n\342\226\266 cortex \302\267 VM\342\206\222host Executable forwarding (end-to-end)\n\n'
 
 printf '[1/4] Build\n'
-cargo build -q --manifest-path "$ROOT/Cargo.toml" --bin exec-server || fail "build exec-server"
+cargo build -q --manifest-path "$ROOT/Cargo.toml" -p cortex-rpc --bin exec-server || fail "build exec-server"
 printf '      \342\234\223 host exec-server\n'
-cargo build -q --manifest-path "$ROOT/Cargo.toml" -p wsx --release --target "$TGT" || fail "build wsx"
+( cd "$ROOT/wsx" && cargo build -q --release --target "$TGT" ) || fail "build wsx"
 WSX="$ROOT/target/$TGT/release/wsx"
 printf '      \342\234\223 guest wsx (%s, static ELF)\n' "$TGT"
 
