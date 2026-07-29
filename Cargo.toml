@@ -7,6 +7,23 @@ edition = "2024"
 name = "apply_krun"
 required-features = ["krun"]
 
+[[bin]]
+name = "apply_krun_s3"
+required-features = ["krun", "s3"]
+
+# Boots a VM whose S3 workspace is attached through microsandbox's pluggable
+# fs-backend registry (the integrator seam), not by constructing the backend
+# inline.
+[[bin]]
+name = "apply_msb_s3"
+required-features = ["msb"]
+
+# A drop-in `msb sandbox` host that registers cortex fs-backends. Point
+# MSB_PATH at it to serve cortex workspaces into real microsandbox sandboxes.
+[[bin]]
+name = "msb_cortex"
+required-features = ["msb"]
+
 [dependencies]
 # The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
 # `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
@@ -15,8 +32,32 @@ required-features = ["krun"]
 msb_krun = { version = "0.1", optional = true }
 libc = { version = "0.2", optional = true }
 tempfile = { version = "3", optional = true }
+# S3 Mountable backend (spike). object_store is async, so it needs a Tokio rt.
+object_store = { version = "0.14", features = ["aws"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+# The `msb` feature: register cortex backends into microsandbox's fs-backend
+# registry (`cortex::msb`), boot a VM through it (`apply_msb_s3`), and host the
+# real `msb sandbox` process with those backends (`msb_cortex`).
+microsandbox-runtime = { git = "https://github.com/brekkylab/microsandbox.git", rev = "012235d869aaeca096270c7225e3215a751b64b6", optional = true }
+microsandbox-cli = { git = "https://github.com/brekkylab/microsandbox.git", rev = "012235d869aaeca096270c7225e3215a751b64b6", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 default = ["krun"]
 # Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
 krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
+# An S3-backed Mountable (read path).
+s3 = ["dep:object_store", "dep:tokio"]
+# Register cortex's `S3Volume` into microsandbox's fs-backend registry and serve
+# it into microsandbox VMs.
+msb = [
+    "krun",
+    "s3",
+    "dep:microsandbox-runtime",
+    "dep:microsandbox-cli",
+    "dep:clap",
+    "dep:serde",
+    "dep:serde_json",
+]

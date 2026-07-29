@@ -1,5 +1,7 @@
 mod error;
 mod mountable;
+#[cfg(feature = "msb")]
+pub mod msb;
 mod stat;
 mod workspace;
 
