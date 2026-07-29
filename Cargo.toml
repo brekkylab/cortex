@@ -38,8 +38,8 @@ tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 # The `msb` feature: register cortex backends into microsandbox's fs-backend
 # registry (`cortex::msb`), boot a VM through it (`apply_msb_s3`), and host the
 # real `msb sandbox` process with those backends (`msb_cortex`).
-microsandbox-runtime = { git = "https://github.com/brekkylab/microsandbox.git", rev = "012235d869aaeca096270c7225e3215a751b64b6", optional = true }
-microsandbox-cli = { git = "https://github.com/brekkylab/microsandbox.git", rev = "012235d869aaeca096270c7225e3215a751b64b6", optional = true }
+microsandbox-runtime = { git = "https://github.com/brekkylab/microsandbox.git", rev = "835d9afef58ee2b89da31f6c563974387d7ae0a2", optional = true }
+microsandbox-cli = { git = "https://github.com/brekkylab/microsandbox.git", rev = "835d9afef58ee2b89da31f6c563974387d7ae0a2", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
