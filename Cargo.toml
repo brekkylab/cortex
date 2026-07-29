@@ -7,12 +7,29 @@ edition = "2024"
 name = "apply_krun"
 required-features = ["krun"]
 
+[[example]]
+name = "mount_fuse"
+required-features = ["fuse"]
+
+[[example]]
+name = "mount_fuse_t"
+required-features = ["fuse-t"]
+
+[build-dependencies]
+# Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
+# build-dependencies cannot themselves be optional.
+cc = "1"
+pkg-config = "0.3"
+
 [dependencies]
 # The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
 # `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
 # backend to the guest — the one thing the upstream libkrun C API and the
 # high-level microsandbox SDK do not offer.
 msb_krun = { version = "0.1", optional = true }
+# Host-side FUSE. Sync trait whose methods take `&self`, so it drives the same
+# `PosixAdapter` (interior mutability) that the krun binding does.
+fuser = { version = "0.17", optional = true }
 libc = { version = "0.2", optional = true }
 tempfile = { version = "3", optional = true }
 
@@ -20,3 +37,23 @@ tempfile = { version = "3", optional = true }
 default = ["krun"]
 # Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
 krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
+# Mount a cortex filesystem on the host through FUSE.
+#
+# Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
+# `brew install --cask fuse-t`) or macFUSE; both export the libfuse2 mount ABI
+# fuser links against. FUSE-T ships `fuse-t.pc` rather than the `fuse.pc` that
+# fuser's macOS branch probes for, so point `PKG_CONFIG_PATH` at the shim in
+# `contrib/pkgconfig` (see `scripts/mount_fuse.sh`). Linux needs no provider —
+# fuser opens /dev/fuse directly.
+fuse = ["dep:fuser", "dep:libc"]
+# Mount on macOS through FUSE-T, which needs no kernel extension.
+#
+# A separate binding rather than a flavour of `fuse`, because the two differ in
+# who drives the session: `fuser` reads the FUSE protocol off the mount fd
+# itself, while FUSE-T hands back a socket to its own helper and expects to drive
+# the filesystem through libfuse-t's loop. Enabling both at once is fine — they
+# are independent call surfaces over the same `PosixFs`.
+fuse-t = ["dep:libc"]
+# Compile and unit-test the FUSE adapter with no libfuse provider installed:
+# skips fuser's pkg-config probe, so the adapter builds but cannot mount.
+fuse-no-mount = ["fuse", "fuser/macos-no-mount"]

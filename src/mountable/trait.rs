@@ -1,22 +1,100 @@
 use std::io;
 use std::path::Path;
 
-use crate::{Result, Stat};
+use crate::{DirentKind, Result, Stat};
 
-/// One entry in a directory listing: its name plus whether it is a file or a
-/// subdirectory. (Full metadata is fetched separately via
-/// [`Mountable::stat`].)
-pub enum Dirent {
-    Dir(String),
-    File(String),
+/// One entry in a directory listing.
+pub struct Dirent {
+    pub name: String,
+
+    pub kind: DirentKind,
+
+    /// Full metadata, but only when the listing produced it for free — which is a
+    /// real property of the backend, hence its place in the type.
+    ///
+    /// An object store or document API returns sizes and timestamps in the *same*
+    /// response, so filling this in costs nothing and saves the caller an N+1
+    /// round trip (a FUSE `readdirplus`, a WebDAV `PROPFIND Depth: 1`). A local
+    /// directory read yields names and `d_type` only, so `Some` there would mean
+    /// an `lstat` per entry that a plain `ls` never asked for.
+    pub stat: Option<Stat>,
 }
 
 impl Dirent {
-    /// The entry's name, regardless of whether it is a directory or a file.
-    pub fn name(&self) -> &str {
-        match self {
-            Dirent::Dir(name) | Dirent::File(name) => name,
+    /// An entry whose metadata the listing did not include.
+    pub fn new(name: impl Into<String>, kind: DirentKind) -> Self {
+        Dirent {
+            name: name.into(),
+            kind,
+            stat: None,
         }
+    }
+
+    /// An entry the listing already knew everything about.
+    pub fn with_stat(name: impl Into<String>, stat: Stat) -> Self {
+        Dirent {
+            name: name.into(),
+            kind: stat.kind,
+            stat: Some(stat),
+        }
+    }
+}
+
+/// How a file should be opened.
+///
+/// The options travel *with* the open rather than being a separate `create`,
+/// because two of them are atomicity requirements only the backend can meet:
+///
+/// * `create_new` is `O_EXCL`. Decomposing it into "stat, then create if absent"
+///   is a race, not a contract — and for a local backend (`O_CREAT|O_EXCL`) or an
+///   object store (`If-None-Match: *`) the atomic form is the only one there is.
+/// * `truncate` must take effect *before* any handle exists, so the metadata the
+///   caller gets back already reflects the empty file. [`FileHandle::truncate`]
+///   is the other, non-atomic resize; a backend must not treat one as the other.
+///
+/// The only meaningless combination — neither `read` nor `write` — is rejected by
+/// [`validate`](Self::validate). `O_RDONLY | O_CREAT` is ordinary POSIX and stays
+/// legal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OpenOptions {
+    pub read: bool,
+    pub write: bool,
+    /// Writes land at the end regardless of the offset given. Mostly inert under
+    /// FUSE (the kernel resolves `O_APPEND` and sends absolute offsets), but a
+    /// library caller means it, so a handle must honour rather than ignore it.
+    pub append: bool,
+    pub truncate: bool,
+    /// Create the file if it is absent. The parent directory is never created.
+    pub create: bool,
+    /// Create the file, failing with [`AlreadyExists`] if it is already there.
+    ///
+    /// [`AlreadyExists`]: crate::CortexError::AlreadyExists
+    pub create_new: bool,
+}
+
+impl OpenOptions {
+    pub fn read_only() -> Self {
+        OpenOptions {
+            read: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn read_write() -> Self {
+        OpenOptions {
+            read: true,
+            write: true,
+            ..Default::default()
+        }
+    }
+
+    /// Reject the one self-contradictory combination, so each backend spends a
+    /// line calling this rather than re-deriving the rule.
+    pub fn validate(&self) -> Result<()> {
+        if !self.read && !self.write {
+            return Err(crate::CortexError::InvalidArgument);
+        }
+        Ok(())
     }
 }
 
@@ -39,16 +117,43 @@ pub trait Mountable: Send + Sync {
     fn stat(&self, path: &Path) -> Result<Stat>;
 
     /// The entries directly under `path`.
+    ///
+    /// Each entry carries metadata only if the listing already had it; see
+    /// [`Dirent::stat`].
     fn list(&self, path: &Path) -> Result<Vec<Dirent>>;
 
     /// Create a directory at `path`.
     fn mkdir(&self, path: &Path) -> Result<()>;
 
-    /// Remove the entry at `path`.
+    /// Remove the *file* at `path`; a directory is rejected with
+    /// [`IsADirectory`]. Use [`rmdir`] for those.
+    ///
+    /// Split because a filesystem never deletes recursively: `rm -rf` is
+    /// decomposed by the caller into `list`, an `unlink` per file, and a final
+    /// `rmdir`. A backend that quietly removed a subtree here would only ever be
+    /// reached by mistake.
+    ///
+    /// [`IsADirectory`]: crate::CortexError::IsADirectory
+    /// [`rmdir`]: Self::rmdir
     fn unlink(&self, path: &Path) -> Result<()>;
 
-    /// Open the file at `path` for I/O.
-    fn open(&self, path: &Path) -> Result<Self::Handle>;
+    /// Remove the *empty directory* at `path`.
+    ///
+    /// A file is rejected with [`NotADirectory`], and a directory that still
+    /// has children with [`NotEmpty`].
+    ///
+    /// [`NotADirectory`]: crate::CortexError::NotADirectory
+    /// [`NotEmpty`]: crate::CortexError::NotEmpty
+    fn rmdir(&self, path: &Path) -> Result<()>;
+
+    /// Open the file at `path`, returning the handle with the entry's metadata as
+    /// of the open.
+    ///
+    /// The [`Stat`] comes back together because a FUSE `create` must answer with
+    /// attributes *and* a handle in one message; a second [`stat`](Self::stat)
+    /// would cost another round trip and leave a window for the entry to be
+    /// replaced. See [`OpenOptions`] for which options must be atomic.
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)>;
 }
 
 /// The object-safe face of [`Mountable`].
@@ -74,9 +179,12 @@ pub trait DynMountable: Send + Sync {
     /// See [`Mountable::unlink`].
     fn unlink(&self, path: &Path) -> Result<()>;
 
+    /// See [`Mountable::rmdir`].
+    fn rmdir(&self, path: &Path) -> Result<()>;
+
     /// See [`Mountable::open`], with the concrete handle boxed behind a trait
     /// object.
-    fn open(&self, path: &Path) -> Result<Box<dyn FileHandle>>;
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)>;
 }
 
 /// Every [`Mountable`] is a [`DynMountable`] once its handle is boxed. The
@@ -102,8 +210,13 @@ where
         Mountable::unlink(self, path)
     }
 
-    fn open(&self, path: &Path) -> Result<Box<dyn FileHandle>> {
-        Ok(Box::new(Mountable::open(self, path)?))
+    fn rmdir(&self, path: &Path) -> Result<()> {
+        Mountable::rmdir(self, path)
+    }
+
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)> {
+        let (handle, stat) = Mountable::open(self, path, options)?;
+        Ok((Box::new(handle), stat))
     }
 }
 
@@ -116,23 +229,36 @@ where
 /// `write_at` (and the whole-buffer `read_exact_at`/`write_all_at`) from
 /// [`FileExt`].
 ///
-/// This trait adds the two hooks std has no portable trait for: [`truncate`] to
-/// resize (FUSE `setattr`) and [`flush`] to commit buffered writes (e.g. finish
-/// an S3 multipart upload). `flush` is `&self`, not [`io::Write::flush`], so it
-/// works on the `Arc`-shared handles concurrent readers hold.
+/// This trait adds the hooks std has no portable trait for: [`truncate`] to
+/// resize (FUSE `setattr`), and the two-stage write-out below. All take `&self`,
+/// so they work on the `Arc`-shared handles concurrent readers hold.
 ///
 /// [`truncate`]: Self::truncate
-/// [`flush`]: Self::flush
-/// [`io::Write::flush`]: std::io::Write::flush
 pub trait FileHandle: FileExt + Send + Sync {
     /// Resize the file to `size` bytes, zero-filling any growth.
     fn truncate(&self, size: u64) -> Result<()>;
 
-    /// Commit any buffered writes (e.g. complete an S3 multipart upload).
-    /// Default: nothing buffered, so a no-op.
     fn flush(&self) -> Result<()> {
         Ok(())
     }
+
+    fn commit(&self) -> Result<()> {
+        self.flush()
+    }
+}
+
+/// The attribute changes a `setattr` asks for. Optional because the kernel sends
+/// a validity mask: only the named fields are meant to move.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SetAttr {
+    /// Resize the file. The only field this crate can actually act on, via
+    /// [`FileHandle::truncate`].
+    pub size: Option<u64>,
+    pub mtime: Option<std::time::SystemTime>,
+    pub atime: Option<std::time::SystemTime>,
+    pub mode: Option<u32>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
 }
 
 /// A plain [`std::fs::File`] is a ready-made handle for a local passthrough
@@ -163,6 +289,9 @@ impl FileHandle for Box<dyn FileHandle> {
     }
     fn flush(&self) -> Result<()> {
         (**self).flush()
+    }
+    fn commit(&self) -> Result<()> {
+        (**self).commit()
     }
 }
 

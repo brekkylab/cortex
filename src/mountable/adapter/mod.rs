@@ -1,7 +1,28 @@
-//! Adapters that expose a [`Mountable`](super::Mountable) backend through a
-//! concrete OS-facing interface.
+//! One module per concrete filesystem interface, each binding
+//! [`PosixFs`](super::PosixFs) to that interface.
+//!
+//! A binding only translates: it decodes the interface's arguments, calls one
+//! of the shared operations, and encodes the reply. The two things a binding
+//! decides for itself are the errno numbering its consumer expects (a guest
+//! kernel is always Linux; the host's is the host's) and the concrete attribute
+//! type it must fill.
+//!
+//! A binding is a trait impl, so declaring the module is what pulls it in. What
+//! is re-exported is each binding's *call surface* — the type a program holds to
+//! put the filesystem in front of that interface. The krun binding needs none:
+//! its call surface belongs to `msb_krun` (`VmBuilder::fs(..).custom(..)`).
 
+#[cfg(feature = "fuse")]
+mod fuse;
+#[cfg(feature = "fuse-t")]
+mod fuse_t;
 mod krun;
-mod posix;
 
-pub use posix::*;
+#[cfg(feature = "fuse")]
+pub use fuse::CortexMount;
+#[cfg(feature = "fuse-t")]
+pub use fuse_t::FuseTMount;
+// Re-exported so a caller can name mount options without taking a direct
+// dependency on `fuser`, which is our implementation detail.
+#[cfg(feature = "fuse")]
+pub use fuser::MountOption;

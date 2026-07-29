@@ -1,4 +1,5 @@
 mod error;
+mod lock;
 mod mountable;
 mod stat;
 mod workspace;

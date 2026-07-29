@@ -1,5 +1,18 @@
-//! Boot a microVM with a cortex [`Workspace`] attached as a FUSE filesystem
-//! and, inside the guest, read the file it serves.
+//! Boot a microVM with a cortex [`Workspace`] attached as a virtio-fs share and,
+//! inside the guest, read *and write* the files it serves.
+//!
+//! # macOS: the binary must be codesigned
+//!
+//! Creating a VM needs the `com.apple.security.hypervisor` entitlement, so a
+//! plain `cargo run` fails with `VmSetup(VmCreate)` before the guest starts.
+//! Relinking drops the signature, so re-sign after every build:
+//!
+//! ```sh
+//! cargo build --bin apply_krun --features krun
+//! codesign --entitlements contrib/hypervisor.entitlements --force -s - \
+//!     target/debug/apply_krun
+//! ./target/debug/apply_krun
+//! ```
 //!
 //! This is a binary rather than a test on purpose: on guest shutdown libkrun
 //! calls `_exit()`, which tears down the whole process. That is exactly what
@@ -15,14 +28,15 @@
 //! CORTEX_TEST_KERNEL=/some/libkrunfw.dylib apply_krun
 //! ```
 //!
-//! On success the guest runs `mount -t virtiofs cortex /mnt && cat /mnt/hello.txt`,
-//! so you should see `Hello from cortex!` on stdout before the process exits
-//! with the guest's exit code.
+//! The guest mounts the share, reads it, writes to it, remounts to discard its
+//! page cache, and reads back — see [`GUEST_SCRIPT`]. The remount is what makes it
+//! a real check: without it `cat` after `echo >` prints the right bytes from the
+//! guest's own cache even if none reached the backend.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cortex::{FileExt, InMemVolume, PosixAdapter, Workspace};
+use cortex::{FileExt, InMemVolume, Mountable, OpenOptions, PosixFs, Workspace};
 use msb_krun::VmBuilder;
 
 /// What the guest reads out of `/mnt/hello.txt`.
@@ -148,8 +162,14 @@ fn resolve_kernel() -> PathBuf {
 /// both resolve; the file itself lives at `hello.txt` under that mount.
 fn build_workspace() -> Workspace {
     let vol = InMemVolume::new();
-    let file = vol
-        .create(Path::new("hello.txt"))
+    let (file, _) = vol
+        .open(
+            Path::new("hello.txt"),
+            OpenOptions {
+                create_new: true,
+                ..OpenOptions::read_write()
+            },
+        )
         .expect("fresh volume: root exists and hello.txt is free");
     file.write_all_at(FILE_CONTENT, 0)
         .expect("in-memory positioned write is infallible");
@@ -159,15 +179,40 @@ fn build_workspace() -> Workspace {
         .expect("the empty mount path never escapes the workspace root")
 }
 
-/// Boot a microVM with a cortex [`Workspace`] served as a virtio-fs share,
-/// tagged `cortex`. Inside the guest:
+/// What the guest runs: read, write, then read back *across a remount*.
 ///
-/// ```text
-/// mount -t virtiofs cortex /mnt && cat /mnt/hello.txt
-/// ```
+/// One line on purpose — these args become the guest's kernel command line, which
+/// `msb_krun` rejects a newline in as `InvalidAscii`. That rules out `#` comments
+/// too, so the explanation lives here:
+///
+/// * `echo replaced > hello.txt` writes 9 bytes over 19. A tail left behind means
+///   `O_TRUNC` was dropped, which with `ATOMIC_O_TRUNC` negotiated is silent.
+/// * `truncate -s 7` is an explicit `ftruncate`, so it arrives as `setattr` — the
+///   other resize path.
+/// * `rm -r` is what the kernel decomposes into `readdir` + `unlink` + `rmdir`;
+///   there is no recursive-delete request for a filesystem to answer.
+const GUEST_SCRIPT: &str = concat!(
+    "set -e; mount -t virtiofs cortex /mnt;",
+    " echo '--- read ---'; cat /mnt/hello.txt;",
+    " echo '--- write ---';",
+    " echo 'written in the guest' > /mnt/new.txt;",
+    " truncate -s 7 /mnt/new.txt;",
+    " mkdir /mnt/made; echo nested > /mnt/made/inner.txt;",
+    " echo replaced > /mnt/hello.txt;",
+    " echo '--- remount, dropping the guest page cache ---';",
+    " sync; umount /mnt; mount -t virtiofs cortex /mnt;",
+    " echo '--- read back, so these bytes came from the backend ---';",
+    " cat /mnt/hello.txt; cat /mnt/new.txt; cat /mnt/made/inner.txt;",
+    " ls -l /mnt; df -h /mnt | tail -1;",
+    " echo '--- rm -r ---'; rm -r /mnt/made; rm /mnt/new.txt; ls -l /mnt;",
+    " echo '--- done ---'",
+);
+
+/// Boot a microVM with a cortex [`Workspace`] served as a virtio-fs share,
+/// tagged `cortex`, and run [`GUEST_SCRIPT`] inside it.
 ///
 /// [`Workspace`] is a path-addressed [`Mountable`](cortex::Mountable) backend;
-/// [`PosixAdapter`] wraps it into the FUSE-shaped
+/// [`PosixFs`] wraps it into the FUSE-shaped
 /// `Box<dyn DynFileSystem + Send + Sync>` that `FsBuilder::custom` attaches to
 /// the guest — so the workspace is served straight from this process, no daemon,
 /// no host mount.
@@ -186,12 +231,9 @@ fn boot_with_workspace(
             // Mount 1: our workspace, reachable inside the guest at virtio-fs tag `cortex`.
             fs.root(rootfs.as_ref())
                 .tag("cortex")
-                .custom(Box::new(PosixAdapter::new(build_workspace())))
+                .custom(Box::new(PosixFs::new(build_workspace())))
         })
-        .exec(|e| {
-            e.path("/bin/sh")
-                .args(["-c", "mount -t virtiofs cortex /mnt && cat /mnt/hello.txt"])
-        })
+        .exec(|e| e.path("/bin/sh").args(["-c", GUEST_SCRIPT]))
         .build()?
         .enter()
 }

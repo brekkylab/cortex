@@ -1,3 +1,7 @@
 /target
 # Local microVM assets (rootfs, kernels) — large, machine-specific, not committed.
 /data
+
+.claude
+.omc
+.remember

@@ -13,7 +13,9 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{CortexError, Dirent, DynMountable, FileHandle, Mountable, Result, Stat};
+use crate::{
+    CortexError, Dirent, DynMountable, FileHandle, Mountable, OpenOptions, Result, Stat,
+};
 
 /// A longest-prefix mount table over heterogeneous backends.
 pub struct Workspace {
@@ -140,9 +142,14 @@ impl Mountable for Workspace {
         backend.unlink(&sub)
     }
 
-    fn open(&self, path: &Path) -> Result<Self::Handle> {
+    fn rmdir(&self, path: &Path) -> Result<()> {
         let (backend, sub) = self.resolve(path)?;
-        backend.open(&sub)
+        backend.rmdir(&sub)
+    }
+
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+        let (backend, sub) = self.resolve(path)?;
+        backend.open(&sub, options)
     }
 }
 
@@ -187,13 +194,13 @@ mod tests {
             Mountable::stat(&ws, Path::new("top.txt")).unwrap().kind,
             DirentKind::File
         );
-        let h = Mountable::open(&ws, Path::new("top.txt")).unwrap();
+        let (h, _) = Mountable::open(&ws, Path::new("top.txt"), OpenOptions::read_only()).unwrap();
         let mut buf = [0u8; 4];
         h.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"root");
 
         // `data/inner.txt` is routed to the deeper mount, re-based to `inner.txt`.
-        let h = Mountable::open(&ws, Path::new("data/inner.txt")).unwrap();
+        let (h, _) = Mountable::open(&ws, Path::new("data/inner.txt"), OpenOptions::read_only()).unwrap();
         let mut buf = [0u8; 5];
         h.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(&buf, b"inner");

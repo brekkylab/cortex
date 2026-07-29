@@ -1,0 +1,16 @@
+# Shim so fuser's macOS branch (which probes for `fuse` >= 2.6.0, the name
+# macFUSE installs) resolves against FUSE-T, which ships `fuse-t.pc` instead.
+# libfuse-t exports the libfuse2 mount ABI fuser links (`fuse_mount_compat25`,
+# `fuse_unmount_compat22`), so the only mismatch is the .pc name and version:
+# 1.2.7 is FUSE-T's product version, while 2.9.9 is the libfuse2 API level it
+# implements — which is what the probe is actually asking about.
+prefix=/usr/local
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include/fuse
+
+Name: fuse
+Description: FUSE-T presented under the libfuse2 name fuser probes for
+Version: 2.9.9
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lfuse-t
+Cflags: -I${includedir}
