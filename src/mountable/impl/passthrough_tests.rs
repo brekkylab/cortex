@@ -1,19 +1,6 @@
 use super::*;
+use crate::test_support::scratch;
 use crate::{FileExt, FileHandle};
-
-/// Create a unique scratch directory under the system temp dir without
-/// pulling in extra crates.
-fn scratch(tag: &str) -> PathBuf {
-    let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "cortex-passthrough-test-{}-{}",
-        std::process::id(),
-        tag
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
 
 fn names(vol: &dyn Mountable<Handle = fs::File>, path: &str) -> Vec<String> {
     let mut names: Vec<_> = vol
@@ -28,7 +15,7 @@ fn names(vol: &dyn Mountable<Handle = fs::File>, path: &str) -> Vec<String> {
 
 #[test]
 fn stat_open_read_write() {
-    let base = scratch("rwlu");
+    let base = scratch("passthrough", "rwlu");
     let vol = PassthroughVolume::new(&base);
 
     vol.mkdir(Path::new("sub")).unwrap();
@@ -39,7 +26,6 @@ fn stat_open_read_write() {
     assert_eq!(st.size, 5);
     assert_eq!(vol.stat(Path::new("sub")).unwrap().kind, DirentKind::Dir);
 
-    // Positioned read through the open handle.
     let (handle, _) = vol
         .open(Path::new("hello.txt"), OpenOptions::read_write())
         .unwrap();
@@ -47,7 +33,7 @@ fn stat_open_read_write() {
     handle.read_exact_at(&mut buf, 0).unwrap();
     assert_eq!(&buf, b"world");
 
-    // Positioned write, then truncate, both observable on disk.
+    // Both observable on disk.
     handle.write_all_at(b"HELLO", 0).unwrap();
     handle.truncate(3).unwrap();
     assert_eq!(fs::read(base.join("hello.txt")).unwrap(), b"HEL");
@@ -65,7 +51,7 @@ fn stat_open_read_write() {
 
 #[test]
 fn a_listing_reports_kinds_but_not_metadata() {
-    let base = scratch("listing");
+    let base = scratch("passthrough", "listing");
     let vol = PassthroughVolume::new(&base);
     vol.mkdir(Path::new("sub")).unwrap();
     fs::write(base.join("f"), b"12345").unwrap();
@@ -74,15 +60,12 @@ fn a_listing_reports_kinds_but_not_metadata() {
     let dir = entries.iter().find(|e| e.name == "sub").unwrap();
     let file = entries.iter().find(|e| e.name == "f").unwrap();
 
-    // The kind rides along in the directory entry itself (`d_type`), so it
-    // is free and always reported.
+    // The kind rides along in `d_type`, so it is free and always reported.
     assert_eq!(dir.kind, DirentKind::Dir);
     assert_eq!(file.kind, DirentKind::File);
 
-    // The size is not: it would be an `lstat` per entry, which a plain `ls`
-    // never asked for. A local listing therefore reports no metadata, and a
-    // caller that wants it asks per entry — the opposite of an object store,
-    // where the listing already contains it.
+    // The size is not: that is an `lstat` per entry, which `ls` never asked for.
+    // The opposite of an object store, whose listing already carries it.
     assert!(dir.stat.is_none());
     assert!(file.stat.is_none());
     assert_eq!(vol.stat(Path::new("f")).unwrap().size, 5);
@@ -92,19 +75,18 @@ fn a_listing_reports_kinds_but_not_metadata() {
 
 #[test]
 fn rename_defers_the_overwrite_contract_to_the_platform() {
-    let base = scratch("rename");
+    let base = scratch("passthrough", "rename");
     let vol = PassthroughVolume::new(&base);
     fs::write(base.join("a"), b"payload").unwrap();
     fs::create_dir(base.join("d")).unwrap();
     fs::create_dir(base.join("busy")).unwrap();
     fs::write(base.join("busy/occupied"), b"x").unwrap();
 
-    // Moves, and the bytes come along.
     vol.rename(Path::new("a"), Path::new("b")).unwrap();
     assert_eq!(fs::read_to_string(base.join("b")).unwrap(), "payload");
     assert!(!base.join("a").exists());
 
-    // The mismatched pairs, which arrive already classified.
+    // The mismatched pairs arrive already classified.
     assert!(matches!(
         vol.rename(Path::new("b"), Path::new("d")),
         Err(CortexError::IsADirectory)
@@ -125,7 +107,7 @@ fn rename_defers_the_overwrite_contract_to_the_platform() {
         vol.rename(Path::new("nope"), Path::new("x")),
         Err(CortexError::NotFound)
     ));
-    // A path that leaves the volume is refused before the OS is asked.
+    // Refused before the OS is asked.
     assert!(matches!(
         vol.rename(Path::new("b"), Path::new("../escape")),
         Err(CortexError::InvalidName)
@@ -136,7 +118,7 @@ fn rename_defers_the_overwrite_contract_to_the_platform() {
 
 #[test]
 fn unlink_takes_files_and_rmdir_takes_empty_directories() {
-    let base = scratch("removal");
+    let base = scratch("passthrough", "removal");
     let vol = PassthroughVolume::new(&base);
     vol.mkdir(Path::new("dir")).unwrap();
     fs::write(base.join("dir/child"), b"x").unwrap();
@@ -150,8 +132,8 @@ fn unlink_takes_files_and_rmdir_takes_empty_directories() {
         vol.rmdir(Path::new("file")),
         Err(CortexError::NotADirectory)
     ));
-    // The old implementation reached for `remove_dir_all` here, which would
-    // have taken `child` with it. Nothing on disk may disappear.
+    // An earlier implementation reached for `remove_dir_all` here, taking `child`
+    // with it.
     assert!(matches!(
         vol.rmdir(Path::new("dir")),
         Err(CortexError::NotEmpty)
@@ -170,9 +152,11 @@ fn unlink_takes_files_and_rmdir_takes_empty_directories() {
     fs::remove_dir_all(&base).unwrap();
 }
 
+/// The three flavours it has to tell apart: a kind mismatch, a path that leaves
+/// the root, and a root that is not there.
 #[test]
-fn kind_errors() {
-    let base = scratch("kind");
+fn the_volume_refuses_what_it_cannot_serve() {
+    let base = scratch("passthrough", "refuse");
     let vol = PassthroughVolume::new(&base);
     vol.mkdir(Path::new("dir")).unwrap();
     fs::write(base.join("file"), b"x").unwrap();
@@ -189,14 +173,7 @@ fn kind_errors() {
         vol.mkdir(Path::new("file")),
         Err(CortexError::AlreadyExists)
     ));
-
-    fs::remove_dir_all(&base).unwrap();
-}
-
-#[test]
-fn escapes_and_missing_root_rejected() {
-    let base = scratch("escape");
-    let vol = PassthroughVolume::new(&base);
+    // A *name* error, not whatever lies outside the root.
     assert!(matches!(
         vol.open(Path::new("../secret"), OpenOptions::read_write()),
         Err(CortexError::InvalidName)
@@ -204,7 +181,7 @@ fn escapes_and_missing_root_rejected() {
     fs::remove_dir_all(&base).unwrap();
 
     // `new` doesn't touch disk, so a missing root only surfaces on use.
-    let missing = scratch("missing");
+    let missing = scratch("passthrough", "missing");
     fs::remove_dir_all(&missing).unwrap();
     let vol = PassthroughVolume::new(&missing);
     assert!(matches!(

@@ -75,10 +75,7 @@ fn volume() -> InMemVolume {
     let (file, _) = vol
         .open(
             std::path::Path::new("greeting.txt"),
-            OpenOptions {
-                create_new: true,
-                ..OpenOptions::read_write()
-            },
+            OpenOptions::create_new(),
         )
         .unwrap();
     cortex::FileExt::write_all_at(&file, b"Hello from cortex!\n", 0).unwrap();

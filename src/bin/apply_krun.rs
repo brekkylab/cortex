@@ -163,13 +163,7 @@ fn resolve_kernel() -> PathBuf {
 fn build_workspace() -> Workspace {
     let vol = InMemVolume::new();
     let (file, _) = vol
-        .open(
-            Path::new("hello.txt"),
-            OpenOptions {
-                create_new: true,
-                ..OpenOptions::read_write()
-            },
-        )
+        .open(Path::new("hello.txt"), OpenOptions::create_new())
         .expect("fresh volume: root exists and hello.txt is free");
     file.write_all_at(FILE_CONTENT, 0)
         .expect("in-memory positioned write is infallible");

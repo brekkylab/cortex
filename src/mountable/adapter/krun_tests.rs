@@ -1,15 +1,9 @@
-//! Baseline for the shared-operation migration.
+//! The krun binding, driven with no VM and no mount — `DynFileSystem` returns
+//! `io::Result`, so nothing here needs a guest.
 //!
-//! `DynFileSystem` returns `io::Result`, so the binding can be driven here
-//! with no VM and no mount — unlike the `fuser` side, whose reply objects
-//! cannot be built outside that crate. These tests pin the behaviour that
-//! must survive being rewritten on top of `PosixFs`'s shared operations:
-//! which inode a name resolves to, what the guest reads back, and which
-//! Linux errno a failure carries.
-//!
-//! Attribute *values* are pinned in `posix.rs`, where the shared policy lives.
-//! What is pinned here is the projection onto the guest's `stat64` — that the
-//! numbers reach the right fields, including those once left zeroed.
+//! Attribute *values* belong to the shared policy in `posix.rs`. What is pinned
+//! here is the projection onto the guest's `stat64` and the Linux errno numbering,
+//! neither of which the host bindings share.
 
 use super::*;
 // Named explicitly: `msb_krun::backends::fs::OpenOptions` is a different
@@ -24,9 +18,8 @@ use std::path::Path;
 const CONTENT: &[u8] = b"Hello from cortex!\n";
 const ROOT: u64 = 1;
 
-/// Collects what the filesystem hands back, standing in for the guest's
-/// descriptor. `ZeroCopyWriter` copies out of a file descriptor rather than
-/// a slice, which is why the binding stages reads through a temp file.
+/// Stands in for the guest's descriptor. `ZeroCopyWriter` copies out of an fd,
+/// not a slice, which is why the binding stages reads through a temp file.
 struct Collected(Vec<u8>);
 
 impl ZeroCopyWriter for Collected {
@@ -50,24 +43,15 @@ fn ctx() -> Context {
 fn fs() -> PosixFs<InMemVolume> {
     let vol = InMemVolume::new();
     let (file, _) = vol
-        .open(
-            Path::new("greeting.txt"),
-            OpenOptions {
-                create_new: true,
-                ..OpenOptions::read_write()
-            },
-        )
+        .open(Path::new("greeting.txt"), OpenOptions::create_new())
         .unwrap();
     file.write_all_at(CONTENT, 0).unwrap();
     vol.mkdir(Path::new("sub")).unwrap();
     PosixFs::new(vol)
 }
 
-/// The errno behind a call that must fail, for asserting against the Linux
-/// numbers the guest kernel expects (which are not the host's).
-///
-/// Matches rather than using `unwrap_err`, which would need `Entry` and
-/// `stat64` to implement `Debug`; neither does.
+/// Matches rather than using `unwrap_err`, which would need `Debug` on `Entry`
+/// and `stat64`; neither has it.
 fn expect_errno<T>(result: std::io::Result<T>) -> i32 {
     match result {
         Ok(_) => panic!("expected this call to fail"),
@@ -96,7 +80,7 @@ impl msb_krun::backends::fs::ZeroCopyReader for Supplied {
 fn the_guest_can_create_write_and_read_back() {
     let fs = fs();
 
-    // CREATE: one reply carrying entry, handle, and attributes.
+    // One reply carrying entry, handle, and attributes.
     let (entry, handle, _) = fs
         .create(
             ctx(),
@@ -112,8 +96,7 @@ fn the_guest_can_create_write_and_read_back() {
     let handle = handle.expect("create hands back a file handle");
     assert_eq!(entry.attr.st_size, 0);
 
-    // WRITE through the ZeroCopy path: the guest delivers via a file
-    // descriptor, not a slice, which is why this binding stages.
+    // Through the ZeroCopy path, which is why this binding stages.
     let mut source = Supplied(b"written".to_vec());
     let n = fs
         .write(
@@ -131,17 +114,15 @@ fn the_guest_can_create_write_and_read_back() {
         .unwrap();
     assert_eq!(n, 7);
 
-    // The new size is visible through the same inode.
     let (attr, _) = fs.getattr(ctx(), entry.inode, Some(handle)).unwrap();
     assert_eq!(attr.st_size, 7);
 
-    // And the bytes read back.
     let mut sink = Collected(Vec::new());
     fs.read(ctx(), entry.inode, handle, &mut sink, 7, 0, None, 0)
         .unwrap();
     assert_eq!(sink.0, b"written");
 
-    // The name resolves to the same inode a `lookup` would give.
+    // The name resolves to the inode CREATE handed out.
     assert_eq!(
         fs.lookup(ctx(), ROOT, c"fresh.txt").unwrap().inode,
         entry.inode
@@ -166,8 +147,7 @@ fn the_guest_can_make_and_remove_directories() {
         .unwrap();
     assert_eq!(dir.attr.st_nlink as u32, 2);
 
-    // A file inside blocks removal and `unlink` refuses the directory, so the
-    // guest has to decompose `rm -rf` itself.
+    // The guest has to decompose `rm -rf` itself.
     let (child, child_fh, _) = fs
         .create(
             ctx(),
@@ -193,35 +173,22 @@ fn the_guest_can_make_and_remove_directories() {
     assert_eq!(expect_errno(fs.lookup(ctx(), ROOT, c"made")), LINUX_ENOENT);
 }
 
-#[test]
-fn an_explicit_ftruncate_arrives_as_setattr() {
-    use msb_krun::backends::fs::SetattrValid;
-    let fs = fs();
-    let entry = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
-
-    // `O_TRUNC` rides the open, but an explicit `ftruncate` still comes
-    // through here — why `setattr` cannot stay ENOSYS.
-    let mut want: stat64 = unsafe { std::mem::zeroed() };
-    want.st_size = 5;
-    let (attr, _) = fs
-        .setattr(ctx(), entry.inode, want, None, SetattrValid::SIZE)
-        .unwrap();
-    assert_eq!(attr.st_size, 5);
-}
-
+/// Every field the guest reads, from both entry points that fill it — the values
+/// themselves belong to `posix.rs`.
 #[test]
 fn the_guest_stat64_carries_the_whole_shared_policy() {
     let fs = fs();
     let dir = fs.lookup(ctx(), ROOT, c"sub").unwrap();
     let file = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
 
-    // A directory's link count is 2 (`.` and `..`).
+    // The full mode is pinned, so the type bits need no separate mask.
     assert_eq!(dir.attr.st_nlink as u32, 2);
     assert_eq!(dir.attr.st_mode as u32, 0o040000 | 0o755);
     assert_eq!(file.attr.st_nlink as u32, 1);
     assert_eq!(file.attr.st_mode as u32, 0o100000 | 0o644);
+    assert_eq!(file.attr.st_size as usize, CONTENT.len());
 
-    // Block accounting, which `du` and friends read.
+    // Block accounting, which `du` reads.
     assert_eq!(file.attr.st_blksize as u64, BLOCK_SIZE);
     assert_eq!(
         file.attr.st_blocks as u64,
@@ -232,10 +199,23 @@ fn the_guest_stat64_carries_the_whole_shared_policy() {
     // deliberately do not share.
     assert_eq!(file.attr.st_uid, 0);
     assert_eq!(file.attr.st_gid, 0);
+
+    // The guest dedups by `st_ino`, so a zero there collapses every entry to one.
+    assert_eq!(file.attr.st_ino as u64, file.inode);
+    assert_ne!(dir.inode, file.inode);
+
+    // The guest compares what it cached from LOOKUP against GETATTR.
+    let (attr, _ttl) = fs.getattr(ctx(), file.inode, None).unwrap();
+    assert_eq!(
+        (attr.st_ino, attr.st_size, attr.st_mode),
+        (file.attr.st_ino, file.attr.st_size, file.attr.st_mode)
+    );
 }
 
+/// Every route by which a guest asks for an access mode or a size change.
 #[test]
-fn open_honours_the_guests_truncate_flag() {
+fn the_guests_flag_words_reach_the_right_options() {
+    use msb_krun::backends::fs::SetattrValid;
     let fs = fs();
     let entry = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
 
@@ -244,60 +224,28 @@ fn open_honours_the_guests_truncate_flag() {
     let (attr, _) = fs.getattr(ctx(), entry.inode, handle).unwrap();
     assert_eq!(attr.st_size as u64, CONTENT.len() as u64);
 
-    // With `O_TRUNC` it must be empty by the time the handle exists.
-    //
-    // Sent on the *open*, not as a separate `setattr`: the server's enabled
-    // set is a union with its own `supported`, so `init` cannot turn
-    // `ATOMIC_O_TRUNC` off. Dropping the flag would let `echo >` keep the old
-    // tail with no error anywhere.
+    // Empty by the time the handle exists. Arrives on the *open* because the
+    // server's enabled set is a union with its `supported`, so `init` cannot turn
+    // `ATOMIC_O_TRUNC` off — and dropping it leaves `echo >` with the old tail.
     let (handle, _) = fs
         .open(ctx(), entry.inode, false, GUEST_O_WRONLY | GUEST_O_TRUNC)
         .unwrap();
     let (attr, _) = fs.getattr(ctx(), entry.inode, handle).unwrap();
     assert_eq!(attr.st_size, 0);
-}
 
-#[test]
-fn an_impossible_access_mode_is_rejected() {
-    let fs = fs();
-    let entry = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
-    // `O_ACCMODE` is a two-bit field and 3 is not a valid value in it. This
-    // is the case a `flags & O_WRONLY` test would wave through.
+    // `O_ACCMODE` is a two-bit field and 3 is not a value in it.
     assert_eq!(
         expect_errno(fs.open(ctx(), entry.inode, false, 3)),
         LINUX_EINVAL
     );
-}
 
-#[test]
-fn lookup_reports_size_and_kind() {
-    let fs = fs();
-
-    let file = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
-    assert_eq!(file.attr.st_size as usize, CONTENT.len());
-    assert_eq!(
-        file.attr.st_mode as u32 & libc::S_IFREG as u32,
-        libc::S_IFREG as u32
-    );
-    assert_eq!(file.attr.st_ino as u64, file.inode);
-
-    let dir = fs.lookup(ctx(), ROOT, c"sub").unwrap();
-    assert_eq!(
-        dir.attr.st_mode as u32 & libc::S_IFDIR as u32,
-        libc::S_IFDIR as u32
-    );
-    assert_ne!(dir.inode, file.inode);
-}
-
-#[test]
-fn getattr_matches_lookup() {
-    let fs = fs();
-    let entry = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
-
-    let (attr, _ttl) = fs.getattr(ctx(), entry.inode, None).unwrap();
-    assert_eq!(attr.st_ino, entry.attr.st_ino);
-    assert_eq!(attr.st_size, entry.attr.st_size);
-    assert_eq!(attr.st_mode, entry.attr.st_mode);
+    // An explicit `ftruncate` still arrives as SETATTR — why it cannot stay ENOSYS.
+    let mut want: stat64 = unsafe { std::mem::zeroed() };
+    want.st_size = 5;
+    let (attr, _) = fs
+        .setattr(ctx(), entry.inode, want, None, SetattrValid::SIZE)
+        .unwrap();
+    assert_eq!(attr.st_size, 5);
 }
 
 #[test]
@@ -323,8 +271,7 @@ fn read_returns_the_stored_bytes() {
     assert_eq!(n, CONTENT.len());
     assert_eq!(out.0, CONTENT);
 
-    // A window past the end is a short read, which is how the guest learns
-    // where the file stops.
+    // Short past the end, which is how the guest finds the end.
     let mut tail = Collected(Vec::new());
     let n = fs
         .read(
@@ -341,7 +288,7 @@ fn read_returns_the_stored_bytes() {
     assert_eq!(n, 0);
     assert!(tail.0.is_empty());
 
-    // Offsets address bytes, not blocks.
+    // Bytes, not blocks.
     let mut mid = Collected(Vec::new());
     fs.read(ctx(), entry.inode, handle, &mut mid, 4, 6, None, 0)
         .unwrap();
@@ -352,7 +299,7 @@ fn read_returns_the_stored_bytes() {
 }
 
 #[test]
-fn readdir_streams_dots_then_children() {
+fn readdir_streams_dots_then_children_and_resumes_from_the_quoted_offset() {
     let fs = fs();
     let mut seen: Vec<(String, u32, u64, u64)> = Vec::new();
     let mut collect = |e: DirEntry<'_>| -> std::io::Result<usize> {
@@ -367,8 +314,7 @@ fn readdir_streams_dots_then_children() {
     fs.readdir_for_each(ctx(), ROOT, 0, 4096, 0, &mut collect)
         .unwrap();
 
-    // `.` and `..` lead, both pointing back at this directory, and offsets
-    // are 1-based so `0` can keep meaning "from the beginning".
+    // Dots lead, and offsets are 1-based so `0` still means "from the beginning".
     assert_eq!(seen[0], (".".to_string(), libc::DT_DIR as u32, 1, ROOT));
     assert_eq!(seen[1], ("..".to_string(), libc::DT_DIR as u32, 2, ROOT));
 
@@ -379,49 +325,50 @@ fn readdir_streams_dots_then_children() {
     assert_eq!(names["greeting.txt"].0, libc::DT_REG as u32);
     assert_eq!(names["sub"].0, libc::DT_DIR as u32);
 
-    // A number readdir hands out must be the one a later lookup confirms,
-    // or the guest would see two inodes for one file.
+    // readdir's number is the one lookup confirms.
     let looked_up = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
     assert_eq!(names["greeting.txt"].1, looked_up.inode);
-}
 
-#[test]
-fn readdir_resumes_from_the_quoted_offset() {
-    let fs = fs();
-    let mut seen = Vec::new();
+    // The guest resumes by quoting the last offset, so 2 skips both dots.
+    let mut resumed = Vec::new();
     let mut collect = |e: DirEntry<'_>| -> std::io::Result<usize> {
-        seen.push(String::from_utf8_lossy(e.name).into_owned());
+        resumed.push(String::from_utf8_lossy(e.name).into_owned());
         Ok(1)
     };
-    // Offset 2 means the kernel already consumed `.` and `..`.
     fs.readdir_for_each(ctx(), ROOT, 0, 4096, 2, &mut collect)
         .unwrap();
-    assert!(!seen.contains(&".".to_string()));
-    assert!(!seen.contains(&"..".to_string()));
-    assert_eq!(seen.len(), 2);
+    // Sorted: the backend's listing order is a `HashMap` iteration.
+    resumed.sort();
+    assert_eq!(resumed, ["greeting.txt", "sub"]);
 }
 
 #[test]
 fn failures_carry_linux_errno() {
     let fs = fs();
 
-    // The guest kernel is always Linux, so these numbers are Linux's even
-    // when the host's differ.
+    // The guest is always Linux, so these are Linux's numbers, not the host's.
     assert_eq!(expect_errno(fs.lookup(ctx(), ROOT, c"nope")), LINUX_ENOENT);
     assert_eq!(expect_errno(fs.getattr(ctx(), 9999, None)), LINUX_ENOENT);
 
     let mut sink = Collected(Vec::new());
     let closed = fs.read(ctx(), ROOT, 4242, &mut sink, 16, 0, None, 0);
     assert_eq!(expect_errno(closed), LINUX_EBADF);
+
+    // A forgotten inode joins them: after FORGET this must answer as it would for
+    // a number it never issued.
+    let entry = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
+    assert!(fs.getattr(ctx(), entry.inode, None).is_ok());
+    fs.forget(ctx(), entry.inode, 1);
+    assert_eq!(
+        expect_errno(fs.getattr(ctx(), entry.inode, None)),
+        LINUX_ENOENT
+    );
 }
 
 #[test]
 fn every_backend_error_has_its_own_linux_errno() {
-    // Drift in an errno table is silent — a wrong number is still a valid
-    // number — so every variant is pinned. Adding one to `CortexError` makes
-    // this match fail to compile, so never add a `_` arm. And nothing but `Io`
-    // may land on EIO: a guest cannot tell "disk full" from "denied" from a
-    // real fault.
+    // Drift is silent — a wrong number is still a valid number. Never add a `_`
+    // arm: the exhaustive match is what forces a choice for a new variant.
     for (err, expected) in [
         (CortexError::NotFound, LINUX_ENOENT),
         (CortexError::NotADirectory, LINUX_ENOTDIR),
@@ -440,17 +387,4 @@ fn every_backend_error_has_its_own_linux_errno() {
     ] {
         assert_eq!(to_errno(err).raw_os_error(), Some(expected));
     }
-}
-
-#[test]
-fn forget_releases_the_inode() {
-    let fs = fs();
-    let entry = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
-    assert!(fs.getattr(ctx(), entry.inode, None).is_ok());
-
-    fs.forget(ctx(), entry.inode, 1);
-    assert_eq!(
-        expect_errno(fs.getattr(ctx(), entry.inode, None)),
-        LINUX_ENOENT
-    );
 }

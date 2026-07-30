@@ -1,9 +1,9 @@
 use super::*;
+use crate::test_support::scratch;
 use crate::{FileExt, InMemVolume, PassthroughVolume};
 use std::fs;
 
-/// A workspace whose mount table is all this test cares about. The backends
-/// are never consulted, so the cheapest one will do.
+/// Only the mount table matters here, so the cheapest backend will do.
 fn table(paths: &[&str]) -> Workspace {
     paths.iter().fold(Workspace::new(), |ws, p| {
         ws.try_with_mount(p, InMemVolume::new()).unwrap()
@@ -14,8 +14,11 @@ fn children_of(ws: &Workspace, at: &str) -> Vec<(String, bool)> {
     ws.mount_children(Path::new(at)).into_iter().collect()
 }
 
+/// Both mount-table queries share one range, so one invariant: `Excluded`, hence
+/// strict descendants only. An `Included` bound would paper over a backend that
+/// answers `NotFound` at its own root with a fabricated directory.
 #[test]
-fn mount_children_yields_the_next_component_and_flags_exact_mounts() {
+fn the_mount_table_sees_only_strict_descendants() {
     let ws = table(&["a/b/c", "a/x", "z"]);
 
     assert_eq!(
@@ -28,27 +31,22 @@ fn mount_children_yields_the_next_component_and_flags_exact_mounts() {
         [("b".into(), false), ("x".into(), true)]
     );
     assert_eq!(children_of(&ws, "a/b"), [("c".into(), true)]);
-    assert!(
-        children_of(&ws, "z").is_empty(),
-        "a mount is not its own child"
-    );
-    assert!(children_of(&ws, "q").is_empty());
-}
-
-#[test]
-fn spans_mounts_counts_only_strict_descendants() {
-    let ws = table(&["a/b/c", "a/x", "z"]);
-
     assert!(ws.spans_mounts(Path::new("")));
     assert!(ws.spans_mounts(Path::new("a")));
     assert!(ws.spans_mounts(Path::new("a/b")));
 
-    // The bound is `Excluded`, so a mount does not span itself. Were it
-    // `Included`, a backend that answered `NotFound` at its own root would be
-    // papered over with a fabricated directory.
-    assert!(!ws.spans_mounts(Path::new("z")));
-    assert!(!ws.spans_mounts(Path::new("a/x")));
-    assert!(!ws.spans_mounts(Path::new("a/b/c")));
+    for exact in ["z", "a/x", "a/b/c"] {
+        assert!(
+            children_of(&ws, exact).is_empty(),
+            "{exact} is not its own child"
+        );
+        assert!(
+            !ws.spans_mounts(Path::new(exact)),
+            "{exact} does not span itself"
+        );
+    }
+    // A path the table knows nothing about answers for neither.
+    assert!(children_of(&ws, "q").is_empty());
     assert!(!ws.spans_mounts(Path::new("q")));
 }
 
@@ -59,9 +57,9 @@ fn a_rootless_workspace_has_a_root_directory() {
     assert_eq!(
         Mountable::stat(&ws, Path::new("")).unwrap().kind,
         DirentKind::Dir,
-        "the directory holding the mounts has to exist, or nothing can be mounted"
+        "without it nothing can be mounted at all"
     );
-    // A mount point itself is still answered by its backend.
+    // A mount point itself is still its backend's answer.
     assert_eq!(
         Mountable::stat(&ws, Path::new("notion")).unwrap().kind,
         DirentKind::Dir
@@ -73,17 +71,25 @@ fn a_rootless_workspace_has_a_root_directory() {
     ));
 }
 
+/// Both ladders at once, because the two have to agree at every rung: a step that
+/// stats as a directory but lists nothing is a path `cd` enters and `ls` empties.
 #[test]
-fn every_ancestor_of_a_deep_mount_is_a_directory() {
+fn every_step_toward_a_deep_mount_is_a_directory_listing_the_next_one() {
     let ws = table(&["a/b/c"]);
 
-    for on_the_way in ["", "a", "a/b"] {
+    for (on_the_way, next) in [("", "a"), ("a", "b"), ("a/b", "c")] {
         assert_eq!(
             Mountable::stat(&ws, Path::new(on_the_way)).unwrap().kind,
             DirentKind::Dir,
             "{on_the_way:?} leads to a mount"
         );
+        assert_eq!(
+            listing(&ws, on_the_way),
+            [(next.into(), DirentKind::Dir, false)],
+            "{on_the_way:?} lists exactly the next component"
+        );
     }
+    // A sibling of a step leads nowhere.
     assert!(matches!(
         Mountable::stat(&ws, Path::new("a/x")),
         Err(CortexError::NotFound)
@@ -112,9 +118,8 @@ fn an_empty_workspace_is_an_empty_directory_not_a_missing_one() {
 
 #[test]
 fn a_backend_that_does_not_know_a_path_on_the_way_to_a_mount_is_overridden() {
-    // The case a "synthesize only when routing fails" implementation misses:
-    // routing *succeeds* here — the root backend claims `data` — and it is the
-    // backend that answers `NotFound`.
+    // What "synthesize only when routing fails" misses: routing *succeeds* — the
+    // root backend claims `data` — and the backend is what answers `NotFound`.
     let ws = Workspace::new()
         .try_with_mount("", InMemVolume::new())
         .unwrap()
@@ -136,10 +141,9 @@ fn a_backend_that_does_not_know_a_path_on_the_way_to_a_mount_is_overridden() {
 
 #[test]
 fn a_broken_root_backend_is_not_hidden_behind_a_synthesized_root() {
-    // A passthrough pointing at a directory that does not exist. Nothing lies
-    // below the root, so there is no mount table to synthesize from and the
-    // misconfiguration must surface.
-    let missing = scratch("gone");
+    // Nothing lies below the root, so there is no mount table to synthesize from
+    // and the misconfiguration has to surface.
+    let missing = scratch("workspace", "gone");
     fs::remove_dir_all(&missing).unwrap();
     let ws = Workspace::new()
         .try_with_mount("", PassthroughVolume::new(&missing))
@@ -174,20 +178,10 @@ fn a_rootless_workspace_lists_its_mount_points() {
 }
 
 #[test]
-fn each_step_toward_a_deep_mount_lists_the_next_component() {
-    let ws = table(&["a/b/c"]);
-
-    assert_eq!(listing(&ws, ""), [("a".into(), DirentKind::Dir, false)]);
-    assert_eq!(listing(&ws, "a"), [("b".into(), DirentKind::Dir, false)]);
-    assert_eq!(listing(&ws, "a/b"), [("c".into(), DirentKind::Dir, false)]);
-}
-
-#[test]
 fn a_name_merely_leading_to_a_mount_keeps_the_backends_entry() {
-    // `shared` exists in the root backend *and* leads to a mount at
-    // `shared/extra`. No mount sits at `shared` itself, so the backend keeps
-    // the name — and its entry carries real metadata the synthesized one
-    // cannot, which is the observable difference.
+    // `shared` is in the root backend *and* leads to a mount at `shared/extra`.
+    // No mount sits on it, so the backend keeps the name — and its entry carries
+    // metadata a synthesized one cannot, which is the observable difference.
     let root = InMemVolume::new();
     Mountable::mkdir(&root, Path::new("shared")).unwrap();
     let ws = Workspace::new()
@@ -201,8 +195,7 @@ fn a_name_merely_leading_to_a_mount_keeps_the_backends_entry() {
     assert_eq!(
         listing(&ws, ""),
         [
-            // Mount-derived names come first, sorted, so their positions do not
-            // move when the backend's contents churn.
+            // Mount-derived names come first, sorted.
             ("data".into(), DirentKind::Dir, false),
             ("shared".into(), DirentKind::Dir, true),
         ],
@@ -212,19 +205,10 @@ fn a_name_merely_leading_to_a_mount_keeps_the_backends_entry() {
 
 #[test]
 fn a_mount_shadows_a_backend_entry_of_the_same_name() {
-    // The topology `apply_krun` recommends: a root backend for inode 1 with
-    // other mounts on top. Here the root backend holds a *file* named `data`
-    // and a directory is mounted over it.
+    // The topology `apply_krun` recommends — a root backend with mounts on top —
+    // where the root holds a *file* named `data` and a directory lands over it.
     let root = InMemVolume::new();
-    let (file, _) = Mountable::open(
-        &root,
-        Path::new("data"),
-        OpenOptions {
-            create_new: true,
-            ..OpenOptions::read_write()
-        },
-    )
-    .unwrap();
+    let (file, _) = Mountable::open(&root, Path::new("data"), OpenOptions::create_new()).unwrap();
     drop(file);
     let ws = Workspace::new()
         .try_with_mount("", root)
@@ -259,27 +243,18 @@ fn backend_entries_that_are_not_mount_paths_come_after_the_mount_derived_ones() 
     let names: Vec<_> = listing(&ws, "").into_iter().map(|(n, ..)| n).collect();
     assert_eq!(
         names[0], "mmm",
-        "the mount holds position 1 regardless of how the backend sorts, so \
-         backend churn cannot shift it out of a readdir window"
+        "the mount holds position 1 however the backend sorts, so its churn \
+         cannot shift the mount out of a readdir window"
     );
     assert_eq!(names.len(), 3);
 }
 
 #[test]
 fn a_list_error_other_than_not_found_is_not_papered_over() {
-    // The root backend holds a *file* at `data` while `data/raw` is mounted
-    // below it. `list("data")` reaches the file and must surface ENOTDIR rather
-    // than pretending `data` is a directory it can enumerate.
+    // A *file* at `data` with `data/raw` mounted below it: `list` has to surface
+    // ENOTDIR rather than pretend `data` is a directory it can enumerate.
     let root = InMemVolume::new();
-    let (file, _) = Mountable::open(
-        &root,
-        Path::new("data"),
-        OpenOptions {
-            create_new: true,
-            ..OpenOptions::read_write()
-        },
-    )
-    .unwrap();
+    let (file, _) = Mountable::open(&root, Path::new("data"), OpenOptions::create_new()).unwrap();
     drop(file);
     let ws = Workspace::new()
         .try_with_mount("", root)
@@ -291,9 +266,9 @@ fn a_list_error_other_than_not_found_is_not_papered_over() {
         Mountable::list(&ws, Path::new("data")),
         Err(CortexError::NotADirectory)
     ));
-    // The asymmetry this leaves is deliberate and recorded: `stat` answers
-    // `File` while `list` answers ENOTDIR, so the mount below is unreachable.
-    // A workspace configured this way is misconfigured, and it says so.
+    // The asymmetry is deliberate: `stat` says `File`, `list` says ENOTDIR, and
+    // the mount below is unreachable. Such a workspace is misconfigured and
+    // says so rather than papering over it.
     assert_eq!(
         Mountable::stat(&ws, Path::new("data")).unwrap().kind,
         DirentKind::File
@@ -304,12 +279,9 @@ fn a_list_error_other_than_not_found_is_not_papered_over() {
     );
 }
 
-/// What the root backend holds at `holder`, in a workspace with a mount at
-/// `holder/inner`.
-///
-/// Each variant is chosen so the *backend* would answer the mutation with `Ok`
-/// if it were asked — which is what makes checking the mount table first
-/// load-bearing rather than decorative.
+/// What the root backend holds at `holder`, with a mount at `holder/inner`.
+/// Every variant is one the backend would answer `Ok` to — which is what makes
+/// checking the mount table first load-bearing rather than decorative.
 enum Holder {
     /// An empty directory: `rmdir` would succeed on it.
     EmptyDir,
@@ -324,15 +296,7 @@ fn shadowing_backend(holder: Holder) -> Workspace {
     match holder {
         Holder::EmptyDir => Mountable::mkdir(&root, Path::new("holder")).unwrap(),
         Holder::File => {
-            Mountable::open(
-                &root,
-                Path::new("holder"),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                },
-            )
-            .unwrap();
+            Mountable::open(&root, Path::new("holder"), OpenOptions::create_new()).unwrap();
         }
         Holder::Absent => {}
     }
@@ -344,9 +308,8 @@ fn shadowing_backend(holder: Holder) -> Workspace {
 }
 
 /// Four mutations aimed at a directory that exists only because a mount lies
-/// below it. Each is refused *before* the backend is consulted, and each row's
-/// backend would otherwise have answered `Ok` — so without the pre-flight check
-/// every one of these detaches the mount.
+/// below it. Every row's backend would answer `Ok`, so without the pre-flight
+/// check each one detaches the mount.
 #[test]
 fn a_mutation_aimed_at_the_mount_table_is_refused_before_the_backend_is_asked() {
     type Op = fn(&Workspace, &Path) -> Result<()>;
@@ -366,42 +329,24 @@ fn a_mutation_aimed_at_the_mount_table_is_refused_before_the_backend_is_asked() 
         .map(|_| ())
     };
 
-    for (holder, op, expected, damage) in [
-        (
-            Holder::EmptyDir,
-            rmdir,
-            CortexError::NotEmpty,
-            "removes a directory the mount table still populates, and evicts \
-             inode mappings the kernel may still hold",
-        ),
-        (
-            Holder::File,
-            unlink,
-            CortexError::IsADirectory,
-            "deletes the mount's parent",
-        ),
-        (
-            Holder::Absent,
-            mkdir,
-            CortexError::AlreadyExists,
-            "succeeds where POSIX requires EEXIST, the path already being a \
-             directory",
-        ),
-        (
-            Holder::Absent,
-            create,
-            CortexError::IsADirectory,
-            "creates a file, after which the kernel answers ENOTDIR for \
-             everything under it and the mount is unreachable",
-        ),
-    ] {
+    #[rustfmt::skip]
+    let rows = [
+        (Holder::EmptyDir, rmdir,  CortexError::NotEmpty,
+         "removes a directory the mount table still populates"),
+        (Holder::File,     unlink, CortexError::IsADirectory,
+         "deletes the mount's parent"),
+        (Holder::Absent,   mkdir,  CortexError::AlreadyExists,
+         "succeeds where POSIX requires EEXIST"),
+        (Holder::Absent,   create, CortexError::IsADirectory,
+         "leaves a file, after which everything under it is ENOTDIR"),
+    ];
+    for (holder, op, expected, damage) in rows {
         let ws = shadowing_backend(holder);
         let got = op(&ws, Path::new("holder"));
         assert!(
             std::mem::discriminant(got.as_ref().unwrap_err()) == std::mem::discriminant(&expected),
             "expected {expected:?}, got {got:?} — unguarded this {damage}"
         );
-        // And in every case the mount below is still reachable.
         assert_eq!(
             Mountable::stat(&ws, Path::new("holder/inner"))
                 .unwrap()
@@ -414,10 +359,9 @@ fn a_mutation_aimed_at_the_mount_table_is_refused_before_the_backend_is_asked() 
 
 #[test]
 fn creating_in_the_synthesized_namespace_is_read_only_not_missing() {
-    // Nothing is mounted at the root, so there is no backend to create in. The
-    // root itself just answered `stat` as a directory and lists three entries,
-    // so `NotFound` would be a plain lie — and the message a user sees
-    // ("No such file or directory") reads as a filesystem bug.
+    // No backend at the root to create in — but the root stats as a directory and
+    // lists three entries, so `NotFound` would be a lie that reads to the user as
+    // a filesystem bug.
     let ws = table(&["s3-prod", "notion", "gdrive"]);
 
     assert!(matches!(
@@ -436,25 +380,28 @@ fn creating_in_the_synthesized_namespace_is_read_only_not_missing() {
         Err(CortexError::ReadOnly)
     ));
 
-    // Narrow on purpose: a path whose parent is *also* unrouted is a genuine
-    // missing-component case, which POSIX answers with ENOENT.
+    // Narrow on purpose: an *unrouted parent* really is a missing component.
     assert!(matches!(
         Mountable::mkdir(&ws, Path::new("nowhere/deeper")),
         Err(CortexError::NotFound)
     ));
-    // And a real mount still takes writes.
-    assert!(Mountable::mkdir(&ws, Path::new("notion/fresh")).is_ok());
+    assert!(
+        Mountable::mkdir(&ws, Path::new("notion/fresh")).is_ok(),
+        "a real mount still writes"
+    );
 }
 
+/// Every path a mount cannot be keyed by, through both entry points since they
+/// must not disagree.
 #[test]
-fn a_mount_path_that_is_not_utf8_is_refused() {
+fn a_mount_path_that_cannot_be_keyed_is_refused() {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
 
     // A listing name is a `String`, so a non-UTF-8 component could only be
     // reported lossily — and a lossy name does not round-trip, giving an entry
-    // that appears in `list` but whose `lookup` fails. Refused where it enters
-    // instead, since this is where mount names first become visible.
+    // that appears in `list` but whose `lookup` fails. This is where mount names
+    // first become visible, so this is where it is caught.
     let bad = PathBuf::from(OsString::from_vec(vec![0x66, 0xFF, 0x6F]));
     let mut ws = Workspace::new();
     assert!(matches!(
@@ -465,13 +412,25 @@ fn a_mount_path_that_is_not_utf8_is_refused() {
         Workspace::new().try_with_mount(&bad, InMemVolume::new()),
         Err(CortexError::InvalidName)
     ));
+
+    // A path that climbs out of the workspace root, likewise.
+    assert!(matches!(
+        ws.mount("../escape", InMemVolume::new()),
+        Err(CortexError::InvalidName)
+    ));
+
+    // A point already taken. `try_with_mount` is the builder and overwrites.
+    ws.mount("m", InMemVolume::new()).unwrap();
+    assert!(matches!(
+        ws.mount("m", InMemVolume::new()),
+        Err(CortexError::AlreadyExists)
+    ));
 }
 
 #[test]
 fn a_workspace_mounted_inside_a_workspace_serves_through_both() {
-    // The module doc has claimed this since the beginning; synthesized roots are
-    // what make it true, because the inner workspace has to answer for its own
-    // root before the outer one can route into it.
+    // Synthesized roots are what make this work: the inner workspace has to answer
+    // for its own root before the outer one can route into it.
     let inner = Workspace::new()
         .try_with_mount("leaf", InMemVolume::new())
         .unwrap();
@@ -492,7 +451,7 @@ fn a_workspace_mounted_inside_a_workspace_serves_through_both() {
         DirentKind::Dir
     );
 
-    // A write reaches the innermost backend through both hops.
+    // And a write reaches the innermost backend through both hops.
     Mountable::mkdir(&outer, Path::new("nested/leaf/deep")).unwrap();
     assert_eq!(
         Mountable::stat(&outer, Path::new("nested/leaf/deep"))
@@ -505,15 +464,7 @@ fn a_workspace_mounted_inside_a_workspace_serves_through_both() {
 #[test]
 fn a_rename_inside_one_mount_reaches_its_backend() {
     let ws = table(&["work"]);
-    Mountable::open(
-        &ws,
-        Path::new("work/a"),
-        OpenOptions {
-            create_new: true,
-            ..OpenOptions::read_write()
-        },
-    )
-    .unwrap();
+    Mountable::open(&ws, Path::new("work/a"), OpenOptions::create_new()).unwrap();
 
     Mountable::rename(&ws, Path::new("work/a"), Path::new("work/b")).unwrap();
 
@@ -529,47 +480,36 @@ fn a_rename_inside_one_mount_reaches_its_backend() {
 
 #[test]
 fn a_rename_across_two_mounts_is_a_cross_device_move() {
-    // One kernel mount, two backends. The kernel cannot see the workspace's own
-    // mount table, so it sends the rename here and this layer has to say that
-    // an in-place move is impossible — as `EXDEV`, the answer `mv` knows how to
-    // recover from by copying and deleting instead.
+    // One kernel mount, two backends. The kernel cannot see the workspace's mount
+    // table, so it asks — and `EXDEV` is the answer `mv` recovers from by copying.
     let ws = table(&["notion", "s3"]);
-    Mountable::open(
-        &ws,
-        Path::new("notion/draft.md"),
-        OpenOptions {
-            create_new: true,
-            ..OpenOptions::read_write()
-        },
-    )
-    .unwrap();
+    Mountable::open(&ws, Path::new("notion/draft.md"), OpenOptions::create_new()).unwrap();
 
     assert!(matches!(
         Mountable::rename(&ws, Path::new("notion/draft.md"), Path::new("s3/draft.md")),
         Err(CortexError::CrossDevice)
     ));
-    // Nothing moved.
-    assert!(Mountable::stat(&ws, Path::new("notion/draft.md")).is_ok());
+    assert!(
+        Mountable::stat(&ws, Path::new("notion/draft.md")).is_ok(),
+        "nothing moved"
+    );
 }
 
 #[test]
 fn the_mount_table_is_not_the_filesystems_to_rearrange() {
-    // `s3-prod` and `notion` are mount points; `a` exists only because `a/b/c`
-    // lies below it. Moving either would mean rewriting the mount table through
-    // a file operation.
+    // `s3-prod`/`notion` are mount points; `a` exists only because `a/b/c` is
+    // below it. Moving either would rewrite the mount table through a file op.
     let ws = table(&["s3-prod", "notion", "a/b/c"]);
 
-    for (from, to, what) in [
-        ("s3-prod", "archive", "a mount point as the source"),
-        ("notion", "s3-prod", "a mount point as the destination"),
-        ("a", "b", "a synthesized directory as the source"),
-        (
-            "s3-prod/f",
-            "a",
-            "a synthesized directory as the destination",
-        ),
-        ("a/b", "elsewhere", "a deeper synthesized directory"),
-    ] {
+    #[rustfmt::skip]
+    let rows = [
+        ("s3-prod",   "archive",   "a mount point as the source"),
+        ("notion",    "s3-prod",   "a mount point as the destination"),
+        ("a",         "b",         "a synthesized directory as the source"),
+        ("s3-prod/f", "a",         "a synthesized directory as the destination"),
+        ("a/b",       "elsewhere", "a deeper synthesized directory"),
+    ];
+    for (from, to, what) in rows {
         assert!(
             matches!(
                 Mountable::rename(&ws, Path::new(from), Path::new(to)),
@@ -583,29 +523,20 @@ fn the_mount_table_is_not_the_filesystems_to_rearrange() {
 #[test]
 fn a_rename_with_nowhere_to_come_from_or_go_to() {
     let ws = table(&["work"]);
-    Mountable::open(
-        &ws,
-        Path::new("work/a"),
-        OpenOptions {
-            create_new: true,
-            ..OpenOptions::read_write()
-        },
-    )
-    .unwrap();
+    Mountable::open(&ws, Path::new("work/a"), OpenOptions::create_new()).unwrap();
 
-    // The source has to exist, and nothing claims this path at all.
+    // Nothing claims the source at all.
     assert!(matches!(
         Mountable::rename(&ws, Path::new("nowhere"), Path::new("work/b")),
         Err(CortexError::NotFound)
     ));
-    // The destination is a *create*, and its parent is the synthesized root —
-    // which exists and was just listed, so `ReadOnly` rather than a claim that
-    // the path is missing.
+    // The destination is a *create* under the synthesized root, which exists —
+    // so `ReadOnly`, not a claim that the path is missing.
     assert!(matches!(
         Mountable::rename(&ws, Path::new("work/a"), Path::new("newthing")),
         Err(CortexError::ReadOnly)
     ));
-    // ...but a destination whose parent is not there either is genuinely absent.
+    // ...but an absent parent really is absent.
     assert!(matches!(
         Mountable::rename(&ws, Path::new("work/a"), Path::new("nowhere/deeper")),
         Err(CortexError::NotFound)
@@ -620,7 +551,7 @@ fn a_synthesized_directory_reports_a_stable_timestamp() {
     let second = Mountable::stat(&ws, Path::new("a")).unwrap();
     assert!(
         first.mtime.is_some(),
-        "the UNIX-epoch fallback is what this avoids"
+        "the epoch fallback is what this avoids"
     );
     assert_eq!(
         first.mtime, second.mtime,
@@ -630,10 +561,9 @@ fn a_synthesized_directory_reports_a_stable_timestamp() {
 
 #[test]
 fn a_longer_sibling_name_does_not_leak_into_the_range() {
-    // The whole algorithm rests on same-prefix keys forming one contiguous run.
-    // `ab` sorts adjacent to `a` but is not under it: `Path::starts_with` works
-    // on component boundaries, not raw bytes. Same for names whose next byte
-    // sorts below `/` (0x2F).
+    // The algorithm rests on same-prefix keys forming one contiguous run, and
+    // `ab` sorts adjacent to `a` without being under it: `Path::starts_with`
+    // works on component boundaries, not bytes. Same below `/` (0x2F).
     let ws = table(&["a", "ab", "a-b", "a b", "a/y"]);
 
     assert_eq!(children_of(&ws, "a"), [("y".into(), true)]);
@@ -642,25 +572,12 @@ fn a_longer_sibling_name_does_not_leak_into_the_range() {
     assert!(ws.spans_mounts(Path::new("a")));
 }
 
-fn scratch(tag: &str) -> PathBuf {
-    let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "cortex-workspace-test-{}-{}",
-        std::process::id(),
-        tag
-    ));
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 #[test]
 fn longest_prefix_routing() {
-    // Two on-disk backends: a root, and a deeper one mounted at `data`.
-    let root_dir = scratch("root");
+    let root_dir = scratch("workspace", "root");
     fs::write(root_dir.join("top.txt"), b"root").unwrap();
 
-    let data_dir = scratch("data");
+    let data_dir = scratch("workspace", "data");
     fs::write(data_dir.join("inner.txt"), b"inner").unwrap();
 
     let ws = Workspace::new()
@@ -669,10 +586,8 @@ fn longest_prefix_routing() {
         .try_with_mount("data", PassthroughVolume::new(&data_dir))
         .unwrap();
 
-    // Both `Mountable` and `DynMountable` (blanket impl) are in scope, so
-    // calls to shared method names must name the trait explicitly.
-
-    // `top.txt` is served by the root backend.
+    // Both traits are in scope via the blanket impl, so shared method names have
+    // to be qualified. `top.txt` is the root backend's.
     assert_eq!(
         Mountable::stat(&ws, Path::new("top.txt")).unwrap().kind,
         DirentKind::File
@@ -682,7 +597,7 @@ fn longest_prefix_routing() {
     h.read_exact_at(&mut buf, 0).unwrap();
     assert_eq!(&buf, b"root");
 
-    // `data/inner.txt` is routed to the deeper mount, re-based to `inner.txt`.
+    // Routed to the deeper mount, re-based to `inner.txt`.
     let (h, _) =
         Mountable::open(&ws, Path::new("data/inner.txt"), OpenOptions::read_only()).unwrap();
     let mut buf = [0u8; 5];
@@ -697,29 +612,4 @@ fn longest_prefix_routing() {
 
     fs::remove_dir_all(&root_dir).unwrap();
     fs::remove_dir_all(&data_dir).unwrap();
-}
-
-#[test]
-fn unmounted_paths_are_not_found() {
-    let ws = Workspace::new();
-    assert!(matches!(
-        Mountable::stat(&ws, Path::new("anything")),
-        Err(CortexError::NotFound)
-    ));
-}
-
-#[test]
-fn mount_rejects_duplicates_and_escapes() {
-    let dir = scratch("dup");
-    let mut ws = Workspace::new();
-    ws.mount("m", PassthroughVolume::new(&dir)).unwrap();
-    assert!(matches!(
-        ws.mount("m", PassthroughVolume::new(&dir)),
-        Err(CortexError::AlreadyExists)
-    ));
-    assert!(matches!(
-        ws.mount("../escape", PassthroughVolume::new(&dir)),
-        Err(CortexError::InvalidName)
-    ));
-    fs::remove_dir_all(&dir).unwrap();
 }

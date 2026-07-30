@@ -89,6 +89,21 @@ impl OpenOptions {
         }
     }
 
+    /// Create a file that must not already exist, opened for reading and
+    /// writing — `O_CREAT | O_EXCL | O_RDWR`, and the shape of
+    /// [`File::create_new`](std::fs::File::create_new).
+    ///
+    /// Here because "make a new file" is the most common thing a caller wants
+    /// and, without it, the only way to say it is a six-line struct update. The
+    /// combination is also the one that has to be exclusive, so spelling it once
+    /// keeps every caller on the atomic form.
+    pub fn create_new() -> Self {
+        OpenOptions {
+            create_new: true,
+            ..Self::read_write()
+        }
+    }
+
     /// Reject the one self-contradictory combination, so each backend spends a
     /// line calling this rather than re-deriving the rule.
     pub fn validate(&self) -> Result<()> {
@@ -462,111 +477,5 @@ impl FileExt for std::fs::File {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    use crate::{CortexError, InMemVolume, Workspace};
-
-    /// A backend that overrides nothing optional — standing in for a read-only
-    /// source (an object store, a document API) whose author never writes a
-    /// `rename`. Its whole job is to pin what those get for free, which is why it
-    /// must never grow an override.
-    struct ReadOnlyStub;
-
-    impl Mountable for ReadOnlyStub {
-        type Handle = Box<dyn FileHandle>;
-
-        fn stat(&self, _: &Path) -> Result<Stat> {
-            Ok(Stat::new(DirentKind::Dir, 0))
-        }
-        fn list(&self, _: &Path) -> Result<Vec<Dirent>> {
-            Ok(Vec::new())
-        }
-        fn mkdir(&self, _: &Path) -> Result<()> {
-            Err(CortexError::ReadOnly)
-        }
-        fn unlink(&self, _: &Path) -> Result<()> {
-            Err(CortexError::ReadOnly)
-        }
-        fn rmdir(&self, _: &Path) -> Result<()> {
-            Err(CortexError::ReadOnly)
-        }
-        fn open(&self, _: &Path, _: OpenOptions) -> Result<(Self::Handle, Stat)> {
-            Err(CortexError::ReadOnly)
-        }
-    }
-
-    /// A backend that does not write gets `rename` for free, and the answer is
-    /// `EROFS` — per-request, unlike the `ENOSYS` a kernel reads as "this
-    /// filesystem cannot rename at all" and applies to the whole mount.
-    #[test]
-    fn a_backend_that_does_not_write_refuses_rename_without_implementing_it() {
-        let backend = ReadOnlyStub;
-
-        assert!(matches!(
-            Mountable::rename(&backend, Path::new("a"), Path::new("b")),
-            Err(CortexError::ReadOnly)
-        ));
-        // Through the erased face, which a mount table stores it as.
-        assert!(matches!(
-            DynMountable::rename(&backend, Path::new("a"), Path::new("b")),
-            Err(CortexError::ReadOnly)
-        ));
-        // And through a shared handle, which is how one store feeds two consumers.
-        assert!(matches!(
-            Mountable::rename(&Arc::new(ReadOnlyStub), Path::new("a"), Path::new("b")),
-            Err(CortexError::ReadOnly)
-        ));
-    }
-
-    /// One store, several owners.
-    ///
-    /// Necessary because every consumer takes its backend *by value* and offers no
-    /// way back — `PosixFs::new` has no accessor, and `Workspace::mount` boxes what
-    /// it is handed — so without this impl a store feeds exactly one consumer, and
-    /// nothing can serve a host mount and a WebDAV handler from the same workspace.
-    #[test]
-    fn an_arc_backend_is_mountable_and_shares_one_store() {
-        let vol = Arc::new(InMemVolume::new());
-
-        let (handle, _) = Mountable::open(
-            &vol,
-            Path::new("shared.txt"),
-            OpenOptions {
-                create_new: true,
-                ..OpenOptions::read_write()
-            },
-        )
-        .expect("fresh volume");
-        handle.write_all_at(b"once", 0).unwrap();
-
-        // Read back through a *different* clone: one store, not a copy per owner.
-        let other = Arc::clone(&vol);
-        let (handle, stat) =
-            Mountable::open(&other, Path::new("shared.txt"), OpenOptions::read_only())
-                .expect("every clone sees the same store");
-        assert_eq!(stat.size, 4);
-        let mut buf = [0u8; 4];
-        handle.read_exact_at(&mut buf, 0).unwrap();
-        assert_eq!(&buf, b"once");
-    }
-
-    /// The blanket [`DynMountable`] impl reaches `Arc<T>` too, so a shared store can
-    /// go into a mount table *and* still be driven directly.
-    #[test]
-    fn an_arc_backend_is_also_dyn_mountable() {
-        let vol = Arc::new(InMemVolume::new());
-        Mountable::mkdir(&vol, Path::new("dir")).unwrap();
-
-        let ws = Workspace::new()
-            .try_with_mount("", Arc::clone(&vol))
-            .expect("Arc<InMemVolume> erases to DynMountable via the blanket impl");
-        assert_eq!(Mountable::list(&ws, Path::new("dir")).unwrap().len(), 0);
-
-        // The workspace shares the store rather than owning it: a write that
-        // bypasses the workspace is still visible through it.
-        Mountable::mkdir(&vol, Path::new("dir/deeper")).unwrap();
-        assert_eq!(Mountable::list(&ws, Path::new("dir")).unwrap().len(), 1);
-    }
-}
+#[path = "trait_tests.rs"]
+mod tests;
