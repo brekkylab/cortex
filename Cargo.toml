@@ -37,9 +37,16 @@ tempfile = { version = "3", optional = true }
 # Nothing by default. The crate's own layers — `Mountable`, `Workspace`, the
 # inode bookkeeping — need no dependencies at all, and each interface binding
 # brings a heavy one: enabling any by default charges every consumer for it.
-# Measured: bare cortex pulls 0 crates, `fuse-t` pulls 1, `krun` pulls 62 (the
-# whole VMM tree — vmm, devices, hvf, kernel, arch). A consumer that mounts over
-# HTTP has no reason to compile a hypervisor.
+# A consumer that mounts over HTTP has no reason to compile a hypervisor.
+#
+# Measured with
+#
+#   cargo tree --features <f> -e normal --prefix none | grep -v '^cortex' \
+#       | sed 's/ (\*)$//' | sort -u | wc -l
+#
+# (normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
+# counted): bare cortex 0, `fuse-t` 1, `fuse` 34, `krun` 65 — the last being the
+# whole VMM tree (vmm, devices, hvf, kernel, arch).
 #
 # Consequence worth knowing: a bare `cargo test` runs 79 of the unit tests, not
 # all of them, because a binding's tests only exist when its feature is on. No
