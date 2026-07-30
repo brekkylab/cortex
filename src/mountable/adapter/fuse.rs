@@ -8,7 +8,15 @@
 //! through a temp file.
 //!
 //! What stays on `fuser`'s `ENOSYS` defaults is what the backend contract has no
-//! notion of — symlinks, hard links, `rename` — matching the krun stubs.
+//! notion of — symlinks, hard links — matching the krun stubs.
+//!
+//! **No unit tests, unlike its two siblings**, and the reason is structural: a
+//! callback here answers by consuming a `Reply*` object that only `fuser` can
+//! construct, so there is nothing a test can hand it and nothing it hands back.
+//! The krun binding returns `io::Result`, and the FUSE-T one fills caller-owned
+//! out-params, so both are driven directly in their `*_tests.rs`. This one is
+//! covered only by `tests/host_mount.rs`, which is `#[ignore]`d because it needs a
+//! real mount — so a plain `cargo test` exercises none of it.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

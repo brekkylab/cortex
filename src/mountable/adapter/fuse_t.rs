@@ -384,6 +384,13 @@ unsafe extern "C" fn forget<T: Mountable>(fs: *mut c_void, inode: u64, nlookup: 
     fs.forget_inode(inode, nlookup);
 }
 
+// Tests live beside this file rather than inside it, matching the crate's other
+// modules. They are still a child module, so the callbacks and the `Ops` table —
+// all private — stay reachable.
+#[cfg(test)]
+#[path = "fuse_t_tests.rs"]
+mod tests;
+
 /// The vtable for one concrete backend, with every callback monomorphised for it.
 fn ops_for<T: Mountable>() -> Ops {
     Ops {
