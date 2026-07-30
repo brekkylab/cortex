@@ -44,6 +44,24 @@ pub enum CortexError {
     /// answering `Unsupported` to a write takes every other backend's writes with
     /// it.
     ReadOnly,
+    /// The two paths are on different backends, so the move cannot happen in
+    /// place.
+    ///
+    /// Not a dead end the caller has to give up on: `EXDEV` has meant "copy, then
+    /// delete" for decades, and `mv`, `rsync` and editors all implement that
+    /// fallback — so naming it precisely is what lets a cross-backend `mv`
+    /// *succeed*. A vaguer error turns the same request into a hard failure the
+    /// user has to work around by hand.
+    ///
+    /// Reached only from inside one mount: a kernel answers a move between two
+    /// real mounts itself, but it cannot see a [`Workspace`](crate::Workspace)'s
+    /// own mount table, so it asks and this layer has to say so.
+    ///
+    /// Not [`Unsupported`](Self::Unsupported), for the reason spelled out on
+    /// [`ReadOnly`](Self::ReadOnly): `ENOSYS` disables the operation mount-wide,
+    /// which would take rename away from the writable backends too.
+    CrossDevice,
+
     /// The backend does not support this operation at all.
     Unsupported,
     /// An underlying I/O error.
@@ -65,6 +83,7 @@ impl std::fmt::Display for CortexError {
             CortexError::PermissionDenied => write!(f, "permission denied"),
             CortexError::NoSpace => write!(f, "no space left on device"),
             CortexError::ReadOnly => write!(f, "read-only filesystem"),
+            CortexError::CrossDevice => write!(f, "cross-device move"),
             CortexError::Unsupported => write!(f, "operation not supported"),
             CortexError::Io(e) => write!(f, "io error: {e}"),
         }

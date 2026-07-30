@@ -61,6 +61,10 @@ struct cortex_fuse_t_ops {
                  struct cortex_stat *out);
     int (*unlink)(void *fs, uint64_t parent, const char *name);
     int (*rmdir)(void *fs, uint64_t parent, const char *name);
+    /* No flags argument: libfuse-t's `rename` has none, so the Rust side
+     * cannot be handed `RENAME_NOREPLACE`/`RENAME_EXCHANGE` here at all. */
+    int (*rename)(void *fs, uint64_t parent, const char *name, uint64_t newparent,
+                  const char *newname);
     int (*readdir)(void *fs, uint64_t ino, uint64_t offset, void *sink,
                    cortex_dirent_sink emit);
     void (*forget)(void *fs, uint64_t ino, uint64_t nlookup);

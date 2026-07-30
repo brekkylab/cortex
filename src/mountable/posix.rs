@@ -123,6 +123,7 @@ pub(super) fn host_errno(err: &CortexError) -> i32 {
         CortexError::PermissionDenied => libc::EACCES,
         CortexError::NoSpace => libc::ENOSPC,
         CortexError::ReadOnly => libc::EROFS,
+        CortexError::CrossDevice => libc::EXDEV,
         CortexError::Unsupported => libc::ENOSYS,
         CortexError::Io(err) => err.raw_os_error().unwrap_or(libc::EIO),
     }
@@ -253,7 +254,7 @@ impl<T: Mountable> PosixFs<T> {
         let mut buf = vec![0u8; size as usize];
         let n = file.read_at(&mut buf, offset)?;
         buf.truncate(n);
-        Ok(buf.into())
+        Ok(buf)
     }
 
     /// Write `data` at `offset` through `fh`, returning the byte count.
@@ -308,6 +309,28 @@ impl<T: Mountable> PosixFs<T> {
         let path = self.path_of(parent)?.join(name);
         self.mountable.rmdir(&path)?;
         lock(&self.inodes).evict_subtree(&path);
+        Ok(())
+    }
+
+    /// Move `name` under `from_parent` to `to_name` under `to_parent`.
+    ///
+    /// The table is rewritten only after the backend agrees, like every other
+    /// mutation here — an eager rekey would strand numbers on paths that never
+    /// changed. But unlike `unlink`/`rmdir` this *rewrites* rather than evicts: the
+    /// object is still there under a new name, and the kernel goes on quoting the
+    /// inode it was given, so dropping the mapping would turn its next `getattr`
+    /// into `ESTALE`.
+    pub(super) fn rename_child(
+        &self,
+        from_parent: u64,
+        name: &OsStr,
+        to_parent: u64,
+        to_name: &OsStr,
+    ) -> Result<()> {
+        let from = self.path_of(from_parent)?.join(name);
+        let to = self.path_of(to_parent)?.join(to_name);
+        self.mountable.rename(&from, &to)?;
+        lock(&self.inodes).rekey_subtree(&from, &to);
         Ok(())
     }
 
@@ -510,6 +533,66 @@ impl InodeTable {
         self.rev.retain(|path, _| !path.starts_with(prefix));
     }
 
+    /// Move the inode↔path mapping for `from`, and everything beneath it, onto
+    /// `to`, keeping every number.
+    ///
+    /// Not an eviction, and that distinction is the whole point. `unlink` and
+    /// `rmdir` may drop a mapping because the entry is *gone* and the kernel will
+    /// never quote its number again. A rename moves a live object: the kernel
+    /// updates its own dentry cache and goes on using the same inode, so dropping
+    /// the mapping would turn its next `getattr` into `ESTALE`.
+    ///
+    /// The destination's own names are dropped first — whatever was there has been
+    /// replaced. `evict_subtree` rather than [`evict_path`](Self::evict_path) for
+    /// the same reason `rmdir` uses it: an earlier listing may have interned
+    /// descendants the backend no longer sees.
+    ///
+    /// This is one operation rather than two so a caller cannot sequence them
+    /// wrongly. Measured on the two-call draft: evicting `to` first *also* wiped
+    /// the source whenever the paths overlapped, leaving `fwd` populated and `rev`
+    /// empty — after which the next `lookup` mints a second number for a path the
+    /// table already knew, which is exactly what `rev` exists to prevent.
+    pub(super) fn rekey_subtree(&mut self, from: &Path, to: &Path) {
+        // Overlapping moves do nothing. A backend refuses them all (`EINVAL` for a
+        // directory into its own descendant, `ENOTEMPTY` for the reverse, a no-op
+        // for a self-rename), so this is a backstop, not the rule — and leaving the
+        // table untouched is the only safe answer when the two subtrees are not
+        // disjoint. `from` being the root is covered for free: every path starts
+        // with `/`, so `to` is always below it.
+        if from == to || to.starts_with(from) || from.starts_with(to) {
+            return;
+        }
+        self.evict_subtree(to);
+
+        // Rebase a path that lives under `from`. `strip_prefix` yields `""` for
+        // `from` itself, and `to.join("")` would append a separator — harmless,
+        // since `Path` equality ignores one, but it makes every later `Debug` and
+        // error message read wrong.
+        let rebase = |path: &Path| -> Option<PathBuf> {
+            let rest = path.strip_prefix(from).ok()?;
+            Some(if rest.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(rest)
+            })
+        };
+
+        // The path is a *field* here, so rewriting it in place keeps the number.
+        for data in self.fwd.values_mut() {
+            if let Some(moved) = rebase(&data.path) {
+                data.path = moved;
+            }
+        }
+        // ...and the *key* there, so the entries have to be reinserted.
+        let moved: Vec<(PathBuf, u64)> = self
+            .rev
+            .iter()
+            .filter_map(|(path, &inode)| rebase(path).map(|moved| (moved, inode)))
+            .collect();
+        self.rev.retain(|path, _| !path.starts_with(from));
+        self.rev.extend(moved);
+    }
+
     /// Return the inode for `path`, allocating a fresh number the first time,
     /// and record one more kernel reference. Pairs with [`forget`](Self::forget).
     pub(super) fn intern(&mut self, path: PathBuf) -> u64 {
@@ -627,404 +710,9 @@ impl<H> HandleTable<H> {
     }
 }
 
+// Tests live beside this file rather than inside it: they had grown longer than
+// the implementation, so a reader opening it had to scroll past them to find the
+// code. They are still a child module, so private items stay reachable.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::InMemVolume;
-    use std::ffi::OsStr;
-    use std::path::Path;
-    use std::time::Duration;
-
-    const CONTENT: &[u8] = b"Hello from cortex!\n";
-
-    /// A volume holding `greeting.txt` at the root plus an empty `sub/`.
-    fn adapter() -> PosixFs<InMemVolume> {
-        let vol = InMemVolume::new();
-        let (file, _) = vol
-            .open(
-                Path::new("greeting.txt"),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                },
-            )
-            .unwrap();
-        file.write_all_at(CONTENT, 0).unwrap();
-        vol.mkdir(Path::new("sub")).unwrap();
-        PosixFs::new(vol)
-    }
-
-    /// The names a directory lists, minus the dots, sorted.
-    fn child_names(fs: &PosixFs<InMemVolume>, inode: u64) -> Vec<String> {
-        let mut names: Vec<_> = fs
-            .dir_entries(inode)
-            .unwrap()
-            .into_iter()
-            .map(|(_, child)| child.name)
-            .filter(|name| name != "." && name != "..")
-            .collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn walks_the_root() {
-        let fs = adapter();
-
-        // The root is pre-interned, so a listing works before any lookup.
-        assert_eq!(child_names(&fs, ROOT_INODE), ["greeting.txt", "sub"]);
-
-        let entries = fs.dir_entries(ROOT_INODE).unwrap();
-        // `.` and `..` lead and both point back at this directory.
-        assert_eq!(entries[0].0, ROOT_INODE);
-        assert_eq!(entries[0].1.name, ".");
-        assert_eq!(entries[1].0, ROOT_INODE);
-        assert_eq!(entries[1].1.name, "..");
-        assert_eq!(entries[0].1.kind, DirentKind::Dir);
-        // Kinds survive the round trip.
-        let sub = entries.iter().find(|(_, c)| c.name == "sub").unwrap();
-        assert_eq!(sub.1.kind, DirentKind::Dir);
-    }
-
-    #[test]
-    fn a_created_file_is_reachable_by_every_route() {
-        let fs = adapter();
-        let (inode, stat, fh) = fs
-            .create_child(
-                ROOT_INODE,
-                OsStr::new("fresh.txt"),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                },
-            )
-            .unwrap();
-        assert_eq!(stat.size, 0);
-
-        // The handle, the inode, and the name must all now agree.
-        assert_eq!(fs.write_handle(fh, 0, b"hello").unwrap(), 5);
-        assert_eq!(fs.read_handle(fh, 0, 5).unwrap(), b"hello");
-        assert_eq!(fs.stat_inode(inode).unwrap().size, 5);
-        let (looked_up, _) = fs
-            .lookup_child(ROOT_INODE, OsStr::new("fresh.txt"))
-            .unwrap();
-        assert_eq!(looked_up, inode);
-        assert!(child_names(&fs, ROOT_INODE).contains(&"fresh.txt".to_string()));
-
-        // `create_new` is exclusive, and it is the backend that says so.
-        assert!(matches!(
-            fs.create_child(
-                ROOT_INODE,
-                OsStr::new("fresh.txt"),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                }
-            ),
-            Err(CortexError::AlreadyExists)
-        ));
-    }
-
-    #[test]
-    fn setattr_resizes_and_swallows_what_it_cannot_store() {
-        let fs = adapter();
-        let (inode, _) = fs
-            .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
-            .unwrap();
-
-        // The one field that is really applied.
-        let stat = fs
-            .setattr_inode(
-                inode,
-                None,
-                SetAttr {
-                    size: Some(4),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(stat.size, 4);
-        let (fh, _) = fs.open_inode(inode, OpenOptions::read_only()).unwrap();
-        assert_eq!(fs.read_handle(fh, 0, 16).unwrap(), &CONTENT[..4]);
-
-        // Mode and ownership are accepted and dropped rather than refused:
-        // failing would break `cp -p` and `tar -x` on every mount, and the
-        // caller's own reply shows it what actually stuck.
-        let stat = fs
-            .setattr_inode(
-                inode,
-                None,
-                SetAttr {
-                    mode: Some(0o600),
-                    uid: Some(42),
-                    gid: Some(42),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(stat.size, 4);
-        assert_eq!(attr_for(&stat).mode, 0o100000 | 0o644);
-    }
-
-    #[test]
-    fn a_removed_name_does_not_resolve_to_the_old_inode() {
-        let fs = adapter();
-        let (old, _) = fs
-            .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
-            .unwrap();
-        let (fh, _) = fs.open_inode(old, OpenOptions::read_only()).unwrap();
-
-        fs.unlink_child(ROOT_INODE, OsStr::new("greeting.txt"))
-            .unwrap();
-
-        // The open handle survives the removal, and so does `getattr` on the old
-        // inode. POSIX requires both — an unlinked-but-open file stays readable
-        // and `fstat`-able through its descriptor, which is the whole basis of
-        // every tempfile implementation.
-        assert_eq!(fs.read_handle(fh, 0, 5).unwrap(), &CONTENT[..5]);
-
-        // A new file at the same name is a *different* file and gets a different
-        // number; reusing the old one would make the kernel conflate the two.
-        let (new, _, _) = fs
-            .create_child(
-                ROOT_INODE,
-                OsStr::new("greeting.txt"),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                },
-            )
-            .unwrap();
-        assert_ne!(new, old);
-    }
-
-    #[test]
-    fn rmdir_evicts_the_whole_subtree() {
-        let fs = adapter();
-        let (dir, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).unwrap();
-        let (_, _, fh) = fs
-            .create_child(
-                dir,
-                OsStr::new("inner"),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                },
-            )
-            .unwrap();
-        let (child_before, _) = fs.lookup_child(dir, OsStr::new("inner")).unwrap();
-
-        // A directory with children cannot go, and the backend is what says so.
-        assert!(matches!(
-            fs.rmdir_child(ROOT_INODE, OsStr::new("sub")),
-            Err(CortexError::NotEmpty)
-        ));
-
-        fs.release_handle(fh).unwrap();
-        fs.unlink_child(dir, OsStr::new("inner")).unwrap();
-        fs.rmdir_child(ROOT_INODE, OsStr::new("sub")).unwrap();
-
-        // Rebuilding the subtree must not reuse the old numbers. Evicting only
-        // the directory's own name would leave `sub/inner` interned and hand the
-        // stale number straight back.
-        fs.mkdir_child(ROOT_INODE, OsStr::new("sub")).unwrap();
-        let (_, _, fh) = fs
-            .create_child(
-                fs.lookup_child(ROOT_INODE, OsStr::new("sub")).unwrap().0,
-                OsStr::new("inner"),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                },
-            )
-            .unwrap();
-        fs.release_handle(fh).unwrap();
-        let (child_after, _) = fs
-            .lookup_child(
-                fs.lookup_child(ROOT_INODE, OsStr::new("sub")).unwrap().0,
-                OsStr::new("inner"),
-            )
-            .unwrap();
-        assert_ne!(child_after, child_before);
-    }
-
-    #[test]
-    fn flush_does_not_finalize_but_release_does() {
-        let fs = adapter();
-        let (inode, _) = fs
-            .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
-            .unwrap();
-        let (fh, _) = fs.open_inode(inode, OpenOptions::read_write()).unwrap();
-
-        // FLUSH arrives on every `close()` of a descriptor, so it must be
-        // repeatable and must leave the handle usable. RELEASE comes once, for
-        // the last one, and is where a backend may finalize.
-        fs.flush_handle(fh).unwrap();
-        fs.flush_handle(fh).unwrap();
-        assert_eq!(fs.write_handle(fh, 0, b"X").unwrap(), 1);
-
-        fs.release_handle(fh).unwrap();
-        assert!(matches!(
-            fs.flush_handle(fh),
-            Err(CortexError::BadHandle)
-        ));
-        // A release for a handle we never issued is the kernel tidying up.
-        fs.release_handle(fh).unwrap();
-    }
-
-    #[test]
-    fn attribute_policy_is_shared_by_both_bindings() {
-        // A directory's link count is 2 even with no subdirectories, because `.`
-        // and `..` are links to it. The two bindings disagreed here — one said 1
-        // — which is the drift this shared policy exists to prevent.
-        let dir = attr_for(&Stat::new(DirentKind::Dir, 0));
-        assert_eq!(dir.nlink, 2);
-        assert_eq!(dir.mode, 0o040000 | 0o755);
-
-        let file = attr_for(&Stat::new(DirentKind::File, 0));
-        assert_eq!(file.nlink, 1);
-        assert_eq!(file.mode, 0o100000 | 0o644);
-
-        // Block counts round up: a 1-byte file still occupies a block, and the
-        // reported `blksize` is what that count is denominated in.
-        assert_eq!(attr_for(&Stat::new(DirentKind::File, 0)).blocks, 0);
-        assert_eq!(attr_for(&Stat::new(DirentKind::File, 1)).blocks, 1);
-        assert_eq!(attr_for(&Stat::new(DirentKind::File, 512)).blocks, 1);
-        assert_eq!(attr_for(&Stat::new(DirentKind::File, 513)).blocks, 2);
-        assert_eq!(file.blksize as u64, BLOCK_SIZE);
-    }
-
-    #[test]
-    fn timestamps_fall_back_rather_than_reporting_zero() {
-        // A backend that knows no times at all lands on the epoch.
-        let unknown = attr_for(&Stat::new(DirentKind::File, 0));
-        assert_eq!(unknown.mtime, UNIX_EPOCH);
-        assert_eq!(unix_time(unknown.mtime), (0, 0));
-
-        // One that knows only a modification time has the others follow it,
-        // rather than each independently reading as 1970. Reporting a real
-        // `mtime` is functional, not cosmetic: the guest negotiates
-        // `AUTO_INVAL_DATA` and watches `mtime` to decide when to drop cached
-        // pages, so a filesystem stuck at 0 never gets its cache invalidated.
-        let known = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
-        let mut stat = Stat::new(DirentKind::File, 10);
-        stat.mtime = Some(known);
-        let attr = attr_for(&stat);
-        assert_eq!(attr.mtime, known);
-        assert_eq!(attr.atime, known);
-        assert_eq!(attr.ctime, known);
-        assert_eq!(attr.crtime, known);
-        assert_eq!(unix_time(attr.mtime), (1_700_000_000, 0));
-
-        // Pre-epoch times clamp instead of wrapping, which would otherwise be
-        // reported to the kernel as a time in the future.
-        assert_eq!(unix_time(UNIX_EPOCH - Duration::from_secs(1)), (0, 0));
-    }
-
-    #[test]
-    fn a_listing_carries_metadata_when_the_backend_had_it() {
-        let fs = adapter();
-        let entries = fs.dir_entries(ROOT_INODE).unwrap();
-
-        // `InMemVolume` already locks each child to learn its kind, so it fills
-        // the metadata in — this is what lets a `readdirplus` answer without an
-        // extra round trip per entry.
-        let file = entries
-            .iter()
-            .find(|(_, c)| c.name == "greeting.txt")
-            .unwrap();
-        let stat = file.1.stat.as_ref().expect("in-memory listing knows sizes");
-        assert_eq!(stat.size, CONTENT.len() as u64);
-        assert_eq!(stat.kind, DirentKind::File);
-
-        // The synthesized dots carry no metadata: they are not backend entries,
-        // and a caller that wants the directory's own attributes has the inode.
-        assert!(entries[0].1.stat.is_none());
-    }
-
-    #[test]
-    fn reads_a_file_through_a_handle() {
-        let fs = adapter();
-        let (inode, stat) = fs.lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).unwrap();
-        assert_eq!(stat.kind, DirentKind::File);
-        assert_eq!(stat.size, CONTENT.len() as u64);
-
-        let (fh, _) = fs.open_inode(inode, OpenOptions::read_only()).unwrap();
-        assert_eq!(fs.read_handle(fh, 0, CONTENT.len() as u32).unwrap(), CONTENT);
-
-        // A window past EOF comes back short rather than erroring, which is how
-        // the kernel learns where the file ends.
-        assert!(fs.read_handle(fh, 0, 4096).unwrap().len() == CONTENT.len());
-        assert!(fs.read_handle(fh, CONTENT.len() as u64, 16).unwrap().is_empty());
-
-        // Mid-file offsets address bytes, not blocks.
-        assert_eq!(fs.read_handle(fh, 6, 4).unwrap(), b"from");
-
-        fs.release_handle(fh).unwrap();
-        // The handle is gone once released — and reported as a *bad handle*, not
-        // as a missing name. A caller told "no such file" for a closed
-        // descriptor retries the open forever; told "bad descriptor", it fixes
-        // its own bookkeeping.
-        assert!(matches!(
-            fs.read_handle(fh, 0, 1),
-            Err(CortexError::BadHandle)
-        ));
-    }
-
-    #[test]
-    fn readdir_and_lookup_agree_on_inode_numbers() {
-        let fs = adapter();
-        let listed = fs
-            .dir_entries(ROOT_INODE)
-            .unwrap()
-            .into_iter()
-            .find(|(_, child)| child.name == "greeting.txt")
-            .unwrap()
-            .0;
-        let (looked_up, _) = fs.lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).unwrap();
-        // A number handed out by readdir must be the one lookup confirms —
-        // otherwise the kernel would see two inodes for one file.
-        assert_eq!(listed, looked_up);
-    }
-
-    #[test]
-    fn missing_entries_report_not_found() {
-        let fs = adapter();
-        assert!(matches!(
-            fs.lookup_child(ROOT_INODE, OsStr::new("nope")),
-            Err(CortexError::NotFound)
-        ));
-        // An inode we never issued resolves to nothing.
-        assert!(matches!(fs.stat_inode(9999), Err(CortexError::NotFound)));
-    }
-
-    #[test]
-    fn forget_evicts_but_spares_the_root() {
-        let fs = adapter();
-        let (inode, _) = fs.lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).unwrap();
-        assert!(fs.stat_inode(inode).is_ok());
-
-        // One lookup, one reference: forgetting it evicts the entry.
-        fs.forget_inode(inode, 1);
-        assert!(matches!(fs.stat_inode(inode), Err(CortexError::NotFound)));
-
-        // The root survives any amount of forgetting; losing it would strand
-        // every path that resolves through it.
-        fs.forget_inode(ROOT_INODE, 1_000);
-        assert!(fs.stat_inode(ROOT_INODE).is_ok());
-    }
-
-    #[test]
-    fn repeated_lookups_share_one_inode() {
-        let fs = adapter();
-        let (first, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).unwrap();
-        let (second, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).unwrap();
-        assert_eq!(first, second);
-
-        // Two references now, so one forget leaves the inode live.
-        fs.forget_inode(first, 1);
-        assert!(fs.stat_inode(first).is_ok());
-        fs.forget_inode(first, 1);
-        assert!(matches!(fs.stat_inode(first), Err(CortexError::NotFound)));
-    }
-}
+#[path = "posix_tests.rs"]
+mod tests;

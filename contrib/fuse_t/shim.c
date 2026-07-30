@@ -207,6 +207,12 @@ static void ll_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name) {
     fuse_reply_err(req, -s->ops.rmdir(s->fs, parent, name));
 }
 
+static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
+                      fuse_ino_t newparent, const char *newname) {
+    struct session *s = ctx(req);
+    fuse_reply_err(req, -s->ops.rename(s->fs, parent, name, newparent, newname));
+}
+
 /* Accumulates entries into libfuse's buffer — the one part of `readdir` the
  * caller cannot do itself, since `fuse_add_direntry` needs the request. */
 struct dirbuf {
@@ -265,7 +271,7 @@ static void ll_statfs(fuse_req_t req, fuse_ino_t ino) {
 }
 
 /* Only what cortex implements. libfuse answers the rest with ENOSYS, matching
- * the other bindings: symlinks, hard links, rename, xattrs, locks. */
+ * the other bindings: symlinks, hard links, xattrs, locks. */
 static const struct fuse_lowlevel_ops LL_OPS = {
     .lookup = ll_lookup,
     .forget = ll_forget,
@@ -274,6 +280,7 @@ static const struct fuse_lowlevel_ops LL_OPS = {
     .mkdir = ll_mkdir,
     .unlink = ll_unlink,
     .rmdir = ll_rmdir,
+    .rename = ll_rename,
     .open = ll_open,
     .read = ll_read,
     .write = ll_write,

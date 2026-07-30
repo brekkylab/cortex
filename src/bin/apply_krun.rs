@@ -204,7 +204,10 @@ const GUEST_SCRIPT: &str = concat!(
     " echo '--- read back, so these bytes came from the backend ---';",
     " cat /mnt/hello.txt; cat /mnt/new.txt; cat /mnt/made/inner.txt;",
     " ls -l /mnt; df -h /mnt | tail -1;",
-    " echo '--- rm -r ---'; rm -r /mnt/made; rm /mnt/new.txt; ls -l /mnt;",
+    " echo '--- mv ---';",
+    " echo edited > /mnt/hello.txt.tmp; mv /mnt/hello.txt.tmp /mnt/hello.txt;",
+    " cat /mnt/hello.txt; mv /mnt/made /mnt/moved; cat /mnt/moved/inner.txt;",
+    " echo '--- rm -r ---'; rm -r /mnt/moved; rm /mnt/new.txt; ls -l /mnt;",
     " echo '--- done ---'",
 );
 

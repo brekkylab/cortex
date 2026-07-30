@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::{DirentKind, Result, Stat};
 
@@ -154,6 +155,75 @@ pub trait Mountable: Send + Sync {
     /// would cost another round trip and leave a window for the entry to be
     /// replaced. See [`OpenOptions`] for which options must be atomic.
     fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)>;
+
+    /// Move the entry at `from` to `to`, replacing whatever was there.
+    ///
+    /// The one operation with a default, because most backends are read-only and a
+    /// store that cannot write has nothing to say here beyond "no". `ReadOnly`
+    /// rather than [`Unsupported`](crate::CortexError::Unsupported): a FUSE kernel
+    /// handed `ENOSYS` stops sending the request *for the whole mount*, so one
+    /// read-only source would take rename away from every writable one beside it.
+    ///
+    /// No flags. `RENAME_NOREPLACE`/`RENAME_EXCHANGE` reach two of the three
+    /// bindings but libfuse-t's `rename` has no flags argument at all, so a
+    /// contract carrying them could not be honoured everywhere; the bindings that
+    /// receive them answer `EINVAL`, as Linux does for a flag it cannot serve.
+    ///
+    /// Both paths belong to *this* backend. A move that crosses a mount boundary
+    /// is [`CrossDevice`](crate::CortexError::CrossDevice), decided a layer up
+    /// where the mount table is visible.
+    ///
+    /// Overwrite rules follow `rename(2)`, which a local backend gets for free
+    /// from `fs::rename`: a file replaces a file, a directory replaces an *empty*
+    /// directory, and the mismatched pairs are `EISDIR`/`ENOTDIR`/`ENOTEMPTY`.
+    /// Renaming a path onto itself succeeds without doing anything, and moving a
+    /// directory inside itself is `EINVAL`.
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let _ = (from, to);
+        Err(crate::CortexError::ReadOnly)
+    }
+}
+
+/// A shared backend is itself a backend: every call forwards to the one inside.
+///
+/// Needed because each consumer takes its backend *by value* and offers no way
+/// back — [`PosixFs::new`](crate::PosixFs::new) has no accessor, and
+/// [`Workspace::mount`](crate::Workspace::mount) boxes what it is handed. Without
+/// this, a store feeds exactly one consumer, so one workspace cannot be served to
+/// an agent through a host mount and to a person over HTTP at the same time.
+///
+/// The handle type passes straight through, so sharing costs nothing on the data
+/// plane: `Arc<T>` hands out `T`'s own handles rather than erased ones.
+impl<T: Mountable> Mountable for Arc<T> {
+    type Handle = T::Handle;
+
+    fn stat(&self, path: &Path) -> Result<Stat> {
+        Mountable::stat(&**self, path)
+    }
+
+    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+        Mountable::list(&**self, path)
+    }
+
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        Mountable::mkdir(&**self, path)
+    }
+
+    fn unlink(&self, path: &Path) -> Result<()> {
+        Mountable::unlink(&**self, path)
+    }
+
+    fn rmdir(&self, path: &Path) -> Result<()> {
+        Mountable::rmdir(&**self, path)
+    }
+
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+        Mountable::open(&**self, path, options)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        Mountable::rename(&**self, from, to)
+    }
 }
 
 /// The object-safe face of [`Mountable`].
@@ -185,6 +255,10 @@ pub trait DynMountable: Send + Sync {
     /// See [`Mountable::open`], with the concrete handle boxed behind a trait
     /// object.
     fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)>;
+
+    /// See [`Mountable::rename`]. No default here — the blanket impl always
+    /// supplies one, forwarding to whatever the backend decided.
+    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
 }
 
 /// Every [`Mountable`] is a [`DynMountable`] once its handle is boxed. The
@@ -217,6 +291,10 @@ where
     fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)> {
         let (handle, stat) = Mountable::open(self, path, options)?;
         Ok((Box::new(handle), stat))
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        Mountable::rename(self, from, to)
     }
 }
 
@@ -380,5 +458,115 @@ impl FileExt for std::fs::File {
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         std::os::windows::fs::FileExt::seek_write(self, buf, offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::{CortexError, InMemVolume, Workspace};
+
+    /// A backend that overrides nothing optional — standing in for a read-only
+    /// source (an object store, a document API) whose author never writes a
+    /// `rename`. Its whole job is to pin what those get for free, which is why it
+    /// must never grow an override.
+    struct ReadOnlyStub;
+
+    impl Mountable for ReadOnlyStub {
+        type Handle = Box<dyn FileHandle>;
+
+        fn stat(&self, _: &Path) -> Result<Stat> {
+            Ok(Stat::new(DirentKind::Dir, 0))
+        }
+        fn list(&self, _: &Path) -> Result<Vec<Dirent>> {
+            Ok(Vec::new())
+        }
+        fn mkdir(&self, _: &Path) -> Result<()> {
+            Err(CortexError::ReadOnly)
+        }
+        fn unlink(&self, _: &Path) -> Result<()> {
+            Err(CortexError::ReadOnly)
+        }
+        fn rmdir(&self, _: &Path) -> Result<()> {
+            Err(CortexError::ReadOnly)
+        }
+        fn open(&self, _: &Path, _: OpenOptions) -> Result<(Self::Handle, Stat)> {
+            Err(CortexError::ReadOnly)
+        }
+    }
+
+    /// A backend that does not write gets `rename` for free, and the answer is
+    /// `EROFS` — per-request, unlike the `ENOSYS` a kernel reads as "this
+    /// filesystem cannot rename at all" and applies to the whole mount.
+    #[test]
+    fn a_backend_that_does_not_write_refuses_rename_without_implementing_it() {
+        let backend = ReadOnlyStub;
+
+        assert!(matches!(
+            Mountable::rename(&backend, Path::new("a"), Path::new("b")),
+            Err(CortexError::ReadOnly)
+        ));
+        // Through the erased face, which a mount table stores it as.
+        assert!(matches!(
+            DynMountable::rename(&backend, Path::new("a"), Path::new("b")),
+            Err(CortexError::ReadOnly)
+        ));
+        // And through a shared handle, which is how one store feeds two consumers.
+        assert!(matches!(
+            Mountable::rename(&Arc::new(ReadOnlyStub), Path::new("a"), Path::new("b")),
+            Err(CortexError::ReadOnly)
+        ));
+    }
+
+    /// One store, several owners.
+    ///
+    /// Necessary because every consumer takes its backend *by value* and offers no
+    /// way back — `PosixFs::new` has no accessor, and `Workspace::mount` boxes what
+    /// it is handed — so without this impl a store feeds exactly one consumer, and
+    /// nothing can serve a host mount and a WebDAV handler from the same workspace.
+    #[test]
+    fn an_arc_backend_is_mountable_and_shares_one_store() {
+        let vol = Arc::new(InMemVolume::new());
+
+        let (handle, _) = Mountable::open(
+            &vol,
+            Path::new("shared.txt"),
+            OpenOptions {
+                create_new: true,
+                ..OpenOptions::read_write()
+            },
+        )
+        .expect("fresh volume");
+        handle.write_all_at(b"once", 0).unwrap();
+
+        // Read back through a *different* clone: one store, not a copy per owner.
+        let other = Arc::clone(&vol);
+        let (handle, stat) =
+            Mountable::open(&other, Path::new("shared.txt"), OpenOptions::read_only())
+                .expect("every clone sees the same store");
+        assert_eq!(stat.size, 4);
+        let mut buf = [0u8; 4];
+        handle.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"once");
+    }
+
+    /// The blanket [`DynMountable`] impl reaches `Arc<T>` too, so a shared store can
+    /// go into a mount table *and* still be driven directly.
+    #[test]
+    fn an_arc_backend_is_also_dyn_mountable() {
+        let vol = Arc::new(InMemVolume::new());
+        Mountable::mkdir(&vol, Path::new("dir")).unwrap();
+
+        let ws = Workspace::new()
+            .try_with_mount("", Arc::clone(&vol))
+            .expect("Arc<InMemVolume> erases to DynMountable via the blanket impl");
+        assert_eq!(Mountable::list(&ws, Path::new("dir")).unwrap().len(), 0);
+
+        // The workspace shares the store rather than owning it: a write that
+        // bypasses the workspace is still visible through it.
+        Mountable::mkdir(&vol, Path::new("dir/deeper")).unwrap();
+        assert_eq!(Mountable::list(&ws, Path::new("dir")).unwrap().len(), 1);
     }
 }

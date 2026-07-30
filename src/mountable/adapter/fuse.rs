@@ -15,8 +15,8 @@ use std::path::{Path, PathBuf};
 
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    LockOwner, MountOption, OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyStatfs, Request,
+    LockOwner, MountOption, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
 use crate::mountable::Mountable;
@@ -153,9 +153,7 @@ fn to_file_attr(inode: u64, stat: &Stat) -> FileAttr {
 impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match self.lookup_child(parent.0, name) {
-            Ok((inode, stat)) => {
-                reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0))
-            }
+            Ok((inode, stat)) => reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0)),
             Err(err) => reply.error(to_errno(err)),
         }
     }
@@ -327,9 +325,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         reply: ReplyEntry,
     ) {
         match self.mkdir_child(parent.0, name) {
-            Ok((inode, stat)) => {
-                reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0))
-            }
+            Ok((inode, stat)) => reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0)),
             Err(err) => reply.error(to_errno(err)),
         }
     }
@@ -343,6 +339,32 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         match self.rmdir_child(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(err) => reply.error(to_errno(err)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` cannot be served: libfuse-t's
+        // `rename` takes no flags at all, so a contract carrying them would be
+        // unhonourable in one of the three bindings. EINVAL is Linux's own answer
+        // for a rename flag it does not implement, and unlike ENOSYS it does not
+        // make the kernel stop sending renames for the whole mount.
+        if !flags.is_empty() {
+            reply.error(Errno::from_i32(libc::EINVAL));
+            return;
+        }
+        match self.rename_child(parent.0, name, newparent.0, newname) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
         }

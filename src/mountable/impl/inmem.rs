@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Component, Path};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::lock::lock;
 use crate::{
@@ -40,28 +41,102 @@ fn checked_end(offset: u64, len: usize) -> Result<usize> {
     }
 }
 
-/// A file's byte buffer, shared between its tree node and every open handle.
-type FileData = Arc<Mutex<Vec<u8>>>;
+/// A file's bytes together with the moment they last changed.
+///
+/// The two live under one lock deliberately. An open [`InMemHandle`] shares only
+/// this body — it has no route to the tree node — so a file's mtime has to be
+/// reachable from here or a write could not advance it. And keeping them under
+/// *one* lock is what stops an observer seeing new bytes beside an old mtime: a
+/// guest that negotiated `AUTO_INVAL_DATA` decides from mtime alone when to drop
+/// cached pages, so that pairing would leave it caching the new bytes forever.
+struct FileBody {
+    bytes: Vec<u8>,
+    mtime: SystemTime,
+    /// Set once at creation. Nothing here changes a birth time.
+    created: SystemTime,
+}
+
+impl FileBody {
+    fn new(bytes: Vec<u8>) -> Self {
+        let now = SystemTime::now();
+        FileBody {
+            bytes,
+            mtime: now,
+            created: now,
+        }
+    }
+
+    /// Record that the bytes just changed. Under the caller's existing lock, so
+    /// the size and the timestamp become visible together.
+    fn touch(&mut self) {
+        self.mtime = SystemTime::now();
+    }
+
+    fn stat(&self) -> Stat {
+        // `atime`/`ctime` stay unset: `attr_for` falls back to `mtime` for both,
+        // and an access time would mean a write on every read.
+        Stat {
+            mtime: Some(self.mtime),
+            created: Some(self.created),
+            ..Stat::new(DirentKind::File, self.bytes.len() as u64)
+        }
+    }
+}
+
+/// A file's body, shared between its tree node and every open handle.
+type FileData = Arc<Mutex<FileBody>>;
 
 /// An interior-mutable link to a tree node, shared through the whole store.
 type Link = Arc<Mutex<Node>>;
 
 enum Node {
-    Dir { children: HashMap<String, Link> },
-    File { data: FileData },
+    /// A directory's mtime lives here rather than in a shared body: nothing but
+    /// the tree ever changes a directory, so there is no handle to reach it from.
+    Dir {
+        children: HashMap<String, Link>,
+        mtime: SystemTime,
+        created: SystemTime,
+    },
+    File {
+        data: FileData,
+    },
 }
 
 impl Node {
     fn new_dir() -> Link {
+        let now = SystemTime::now();
         Arc::new(Mutex::new(Node::Dir {
             children: HashMap::new(),
+            mtime: now,
+            created: now,
         }))
     }
 
-    fn new_file(data: Vec<u8>) -> Link {
+    fn new_file(bytes: Vec<u8>) -> Link {
         Arc::new(Mutex::new(Node::File {
-            data: Arc::new(Mutex::new(data)),
+            data: Arc::new(Mutex::new(FileBody::new(bytes))),
         }))
+    }
+
+    /// The metadata this node reports. The caller already holds its lock.
+    fn stat(&self) -> Stat {
+        match self {
+            Node::Dir { mtime, created, .. } => Stat {
+                mtime: Some(*mtime),
+                created: Some(*created),
+                ..Stat::new(DirentKind::Dir, 0)
+            },
+            Node::File { data } => lock(data).stat(),
+        }
+    }
+
+    /// Record that this directory's set of names just changed — a child added or
+    /// removed, which POSIX counts as modifying the directory itself. Writing a
+    /// child's *contents* does not.
+    fn touch_dir(&mut self) {
+        if let Node::Dir { mtime, .. } = self {
+            *mtime = SystemTime::now();
+        }
     }
 }
 
@@ -96,22 +171,24 @@ impl InMemVolume {
         let (parent, name) = split_last(&comps)?;
         let dir = self.navigate(parent)?;
         let mut node = lock(&dir);
-        let Node::Dir { children } = &mut *node else {
-            return Err(CortexError::NotADirectory);
-        };
-        // Scoped so the borrow of `children` ends before the removal.
+        // Scoped so the borrow of `children` ends before the removal — and before
+        // `touch_dir`, which needs the node back.
         {
+            let Node::Dir { children, .. } = &mut *node else {
+                return Err(CortexError::NotADirectory);
+            };
             let target = children.get(name).ok_or(CortexError::NotFound)?;
             match (&*lock(target), expect) {
-                (Node::Dir { children }, DirentKind::Dir) if !children.is_empty() => {
+                (Node::Dir { children, .. }, DirentKind::Dir) if !children.is_empty() => {
                     return Err(CortexError::NotEmpty);
                 }
                 (Node::Dir { .. }, DirentKind::File) => return Err(CortexError::IsADirectory),
                 (Node::File { .. }, DirentKind::Dir) => return Err(CortexError::NotADirectory),
                 _ => {}
             }
+            children.remove(name);
         }
-        children.remove(name);
+        node.touch_dir();
         Ok(())
     }
 
@@ -121,7 +198,7 @@ impl InMemVolume {
         let mut cur = self.root.clone();
         for name in comps {
             let next = match &*lock(&cur) {
-                Node::Dir { children } => {
+                Node::Dir { children, .. } => {
                     children.get(name).cloned().ok_or(CortexError::NotFound)?
                 }
                 Node::File { .. } => return Err(CortexError::NotADirectory),
@@ -144,14 +221,7 @@ impl Mountable for InMemVolume {
     fn stat(&self, path: &Path) -> Result<Stat> {
         let comps = components(path)?;
         let link = self.navigate(&comps)?;
-        let node = lock(&link);
-        match &*node {
-            Node::Dir { .. } => Ok(Stat::new(DirentKind::Dir, 0)),
-            Node::File { data } => {
-                let size = lock(data).len() as u64;
-                Ok(Stat::new(DirentKind::File, size))
-            }
-        }
+        Ok(lock(&link).stat())
     }
 
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
@@ -160,16 +230,11 @@ impl Mountable for InMemVolume {
         let node = lock(&link);
         match &*node {
             // The child's lock is already taken to learn its kind, and its size
-            // is right there behind it, so full metadata is free here.
-            Node::Dir { children } => Ok(children
+            // and timestamps are right there behind it, so full metadata is free
+            // here — a consumer that had to re-`stat` every name would pay an N+1.
+            Node::Dir { children, .. } => Ok(children
                 .iter()
-                .map(|(name, child)| match &*lock(child) {
-                    Node::Dir { .. } => Dirent::with_stat(name, Stat::new(DirentKind::Dir, 0)),
-                    Node::File { data } => Dirent::with_stat(
-                        name,
-                        Stat::new(DirentKind::File, lock(data).len() as u64),
-                    ),
-                })
+                .map(|(name, child)| Dirent::with_stat(name, lock(child).stat()))
                 .collect()),
             Node::File { .. } => Err(CortexError::NotADirectory),
         }
@@ -181,13 +246,17 @@ impl Mountable for InMemVolume {
         let dir = self.navigate(parent)?;
         let mut node = lock(&dir);
         match &mut *node {
-            Node::Dir { children } => match children.get(name) {
+            Node::Dir { children, .. } => match children.get(name) {
                 Some(existing) => match &*lock(existing) {
+                    // Idempotent, matching the platform backends. The workspace
+                    // above answers `AlreadyExists` for a *synthesized* directory,
+                    // which is a different question.
                     Node::Dir { .. } => Ok(()),
                     Node::File { .. } => Err(CortexError::AlreadyExists),
                 },
                 None => {
                     children.insert(name.clone(), Node::new_dir());
+                    node.touch_dir();
                     Ok(())
                 }
             },
@@ -203,6 +272,72 @@ impl Mountable for InMemVolume {
         self.remove(path, DirentKind::Dir)
     }
 
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let (from_comps, to_comps) = (components(from)?, components(to)?);
+
+        // Onto itself is a no-op, checked before anything is detached — POSIX says
+        // a rename where both names refer to the same file changes nothing, and
+        // going through the move would delete the entry and then re-add it.
+        if from_comps == to_comps {
+            return Ok(());
+        }
+        // Into its own descendant would detach the subtree from the tree, leaving a
+        // cycle reachable from nothing. `EINVAL`, as `fs::rename` gives.
+        if to_comps.starts_with(&from_comps) {
+            return Err(CortexError::InvalidArgument);
+        }
+
+        let (from_dir, from_name) = self.parent_of(from)?;
+        let (to_dir, to_name) = self.parent_of(to)?;
+
+        // Detach under the source parent's lock, then attach under the
+        // destination's. Taking both at once would deadlock whenever two renames
+        // crossed the same pair of directories in opposite directions.
+        let moving = {
+            let node = lock(&from_dir);
+            let Node::Dir { children, .. } = &*node else {
+                return Err(CortexError::NotADirectory);
+            };
+            children
+                .get(&from_name)
+                .cloned()
+                .ok_or(CortexError::NotFound)?
+        };
+        let moving_is_dir = matches!(&*lock(&moving), Node::Dir { .. });
+
+        // The destination decides whether this is legal at all, so it is checked
+        // before the source is detached: a refusal must leave the tree untouched.
+        {
+            let mut node = lock(&to_dir);
+            let Node::Dir { children, .. } = &mut *node else {
+                return Err(CortexError::NotADirectory);
+            };
+            if let Some(existing) = children.get(&to_name) {
+                match (&*lock(existing), moving_is_dir) {
+                    // A directory may only replace an *empty* directory.
+                    (Node::Dir { children, .. }, true) if !children.is_empty() => {
+                        return Err(CortexError::NotEmpty);
+                    }
+                    (Node::Dir { .. }, false) => return Err(CortexError::IsADirectory),
+                    (Node::File { .. }, true) => return Err(CortexError::NotADirectory),
+                    // file over file, or directory over empty directory: replaced.
+                    _ => {}
+                }
+            }
+            children.insert(to_name, Arc::clone(&moving));
+            node.touch_dir();
+        }
+
+        // Only now does the old name go. If the two parents are the same node this
+        // re-locks it, which is why the destination's guard is already released.
+        let mut node = lock(&from_dir);
+        if let Node::Dir { children, .. } = &mut *node {
+            children.remove(&from_name);
+        }
+        node.touch_dir();
+        Ok(())
+    }
+
     fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         options.validate()?;
 
@@ -212,29 +347,39 @@ impl Mountable for InMemVolume {
         let data = if options.create || options.create_new {
             let (dir, name) = self.parent_of(path)?;
             let mut node = lock(&dir);
-            let Node::Dir { children } = &mut *node else {
-                return Err(CortexError::NotADirectory);
+            let created;
+            let data = {
+                let Node::Dir { children, .. } = &mut *node else {
+                    return Err(CortexError::NotADirectory);
+                };
+                match children.get(&name) {
+                    Some(existing) => {
+                        if options.create_new {
+                            return Err(CortexError::AlreadyExists);
+                        }
+                        created = false;
+                        match &*lock(existing) {
+                            Node::File { data } => data.clone(),
+                            Node::Dir { .. } => return Err(CortexError::IsADirectory),
+                        }
+                    }
+                    None => {
+                        let file = Node::new_file(Vec::new());
+                        let data = match &*lock(&file) {
+                            Node::File { data } => data.clone(),
+                            Node::Dir { .. } => unreachable!("just built a file node"),
+                        };
+                        children.insert(name, file);
+                        created = true;
+                        data
+                    }
+                }
             };
-            match children.get(&name) {
-                Some(existing) => {
-                    if options.create_new {
-                        return Err(CortexError::AlreadyExists);
-                    }
-                    match &*lock(existing) {
-                        Node::File { data } => data.clone(),
-                        Node::Dir { .. } => return Err(CortexError::IsADirectory),
-                    }
-                }
-                None => {
-                    let file = Node::new_file(Vec::new());
-                    let data = match &*lock(&file) {
-                        Node::File { data } => data.clone(),
-                        Node::Dir { .. } => unreachable!("just built a file node"),
-                    };
-                    children.insert(name, file);
-                    data
-                }
+            // A new *name* modifies the directory; reusing an existing one does not.
+            if created {
+                node.touch_dir();
             }
+            data
         } else {
             let link = self.navigate(&components(path)?)?;
             match &*lock(&link) {
@@ -244,15 +389,18 @@ impl Mountable for InMemVolume {
         };
 
         // Truncate before the handle exists, so the metadata reported back is
-        // already that of the empty file.
-        let size = {
-            let mut bytes = lock(&data);
-            if options.truncate {
-                bytes.clear();
+        // already that of the empty file. `O_TRUNC` rides the open rather than
+        // arriving as its own call, so this is the second path to a resize and
+        // has to stamp the file like the first.
+        let stat = {
+            let mut body = lock(&data);
+            if options.truncate && !body.bytes.is_empty() {
+                body.bytes.clear();
+                body.touch();
             }
-            bytes.len() as u64
+            body.stat()
         };
-        Ok((InMemHandle { data }, Stat::new(DirentKind::File, size)))
+        Ok((InMemHandle { data }, stat))
     }
 }
 
@@ -265,13 +413,15 @@ pub struct InMemHandle {
 
 impl FileExt for InMemHandle {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        let data = lock(&self.data);
+        // No `touch`: a read is not a modification, and an access time would put a
+        // write on the read path for something `attr_for` already derives.
+        let body = lock(&self.data);
         let offset = offset as usize;
-        if offset >= data.len() {
+        if offset >= body.bytes.len() {
             return Ok(0);
         }
-        let n = (data.len() - offset).min(buf.len());
-        buf[..n].copy_from_slice(&data[offset..offset + n]);
+        let n = (body.bytes.len() - offset).min(buf.len());
+        buf[..n].copy_from_slice(&body.bytes[offset..offset + n]);
         Ok(n)
     }
 
@@ -280,11 +430,14 @@ impl FileExt for InMemHandle {
         // would honour it literally.
         let end = checked_end(offset, buf.len())
             .map_err(|_| io::Error::from(io::ErrorKind::FileTooLarge))?;
-        let mut data = lock(&self.data);
-        if end > data.len() {
-            data.resize(end, 0);
+        let mut body = lock(&self.data);
+        if end > body.bytes.len() {
+            body.bytes.resize(end, 0);
         }
-        data[end - buf.len()..end].copy_from_slice(buf);
+        body.bytes[end - buf.len()..end].copy_from_slice(buf);
+        // Under the same lock as the bytes, so no observer can pair the new
+        // contents with the old timestamp.
+        body.touch();
         Ok(buf.len())
     }
 }
@@ -293,7 +446,11 @@ impl FileHandle for InMemHandle {
     fn truncate(&self, size: u64) -> Result<()> {
         // Reaches the same `resize`, so it needs the same ceiling.
         let size = checked_end(size, 0)?;
-        lock(&self.data).resize(size, 0);
+        let mut body = lock(&self.data);
+        if body.bytes.len() != size {
+            body.bytes.resize(size, 0);
+            body.touch();
+        }
         Ok(())
     }
 }
@@ -327,271 +484,9 @@ fn split_last(comps: &[String]) -> Result<(&[String], &String)> {
     }
 }
 
+// Tests live beside this file rather than inside it: they had grown longer than
+// the implementation, so a reader opening it had to scroll past them to find the
+// code. They are still a child module, so private items stay reachable.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn names(vol: &InMemVolume, path: &str) -> Vec<String> {
-        let mut names: Vec<_> = vol
-            .list(Path::new(path))
-            .unwrap()
-            .iter()
-            .map(|e| e.name.clone())
-            .collect();
-        names.sort();
-        names
-    }
-
-    /// Create a file and fill it with `data` in one step.
-    fn write_file(vol: &InMemVolume, path: &str, data: &[u8]) {
-        let (handle, _) = vol
-            .open(
-                Path::new(path),
-                OpenOptions {
-                    create_new: true,
-                    ..OpenOptions::read_write()
-                },
-            )
-            .unwrap();
-        handle.write_all_at(data, 0).unwrap();
-    }
-
-    fn read_file(vol: &InMemVolume, path: &str) -> Vec<u8> {
-        let (handle, stat) = vol
-            .open(Path::new(path), OpenOptions::read_only())
-            .unwrap();
-        let mut buf = vec![0u8; stat.size as usize];
-        handle.read_exact_at(&mut buf, 0).unwrap();
-        buf
-    }
-
-    #[test]
-    fn create_read_list_unlink() {
-        let vol = InMemVolume::new();
-        vol.mkdir(Path::new("/sub")).unwrap();
-        write_file(&vol, "/hello.txt", b"world");
-        write_file(&vol, "/sub/inner", b"hi");
-
-        assert_eq!(read_file(&vol, "/hello.txt"), b"world");
-        assert_eq!(read_file(&vol, "/sub/inner"), b"hi");
-        assert_eq!(names(&vol, "/"), vec!["hello.txt", "sub"]);
-        assert_eq!(names(&vol, "/sub"), vec!["inner"]);
-
-        vol.unlink(Path::new("/hello.txt")).unwrap();
-        assert!(matches!(
-            vol.open(Path::new("/hello.txt"), OpenOptions::read_write()),
-            Err(CortexError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn positioned_writes_and_truncate_are_shared() {
-        let vol = InMemVolume::new();
-        write_file(&vol, "/f", b"world");
-
-        // A second handle sees writes made through the first, and both share the
-        // tree's buffer, so `stat` reflects the new size.
-        let (a, _) = vol.open(Path::new("/f"), OpenOptions::read_write()).unwrap();
-        let (b, _) = vol.open(Path::new("/f"), OpenOptions::read_write()).unwrap();
-        a.write_all_at(b"HELLO", 0).unwrap();
-        let mut buf = [0u8; 5];
-        b.read_exact_at(&mut buf, 0).unwrap();
-        assert_eq!(&buf, b"HELLO");
-
-        // Growth zero-fills; a positioned write past EOF extends the file.
-        a.write_all_at(b"!", 6).unwrap();
-        assert_eq!(read_file(&vol, "/f"), b"HELLO\0!");
-
-        a.truncate(3).unwrap();
-        assert_eq!(vol.stat(Path::new("/f")).unwrap().size, 3);
-        assert_eq!(read_file(&vol, "/f"), b"HEL");
-    }
-
-    #[test]
-    fn open_options_pin_the_creation_contract() {
-        let vol = InMemVolume::new();
-        let rw = OpenOptions::read_write();
-        let create = OpenOptions { create: true, ..rw };
-        let create_new = OpenOptions {
-            create_new: true,
-            ..create
-        };
-
-        // `open` reports the entry's metadata in the same call that hands out
-        // the handle: a FUSE `create` must answer with attributes *and* an `fh`
-        // in one message, and a follow-up `stat` would be both a second backend
-        // round trip and a window for the entry to be replaced underneath.
-        let (handle, stat) = vol.open(Path::new("/f"), create).unwrap();
-        assert_eq!(stat.kind, DirentKind::File);
-        assert_eq!(stat.size, 0);
-        handle.write_all_at(b"hello", 0).unwrap();
-
-        // `create` on something that already exists simply opens it.
-        let (_, stat) = vol.open(Path::new("/f"), create).unwrap();
-        assert_eq!(stat.size, 5);
-
-        // `create_new` is the exclusive one. This check has to belong to the
-        // backend: decomposing it into `stat`-then-create would be a race, and
-        // for a remote backend the atomic form is the only one that exists
-        // (a conditional PUT, `O_EXCL`) — which is why the options travel with
-        // the call instead of `create` being a separate operation.
-        assert!(matches!(
-            vol.open(Path::new("/f"), create_new),
-            Err(CortexError::AlreadyExists)
-        ));
-
-        // Truncation happens at open time, before the handle exists, so the
-        // metadata reported back already reflects it.
-        let (_, stat) = vol
-            .open(Path::new("/f"), OpenOptions { truncate: true, ..rw })
-            .unwrap();
-        assert_eq!(stat.size, 0);
-
-        // A missing parent is never created implicitly.
-        assert!(matches!(
-            vol.open(Path::new("/missing/f"), create_new),
-            Err(CortexError::NotFound)
-        ));
-
-        // Without `create`, `open` opens only what is already there.
-        assert!(matches!(
-            vol.open(Path::new("/nope"), rw),
-            Err(CortexError::NotFound)
-        ));
-
-        // A directory never becomes a file handle, whatever the options ask.
-        vol.mkdir(Path::new("/d")).unwrap();
-        assert!(matches!(
-            vol.open(Path::new("/d"), create),
-            Err(CortexError::IsADirectory)
-        ));
-
-        // `O_RDONLY | O_CREAT` is legal POSIX and stays legal here.
-        let (_, stat) = vol
-            .open(
-                Path::new("/ro"),
-                OpenOptions {
-                    create: true,
-                    ..OpenOptions::read_only()
-                },
-            )
-            .unwrap();
-        assert_eq!(stat.size, 0);
-
-        // Asking for neither read nor write leaves nothing the handle can do.
-        assert!(matches!(
-            vol.open(Path::new("/f"), OpenOptions::default()),
-            Err(CortexError::InvalidArgument)
-        ));
-    }
-
-    #[test]
-    fn absurd_offsets_are_refused_rather_than_allocated() {
-        let vol = InMemVolume::new();
-        let (handle, _) = vol.open(Path::new("/f"), OpenOptions { create_new: true, ..OpenOptions::read_write() }).unwrap();
-        handle.write_all_at(b"keep", 0).unwrap();
-
-        // virtio-fs caps the byte *count* at 1 MiB but passes the guest's
-        // `offset` through untouched, so the offset is attacker-controlled.
-        // Growing the buffer to meet it would abort the host process, and there
-        // is no `catch_unwind` between here and the virtio-fs worker thread.
-        let err = handle.write_at(b"x", 1 << 45).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
-
-        // Near the top of the range the `offset + len` addition itself wraps.
-        let err = handle.write_at(b"x", u64::MAX).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
-
-        // `truncate` reaches the same `resize`, so it needs the same guard.
-        assert!(matches!(
-            handle.truncate(1 << 45),
-            Err(CortexError::FileTooLarge)
-        ));
-
-        // A rejected call leaves the file exactly as it was.
-        assert_eq!(vol.stat(Path::new("/f")).unwrap().size, 4);
-        assert_eq!(read_file(&vol, "/f"), b"keep");
-
-        // A write that lands inside the limit still works.
-        handle.write_all_at(b"!", 4).unwrap();
-        assert_eq!(read_file(&vol, "/f"), b"keep!");
-    }
-
-    #[test]
-    fn unlink_takes_files_and_rmdir_takes_empty_directories() {
-        let vol = InMemVolume::new();
-        vol.mkdir(Path::new("/dir")).unwrap();
-        write_file(&vol, "/dir/child", b"x");
-        write_file(&vol, "/file", b"y");
-
-        // Each call refuses the other's kind, exactly as the two syscalls do.
-        assert!(matches!(
-            vol.unlink(Path::new("/dir")),
-            Err(CortexError::IsADirectory)
-        ));
-        assert!(matches!(
-            vol.rmdir(Path::new("/file")),
-            Err(CortexError::NotADirectory)
-        ));
-        // A directory with children is never discarded implicitly.
-        assert!(matches!(
-            vol.rmdir(Path::new("/dir")),
-            Err(CortexError::NotEmpty)
-        ));
-        assert_eq!(names(&vol, "/dir"), vec!["child"]);
-
-        // The `rm -rf` sequence a kernel actually sends: empty it, then drop it.
-        vol.unlink(Path::new("/dir/child")).unwrap();
-        vol.rmdir(Path::new("/dir")).unwrap();
-        assert!(matches!(
-            vol.stat(Path::new("/dir")),
-            Err(CortexError::NotFound)
-        ));
-
-        assert!(matches!(
-            vol.rmdir(Path::new("/dir")),
-            Err(CortexError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn kind_errors() {
-        let vol = InMemVolume::new();
-        vol.mkdir(Path::new("/dir")).unwrap();
-        write_file(&vol, "/file", b"x");
-
-        assert!(matches!(
-            vol.open(Path::new("/dir"), OpenOptions::read_write()),
-            Err(CortexError::IsADirectory)
-        ));
-        assert!(matches!(
-            vol.list(Path::new("/file")),
-            Err(CortexError::NotADirectory)
-        ));
-        assert!(matches!(
-            vol.mkdir(Path::new("/file")),
-            Err(CortexError::AlreadyExists)
-        ));
-        assert!(matches!(
-            vol.open(Path::new("/file"), OpenOptions { create_new: true, ..OpenOptions::read_write() }),
-            Err(CortexError::AlreadyExists)
-        ));
-    }
-
-    #[test]
-    fn missing_and_invalid_paths_rejected() {
-        let vol = InMemVolume::new();
-        assert!(matches!(
-            vol.stat(Path::new("/nope")),
-            Err(CortexError::NotFound)
-        ));
-        assert!(matches!(
-            vol.open(Path::new("/missing/deep"), OpenOptions { create_new: true, ..OpenOptions::read_write() }),
-            Err(CortexError::NotFound)
-        ));
-        assert!(matches!(
-            vol.mkdir(Path::new("/a/../b")),
-            Err(CortexError::InvalidName)
-        ));
-    }
-}
+#[path = "inmem_tests.rs"]
+mod tests;

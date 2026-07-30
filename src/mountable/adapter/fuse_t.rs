@@ -96,13 +96,13 @@ fn to_cortex_stat(inode: u64, stat: &Stat) -> CortexStat {
 
 /// Emits one directory entry, returning non-zero once the kernel's buffer is
 /// full. Implemented on the C side, which owns `fuse_add_direntry`'s accounting.
-type DirentSink =
-    unsafe extern "C" fn(*mut c_void, u64, *const c_char, u32, u64) -> c_int;
+type DirentSink = unsafe extern "C" fn(*mut c_void, u64, *const c_char, u32, u64) -> c_int;
 
 /// Mirror of `struct cortex_fuse_t_ops`. Field order is the contract.
 #[repr(C)]
 struct Ops {
-    lookup: unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut CortexStat) -> c_int,
+    lookup:
+        unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut CortexStat) -> c_int,
     getattr: unsafe extern "C" fn(*mut c_void, u64, *mut CortexStat) -> c_int,
     setattr:
         unsafe extern "C" fn(*mut c_void, u64, u64, c_int, u64, c_int, *mut CortexStat) -> c_int,
@@ -120,9 +120,11 @@ struct Ops {
     write: unsafe extern "C" fn(*mut c_void, u64, u64, u64, *const c_char) -> c_long,
     flush: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
     release: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
-    mkdir: unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut CortexStat) -> c_int,
+    mkdir:
+        unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut CortexStat) -> c_int,
     unlink: unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> c_int,
     rmdir: unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> c_int,
+    rename: unsafe extern "C" fn(*mut c_void, u64, *const c_char, u64, *const c_char) -> c_int,
     readdir: unsafe extern "C" fn(*mut c_void, u64, u64, *mut c_void, DirentSink) -> c_int,
     forget: unsafe extern "C" fn(*mut c_void, u64, u64),
     total_blocks: u64,
@@ -334,6 +336,22 @@ unsafe extern "C" fn rmdir<T: Mountable>(
     code(fs.rmdir_child(parent, name))
 }
 
+/// No flags parameter, because libfuse-t's `rename` has none — so
+/// `RENAME_NOREPLACE`/`RENAME_EXCHANGE` never reach this binding and there is
+/// nothing here to refuse. The two bindings that do receive them answer EINVAL.
+unsafe extern "C" fn rename<T: Mountable>(
+    fs: *mut c_void,
+    parent: u64,
+    name: *const c_char,
+    newparent: u64,
+    newname: *const c_char,
+) -> c_int {
+    let fs = unsafe { recover::<T>(fs) };
+    let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
+    let newname = OsStr::from_bytes(unsafe { CStr::from_ptr(newname) }.to_bytes());
+    code(fs.rename_child(parent, name, newparent, newname))
+}
+
 unsafe extern "C" fn readdir<T: Mountable>(
     fs: *mut c_void,
     inode: u64,
@@ -342,21 +360,23 @@ unsafe extern "C" fn readdir<T: Mountable>(
     emit: DirentSink,
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
-    code(fs.for_each_dirent(inode, offset, |child_inode, child, cursor| {
-        // An interior NUL cannot be handed to C, and cannot have come from a
-        // well-behaved backend either.
-        let name = CString::new(child.name.as_bytes()).map_err(|_| CortexError::InvalidName)?;
-        let stop = unsafe {
-            emit(
-                sink,
-                child_inode,
-                name.as_ptr(),
-                mode_for(child.kind),
-                cursor,
-            )
-        };
-        Ok(stop != 0)
-    }))
+    code(
+        fs.for_each_dirent(inode, offset, |child_inode, child, cursor| {
+            // An interior NUL cannot be handed to C, and cannot have come from a
+            // well-behaved backend either.
+            let name = CString::new(child.name.as_bytes()).map_err(|_| CortexError::InvalidName)?;
+            let stop = unsafe {
+                emit(
+                    sink,
+                    child_inode,
+                    name.as_ptr(),
+                    mode_for(child.kind),
+                    cursor,
+                )
+            };
+            Ok(stop != 0)
+        }),
+    )
 }
 
 unsafe extern "C" fn forget<T: Mountable>(fs: *mut c_void, inode: u64, nlookup: u64) {
@@ -379,6 +399,7 @@ fn ops_for<T: Mountable>() -> Ops {
         mkdir: mkdir::<T>,
         unlink: unlink::<T>,
         rmdir: rmdir::<T>,
+        rename: rename::<T>,
         readdir: readdir::<T>,
         forget: forget::<T>,
         total_blocks: TOTAL_BLOCKS,
@@ -454,9 +475,8 @@ impl FuseTMount {
         let fs_ptr = &*fs as *const PosixFs<T> as *mut c_void;
         let ops = ops_for::<T>();
 
-        let session = unsafe {
-            cortex_fuse_t_mount(c_mountpoint.as_ptr(), c_fsname.as_ptr(), fs_ptr, &ops)
-        };
+        let session =
+            unsafe { cortex_fuse_t_mount(c_mountpoint.as_ptr(), c_fsname.as_ptr(), fs_ptr, &ops) };
         if session.is_null() {
             return Err(CortexError::Io(io::Error::other(format!(
                 "FUSE-T could not mount {}: is fuse-t installed, and does the \
