@@ -34,7 +34,26 @@ libc = { version = "0.2", optional = true }
 tempfile = { version = "3", optional = true }
 
 [features]
-default = ["krun"]
+# Nothing by default. The crate's own layers — `Mountable`, `Workspace`, the
+# inode bookkeeping — need no dependencies at all, and each interface binding
+# brings a heavy one: enabling any by default charges every consumer for it.
+# Measured: bare cortex pulls 0 crates, `fuse-t` pulls 1, `krun` pulls 62 (the
+# whole VMM tree — vmm, devices, hvf, kernel, arch). A consumer that mounts over
+# HTTP has no reason to compile a hypervisor.
+#
+# Consequence worth knowing: a bare `cargo test` runs 79 of the unit tests, not
+# all of them, because a binding's tests only exist when its feature is on. No
+# default set fixes that — `fuse` and `fuse-t` are independent, so no single
+# configuration covers every binding. Full coverage is a sweep:
+#
+#   export PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig"
+#   for f in "" "--features krun" "--features fuse" "--features fuse-t" \
+#            "--features fuse-no-mount" "--features fuse,fuse-t" \
+#            "--features fuse,fuse-t,krun"; do cargo test $f --all-targets; done
+#
+# Editors default to no features too, so a binding shows as inactive code until
+# its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
+default = []
 # Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
 krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
 # Mount a cortex filesystem on the host through FUSE.
@@ -43,8 +62,11 @@ krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
 # `brew install --cask fuse-t`) or macFUSE; both export the libfuse2 mount ABI
 # fuser links against. FUSE-T ships `fuse-t.pc` rather than the `fuse.pc` that
 # fuser's macOS branch probes for, so point `PKG_CONFIG_PATH` at the shim in
-# `contrib/pkgconfig` (see `scripts/mount_fuse.sh`). Linux needs no provider —
-# fuser opens /dev/fuse directly.
+# `contrib/pkgconfig`:
+#
+#   PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig" cargo build --features fuse
+#
+# Linux needs no provider — fuser opens /dev/fuse directly.
 fuse = ["dep:fuser", "dep:libc"]
 # Mount on macOS through FUSE-T, which needs no kernel extension.
 #

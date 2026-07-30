@@ -17,7 +17,12 @@
 #include <sys/statvfs.h>
 
 /* Mirrors the Rust side's TTL. Spelled here rather than plumbed through the
- * vtable, because libfuse wants it as a double. */
+ * vtable, because libfuse wants it as a double.
+ *
+ * Two copies of one number, with nothing checking they agree: changing
+ * `posix::TTL` and not this leaves the FUSE-T mount caching for a different
+ * window than the other bindings, silently. Plumb it through
+ * `cortex_fuse_t_ops` if it ever needs to be configurable. */
 #define CORTEX_TTL 1.0
 
 struct session {

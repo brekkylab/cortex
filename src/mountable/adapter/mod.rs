@@ -16,6 +16,11 @@
 mod fuse;
 #[cfg(feature = "fuse-t")]
 mod fuse_t;
+// Gated like the others even though it exports nothing. A binding is a trait
+// impl, so the module declaration is the only thing pulling it in — and an
+// ungated one makes its foreign crate mandatory for every consumer, whether or
+// not they ever boot a VM.
+#[cfg(feature = "krun")]
 mod krun;
 
 #[cfg(feature = "fuse")]

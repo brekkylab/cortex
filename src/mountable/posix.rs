@@ -4,6 +4,24 @@
 //! tracks the kernel's per-inode reference counts. It carries no FUSE/`msb_krun`
 //! coupling of its own — a concrete filesystem binding (the sibling `krun`
 //! module) drives it.
+//!
+//! This layer exists *because* a kernel addresses files by number. A
+//! path-addressed consumer — [`Workspace`](crate::Workspace), or an HTTP binding
+//! whose verbs all carry paths — reaches [`Mountable`] directly and never comes
+//! through here. So with no kernel binding compiled in, nothing reads any of it.
+
+// Which items a build actually reads depends on which bindings are enabled, and
+// the subsets do not line up: with no kernel binding nothing here is read at all;
+// `unix_time` serves only the two bindings that fill a C `stat` (`fuser`'s
+// `FileAttr` carries `SystemTime` directly); `TTL` serves only the two that pass a
+// timeout through Rust (the FUSE-T shim spells the same value as `CORTEX_TTL`,
+// because libfuse-t wants a `double` on the reply path).
+//
+// Gating each item by the set of bindings that happens to want it would encode an
+// implementation detail that moves whenever a binding does — and would break the
+// tests, which exercise every item regardless of features. So the module opts out
+// wholesale, and coverage is what keeps it honest.
+#![allow(dead_code)]
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
