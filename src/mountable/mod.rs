@@ -23,6 +23,6 @@ mod r#trait;
 // own to export — the krun binding's belongs to `msb_krun`.
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
 pub use adapter::*;
-pub use posix::*;
 pub use r#impl::*;
+pub use posix::*;
 pub use r#trait::*;

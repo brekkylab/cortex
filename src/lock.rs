@@ -11,5 +11,7 @@ use std::sync::{Mutex, MutexGuard};
 /// lock guards a single insert/remove/resize, so a poisoned one means another
 /// thread panicked, not that the data is half-written.
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
