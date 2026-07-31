@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{Dirent, Result, CortexError, Mountable};
+use crate::{CortexError, Dirent, DirentKind, Mountable, Result, Stat};
 
 /// A volume backed by a real on-disk directory.
 pub struct PassthroughVolume {
@@ -46,6 +46,23 @@ impl PassthroughVolume {
 }
 
 impl Mountable for PassthroughVolume {
+    type Handle = fs::File;
+
+    fn stat(&self, path: &Path) -> Result<Stat> {
+        let real = self.real_path(path)?;
+        let meta = fs::symlink_metadata(&real)?;
+        let kind = if meta.is_dir() {
+            DirentKind::Dir
+        } else {
+            DirentKind::File
+        };
+        let mut stat = Stat::new(kind, meta.len());
+        stat.mtime = meta.modified().ok();
+        stat.atime = meta.accessed().ok();
+        stat.created = meta.created().ok();
+        Ok(stat)
+    }
+
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let real = self.real_path(path)?;
         if !fs::symlink_metadata(&real)?.is_dir() {
@@ -88,29 +105,22 @@ impl Mountable for PassthroughVolume {
         Ok(())
     }
 
-    fn read(&self, path: &Path) -> Result<Vec<u8>> {
+    fn open(&self, path: &Path) -> Result<Self::Handle> {
         let real = self.real_path(path)?;
         if fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::IsADirectory);
         }
-        Ok(fs::read(&real)?)
-    }
-
-    fn write(&self, path: &Path, data: &[u8]) -> Result<()> {
-        let real = self.real_path(path)?;
-        if let Ok(meta) = fs::symlink_metadata(&real) {
-            if meta.is_dir() {
-                return Err(CortexError::IsADirectory);
-            }
-        }
-        fs::write(&real, data)?;
-        Ok(())
+        // Open for positioned reads and writes. Creation of new files is a
+        // separate concern (a future FUSE `create`), so a missing path surfaces
+        // as `NotFound` rather than being created here.
+        Ok(fs::OpenOptions::new().read(true).write(true).open(&real)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{FileExt, FileHandle};
 
     /// Create a unique scratch directory under the system temp dir without
     /// pulling in extra crates.
@@ -126,7 +136,7 @@ mod tests {
         dir
     }
 
-    fn names(vol: &dyn Mountable, path: &str) -> Vec<String> {
+    fn names(vol: &dyn Mountable<Handle = fs::File>, path: &str) -> Vec<String> {
         let mut names: Vec<_> = vol
             .list(Path::new(path))
             .unwrap()
@@ -138,22 +148,36 @@ mod tests {
     }
 
     #[test]
-    fn write_read_list_unlink() {
+    fn stat_open_read_write() {
         let base = scratch("rwlu");
         let vol = PassthroughVolume::new(&base);
 
         vol.mkdir(Path::new("sub")).unwrap();
-        vol.write(Path::new("hello.txt"), b"world").unwrap();
-        vol.write(Path::new("sub/inner"), b"hi").unwrap();
+        // Files are created out-of-band (the volume has no `create` yet), then
+        // driven through its handle.
+        fs::write(base.join("hello.txt"), b"world").unwrap();
 
-        assert_eq!(vol.read(Path::new("hello.txt")).unwrap(), b"world");
-        assert_eq!(vol.read(Path::new("sub/inner")).unwrap(), b"hi");
+        let st = vol.stat(Path::new("hello.txt")).unwrap();
+        assert_eq!(st.kind, DirentKind::File);
+        assert_eq!(st.size, 5);
+        assert_eq!(vol.stat(Path::new("sub")).unwrap().kind, DirentKind::Dir);
+
+        // Positioned read through the open handle.
+        let handle = vol.open(Path::new("hello.txt")).unwrap();
+        let mut buf = [0u8; 5];
+        handle.read_exact_at(&mut buf, 0).unwrap();
+        assert_eq!(&buf, b"world");
+
+        // Positioned write, then truncate, both observable on disk.
+        handle.write_all_at(b"HELLO", 0).unwrap();
+        handle.truncate(3).unwrap();
+        assert_eq!(fs::read(base.join("hello.txt")).unwrap(), b"HEL");
+
         assert_eq!(names(&vol, ""), vec!["hello.txt", "sub"]);
-        assert_eq!(names(&vol, "sub"), vec!["inner"]);
 
         vol.unlink(Path::new("hello.txt")).unwrap();
         assert!(matches!(
-            vol.read(Path::new("hello.txt")),
+            vol.stat(Path::new("hello.txt")),
             Err(CortexError::NotFound)
         ));
 
@@ -165,14 +189,10 @@ mod tests {
         let base = scratch("kind");
         let vol = PassthroughVolume::new(&base);
         vol.mkdir(Path::new("dir")).unwrap();
-        vol.write(Path::new("file"), b"x").unwrap();
+        fs::write(base.join("file"), b"x").unwrap();
 
         assert!(matches!(
-            vol.read(Path::new("dir")),
-            Err(CortexError::IsADirectory)
-        ));
-        assert!(matches!(
-            vol.write(Path::new("dir"), b"y"),
+            vol.open(Path::new("dir")),
             Err(CortexError::IsADirectory)
         ));
         assert!(matches!(
@@ -192,7 +212,7 @@ mod tests {
         let base = scratch("escape");
         let vol = PassthroughVolume::new(&base);
         assert!(matches!(
-            vol.read(Path::new("../secret")),
+            vol.open(Path::new("../secret")),
             Err(CortexError::InvalidName)
         ));
         fs::remove_dir_all(&base).unwrap();
