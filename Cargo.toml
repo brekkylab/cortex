@@ -8,6 +8,8 @@ name = "apply_krun"
 required-features = ["krun"]
 
 [dependencies]
+serde_json = "1"
+
 # The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
 # `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
 # backend to the guest — the one thing the upstream libkrun C API and the
