@@ -57,34 +57,6 @@ impl InMemVolume {
         }
     }
 
-    /// Create an empty file at `path` and return a handle to it. The parent must
-    /// exist as a directory, and nothing may already occupy `path`.
-    ///
-    /// This is the in-memory stand-in for a FUSE `create`: the trait's
-    /// [`open`](Mountable::open) only opens files that already exist, so this is
-    /// how bytes first enter the store.
-    pub fn create(&self, path: &Path) -> Result<InMemHandle> {
-        let comps = components(path)?;
-        let (parent, name) = split_last(&comps)?;
-        let dir = self.navigate(parent)?;
-        let mut node = dir.lock().unwrap();
-        match &mut *node {
-            Node::Dir { children } => {
-                if children.contains_key(name) {
-                    return Err(CortexError::AlreadyExists);
-                }
-                let file = Node::new_file(Vec::new());
-                let data = match &*file.lock().unwrap() {
-                    Node::File { data } => data.clone(),
-                    Node::Dir { .. } => unreachable!("just built a file node"),
-                };
-                children.insert(name.clone(), file);
-                Ok(InMemHandle { data })
-            }
-            Node::File { .. } => Err(CortexError::NotADirectory),
-        }
-    }
-
     /// Walk from the root to the node addressed by `comps`. Every intermediate
     /// component must be a directory.
     fn navigate(&self, comps: &[String]) -> Result<Link> {
@@ -181,6 +153,28 @@ impl Mountable for InMemVolume {
         match &*node {
             Node::File { data } => Ok(InMemHandle { data: data.clone() }),
             Node::Dir { .. } => Err(CortexError::IsADirectory),
+        }
+    }
+
+    fn create(&self, path: &Path) -> Result<Self::Handle> {
+        let comps = components(path)?;
+        let (parent, name) = split_last(&comps)?;
+        let dir = self.navigate(parent)?;
+        let mut node = dir.lock().unwrap();
+        match &mut *node {
+            Node::Dir { children } => {
+                if children.contains_key(name) {
+                    return Err(CortexError::AlreadyExists);
+                }
+                let file = Node::new_file(Vec::new());
+                let data = match &*file.lock().unwrap() {
+                    Node::File { data } => data.clone(),
+                    Node::Dir { .. } => unreachable!("just built a file node"),
+                };
+                children.insert(name.clone(), file);
+                Ok(InMemHandle { data })
+            }
+            Node::File { .. } => Err(CortexError::NotADirectory),
         }
     }
 }
