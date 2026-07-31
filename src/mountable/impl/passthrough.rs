@@ -110,10 +110,19 @@ impl Mountable for PassthroughVolume {
         if fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::IsADirectory);
         }
-        // Open for positioned reads and writes. Creation of new files is a
-        // separate concern (a future FUSE `create`), so a missing path surfaces
-        // as `NotFound` rather than being created here.
+        // Open for positioned reads and writes. Creating a missing file is
+        // `create`, not `open`, so a missing path surfaces as `NotFound` here.
         Ok(fs::OpenOptions::new().read(true).write(true).open(&real)?)
+    }
+
+    fn create(&self, path: &Path) -> Result<Self::Handle> {
+        let real = self.real_path(path)?;
+        // `create_new`: parent must exist, a clash is `AlreadyExists`.
+        Ok(fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&real)?)
     }
 }
 

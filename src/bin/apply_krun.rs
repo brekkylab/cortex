@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cortex::{FileExt, InMemVolume, PosixAdapter, Workspace};
+use cortex::{FileExt, InMemVolume, Mountable, PosixAdapter, Workspace};
 use msb_krun::VmBuilder;
 
 /// What the guest reads out of `/mnt/hello.txt`.

@@ -127,7 +127,23 @@ impl Mountable for Workspace {
 
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let (backend, sub) = self.resolve(path)?;
-        backend.list(&sub)
+        let mut entries = backend.list(&sub)?;
+
+        // Surface mount points directly under `path` as directories, so a
+        // listing reveals mounted backends (a backend can't see the table).
+        let base = normalize(path)?;
+        for key in self.mounts.keys() {
+            if let Ok(rest) = key.strip_prefix(&base) {
+                let mut c = rest.components();
+                if let (Some(Component::Normal(name)), None) = (c.next(), c.next()) {
+                    let name = name.to_string_lossy().into_owned();
+                    if !entries.iter().any(|e| e.name() == name) {
+                        entries.push(Dirent::Dir(name));
+                    }
+                }
+            }
+        }
+        Ok(entries)
     }
 
     fn mkdir(&self, path: &Path) -> Result<()> {
@@ -144,13 +160,34 @@ impl Mountable for Workspace {
         let (backend, sub) = self.resolve(path)?;
         backend.open(&sub)
     }
+
+    fn create(&self, path: &Path) -> Result<Self::Handle> {
+        let (backend, sub) = self.resolve(path)?;
+        backend.create(&sub)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{DirentKind, FileExt, PassthroughVolume};
+    use crate::{DirentKind, FileExt, InMemVolume, PassthroughVolume};
     use std::fs;
+
+    #[test]
+    fn list_surfaces_mount_points() {
+        let ws = Workspace::new()
+            .try_with_mount("", InMemVolume::new())
+            .unwrap()
+            .try_with_mount("skills", InMemVolume::new())
+            .unwrap();
+        // Root lists the mounted `skills` dir even though the root backend is empty.
+        let names: Vec<String> = Mountable::list(&ws, Path::new(""))
+            .unwrap()
+            .iter()
+            .map(|e| e.name().to_string())
+            .collect();
+        assert!(names.contains(&"skills".to_string()));
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let mut dir = std::env::temp_dir();

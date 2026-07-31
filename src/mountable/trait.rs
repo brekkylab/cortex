@@ -49,6 +49,10 @@ pub trait Mountable: Send + Sync {
 
     /// Open the file at `path` for I/O.
     fn open(&self, path: &Path) -> Result<Self::Handle>;
+
+    /// Create a new empty file at `path` and open it. Parent must exist; errors
+    /// `AlreadyExists` if occupied. The FUSE `create` (`open` = existing only).
+    fn create(&self, path: &Path) -> Result<Self::Handle>;
 }
 
 /// The object-safe face of [`Mountable`].
@@ -77,6 +81,9 @@ pub trait DynMountable: Send + Sync {
     /// See [`Mountable::open`], with the concrete handle boxed behind a trait
     /// object.
     fn open(&self, path: &Path) -> Result<Box<dyn FileHandle>>;
+
+    /// See [`Mountable::create`], with the concrete handle boxed.
+    fn create(&self, path: &Path) -> Result<Box<dyn FileHandle>>;
 }
 
 /// Every [`Mountable`] is a [`DynMountable`] once its handle is boxed. The
@@ -104,6 +111,10 @@ where
 
     fn open(&self, path: &Path) -> Result<Box<dyn FileHandle>> {
         Ok(Box::new(Mountable::open(self, path)?))
+    }
+
+    fn create(&self, path: &Path) -> Result<Box<dyn FileHandle>> {
+        Ok(Box::new(Mountable::create(self, path)?))
     }
 }
 
