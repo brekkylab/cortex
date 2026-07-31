@@ -1,3 +1,25 @@
 /target
 # Local microVM assets (rootfs, kernels) — large, machine-specific, not committed.
 /data
+
+# rustfmt backups
+**/*.rs.bk
+
+# MSVC debug info
+*.pdb
+
+# cargo mutants
+**/mutants.out*/
+
+# rustc ICE dumps
+rustc-ice-*.txt
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Local tooling
+.omc
+
+# Generated docs write-ups (not versioned)
+docs/
