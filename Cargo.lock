@@ -257,6 +257,7 @@ dependencies = [
  "msb_krun",
  "object_store",
  "pkg-config",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
@@ -379,6 +380,14 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "exec-server"
+version = "0.1.0"
+dependencies = [
+ "cortex",
+ "wsx",
 ]
 
 [[package]]
@@ -842,9 +851,9 @@ dependencies = [
 
 [[package]]
 name = "ipnet"
-version = "2.12.0"
+version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+checksum = "6a756c3fac73139e83f14c2d742155dd2b78d3ee56597b419a0579b7bdd6dd78"
 
 [[package]]
 name = "itertools"
@@ -2613,6 +2622,13 @@ name = "writeable"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+
+[[package]]
+name = "wsx"
+version = "0.1.0"
+dependencies = [
+ "cortex",
+]
 
 [[package]]
 name = "yoke"

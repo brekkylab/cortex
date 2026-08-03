@@ -1,0 +1,12 @@
+[package]
+name = "exec-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cortex = { path = "..", default-features = false }
+
+[dev-dependencies]
+# The forwarding integration test spawns the exec-server binary and drives it
+# with the guest client from `wsx`.
+wsx = { path = "../wsx" }

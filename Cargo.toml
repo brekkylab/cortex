@@ -25,6 +25,8 @@ cc = "1"
 pkg-config = "0.3"
 
 [dependencies]
+serde_json = "1"
+
 # The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
 # `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
 # backend to the guest — the one thing the upstream libkrun C API and the
@@ -110,3 +112,6 @@ fuse-t = ["dep:libc"]
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.
 fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
 s3 = ["dep:object_store", "dep:tokio"]
+
+[workspace]
+members = ["exec-server", "wsx"]
