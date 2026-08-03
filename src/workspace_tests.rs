@@ -159,7 +159,11 @@ fn listing(ws: &Workspace, at: &str) -> Vec<(String, DirentKind, bool)> {
     Mountable::list(ws, Path::new(at))
         .unwrap()
         .into_iter()
-        .map(|d| (d.name, d.kind, d.stat.is_some()))
+        // `stat()` borrows, so it has to be read before `name` is moved out.
+        .map(|d| {
+            let carries_metadata = d.stat().is_some();
+            (d.name, d.kind, carries_metadata)
+        })
         .collect()
 }
 

@@ -3,6 +3,29 @@ use std::sync::Arc;
 
 use crate::{CortexError, InMemVolume, Workspace};
 
+/// A `Dirent` cannot claim one kind and carry metadata saying another.
+///
+/// `kind` exists twice — once on the entry, once inside its [`Stat`] — so the only
+/// thing keeping them honest is that `with_stat` derives one from the other. That is
+/// why `stat` is not a public field: with one, `Dirent { kind: Dir, stat: <a file's>
+/// }` would compile, and nothing would be wrong until a kernel believed it.
+#[test]
+fn an_entry_takes_its_kind_from_the_metadata_it_carries() {
+    let carried = Dirent::with_stat("d", Stat::new(DirentKind::Dir, 0));
+    assert_eq!(carried.kind, DirentKind::Dir);
+    assert_eq!(
+        carried.stat().expect("metadata was given").kind,
+        carried.kind,
+        "the entry's kind and its metadata's kind are the same fact"
+    );
+
+    // And an entry the listing knew nothing about says so, rather than inventing a
+    // `Stat` whose fields would all be guesses.
+    let bare = Dirent::new("f", DirentKind::File);
+    assert_eq!(bare.kind, DirentKind::File);
+    assert!(bare.stat().is_none());
+}
+
 /// Stands in for a read-only source whose author never writes a `rename`. Its
 /// whole job is to pin what those get for free, so it must never grow an override.
 struct ReadOnlyStub;

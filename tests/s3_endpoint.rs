@@ -171,8 +171,7 @@ fn find_a_file(vol: &S3Volume, at: &Path, depth: usize) -> Option<(std::path::Pa
         if entry.kind == DirentKind::File {
             let path = at.join(&entry.name);
             let size = entry
-                .stat
-                .as_ref()
+                .stat()
                 .map(|s| s.size)
                 .unwrap_or_else(|| vol.stat(&path).expect("stat").size);
             // Keep looking rather than read something the assertions cannot hold, or

@@ -66,8 +66,8 @@ fn a_listing_reports_kinds_but_not_metadata() {
 
     // The size is not: that is an `lstat` per entry, which `ls` never asked for.
     // The opposite of an object store, whose listing already carries it.
-    assert!(dir.stat.is_none());
-    assert!(file.stat.is_none());
+    assert!(dir.stat().is_none());
+    assert!(file.stat().is_none());
     assert_eq!(vol.stat(Path::new("f")).unwrap().size, 5);
 
     fs::remove_dir_all(&base).unwrap();

@@ -318,12 +318,12 @@ fn a_listing_carries_metadata_when_the_backend_had_it() {
         .iter()
         .find(|(_, c)| c.name == "greeting.txt")
         .unwrap();
-    let stat = file.1.stat.as_ref().expect("in-memory listing knows sizes");
+    let stat = file.1.stat().expect("in-memory listing knows sizes");
     assert_eq!(stat.size, CONTENT.len() as u64);
     assert_eq!(stat.kind, DirentKind::File);
 
     // The dots are synthesized, not backend entries.
-    assert!(entries[0].1.stat.is_none());
+    assert!(entries[0].1.stat().is_none());
 }
 
 #[test]

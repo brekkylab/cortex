@@ -500,10 +500,7 @@ fn a_listing_carries_metadata_it_already_had() {
         .iter()
         .find(|e| e.name == "a.txt")
         .expect("a.txt listed");
-    let stat = file
-        .stat
-        .as_ref()
-        .expect("S-4: stat filled from the listing");
+    let stat = file.stat().expect("S-4: stat filled from the listing");
     assert_eq!(stat.size, 5);
     assert!(stat.mtime.is_some());
     assert!(stat.etag.is_some());
@@ -520,7 +517,7 @@ fn a_listed_directory_carries_no_metadata() {
         .into_iter()
         .find(|e| e.name == "dir")
         .expect("dir listed");
-    assert!(dir.stat.is_none());
+    assert!(dir.stat().is_none());
 }
 
 /// A folder marker surfaces as an object *at its own level* — the key equals the

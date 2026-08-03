@@ -18,7 +18,13 @@ pub struct Dirent {
     /// round trip (a FUSE `readdirplus`, a WebDAV `PROPFIND Depth: 1`). A local
     /// directory read yields names and `d_type` only, so `Some` there would mean
     /// an `lstat` per entry that a plain `ls` never asked for.
-    pub stat: Option<Stat>,
+    ///
+    /// Private, unlike the two fields above, because it is the one that can
+    /// contradict them: `kind` also lives inside a [`Stat`], so a public field
+    /// would let the two disagree. [`with_stat`](Self::with_stat) is the only way
+    /// to set it and takes `kind` *from* the stat, which is what makes the
+    /// disagreement unrepresentable rather than merely undocumented.
+    stat: Option<Stat>,
 }
 
 impl Dirent {
@@ -38,6 +44,14 @@ impl Dirent {
             kind: stat.kind,
             stat: Some(stat),
         }
+    }
+
+    /// The metadata the listing came with, if it came with any.
+    ///
+    /// `None` is not "unknown to the backend" — it is "not free from the listing".
+    /// A consumer that needs it anyway asks [`Mountable::stat`], and pays for it.
+    pub fn stat(&self) -> Option<&Stat> {
+        self.stat.as_ref()
     }
 }
 

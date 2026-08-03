@@ -29,7 +29,9 @@ fn a_new_entry_reports_a_real_timestamp() {
     // A listing carries each entry's own timestamp — free, since it already locks
     // every child for its kind, and an N+1 otherwise.
     for entry in vol.list(Path::new("")).unwrap() {
-        let stat = entry.stat.expect("the in-memory listing carries metadata");
+        let stat = entry
+            .stat()
+            .expect("the in-memory listing carries metadata");
         assert!(
             stat.mtime.is_some_and(|m| m >= started),
             "{} has no usable mtime",
