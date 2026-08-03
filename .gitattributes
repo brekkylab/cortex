@@ -1,0 +1,8 @@
+# `Cargo.lock` is 2752 lines of resolver output, and a feature that pulls an HTTP and
+# TLS stack moves most of them. Marking it generated collapses it in GitHub's diff by
+# default, so it stops burying the files a reviewer actually has to read. It stays in
+# the diff and expands on request.
+#
+# Deliberately not `-diff`, which would treat it as binary: when a dependency moves,
+# being able to see *which* one is the whole point of committing the file.
+Cargo.lock linguist-generated=true
