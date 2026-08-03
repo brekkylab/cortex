@@ -55,10 +55,10 @@ tokio = { version = "1", features = [
 ], optional = true }
 
 [features]
-# Nothing by default. The crate's own layers — `Mountable`, `Workspace`, the
-# inode bookkeeping — need no dependencies at all, and each interface binding
-# brings a heavy one: enabling any by default charges every consumer for it.
-# A consumer that mounts over HTTP has no reason to compile a hypervisor.
+# No *binding* by default. The crate's own layers — `Mountable`, `Workspace`, the
+# inode bookkeeping — need nothing, and each interface binding brings a heavy
+# dependency: enabling any by default charges every consumer for it. A consumer
+# that mounts over HTTP has no reason to compile a hypervisor.
 #
 # Measured with
 #
@@ -66,9 +66,15 @@ tokio = { version = "1", features = [
 #       | sed 's/ (\*)$//' | sort -u | wc -l
 #
 # (normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
-# counted): bare cortex 0, `fuse-t` 1, `fuse` 34, `krun` 65, `s3` 131 — `krun`
+# counted): bare cortex 5, `fuse-t` 6, `fuse` 38, `krun` 70, `s3` 131 — `krun`
 # being the whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP and
 # TLS stack under `object_store`.
+#
+# The bare 5 are `serde_json` and its own (itoa, memchr, serde_core, zmij), which
+# `Executable`/`wire` need unconditionally. That is the one thing every consumer
+# pays for whether or not it ever serializes a tool call — gating it would mean
+# gating `executable`, `wire` and `demo` behind a feature, which is a design
+# question for whoever owns those rather than something this branch decided.
 #
 # Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
 # because a binding's tests only exist when its feature is on. No default set fixes
