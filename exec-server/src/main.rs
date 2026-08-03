@@ -17,7 +17,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 
-use cortex::{Bin, ExecOutput, ExecRequest, InMemVolume, PassthroughVolume, Workspace};
+use cortex_fs::{Bin, ExecOutput, ExecRequest, InMemVolume, PassthroughVolume, Workspace};
 
 fn main() -> std::io::Result<()> {
     let addr = std::env::var("WSX_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());

@@ -15,7 +15,7 @@ PROFILE_DIR="debug"
 BIN="target/${PROFILE_DIR}/apply_krun"
 
 echo "==> building apply_krun"
-cargo build --features krun --bin apply_krun "$@"
+cargo build -p cortex-fs --features krun --bin apply_krun "$@"
 
 echo "==> codesigning with hypervisor entitlement"
 codesign --entitlements macos-entitlements.plist -s - --force "$BIN"

@@ -22,7 +22,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use cortex::{FileExt, InMemVolume, Mountable, PosixAdapter, Workspace};
+use cortex_fs::{FileExt, InMemVolume, Mountable, PosixAdapter, Workspace};
 use msb_krun::VmBuilder;
 
 /// What the guest reads out of `/mnt/hello.txt`.
@@ -166,7 +166,7 @@ fn build_workspace() -> Workspace {
 /// mount -t virtiofs cortex /mnt && cat /mnt/hello.txt
 /// ```
 ///
-/// [`Workspace`] is a path-addressed [`Mountable`](cortex::Mountable) backend;
+/// [`Workspace`] is a path-addressed [`Mountable`](cortex_fs::Mountable) backend;
 /// [`PosixAdapter`] wraps it into the FUSE-shaped
 /// `Box<dyn DynFileSystem + Send + Sync>` that `FsBuilder::custom` attaches to
 /// the guest — so the workspace is served straight from this process, no daemon,

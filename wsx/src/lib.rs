@@ -8,7 +8,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 
-use cortex::{ExecOutput, ExecRequest};
+use cortex_fs::{ExecOutput, ExecRequest};
 
 /// POST `req` to the forward-server at `addr`, returning its [`ExecOutput`].
 /// A non-200 status becomes an `Err` carrying the status and message body.

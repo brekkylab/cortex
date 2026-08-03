@@ -9,7 +9,7 @@ use std::process::{Child, Command};
 use std::thread::sleep;
 use std::time::Duration;
 
-use cortex::ExecRequest;
+use cortex_fs::ExecRequest;
 use wsx::post;
 
 fn free_port() -> u16 {

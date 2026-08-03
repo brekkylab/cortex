@@ -1,0 +1,10 @@
+[package]
+name = "cortex-console-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+# The stdio protocol is JSON, so both are unconditional.
+serde = { workspace = true }
+serde_json = { workspace = true }

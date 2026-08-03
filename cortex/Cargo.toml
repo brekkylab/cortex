@@ -1,0 +1,15 @@
+[package]
+name = "cortex"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+futures-core = { workspace = true }
+libc = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["fs", "process", "rt", "time"] }
+
+[features]
+default = []
+# Run commands inside a libkrun microVM instead of on the host terminal.
+mvm = ["dep:libc"]

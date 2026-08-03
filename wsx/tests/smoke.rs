@@ -7,7 +7,7 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::thread;
 
-use cortex::ExecOutput;
+use cortex_fs::ExecOutput;
 
 #[test]
 fn wsx_forwards_and_replays_output() {

@@ -10,7 +10,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use cortex::ExecRequest;
+use cortex_fs::ExecRequest;
 use wsx::post;
 
 fn main() -> ExitCode {

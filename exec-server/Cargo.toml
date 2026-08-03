@@ -1,10 +1,10 @@
 [package]
 name = "exec-server"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-cortex = { path = "..", default-features = false }
+cortex-fs = { workspace = true }
 
 [dev-dependencies]
 # The forwarding integration test spawns the exec-server binary and drives it

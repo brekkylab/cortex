@@ -1,27 +1,34 @@
-[package]
-name = "cortex"
+[workspace]
+resolver = "3"
+members = [
+    "cortex-fs",
+    "cortex",
+    "cortex-console-server",
+    "cortex-local-console-server",
+    "cortex-uvm-console-server",
+    "exec-server",
+    "wsx",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "apply_krun"
-required-features = ["krun"]
-
-[dependencies]
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+cortex = { path = "cortex", default-features = false }
+cortex-console-server = { path = "cortex-console-server" }
+cortex-fs = { path = "cortex-fs", default-features = false }
+futures-core = "0.3"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
+tokio = "1"
 
 # The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
 # `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
 # backend to the guest — the one thing the upstream libkrun C API and the
 # high-level microsandbox SDK do not offer.
-msb_krun = { version = "0.1", optional = true }
-libc = { version = "0.2", optional = true }
-tempfile = { version = "3", optional = true }
-
-[features]
-default = ["krun"]
-# Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
-krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
-
-[workspace]
-members = ["exec-server", "wsx"]
+msb_krun = "0.1"
