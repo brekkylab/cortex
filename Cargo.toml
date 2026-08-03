@@ -15,6 +15,12 @@ required-features = ["fuse"]
 name = "mount_fuse_t"
 required-features = ["fuse-t"]
 
+# Measures the read sizes a kernel asks for, for the S3 read-ahead window
+# (.omc/specs/cortex-s3-readonly.md P5).
+[[example]]
+name = "measure_read_sizes"
+required-features = ["fuse-t"]
+
 [build-dependencies]
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.
@@ -32,6 +38,22 @@ msb_krun = { version = "0.1", optional = true }
 fuser = { version = "0.17", optional = true }
 libc = { version = "0.2", optional = true }
 tempfile = { version = "3", optional = true }
+# A read-only S3 backend. `default-features = false` on purpose: the default set
+# is `["fs"]`, which is object_store's *own* local-filesystem store and drags in
+# walkdir/nix/same-file for a thing we already have in `PassthroughVolume`. The
+# `memory` module is ungated, so the in-memory store the tests build on survives.
+object_store = { version = "0.14", default-features = false, features = [
+    "aws",
+], optional = true }
+# `net` and `time` are named rather than left to feature unification, because
+# `Builder::enable_all` is cfg'd on exactly those two: with only `rt-multi-thread`
+# it still compiles and silently enables neither, leaving the runtime with no I/O
+# driver. Today reqwest happens to turn them on; that is not something to depend on.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+], optional = true }
 
 [features]
 # Nothing by default. The crate's own layers — `Mountable`, `Workspace`, the
@@ -45,18 +67,22 @@ tempfile = { version = "3", optional = true }
 #       | sed 's/ (\*)$//' | sort -u | wc -l
 #
 # (normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
-# counted): bare cortex 0, `fuse-t` 1, `fuse` 34, `krun` 65 — the last being the
-# whole VMM tree (vmm, devices, hvf, kernel, arch).
+# counted): bare cortex 0, `fuse-t` 1, `fuse` 34, `krun` 65, `s3` 131 — `krun`
+# being the whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP and
+# TLS stack under `object_store`.
 #
-# Consequence worth knowing: a bare `cargo test` runs 79 of the unit tests, not
-# all of them, because a binding's tests only exist when its feature is on. No
-# default set fixes that — `fuse` and `fuse-t` are independent, so no single
-# configuration covers every binding. Full coverage is a sweep:
+# Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
+# because a binding's tests only exist when its feature is on. No default set fixes
+# that — `fuse` and `fuse-t` are independent, so no single configuration covers
+# every binding. Full coverage is a sweep:
 #
 #   export PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig"
 #   for f in "" "--features krun" "--features fuse" "--features fuse-t" \
-#            "--features fuse-no-mount" "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,krun"; do cargo test $f --all-targets; done
+#            "--features fuse-no-mount" "--features s3" "--features fuse,fuse-t" \
+#            "--features fuse,fuse-t,krun,s3"; do cargo test $f --all-targets; done
+#
+# Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
+# unquoted expansion — under zsh pass the flags as separate arguments.
 #
 # Editors default to no features too, so a binding shows as inactive code until
 # its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
@@ -86,3 +112,4 @@ fuse-t = ["dep:libc"]
 # Compile and unit-test the FUSE adapter with no libfuse provider installed:
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.
 fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
+s3 = ["dep:object_store", "dep:tokio"]

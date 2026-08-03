@@ -27,7 +27,8 @@ flowchart TB
         ws["<b>Workspace</b><br/>최장 접두사 마운트 테이블"]
         mem["InMemVolume"]
         pass["PassthroughVolume"]
-        future["S3 · Notion · … <i>(예정)</i>"]
+        s3["S3Volume <i>(읽기 전용)</i>"]
+        future["Notion · … <i>(예정)</i>"]
     end
 
     krun --> posix
@@ -38,6 +39,7 @@ flowchart TB
     mountable --- ws
     mountable --- mem
     mountable --- pass
+    mountable --- s3
     mountable --- future
     ws -->|"합성"| mem
     ws -->|"합성"| pass
