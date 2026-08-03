@@ -14,8 +14,8 @@ use msb_krun::{
 };
 
 use super::PosixAdapter;
-use crate::mountable::{FileExt, FileHandle, Mountable};
-use crate::{CortexError, Dirent, DirentKind, Stat};
+use crate::CortexError;
+use crate::volume::{Dirent, DirentKind, FileExt, FileHandle, Mountable, Stat};
 
 // The guest kernel is always Linux, so every reply must carry Linux errno
 // numbers. The host's `libc` values differ (e.g. ENOSYS is 78 on macOS but 38

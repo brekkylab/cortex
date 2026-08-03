@@ -4,12 +4,22 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
 base64 = { workspace = true }
 futures-core = { workspace = true }
 libc = { workspace = true, optional = true }
+msb_krun = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["fs", "process", "rt", "time"] }
 
 [features]
 default = []
-# Run commands inside a libkrun microVM instead of on the host terminal.
-mvm = ["dep:libc"]
+
+# For implementing console servers, add this feature.
+# The stdio protocol is JSON, so it is what pulls serde in.
+console_server = ["dep:anyhow", "dep:serde", "dep:serde_json"]
+
+# Add support for libkrun, running agent with microVM
+uvm = ["dep:libc", "dep:msb_krun", "dep:tempfile"]

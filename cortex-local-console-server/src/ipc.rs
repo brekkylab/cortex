@@ -1,11 +1,11 @@
 //! The wire between a shim and the server that put it on `PATH`.
 //!
-//! A second protocol, distinct from the stdio one in
-//! [`cortex_console_server`]: that one carries "run this argv" inward from
-//! whoever launched us, this one carries "I was called, here is how" back from
-//! a process we ourselves caused to exist. Same framing — one JSON object per
-//! line, one reply per request — because the reasons for it are the same, and
-//! a shim that speaks the loop it already knows needs no second parser.
+//! A second protocol, distinct from the stdio one in [`cortex::console`]: that
+//! one carries "run this argv" inward from whoever launched us, this one carries
+//! "I was called, here is how" back from a process we ourselves caused to exist.
+//! Same framing — one JSON object per line, one reply per request — because the
+//! reasons for it are the same, and a shim that speaks the loop it already knows
+//! needs no second parser.
 //!
 //! The transport is a unix socket rather than the shim's own stdio: its stdio
 //! belongs to whatever ran it, which may be a pipeline, and is the only place

@@ -1,6 +1,6 @@
+pub mod console;
 mod error;
-mod executable;
+pub mod executable;
 pub mod volume;
 
 pub use error::*;
-pub use executable::*;

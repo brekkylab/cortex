@@ -1,7 +1,7 @@
 //! Adapters that expose a [`Mountable`](super::Mountable) backend through a
 //! concrete OS-facing interface.
 
-#[cfg(feature = "krun")]
+#[cfg(feature = "uvm")]
 mod krun;
 mod posix;
 

@@ -5,8 +5,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-cortex = { workspace = true }
-cortex-console-server = { workspace = true }
+cortex = { workspace = true, features = ["console_server"] }
 # `kill(pid, 0)`, to tell an abandoned scratch directory from a live one.
 libc = { workspace = true }
 serde = { workspace = true }

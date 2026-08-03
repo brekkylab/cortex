@@ -1,13 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    "cortex-fs",
     "cortex",
-    "cortex-console-server",
     "cortex-local-console-server",
     "cortex-uvm-console-server",
-    "exec-server",
-    "wsx",
 ]
 
 [workspace.package]
@@ -18,7 +14,6 @@ edition = "2024"
 anyhow = "1"
 base64 = "0.22"
 cortex = { path = "cortex", default-features = false }
-cortex-console-server = { path = "cortex-console-server" }
 cortex-fs = { path = "cortex-fs", default-features = false }
 futures-core = "0.3"
 libc = "0.2"

@@ -10,8 +10,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 use std::thread;
 
+use cortex::executable::ExecutableSet;
+
 use crate::ipc::{Call, CallReply};
-use crate::registry::Registry;
 
 /// A name that reached us without being registered. Not reachable by an honest
 /// caller — the only names on `PATH` are the ones we linked — so this answers
@@ -19,24 +20,24 @@ use crate::registry::Registry;
 const NOT_FOUND: i32 = 127;
 
 /// Accept shim calls until the listener goes away.
-pub fn serve(listener: UnixListener, registry: Arc<Registry>) {
+pub fn serve(listener: UnixListener, execs: Arc<ExecutableSet>) {
     for stream in listener.incoming() {
         // One bad connection says nothing about the next.
         let Ok(stream) = stream else { continue };
-        let registry = Arc::clone(&registry);
+        let execs = Arc::clone(&execs);
         // A thread per call, because two shims can be in flight at once:
         // `foo | bar` starts both. Served serially, the first could block
         // writing into a pipe nobody is draining yet while the second waits in
         // the accept backlog to become the drainer — a deadlock with no timeout
         // to break it.
         thread::spawn(move || {
-            let _ = handle(stream, &registry);
+            let _ = handle(stream, &execs);
         });
     }
 }
 
 /// Read one [`Call`], run it, write one [`CallReply`].
-fn handle(stream: UnixStream, registry: &Registry) -> std::io::Result<()> {
+fn handle(stream: UnixStream, execs: &ExecutableSet) -> std::io::Result<()> {
     let mut line = String::new();
     BufReader::new(&stream).read_line(&mut line)?;
 
@@ -46,7 +47,7 @@ fn handle(stream: UnixStream, registry: &Registry) -> std::io::Result<()> {
         Err(_) => return Ok(()),
     };
 
-    let reply = match registry.invoke(&call.name, call.args) {
+    let reply = match execs.invoke(&call.name, call.args) {
         Some(out) => CallReply {
             stdout: out.stdout,
             stderr: out.stderr,

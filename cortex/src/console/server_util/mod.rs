@@ -1,21 +1,25 @@
-//! The base library every Cortex console backend is built on.
+//! What every Cortex console server is built on — behind the `console_server`
+//! feature.
 //!
-//! A *console backend* is a process that accepts commands over stdio and runs
+//! A *console server* is a process that accepts commands over stdio and runs
 //! them somewhere — on this host, inside a micro-VM, wherever. What differs
-//! between backends is only that "somewhere"; the wire they speak and the loop
-//! they serve it with are the same, and both live here. A backend links this
-//! crate, supplies a `handle` function, and is done.
+//! between them is only that "somewhere"; the wire they speak and the loop they
+//! serve it with are the same, and both live here. An implementation turns the
+//! feature on, supplies a `handle` function, and is done.
 //!
-//! The split is deliberate: the parts a caller depends on — the shape of a
-//! request, the shape of a reply, the one-in-one-out ordering — are decided in
-//! one place, so two backends cannot drift apart on them. See [`Request`] and
+//! Keeping it in one place is the point: the parts a caller depends on — the
+//! shape of a request, the shape of a reply, the one-in-one-out ordering — are
+//! decided once, so two servers cannot drift apart on them. See [`Request`] and
 //! [`Response`] for the wire, [`enter_loop`] for the loop.
-
-mod protocol;
-
-pub use protocol::*;
+//!
+//! It is feature-gated because most of `cortex` is about what a backend *does*,
+//! not about being spoken to over a pipe: a consumer that only wants
+//! [`Executable`](crate::Executable) or [`volume`](crate::volume) has no use for
+//! this module, and should not pay `serde_json` for it.
 
 use std::io::{self, BufRead, Write};
+
+use crate::console::{Request, Response};
 
 /// Serve requests off stdin until the caller says to stop.
 ///

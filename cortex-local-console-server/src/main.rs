@@ -2,9 +2,8 @@
 //!
 //! Speaks an MCP-style stdio protocol: boot, then serve JSON requests off stdin
 //! one at a time until the caller sends `quit` or closes the pipe. The wire and
-//! the loop both live in [`cortex_console_server`], so every console-server
-//! backend behaves identically on the parts that are not about running the
-//! command.
+//! the loop both live in [`cortex::console`], so every console-server backend
+//! behaves identically on the parts that are not about running the command.
 //!
 //! Serving means running the request's argv here on the host and reporting what
 //! it did. The command's output is captured rather than inherited, because it
@@ -22,9 +21,10 @@
 //!
 //! # Two roles, one binary
 //!
-//! Boot also puts the [`Registry`]'s virtual executables on `PATH`, as symlinks
-//! back to this same binary (see [`bin_dir`]). So this program is reached two
-//! ways, and [`role`] tells them apart by the name it was invoked under:
+//! Boot also puts the [`ExecutableSet`](cortex::ExecutableSet)'s virtual
+//! executables on `PATH`, as symlinks back to this same binary (see
+//! [`bin_dir`]). So this program is reached two ways, and [`role`] tells them
+//! apart by the name it was invoked under:
 //!
 //! - under its own name — **server**: serve the stdio loop, above.
 //! - under any other — **shim**: that name is a registered executable someone
@@ -32,7 +32,7 @@
 //!   [`shim`]).
 //!
 //! There is nothing to build or ship for the second role. A virtual executable
-//! costs one `Registry::register` line and one `symlink(2)` at boot.
+//! costs one `ExecutableSet::register` line and one `symlink(2)` at boot.
 //!
 //! ```text
 //! $ cargo run -q -p cortex-local-console-server
@@ -59,8 +59,8 @@
 
 mod bin_dir;
 mod callback;
+mod demo;
 mod ipc;
-mod registry;
 mod shim;
 
 use std::ffi::OsStr;
@@ -72,11 +72,10 @@ use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::thread;
 
-use cortex_console_server::{ExecRequest, ExecResponse, Request, Response, enter_loop};
+use cortex::console::{ExecRequest, ExecResponse, Request, Response, enter_loop};
 
 use bin_dir::BinDir;
 use ipc::SOCK_ENV;
-use registry::Registry;
 
 /// Codes for a command that never ran, borrowed from the shell so they mean
 /// what a caller already expects: 127 for a program that could not be found,
@@ -128,11 +127,11 @@ fn main() -> ExitCode {
 
 /// Boot, then serve until told to stop.
 fn server() -> anyhow::Result<()> {
-    let registry = Arc::new(Registry::demo());
+    let execs = Arc::new(demo::set());
 
     // Order matters: the names have to be linked and the socket bound before
     // anything can be spawned that might call one.
-    let dir = BinDir::create(registry.names())?;
+    let dir = BinDir::create(execs.names())?;
     let listener = UnixListener::bind(dir.socket())?;
 
     // SAFETY: this is the only thread — the listener below is the first one we
@@ -148,8 +147,8 @@ fn server() -> anyhow::Result<()> {
     }
 
     thread::spawn({
-        let registry = Arc::clone(&registry);
-        move || callback::serve(listener, registry)
+        let execs = Arc::clone(&execs);
+        move || callback::serve(listener, execs)
     });
 
     enter_loop(

@@ -11,6 +11,12 @@
 
 use serde::{Deserialize, Serialize};
 
+pub enum Packet {
+    ExecReq(ExecRequest),
+    ExecResp(ExecResponse),
+    Quit,
+}
+
 /// What the caller asks the backend to do.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
