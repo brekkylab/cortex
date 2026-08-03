@@ -226,8 +226,9 @@ fn flush_does_not_finalize_but_release_does() {
     fs.release_handle(fh).unwrap();
 }
 
-/// One policy, because the bindings project it onto different structs and must
-/// not disagree. They once did — one reported `nlink` 1 for a directory.
+/// One policy, because the bindings project it onto different structs and must not
+/// disagree — a directory reported with `nlink` 1 by one of them and 2 by another is
+/// the kind of divergence a shared source removes.
 #[test]
 fn attribute_policy_is_shared_by_both_bindings() {
     let dir = attr_for(&Stat::new(DirentKind::Dir, 0));

@@ -236,9 +236,8 @@ impl Mountable for SkillDir {
 
     fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         options.validate()?;
-        // Where the separate `create` went: `open` with `OpenOptions::create_new()`
-        // is that same request, and it is refused before the path is resolved
-        // because nothing about the doc changes the answer.
+        // Refused before the path is resolved, because nothing about the doc changes
+        // the answer.
         if options.write
             || options.append
             || options.truncate
@@ -375,8 +374,7 @@ mod tests {
 
         // `ReadOnly`, not `Unsupported`: a rendered view of skills will not write,
         // rather than having no notion of writing — so userspace hears EROFS, which
-        // it has a path for, instead of ENOSYS. The old separate `create` is now
-        // `open` with `create_new`.
+        // it has a path for, instead of ENOSYS.
         for refused in [
             docs.open(Path::new("x"), OpenOptions::create_new())
                 .map(|_| ()),

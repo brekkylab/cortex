@@ -357,8 +357,8 @@ fn a_failed_listing_is_not_an_absent_path() {
 
 // ----------------------------------------------------------------------- stat
 
-/// A file carries everything the listing knew, not just its size — S-6, and the
-/// fields a consumer needs for cache validation.
+/// A file carries everything the listing knew, not just its size — the fields a
+/// consumer needs for cache validation.
 #[test]
 fn a_file_reports_its_size_and_metadata() {
     let vol = holding("", &[("a.txt", "hello")]);
@@ -400,8 +400,7 @@ fn a_prefix_with_children_is_a_directory() {
     );
 }
 
-/// Defect ②: an object whose key equals a prefix and whose body is empty is a
-/// folder marker. `head` *succeeds* on it, so reporting what `head` said would call
+/// An object whose key equals a prefix and whose body is empty is a folder marker. `head` *succeeds* on it, so reporting what `head` said would call
 /// the directory a 0-byte file and the guest could not descend into it.
 #[test]
 fn a_zero_byte_marker_with_children_is_a_directory() {
@@ -413,7 +412,7 @@ fn a_zero_byte_marker_with_children_is_a_directory() {
     );
 }
 
-/// The other side of defect ②: a genuinely empty file is a file. `_SUCCESS` and
+/// The other side of that: a genuinely empty file is a file. `_SUCCESS` and
 /// `.gitkeep` are not directories just because they are empty.
 #[test]
 fn a_zero_byte_file_without_children_stays_a_file() {
@@ -490,7 +489,7 @@ fn a_listing_names_one_level() {
     assert_eq!(listed(&vol, "dir"), ["dir:sub", "file:b.txt"]);
 }
 
-/// S-4: the listing already carries each object's metadata, so the entry does too.
+/// The listing already carries each object's metadata, so the entry does too.
 /// This is what lets a `readdirplus` answer without a `stat` per name.
 #[test]
 fn a_listing_carries_metadata_it_already_had() {
@@ -500,7 +499,7 @@ fn a_listing_carries_metadata_it_already_had() {
         .iter()
         .find(|e| e.name == "a.txt")
         .expect("a.txt listed");
-    let stat = file.stat().expect("S-4: stat filled from the listing");
+    let stat = file.stat().expect("stat filled from the listing");
     assert_eq!(stat.size, 5);
     assert!(stat.mtime.is_some());
     assert!(stat.etag.is_some());
@@ -528,7 +527,7 @@ fn a_marker_is_not_an_entry_in_its_own_directory() {
     assert_eq!(listed(&vol, "dir"), ["file:a.txt"]);
 }
 
-/// Defect ①, the zero-byte branch: the name arrives from both `common_prefixes` and
+/// The zero-byte branch of a name collision: it arrives from both `common_prefixes` and
 /// `objects`, and a `readdir` may not repeat a name. An empty body means the object
 /// stands for the directory, so the object goes and the directory stays.
 #[test]
@@ -541,7 +540,7 @@ fn a_zero_byte_object_yields_to_the_directory_of_the_same_name() {
     );
 }
 
-/// Defect ①, the other branch: an object with a body is real content and cannot be
+/// The other branch: an object with a body is real content and cannot be
 /// hidden, so the directory yields instead. Its subtree becomes unreachable — the
 /// cost this rule accepts, and the reason the branch turns on size.
 #[test]
@@ -598,7 +597,10 @@ fn opening_a_file_yields_its_metadata_with_the_handle() {
         .expect("open");
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, 5);
-    assert!(stat.etag.is_some(), "S-6 fields ride along with the open");
+    assert!(
+        stat.etag.is_some(),
+        "the listing's metadata rides along with the open"
+    );
     // The handle carries the same size, which is what lets a read past the end
     // answer without asking the store.
     assert_eq!(handle.size, 5);
@@ -752,8 +754,8 @@ fn the_first_read_does_not_read_ahead() {
     assert_eq!(cache.last_end, Some(4096));
 }
 
-/// A read that continues where the last ended earns a window. This is D6: continuity
-/// is the signal, not the request size.
+/// A read that continues where the last ended earns a window: continuity is the
+/// signal, not the request size.
 #[test]
 fn a_contiguous_read_fetches_a_window() {
     let handle = open_reader(&ruler(1_000_000));
@@ -815,8 +817,7 @@ fn a_scattered_read_does_not_fetch_a_window() {
     assert_eq!(data.len(), 4096, "a jump must not fetch ahead");
 }
 
-/// Acceptance criterion 14. A request that begins inside the window and ends past it
-/// must still come back whole: a short return means EOF to `PosixFs`, so stopping at
+/// A request that begins inside the window and ends past it must still come back whole: a short return means EOF to `PosixFs`, so stopping at
 /// the window edge would make the file appear to end there.
 ///
 /// The offsets are deliberately unaligned to the window, which is how the real case
@@ -1096,8 +1097,7 @@ mod mounted {
             "nested\n"
         );
 
-        // Defect ② end to end: a zero-byte object standing for a folder has to be
-        // traversable, or this path does not resolve at all.
+        // End to end: a zero-byte object standing for a folder has to be traversable, or this path does not resolve at all.
         assert!(
             fs::metadata(mnt.join("marker"))
                 .expect("stat marker")
@@ -1110,7 +1110,7 @@ mod mounted {
         );
 
         // The kernel's own request sizes, across more than one window, with content
-        // checked — this is the path R1 was about.
+        // checked — the path a window-boundary short read would break.
         let read = fs::read(mnt.join("big.bin")).expect("read big");
         assert_eq!(
             read.len(),
@@ -1123,8 +1123,8 @@ mod mounted {
         fs::remove_dir_all(&mnt).ok();
     }
 
-    /// What S-1 was for. Every unit test above asserts a `CortexError`; this asserts
-    /// what userspace is actually told, which is the only thing tools act on.
+    /// Every unit test above asserts a `CortexError`; this asserts what userspace is
+    /// actually told, which is the only thing tools act on.
     #[test]
     #[ignore = "needs a libfuse provider and mounts a real filesystem"]
     fn the_operating_system_is_told_the_mount_is_read_only() {

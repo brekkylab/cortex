@@ -79,7 +79,7 @@ const FILE_SIZE: usize = 32 << 20;
 
 /// Scattered-read step. Coprime with `FILE_SIZE` so successive offsets neither
 /// repeat nor march in order — the access pattern that thrashes a single-window
-/// cache (spec §5.2).
+/// cache.
 const SCATTER_STEP: u64 = 7_919_003;
 
 const SCATTER_READS: u64 = 200;
@@ -235,7 +235,7 @@ fn main() {
     report("seq-small");
 
     // Phase 3: scattered 4 KiB reads through one handle — the case that evicts a
-    // single-window cache on every request (spec §5.2), with no concurrency.
+    // single-window cache on every request, with no concurrency.
     println!("PHASE scattered");
     let file = std::fs::File::open(base.join(PHASES[2])).expect("open scattered");
     let limit = (FILE_SIZE - SMALL_READ) as u64;

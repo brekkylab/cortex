@@ -45,17 +45,15 @@ pub enum CortexError {
     /// none for `ENOSYS`, which reads as a filesystem that is broken rather than
     /// data that is protected.
     ///
-    /// The stronger claim once made here — that `ENOSYS` makes the kernel stop
-    /// sending the request for the whole mount — is **not** true of these
-    /// operations. Measured on a Linux guest over virtio-fs: `mkdir`, `unlink`,
-    /// `rmdir`, `rename` and `write` each reached the backend on all three of
-    /// three attempts, so nothing was latched.
+    /// `ENOSYS` does **not** make the kernel stop sending these requests: measured
+    /// on a Linux guest over virtio-fs, `mkdir`, `unlink`, `rmdir`, `rename` and
+    /// `write` each reached the backend on all three of three attempts.
     ///
     /// Such latching does exist for *some* requests — a FUSE connection carries
     /// `no_open`-style flags that turn an operation off after one `ENOSYS` — but
-    /// which requests those are is not something this crate has checked. Hence
-    /// the rule is to answer the accurate errno everywhere, rather than to keep a
-    /// list of where an inaccurate one would be survivable.
+    /// which requests those are is not something this crate has checked. Hence the
+    /// rule is to answer the accurate errno everywhere, rather than to keep a list
+    /// of where an inaccurate one would be survivable.
     ReadOnly,
     /// The two paths are on different backends, so the move cannot happen in
     /// place.

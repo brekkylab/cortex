@@ -71,10 +71,9 @@ tokio = { version = "1", features = [
 # TLS stack under `object_store`.
 #
 # The bare 5 are `serde_json` and its own (itoa, memchr, serde_core, zmij), which
-# `Executable`/`wire` need unconditionally. That is the one thing every consumer
-# pays for whether or not it ever serializes a tool call — gating it would mean
-# gating `executable`, `wire` and `demo` behind a feature, which is a design
-# question for whoever owns those rather than something this branch decided.
+# `Executable`/`wire` need unconditionally — the one thing every consumer pays for
+# whether or not it ever serializes a tool call. Gating it means gating
+# `executable`, `wire` and `demo` behind a feature.
 #
 # Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
 # because a binding's tests only exist when its feature is on. No default set fixes

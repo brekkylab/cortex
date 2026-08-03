@@ -24,9 +24,9 @@ fn read_all(ws: &Workspace, path: &Path) -> Result<Vec<u8>> {
 
 /// Write `data` to `path`, creating or replacing it.
 fn write_all(ws: &Workspace, path: &Path, data: &[u8]) -> Result<()> {
-    // One call, where this used to be `create`, catch `AlreadyExists`, reopen,
-    // truncate. The backend applies `create` and `truncate` together, so nothing can
-    // slip into the gap the retry left — which is what `OpenOptions` is for.
+    // One call: the backend applies `create` and `truncate` together, so nothing can
+    // slip in between them. Reaching the same place by creating, catching
+    // `AlreadyExists` and reopening would leave exactly that gap.
     let (h, _) = ws.open(
         path,
         OpenOptions {

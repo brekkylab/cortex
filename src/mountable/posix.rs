@@ -467,9 +467,9 @@ impl<T: Mountable> PosixFs<T> {
     /// The open handle behind an `fh`, or [`CortexError::BadHandle`] if it is
     /// closed. A cheap `Arc` clone, so the lock is released immediately.
     ///
-    /// `BadHandle`, not `NotFound`: the two mean different things to a caller,
-    /// and reporting the wrong one here forced each binding to patch it up
-    /// separately — which only one of them did.
+    /// `BadHandle`, not `NotFound`: the two mean different things to a caller, and
+    /// getting it right here is what keeps every binding from having to patch it up
+    /// on its own.
     fn handle_of(&self, fh: u64) -> Result<Arc<T::Handle>> {
         lock(&self.handles).get(fh).ok_or(CortexError::BadHandle)
     }
@@ -565,11 +565,11 @@ impl InodeTable {
     /// the same reason `rmdir` uses it: an earlier listing may have interned
     /// descendants the backend no longer sees.
     ///
-    /// This is one operation rather than two so a caller cannot sequence them
-    /// wrongly. Measured on the two-call draft: evicting `to` first *also* wiped
-    /// the source whenever the paths overlapped, leaving `fwd` populated and `rev`
-    /// empty — after which the next `lookup` mints a second number for a path the
-    /// table already knew, which is exactly what `rev` exists to prevent.
+    /// One operation rather than two, because two cannot be sequenced safely:
+    /// evicting `to` first *also* wipes the source whenever the paths overlap,
+    /// leaving `fwd` populated and `rev` empty — after which the next `lookup` mints
+    /// a second number for a path the table already knew, which is exactly what
+    /// `rev` exists to prevent.
     pub(super) fn rekey_subtree(&mut self, from: &Path, to: &Path) {
         // Overlapping moves do nothing. A backend refuses them all (`EINVAL` for a
         // directory into its own descendant, `ENOTEMPTY` for the reverse, a no-op

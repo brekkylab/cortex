@@ -4,9 +4,8 @@
 //! `PosixFs`, a different interface in front of it.
 //!
 //! One example for both host bindings, because the only difference between them
-//! here is which guard type is constructed — and two copies of the same program
-//! drift. They already had: the FUSE-T one had lost the explanation below and
-//! three of the four hint lines.
+//! here is which guard type is constructed, and two copies of the same program
+//! drift apart.
 //!
 //! ```sh
 //! # FUSE-T (macOS, no kernel extension — `brew install --cask fuse-t`)
