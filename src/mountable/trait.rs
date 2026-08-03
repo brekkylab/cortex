@@ -175,9 +175,9 @@ pub trait Mountable: Send + Sync {
     ///
     /// The one operation with a default, because most backends are read-only and a
     /// store that cannot write has nothing to say here beyond "no". `ReadOnly`
-    /// rather than [`Unsupported`](crate::CortexError::Unsupported): a FUSE kernel
-    /// handed `ENOSYS` stops sending the request *for the whole mount*, so one
-    /// read-only source would take rename away from every writable one beside it.
+    /// rather than [`Unsupported`](crate::CortexError::Unsupported), whose doc
+    /// carries the reason: `EROFS` is a state userspace has a path for, `ENOSYS` is
+    /// a filesystem that cannot do the operation at all.
     ///
     /// No flags. `RENAME_NOREPLACE`/`RENAME_EXCHANGE` reach two of the three
     /// bindings but libfuse-t's `rename` has no flags argument at all, so a

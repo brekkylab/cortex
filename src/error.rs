@@ -39,10 +39,23 @@ pub enum CortexError {
     NoSpace,
     /// The backend is mounted or configured read-only.
     ///
-    /// Not [`Unsupported`](Self::Unsupported): a FUSE kernel that gets `ENOSYS`
-    /// disables that operation for the *whole mount*, so a read-only backend
-    /// answering `Unsupported` to a write takes every other backend's writes with
-    /// it.
+    /// Not [`Unsupported`](Self::Unsupported), which renders as `ENOSYS` — "this
+    /// filesystem does not implement the operation at all". Userspace acts on the
+    /// difference: `cp`, `rsync` and editors have a read-only path for `EROFS` and
+    /// none for `ENOSYS`, which reads as a filesystem that is broken rather than
+    /// data that is protected.
+    ///
+    /// The stronger claim once made here — that `ENOSYS` makes the kernel stop
+    /// sending the request for the whole mount — is **not** true of these
+    /// operations. Measured on a Linux guest over virtio-fs: `mkdir`, `unlink`,
+    /// `rmdir`, `rename` and `write` each reached the backend on all three of
+    /// three attempts, so nothing was latched.
+    ///
+    /// Such latching does exist for *some* requests — a FUSE connection carries
+    /// `no_open`-style flags that turn an operation off after one `ENOSYS` — but
+    /// which requests those are is not something this crate has checked. Hence
+    /// the rule is to answer the accurate errno everywhere, rather than to keep a
+    /// list of where an inaccurate one would be survivable.
     ReadOnly,
     /// The two paths are on different backends, so the move cannot happen in
     /// place.
@@ -58,11 +71,20 @@ pub enum CortexError {
     /// own mount table, so it asks and this layer has to say so.
     ///
     /// Not [`Unsupported`](Self::Unsupported), for the reason spelled out on
-    /// [`ReadOnly`](Self::ReadOnly): `ENOSYS` disables the operation mount-wide,
-    /// which would take rename away from the writable backends too.
+    /// [`ReadOnly`](Self::ReadOnly), and here the mistranslation is sharper still:
+    /// `ENOSYS` says this filesystem has no rename at all, when the truth is that
+    /// *this pair of paths* cannot be renamed in place. The first sends a caller
+    /// away for good; the second tells it to copy and delete.
     CrossDevice,
 
-    /// The backend does not support this operation at all.
+    /// The backend does not support this operation at all — `ENOSYS`.
+    ///
+    /// The claim is about the *filesystem*, not about this data or this request:
+    /// a store with no notion of symlinks answers `readlink` with this. A store
+    /// that could write but is configured not to wants
+    /// [`ReadOnly`](Self::ReadOnly); one whose two paths sit on different backends
+    /// wants [`CrossDevice`](Self::CrossDevice). Both of those are read as
+    /// recoverable by userspace, where `ENOSYS` is not.
     Unsupported,
     /// An underlying I/O error.
     Io(std::io::Error),
@@ -113,6 +135,13 @@ impl From<std::io::Error> for CortexError {
             ErrorKind::IsADirectory => CortexError::IsADirectory,
             ErrorKind::NotADirectory => CortexError::NotADirectory,
             ErrorKind::InvalidInput => CortexError::InvalidArgument,
+            // `FileExt::read_at`/`write_at` return `io::Error`, so this is the only
+            // way a *handle* can say "not implemented". Without the arm it degrades
+            // to `Io` and reaches the caller as EIO — a worse answer than ENOSYS,
+            // since EIO points at the storage rather than at the operation. A
+            // handle that cannot write because the backend is read-only wants
+            // `ReadOnlyFilesystem` below, not this.
+            ErrorKind::Unsupported => CortexError::Unsupported,
             // `find`/`rsync`/`tar` skip on EACCES but abort on EIO, so collapsing
             // the two loses a whole traversal to one unreadable file.
             ErrorKind::PermissionDenied => CortexError::PermissionDenied,

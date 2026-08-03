@@ -126,6 +126,19 @@ fn to_entry(inode: u64, stat: &Stat) -> Entry {
 }
 
 impl<T: Mountable> DynFileSystem for PosixFs<T> {
+    /// Empty is not "no features" — it means "the server's defaults".
+    ///
+    /// What comes back here can only *add*: the server settles on
+    /// `capable & (want | supported)`, where `supported` is its own list. So
+    /// returning nothing subtracts nothing, and the set still includes
+    /// `AUTO_INVAL_DATA` (which is what makes a backend's [`Stat::mtime`]
+    /// functional rather than decorative — a guest watches it to decide when to
+    /// drop cached pages) and `MAX_PAGES` (which lets a request reach the server's
+    /// 1 MiB buffer instead of the 32-page default).
+    ///
+    /// Worth stating because the line reads like the opposite of what it does.
+    ///
+    /// [`Stat::mtime`]: crate::Stat::mtime
     fn init(&self, _capable: FsOptions) -> Result<FsOptions> {
         Ok(FsOptions::empty())
     }
