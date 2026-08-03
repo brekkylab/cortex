@@ -9,10 +9,14 @@
 //!
 //! ```sh
 //! cargo build --bin apply_krun --features krun
-//! codesign --entitlements contrib/hypervisor.entitlements --force -s - \
+//! codesign --entitlements macos-entitlements.plist --force -s - \
 //!     target/debug/apply_krun
 //! ./target/debug/apply_krun
 //! ```
+//!
+//! That file also carries `disable-library-validation`, which libkrun needs
+//! because it `dlopen()`s libkrunfw. `scripts/apply_krun.sh` signs with the same
+//! one, so there is a single answer to "which entitlements".
 //!
 //! This is a binary rather than a test on purpose: on guest shutdown libkrun
 //! calls `_exit()`, which tears down the whole process. That is exactly what

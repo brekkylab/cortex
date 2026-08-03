@@ -462,11 +462,11 @@ impl FuseTMount {
     }
 
     /// [`spawn`](Self::spawn) with the name the mount reports as its source.
-    pub fn spawn_named<T>(
-        fs: PosixFs<T>,
-        mountpoint: impl AsRef<Path>,
-        fsname: &str,
-    ) -> Result<Self>
+    ///
+    /// Private: nothing has wanted a name other than `cortex` yet, and the fuser
+    /// binding's `spawn_with` is the one that has a caller. Widen it when something
+    /// needs it rather than carrying the surface on the chance.
+    fn spawn_named<T>(fs: PosixFs<T>, mountpoint: impl AsRef<Path>, fsname: &str) -> Result<Self>
     where
         T: Mountable + 'static,
         T::Handle: 'static,

@@ -7,16 +7,13 @@ edition = "2024"
 name = "apply_krun"
 required-features = ["krun"]
 
+# Serves both host bindings from one file, so no `required-features`: the key is
+# AND, so it cannot say "fuse or fuse-t", and naming either would lock the other
+# out. The example carries a no-feature `main` instead.
 [[example]]
-name = "mount_fuse"
-required-features = ["fuse"]
+name = "mount_host"
 
-[[example]]
-name = "mount_fuse_t"
-required-features = ["fuse-t"]
-
-# Measures the read sizes a kernel asks for, for the S3 read-ahead window
-# (.omc/specs/cortex-s3-readonly.md P5).
+# Measures the read sizes a kernel asks for, for the S3 read-ahead window.
 [[example]]
 name = "measure_read_sizes"
 required-features = ["fuse-t"]
