@@ -25,7 +25,8 @@
 //!
 //! So a delegated `foo` plus a command of `sh -c 'foo | tr a-z A-Z'` prints `BAR`: `foo`
 //! is not a file anyone built, it is a symlink to this binary, and what it printed came
-//! from the client over a socket this process never touches.
+//! from the client — which the server asked, by answering the `exec` it was still working
+//! on with a `Delegated` instead of a result.
 
 mod ipc;
 mod server;

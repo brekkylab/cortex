@@ -1,38 +1,38 @@
-//! The public end: a console server to run commands in, and the two channels it takes.
+//! The public end: a console server to run commands in, and the one channel it takes.
 //!
-//! # Why there are two channels
+//! # One channel, one direction of asking
 //!
-//! A console is not one conversation. Driving the server is one — this end asks, the
-//! server answers — and a *delegated* executable is the other, running the opposite
-//! way: something inside the server calls a name whose behaviour lives out here, so
-//! this end has to answer.
+//! A console is one conversation. This end asks and the server answers, and that stays
+//! true even for a *delegated* executable — a name whose behaviour lives out here,
+//! called by something running inside the server.
 //!
-//! They are separate channels rather than one bidirectional channel, which is what
-//! keeps each end of each channel doing one job: a [`Requestable`] only asks and a
-//! [`Responsable`] only answers, and neither has a pending table or a thread waiting on
-//! something it also has to read.
+//! The server does not ask for one. It *answers* with a
+//! [`Delegated`](Progress::Delegated): a complete response to the `exec` this end is
+//! already waiting on, meaning the execution is not over and here is what it needs. So
+//! this end has no pending table, no listener, no thread waiting on something it also
+//! has to read, and no channel per delegated call.
 //!
-//! # Why delegated calls need threads
+//! # What [`exec`](Console::exec) actually does
 //!
-//! A delegated call arrives *while* an [`exec`](Console::exec) is outstanding — that is
-//! the whole point: the command that triggered it is still running, waiting for the
-//! name to produce something. So it cannot be serviced by whoever is blocked on the
-//! answer to that `exec`.
+//! It walks that chain. The server's answer is either the execution's
+//! [`ExecResult`] or a delegated call; the second is resolved against the
+//! [`ExecutableSet`] and sent back as a `resume`, until an answer is the first.
 //!
-//! And there is not one of them but a stream: one shell command can start several
-//! delegated executables together (`foo | bar`, `make -j8`), each on a channel of its
-//! own and each blocked until it is answered. So a console takes something that *yields*
-//! channels — see [`ConsoleBuilder::delegates`] — and gives each one a thread.
+//! Which is why the loop is here and not in a transport: `Progress` is a
+//! [`Requestable`]'s and resolving a *name* is an `ExecutableSet`'s, and this is the
+//! one type that holds both.
+//!
+//! Delegated calls are therefore served in turn, not together — a command that starts
+//! several (`foo & bar`, `make -j8`) has them run one after another. See
+//! [`Progress`] for why that is latency rather than a deadlock, and what would have to
+//! change for it to stop being so.
 
-use std::io;
 use std::process::{Child, ExitStatus};
-use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use anyhow::Context as _;
 
-use crate::console::base::{Failure, Requestable, Responsable};
-use crate::console::message::{Call, Error, Exec, ExecResult, Message, Outcome, Start};
+use crate::console::base::{Failure, Requestable};
+use crate::console::message::{Error, Exec, ExecResult, Outcome, Progress, Start};
 use crate::executable::{ExecCall, ExecutableSet};
 
 /// Assembles a [`Console`] from the parts it needs.
@@ -41,14 +41,12 @@ use crate::executable::{ExecCall, ExecutableSet};
 /// volumes to project, limits, a backend of its own choosing — and each should be
 /// something a caller can leave out.
 ///
-/// Nothing here starts anything. The two channels are described, not opened, until
+/// Nothing here starts anything. The channel is described, not driven, until
 /// [`Console::start`].
 #[derive(Default)]
 pub struct ConsoleBuilder {
     client: Option<Box<dyn Requestable>>,
     server: Option<Child>,
-    #[allow(clippy::type_complexity)]
-    delegates: Option<Box<dyn FnMut() -> io::Result<Option<Box<dyn Responsable + Send>>> + Send>>,
     execs: ExecutableSet,
     default_timeout_ms: Option<u64>,
 }
@@ -74,28 +72,11 @@ impl ConsoleBuilder {
         self
     }
 
-    /// Answer delegated calls on the channels `accept` yields.
-    ///
-    /// One call, one channel: a shim reaching this end has exactly one thing to ask, so
-    /// `accept` is the thing that waits for the next one — a `UnixListener::accept`, a
-    /// virtio port opening, a queue of canned channels in a test. It blocks, is called
-    /// again as soon as it returns, and each channel it yields gets a thread.
-    ///
-    /// `Ok(None)` means no more are coming and this end is done accepting. An `Err` is
-    /// reported and stops accepting too: whatever is wrong with a listener is not
-    /// something calling it again would fix.
-    ///
-    /// Leaving it out is allowed and means delegated names are announced but nothing
-    /// answers them. Only useful when [`executables`](Self::executables) is empty too.
-    pub fn delegates(
-        mut self,
-        accept: impl FnMut() -> io::Result<Option<Box<dyn Responsable + Send>>> + Send + 'static,
-    ) -> Self {
-        self.delegates = Some(Box::new(accept));
-        self
-    }
-
     /// The names this console offers, and what each one does.
+    ///
+    /// These are announced to the server by [`start`](Console::start) and resolved here
+    /// when one comes back as a [`Delegated`](Progress::Delegated). Leaving it out means
+    /// a client with nothing to delegate, which is still a client.
     pub fn executables(mut self, execs: ExecutableSet) -> Self {
         self.execs = execs;
         self
@@ -119,10 +100,8 @@ impl ConsoleBuilder {
         Ok(Console {
             client,
             server: self.server,
-            delegates: self.delegates,
-            execs: Arc::new(self.execs),
+            execs: self.execs,
             default_timeout_ms: self.default_timeout_ms,
-            serving: None,
             started: false,
         })
     }
@@ -135,23 +114,15 @@ impl ConsoleBuilder {
 /// there is more to do. [`shutdown`](Self::shutdown) ends the session for good.
 ///
 /// ```no_run
-/// use cortex::console::stdio::{StdioRequester, StdioResponder};
+/// use cortex::console::stdio::StdioRequester;
 /// use cortex::console::{Console, Exec};
 /// use cortex::executable::ExecutableSet;
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// // Whatever the client channel actually runs over — a child's pipes, a virtio port.
 /// # let (to_server, from_server) = (std::io::sink(), std::io::empty());
-/// let listener = std::os::unix::net::UnixListener::bind("/tmp/console.sock")?;
-///
 /// let mut console = Console::builder()
 ///     .client(StdioRequester::new(from_server, to_server))
-///     // One shim connection is one delegated call, so accepting is what waits.
-///     .delegates(move || {
-///         let (stream, _) = listener.accept()?;
-///         let server = StdioResponder::new(stream.try_clone()?, stream);
-///         Ok(Some(Box::new(server) as Box<dyn cortex::console::Responsable + Send>))
-///     })
 ///     .executables(ExecutableSet::new())
 ///     .default_timeout_ms(30_000)
 ///     .build()?;
@@ -175,23 +146,16 @@ pub struct Console {
     /// The process the client is talking to, if the caller had one to hand over.
     server: Option<Child>,
 
-    /// Taken by [`start`](Self::start) and handed to the thread that accepts on it, which
-    /// is why it is an `Option` and not simply a field.
-    #[allow(clippy::type_complexity)]
-    delegates: Option<Box<dyn FnMut() -> io::Result<Option<Box<dyn Responsable + Send>>> + Send>>,
-
-    /// Shared with that thread, which is the only other place it is read.
-    execs: Arc<ExecutableSet>,
+    /// What a delegated name announced by [`start`](Self::start) resolves to when one
+    /// comes back as a [`Delegated`](Progress::Delegated).
+    execs: ExecutableSet,
 
     default_timeout_ms: Option<u64>,
-
-    /// The delegate thread, once there is one.
-    serving: Option<JoinHandle<()>>,
 
     /// Whether [`start`](Self::start) has been answered and not yet undone.
     ///
     /// Kept here because nothing else keeps it: what a session allows is not a
-    /// transport's business, so neither channel checks it.
+    /// transport's business, so the channel does not check it.
     started: bool,
 }
 
@@ -200,13 +164,10 @@ impl Console {
         ConsoleBuilder::default()
     }
 
-    /// Boot the server, and begin answering delegated calls.
+    /// Boot the server, and announce the names it may call back into.
     ///
     /// Returning is the readiness signal: booting is not free, and this is where it is
     /// paid for rather than inside the first command.
-    ///
-    /// The delegate thread starts *after* the server has booted, because until then
-    /// there is nothing that could call a delegated name.
     pub fn start(&mut self) -> Result<(), Failure> {
         if self.started {
             return Err(Failure::broken("this console has already started"));
@@ -217,24 +178,35 @@ impl Console {
             default_timeout_ms: self.default_timeout_ms,
         })?;
         self.started = true;
-
-        // Only the first `start` opens it, because taking it is what leaves nothing to
-        // take. A console stopped and started again keeps the thread it already has:
-        // whatever accepts did not go anywhere.
-        if let Some(accept) = self.delegates.take() {
-            let execs = Arc::clone(&self.execs);
-            self.serving = Some(std::thread::spawn(move || accepting(accept, execs)));
-        }
-
         Ok(())
     }
 
     /// Run one command, and return everything it produced.
+    ///
+    /// Every delegated call the command makes is resolved here, against the
+    /// [`ExecutableSet`] this console was built with, before this returns: the server
+    /// answers with a [`Delegated`](Progress::Delegated) instead of a result, the name
+    /// runs in *this* process, and what it produced goes back as a `resume`. However
+    /// many times that happens is not something a caller sees.
+    ///
+    /// So a caller waits for one thing and gets one thing, and the delegated calls
+    /// underneath it are served in the order the command made them.
     pub fn exec(&mut self, exec: Exec) -> Result<ExecResult, Failure> {
         if !self.started {
             return Err(Failure::broken("this console has not started"));
         }
-        self.client.exec(exec)
+
+        let mut progress = self.client.exec(exec)?;
+        loop {
+            match progress {
+                Progress::Done(result) => return Ok(result),
+                // The execution owes an answer it has not been given, so nothing else
+                // may be asked until this goes back.
+                Progress::Delegated(exec) => {
+                    progress = self.client.resume(answer(&self.execs, exec))?;
+                }
+            }
+        }
     }
 
     /// Release what [`start`](Self::start) booted.
@@ -266,9 +238,6 @@ impl Console {
         }
         let _ = self.client.quit();
 
-        // The delegate thread is not joined here. It ends when whatever it accepts on
-        // goes away, and that is not something this function can bring about — a
-        // listener with nobody dialling it blocks forever. Joining would hang.
         match self.server.as_mut() {
             Some(server) => server
                 .wait()
@@ -293,70 +262,8 @@ impl Drop for Console {
     }
 }
 
-/// Take delegate channels as they arrive and give each one a thread.
-///
-/// A thread per channel rather than one loop over all of them, because each blocks
-/// until its call is answered: several delegated executables can be in flight at once,
-/// and serving them in turn would make the first one's runtime the second one's wait.
-#[allow(clippy::type_complexity)]
-fn accepting(
-    mut accept: Box<dyn FnMut() -> io::Result<Option<Box<dyn Responsable + Send>>> + Send>,
-    execs: Arc<ExecutableSet>,
-) {
-    loop {
-        match accept() {
-            Ok(Some(channel)) => {
-                let execs = Arc::clone(&execs);
-                std::thread::spawn(move || serve(channel, &execs));
-            }
-            // Nothing more is coming.
-            Ok(None) => return,
-            Err(e) => {
-                eprintln!("console: no more delegate channels: {e}");
-                return;
-            }
-        }
-    }
-}
-
-/// Answer calls on one delegate channel until it closes.
-///
-/// Which is normally exactly one call — a shim asks its single question and goes — but
-/// nothing here assumes that.
-fn serve(mut delegates: Box<dyn Responsable + Send>, execs: &ExecutableSet) {
-    loop {
-        let message = match delegates.recv() {
-            Ok(Some(message)) => message,
-            // The channel ended, cleanly or not. Either way there is nothing to answer
-            // and no way to say so.
-            Ok(None) => return,
-            Err(e) => {
-                eprintln!("console: the delegate channel broke: {e}");
-                return;
-            }
-        };
-
-        let Message::Request { id, call } = message else {
-            // A response answers a request and this end makes none; a notification on
-            // this channel means nothing yet.
-            continue;
-        };
-
-        if delegates.respond(id, answer(execs, call)).is_err() {
-            return;
-        }
-    }
-}
-
-/// What one delegated call comes to.
-fn answer(execs: &ExecutableSet, call: Call) -> Outcome {
-    let Call::Exec(exec) = call else {
-        return refused(
-            Error::INVALID_REQUEST,
-            "a delegate channel carries executions and nothing else",
-        );
-    };
-
+/// What one delegated call comes to: the `params` of the `resume` that answers it.
+fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
     let Some((name, args)) = exec.cmd.split_first() else {
         return refused(Error::INVALID_PARAMS, "an empty command");
     };
@@ -367,8 +274,8 @@ fn answer(execs: &ExecutableSet, call: Call) -> Outcome {
     };
 
     // `None` is the allowlist boundary. Nothing honest reaches it — the only names the
-    // server was given are the ones in this set — so this is something that found the
-    // channel another way.
+    // server was given are the ones in this set — so this is a server asking for
+    // something it was never told about.
     let Some(result) = execs.invoke(&call) else {
         return refused(
             Error::NOT_EXECUTABLE,
@@ -401,23 +308,21 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::console::message::{Method, Notification, RequestId};
-    use crate::console::stdio::{StdioResponder, read, write};
+    use crate::console::message::{Call, Method, Notification};
     use crate::executable::{ExecResult as ExecOutput, Executable};
 
-    /// A client over canned answers, recording what it was asked.
+    /// A client over canned answers, recording every call it was handed.
+    ///
+    /// The whole `Call` and not just its method, because the delegated calls a console
+    /// resolves are only visible in what its `resume`s carried.
     struct Recorder {
         answers: Vec<Outcome>,
-        asked: Arc<Mutex<Vec<Method>>>,
+        asked: Arc<Mutex<Vec<Call>>>,
     }
 
     impl Requestable for Recorder {
         fn call(&mut self, call: Call) -> Result<Outcome, Failure> {
-            self.asked.lock().unwrap().push(match &call {
-                Call::Start(_) => Method::Start,
-                Call::Exec(_) => Method::Exec,
-                Call::Stop => Method::Stop,
-            });
+            self.asked.lock().unwrap().push(call);
             if self.answers.is_empty() {
                 // Not a panic: `Drop` stops a console best-effort, and a test that has
                 // said all it means to say should not have to answer that too.
@@ -427,12 +332,12 @@ mod tests {
         }
 
         fn notify(&mut self, _: Notification) -> Result<(), Failure> {
-            self.asked.lock().unwrap().push(Method::Quit);
+            self.asked.lock().unwrap().push(Call::Stop);
             Ok(())
         }
     }
 
-    fn recorder(answers: Vec<Outcome>) -> (Recorder, Arc<Mutex<Vec<Method>>>) {
+    fn recorder(answers: Vec<Outcome>) -> (Recorder, Arc<Mutex<Vec<Call>>>) {
         let asked = Arc::new(Mutex::new(Vec::new()));
         (
             Recorder {
@@ -443,20 +348,35 @@ mod tests {
         )
     }
 
+    /// The methods that went out, in order — a notification spelled as `Stop` by
+    /// `Recorder`, so `quit` is the last one.
+    fn methods(asked: &Arc<Mutex<Vec<Call>>>) -> Vec<Method> {
+        asked.lock().unwrap().iter().map(Call::method).collect()
+    }
+
     fn null() -> Outcome {
         Outcome::Result(serde_json::Value::Null)
     }
 
-    /// What `exec` answers with, which is not null — it has a result shape.
+    fn progress(progress: Progress) -> Outcome {
+        Outcome::Result(serde_json::to_value(progress).unwrap())
+    }
+
+    /// An execution that finished without delegating anything.
     fn ran(stdout: &[u8]) -> Outcome {
-        Outcome::Result(
-            serde_json::to_value(ExecResult {
-                code: 0,
-                stdout: stdout.to_vec(),
-                ..ExecResult::default()
-            })
-            .unwrap(),
-        )
+        progress(Progress::Done(ExecResult {
+            code: 0,
+            stdout: stdout.to_vec(),
+            ..ExecResult::default()
+        }))
+    }
+
+    /// An execution pausing on a delegated name.
+    fn delegated(cmd: &[&str]) -> Outcome {
+        progress(Progress::Delegated(Exec {
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            ..Exec::default()
+        }))
     }
 
     struct Greeter;
@@ -505,117 +425,51 @@ mod tests {
         // No process was handed over, so there is no status to report.
         assert!(console.shutdown().unwrap().is_none());
 
+        // An execution that delegated nothing is one round trip: no `resume`.
         assert_eq!(
-            *asked.lock().unwrap(),
-            [Method::Start, Method::Exec, Method::Stop, Method::Quit]
+            methods(&asked),
+            [Method::Start, Method::Exec, Method::Stop, Method::Stop]
         );
     }
 
-    /// A delegated call is answered from the set, on its own channel, while the client
-    /// channel is untouched.
+    /// A delegated call is resolved from the set and sent back as a `resume`, and the
+    /// caller sees one result for the one `exec` it asked for.
     #[test]
-    fn a_delegated_call_is_answered_from_the_set() {
-        /// Both directions of the delegate channel, as one process's two buffers.
-        #[derive(Clone, Default)]
-        struct Wrote(Arc<Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Wrote {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl Wrote {
-            /// Wait until `want` responses have been framed here, and return them.
-            ///
-            /// Polled rather than joined because the threads that write these are one
-            /// per channel and nothing hands back a handle to them. Panics rather than
-            /// hanging if they never arrive.
-            fn responses(&self, want: usize) -> Vec<(RequestId, Outcome)> {
-                for _ in 0..1_000 {
-                    let bytes = self.0.lock().unwrap().clone();
-                    let mut reader = bytes.as_slice();
-                    let mut seen = Vec::new();
-                    // A partial frame reads as an error, which here means "not yet".
-                    while let Ok(Some(message)) = read(&mut reader) {
-                        match message {
-                            Message::Response { id, outcome } => seen.push((id, outcome)),
-                            other => panic!("a delegate end sent {other:?}"),
-                        }
-                    }
-                    if seen.len() >= want {
-                        return seen;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                panic!("only ever saw fewer than {want} responses");
-            }
-        }
-
-        fn asking(id: RequestId, cmd: &[&str]) -> Vec<u8> {
-            let mut bytes = Vec::new();
-            write(
-                &mut bytes,
-                &Message::Request {
-                    id,
-                    call: Call::Exec(Exec {
-                        cmd: cmd.iter().map(|s| s.to_string()).collect(),
-                        ..Exec::default()
-                    }),
-                },
-            )
-            .unwrap();
-            bytes
-        }
-
-        let mut incoming = asking(0, &["foo", "world"]);
-        incoming.extend(asking(1, &["nope"]));
-
-        let answered = Wrote::default();
-        let (client, asked) = recorder(vec![null()]);
-
-        // One channel, then nothing more — which is what ends the accept loop.
-        let mut once = Some(StdioResponder::new(
-            std::io::Cursor::new(incoming),
-            answered.clone(),
-        ));
-
+    fn a_delegated_call_is_resolved_inside_one_exec() {
+        let (client, asked) = recorder(vec![
+            null(),
+            // Two in a row, so the chain is a loop and not a single extra step.
+            delegated(&["foo", "world"]),
+            delegated(&["nope"]),
+            ran(b"done\n"),
+        ]);
         let mut console = Console::builder()
             .client(client)
-            .delegates(move || {
-                Ok(once
-                    .take()
-                    .map(|server| Box::new(server) as Box<dyn Responsable + Send>))
-            })
             .executables(ExecutableSet::new().register("foo", Greeter))
             .build()
             .unwrap();
 
         console.start().unwrap();
+        assert_eq!(console.exec(Exec::default()).unwrap().stdout, b"done\n");
 
-        // Joining `serving` would only prove the accept loop ended — each channel is
-        // served on a thread of its own, so wait for the answers themselves.
-        let outcomes = answered.responses(2);
-        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
-
-        // The registered name ran, and its output came back as a result.
-        assert_eq!(outcomes[0].0, 0);
-        let result: ExecResult = outcomes[0].1.clone().take().unwrap();
-        assert_eq!(result.stdout, b"hello world\n");
-
-        // The unregistered one is refused, not run.
-        assert_eq!(outcomes[1].0, 1);
         assert_eq!(
-            outcomes[1].1.error().map(|e| e.code),
-            Some(Error::NOT_EXECUTABLE)
+            methods(&asked),
+            [Method::Start, Method::Exec, Method::Resume, Method::Resume]
         );
 
-        // And none of it went near the client channel.
-        assert_eq!(*asked.lock().unwrap(), [Method::Start]);
+        // The registered name ran, and its output is what the first `resume` carried.
+        let asked = asked.lock().unwrap();
+        let Call::Resume(outcome) = &asked[2] else {
+            panic!("{:?} is not a resume", asked[2]);
+        };
+        let result: ExecResult = outcome.clone().take().unwrap();
+        assert_eq!(result.stdout, b"hello world\n");
+
+        // The unregistered one is refused rather than run — a server asking for a name
+        // it was never given.
+        let Call::Resume(outcome) = &asked[3] else {
+            panic!("{:?} is not a resume", asked[3]);
+        };
+        assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
     }
 }

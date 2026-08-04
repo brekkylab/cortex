@@ -2,9 +2,9 @@
 //!
 //! A [`Call`] is a `method` and its `params`, and the payloads here are the two
 //! halves of one: what a request sends ([`Start`], [`Exec`]) and what its response
-//! brings back ([`ExecResult`]). They live together because a `result` is typed by
-//! the method its `id` was issued for, so the pair is the thing worth reading at
-//! once.
+//! brings back ([`Progress`], and the [`ExecResult`] inside it). They live together
+//! because a `result` is typed by the method its `id` was issued for, so the pair is
+//! the thing worth reading at once.
 //!
 //! [`Notification`](super::Notification) is the other half of the protocol: the
 //! methods nothing answers.
@@ -14,16 +14,37 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::Method;
+use super::{Method, Outcome};
 
 /// A method and its parameters.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// All of them are the client's: the client asks and the server answers, and that is
+/// true of every method here. Nothing the server has to say arrives as a request of
+/// its own — see [`Progress`] for how a server that needs something from the client
+/// asks for it while remaining the answering end.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Call {
     /// **client → server.** Boot, and make these names runnable.
     Start(Start),
 
-    /// **either direction.** Run this.
+    /// **client → server.** Run this.
     Exec(Exec),
+
+    /// **client → server.** The delegated call you asked for ended like this; carry
+    /// on.
+    ///
+    /// The other half of [`Progress::Delegated`], and only ever a reply to one: an
+    /// execution that paused for a delegated call is waiting for exactly this, and
+    /// there is never more than one paused at a time. So nothing identifies *which*
+    /// delegated call this answers — the id of the response that asked for it does,
+    /// and there is only one outstanding.
+    ///
+    /// An [`Outcome`] and not an [`ExecResult`] because a delegated call can fail to
+    /// produce one at all: a name the client does not have is
+    /// [`NOT_EXECUTABLE`](super::Error::NOT_EXECUTABLE) and one that ran too long is
+    /// [`TIMED_OUT`](super::Error::TIMED_OUT), and the server hands whichever it gets
+    /// straight to the shim that is waiting.
+    Resume(Outcome),
 
     /// **client → server.** Release what [`Start`] booted.
     ///
@@ -66,11 +87,15 @@ pub struct Start {
     pub default_timeout_ms: Option<u64>,
 }
 
-/// One thing to run, and everything needed to run it. The `params` of `exec`.
+/// One thing to run, and everything needed to run it. The `params` of `exec`, and
+/// what a [`Progress::Delegated`] carries back the other way.
 ///
-/// On a console channel it is the command the session exists for. On a delegate
-/// channel it is a delegated executable, and `cmd[0]` is one of the names that
-/// arrived in [`Start`].
+/// As `params` it is the command the session exists for. Inside a `Delegated` it is a
+/// delegated executable the server cannot run itself, and `cmd[0]` is one of the
+/// names that arrived in [`Start`].
+///
+/// One type for both because an execution request is an execution request no matter
+/// who is asking whom: a command, some input, output, a code at the end.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exec {
     /// Already split into argv. Nothing here consults a shell, so quoting and word
@@ -111,13 +136,59 @@ pub struct Exec {
     pub timeout_ms: Option<u64>,
 }
 
-pub enum ExecResultV2 {
+/// How far an execution got: finished, or waiting for the client. The `result` of
+/// both `exec` and `resume`.
+///
+/// # Why a result and not a request
+///
+/// A delegated executable's behaviour lives in the *client* — a Rust closure, an HTTP
+/// call, whatever the host wants a tool to mean — so a command that invokes one by
+/// name cannot be finished by the server alone. The server has to ask.
+///
+/// It asks by answering. [`Delegated`](Self::Delegated) is a complete, ordinary
+/// response to the request the client is already waiting on, and it means *this
+/// execution is not over and here is what I need from you*. The client runs the name,
+/// says so with [`Resume`](Call::Resume), and gets the next `Progress` back. The chain
+/// ends at [`Done`](Self::Done).
+///
+/// So the server never issues a request and the client never answers one. Every
+/// channel in the system has one end that only asks and one that only answers, which
+/// is what there is to gain: no end needs a pending table, no end has a thread waiting
+/// on something only that thread could read, and there is one channel rather than one
+/// per delegated call.
+///
+/// # What it costs
+///
+/// **Delegated calls are served one at a time.** A response can carry one of these,
+/// so a command that starts several delegated executables together (`foo & bar`,
+/// `make -j8`) has them run in turn rather than at once. The [`timeout_ms`](Exec::timeout_ms)
+/// of the outer execution has to cover the sum.
+///
+/// That is latency and not a deadlock, and only because delegated calls are
+/// independent of each other: one carries no [`stdin`](Exec::stdin) — a shim sends
+/// none and an [`ExecCall`](crate::executable::ExecCall) has nowhere to put any — so
+/// no delegated call is waiting on another being served first. **If input ever reaches
+/// a delegated call, serving them in turn stops being safe** and this is the line of
+/// reasoning that has to change.
+///
+/// A client with no delegated names never sees anything but `Done`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Progress {
+    /// The execution is over, and this is all of it.
     Done(ExecResult),
+
+    /// The execution is paused on a delegated executable. Run it and
+    /// [`Resume`](Call::Resume).
+    ///
+    /// Nothing else may be asked until then: the execution owes an answer that has not
+    /// been sent, so a client that asks about anything else is asking about a request
+    /// it has not been answered on.
     Delegated(Exec),
 }
 
 /// A whole execution in one value: everything it wrote, and how it ended. The
-/// `result` of `exec`.
+/// [`Done`](Progress::Done) of a `Progress`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecResult {
     /// A command killed by a signal has no code of its own; the convention is
@@ -153,6 +224,7 @@ impl Call {
         match self {
             Call::Start(_) => Method::Start,
             Call::Exec(_) => Method::Exec,
+            Call::Resume(_) => Method::Resume,
             Call::Stop => Method::Stop,
         }
     }
@@ -168,6 +240,7 @@ impl Call {
         match self {
             Call::Start(start) => map.serialize_entry("params", start),
             Call::Exec(exec) => map.serialize_entry("params", exec),
+            Call::Resume(outcome) => map.serialize_entry("params", outcome),
             Call::Stop => Ok(()),
         }
     }
@@ -181,6 +254,7 @@ impl Call {
         Ok(match method {
             Method::Start => Call::Start(typed_params(method, params)?),
             Method::Exec => Call::Exec(typed_params(method, params)?),
+            Method::Resume => Call::Resume(typed_params(method, params)?),
             Method::Stop => Call::Stop,
             Method::Quit => {
                 return Err(E::custom("quit is a notification and cannot carry an id"));

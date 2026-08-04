@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "cortex",
     "cortex-local-console",
-    "cortex-uvm-console-server",
 ]
 
 [workspace.package]

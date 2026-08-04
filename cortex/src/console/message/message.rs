@@ -2,39 +2,41 @@
 //! wire.
 //!
 //! What is here is true of every message regardless of method — the `jsonrpc`
-//! member, the `id` that pairs a response with its request, the `result` xor
-//! `error` of a response — and the serde impls that read and write all of it. What
-//! a particular method carries is [`Call`]'s and [`Notification`]'s.
+//! member, the `id` that pairs a response with its request, which of the three
+//! shapes the member set makes it — and the serde impls that read and write all of
+//! it.
+//!
+//! What a particular method carries is [`Call`]'s and [`Notification`]'s, and how
+//! something *ended* is [`Outcome`]'s: a response carries one, and so does a
+//! `resume`, which is why it is not in here.
 
 use std::fmt;
 
-use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
+use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use super::{Call, Notification};
+use super::{Call, Error, Notification, Outcome};
 
 /// The only `jsonrpc` member this protocol accepts.
 pub const VERSION: &str = "2.0";
 
 /// Pairs a response with the request it answers.
 ///
-/// Allocated by whoever issues the request, and unique only among that issuer's
-/// own. Two issuers can hand out the same number without either being wrong: a
-/// response travels back the way its request came, so what pairs them is the
-/// channel *and* the id, and no end can be handed an answer to a request it did
-/// not make. Each counts for itself, from zero, by one.
+/// Allocated by the client, which is the only end that asks, and counted from zero
+/// by one. Nothing on the answering side reads a meaning into the number.
 ///
-/// On any one channel there is a single request outstanding at a time today, so
-/// what the id earns is not concurrency but certainty about what an answer
-/// answers: one carrying a number nobody issued is a peer that has lost its place,
-/// and can be dropped rather than mistaken for the answer that was due.
+/// There is a single request outstanding at a time, so what the id earns is not
+/// concurrency but certainty about what an answer answers: one carrying a number
+/// nobody issued is a peer that has lost its place, and can be dropped rather than
+/// mistaken for the answer that was due.
 ///
-/// Several delegated calls *can* be in flight together — one shell command can
-/// start any number of them (`foo | bar`, `make -j8`) — but on one channel each,
-/// not interleaved on one. That is what the id would be earning if a channel ever
-/// carried more than one, and it costs nothing to keep.
+/// It is also what threads a [`Progress::Delegated`](super::Progress::Delegated)
+/// exchange together. An execution that pauses for a delegated call is answered
+/// once per round trip — the `exec`, then each `resume` — and each of those
+/// responses carries the id of the request it is the answer to, so a client waiting
+/// on one is never handed the answer to another.
 ///
 /// JSON-RPC also allows a string or null id. This protocol issues numbers, which
 /// is what an off-the-shelf peer will happily accept; nothing reads any other
@@ -71,23 +73,13 @@ pub enum Message {
     Response { id: RequestId, outcome: Outcome },
 }
 
-/// A response's `result` or its `error` — never both, never neither.
-///
-/// The `result` is held as a [`Value`] because its type depends on the method the
-/// `id` was issued for, which only the end that issued it knows.
-/// [`take`](Outcome::take) is where that knowledge is applied.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Outcome {
-    Result(Value),
-    Error(Error),
-}
-
 /// Which method a request called, and its response answers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
     Start,
     Exec,
+    Resume,
     Stop,
     Quit,
 }
@@ -98,6 +90,7 @@ impl Method {
         match self {
             Method::Start => "start",
             Method::Exec => "exec",
+            Method::Resume => "resume",
             Method::Stop => "stop",
             Method::Quit => "quit",
         }
@@ -107,6 +100,7 @@ impl Method {
         Some(match name {
             "start" => Method::Start,
             "exec" => Method::Exec,
+            "resume" => Method::Resume,
             "stop" => Method::Stop,
             "quit" => Method::Quit,
             _ => return None,
@@ -119,70 +113,6 @@ impl fmt::Display for Method {
         f.write_str(self.as_str())
     }
 }
-
-/// Why a request could not be answered with a result.
-///
-/// `code` is what a program branches on and `message` is what a person reads.
-/// `data` is anything extra the sender thought was worth carrying; nothing in this
-/// protocol requires it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Error {
-    pub code: i64,
-    pub message: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-}
-
-impl Error {
-    /// `exec`: the execution outlived its [`timeout_ms`](super::Exec::timeout_ms) and
-    /// was killed.
-    ///
-    /// An error rather than a result, because there is no result: a killed command
-    /// has no exit code, and whatever it had written is gone with it — one message
-    /// cannot carry an ending that never happened. A requester acts on this
-    /// specifically, which is what the code is for: retry with more time, or give
-    /// up.
-    pub const TIMED_OUT: i64 = -32000;
-
-    /// `exec`: the program was not there, or could not be started.
-    pub const NOT_EXECUTABLE: i64 = -32001;
-
-    /// `start`: the backend could not be brought up.
-    ///
-    /// Worth its own code because it is the failure the old wire could not report
-    /// at all: a server that could not set itself up had nothing to say and could
-    /// only die, leaving the client to guess from an exit status.
-    pub const BOOT_FAILED: i64 = -32002;
-
-    /// `stop`: the resources could not be released, and may still be held.
-    pub const STOP_FAILED: i64 = -32003;
-
-    /// Any: `start` has not been answered yet, or has been undone by `stop`.
-    pub const NOT_STARTED: i64 = -32004;
-
-    /// The four the spec defines that a peer of ours can hit. `-32700` (parse
-    /// error) belongs to whoever reads the frame, not here.
-    pub const INVALID_REQUEST: i64 = -32600;
-    pub const METHOD_NOT_FOUND: i64 = -32601;
-    pub const INVALID_PARAMS: i64 = -32602;
-    pub const INTERNAL_ERROR: i64 = -32603;
-
-    pub fn new(code: i64, message: impl Into<String>) -> Self {
-        Error {
-            code,
-            message: message.into(),
-            data: None,
-        }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} ({})", self.message, self.code)
-    }
-}
-
-impl std::error::Error for Error {}
 
 impl Message {
     /// The request this message is, or answers. `None` for a notification, which
@@ -202,37 +132,6 @@ impl Message {
             Message::Request { call, .. } => Some(call.method()),
             Message::Notification(notification) => Some(notification.method()),
             Message::Response { .. } => None,
-        }
-    }
-}
-
-impl Outcome {
-    /// The error, if this is an error response.
-    pub fn error(&self) -> Option<&Error> {
-        match self {
-            Outcome::Error(error) => Some(error),
-            Outcome::Result(_) => None,
-        }
-    }
-
-    /// The `result`, as the type the method returns — `ExecResult` for `exec`,
-    /// `()` for `start` and `stop`.
-    ///
-    /// The caller supplies `T` because the caller is the end that issued the `id`
-    /// and so is the only one that knows the method. A `result` that will not
-    /// deserialize is reported as an [`INTERNAL_ERROR`](Error::INTERNAL_ERROR),
-    /// because from here it is indistinguishable from a peer that answered the
-    /// wrong request — either way there is nothing usable and the reason belongs in
-    /// a log.
-    pub fn take<T: DeserializeOwned>(self) -> Result<T, Error> {
-        match self {
-            Outcome::Error(error) => Err(error),
-            Outcome::Result(value) => serde_json::from_value(value).map_err(|e| {
-                Error::new(
-                    Error::INTERNAL_ERROR,
-                    format!("result is not what this method returns: {e}"),
-                )
-            }),
         }
     }
 }
@@ -358,22 +257,11 @@ impl<'de> Visitor<'de> for MessageVisitor {
             };
         }
 
-        // No method, so a response: exactly one of result and error, and an id to
-        // say what it answers.
-        let outcome = match (result, error) {
-            (Some(value), None) => Outcome::Result(value),
-            (None, Some(error)) => Outcome::Error(error),
-            (Some(_), Some(_)) => {
-                return Err(de::Error::custom(
-                    "a response has both a result and an error",
-                ));
-            }
-            (None, None) => {
-                return Err(de::Error::custom(
-                    "a message has no method, result or error",
-                ));
-            }
-        };
+        // No method, so a response: an outcome, and an id to say what it answers.
+        // Neither member being there is what makes this none of the three shapes —
+        // there was no `method` either, or we would not have got here.
+        let outcome = Outcome::from_members(result, error)?
+            .ok_or_else(|| de::Error::custom("a message has no method, result or error"))?;
         let id = id.ok_or_else(|| de::Error::custom("a response needs an id"))?;
         Ok(Message::Response { id, outcome })
     }
@@ -383,7 +271,7 @@ impl<'de> Visitor<'de> for MessageVisitor {
 mod tests {
     use serde_json::json;
 
-    use super::super::{Exec, ExecResult, Start};
+    use super::super::{Exec, ExecResult, Progress, Start};
     use super::*;
 
     fn exec() -> Exec {
@@ -396,12 +284,13 @@ mod tests {
         }
     }
 
-    /// One whole session, in order: boot, run something, release, exit — plus the
-    /// delegated call that command made, which travels on a channel of its own and
-    /// is here because it is the same `Message` and has to survive the same trip.
+    /// A whole session on one channel, in order: boot, run something that delegates
+    /// twice on the way, release, exit.
     ///
-    /// The ids are whatever each end happened to allocate; nothing here reads a
-    /// meaning into the numbers, and a roundtrip does not care which they are.
+    /// The execution in the middle is the shape worth reading: the `exec` is answered
+    /// with a `Delegated` rather than a result, each `resume` is answered with the
+    /// next one, and the last of them carries the execution's own ending. Every
+    /// request is the client's and every response the server's throughout.
     fn session() -> Vec<Message> {
         vec![
             Message::Request {
@@ -416,34 +305,61 @@ mod tests {
                 outcome: Outcome::Result(Value::Null),
             },
             Message::Request {
-                id: 2,
+                id: 1,
                 call: Call::Exec(exec()),
             },
-            // A delegated call, which reaches the client on a channel of its own:
-            // no input, no timeout of its own.
-            Message::Request {
-                id: 1,
-                call: Call::Exec(Exec {
-                    cmd: vec!["foo".into()],
-                    ..Exec::default()
-                }),
-            },
+            // Not the execution's result: a name the server cannot run itself. No
+            // input, no timeout of its own.
             Message::Response {
                 id: 1,
-                outcome: Outcome::Error(Error::new(
-                    Error::NOT_EXECUTABLE,
-                    "foo: no such executable on the client",
+                outcome: Outcome::Result(
+                    serde_json::to_value(Progress::Delegated(Exec {
+                        cmd: vec!["foo".into()],
+                        ..Exec::default()
+                    }))
+                    .unwrap(),
+                ),
+            },
+            // A delegated call that produced something.
+            Message::Request {
+                id: 2,
+                call: Call::Resume(Outcome::Result(
+                    serde_json::to_value(ExecResult {
+                        code: 0,
+                        stdout: b"foo said this\n".to_vec(),
+                        ..ExecResult::default()
+                    })
+                    .unwrap(),
                 )),
             },
             Message::Response {
                 id: 2,
                 outcome: Outcome::Result(
-                    serde_json::to_value(ExecResult {
+                    serde_json::to_value(Progress::Delegated(Exec {
+                        cmd: vec!["bar".into(), "--twice".into()],
+                        ..Exec::default()
+                    }))
+                    .unwrap(),
+                ),
+            },
+            // And one that did not, which is why a `resume` carries an outcome and not
+            // a result.
+            Message::Request {
+                id: 3,
+                call: Call::Resume(Outcome::Error(Error::new(
+                    Error::NOT_EXECUTABLE,
+                    "bar: no such executable on the client",
+                ))),
+            },
+            Message::Response {
+                id: 3,
+                outcome: Outcome::Result(
+                    serde_json::to_value(Progress::Done(ExecResult {
                         code: -1,
                         stdout: vec![0, 1, 2, 255, b'\n'],
                         stderr: vec![],
                         truncated: false,
-                    })
+                    }))
                     .unwrap(),
                 ),
             },
@@ -474,7 +390,7 @@ mod tests {
                     outcome: Outcome::Error(Error::new(Error::BOOT_FAILED, "no kvm")),
                 },
                 Message::Response {
-                    id: 2,
+                    id: 1,
                     outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
                 },
                 Message::Response {
@@ -531,6 +447,53 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "error": {"code": -32000, "message": "killed after 1000ms"},
+            }),
+        );
+
+        // A `Delegated` is an ordinary `result`, which is the whole point of it: an
+        // off-the-shelf peer sees a response and nothing stranger.
+        assert_eq!(
+            wire(&Message::Response {
+                id: 2,
+                outcome: Outcome::Result(
+                    serde_json::to_value(super::super::Progress::Delegated(Exec {
+                        cmd: vec!["foo".into()],
+                        ..Exec::default()
+                    }))
+                    .unwrap()
+                ),
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "result": {"delegated": {"cmd": ["foo"]}},
+            }),
+        );
+
+        // And a `resume` carries the two members a response spells an outcome with, as
+        // its `params`.
+        assert_eq!(
+            wire(&Message::Request {
+                id: 3,
+                call: Call::Resume(Outcome::Error(Error::new(Error::TIMED_OUT, "too slow"))),
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "resume",
+                "params": {"error": {"code": -32000, "message": "too slow"}},
+            }),
+        );
+        assert_eq!(
+            wire(&Message::Request {
+                id: 3,
+                call: Call::Resume(Outcome::Result(json!({"code": 0}))),
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "resume",
+                "params": {"result": {"code": 0}},
             }),
         );
 
@@ -603,6 +566,16 @@ mod tests {
         refused(
             r#"{"jsonrpc":"2.0","id":1,"method":"exec","params":{"cmd":"ls"}}"#,
             "exec params",
+        );
+        // A `resume` carries an outcome, so the same two rules apply to its `params` as
+        // to a response's members.
+        refused(
+            r#"{"jsonrpc":"2.0","id":1,"method":"resume","params":{}}"#,
+            "no result and no error",
+        );
+        refused(
+            r#"{"jsonrpc":"2.0","id":1,"method":"resume","params":{"result":null,"error":{"code":1,"message":"x"}}}"#,
+            "both a result and an error",
         );
     }
 

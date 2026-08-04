@@ -27,8 +27,9 @@ const PREFIX: &str = "cortex-console-";
 
 /// Our scratch directory: the `bin/` that goes on `PATH`, and nothing else.
 ///
-/// The socket a shim dials is not here — the client binds that one, because the client
-/// is what a shim has to reach. See [`ipc`](crate::ipc).
+/// The socket a shim dials is not here. It is bound once for the process rather than per
+/// session, so its lifetime is not this directory's — see
+/// [`Shims`](super::Shims) and [`ipc`](crate::ipc).
 ///
 /// Owns the directory outright — dropping it removes the tree, so the caller
 /// keeps it alive for exactly as long as the names should be callable.

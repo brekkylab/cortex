@@ -8,12 +8,12 @@ Two things make it more than a remote `exec`:
 
 1. Fully compatible to JSON-RPC 2.0
 2. Execution runs both ways.
-   A tool that only the client knows how to run ends up runnable inside a sandbox — the client answers an `exec` for it, on a channel of its own.
+   A tool that only the client knows how to run ends up runnable inside a sandbox — the server asks for it by *answering*, and the client runs it.
 
-**Each end of a channel does one job.** A requesting end only asks; an answering end only answers.
-Execution running both ways therefore means *two channels*, not one channel used both ways — see [Delegation](#delegation-and-execution-both-ways) for what that buys and what it costs.
+**Each end of the channel does one job.** The client only asks; the server only answers.
+Execution running both ways does *not* mean requests going both ways: a server that needs a delegated executable run says so in a `result`, on the request the client is already waiting on — see [Delegation](#delegation-and-execution-both-ways) for what that buys and what it costs.
 
-Source: [`message/`](message/) for the objects, [`stdio/channel.rs`](stdio/channel.rs) for the wire, [`base.rs`](base.rs) for what each end can do, [`stdio/`](stdio/) for the ends themselves, [`console.rs`](console.rs) for the public end that holds both channels.
+Source: [`message/`](message/) for the objects, [`stdio/channel.rs`](stdio/channel.rs) for the wire, [`base.rs`](base.rs) for what each end can do, [`stdio/`](stdio/) for the ends themselves, [`console.rs`](console.rs) for the public end that walks the delegation chain.
 
 ---
 
@@ -30,6 +30,8 @@ It is a rule, not something the types enforce — holding `StdoutLock` for the p
 
 A command's own stdio never appears here.
 It is captured wherever the command runs and travels back inside a `result`, which is what makes one pair of descriptors enough where the old wire needed four (`fd 0` for the command *then* its stdin, `fd 1`/`fd 2` for its output, `fd 3` for delegation).
+
+One pair is also all there is: delegation does not add a second channel, so this is the whole of the protocol's surface.
 
 ### Framing
 
@@ -71,17 +73,14 @@ Every request gets exactly one response, carrying the same `id`.
 
 ### Ids
 
-`id` is a number, allocated by whoever issues the request and **unique only among that issuer's own**.
-Each end counts for itself, from zero, by one.
+`id` is a number, allocated by the **client** — the only end that issues requests — counting from zero, by one.
+Nothing on the answering side reads a meaning into the number.
 
-The two ends can hand out the same number without either being wrong: a response travels back the way its request came, so what pairs them is the direction *and* the id.
-Neither end can be handed an answer to a request it did not make, so there is nothing for a split id space to prevent.
-
-On any one channel today there is a single request outstanding at a time: a console channel is driven by one caller waiting for each answer, and a delegate channel carries one call and ends.
+There is a single request outstanding at a time.
 So what an `id` earns is not concurrency but **certainty about what an answer answers** — a response carrying an id nobody issued is a peer that has lost its place, and it can be dropped instead of being mistaken for the answer that was due.
 
-Several delegated calls *can* be in flight together (`foo | bar`, `make -j8`) — one channel each, not one channel shared.
-That is what the id space would be earning if a channel ever carried more than one, and it costs nothing to keep.
+It is also what threads a delegation together.
+One execution is answered once per round trip — the `exec`, then each `resume` — and each response carries the id of the request it answers, so the client is never handed the answer to a different step than the one it is waiting on.
 
 **Pair by `id`, not by position.**
 
@@ -106,16 +105,17 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 ## Methods
 
-| method | channel | `params` | `result` |
-|---|---|---|---|
-| `start` | console: client → server | `{delegated, default_timeout_ms?}` | `null` |
-| `exec` | console: client → server | `{cmd, stdin?, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
-| `exec` | delegate: shim → client | `{cmd, stdin?, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
-| `stop` | console: client → server | — | `null` |
-| `quit` | console: client → server | — | *(notification)* |
+| method | `params` | `result` |
+|---|---|---|
+| `start` | `{delegated, default_timeout_ms?}` | `null` |
+| `exec` | `{cmd, stdin?, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
+| `resume` | `{result: ...}` or `{error: {...}}` | `{done: {...}}` or `{delegated: {...}}` |
+| `stop` | — | `null` |
+| `quit` | — | *(notification)* |
 
-Every channel runs one way: the end that asks on it never answers on it, and the end that answers never asks.
-`exec` appears twice because it is the same request on both, not because either channel carries it both ways.
+**Every method is the client's.**
+The channel runs one way: the client asks and never answers, the server answers and never asks.
+There is no method a server issues, which is what [Delegation](#delegation-and-execution-both-ways) is about.
 
 `params` is omitted entirely for a method that takes none: the spec allows leaving it out, and `null` is not one of the two types it permits.
 
@@ -151,8 +151,8 @@ A backend that cannot come up answers `BOOT_FAILED`, which the old wire had no w
 ### `exec` — run this
 
 ```json
-{"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","cat && fetch x"],"stdin":"aGkK","timeout_ms":5000}}
-{"jsonrpc":"2.0","id":2,"result":{"code":0,"stderr":"","stdout":"aGkK","truncated":false}}
+{"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","cat && echo x"],"stdin":"aGkK","timeout_ms":5000}}
+{"jsonrpc":"2.0","id":2,"result":{"done":{"code":0,"stderr":"","stdout":"aGkK","truncated":false}}}
 ```
 
 Minimal form — no input, no timeout of its own:
@@ -169,6 +169,28 @@ Minimal form — no input, no timeout of its own:
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
 | `stdout`/`stderr` | base64, byte-exact, kept apart. |
 | `truncated` | the command wrote more than the executor would hold, and this is the beginning of it. |
+
+The `result` is not the execution's output but **how far it got**: `done` is the whole of it, `delegated` is the execution pausing on something only the client can run.
+A client with nothing delegated never sees the second.
+See [Delegation](#delegation-and-execution-both-ways).
+
+### `resume` — the delegated call ended like this
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"resume","params":{"result":{"code":0,"stdout":"aGkK","stderr":"","truncated":false}}}
+{"jsonrpc":"2.0","id":3,"result":{"done":{"code":0,"stdout":"aGkK","stderr":"","truncated":false}}}
+```
+
+Only ever a reply to a `delegated`, and its `result` is the next step of the *same* execution — another `delegated`, or the end of it.
+
+`params` is the two members a response spells an outcome with, because a delegated call can fail to produce one at all:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"resume","params":{"error":{"code":-32001,"message":"fetch: not a delegated executable"}}}
+```
+
+The server hands whichever arrives straight to the shim that is waiting, and does not read it.
+A `resume` when nothing is paused is `INVALID_REQUEST`.
 
 There is no working directory.
 Sending one would be a host path, which means nothing inside a micro-VM guest, so *where* to run something only becomes expressible once both ends agree on what a path is — which is a workspace volume mount's job.
@@ -221,73 +243,112 @@ A delegated executable's behaviour lives in the **client's** `ExecutableSet` —
 The server cannot have it.
 But a command running inside the server's world must be able to invoke it by name, as if it were a program on `PATH`.
 
-So the client answers an `exec` for it — same method, same shapes, **a different channel**.
+So the server has to ask the client for it.
+**It asks by answering.**
 
-### Why not the same channel
+### `delegated` is a response, not a request
 
-Because then the console channel would carry requests in both directions, and every end of it would have to be both a requester and an answerer: a pending table to match late responses, and a reader that must never block on work it is also the only one who can read for.
-That was the earlier design, and the cost was not the table — it was that a server answering an `exec` inline would sit waiting for a delegated answer that only its own read loop could deliver.
+A `delegated` is a complete, ordinary JSON-RPC response to the `exec` the client is already waiting on.
+It means *this execution is not over, and here is what I need from you*.
+The client runs the name, says so with `resume`, and gets the next step back.
+The chain ends at `done`.
 
-One channel per direction of asking removes the problem rather than managing it.
-A requesting end has no pending table because everything arriving on it is the answer to what it just asked; an answering end has no read-while-blocked problem because nothing it needs ever arrives on the channel it is answering.
+So the server never issues a request and the client never answers one.
+There is one channel, one end that asks, one end that answers — no pending table anywhere, no reader that must not block, and no channel per delegated call.
 
-### The two channels
+### Why not a request from the server
+
+That was the earlier design, twice over.
+
+Sending the server's `exec` **on the console channel** makes every end both a requester and an answerer: a pending table to match late responses, and a reader that must never block on work it is also the only one who can read for.
+The cost was not the table — it was that a server answering an `exec` inline would sit waiting for a delegated answer that only its own read loop could deliver.
+
+Giving the shim **a channel of its own to the client** fixed that, and cost something else: the client had to be an answering end too.
+A listener to bind, a thread per delegated call, an accept loop that could never be joined because a listener with nobody dialling it blocks forever, and a socket address only the client could choose but only the server's environment could carry.
+It also put the hop in the wrong place — a shim inside a micro-VM guest would have to reach across the guest boundary to the host, which a unix socket cannot do.
+
+Answering with `delegated` needs neither.
+The shim's hop is to the **server**, which is on the same side of every boundary as the command that ran it, and the console channel — which already crosses whatever there is to cross — carries the call the rest of the way.
+
+### The one channel
 
 ```
-console channel      client ──asks──► server        one, for the session
-delegate channel     shim   ──asks──► client        one per delegated call
+console channel      client ──asks──► server          one, for the session
+shim socket          shim   ──asks──► server          server-local, not this protocol
 ```
 
-The **client** binds whatever a shim dials and hands the address to the server's environment; nothing about it appears in this protocol.
-The server never sees a delegated call at all: it puts the name on `PATH` and is done.
+The **server** binds whatever a shim dials and names it in the environment of everything an execution spawns; nothing about it appears in this protocol.
 
+A solid arrow is a request and a dashed one a response.
+**On the console channel — the two leftmost lifelines — every solid arrow starts at the client**, and every one of the server's is dashed.
+That is the whole diagram's point.
+
+```mermaid
+sequenceDiagram
+    participant client
+    participant server
+    box transparent sandbox
+        participant sh
+        participant shim as fetch
+    end
+
+    client->>server: id:0 start {delegated:["fetch"]}
+    Note over client,server: server symlinks `fetch` into a bin/ dir
+    server-->>client: id:0 result null
+
+    client->>server: id:1 exec {cmd:["sh","-c","fetch x"]}
+    server->>sh: spawn
+    activate sh
+    sh->>shim: runs `fetch x`
+    activate shim
+    shim->>server: dials the shim socket
+    Note over sh,shim: both blocked until this is answered
+    server-->>client: id:1 result {delegated:{cmd:["fetch","x"]}}
+    Note over client,server: client runs ExecutableSet::invoke("fetch", ["x"])
+    client->>server: id:2 resume {result:{code:0, stdout:"…"}}
+    server-->>shim: {code:0, stdout:"…"}
+    shim-->>sh: onto its own stdout, exits 0
+    deactivate shim
+    sh-->>server: exits
+    deactivate sh
+    server-->>client: id:2 result {done:{code:0, stdout:"…"}}
+
+    client->>server: id:3 stop
+    server-->>client: id:3 result null
+    client->>server: quit — no id, so nothing answers
 ```
-  client                                                server            sandbox
-    │                                                      │                  │
-    │ ── {id:0, method:"start",                             │                  │
-    │      params:{delegated:["fetch"]}} ─────────────────► │                  │
-    │                                                      ├─ symlink `fetch`  │
-    │                                                      │  onto PATH        │
-    │ ◄─────────────────────────── {id:0, result:null} ──── │                  │
-    │                                                      │                  │
-    │ ── {id:1, method:"exec",                              │                  │
-    │      params:{cmd:["sh","-c","fetch x"]}} ───────────► │                  │
-    │                                                      ├──── run ────────► │
-    │                                                      │            sh runs
-    │                                                      │            `fetch x`
-    │                                                      │                  │
-    │        ┌─── delegate channel ─────────────────────────┼──── shim dials ──┤
-    │        │                                             │       (blocked)   │
-    │ ◄── {id:0, method:"exec", params:{cmd:["fetch","x"]}} ┼───────────────────┤
-    ├─ ExecutableSet::invoke("fetch", ["x"])                │                  │
-    │ ── {id:0, result:{code:0, stdout:"…"}} ───────────────┼──────────────────►│
-    │        └─── channel ends ────────────────────────────┼───────────────────┤
-    │                                                      │            sh finishes
-    │ ◄── {id:1, result:{code:0, stdout:"…"}} ───────────── │                  │
-    │                                                      │                  │
-    │ ── {id:2, method:"stop"} ──────────────────────────►  │                  │
-    │ ◄── {id:2, result:null} ───────────────────────────── │                  │
-    │ ── {method:"quit"} ────────────────────────────────►  │                  │
-```
 
-Note what the two `exec` requests have in common: **nothing distinguishes them but which channel they arrived on.**
-An execution request is an execution request no matter who asks — a command, some input, output, a code at the end — so there is one method and one result shape, and one codec in the system rather than two.
+Note that `id:1` is answered **once**, with `delegated`, and the execution's own ending goes to `id:2` — the `resume` that was outstanding by then.
+Every request still gets exactly one response.
 
-Both delegated `id`s are `0` because a delegate channel carries one call: there is nothing for an id to tell apart, and it is on the wire only because a request without one would be a notification.
+The shim's dial is the only arrow that is not this protocol: it is server-local, and the server is what turns it into the `delegated` above it.
+
+And note what the delegated call carries: an ordinary `exec`'s `params`, verbatim.
+An execution request is an execution request no matter who is asking whom — a command, some input, output, a code at the end — so there is one shape and one codec in the system rather than two.
 
 ### Consequences
 
-**Concurrent, not nested.**
-Several delegated calls can be outstanding together, each on its own channel, and the client gives each channel a thread.
-Serving them in turn would deadlock a pipeline: `foo | bar` starts both before either finishes, and the second would wait for the first's answer, which waits for the second to be read.
+**Delegated calls are served one at a time.**
+A response can carry one `delegated`, so a command that starts several delegated executables together (`foo & bar`, `make -j8`) has them run in turn.
+The outer execution's `timeout_ms` has to cover the sum.
 
-**No thread is waiting on a channel it also has to read.**
-The console channel's answerer is a plain sequential loop — read a request, answer it, read the next — because nothing it needs to answer can arrive on it.
-That is the whole benefit of the split, and it is why the earlier design's "the reader must never block on backend work" rule no longer exists to break.
+That is latency and not a deadlock, and **only because delegated calls are independent of each other**: one carries no `stdin` — a shim sends none and an `ExecCall` has nowhere to put any — so no delegated call is waiting on another being served first.
+`foo | bar` where both are delegated works because `bar` never reads what `foo` wrote.
+
+> **This is the line of reasoning to change first.**
+> If input ever reaches a delegated call, serving them in turn stops being safe, and delegation needs a shape that can carry more than one at a time.
+
+**The client is purely an asking end.**
+No listener, no accept loop, no thread per delegated call, and nothing to join at shutdown.
+`Console::exec` walks the chain in the caller's own thread and returns one result for the one command it was given.
+
+**The server interleaves.**
+It cannot run a command to completion and then answer, because the delegated call arrives while the command is still running.
+So an execution is a loop over *a shim connected* and *the command ended*, which is where the concurrency that used to be the client's now lives.
 
 **Shutting down is one-sided.**
 Ending the session ends the console channel.
-Whatever accepts delegate channels is not ended by that and is not waited for: a listener with nobody dialling it blocks forever, so joining it would hang.
+The server's shim socket is bound for the life of the process, not of a session, because a thread blocked in `accept` cannot be told to stop.
 
 ---
 
@@ -307,7 +368,7 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32002` | `start` | **boot failed** — the backend could not be brought up. |
 | `-32003` | `stop` | **stop failed** — the resources may still be held. |
 | `-32004` | `exec`, `stop` | **not started** — no `start` has been answered, or a `stop` has undone it. |
-| `-32600` | any | invalid request |
+| `-32600` | any | invalid request — including a `resume` when nothing is paused on a delegated call. |
 | `-32601` | any | method not found |
 | `-32602` | any | invalid params — an empty `cmd`. A delegated name that is not a plain path component *should* be this and is not checked; see [`start`](#start--boot-and-make-these-names-runnable). |
 | `-32603` | any | internal error |
@@ -335,23 +396,33 @@ stateDiagram-v2
     [*] --> Idle
     Idle --> Up: start → result
     Idle --> Idle: start → BOOT_FAILED
-    Up --> Up: exec → result / error
+    Up --> Paused: exec / resume → delegated
+    Paused --> Paused: resume → delegated
+    Paused --> Up: resume → done / error
+    Up --> Up: exec → done / error
     Up --> Idle: stop → result
     Idle --> [*]: quit
     Up --> [*]: quit
 ```
 
 From `Idle`, an `exec` or a `stop` is `NOT_STARTED`.
-From `Up`, a second `start` is `INVALID_REQUEST`.
+From `Up`, a second `start` is `INVALID_REQUEST`, and so is a `resume` — nothing is paused.
 A failed `start` leaves `Idle`, so nothing thinks it is up.
 
-> **Not enforced on the answering side today.**
-> The shared server layer that held these rules is gone, and nothing has replaced it: an answering end moves frames and reads no meaning into them.
-> `Console` keeps the flag on the *asking* side, so an `exec` before `start` never reaches a channel — but that is one client being well-behaved, not the protocol being upheld.
-> A peer that asks out of order gets whatever the backend does, and a delegated name is linked unchecked.
+`Paused` is an execution that has been answered with `delegated` and not yet resumed.
+It is the client's turn and **only** a `resume` belongs there: the execution owes an answer that has not been sent, so a client asking about anything else is asking about a request it has not been answered on.
+There is at most one `Paused` execution, which is why a `resume` needs nothing to say *which* delegated call it answers.
+
+> **Barely enforced on the answering side today.**
+> An answering end moves frames and reads no meaning into them, and the shared server layer that held these rules is gone.
+> A backend refuses a `resume` that nothing is waiting on, because it is the only end that knows — but `NOT_STARTED` and a second `start` are not checked, and a delegated name is linked unchecked.
+> `Console` keeps the started flag on the *asking* side, so an `exec` before `start` never reaches the channel — but that is one client being well-behaved, not the protocol being upheld.
 >
 > Where they belong when they come back: not in each backend, because every backend's version would be the same and would be the same to get wrong.
-> A backend should implement only the three things that differ — making a name runnable, running a command, releasing what booting took — and never see a broken session.
+> A backend should implement only the things that differ — making a name runnable, running a command while letting a delegated call through, releasing what booting took — and never see a broken session.
+>
+> The interleaving loop is a candidate for the same treatment.
+> Every backend's version of "wait for a shim or the command's end, answer the console channel, hand the outcome back" is the same, and it is now the most intricate thing a backend does.
 
 ---
 
@@ -367,3 +438,4 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | say where to run something | a host path means nothing inside a guest. Needs a workspace volume mount first. |
 | cancel one execution | `stop` releases the whole session, not a command. Let the timeout expire. |
 | output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. |
+| run two delegated calls at once | a response carries one `delegated`. Needs delegated calls to stop being independent before it is worth a shape that carries several — see [Consequences](#consequences). |

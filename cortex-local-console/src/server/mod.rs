@@ -1,43 +1,66 @@
 //! The server role: answer a console session by running commands on this host.
 //!
-//! A [`StdioResponder`] brings the requests in and puts the responses out, and does nothing
-//! else — so what is left here is the two things that are actually ours: making a
-//! delegated name runnable, and running a command.
+//! A [`StdioResponder`] brings the requests in and puts the responses out, and does
+//! nothing else — so what is left here is the three things that are actually ours: making
+//! a delegated name runnable, running a command, and letting a delegated call reach the
+//! client while that command waits for it.
 //!
 //! # Making a delegated name runnable
 //!
 //! A `PATH` entry: a directory of symlinks, one per delegated name, each pointing back
 //! at this binary (see [`bin_dir`]). A command that runs one of them re-enters this
-//! binary as a shim, which reaches the *client* directly — see [`ipc`](crate::ipc) for
-//! why that is not our hop to make. Nothing here answers a delegated call, and nothing
-//! here knows what one does.
+//! binary as a shim, which dials the socket *we* bound — see [`ipc`](crate::ipc).
 //!
 //! Host-local by nature: a micro-VM backend can use neither a symlink on our filesystem
 //! nor a socket on it.
 //!
-//! # Running the command
+//! # Running the command, and pausing it
 //!
-//! [`Command`], captured. Everything a command wrote comes back inside one
-//! [`ExecResult`], because that is the shape of the protocol's answer — there are no
-//! output chunks and no way to watch a command work.
+//! [`Command`], captured — but spawned rather than run to completion, because a
+//! delegated call arrives *while* it runs and has to be answered before it can finish.
+//! So an execution is a loop over two things that can happen next: a shim connects, or
+//! the command ends. Both arrive on one queue ([`Shims`]), because waiting for either is
+//! what the loop does and there is no way to wait on two.
+//!
+//! A shim connecting means answering the console request with a
+//! [`Delegated`](Progress::Delegated) and waiting for the client's `resume` — which is
+//! why the console channel is threaded through [`execute`] rather than being answered
+//! once at the end. The client is still the only end that asks; this end just answers
+//! more than once per execution.
+//!
+//! Delegated calls are therefore served in turn. See [`Progress`] for why that is
+//! latency rather than a deadlock.
 //!
 //! # What this does not do
 //!
-//! The session rules are not enforced anywhere yet. An `exec` before `start` runs, a
-//! second `start` re-boots, and a delegated name is linked **without being checked as a
-//! plain path component** — so a name like `../../etc/foo` would put a symlink somewhere
-//! this process does not reach and cannot clean up. Every name that gets here came from
-//! the client, which is in-process with whoever chose them; that is the only thing
-//! standing in for the check today.
+//! The session rules are not enforced anywhere yet. An `exec` before `start` runs (with
+//! no delegated names on `PATH`, since there are none), a second `start` re-boots, and a
+//! delegated name is linked **without being checked as a plain path component** — so a
+//! name like `../../etc/foo` would put a symlink somewhere this process does not reach
+//! and cannot clean up. Every name that gets here came from the client, which is
+//! in-process with whoever chose them; that is the only thing standing in for the check
+//! today.
+//!
+//! [`Exec::stdin`] is also still ignored: a command is spawned with its input already at
+//! EOF. That was true of the `output()` call this replaced and is not something the
+//! restructuring changed.
 
 mod bin_dir;
 
+use std::ffi::OsString;
+use std::io;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt as _;
-use std::process::{Command, ExitStatus};
+use std::path::PathBuf;
+use std::process::{Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use cortex::console::stdio::StdioResponder;
-use cortex::console::{Call, Error, Exec, ExecResult, Message, Outcome, Responsable, Start};
+use cortex::console::{
+    Call, Error, Exec, ExecResult, Message, Outcome, Progress, RequestId, Responsable, Start,
+};
 
+use crate::ipc::SOCK_ENV;
 use bin_dir::BinDir;
 
 /// A command we found but could not start, and one we could not find at all.
@@ -52,6 +75,10 @@ const NOT_FOUND: i32 = 127;
 pub fn run() -> anyhow::Result<()> {
     let mut server = StdioResponder::stdio()?;
 
+    // Bound once, before anything can be running, and kept for the process. See
+    // [`Shims::bind`] for why its lifetime is the process's and not a session's.
+    let shims = Shims::bind()?;
+
     // Dropped on `stop`, and on the way out of this function whichever way it leaves —
     // which takes the symlinks with it every time.
     let mut linked: Option<BinDir> = None;
@@ -61,17 +88,30 @@ pub fn run() -> anyhow::Result<()> {
             // The session is over.
             Message::Notification(_) => return Ok(()),
 
-            Message::Request { id, call } => {
-                let outcome = match call {
-                    Call::Start(start) => boot(&mut linked, &start),
-                    Call::Exec(exec) => run_one(&exec),
-                    Call::Stop => {
-                        linked = None;
-                        Outcome::Result(serde_json::Value::Null)
-                    }
-                };
-                server.respond(id, outcome)?;
-            }
+            Message::Request { id, call } => match call {
+                Call::Start(start) => {
+                    let outcome = boot(&mut linked, &start);
+                    server.respond(id, outcome)?;
+                }
+
+                Call::Exec(exec) => execute(&mut server, id, &exec, linked.as_ref(), &shims)?,
+
+                // Only an execution paused on a delegated call has anything to resume,
+                // and one of those is answered inside `execute` — so reaching here is a
+                // client resuming something that is not waiting.
+                Call::Resume(_) => server.respond(
+                    id,
+                    refused(
+                        Error::INVALID_REQUEST,
+                        "nothing is waiting on a delegated call, so there is nothing to resume",
+                    ),
+                )?,
+
+                Call::Stop => {
+                    linked = None;
+                    server.respond(id, Outcome::Result(serde_json::Value::Null))?;
+                }
+            },
 
             // A response answers a request, and this end makes none.
             Message::Response { id, .. } => eprintln!(
@@ -83,58 +123,281 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Put the delegated names on `PATH`, as symlinks back to this binary.
+/// Put the delegated names somewhere `execvp` will find them, as symlinks back to this
+/// binary.
 ///
-/// Nothing is done about the socket a shim will dial: the client bound it and put it in
-/// the environment we were started with, so everything we spawn inherits it already.
+/// The directory is not put on `PATH` here. Every execution is given its own environment
+/// (see [`environment`]), which is what an inherited `PATH` and a `set_var` used to be
+/// for — and doing it per command rather than per process is what lets this program have
+/// more than one thread.
 fn boot(linked: &mut Option<BinDir>, start: &Start) -> Outcome {
     let dir = match BinDir::create(start.delegated.iter().map(String::as_str)) {
         Ok(dir) => dir,
         Err(e) => return refused(Error::BOOT_FAILED, format!("linking delegated names: {e}")),
     };
 
-    // SAFETY: this process is single-threaded — the console channel is read and written
-    // on this thread and there is no other — so nothing can be reading the environment
-    // concurrently.
-    unsafe {
-        // Appended, not prepended: these names are meant to add commands, not to quietly
-        // shadow a real `git` or `python` a caller meant to run.
-        let path = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{path}:{}", dir.bin().display()));
-    }
-
-    // Any previous one drops here, after the new `PATH` is already in place.
+    // Any previous one drops here, which takes its symlinks with it.
     *linked = Some(dir);
     Outcome::Result(serde_json::Value::Null)
 }
 
-/// Run one command and answer with everything it produced.
-fn run_one(exec: &Exec) -> Outcome {
+/// Run one command, answering the console channel as many times as it takes.
+///
+/// Exactly one of those answers is the execution's own — a [`Done`](Progress::Done) or an
+/// error — and it goes to whichever request is owed one by then: the `exec` if nothing was
+/// delegated, or the last `resume` if something was.
+fn execute(
+    server: &mut StdioResponder,
+    id: RequestId,
+    exec: &Exec,
+    linked: Option<&BinDir>,
+    shims: &Shims,
+) -> io::Result<()> {
     let Some((program, args)) = exec.split() else {
-        return refused(Error::INVALID_PARAMS, "an empty command");
+        return server.respond(id, refused(Error::INVALID_PARAMS, "an empty command"));
     };
 
-    let out = match Command::new(program).args(args).output() {
-        Ok(out) => out,
+    let child = Command::new(program)
+        .args(args)
+        .envs(environment(linked, shims))
+        // Piped and then read by `wait_with_output`, which is what carries the output
+        // back. `stdin` is already at EOF — see this module's docs.
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+
+    let child = match child {
+        Ok(child) => child,
         Err(e) => {
             let code = match e.kind() {
-                std::io::ErrorKind::NotFound => NOT_FOUND,
+                io::ErrorKind::NotFound => NOT_FOUND,
                 _ => NOT_EXECUTABLE,
             };
-            return refused(
-                Error::NOT_EXECUTABLE,
-                format!("{program}: {e} (a shell would report {code})"),
+            return server.respond(
+                id,
+                refused(
+                    Error::NOT_EXECUTABLE,
+                    format!("{program}: {e} (a shell would report {code})"),
+                ),
             );
         }
     };
 
-    let result = ExecResult {
+    // On the shims' queue rather than one of its own, so that this loop has a single
+    // thing to wait on. `wait_with_output` reads both pipes as it waits, which is what
+    // keeps a command that fills one from blocking on it.
+    let ending = shims.sender();
+    std::thread::spawn(move || {
+        let _ = ending.send(Event::Exited(child.wait_with_output()));
+    });
+
+    // Which request this execution owes its answer to. The `exec` to begin with, and each
+    // `resume` after that — a `Delegated` spends the one it is sent on.
+    let mut owed = id;
+
+    loop {
+        match shims.next() {
+            Event::Shim(stream) => match delegate(server, owed, stream)? {
+                Some(next) => owed = next,
+                // The client stopped saying anything that could resume the execution, so
+                // there is nobody left to answer. The command is left to the process's
+                // ending, which is moments away: the main loop reads the same channel.
+                None => return Ok(()),
+            },
+
+            Event::Exited(output) => return server.respond(owed, finished(output)),
+        }
+    }
+}
+
+/// Hand one delegated call to the client, and give the shim what comes back.
+///
+/// Two messages on the console channel: the [`Delegated`](Progress::Delegated) that
+/// answers what this execution currently owes, and the `resume` that brings the result.
+/// What is returned is the id of the request now owed the execution's own answer, or
+/// `None` when the client said nothing that could be one.
+fn delegate(
+    server: &mut StdioResponder,
+    owed: RequestId,
+    stream: UnixStream,
+) -> io::Result<Option<RequestId>> {
+    let mut shim = StdioResponder::new(stream.try_clone()?, stream);
+
+    // A connection carrying anything but a shim's one `exec` is not something to forward,
+    // and the execution still owes what it owed. Dropping the connection is all there is
+    // to say to it.
+    let (shim_id, exec) = match shim.recv()? {
+        Some(Message::Request {
+            id,
+            call: Call::Exec(exec),
+        }) => (id, exec),
+        other => {
+            eprintln!(
+                "{}: a shim sent {other:?} instead of an exec",
+                env!("CARGO_BIN_NAME")
+            );
+            return Ok(Some(owed));
+        }
+    };
+
+    server.respond(owed, result(Progress::Delegated(exec)))?;
+
+    // Only a `resume` can arrive now. This end owes an answer it has not sent, so there is
+    // nothing else the client could be asking about.
+    match server.recv()? {
+        Some(Message::Request {
+            id,
+            call: Call::Resume(outcome),
+        }) => {
+            // Whatever the client said, verbatim: a refusal is as much an answer as a
+            // result, and the shim is what turns either into an exit code.
+            shim.respond(shim_id, outcome)?;
+            Ok(Some(id))
+        }
+
+        // The shim goes unanswered on purpose. There is nothing to tell it, and a dropped
+        // connection is what says so — the shim reports that on its own stderr.
+        other => {
+            if let Some(message) = other {
+                eprintln!(
+                    "{}: the client sent {message:?} instead of resuming",
+                    env!("CARGO_BIN_NAME")
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// The environment variables an execution is given: the way home for a shim, and a `PATH`
+/// with the delegated names on it.
+///
+/// Per command rather than per process. `std::env::set_var` is unsound with any other
+/// thread running and this program now has one, so what used to be a `PATH` this process
+/// mutated at `start` is a `PATH` each `Command` is handed.
+fn environment(linked: Option<&BinDir>, shims: &Shims) -> Vec<(OsString, OsString)> {
+    let mut env = vec![(SOCK_ENV.into(), shims.sock.clone().into_os_string())];
+
+    if let Some(bin) = linked.map(BinDir::bin) {
+        // Appended, not prepended: these names are meant to add commands, not to quietly
+        // shadow a real `git` or `python` a caller meant to run.
+        let mut path = std::env::var_os("PATH").unwrap_or_default();
+        path.push(":");
+        path.push(bin);
+        env.push(("PATH".into(), path));
+    }
+
+    env
+}
+
+/// The socket every shim dials, and the queue of what an execution is waiting for.
+///
+/// # Why the process binds it and not a session
+///
+/// A thread blocked in `accept` cannot be told to stop, so there is one of them and it
+/// lives as long as the process — which means the socket does too. Binding it per `start`
+/// would leave a thread behind on every `stop`, each blocked on a socket nobody will ever
+/// dial again.
+///
+/// The cost is a socket a server with nothing delegated never uses, and the window
+/// between a `stop` and the next `start` in which a connection could queue up unserved.
+struct Shims {
+    /// Handed to every execution's environment, which is how a shim finds it.
+    sock: PathBuf,
+
+    /// Cloned per execution, so a command's ending queues where its shims do.
+    ending: Sender<Event>,
+
+    incoming: Receiver<Event>,
+}
+
+/// Something an execution is waiting for.
+///
+/// One enum and one queue because an execution waits for whichever comes first, and
+/// `std`'s channels cannot be selected over.
+enum Event {
+    /// A delegated executable has run and is waiting to be told what it produced.
+    Shim(UnixStream),
+
+    /// The command itself is over, and this is everything it wrote.
+    Exited(io::Result<Output>),
+}
+
+impl Shims {
+    fn bind() -> anyhow::Result<Shims> {
+        // Under `/tmp` rather than `$TMPDIR`: `sockaddr_un.sun_path` is 104 bytes on
+        // macOS and a per-user temp directory is most of that on its own.
+        let sock = PathBuf::from(format!("/tmp/cortex-console-{}.sock", std::process::id()));
+        // A live pid cannot have left one behind, so anything here is a reused pid whose
+        // socket outlived its process.
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock)?;
+
+        let (ending, incoming) = mpsc::channel();
+        let accepting = ending.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let queued = match stream {
+                    Ok(stream) => accepting.send(Event::Shim(stream)),
+                    Err(e) => {
+                        eprintln!("{}: no more shims: {e}", env!("CARGO_BIN_NAME"));
+                        return;
+                    }
+                };
+                // The receiver is held for the life of the process, so this only fails
+                // once there is nothing left to serve.
+                if queued.is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Shims {
+            sock,
+            ending,
+            incoming,
+        })
+    }
+
+    fn sender(&self) -> Sender<Event> {
+        self.ending.clone()
+    }
+
+    /// The next thing an execution is waiting for.
+    ///
+    /// Cannot fail: this struct holds a sender of its own, so the queue cannot be
+    /// disconnected while it is alive.
+    fn next(&self) -> Event {
+        self.incoming
+            .recv()
+            .expect("a queue whose sender is held cannot disconnect")
+    }
+}
+
+impl Drop for Shims {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+/// A command that ended, as the answer to whatever asked for it.
+fn finished(output: io::Result<Output>) -> Outcome {
+    let out = match output {
+        Ok(out) => out,
+        Err(e) => return refused(Error::INTERNAL_ERROR, format!("waiting for a command: {e}")),
+    };
+
+    result(Progress::Done(ExecResult {
         code: exit_code(&out.status),
         stdout: out.stdout,
         stderr: out.stderr,
         truncated: false,
-    };
-    match serde_json::to_value(result) {
+    }))
+}
+
+fn result(progress: Progress) -> Outcome {
+    match serde_json::to_value(progress) {
         Ok(value) => Outcome::Result(value),
         Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
     }

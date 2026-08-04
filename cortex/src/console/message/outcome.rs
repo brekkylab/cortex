@@ -1,0 +1,285 @@
+//! How something ended: what it produced, or why it produced nothing.
+//!
+//! An [`Outcome`] is `result` xor `error` — never both, never neither — and [`Error`] is
+//! the second of those with a numeric [`code`](Error::code) a program can branch on.
+//!
+//! # Why this is not part of the envelope
+//!
+//! It was, and for as long as an outcome only ever came back it belonged there: `result`
+//! and `error` are two of a *response's* members, and a response is one of
+//! [`Message`](super::Message)'s three shapes.
+//!
+//! [`Resume`](super::Call::Resume) is what changed that. A delegated call runs in the
+//! client and how it ended is the whole of what the `resume` reporting it has to say, so
+//! an outcome now travels inside a **request** too — which is why it has a serde impl of
+//! its own and a file of its own. It is no longer "what a response carries"; it is how
+//! anything in this protocol ended, whichever direction it is travelling.
+//!
+//! One rule about it is shared with the envelope rather than written twice — see
+//! [`Outcome::from_members`].
+
+use std::fmt;
+
+use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
+
+/// A `result` or an `error` — never both, never neither.
+///
+/// The `result` is held as a [`Value`] because its type depends on the method the `id`
+/// was issued for, which only the end that issued it knows. [`take`](Outcome::take) is
+/// where that knowledge is applied.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    Result(Value),
+    Error(Error),
+}
+
+/// Why a request could not be answered with a result.
+///
+/// `code` is what a program branches on and `message` is what a person reads. `data` is
+/// anything extra the sender thought was worth carrying; nothing in this protocol
+/// requires it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Error {
+    pub code: i64,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
+}
+
+impl Error {
+    /// `exec`: the execution outlived its [`timeout_ms`](super::Exec::timeout_ms) and
+    /// was killed.
+    ///
+    /// An error rather than a result, because there is no result: a killed command
+    /// has no exit code, and whatever it had written is gone with it — one message
+    /// cannot carry an ending that never happened. A requester acts on this
+    /// specifically, which is what the code is for: retry with more time, or give
+    /// up.
+    pub const TIMED_OUT: i64 = -32000;
+
+    /// `exec`: the program was not there, or could not be started.
+    pub const NOT_EXECUTABLE: i64 = -32001;
+
+    /// `start`: the backend could not be brought up.
+    ///
+    /// Worth its own code because it is the failure the old wire could not report
+    /// at all: a server that could not set itself up had nothing to say and could
+    /// only die, leaving the client to guess from an exit status.
+    pub const BOOT_FAILED: i64 = -32002;
+
+    /// `stop`: the resources could not be released, and may still be held.
+    pub const STOP_FAILED: i64 = -32003;
+
+    /// Any: `start` has not been answered yet, or has been undone by `stop`.
+    pub const NOT_STARTED: i64 = -32004;
+
+    /// The four the spec defines that a peer of ours can hit. `-32700` (parse
+    /// error) belongs to whoever reads the frame, not here.
+    pub const INVALID_REQUEST: i64 = -32600;
+    pub const METHOD_NOT_FOUND: i64 = -32601;
+    pub const INVALID_PARAMS: i64 = -32602;
+    pub const INTERNAL_ERROR: i64 = -32603;
+
+    pub fn new(code: i64, message: impl Into<String>) -> Self {
+        Error {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{} ({})", self.message, self.code)
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl Outcome {
+    /// The error, if this is an error response.
+    pub fn error(&self) -> Option<&Error> {
+        match self {
+            Outcome::Error(error) => Some(error),
+            Outcome::Result(_) => None,
+        }
+    }
+
+    /// The `result`, as the type the method returns — `Progress` for `exec` and
+    /// `resume`, `()` for `start` and `stop`.
+    ///
+    /// The caller supplies `T` because the caller is the end that issued the `id`
+    /// and so is the only one that knows the method. A `result` that will not
+    /// deserialize is reported as an [`INTERNAL_ERROR`](Error::INTERNAL_ERROR),
+    /// because from here it is indistinguishable from a peer that answered the
+    /// wrong request — either way there is nothing usable and the reason belongs in
+    /// a log.
+    pub fn take<T: DeserializeOwned>(self) -> Result<T, Error> {
+        match self {
+            Outcome::Error(error) => Err(error),
+            Outcome::Result(value) => serde_json::from_value(value).map_err(|e| {
+                Error::new(
+                    Error::INTERNAL_ERROR,
+                    format!("result is not what this method returns: {e}"),
+                )
+            }),
+        }
+    }
+
+    /// The one of the two members that is there, or `None` for neither.
+    ///
+    /// The xor is the whole of what this enforces, and it is enforced in one place
+    /// because there are two that read these members: [`Message`](super::Message)'s
+    /// deserializer, which finds them among a response's own members, and
+    /// [`Outcome`]'s, which finds them in a `resume`'s `params`.
+    ///
+    /// Neither is `None` rather than an error because the two callers mean different
+    /// things by it. A message with no `result` and no `error` has no `method` either,
+    /// so what is wrong with it is that it is none of the three shapes; an outcome with
+    /// neither is an outcome, and simply empty.
+    pub(super) fn from_members<E: de::Error>(
+        result: Option<Value>,
+        error: Option<Error>,
+    ) -> Result<Option<Outcome>, E> {
+        match (result, error) {
+            (Some(value), None) => Ok(Some(Outcome::Result(value))),
+            (None, Some(error)) => Ok(Some(Outcome::Error(error))),
+            (Some(_), Some(_)) => Err(E::custom("both a result and an error")),
+            (None, None) => Ok(None),
+        }
+    }
+}
+
+/// `{"result": ..}` or `{"error": ..}` — an object of exactly the member that is there.
+///
+/// Separate from [`Message`](super::Message)'s serializer, which writes the same two
+/// members but *into* the response object rather than into one of their own. Sharing
+/// would put a nested `{"result": {"result": ..}}` on the wire for a response, or need a
+/// flattening helper for `params`; two small impls are the cheaper of the two. The rule
+/// they share is [`from_members`](Outcome::from_members).
+impl Serialize for Outcome {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(Some(1))?;
+        match self {
+            Outcome::Result(value) => map.serialize_entry("result", value)?,
+            Outcome::Error(error) => map.serialize_entry("error", error)?,
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Outcome {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Outcome, D::Error> {
+        d.deserialize_map(OutcomeVisitor)
+    }
+}
+
+struct OutcomeVisitor;
+
+impl<'de> Visitor<'de> for OutcomeVisitor {
+    type Value = Outcome;
+
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("an object with a result or an error")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Outcome, A::Error> {
+        let mut result: Option<Value> = None;
+        let mut error: Option<Error> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "result" => result = Some(map.next_value()?),
+                "error" => error = Some(map.next_value()?),
+                // Ignored for the same reason the envelope ignores them.
+                _ => {
+                    map.next_value::<de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        Outcome::from_members(result, error)?
+            .ok_or_else(|| de::Error::custom("an outcome has no result and no error"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ExecResult;
+    use super::*;
+
+    /// A response's `result` is typed by the method its id was issued for, which only
+    /// the end that issued it knows.
+    #[test]
+    fn a_result_is_typed_by_the_method_the_caller_remembers() {
+        let result = Outcome::Result(
+            serde_json::to_value(ExecResult {
+                code: 3,
+                stdout: b"out".to_vec(),
+                ..ExecResult::default()
+            })
+            .unwrap(),
+        );
+        assert_eq!(result.clone().take::<ExecResult>().unwrap().code, 3);
+        // `start` and `stop` return nothing, and nothing is what `null` is.
+        Outcome::Result(Value::Null).take::<()>().unwrap();
+
+        // Asking for the wrong type is a peer that answered the wrong request as
+        // far as anyone here can tell.
+        let wrong = result.take::<()>().unwrap_err();
+        assert_eq!(wrong.code, Error::INTERNAL_ERROR);
+
+        let error = Outcome::Error(Error::new(Error::TIMED_OUT, "killed"));
+        assert_eq!(error.error().unwrap().code, Error::TIMED_OUT);
+        assert_eq!(
+            error.take::<ExecResult>().unwrap_err().code,
+            Error::TIMED_OUT
+        );
+    }
+
+    /// An outcome on its own, which is how a `resume` carries one: the member that is
+    /// there and no other, and the xor enforced both ways.
+    #[test]
+    fn an_outcome_is_the_one_member_that_is_there() {
+        let wire = |outcome: &Outcome| serde_json::to_value(outcome).unwrap();
+
+        assert_eq!(
+            wire(&Outcome::Result(serde_json::json!({"code": 0}))),
+            serde_json::json!({"result": {"code": 0}}),
+        );
+        assert_eq!(
+            wire(&Outcome::Error(Error::new(Error::TIMED_OUT, "too slow"))),
+            serde_json::json!({"error": {"code": -32000, "message": "too slow"}}),
+        );
+
+        for outcome in [
+            Outcome::Result(Value::Null),
+            Outcome::Error(Error::new(Error::NOT_STARTED, "no start yet")),
+        ] {
+            let text = serde_json::to_string(&outcome).unwrap();
+            assert_eq!(serde_json::from_str::<Outcome>(&text).unwrap(), outcome);
+        }
+
+        let refused = |text: &str, because: &str| {
+            let error = serde_json::from_str::<Outcome>(text)
+                .expect_err(&format!("accepted {text}"))
+                .to_string();
+            assert!(error.contains(because), "{text} → {error}");
+        };
+
+        refused(r#"{}"#, "no result and no error");
+        refused(
+            r#"{"result":null,"error":{"code":1,"message":"x"}}"#,
+            "both a result and an error",
+        );
+        // Unknown members are ignored here too, so a peer may add one.
+        assert_eq!(
+            serde_json::from_str::<Outcome>(r#"{"result":null,"trace_id":"abc"}"#).unwrap(),
+            Outcome::Result(Value::Null),
+        );
+    }
+}

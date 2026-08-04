@@ -2,9 +2,10 @@
 //!
 //! A client only asks. Nothing arrives on this channel but the answers to what it
 //! asked, so this is a send, a read and a match — no threads, no locks, no pending
-//! table. A delegated executable is *not* an exception: the shim that runs one
-//! reaches whoever owns the behaviour on a channel of its own, which is what keeps
-//! this end a requester.
+//! table. A delegated executable is *not* an exception: a server that needs one run
+//! says so in the response to the `exec` it was already going to answer
+//! ([`Progress::Delegated`](crate::console::Progress::Delegated)), so what arrives here
+//! is still only ever a response.
 //!
 //! The protocol's methods are [`Requestable`]'s. What is here is only what the wire adds:
 //! an id per call, and waiting for the response that brings it back.
@@ -141,7 +142,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::console::{Error, Exec, ExecResult, Method, Start};
+    use crate::console::{Error, Exec, ExecResult, Method, Progress, Start};
 
     /// Everything the client wrote, readable after it has been dropped or not — a
     /// `Vec` cannot be, once the client owns it.
@@ -184,17 +185,27 @@ mod tests {
         (StdioRequester::new(Cursor::new(bytes), sent.clone()), sent)
     }
 
+    /// An execution that finished without delegating anything, which is the only shape
+    /// this end can see without something out here resolving a name.
     fn ran(id: RequestId, stdout: &[u8]) -> Message {
         Message::Response {
             id,
             outcome: Outcome::Result(
-                serde_json::to_value(ExecResult {
+                serde_json::to_value(Progress::Done(ExecResult {
                     code: 0,
                     stdout: stdout.to_vec(),
                     ..ExecResult::default()
-                })
+                }))
                 .unwrap(),
             ),
+        }
+    }
+
+    /// The [`ExecResult`] of a finished execution, or a panic if it was not one.
+    fn done(progress: Progress) -> ExecResult {
+        match progress {
+            Progress::Done(result) => result,
+            Progress::Delegated(exec) => panic!("still delegating {:?}", exec.cmd),
         }
     }
 
@@ -222,7 +233,7 @@ mod tests {
                 ..Exec::default()
             })
             .unwrap();
-        assert_eq!(result.stdout, b"hi\n");
+        assert_eq!(done(result).stdout, b"hi\n");
         client.stop().unwrap();
         client.quit().unwrap();
 
@@ -263,7 +274,8 @@ mod tests {
     #[test]
     fn a_client_answers_nothing() {
         let (mut client, _) = driving(&[ran(99, b"who asked"), ran(0, b"mine\n")]);
-        assert_eq!(client.exec(Exec::default()).unwrap().stdout, b"mine\n");
+        let result = done(client.exec(Exec::default()).unwrap());
+        assert_eq!(result.stdout, b"mine\n");
 
         let (mut client, _) = driving(&[Message::Request {
             id: 1,

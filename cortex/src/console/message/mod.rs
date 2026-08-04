@@ -22,31 +22,39 @@
 //! `Message` does not know where it ends. A length prefix is the cheapest thing
 //! that does — see [`MAX_PAYLOAD`].
 //!
-//! The split inside here is the spec's own, between an object that is answered and
-//! one that is not:
+//! The split inside here is mostly the spec's own, between an object that is
+//! answered and one that is not:
 //!
 //! - `message` — the envelope every object shares: [`Message`] and its three
 //!   shapes, [`Method`], the [`RequestId`] that pairs a response with its request,
-//!   the [`Outcome`] and [`Error`] a response carries, and the serde impls that put
-//!   all of it on the wire.
+//!   and the serde impls that put all of it on the wire.
 //! - `call` — the methods something answers: [`Call`], and the `params` and
-//!   `result` they carry ([`Start`], [`Exec`], [`ExecResult`]).
+//!   `result` they carry ([`Start`], [`Exec`], [`Progress`], [`ExecResult`]).
 //! - `notification` — the methods nothing answers: [`Notification`].
+//! - `outcome` — how something ended: [`Outcome`], and the [`Error`] and codes that
+//!   are the second half of it.
 //!
 //! A `Call` and a `Notification` each write and read their own `params`, so adding
 //! a method means touching the side it belongs to and not the envelope.
+//!
+//! `outcome` is the one that is not one of the spec's shapes, and it earned its place
+//! by being on both sides of the request/response line: a response carries an outcome,
+//! and so does the `resume` reporting a delegated call that ran in the client. It was
+//! part of the envelope for as long as it was only ever a response's.
 //!
 //! # What the protocol is
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
 //! | `start` | [`Start`] | `null` | [`BOOT_FAILED`](Error::BOOT_FAILED) |
-//! | `exec` | [`Exec`] | [`ExecResult`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`NOT_STARTED`](Error::NOT_STARTED) |
+//! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`NOT_STARTED`](Error::NOT_STARTED) |
+//! | `resume` | [`Outcome`] | [`Progress`] | [`INVALID_REQUEST`](Error::INVALID_REQUEST) |
 //! | `stop` | — | `null` | [`STOP_FAILED`](Error::STOP_FAILED) |
 //! | `quit` | — | *(notification — no response)* | — |
 //!
 //! Every request gets exactly one response, correlated by `id`. `quit` is a
-//! notification: no `id`, nothing answers it.
+//! notification: no `id`, nothing answers it. **Every one of them is the client's:**
+//! there is no method a server issues, which is what [`Progress`] is for.
 //!
 //! # Why the codec is now fixed
 //!
@@ -76,17 +84,26 @@
 //! ever proved the failure was the server's. An `error` cannot be mistaken for a
 //! command's own exit status, because it does not carry one.
 //!
-//! # Why one method for both directions
+//! # Why execution runs both ways without a request going both ways
 //!
-//! An execution request is an execution request no matter who asks. A client
-//! asking a server to run `sh -c ...` and a shim asking a client to run a
-//! delegated `foo` are the same shape: a command, some input, output, a code at
-//! the end. So there is one `exec`, and what tells the two apart is the channel it
-//! arrived on rather than anything in the message.
+//! A delegated executable's behaviour lives in the client, so a command inside the server
+//! that invokes one by name cannot be finished by the server alone. The obvious spelling
+//! is for the server to send an `exec` of its own — and that makes every end of the
+//! channel both a requester and an answerer, with a pending table each and a read loop
+//! that must never block on work only it can unblock.
 //!
-//! Which is what makes one codec enough for the whole system. A delegated call is
-//! not a wire of its own to be translated into this one — it is this one, on
-//! another channel.
+//! [`Progress`] is the spelling that does not. The server *answers* with a
+//! [`Delegated`](Progress::Delegated): a complete, ordinary response to the request the
+//! client is already waiting on, meaning *not finished, and here is what I need*. The
+//! client runs the name and says so with `resume`, whose answer is the next `Progress`.
+//!
+//! So one channel, one end that asks, one end that answers — and one [`Exec`] type, since
+//! a delegated call is the same shape as any other execution request: a command, some
+//! input, output, a code at the end. One codec for the whole system, and a delegated call
+//! that is not a wire of its own to be translated into this one.
+//!
+//! What it costs is that delegated calls are served one at a time; [`Progress`] has that,
+//! and why it is latency rather than a deadlock.
 //!
 //! # Why a result rather than a stream
 //!
@@ -131,7 +148,9 @@
 mod call;
 mod message;
 mod notification;
+mod outcome;
 
 pub use call::*;
 pub use message::*;
 pub use notification::*;
+pub use outcome::*;

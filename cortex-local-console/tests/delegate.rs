@@ -4,16 +4,15 @@
 //!
 //! Which is the only way to test the interesting part. A delegated executable works only
 //! if `execvp` finds a symlink, re-enters this binary as a shim, the shim dials the socket
-//! *this* process bound, and the answer comes back out of the shim's own stdout — four
-//! processes and two channels. Nothing smaller than the whole thing exercises it.
+//! the *server* bound, the server passes the call up the console channel as a `Delegated`,
+//! this process answers it with a `resume`, and the bytes come back out of the shim's own
+//! stdout — four processes and one channel. Nothing smaller than the whole thing exercises
+//! it.
 
-use std::io;
-use std::os::unix::net::UnixListener;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use cortex::console::stdio::{StdioRequester, StdioResponder};
-use cortex::console::{Console, Exec, ExecResult, Responsable};
+use cortex::console::stdio::StdioRequester;
+use cortex::console::{Console, Exec, ExecResult};
 use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
 
 /// An executable with a canned answer — enough to tell a round trip from a coincidence.
@@ -43,13 +42,12 @@ impl Executable for Report {
     }
 }
 
-/// A console over the real binary, plus the socket its shims dial.
+/// A console over the real binary.
 ///
-/// Bound under `/tmp` rather than `$TMPDIR`, because `sockaddr_un.sun_path` is 104 bytes
-/// on macOS and the per-user temp directory is most of that on its own.
+/// Nothing about the socket the shims dial appears here: the server binds it, names it in
+/// the environment of everything it spawns, and cleans it up. This end only asks.
 struct Fixture {
     console: Console,
-    sock: PathBuf,
 }
 
 impl Fixture {
@@ -82,18 +80,7 @@ impl Fixture {
             )
             .register("report", Report);
 
-        // One per test, and tests share a process — so the pid alone is not unique.
-        let sock = PathBuf::from(format!(
-            "/tmp/cx-{}-{:p}.sock",
-            std::process::id(),
-            &execs as *const _
-        ));
-        let _ = std::fs::remove_file(&sock);
-        let listener = UnixListener::bind(&sock).expect("binding the delegate socket");
-
         let mut child = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"))
-            // The way home for every shim, inherited by everything the server spawns.
-            .env("CORTEX_CONSOLE_SOCK", &sock)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -106,19 +93,12 @@ impl Fixture {
         let console = Console::builder()
             .client(StdioRequester::new(stdout, stdin))
             .server(child)
-            // One connection is one delegated call, so accepting is what waits for the
-            // next one.
-            .delegates(move || {
-                let (stream, _) = listener.accept()?;
-                let server = StdioResponder::new(stream.try_clone()?, stream);
-                Ok(Some(Box::new(server) as Box<dyn Responsable + Send>))
-            })
             .executables(execs)
             .default_timeout_ms(30_000)
             .build()
             .expect("building the console");
 
-        Fixture { console, sock }
+        Fixture { console }
     }
 
     /// Boot, run one command, and return what it produced.
@@ -133,12 +113,6 @@ impl Fixture {
             .expect("running the command");
         self.console.stop().expect("stopping the server");
         result
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.sock);
     }
 }
 
@@ -201,12 +175,24 @@ fn the_call_arrives_as_it_was_made() {
     assert_eq!(out.stdout, b"report|one,two\n");
 }
 
-/// Several at once, which is what the thread per connection is for: each blocks until
-/// this process answers it, so serving them in turn would deadlock a pipeline.
+/// Several started together and served one at a time: each shim waits its turn on the
+/// server's queue, and all three get their answer.
+///
+/// Which is the whole of what serialised delegation gives up — the three run in sequence
+/// rather than at once — and the whole of what it does not: a delegated call carries no
+/// input and so waits on nothing but being served.
 #[test]
-fn delegated_names_can_be_in_flight_together() {
+fn delegated_names_started_together_are_all_answered() {
     let out = output("foo & foo & foo & wait");
     assert_eq!(out.stdout, b"bar\nbar\nbar\n");
+}
+
+/// Delegated calls one after another inside a single command, which is the chain being a
+/// loop rather than one extra round trip.
+#[test]
+fn several_delegated_calls_run_in_one_execution() {
+    let out = output("foo; report a; foo");
+    assert_eq!(out.stdout, b"bar\nreport|a\nbar\n");
 }
 
 /// A name nobody registered is not on `PATH`, so the shell never reaches a shim at all.
@@ -263,6 +249,3 @@ fn shutting_down_collects_the_process() {
     let status = status.expect("a console given a process reports its status");
     assert!(status.success(), "{status:?}");
 }
-
-/// Only so `io` is what the accept closure's signature says it is.
-const _: fn(io::Error) = |_| ();

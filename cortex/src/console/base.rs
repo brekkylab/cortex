@@ -7,8 +7,14 @@
 //! what a message *means* — where a command runs, what a session allows, when something
 //! has booted: none of that is here, and a transport is the last place it should be.
 //!
+//! A client is only ever a [`Requestable`] and a server only ever a [`Responsable`].
+//! Delegation does not change that: a server needing something from the client says so
+//! in a [`Progress::Delegated`] — a response, on the request the client is already
+//! waiting on — so nothing here has to be both.
+//!
 //! What is here is only what would otherwise be written once per transport: `start`,
-//! `exec`, `stop` and `quit` follow from `call` and `notify`, so they follow once.
+//! `exec`, `resume`, `stop` and `quit` follow from `call` and `notify`, so they follow
+//! once.
 //!
 //! [`stdio`](crate::console::stdio) is the transport there is — framed JSON-RPC
 //! over a pipe. A micro-VM's virtio port would be another, and nothing here would
@@ -17,7 +23,7 @@
 use std::io;
 
 use crate::console::{
-    Call, Error, Exec, ExecResult, Message, Notification, Outcome, RequestId, Start,
+    Call, Error, Exec, Message, Notification, Outcome, Progress, RequestId, Start,
 };
 
 /// Why a call produced no result.
@@ -100,13 +106,31 @@ pub trait Requestable {
         self.call(Call::Start(start))?.take().map_err(Failure::from)
     }
 
-    /// Run one command, and return everything it produced.
+    /// Run one command, and return how far it got.
     ///
-    /// A command that merely failed is an `Ok` with a non-zero
-    /// [`code`](ExecResult::code); a [`Refused`](Failure::Refused) is the execution
-    /// having no result at all.
-    fn exec(&mut self, exec: Exec) -> Result<ExecResult, Failure> {
+    /// [`Done`](Progress::Done) is the whole execution; a command that merely failed is
+    /// an `Ok` with a non-zero [`code`](crate::console::ExecResult::code), and a
+    /// [`Refused`](Failure::Refused) is the execution having no result at all.
+    ///
+    /// [`Delegated`](Progress::Delegated) is the execution pausing on a name whose
+    /// behaviour lives out here, and it has to be answered with
+    /// [`resume`](Self::resume) before anything else is asked. Resolving those against
+    /// something that knows what a name *does* is not a transport's job — that is
+    /// [`Console::exec`](crate::console::Console::exec), which is what a caller
+    /// normally wants.
+    fn exec(&mut self, exec: Exec) -> Result<Progress, Failure> {
         self.call(Call::Exec(exec))?.take().map_err(Failure::from)
+    }
+
+    /// Say how the delegated call the last response asked for ended, and carry on.
+    ///
+    /// Only ever a reply to a [`Delegated`](Progress::Delegated), and the answer is the
+    /// next [`Progress`] of the same execution — another delegated call, or the end of
+    /// it.
+    fn resume(&mut self, outcome: Outcome) -> Result<Progress, Failure> {
+        self.call(Call::Resume(outcome))?
+            .take()
+            .map_err(Failure::from)
     }
 
     /// Release what [`start`](Self::start) booted. Another `start` is allowed after

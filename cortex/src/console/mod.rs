@@ -15,14 +15,13 @@
 //!   ends over it ([`StdioRequester`](stdio::StdioRequester),
 //!   [`StdioResponder`](stdio::StdioResponder)).
 //! - [`Console`] — the public end, and what a caller normally reaches for: the channel
-//!   that drives a server, the channels delegated calls arrive on, and the names those
-//!   calls resolve to.
+//!   that drives a server, and the names a delegated call resolves to.
 //!
-//! Each end of a channel does one job. A delegated executable is what used to make that
-//! untrue — the server asked and the client answered, on this same channel — and it no
-//! longer does: a shim reaches the client on a channel of its own, so execution still
-//! runs both ways without any channel being used both ways. [`Console`] has the
-//! reasoning.
+//! Each end of a channel does one job, and a delegated executable does not make that
+//! untrue. A server that needs one run says so in a [`Progress::Delegated`] — a response,
+//! on the request the client is already waiting on — so execution runs both ways over one
+//! channel that is only ever asked on from one side. [`Progress`] has the reasoning, and
+//! what it costs.
 //!
 //! [`Message`] has the reasoning for the protocol,
 //! [`read`](stdio::read) and [`write`](stdio::write) for the wire.
