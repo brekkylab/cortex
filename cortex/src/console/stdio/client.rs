@@ -7,7 +7,7 @@
 //! ([`Progress::Delegated`](crate::console::Progress::Delegated)), so what arrives here
 //! is still only ever a response.
 //!
-//! The protocol's methods are [`Requestable`]'s. What is here is only what the wire adds:
+//! The protocol's methods come from [`Client`]. What is here is only what the wire adds:
 //! an id per call, and waiting for the response that brings it back.
 //!
 //! # The pipes, and the process they belong to
@@ -19,7 +19,7 @@
 //! client with nothing to say.
 //!
 //! The pipes and the process are therefore one fact, and this end holds both.
-//! [`quit`](Requestable::quit) is the ending: the writer is dropped — which is how a
+//! [`quit`](Client::quit) is the ending: the writer is dropped — which is how a
 //! server learns the session is over — and then the process is waited for. Dropping a
 //! client that was never quit kills it instead, so a server does not outlive the channel
 //! to it either way.
@@ -39,13 +39,13 @@ use std::io::{self, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 use crate::console::stdio::{read, write};
-use crate::console::{Call, Failure, Message, Notification, Outcome, RequestId, Requestable};
+use crate::console::{Call, Failure, Message, Notification, Outcome, RequestId, Client};
 
-/// A [`Requestable`] over a server process's pipes, and the process itself.
+/// A [`Client`] over a server process's pipes, and the process itself.
 ///
 /// The two directions are separate fields and not a pair, because that is what they
 /// are: what goes out has nothing to do with what comes back beyond the framing they
-/// share, and holding them apart is what lets [`call`](Requestable::call) write and then
+/// share, and holding them apart is what lets [`call`](Client::call) write and then
 /// read without giving up one borrow for the other.
 ///
 /// Trait objects rather than the child's own descriptor types. Reading frames and writing
@@ -61,7 +61,7 @@ pub struct StdioClient {
     /// else's.
     incoming: BufReader<Box<dyn Read + Send>>,
 
-    /// Where calls go — the server's stdin, until [`quit`](Requestable::quit) closes it.
+    /// Where calls go — the server's stdin, until [`quit`](Client::quit) closes it.
     outgoing: Box<dyn Write + Send>,
 
     /// The process those pipes belong to.
@@ -132,7 +132,7 @@ impl StdioClient {
     }
 }
 
-impl Requestable for StdioClient {
+impl Client for StdioClient {
     /// Send one call and read until the response with its id arrives.
     ///
     /// Anything else that arrives is a server that has lost track of itself. A

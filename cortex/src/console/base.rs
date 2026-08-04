@@ -1,16 +1,15 @@
 //! What the two ends of a console can *do* on a channel, apart from whatever carries
 //! them.
 //!
-//! One end asks and the other answers, so the two are named for that and nothing more:
-//! a [`Requestable`] issues calls and takes the answers back, a [`Responsable`] takes
+//! One end asks and the other answers, and the two ends are named for which they are:
+//! a [`Client`] issues calls and takes the answers back, a [`Server`] takes
 //! what arrives and puts an answer out. Both are about moving messages. Neither decides
 //! what a message *means* — where a command runs, what a session allows, when something
 //! has booted: none of that is here, and a transport is the last place it should be.
 //!
-//! A client is only ever a [`Requestable`] and a server only ever a [`Responsable`].
-//! Delegation does not change that: a server needing something from the client says so
-//! in a [`Progress::Delegated`] — a response, on the request the client is already
-//! waiting on — so nothing here has to be both.
+//! Each end is only ever the one it is. Delegation does not change that: a server needing
+//! something from the client says so in a [`Progress::Delegated`] — a response, on the
+//! request the client is already waiting on — so nothing here has to be both.
 //!
 //! What is here is only what would otherwise be written once per transport: `start`,
 //! `exec`, `resume`, `stop` and `quit` follow from `call` and `notify`, so they follow
@@ -88,7 +87,7 @@ impl From<Error> for Failure {
 /// response that answers *that* call, and putting a notification on the wire. The
 /// four methods below are neither, so they are written once here — which is also the
 /// one place an untyped [`Outcome`] becomes what its method returns.
-pub trait Requestable {
+pub trait Client {
     /// Make one call and wait for its response.
     ///
     /// Allocating the id and pairing it with what comes back is the transport's,
@@ -150,7 +149,7 @@ pub trait Requestable {
 /// Both halves of that are a transport's, and there is nothing else. What a message
 /// means, where a command runs, what a session allows when — none of it is here. This
 /// trait moves frames and holds no state.
-pub trait Responsable {
+pub trait Server {
     /// The next message. `Ok(None)` is the other end closing the channel cleanly.
     fn recv(&mut self) -> io::Result<Option<Message>>;
 

@@ -2,11 +2,11 @@
 //!
 //! That is the whole of this file. Nothing here decides what a request *means* — what a
 //! session allows, where a command runs, what counts as booted. A
-//! [`Responsable`] moves frames, and whoever answers them does so somewhere else.
+//! [`Server`] moves frames, and whoever answers them does so somewhere else.
 //!
 //! ```no_run
 //! use cortex::console::stdio::StdioServer;
-//! use cortex::console::{Message, Outcome, Responsable};
+//! use cortex::console::{Message, Outcome, Server};
 //!
 //! # fn answer(call: cortex::console::Call) -> Outcome { unimplemented!() }
 //! # fn main() -> anyhow::Result<()> {
@@ -26,7 +26,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::console::stdio::{read, write};
-use crate::console::{Message, Outcome, RequestId, Responsable};
+use crate::console::{Message, Outcome, RequestId, Server};
 
 /// Whether this process has already taken its standard descriptors.
 ///
@@ -39,7 +39,7 @@ use crate::console::{Message, Outcome, RequestId, Responsable};
 /// writes a *child's* pipes and never touches its own.
 static TAKEN: AtomicBool = AtomicBool::new(false);
 
-/// A [`Responsable`] over one readable and one writable descriptor.
+/// A [`Server`] over one readable and one writable descriptor.
 ///
 /// The two directions are separate fields and not a pair, because that is what they
 /// are: a frame going out has nothing to do with the one coming in beyond the framing
@@ -95,7 +95,7 @@ impl StdioServer {
     }
 }
 
-impl Responsable for StdioServer {
+impl Server for StdioServer {
     fn recv(&mut self) -> io::Result<Option<Message>> {
         read(&mut self.incoming)
     }

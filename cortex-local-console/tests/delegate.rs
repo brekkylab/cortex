@@ -233,15 +233,14 @@ fn a_console_can_be_stopped_and_started_again() {
     fixture.console.stop().unwrap();
 }
 
-/// A server told the session is over exits, and `shutdown` is where that is waited for:
-/// the process is the client's, so a clean ending is what comes back here.
+/// A started session can be dropped without stopping it first, and the drop returns —
+/// which is the whole of what is observable now that ending has no result: the `stop` and
+/// the `quit` go out, the server exits on hearing them, and the wait for it comes back.
+/// A server that ignored either would hang here.
 #[test]
-fn shutting_down_collects_the_process() {
+fn a_started_session_can_just_be_dropped() {
     let mut fixture = Fixture::new();
     fixture.console.start().unwrap();
 
-    fixture
-        .console
-        .shutdown()
-        .expect("the server should end cleanly");
+    drop(fixture);
 }

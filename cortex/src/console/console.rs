@@ -19,7 +19,7 @@
 //! [`ExecutableSet`] and sent back as a `resume`, until an answer is the first.
 //!
 //! Which is why the loop is here and not in a transport: `Progress` is a
-//! [`Requestable`]'s and resolving a *name* is an `ExecutableSet`'s, and this is the
+//! [`Client`]'s and resolving a *name* is an [`ExecutableSet`]'s, and this is the
 //! one type that holds both.
 //!
 //! Delegated calls are therefore served in turn, not together — a command that starts
@@ -29,7 +29,7 @@
 
 use anyhow::Context as _;
 
-use crate::console::base::{Failure, Requestable};
+use crate::console::base::{Failure, Client};
 use crate::console::message::{Error, Exec, ExecResult, Outcome, Progress, Start};
 use crate::executable::{ExecCall, ExecutableSet};
 
@@ -43,7 +43,7 @@ use crate::executable::{ExecCall, ExecutableSet};
 /// [`Console::start`].
 #[derive(Default)]
 pub struct ConsoleBuilder {
-    client: Option<Box<dyn Requestable>>,
+    client: Option<Box<dyn Client>>,
     execs: ExecutableSet,
     default_timeout_ms: Option<u64>,
 }
@@ -55,7 +55,7 @@ impl ConsoleBuilder {
     /// over a server it started, a virtio port into a guest, both ends in one process for
     /// a test. Whatever it took to have a channel is the client's, including a process if
     /// that is what it runs over, so there is nothing else here about where a server is.
-    pub fn client(mut self, client: impl Requestable + 'static) -> Self {
+    pub fn client(mut self, client: impl Client + 'static) -> Self {
         self.client = Some(Box::new(client));
         self
     }
@@ -98,7 +98,7 @@ impl ConsoleBuilder {
 ///
 /// [`start`](Self::start) to boot it, an [`exec`](Self::exec) per command,
 /// [`stop`](Self::stop) to release what booting took — and another `start` after that if
-/// there is more to do. [`shutdown`](Self::shutdown) ends the session for good.
+/// there is more to do. Dropping it ends the session for good.
 ///
 /// ```no_run
 /// use std::process::Command;
@@ -124,12 +124,13 @@ impl ConsoleBuilder {
 /// assert_eq!(result.stdout, b"hi\n");
 ///
 /// console.stop()?;
-/// console.shutdown()?;
+///
+/// // And the session ends when the console goes — here, at the end of the scope.
 /// # Ok(())
 /// # }
 /// ```
 pub struct Console {
-    client: Box<dyn Requestable>,
+    client: Box<dyn Client>,
 
     /// What a delegated name announced by [`start`](Self::start) resolves to when one
     /// comes back as a [`Delegated`](Progress::Delegated).
@@ -197,8 +198,7 @@ impl Console {
     /// Release what [`start`](Self::start) booted.
     ///
     /// Not the end of anything: the session stays open and another `start` is allowed,
-    /// which is what the protocol's `stop` means. [`shutdown`](Self::shutdown) is the one
-    /// that ends it.
+    /// which is what the protocol's `stop` means. Dropping the console is what ends it.
     pub fn stop(&mut self) -> Result<(), Failure> {
         if !std::mem::take(&mut self.started) {
             return Err(Failure::broken("this console has not started"));
@@ -206,33 +206,25 @@ impl Console {
         self.client.stop()
     }
 
-    /// End the session for good.
-    ///
-    /// `stop` if it is started, then `quit`, in that order: the server owes us nothing
-    /// once the session is over, so anything we want undone has to be undone first. The
-    /// `stop` is best-effort — the session is ending either way — and what comes back is
-    /// the ending itself, which is the answer worth having.
-    ///
-    /// What that ending *is* belongs to the client, because so does whatever having a
-    /// channel took. A [`StdioClient`](crate::console::stdio::StdioClient) has a
-    /// server process to wait for and reports how it exited; a channel that is only a
-    /// channel has nothing to report and says so by succeeding.
-    ///
-    /// Calling this twice is not an error; the second time there is nothing left to do.
-    pub fn shutdown(&mut self) -> Result<(), Failure> {
-        if std::mem::take(&mut self.started) {
-            let _ = self.client.stop();
-        }
-        self.client.quit()
-    }
 }
 
 impl Drop for Console {
+    /// End the session: `stop` if it is started, then `quit`, in that order.
+    ///
+    /// The order is what the `stop` is for — the server owes us nothing once the session
+    /// is over, so anything we want undone has to be undone first.
+    ///
+    /// And ending is only here, because there is no moment where a caller would want it
+    /// earlier and a result for it. What a `quit` reports is how the ending went — over
+    /// stdio, the server process's exit status — and by then the channel is shut and the
+    /// process collected, so nothing can be done about it either way. What having a
+    /// channel took beyond this — a process that must not outlive it — is the client's,
+    /// and happens when the client is dropped, immediately after.
     fn drop(&mut self) {
-        // A console already shut down by hand takes this as a no-op. What a client needs
-        // to do beyond this — a process that must not outlive its channel — happens when
-        // the client itself is dropped, immediately after.
-        let _ = self.shutdown();
+        if std::mem::take(&mut self.started) {
+            let _ = self.client.stop();
+        }
+        let _ = self.client.quit();
     }
 }
 
@@ -294,7 +286,7 @@ mod tests {
         asked: Arc<Mutex<Vec<Call>>>,
     }
 
-    impl Requestable for Recorder {
+    impl Client for Recorder {
         fn call(&mut self, call: Call) -> Result<Outcome, Failure> {
             self.asked.lock().unwrap().push(call);
             if self.answers.is_empty() {
@@ -396,8 +388,8 @@ mod tests {
         assert!(console.stop().is_err());
         assert!(console.exec(Exec::default()).is_err());
 
-        // This client is a channel and nothing more, so its ending is nothing more.
-        console.shutdown().unwrap();
+        // Ending is the console going away, and nothing else has to happen for it.
+        drop(console);
 
         // An execution that delegated nothing is one round trip: no `resume`.
         assert_eq!(

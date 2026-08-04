@@ -8,8 +8,8 @@
 //! two servers cannot drift apart on them.
 //!
 //! - `message` — [`Message`] and the methods, errors and payloads both ends agree on.
-//! - `base` — what each end can *do* on a channel: a [`Requestable`] only asks, a
-//!   [`Responsable`] only answers. Both move messages and neither reads a meaning into
+//! - `base` — what each end can *do* on a channel: a [`Client`] only asks, a
+//!   [`Server`] only answers. Both move messages and neither reads a meaning into
 //!   one.
 //! - [`stdio`] — the transport there is: framed JSON-RPC over a pipe, and the two
 //!   ends over it ([`StdioClient`](stdio::StdioClient), which starts the server process

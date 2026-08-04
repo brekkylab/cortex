@@ -57,7 +57,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, Exec, ExecResult, Message, Outcome, Progress, RequestId, Responsable, Start,
+    Call, Error, Exec, ExecResult, Message, Outcome, Progress, RequestId, Server, Start,
 };
 
 use crate::ipc::SOCK_ENV;
