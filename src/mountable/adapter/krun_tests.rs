@@ -145,7 +145,7 @@ fn the_guest_can_make_and_remove_directories() {
     let dir = fs
         .mkdir(ctx(), ROOT, c"made", 0o755, 0, Extensions::default())
         .unwrap();
-    assert_eq!(dir.attr.st_nlink as u32, 2);
+    assert_eq!(dir.attr.st_nlink as u32, 1);
 
     // The guest has to decompose `rm -rf` itself.
     let (child, child_fh, _) = fs
@@ -182,7 +182,7 @@ fn the_guest_stat64_carries_the_whole_shared_policy() {
     let file = fs.lookup(ctx(), ROOT, c"greeting.txt").unwrap();
 
     // The full mode is pinned, so the type bits need no separate mask.
-    assert_eq!(dir.attr.st_nlink as u32, 2);
+    assert_eq!(dir.attr.st_nlink as u32, 1);
     assert_eq!(dir.attr.st_mode as u32, 0o040000 | 0o755);
     assert_eq!(file.attr.st_nlink as u32, 1);
     assert_eq!(file.attr.st_mode as u32, 0o100000 | 0o644);

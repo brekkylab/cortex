@@ -155,12 +155,10 @@ pub(super) fn host_errno(err: &CortexError) -> i32 {
 /// watches it to decide when to drop cached pages, so one stuck at 0 never has
 /// its cache invalidated.
 pub(super) fn attr_for(stat: &Stat) -> Attr {
-    // `.` and `..` alone make a directory's link count 2, even with no
-    // subdirectories of its own.
-    let nlink = match stat.kind {
-        DirentKind::Dir => 2,
-        DirentKind::File => 1,
-    };
+    // A directory's real link count is `2 + subdirs`, and `find`/`du` read
+    // `nlink - 2` as that count and stop descending at zero. `1` is the
+    // conventional "unreliable", which turns that optimisation off.
+    let nlink = 1;
     let mode = mode_for(stat.kind);
     let mtime = stat.mtime.unwrap_or(UNIX_EPOCH);
     Attr {

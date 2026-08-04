@@ -288,7 +288,7 @@ fn the_mutating_callbacks_reach_the_backend() {
     let (rc, dir, dir_stat) = shim.mkdir(ROOT, "made");
     assert_eq!(rc, 0);
     assert_eq!(dir_stat.mode, 0o040000 | 0o755);
-    assert_eq!(dir_stat.nlink, 2);
+    assert_eq!(dir_stat.nlink, 1);
 
     // A rename moves a live object, so the same inode answers under the new name.
     assert_eq!(shim.rename(ROOT, "fresh.txt", dir, "moved.txt"), 0);
@@ -333,7 +333,7 @@ fn the_cortex_stat_projection_fills_every_field() {
 
     let dir = to_cortex_stat(1, &Stat::new(DirentKind::Dir, 0));
     assert_eq!(dir.mode, 0o040000 | 0o755);
-    assert_eq!(dir.nlink, 2, "`.` and `..` are links to it");
+    assert_eq!(dir.nlink, 1);
 
     // A narrowing cast, so it has to survive the trip into `u32`.
     assert_eq!(ops_for::<Arc<InMemVolume>>().block_size as u64, BLOCK_SIZE);

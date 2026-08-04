@@ -232,7 +232,7 @@ fn flush_does_not_finalize_but_release_does() {
 #[test]
 fn attribute_policy_is_shared_by_both_bindings() {
     let dir = attr_for(&Stat::new(DirentKind::Dir, 0));
-    assert_eq!(dir.nlink, 2);
+    assert_eq!(dir.nlink, 1);
     assert_eq!(dir.mode, 0o040000 | 0o755);
 
     let file = attr_for(&Stat::new(DirentKind::File, 0));
