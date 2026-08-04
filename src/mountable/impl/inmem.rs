@@ -32,6 +32,10 @@ use crate::{
 /// Raise it if a workload legitimately needs bigger files in RAM.
 const MAX_FILE_SIZE: u64 = 1 << 30;
 
+/// What a handle answers when asked to do what its open did not allow. Identical
+/// on every POSIX system, and `libc` is only an optional dependency.
+const EBADF: i32 = 9;
+
 /// Bound a requested end-of-file against [`MAX_FILE_SIZE`]. Overflow counts as
 /// exceeding it: both mean a size this volume will not represent.
 fn checked_end(offset: u64, len: usize) -> Result<usize> {
@@ -400,7 +404,15 @@ impl Mountable for InMemVolume {
             }
             body.stat()
         };
-        Ok((InMemHandle { data }, stat))
+        Ok((
+            InMemHandle {
+                data,
+                read: options.read,
+                write: options.write,
+                append: options.append,
+            },
+            stat,
+        ))
     }
 }
 
@@ -409,10 +421,16 @@ impl Mountable for InMemVolume {
 /// and truncations are seen by later `stat`s, `open`s, and reads.
 pub struct InMemHandle {
     data: FileData,
+    read: bool,
+    write: bool,
+    append: bool,
 }
 
 impl FileExt for InMemHandle {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        if !self.read {
+            return Err(io::Error::from_raw_os_error(EBADF));
+        }
         // No `touch`: a read is not a modification, and an access time would put a
         // write on the read path for something `attr_for` already derives.
         let body = lock(&self.data);
@@ -426,11 +444,19 @@ impl FileExt for InMemHandle {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        if !self.write {
+            return Err(io::Error::from_raw_os_error(EBADF));
+        }
+        let mut body = lock(&self.data);
+        let offset = if self.append {
+            body.bytes.len() as u64
+        } else {
+            offset
+        };
         // Bound before allocating: `offset` is the guest's choice, and `resize`
         // would honour it literally.
         let end = checked_end(offset, buf.len())
             .map_err(|_| io::Error::from(io::ErrorKind::FileTooLarge))?;
-        let mut body = lock(&self.data);
         if end > body.bytes.len() {
             body.bytes.resize(end, 0);
         }
@@ -444,6 +470,11 @@ impl FileExt for InMemHandle {
 
 impl FileHandle for InMemHandle {
     fn truncate(&self, size: u64) -> Result<()> {
+        // `InvalidArgument`, which is what `ftruncate` gives a read-only
+        // descriptor and so what `PassthroughVolume` answers.
+        if !self.write {
+            return Err(CortexError::InvalidArgument);
+        }
         // Reaches the same `resize`, so it needs the same ceiling.
         let size = checked_end(size, 0)?;
         let mut body = lock(&self.data);

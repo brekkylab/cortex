@@ -63,6 +63,7 @@ fn expect_errno<T>(result: std::io::Result<T>) -> i32 {
 
 /// Guest-side open flags, in the guest's (Linux) numbering.
 const GUEST_O_WRONLY: u32 = 1;
+const GUEST_O_RDWR: u32 = 2;
 const GUEST_O_TRUNC: u32 = 0o1000;
 
 /// Feeds bytes from a file descriptor — the mirror of [`Collected`].
@@ -88,7 +89,9 @@ fn the_guest_can_create_write_and_read_back() {
             c"fresh.txt",
             0o644,
             false,
-            GUEST_O_WRONLY,
+            // `O_RDWR`, because this reads the bytes back through the same
+            // handle — a guest kernel would not send that read for `O_WRONLY`.
+            GUEST_O_RDWR,
             0,
             Extensions::default(),
         )

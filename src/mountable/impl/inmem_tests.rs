@@ -528,3 +528,53 @@ fn the_namespace_operations_classify_what_they_refuse() {
         Err(CortexError::InvalidName)
     ));
 }
+
+/// An `append` handle writes at the end whatever offset it is given, which is
+/// what `OpenOptions::append` promises and what the kernel does for
+/// `PassthroughVolume`.
+#[test]
+fn append_writes_land_at_the_end() {
+    let vol = InMemVolume::new();
+    let append = OpenOptions {
+        append: true,
+        ..OpenOptions::read_write()
+    };
+    let (h, _) = vol
+        .open(
+            Path::new("log"),
+            OpenOptions {
+                create: true,
+                ..append
+            },
+        )
+        .unwrap();
+
+    h.write_all_at(b"AAA", 0).unwrap();
+    h.write_all_at(b"BBB", 0).unwrap();
+
+    let mut buf = [0u8; 6];
+    h.read_exact_at(&mut buf, 0).unwrap();
+    assert_eq!(&buf, b"AAABBB");
+}
+
+/// The access mode outlives the open, as it does for a file descriptor.
+#[test]
+fn a_handle_refuses_what_its_open_did_not_allow() {
+    let vol = InMemVolume::new();
+    vol.open(Path::new("f"), OpenOptions::create_new()).unwrap();
+
+    let (ro, _) = vol.open(Path::new("f"), OpenOptions::read_only()).unwrap();
+    assert_eq!(ro.write_at(b"x", 0).unwrap_err().raw_os_error(), Some(9));
+    assert!(matches!(ro.truncate(0), Err(CortexError::InvalidArgument)));
+
+    let write_only = OpenOptions {
+        read: false,
+        write: true,
+        ..Default::default()
+    };
+    let (wo, _) = vol.open(Path::new("f"), write_only).unwrap();
+    assert_eq!(
+        wo.read_at(&mut [0u8; 1], 0).unwrap_err().raw_os_error(),
+        Some(9)
+    );
+}
