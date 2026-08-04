@@ -217,7 +217,8 @@ Much what stopping a VM is: the guest goes away, the socket and the symlinks go 
 Backends differ in what that costs, which is why the client asks rather than assuming.
 
 Afterwards the session is back where it was before `start`, so **another `start` is allowed** — a server process can outlive the resources it booted, which is worth something when booting is the expensive part.
-`Console::stop` is therefore not the end of anything; `Console::shutdown` is the one that sends `quit` and collects the process.
+`Console::stop` is therefore not the end of anything; `Console::shutdown` is the one that sends `quit`.
+What `quit` costs to carry out is the transport's — over stdio it also closes the server's stdin and waits for the process, because that client is what started it.
 
 `stop` does **not** wait for an `exec` that is still running.
 A client that wants its commands finished first waits for their responses — which it can, since it is the only thing asking on that channel.

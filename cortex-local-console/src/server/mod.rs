@@ -1,6 +1,6 @@
 //! The server role: answer a console session by running commands on this host.
 //!
-//! A [`StdioResponder`] brings the requests in and puts the responses out, and does
+//! A [`StdioServer`] brings the requests in and puts the responses out, and does
 //! nothing else — so what is left here is the three things that are actually ours: making
 //! a delegated name runnable, running a command, and letting a delegated call reach the
 //! client while that command waits for it.
@@ -55,7 +55,7 @@ use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use cortex::console::stdio::StdioResponder;
+use cortex::console::stdio::StdioServer;
 use cortex::console::{
     Call, Error, Exec, ExecResult, Message, Outcome, Progress, RequestId, Responsable, Start,
 };
@@ -73,7 +73,7 @@ const NOT_FOUND: i32 = 127;
 
 /// Answer requests until the client says `quit` or closes the channel.
 pub fn run() -> anyhow::Result<()> {
-    let mut server = StdioResponder::stdio()?;
+    let mut server = StdioServer::stdio()?;
 
     // Bound once, before anything can be running, and kept for the process. See
     // [`Shims::bind`] for why its lifetime is the process's and not a session's.
@@ -147,7 +147,7 @@ fn boot(linked: &mut Option<BinDir>, start: &Start) -> Outcome {
 /// error — and it goes to whichever request is owed one by then: the `exec` if nothing was
 /// delegated, or the last `resume` if something was.
 fn execute(
-    server: &mut StdioResponder,
+    server: &mut StdioServer,
     id: RequestId,
     exec: &Exec,
     linked: Option<&BinDir>,
@@ -218,11 +218,11 @@ fn execute(
 /// What is returned is the id of the request now owed the execution's own answer, or
 /// `None` when the client said nothing that could be one.
 fn delegate(
-    server: &mut StdioResponder,
+    server: &mut StdioServer,
     owed: RequestId,
     stream: UnixStream,
 ) -> io::Result<Option<RequestId>> {
-    let mut shim = StdioResponder::new(stream.try_clone()?, stream);
+    let mut shim = StdioServer::new(stream.try_clone()?, stream);
 
     // A connection carrying anything but a shim's one `exec` is not something to forward,
     // and the execution still owes what it owed. Dropping the connection is all there is

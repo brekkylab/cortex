@@ -12,8 +12,9 @@
 //!   [`Responsable`] only answers. Both move messages and neither reads a meaning into
 //!   one.
 //! - [`stdio`] — the transport there is: framed JSON-RPC over a pipe, and the two
-//!   ends over it ([`StdioRequester`](stdio::StdioRequester),
-//!   [`StdioResponder`](stdio::StdioResponder)).
+//!   ends over it ([`StdioClient`](stdio::StdioClient), which starts the server process
+//!   it drives, and [`StdioServer`](stdio::StdioServer), which answers on stdin and
+//!   stdout).
 //! - [`Console`] — the public end, and what a caller normally reaches for: the channel
 //!   that drives a server, and the names a delegated call resolves to.
 //!

@@ -27,8 +27,6 @@
 //! [`Progress`] for why that is latency rather than a deadlock, and what would have to
 //! change for it to stop being so.
 
-use std::process::{Child, ExitStatus};
-
 use anyhow::Context as _;
 
 use crate::console::base::{Failure, Requestable};
@@ -46,7 +44,6 @@ use crate::executable::{ExecCall, ExecutableSet};
 #[derive(Default)]
 pub struct ConsoleBuilder {
     client: Option<Box<dyn Requestable>>,
-    server: Option<Child>,
     execs: ExecutableSet,
     default_timeout_ms: Option<u64>,
 }
@@ -54,21 +51,12 @@ pub struct ConsoleBuilder {
 impl ConsoleBuilder {
     /// Drive the server over `client`.
     ///
-    /// Anything that asks will do — a [`StdioRequester`](crate::console::stdio::StdioRequester)
-    /// over a child's pipes, a virtio port into a guest, both ends in one process for a
-    /// test.
+    /// Anything that asks will do — a [`StdioClient`](crate::console::stdio::StdioClient)
+    /// over a server it started, a virtio port into a guest, both ends in one process for
+    /// a test. Whatever it took to have a channel is the client's, including a process if
+    /// that is what it runs over, so there is nothing else here about where a server is.
     pub fn client(mut self, client: impl Requestable + 'static) -> Self {
         self.client = Some(Box::new(client));
-        self
-    }
-
-    /// The process the client talks to, if there is one, so that [`Console::stop`] can
-    /// collect it and say how it went.
-    ///
-    /// Separate from [`client`](Self::client) because they are separate facts: a client
-    /// is a channel and this is a process, and a channel does not have to have one.
-    pub fn server(mut self, server: Child) -> Self {
-        self.server = Some(server);
         self
     }
 
@@ -99,7 +87,6 @@ impl ConsoleBuilder {
 
         Ok(Console {
             client,
-            server: self.server,
             execs: self.execs,
             default_timeout_ms: self.default_timeout_ms,
             started: false,
@@ -114,15 +101,16 @@ impl ConsoleBuilder {
 /// there is more to do. [`shutdown`](Self::shutdown) ends the session for good.
 ///
 /// ```no_run
-/// use cortex::console::stdio::StdioRequester;
+/// use std::process::Command;
+///
+/// use cortex::console::stdio::StdioClient;
 /// use cortex::console::{Console, Exec};
 /// use cortex::executable::ExecutableSet;
 ///
 /// # fn main() -> anyhow::Result<()> {
-/// // Whatever the client channel actually runs over — a child's pipes, a virtio port.
-/// # let (to_server, from_server) = (std::io::sink(), std::io::empty());
+/// // Whichever console server this is: the client starts it and owns it from here.
 /// let mut console = Console::builder()
-///     .client(StdioRequester::new(from_server, to_server))
+///     .client(StdioClient::new(Command::new("cortex-local-console"))?)
 ///     .executables(ExecutableSet::new())
 ///     .default_timeout_ms(30_000)
 ///     .build()?;
@@ -142,9 +130,6 @@ impl ConsoleBuilder {
 /// ```
 pub struct Console {
     client: Box<dyn Requestable>,
-
-    /// The process the client is talking to, if the caller had one to hand over.
-    server: Option<Child>,
 
     /// What a delegated name announced by [`start`](Self::start) resolves to when one
     /// comes back as a [`Delegated`](Progress::Delegated).
@@ -221,44 +206,33 @@ impl Console {
         self.client.stop()
     }
 
-    /// End the session and collect the process if there is one.
+    /// End the session for good.
     ///
     /// `stop` if it is started, then `quit`, in that order: the server owes us nothing
-    /// once the session is over, so anything we want undone has to be undone first. Both
-    /// are best-effort — the session is ending either way, and the exit status is the
-    /// answer worth having.
+    /// once the session is over, so anything we want undone has to be undone first. The
+    /// `stop` is best-effort — the session is ending either way — and what comes back is
+    /// the ending itself, which is the answer worth having.
     ///
-    /// `Ok(None)` when no process was handed over, which is not a failure: a caller that
-    /// gave us only a channel gets only the channel's ending.
+    /// What that ending *is* belongs to the client, because so does whatever having a
+    /// channel took. A [`StdioClient`](crate::console::stdio::StdioClient) has a
+    /// server process to wait for and reports how it exited; a channel that is only a
+    /// channel has nothing to report and says so by succeeding.
     ///
     /// Calling this twice is not an error; the second time there is nothing left to do.
-    pub fn shutdown(&mut self) -> Result<Option<ExitStatus>, Failure> {
+    pub fn shutdown(&mut self) -> Result<(), Failure> {
         if std::mem::take(&mut self.started) {
             let _ = self.client.stop();
         }
-        let _ = self.client.quit();
-
-        match self.server.as_mut() {
-            Some(server) => server
-                .wait()
-                .map(Some)
-                .context("waiting for the console server")
-                .map_err(Failure::Broken),
-            None => Ok(None),
-        }
+        self.client.quit()
     }
 }
 
 impl Drop for Console {
     fn drop(&mut self) {
-        // A console already shut down by hand takes this as a no-op: `quit` on a closed
-        // channel fails, and there is no process left to wait for.
+        // A console already shut down by hand takes this as a no-op. What a client needs
+        // to do beyond this — a process that must not outlive its channel — happens when
+        // the client itself is dropped, immediately after.
         let _ = self.shutdown();
-        // Whatever the session did, the process does not outlive the handle to it.
-        if let Some(server) = self.server.as_mut() {
-            let _ = server.kill();
-            let _ = server.wait();
-        }
     }
 }
 
@@ -422,8 +396,8 @@ mod tests {
         assert!(console.stop().is_err());
         assert!(console.exec(Exec::default()).is_err());
 
-        // No process was handed over, so there is no status to report.
-        assert!(console.shutdown().unwrap().is_none());
+        // This client is a channel and nothing more, so its ending is nothing more.
+        console.shutdown().unwrap();
 
         // An execution that delegated nothing is one round trip: no `resume`.
         assert_eq!(

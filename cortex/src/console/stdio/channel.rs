@@ -32,7 +32,7 @@
 //! *Which* descriptors an end takes is not this module's. Framing is the same over
 //! a pipe, a virtio port or a `Vec<u8>`, whereas taking **the process's** stdin and
 //! stdout is a process-wide claim that exactly one end makes, exactly once — so it
-//! lives with that end, in [`StdioResponder::stdio`](super::StdioResponder::stdio).
+//! lives with that end, in [`StdioServer::stdio`](super::StdioServer::stdio).
 //!
 //! # The two directions are not paired here
 //!

@@ -11,7 +11,7 @@
 
 use std::process::{Command, Stdio};
 
-use cortex::console::stdio::StdioRequester;
+use cortex::console::stdio::StdioClient;
 use cortex::console::{Console, Exec, ExecResult};
 use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
 
@@ -80,19 +80,13 @@ impl Fixture {
             )
             .register("report", Report);
 
-        let mut child = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .expect("spawning the console server");
-
-        let stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
+        // Only its stderr is ours to place — the client sets the two descriptors the
+        // protocol runs on, and starts the process it owns from here on.
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+        server.stderr(Stdio::inherit());
 
         let console = Console::builder()
-            .client(StdioRequester::new(stdout, stdin))
-            .server(child)
+            .client(StdioClient::new(server).expect("spawning the console server"))
             .executables(execs)
             .default_timeout_ms(30_000)
             .build()
@@ -239,13 +233,15 @@ fn a_console_can_be_stopped_and_started_again() {
     fixture.console.stop().unwrap();
 }
 
-/// A server whose stdin ends exits, and `shutdown` collects it.
+/// A server told the session is over exits, and `shutdown` is where that is waited for:
+/// the process is the client's, so a clean ending is what comes back here.
 #[test]
 fn shutting_down_collects_the_process() {
     let mut fixture = Fixture::new();
     fixture.console.start().unwrap();
 
-    let status = fixture.console.shutdown().unwrap();
-    let status = status.expect("a console given a process reports its status");
-    assert!(status.success(), "{status:?}");
+    fixture
+        .console
+        .shutdown()
+        .expect("the server should end cleanly");
 }

@@ -5,13 +5,13 @@
 //! [`Responsable`] moves frames, and whoever answers them does so somewhere else.
 //!
 //! ```no_run
-//! use cortex::console::stdio::StdioResponder;
+//! use cortex::console::stdio::StdioServer;
 //! use cortex::console::{Message, Outcome, Responsable};
 //!
 //! # fn answer(call: cortex::console::Call) -> Outcome { unimplemented!() }
 //! # fn main() -> anyhow::Result<()> {
 //! // Takes stdin and stdout for the protocol; everything else goes to stderr.
-//! let mut server = StdioResponder::stdio()?;
+//! let mut server = StdioServer::stdio()?;
 //!
 //! while let Some(message) = server.recv()? {
 //!     if let Message::Request { id, call } = message {
@@ -30,7 +30,7 @@ use crate::console::{Message, Outcome, RequestId, Responsable};
 
 /// Whether this process has already taken its standard descriptors.
 ///
-/// There is one stdin and one stdout, so a second [`StdioResponder::stdio`] would be a
+/// There is one stdin and one stdout, so a second [`StdioServer::stdio`] would be a
 /// second owner of both and the two would interleave frames. Refusing there is what
 /// lets the first one assume it is alone.
 ///
@@ -50,7 +50,7 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 /// answer in every signature that mentions one.
 ///
 /// No state beyond the two descriptors. There is no session here to keep.
-pub struct StdioResponder {
+pub struct StdioServer {
     /// Where requests come from.
     ///
     /// Buffered here, once. Nothing hands this to a command — it is the protocol's for
@@ -62,14 +62,14 @@ pub struct StdioResponder {
     outgoing: Box<dyn Write + Send>,
 }
 
-impl StdioResponder {
+impl StdioServer {
     /// Take the two descriptors, whatever they are — this process's stdin and stdout, a
     /// virtio port out of a guest, a `Cursor` and a `Vec` for a test.
     pub fn new(
         incoming: impl Read + Send + 'static,
         outgoing: impl Write + Send + 'static,
     ) -> Self {
-        StdioResponder {
+        StdioServer {
             incoming: BufReader::new(Box::new(incoming)),
             outgoing: Box::new(outgoing),
         }
@@ -91,11 +91,11 @@ impl StdioResponder {
         if TAKEN.swap(true, Ordering::SeqCst) {
             anyhow::bail!("stdin and stdout are already the protocol's — there is one of each");
         }
-        Ok(StdioResponder::new(io::stdin(), io::stdout()))
+        Ok(StdioServer::new(io::stdin(), io::stdout()))
     }
 }
 
-impl Responsable for StdioResponder {
+impl Responsable for StdioServer {
     fn recv(&mut self) -> io::Result<Option<Message>> {
         read(&mut self.incoming)
     }
@@ -164,7 +164,7 @@ mod tests {
             Message::Notification(Notification::Quit),
         ];
 
-        let mut server = StdioResponder::new(Cursor::new(framed(&sent)), Sent::default());
+        let mut server = StdioServer::new(Cursor::new(framed(&sent)), Sent::default());
         for message in &sent {
             assert_eq!(server.recv().unwrap().as_ref(), Some(message));
         }
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn a_response_carries_the_id_it_was_given() {
         let sent = Sent::default();
-        let mut server = StdioResponder::new(io::empty(), sent.clone());
+        let mut server = StdioServer::new(io::empty(), sent.clone());
 
         server
             .respond(7, Outcome::Result(serde_json::Value::Null))
@@ -215,7 +215,7 @@ mod tests {
         let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
         bytes.extend_from_slice(payload);
 
-        let mut server = StdioResponder::new(Cursor::new(bytes), Sent::default());
+        let mut server = StdioServer::new(Cursor::new(bytes), Sent::default());
         let error = server.recv().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }

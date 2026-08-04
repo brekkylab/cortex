@@ -10,39 +10,50 @@
 //! The protocol's methods are [`Requestable`]'s. What is here is only what the wire adds:
 //! an id per call, and waiting for the response that brings it back.
 //!
-//! # Two descriptors, and nothing about where they came from
+//! # The pipes, and the process they belong to
 //!
-//! A client is handed the pair it talks over and knows nothing else. Not what program
-//! a server is, nor how it was started, nor who collects it — those are decisions this
-//! end has no part in, and leaving them out is what lets the same code drive a child's
-//! pipes, a virtio port into a guest, or both ends inside one test.
+//! A client over stdio is a client over some program's pipes, so [`new`](StdioClient::new)
+//! takes the program and starts it. What a caller decides is the command — what to run,
+//! with what arguments and environment, where its stderr goes; the two descriptors the
+//! protocol runs on are this end's, because a caller who got those wrong would have a
+//! client with nothing to say.
 //!
-//! It does own the descriptors, though, which is the one thing a caller has to know:
-//! **dropping the client closes the writer**, and for a server process that closed
-//! stdin is how it learns the session is over. Whoever holds the process should expect
-//! it to end shortly after.
+//! The pipes and the process are therefore one fact, and this end holds both.
+//! [`quit`](Requestable::quit) is the ending: the writer is dropped — which is how a
+//! server learns the session is over — and then the process is waited for. Dropping a
+//! client that was never quit kills it instead, so a server does not outlive the channel
+//! to it either way.
 //!
-//! [`Console`](crate::console::Console) is this plus the process and the names a server
-//! may call back into, and is what a caller normally wants.
+//! Which is why the process is not a [`Console`]'s. What a session *is* — the methods, the
+//! delegated names, walking the delegation chain — is the same wherever a server runs;
+//! something to `wait` for exists only because this transport is a pipe to a child. A
+//! transport into a micro-VM guest is a channel with no process behind it, and a `Console`
+//! over one should not carry a field for a thing that does not exist.
+//!
+//! [`Console`] is this plus the names a server may call back into, and is what a caller
+//! normally wants.
+//!
+//! [`Console`]: crate::console::Console
 
 use std::io::{self, BufReader, Read, Write};
+use std::process::{Child, Command, Stdio};
 
 use crate::console::stdio::{read, write};
 use crate::console::{Call, Failure, Message, Notification, Outcome, RequestId, Requestable};
 
-/// A [`Requestable`] over one readable and one writable descriptor.
+/// A [`Requestable`] over a server process's pipes, and the process itself.
 ///
 /// The two directions are separate fields and not a pair, because that is what they
 /// are: what goes out has nothing to do with what comes back beyond the framing they
 /// share, and holding them apart is what lets [`call`](Requestable::call) write and then
 /// read without giving up one borrow for the other.
 ///
-/// Trait objects rather than type parameters. Which descriptors these are is not
-/// something this end reads differently, so a pair of parameters would only put the
-/// answer in every signature that mentions a client — including
-/// [`Console`](crate::console::Console), which holds one behind a `dyn Requestable` and so
-/// could not use the answer anyway.
-pub struct StdioRequester {
+/// Trait objects rather than the child's own descriptor types. Reading frames and writing
+/// them is all this end does with either, so naming the types would buy nothing and cost
+/// two things: a writer that can be let go of when the session ends without the field
+/// becoming an `Option`, and a test that can drive this over a canned stream instead of a
+/// process.
+pub struct StdioClient {
     /// Where responses come from.
     ///
     /// Buffered here, once. Nothing hands this to a command — it is the protocol's for
@@ -50,28 +61,64 @@ pub struct StdioRequester {
     /// else's.
     incoming: BufReader<Box<dyn Read + Send>>,
 
-    /// Where calls go.
+    /// Where calls go — the server's stdin, until [`quit`](Requestable::quit) closes it.
     outgoing: Box<dyn Write + Send>,
+
+    /// The process those pipes belong to.
+    ///
+    /// `None` once it has been collected, which is all this `Option` says and the only
+    /// state either end of the session needs: a client with no process left is a client
+    /// whose session is over, so nothing has to be tracked twice.
+    server: Option<Child>,
 
     /// From zero, by one. Nothing on the other side reads a meaning into the number,
     /// and it only has to be unique among this client's own — see [`RequestId`].
     next_id: RequestId,
 }
 
-impl StdioRequester {
-    /// Take the two descriptors, whatever they are — a child's stdout and stdin, a
-    /// virtio port, a `Cursor` and a `Vec` for a test.
+impl StdioClient {
+    /// Start `server` and drive the session over its own pipes.
     ///
-    /// Owned rather than borrowed: they are the protocol's until this client is
-    /// dropped, and a caller that could still reach them could take a byte that was a
-    /// response's.
-    pub fn new(
-        incoming: impl Read + Send + 'static,
-        outgoing: impl Write + Send + 'static,
-    ) -> Self {
-        StdioRequester {
+    /// Everything about the command is the caller's — what to run, its arguments, its
+    /// environment, where its stderr goes — except the two descriptors the protocol needs,
+    /// which are set here. A caller who got those wrong would have a client with nothing
+    /// to say, so they are not something to get wrong.
+    ///
+    /// The pipes are the protocol's from here on, and so is the process: nothing else may
+    /// reach either, because a reader that could would take a byte that was a response's.
+    pub fn new(mut server: Command) -> io::Result<StdioClient> {
+        let mut server = server
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+
+        // Both are `Some`: they were asked for immediately above.
+        let outgoing = server.stdin.take().expect("a piped stdin");
+        let incoming = server.stdout.take().expect("a piped stdout");
+
+        Ok(StdioClient {
             incoming: BufReader::new(Box::new(incoming)),
             outgoing: Box::new(outgoing),
+            server: Some(server),
+            next_id: 0,
+        })
+    }
+
+    /// A client over two descriptors and no process, for the tests below.
+    ///
+    /// Which is where a canned stream of what a server *would* have said comes from — a
+    /// server that has lost track of its own ids is not something a real program does on
+    /// request. Not public: what a caller has is a program to run, and a client that could
+    /// be built without one would have a process to collect on some paths and not others.
+    #[cfg(test)]
+    fn over(
+        incoming: impl Read + Send + 'static,
+        outgoing: impl Write + Send + 'static,
+    ) -> StdioClient {
+        StdioClient {
+            incoming: BufReader::new(Box::new(incoming)),
+            outgoing: Box::new(outgoing),
+            server: None,
             next_id: 0,
         }
     }
@@ -85,7 +132,7 @@ impl StdioRequester {
     }
 }
 
-impl Requestable for StdioRequester {
+impl Requestable for StdioClient {
     /// Send one call and read until the response with its id arrives.
     ///
     /// Anything else that arrives is a server that has lost track of itself. A
@@ -127,6 +174,54 @@ impl Requestable for StdioRequester {
 
     fn notify(&mut self, notification: Notification) -> Result<(), Failure> {
         self.send(&Message::Notification(notification))
+    }
+
+    /// Say the session is over, close the pipe, and wait for the server to go.
+    ///
+    /// In that order, and each step because of the next one. A server ends on `quit`; one
+    /// that somehow missed it still sees its stdin end, and a `wait` that kept the pipe
+    /// open would be a wait that does not return. The writer is swapped for a sink rather
+    /// than removed — anything asked after a session is over goes nowhere, which is what a
+    /// closed pipe would have made of it anyway.
+    ///
+    /// What comes back is the process's ending and not the notification's: a server that
+    /// exited cleanly did not need to hear `quit` to know, and a send that failed is a
+    /// server that was already gone. A bad exit is a [`Broken`](Failure::Broken) carrying
+    /// the status — nothing can be done about it by then, but a server that died is not the
+    /// ending a caller asked for. With no process to collect, the notification is the whole
+    /// of the ending and its result is what this is.
+    ///
+    /// Calling this twice is not an error; the second time there is nothing left to collect.
+    fn quit(&mut self) -> Result<(), Failure> {
+        let said = self.notify(Notification::Quit);
+        self.outgoing = Box::new(io::sink());
+
+        let Some(mut server) = self.server.take() else {
+            return said;
+        };
+
+        let status = server
+            .wait()
+            .map_err(broke("waiting for the console server"))?;
+
+        if !status.success() {
+            return Err(Failure::broken(format!(
+                "the console server ended with {status}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StdioClient {
+    fn drop(&mut self) {
+        // A session that ended by hand has nothing here. One that did not gets no grace:
+        // there is no telling what a server left mid-session is waiting for, and a `wait`
+        // in a `drop` that guessed wrong would hang whoever is dropping it.
+        if let Some(server) = self.server.as_mut() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
     }
 }
 
@@ -176,13 +271,13 @@ mod tests {
     /// A client over a canned stream of what a server would have said — which is
     /// enough for the whole protocol, now that everything this end reads is a
     /// response.
-    fn driving(incoming: &[Message]) -> (StdioRequester, Sent) {
+    fn driving(incoming: &[Message]) -> (StdioClient, Sent) {
         let mut bytes = Vec::new();
         for message in incoming {
             write(&mut bytes, message).unwrap();
         }
         let sent = Sent::default();
-        (StdioRequester::new(Cursor::new(bytes), sent.clone()), sent)
+        (StdioClient::over(Cursor::new(bytes), sent.clone()), sent)
     }
 
     /// An execution that finished without delegating anything, which is the only shape
@@ -283,6 +378,31 @@ mod tests {
         }]);
         let failure = client.exec(Exec::default()).unwrap_err();
         assert!(failure.to_string().contains("cannot answer"), "{failure}");
+    }
+
+    /// The process is the client's, so how it ended is the client's to report — and
+    /// `quit` is where a caller hears it.
+    ///
+    /// Neither of these programs speaks the protocol, which is the point: what is being
+    /// tested is the ending, and an ending is the one thing this end does not need an
+    /// answer for.
+    #[test]
+    fn quitting_collects_the_server_and_says_how_it_went() {
+        let mut ends_badly = Command::new("sh");
+        ends_badly.args(["-c", "exit 3"]);
+        let mut client = StdioClient::new(ends_badly).unwrap();
+
+        let failure = client.quit().unwrap_err();
+        assert_eq!(failure.code(), None, "a dead server is not a refusal");
+        assert!(failure.to_string().contains("exit status: 3"), "{failure}");
+
+        // Collected once. A second `quit` has nothing left to wait for and says nothing
+        // about a status it already reported.
+        client.quit().unwrap();
+
+        let mut ends_well = Command::new("sh");
+        ends_well.args(["-c", "exit 0"]);
+        StdioClient::new(ends_well).unwrap().quit().unwrap();
     }
 
     /// An id is spent whether or not its call worked, so a failed call cannot leave

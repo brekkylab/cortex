@@ -1,7 +1,7 @@
 mod channel;
-mod requester;
-mod responder;
+mod client;
+mod server;
 
 pub use channel::*;
-pub use requester::*;
-pub use responder::*;
+pub use client::*;
+pub use server::*;
