@@ -1,7 +1,0 @@
-[package]
-name = "wsx"
-version.workspace = true
-edition.workspace = true
-
-[dependencies]
-cortex-fs = { workspace = true }
