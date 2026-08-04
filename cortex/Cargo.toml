@@ -4,22 +4,21 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-anyhow = { workspace = true, optional = true }
+anyhow = { workspace = true }
 base64 = { workspace = true }
 futures-core = { workspace = true }
 libc = { workspace = true, optional = true }
 msb_krun = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde = { workspace = true }
+# The console wire is JSON-RPC 2.0, which needs a self-describing codec: `params`
+# and `result` are typed by a method that may arrive after them, and `result` xor
+# `error` is decided by which member is present.
+serde_json = { workspace = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["fs", "process", "rt", "time"] }
 
 [features]
 default = []
-
-# For implementing console servers, add this feature.
-# The stdio protocol is JSON, so it is what pulls serde in.
-console_server = ["dep:anyhow", "dep:serde", "dep:serde_json"]
 
 # Add support for libkrun, running agent with microVM
 uvm = ["dep:libc", "dep:msb_krun", "dep:tempfile"]

@@ -25,12 +25,10 @@ use std::path::{Path, PathBuf};
 /// tell an abandoned directory from one still in use.
 const PREFIX: &str = "cortex-console-";
 
-/// `sockaddr_un.sun_path` on macOS. A path that does not fit cannot be bound or
-/// connected to, and the failure surfaces far from the cause — so we check it
-/// where the path is built rather than where it is used.
-const SUN_PATH_MAX: usize = 104;
-
-/// Our scratch directory: the `bin/` on `PATH` plus the socket its shims dial.
+/// Our scratch directory: the `bin/` that goes on `PATH`, and nothing else.
+///
+/// The socket a shim dials is not here — the client binds that one, because the client
+/// is what a shim has to reach. See [`ipc`](crate::ipc).
 ///
 /// Owns the directory outright — dropping it removes the tree, so the caller
 /// keeps it alive for exactly as long as the names should be callable.
@@ -53,19 +51,11 @@ impl BinDir {
         // directory outlived the sweep. Start clean either way.
         let _ = fs::remove_dir_all(&root);
 
-        // 0700: the socket inside is an unauthenticated channel to `exec`, so
-        // the directory permission is what keeps other users off it.
+        // 0700: every name in here re-enters this binary as a shim, so the directory
+        // permission is what keeps other users from putting one on our `PATH`.
         DirBuilder::new().mode(0o700).create(&root)?;
         let dir = BinDir { root };
         DirBuilder::new().mode(0o700).create(dir.bin())?;
-
-        let sock = dir.socket();
-        if sock.as_os_str().len() >= SUN_PATH_MAX {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("socket path too long for sun_path: {}", sock.display()),
-            ));
-        }
 
         // Resolved, not `argv[0]`: the link must point at the binary itself, or
         // it would break the moment the caller's cwd changed.
@@ -79,11 +69,6 @@ impl BinDir {
     /// The directory to put on `PATH`.
     pub fn bin(&self) -> PathBuf {
         self.root.join("bin")
-    }
-
-    /// The socket shims connect back on.
-    pub fn socket(&self) -> PathBuf {
-        self.root.join("sock")
     }
 }
 

@@ -1,0 +1,222 @@
+//! The answering end, over a framed channel: bring a message in, put a response out.
+//!
+//! That is the whole of this file. Nothing here decides what a request *means* — what a
+//! session allows, where a command runs, what counts as booted. A
+//! [`Responsable`] moves frames, and whoever answers them does so somewhere else.
+//!
+//! ```no_run
+//! use cortex::console::stdio::StdioResponder;
+//! use cortex::console::{Message, Outcome, Responsable};
+//!
+//! # fn answer(call: cortex::console::Call) -> Outcome { unimplemented!() }
+//! # fn main() -> anyhow::Result<()> {
+//! // Takes stdin and stdout for the protocol; everything else goes to stderr.
+//! let mut server = StdioResponder::stdio()?;
+//!
+//! while let Some(message) = server.recv()? {
+//!     if let Message::Request { id, call } = message {
+//!         server.respond(id, answer(call))?;
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
+use std::io::{self, BufReader, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::console::stdio::{read, write};
+use crate::console::{Message, Outcome, RequestId, Responsable};
+
+/// Whether this process has already taken its standard descriptors.
+///
+/// There is one stdin and one stdout, so a second [`StdioResponder::stdio`] would be a
+/// second owner of both and the two would interleave frames. Refusing there is what
+/// lets the first one assume it is alone.
+///
+/// A process-wide claim, so it is a process-wide flag — and it belongs here rather than
+/// with the framing, because this is the end that makes it. A requesting end reads and
+/// writes a *child's* pipes and never touches its own.
+static TAKEN: AtomicBool = AtomicBool::new(false);
+
+/// A [`Responsable`] over one readable and one writable descriptor.
+///
+/// The two directions are separate fields and not a pair, because that is what they
+/// are: a frame going out has nothing to do with the one coming in beyond the framing
+/// they share.
+///
+/// Trait objects rather than type parameters. Which descriptors these are is not
+/// something this end answers differently, so a pair of parameters would only put the
+/// answer in every signature that mentions one.
+///
+/// No state beyond the two descriptors. There is no session here to keep.
+pub struct StdioResponder {
+    /// Where requests come from.
+    ///
+    /// Buffered here, once. Nothing hands this to a command — it is the protocol's for
+    /// the life of the session — so reading ahead cannot take a byte that was somebody
+    /// else's.
+    incoming: BufReader<Box<dyn Read + Send>>,
+
+    /// Where responses go.
+    outgoing: Box<dyn Write + Send>,
+}
+
+impl StdioResponder {
+    /// Take the two descriptors, whatever they are — this process's stdin and stdout, a
+    /// virtio port out of a guest, a `Cursor` and a `Vec` for a test.
+    pub fn new(
+        incoming: impl Read + Send + 'static,
+        outgoing: impl Write + Send + 'static,
+    ) -> Self {
+        StdioResponder {
+            incoming: BufReader::new(Box::new(incoming)),
+            outgoing: Box::new(outgoing),
+        }
+    }
+
+    /// Take stdin and stdout for the protocol, for the life of the process.
+    ///
+    /// From here on **stdout carries frames and nothing else**. That is a rule rather
+    /// than something checked — see [`read()`] and [`write()`] for why it cannot be — so
+    /// diagnostics go to stderr.
+    ///
+    /// The handles rather than their locks, because a lock guard is not [`Send`]. Both
+    /// are buffered already, which is fine now that neither descriptor is ever handed
+    /// to a command.
+    ///
+    /// Fails if called twice: there is one stdin and one stdout, so a second of these
+    /// would be a second owner of both and the two would interleave frames.
+    pub fn stdio() -> anyhow::Result<Self> {
+        if TAKEN.swap(true, Ordering::SeqCst) {
+            anyhow::bail!("stdin and stdout are already the protocol's — there is one of each");
+        }
+        Ok(StdioResponder::new(io::stdin(), io::stdout()))
+    }
+}
+
+impl Responsable for StdioResponder {
+    fn recv(&mut self) -> io::Result<Option<Message>> {
+        read(&mut self.incoming)
+    }
+
+    fn respond(&mut self, id: RequestId, outcome: Outcome) -> io::Result<()> {
+        write(&mut self.outgoing, &Message::Response { id, outcome })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use crate::console::{Call, Error, Exec, Notification, Start};
+
+    /// Everything this end wrote, readable after it has been dropped or not — a `Vec`
+    /// cannot be, once the server owns it.
+    #[derive(Clone, Default)]
+    struct Sent(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sent {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn framed(messages: &[Message]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for message in messages {
+            write(&mut bytes, message).unwrap();
+        }
+        bytes
+    }
+
+    fn request(id: RequestId, call: Call) -> Message {
+        Message::Request { id, call }
+    }
+
+    /// Everything arrives, in order, and nothing is read into: a notification and a
+    /// response are handed over exactly as they came, for a caller to make of what it
+    /// will.
+    #[test]
+    fn every_message_arrives_as_it_was_sent() {
+        let sent = vec![
+            request(0, Call::Start(Start::default())),
+            request(
+                1,
+                Call::Exec(Exec {
+                    cmd: vec!["echo".into(), "hi".into()],
+                    ..Exec::default()
+                }),
+            ),
+            request(2, Call::Stop),
+            // Not a request, and this end has no opinion about that.
+            Message::Response {
+                id: 99,
+                outcome: Outcome::Result(serde_json::Value::Null),
+            },
+            Message::Notification(Notification::Quit),
+        ];
+
+        let mut server = StdioResponder::new(Cursor::new(framed(&sent)), Sent::default());
+        for message in &sent {
+            assert_eq!(server.recv().unwrap().as_ref(), Some(message));
+        }
+        // And the end of the channel is a clean end, not an error.
+        assert!(server.recv().unwrap().is_none());
+    }
+
+    /// A response goes out framed, carrying the id it was given and nothing else.
+    #[test]
+    fn a_response_carries_the_id_it_was_given() {
+        let sent = Sent::default();
+        let mut server = StdioResponder::new(io::empty(), sent.clone());
+
+        server
+            .respond(7, Outcome::Result(serde_json::Value::Null))
+            .unwrap();
+        server
+            .respond(9, Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")))
+            .unwrap();
+
+        let bytes = sent.0.lock().unwrap().clone();
+        let mut reader = bytes.as_slice();
+        let mut written = Vec::new();
+        while let Some(message) = read(&mut reader).unwrap() {
+            written.push(message);
+        }
+
+        assert_eq!(
+            written,
+            [
+                Message::Response {
+                    id: 7,
+                    outcome: Outcome::Result(serde_json::Value::Null),
+                },
+                Message::Response {
+                    id: 9,
+                    outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")),
+                },
+            ]
+        );
+    }
+
+    /// A frame that is not a message cannot be resynchronised past, so it is an error
+    /// rather than an ending.
+    #[test]
+    fn a_malformed_frame_is_an_error_and_not_an_end() {
+        let payload = br#"{"jsonrpc":"2.0","method":"nonsense"}"#;
+        let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(payload);
+
+        let mut server = StdioResponder::new(Cursor::new(bytes), Sent::default());
+        let error = server.recv().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+}

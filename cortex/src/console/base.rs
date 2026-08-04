@@ -1,0 +1,135 @@
+//! What the two ends of a console can *do* on a channel, apart from whatever carries
+//! them.
+//!
+//! One end asks and the other answers, so the two are named for that and nothing more:
+//! a [`Requestable`] issues calls and takes the answers back, a [`Responsable`] takes
+//! what arrives and puts an answer out. Both are about moving messages. Neither decides
+//! what a message *means* — where a command runs, what a session allows, when something
+//! has booted: none of that is here, and a transport is the last place it should be.
+//!
+//! What is here is only what would otherwise be written once per transport: `start`,
+//! `exec`, `stop` and `quit` follow from `call` and `notify`, so they follow once.
+//!
+//! [`stdio`](crate::console::stdio) is the transport there is — framed JSON-RPC
+//! over a pipe. A micro-VM's virtio port would be another, and nothing here would
+//! change.
+
+use std::io;
+
+use crate::console::{
+    Call, Error, Exec, ExecResult, Message, Notification, Outcome, RequestId, Start,
+};
+
+/// Why a call produced no result.
+///
+/// The distinction is the useful part. A refusal came from the server and is about
+/// the call — retry it with more time, or report it. A broken channel is about the
+/// session, and every later call will fail the same way.
+#[derive(Debug)]
+pub enum Failure {
+    /// The server answered `error`. Branch on [`code`](Error::code) —
+    /// [`TIMED_OUT`](Error::TIMED_OUT) is worth another try with more time, the rest
+    /// are not.
+    Refused(Error),
+
+    /// The channel or the server process failed, so there is no answer and will not
+    /// be one.
+    Broken(anyhow::Error),
+}
+
+impl Failure {
+    /// The protocol code, for a refusal. `None` for a broken channel, which is not
+    /// something the server said.
+    pub fn code(&self) -> Option<i64> {
+        match self {
+            Failure::Refused(error) => Some(error.code),
+            Failure::Broken(_) => None,
+        }
+    }
+
+    pub(crate) fn broken(what: impl Into<String>) -> Failure {
+        Failure::Broken(anyhow::Error::msg(what.into()))
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Failure::Refused(error) => write!(f, "the console server refused: {error}"),
+            Failure::Broken(e) => write!(f, "the console channel broke: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Failure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Failure::Refused(error) => Some(error),
+            Failure::Broken(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl From<Error> for Failure {
+    fn from(error: Error) -> Failure {
+        Failure::Refused(error)
+    }
+}
+
+/// The asking end of a channel: issue a call, get its answer back.
+///
+/// Two things are a transport's: putting a call on the wire and coming back with the
+/// response that answers *that* call, and putting a notification on the wire. The
+/// four methods below are neither, so they are written once here — which is also the
+/// one place an untyped [`Outcome`] becomes what its method returns.
+pub trait Requestable {
+    /// Make one call and wait for its response.
+    ///
+    /// Allocating the id and pairing it with what comes back is the transport's,
+    /// because so is anything else that may arrive while it waits.
+    fn call(&mut self, call: Call) -> Result<Outcome, Failure>;
+
+    /// Send something nothing answers, so there is nothing to wait for.
+    fn notify(&mut self, notification: Notification) -> Result<(), Failure>;
+
+    /// Boot the server, and make the delegated names runnable inside it.
+    ///
+    /// Returning is the readiness signal: booting is not free, and this is where it
+    /// is paid for rather than inside the first command.
+    fn start(&mut self, start: Start) -> Result<(), Failure> {
+        self.call(Call::Start(start))?.take().map_err(Failure::from)
+    }
+
+    /// Run one command, and return everything it produced.
+    ///
+    /// A command that merely failed is an `Ok` with a non-zero
+    /// [`code`](ExecResult::code); a [`Refused`](Failure::Refused) is the execution
+    /// having no result at all.
+    fn exec(&mut self, exec: Exec) -> Result<ExecResult, Failure> {
+        self.call(Call::Exec(exec))?.take().map_err(Failure::from)
+    }
+
+    /// Release what [`start`](Self::start) booted. Another `start` is allowed after
+    /// it.
+    fn stop(&mut self) -> Result<(), Failure> {
+        self.call(Call::Stop)?.take().map_err(Failure::from)
+    }
+
+    /// Say the session is over.
+    fn quit(&mut self) -> Result<(), Failure> {
+        self.notify(Notification::Quit)
+    }
+}
+
+/// The answering end of a channel: take what arrived, put an answer out.
+///
+/// Both halves of that are a transport's, and there is nothing else. What a message
+/// means, where a command runs, what a session allows when — none of it is here. This
+/// trait moves frames and holds no state.
+pub trait Responsable {
+    /// The next message. `Ok(None)` is the other end closing the channel cleanly.
+    fn recv(&mut self) -> io::Result<Option<Message>>;
+
+    /// Put out one response, with the id of the request it answers.
+    fn respond(&mut self, id: RequestId, outcome: Outcome) -> io::Result<()>;
+}

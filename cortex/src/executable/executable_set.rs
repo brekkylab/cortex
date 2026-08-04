@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::executable::{ExecResult, Executable};
+use crate::executable::{ExecCall, ExecResult, Executable};
 
 /// A named set of [`Executable`]s — the allowlist one console server offers.
 ///
@@ -33,13 +33,14 @@ impl ExecutableSet {
         self.execs.keys().map(String::as_str)
     }
 
-    /// Run the named executable, or `None` if nothing is registered under it.
+    /// Run the executable `call` names, or `None` if nothing is registered under
+    /// it.
     ///
     /// `None` is the allowlist boundary. A server that only ever exposes the
     /// names in this set should not reach it — but the name usually arrives
     /// from outside the process, so it is input, not a guarantee.
-    pub fn invoke(&self, name: &str, args: Vec<String>) -> Option<ExecResult> {
-        let exec = self.execs.get(name)?;
-        Some(exec.exec(name.to_string(), args))
+    pub fn invoke(&self, call: &ExecCall) -> Option<ExecResult> {
+        let exec = self.execs.get(&call.name)?;
+        Some(exec.exec(call))
     }
 }

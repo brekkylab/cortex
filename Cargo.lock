@@ -139,19 +139,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-local-console-server"
+name = "cortex-local-console"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "cortex",
  "libc",
- "serde",
  "serde_json",
+ "tempfile",
 ]
-
-[[package]]
-name = "cortex-uvm-console-server"
-version = "0.1.0"
 
 [[package]]
 name = "crc32fast"

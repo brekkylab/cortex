@@ -1,12 +1,14 @@
 [package]
-name = "cortex-local-console-server"
+name = "cortex-local-console"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-cortex = { workspace = true, features = ["console_server"] }
+cortex = { workspace = true }
+serde_json = { workspace = true }
 # `kill(pid, 0)`, to tell an abandoned scratch directory from a live one.
 libc = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

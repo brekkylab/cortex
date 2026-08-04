@@ -2,7 +2,7 @@
 resolver = "3"
 members = [
     "cortex",
-    "cortex-local-console-server",
+    "cortex-local-console",
     "cortex-uvm-console-server",
 ]
 

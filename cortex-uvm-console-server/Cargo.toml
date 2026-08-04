@@ -1,4 +1,0 @@
-[package]
-name = "cortex-uvm-console-server"
-version.workspace = true
-edition.workspace = true
