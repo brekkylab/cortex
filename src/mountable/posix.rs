@@ -23,7 +23,7 @@
 // wholesale, and coverage is what keeps it honest.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -497,7 +497,17 @@ pub(super) struct InodeTable {
 
     /// The next number to hand out.
     next: u64,
+
+    /// Numbers [`number_for`](Self::number_for) minted, oldest first, so the
+    /// ones nothing ever claimed can be recycled.
+    provisional: VecDeque<u64>,
 }
+
+/// How many advertised-but-unclaimed numbers to keep before recycling the
+/// oldest. At roughly 200 bytes an entry this caps them near 13 MB, which holds
+/// a full walk of most single repositories — inside it, the number `readdir`
+/// advertised is still the one a later `lookup` returns.
+const MAX_PROVISIONAL_INODES: usize = 64 * 1024;
 
 impl InodeTable {
     fn new() -> Self {
@@ -516,6 +526,7 @@ impl InodeTable {
             fwd,
             rev,
             next: ROOT_INODE + 1,
+            provisional: VecDeque::new(),
         }
     }
 
@@ -642,13 +653,15 @@ impl InodeTable {
     /// later `lookup` returns, yet readdir (unlike lookup) must not bump the
     /// reference count.
     ///
-    /// **Known leak, and it is unbounded.** Entries created here start at
-    /// `lookup_count == 0`, and the kernel never sends `forget` for an inode it
-    /// did not itself look up — so a browsed-but-never-opened name is never
-    /// reclaimed. One `ls` of a large directory strands an entry per child.
-    /// Reusing numbers is *not* the fix (that would make the `generation: 0` in
-    /// each binding a correctness bug); pruning provisional entries or capping
-    /// them is.
+    /// Entries start at `lookup_count == 0`, and the kernel never sends
+    /// `forget` for an inode it did not look up, so nothing else would ever
+    /// reclaim them — one `ls` of a large directory would strand an entry per
+    /// child. Hence the queue: past [`MAX_PROVISIONAL_INODES`] the oldest
+    /// unclaimed number is recycled.
+    ///
+    /// A recycled number means a later `lookup` of that path answers with a
+    /// different one than `readdir` advertised. Numbers themselves are still
+    /// never reused, which is what lets each binding report `generation: 0`.
     pub(super) fn number_for(&mut self, path: PathBuf) -> u64 {
         if let Some(&inode) = self.rev.get(&path) {
             return inode;
@@ -663,6 +676,13 @@ impl InodeTable {
             },
         );
         self.rev.insert(path, inode);
+        // One in, at most one out, so the queue never passes the cap.
+        self.provisional.push_back(inode);
+        if self.provisional.len() > MAX_PROVISIONAL_INODES
+            && let Some(oldest) = self.provisional.pop_front()
+        {
+            self.reclaim_if_unreferenced(oldest);
+        }
         inode
     }
 
@@ -675,13 +695,28 @@ impl InodeTable {
         if inode == ROOT_INODE {
             return;
         }
-        if let Some(data) = self.fwd.get_mut(&inode) {
-            data.lookup_count = data.lookup_count.saturating_sub(count);
-            if data.lookup_count == 0 {
-                let path = data.path.clone();
-                self.fwd.remove(&inode);
-                self.rev.remove(&path);
-            }
+        let Some(data) = self.fwd.get_mut(&inode) else {
+            return;
+        };
+        data.lookup_count = data.lookup_count.saturating_sub(count);
+        self.reclaim_if_unreferenced(inode);
+    }
+
+    /// Drop `inode` from both maps, if nothing holds it.
+    fn reclaim_if_unreferenced(&mut self, inode: u64) {
+        let Some(data) = self.fwd.get(&inode) else {
+            return;
+        };
+        if data.lookup_count != 0 {
+            return;
+        }
+        let path = data.path.clone();
+        self.fwd.remove(&inode);
+        // `evict_path` drops the name and keeps the entry, so a second inode may
+        // hold this path by now. Taking its name would leave it live and
+        // unreachable, and the next lookup would mint a third.
+        if self.rev.get(&path) == Some(&inode) {
+            self.rev.remove(&path);
         }
     }
 }

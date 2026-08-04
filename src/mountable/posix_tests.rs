@@ -706,3 +706,19 @@ fn inode_references_are_counted_and_the_root_is_spared() {
     fs.forget_inode(ROOT_INODE, 1_000);
     assert!(fs.stat_inode(ROOT_INODE).is_ok());
 }
+
+/// `evict_path` keeps the forward entry, so one path can have two of them: the
+/// unlinked-but-open inode and the one created in its place. A `forget` arriving
+/// for the first must not take the second's name with it.
+#[test]
+fn forgetting_an_unlinked_inode_leaves_a_re_interned_path_mapped() {
+    let mut t = InodeTable::new();
+    let unlinked = t.intern(PathBuf::from("/a"));
+    t.evict_path(Path::new("/a"));
+    let replacement = t.intern(PathBuf::from("/a"));
+
+    t.forget(unlinked, 1);
+
+    assert_eq!(t.path_of(replacement).as_deref(), Some(Path::new("/a")));
+    assert_eq!(t.number_for(PathBuf::from("/a")), replacement);
+}
