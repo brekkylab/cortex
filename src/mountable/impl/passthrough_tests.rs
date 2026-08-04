@@ -189,3 +189,78 @@ fn the_volume_refuses_what_it_cannot_serve() {
         Err(CortexError::NotFound)
     ));
 }
+
+#[cfg(unix)]
+fn link(target: impl AsRef<Path>, at: impl AsRef<Path>) {
+    std::os::unix::fs::symlink(target.as_ref(), at.as_ref()).unwrap();
+}
+
+/// The containment property, by every route a link offers out of the root.
+#[test]
+#[cfg(unix)]
+fn a_link_cannot_take_a_request_out_of_the_root() {
+    let base = scratch("passthrough", "escape");
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), b"OUT").unwrap();
+    fs::write(root.join("real.txt"), b"IN").unwrap();
+
+    link(outside.join("secret.txt"), root.join("onleaf"));
+    link(&outside, root.join("inmiddle"));
+    // Dangling: `exists()` follows the link and so answers false, which is how
+    // a parent-only check lets a creating `open` write on the far side.
+    link(outside.join("new.txt"), root.join("dangling"));
+
+    let vol = PassthroughVolume::new(&root);
+    for escaping in ["onleaf", "inmiddle/secret.txt", "dangling"] {
+        assert!(
+            matches!(vol.stat(Path::new(escaping)), Err(CortexError::NotFound)),
+            "{escaping} escaped"
+        );
+        assert!(matches!(
+            vol.open(Path::new(escaping), OpenOptions::create_new()),
+            Err(CortexError::NotFound)
+        ));
+    }
+    assert!(!outside.join("new.txt").exists(), "a create wrote outside");
+
+    // Omission and the error have to tell one story, or a caller holding the
+    // name from a stale cache hears something the listing contradicts.
+    assert_eq!(names(&vol, ""), vec!["real.txt"]);
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A link that stays inside is followed, so what `stat` and `list` report is
+/// what `open` will hand back.
+#[test]
+#[cfg(unix)]
+fn a_link_inside_the_root_is_followed() {
+    let base = scratch("passthrough", "inlink");
+    fs::create_dir_all(base.join("sub")).unwrap();
+    fs::write(base.join("sub/inner.txt"), b"INNER").unwrap();
+    link("sub/inner.txt", base.join("tofile"));
+    link("sub", base.join("todir"));
+    let vol = PassthroughVolume::new(&base);
+
+    // An `lstat` answers 13 — the link string's own length — and a kernel that
+    // believes it truncates every read of the file to it, reporting success.
+    assert_eq!(vol.stat(Path::new("tofile")).unwrap().size, 5);
+    let (handle, opened) = vol
+        .open(Path::new("tofile"), OpenOptions::read_only())
+        .unwrap();
+    assert_eq!(opened.size, 5);
+    let mut buf = vec![0u8; 5];
+    handle.read_exact_at(&mut buf, 0).unwrap();
+    assert_eq!(&buf, b"INNER");
+
+    // `d_type` answers DT_LNK and never DT_DIR, so a listing's kind has to come
+    // from the target or a caller is handed a file it cannot descend into.
+    let entries = vol.list(Path::new("")).unwrap();
+    let listed = entries.iter().find(|e| e.name == "todir").unwrap();
+    assert_eq!(listed.kind, DirentKind::Dir);
+    assert_eq!(names(&vol, "todir"), vec!["inner.txt"]);
+
+    fs::remove_dir_all(&base).unwrap();
+}
