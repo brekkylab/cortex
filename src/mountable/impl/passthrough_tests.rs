@@ -264,3 +264,27 @@ fn a_link_inside_the_root_is_followed() {
 
     fs::remove_dir_all(&base).unwrap();
 }
+
+#[test]
+fn list_comes_back_in_a_stable_order() {
+    let base = scratch("passthrough", "order");
+    let vol = PassthroughVolume::new(&base);
+    for name in [
+        "zebra", "yak", "xray", "walrus", "viper", "umbrella", "tiger", "snake",
+    ] {
+        fs::write(base.join(name), b"x").unwrap();
+    }
+
+    // Not through `names`, which sorts before comparing — that is why every
+    // other test here is blind to order.
+    let entries = vol.list(Path::new("")).unwrap();
+    let listed: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(
+        listed,
+        [
+            "snake", "tiger", "umbrella", "viper", "walrus", "xray", "yak", "zebra"
+        ]
+    );
+
+    fs::remove_dir_all(&base).unwrap();
+}

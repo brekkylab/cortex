@@ -161,6 +161,10 @@ impl Mountable for PassthroughVolume {
             };
             out.push(Dirent::new(name, kind));
         }
+        // `read_dir` gives the directory's own order — a hash order on APFS and
+        // ext4 — and a `readdir` resumes by position, so it has to be the same
+        // on the next call.
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
 
