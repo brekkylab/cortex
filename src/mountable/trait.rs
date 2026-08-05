@@ -80,10 +80,6 @@ impl Dirent {
 pub struct OpenOptions {
     pub read: bool,
     pub write: bool,
-    /// Writes land at the end regardless of the offset given. Mostly inert under
-    /// FUSE (the kernel resolves `O_APPEND` and sends absolute offsets), but a
-    /// library caller means it, so a handle must honour rather than ignore it.
-    pub append: bool,
     pub truncate: bool,
     /// Create the file if it is absent. The parent directory is never created.
     pub create: bool,
@@ -148,13 +144,6 @@ impl OpenOptions {
         OpenOptions { write: yes, ..self }
     }
 
-    pub fn append(self, yes: bool) -> Self {
-        OpenOptions {
-            append: yes,
-            ..self
-        }
-    }
-
     pub fn truncate(self, yes: bool) -> Self {
         OpenOptions {
             truncate: yes,
@@ -172,7 +161,7 @@ impl OpenOptions {
     /// What a read-only backend refuses on. `create` counts: it writes no bytes
     /// to the file, but modifies its parent.
     pub fn intends_write(&self) -> bool {
-        self.write || self.append || self.truncate || self.create || self.create_new
+        self.write || self.truncate || self.create || self.create_new
     }
 
     /// Reject the one self-contradictory combination, so each backend spends a

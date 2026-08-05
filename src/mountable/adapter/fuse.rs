@@ -38,7 +38,6 @@ use crate::{CortexError, DirentKind, Result, SetAttr, Stat};
 /// Host numbering, where the krun binding's is Linux's — `O_TRUNC` is not the
 /// same number on the two.
 const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
-    append: libc::O_APPEND,
     truncate: libc::O_TRUNC,
     create: libc::O_CREAT,
     create_new: libc::O_EXCL,

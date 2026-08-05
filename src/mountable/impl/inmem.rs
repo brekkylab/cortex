@@ -409,7 +409,6 @@ impl Mountable for InMemVolume {
                 data,
                 read: options.read,
                 write: options.write,
-                append: options.append,
             },
             stat,
         ))
@@ -423,7 +422,6 @@ pub struct InMemHandle {
     data: FileData,
     read: bool,
     write: bool,
-    append: bool,
 }
 
 impl FileExt for InMemHandle {
@@ -447,16 +445,11 @@ impl FileExt for InMemHandle {
         if !self.write {
             return Err(io::Error::from_raw_os_error(EBADF));
         }
-        let mut body = lock(&self.data);
-        let offset = if self.append {
-            body.bytes.len() as u64
-        } else {
-            offset
-        };
         // Bound before allocating: `offset` is the guest's choice, and `resize`
         // would honour it literally.
         let end = checked_end(offset, buf.len())
             .map_err(|_| io::Error::from(io::ErrorKind::FileTooLarge))?;
+        let mut body = lock(&self.data);
         if end > body.bytes.len() {
             body.bytes.resize(end, 0);
         }

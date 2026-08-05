@@ -506,23 +506,6 @@ fn the_namespace_operations_classify_what_they_refuse() {
     ));
 }
 
-/// An `append` handle writes at the end whatever offset it is given, which is
-/// what `OpenOptions::append` promises and what the kernel does for
-/// `PassthroughVolume`.
-#[test]
-fn append_writes_land_at_the_end() {
-    let vol = InMemVolume::new();
-    let append = OpenOptions::read_write().append(true);
-    let (h, _) = vol.open(Path::new("log"), append.create(true)).unwrap();
-
-    h.write_all_at(b"AAA", 0).unwrap();
-    h.write_all_at(b"BBB", 0).unwrap();
-
-    let mut buf = [0u8; 6];
-    h.read_exact_at(&mut buf, 0).unwrap();
-    assert_eq!(&buf, b"AAABBB");
-}
-
 /// The access mode outlives the open, as it does for a file descriptor.
 #[test]
 fn a_handle_refuses_what_its_open_did_not_allow() {

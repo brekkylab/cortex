@@ -614,7 +614,6 @@ fn opening_for_writing_is_read_only() {
     let write_intents = [
         OpenOptions::read_write(),
         OpenOptions::create_new(),
-        OpenOptions::read_only().append(true),
         OpenOptions::read_only().truncate(true),
         OpenOptions::read_only().create(true),
     ];

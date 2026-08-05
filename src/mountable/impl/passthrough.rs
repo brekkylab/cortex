@@ -143,7 +143,6 @@ impl Mountable for PassthroughVolume {
         let file = fs::OpenOptions::new()
             .read(options.read)
             .write(options.write)
-            .append(options.append)
             .truncate(options.truncate)
             .create(options.create)
             .create_new(options.create_new)

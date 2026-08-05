@@ -30,11 +30,11 @@ fn an_entry_takes_its_kind_from_the_metadata_it_carries() {
 /// reached by narrowing.
 #[test]
 fn a_flag_lands_on_an_access_mode_without_disturbing_the_others() {
-    let appending = OpenOptions::write_only().append(true);
-    assert!(!appending.read && appending.write, "the mode survived");
-    assert!(appending.append);
+    let truncating = OpenOptions::write_only().truncate(true);
+    assert!(!truncating.read && truncating.write, "the mode survived");
+    assert!(truncating.truncate);
     assert!(
-        !appending.truncate && !appending.create && !appending.create_new,
+        !truncating.create && !truncating.create_new,
         "a setter answers for its own flag only"
     );
 
@@ -63,7 +63,6 @@ fn every_flag_but_read_means_modification() {
 
     for (flag, options) in [
         ("write", ro.write(true)),
-        ("append", ro.append(true)),
         ("truncate", ro.truncate(true)),
         ("create", ro.create(true)),
         ("create_new", OpenOptions::create_new()),

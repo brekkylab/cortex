@@ -40,7 +40,6 @@ use crate::{CortexError, Result, Stat};
 /// Open flags in the host's numbering, exactly as the `fuser` binding uses —
 /// this reply also goes to this host's kernel.
 const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
-    append: libc::O_APPEND,
     truncate: libc::O_TRUNC,
     create: libc::O_CREAT,
     create_new: libc::O_EXCL,

@@ -188,7 +188,6 @@ pub(super) fn unix_time(time: SystemTime) -> (i64, i64) {
 /// binding supplies its own — same split as the errno tables. The access mode is
 /// portable and decoded once below.
 pub(super) struct OpenFlagBits {
-    pub append: i32,
     pub truncate: i32,
     pub create: i32,
     pub create_new: i32,
@@ -213,7 +212,6 @@ pub(super) fn decode_open_flags(flags: i32, bits: &OpenFlagBits) -> Result<OpenO
     Ok(OpenOptions {
         read,
         write,
-        append: flags & bits.append != 0,
         truncate: flags & bits.truncate != 0,
         create: flags & bits.create != 0,
         create_new: flags & bits.create_new != 0,

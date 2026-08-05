@@ -42,7 +42,6 @@ const LINUX_ENOTEMPTY: i32 = 39;
 /// Linux-numbered for the same reason the errnos are. (`O_TRUNC` is `0o1000`
 /// here and `0o2000` on a macOS host.)
 const LINUX_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
-    append: 0o2000,
     truncate: 0o1000,
     create: 0o100,
     create_new: 0o200,
