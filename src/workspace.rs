@@ -472,10 +472,12 @@ impl Mountable for Workspace {
         self.guard_synthesized(&key, CortexError::IsADirectory)?;
         // Whether this open can mutate — decides if a write hook is armed. The
         // create-vs-modify split is by pre-existence at open, checked only when a
-        // hook is actually attached. (`create_new` implies `create` upstream, so
-        // the refusal below only checks `create`; the broader OR here is a
-        // harmless superset.)
-        let writing = options.write || options.create || options.create_new || options.truncate;
+        // hook is actually attached. Uses the same predicate as a read-only
+        // backend's refusal, so `append` (which grants OS-level write on a
+        // passthrough mount even without `write`) still arms the hook. The refusal
+        // below only checks `create` because `create_new` implies `create`
+        // upstream — a narrower question than "can this mutate".
+        let writing = options.intends_write();
         let pre_existed = if writing && self.hook.is_some() {
             match self.route(&key) {
                 Some((b, s)) => b.stat(&s).await.is_ok(),
@@ -627,12 +629,19 @@ impl FileHandle for HookedHandle {
     }
     async fn flush(&self) -> Result<()> {
         let r = self.inner.flush().await;
-        self.fire_once();
+        // Only a write that landed is a change to announce — firing on a failed
+        // flush would have a consumer index bytes the backend never persisted.
+        // Matches the `is_ok` gate on `unlink`/`rmdir`/`rename`.
+        if r.is_ok() {
+            self.fire_once();
+        }
         r
     }
     async fn commit(&self) -> Result<()> {
         let r = self.inner.commit().await;
-        self.fire_once();
+        if r.is_ok() {
+            self.fire_once();
+        }
         r
     }
 }
