@@ -68,7 +68,7 @@ The wire is **BSON**, for two reasons.
 A `result`'s type also depends on the method its `id` was issued for, so it is held as an untyped value until the pending request names it.
 
 **It has to have a byte type.**
-`stdin` and a command's output are most of what this channel carries and none of it is text.
+A command's output is most of what this channel carries and none of it is text.
 JSON has no way to say so, which meant base64 at 1.37× — decoded again at the far end — or `[104,105,10]` at 4×.
 BSON has `Binary`, so they travel as themselves.
 
@@ -90,7 +90,7 @@ BSON won on two things neither has: its documents are **self-delimiting**, which
 
 ## JSON-RPC 2.0
 
-The object model below is the spec's, member for member. Only the encoding is not — every example is written as Extended JSON would show it, so that the members are legible; `stdin`, `stdout` and `stderr` are `Binary` and not the strings they appear as.
+The object model below is the spec's, member for member. Only the encoding is not — every example is written as Extended JSON would show it, so that the members are legible; `stdout` and `stderr` are `Binary` and not the strings they appear as.
 
 Three object shapes, told apart the way the spec tells them apart — by which members are present, not by a tag we invented.
 
@@ -139,7 +139,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 | method | `params` | `result` |
 |---|---|---|
 | `start` | `{delegated, default_timeout_ms?}` | `null` |
-| `exec` | `{cmd, stdin?, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
+| `exec` | `{cmd, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `resume` | `{result: ...}` or `{error: {...}}` | `{done: {...}}` or `{delegated: {...}}` |
 | `stop` | — | `null` |
 | `quit` | — | *(notification)* |
@@ -182,11 +182,11 @@ A backend that cannot come up answers `BOOT_FAILED`, which the old wire had no w
 ### `exec` — run this
 
 ```json
-{"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","cat && echo x"],"stdin":{"$binary":{"base64":"aGkK","subType":"00"}},"timeout_ms":5000}}
+{"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","echo hi"],"timeout_ms":5000}}
 {"jsonrpc":"2.0","id":2,"result":{"done":{"code":0,"stderr":{"$binary":{"base64":"","subType":"00"}},"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"truncated":false}}}
 ```
 
-Minimal form — no input, no timeout of its own:
+Minimal form — no timeout of its own:
 
 ```json
 {"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["ls"]}}
@@ -195,7 +195,6 @@ Minimal form — no input, no timeout of its own:
 | field | |
 |---|---|
 | `cmd` | already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`. |
-| `stdin` | **all** of the input, as `Binary`, sent up front. Omitted or empty means immediate EOF. |
 | `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. Falls back to `default_timeout_ms`. |
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
 | `stdout`/`stderr` | `Binary`, byte-exact, kept apart. |
@@ -233,7 +232,7 @@ The interleaving between them is not preserved: two buffers are not one stream, 
 A result travels in one frame under `MAX_PAYLOAD`, so an unbounded writer has to be cut off somewhere, and an agent reading output it does not know is partial will draw a conclusion from it.
 
 **Bytes, not text.**
-`stdin`, `stdout` and `stderr` cross as BSON `Binary`, subtype `Generic` — at 1.0×, and byte-exact whether or not the output was ever UTF-8, which routinely it was not.
+`stdout` and `stderr` cross as BSON `Binary`, subtype `Generic` — at 1.0×, and byte-exact whether or not the output was ever UTF-8, which routinely it was not.
 Getting this is the second half of [why the codec is BSON](#codec): JSON had no byte type, so the same payloads had to be base64 (1.37×) to avoid being `[104,105,10]` (4×).
 
 The `bytes` helper no longer asks the codec whether it is human-readable, and that is deliberate rather than a simplification.
@@ -360,7 +359,7 @@ Every request still gets exactly one response.
 The shim's dial is the only arrow that is not this protocol: it is server-local, and the server is what turns it into the `delegated` above it.
 
 And note what the delegated call carries: an ordinary `exec`'s `params`, verbatim.
-An execution request is an execution request no matter who is asking whom — a command, some input, output, a code at the end — so there is one shape and one codec in the system rather than two.
+An execution request is an execution request no matter who is asking whom — a command, output, a code at the end — so there is one shape and one codec in the system rather than two.
 
 ### Consequences
 
@@ -368,7 +367,7 @@ An execution request is an execution request no matter who is asking whom — a 
 A response can carry one `delegated`, so a command that starts several delegated executables together (`foo & bar`, `make -j8`) has them run in turn.
 The outer execution's `timeout_ms` has to cover the sum.
 
-That is latency and not a deadlock, and **only because delegated calls are independent of each other**: one carries no `stdin` — a shim sends none and an `ExecCall` has nowhere to put any — so no delegated call is waiting on another being served first.
+That is latency and not a deadlock, and **only because delegated calls are independent of each other**: nothing an `exec` carries is input, so no delegated call is waiting on another being served first.
 `foo | bar` where both are delegated works because `bar` never reads what `foo` wrote.
 
 > **This is the line of reasoning to change first.**
@@ -470,7 +469,7 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | not possible | why not |
 |---|---|
 | watch a command work | an agent cannot use a partial answer, so early output arrives to nobody. Streaming would cost a second shape for every ending and a second code path in every consumer — and JSON-RPC has no spelling for it: a request has one response. |
-| drive an interactive command | its prompt would arrive after the answer was due. Input therefore goes with the request, which is the same trade in the other direction. |
+| drive an interactive command | its prompt would arrive after the answer was due. An `exec` carries no input at all, which is the same trade in the other direction. |
 | run something that never ends | `tail -f` has no result to send. `timeout_ms` is what ends it; without one, such an execution simply never answers. |
 | say where to run something | a host path means nothing inside a guest. Needs a workspace volume mount first. |
 | cancel one execution | `stop` releases the whole session, not a command. Let the timeout expire. |

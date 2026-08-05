@@ -292,7 +292,6 @@ mod tests {
             // A multi-line `sh -c` script is one argument, and argv's last element
             // can be empty — both are ordinary argv.
             cmd: vec!["sh".into(), "-c".into(), "echo a\necho b".into(), "".into()],
-            stdin: vec![0xff, 0x00, b'\n'],
             timeout_ms: Some(1_000),
         }
     }
@@ -321,8 +320,8 @@ mod tests {
                 id: 1,
                 call: Call::Exec(exec()),
             },
-            // Not the execution's result: a name the server cannot run itself. No
-            // input, no timeout of its own.
+            // Not the execution's result: a name the server cannot run itself, and
+            // no timeout of its own.
             Message::Response {
                 id: 1,
                 outcome: Outcome::Result(

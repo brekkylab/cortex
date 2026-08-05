@@ -72,8 +72,8 @@
 //! on the method its `id` was issued for, so reading one means holding it as a value
 //! until the pending request identifies it, which is what [`Outcome`] is.
 //!
-//! **A byte type.** [`stdin`](Exec::stdin) and an [`ExecResult`]'s output are the bulk
-//! of what this channel carries and they are not text. JSON has no way to say so, which
+//! **A byte type.** An [`ExecResult`]'s output is the bulk of what this channel
+//! carries and it is not text. JSON has no way to say so, which
 //! left base64 — 1.37×, and a spelling that has to be decoded before it is bytes again.
 //! BSON has `Binary`, so they travel as themselves.
 //!
@@ -130,8 +130,8 @@
 //! client runs the name and says so with `resume`, whose answer is the next `Progress`.
 //!
 //! So one channel, one end that asks, one end that answers — and one [`Exec`] type, since
-//! a delegated call is the same shape as any other execution request: a command, some
-//! input, output, a code at the end. One codec for the whole system, and a delegated call
+//! a delegated call is the same shape as any other execution request: a command,
+//! output, a code at the end. One codec for the whole system, and a delegated call
 //! that is not a wire of its own to be translated into this one.
 //!
 //! What it costs is that delegated calls are served one at a time; [`Progress`] has that,
@@ -154,10 +154,9 @@
 //!
 //! Two things follow, and both are consequences rather than accidents:
 //!
-//! - **Input goes with the request.** [`Exec::stdin`] is the whole of it, sent up
-//!   front. An exchange — read the prompt, then answer it — is not expressible,
-//!   which is the same trade in the other direction and would be incoherent to
-//!   make differently.
+//! - **There is no input.** An exchange — read the prompt, then answer it — is not
+//!   expressible, which is the same trade in the other direction and would be
+//!   incoherent to make differently. An [`Exec`] carries none at all.
 //! - **A command that never ends produces nothing.** `tail -f` has no result to
 //!   send, so [`timeout_ms`](Exec::timeout_ms) is what ends it. Without a timeout
 //!   such an execution simply never answers, which is why one is worth setting.
@@ -167,8 +166,8 @@
 //!
 //! # What is not text
 //!
-//! [`stdin`](Exec::stdin) and the output on an [`ExecResult`] are raw `Vec<u8>`,
-//! because they are program bytes and nothing may touch them. A command's name and
+//! The output on an [`ExecResult`] is raw `Vec<u8>`, because those are program bytes
+//! and nothing may touch them. A command's name and
 //! arguments are required to be UTF-8: they have to become the `String`s an
 //! [`Executable`](crate::executable::Executable) takes, so a name that could not be
 //! one would have nowhere to go.

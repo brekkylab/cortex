@@ -166,7 +166,7 @@ fn bad(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::{Call, Exec, Notification, Outcome, Start};
+    use crate::console::{Call, Exec, ExecResult, Notification, Outcome, Progress, Start};
 
     fn messages() -> Vec<Message> {
         vec![
@@ -185,11 +185,20 @@ mod tests {
                 id: 2,
                 call: Call::Exec(Exec {
                     cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
-                    // Not utf-8, and contains the byte a newline-delimited
-                    // framing would have had to escape.
-                    stdin: vec![0xff, 0x00, b'\n'],
                     timeout_ms: None,
                 }),
+            },
+            Message::Response {
+                id: 2,
+                outcome: Outcome::Result(
+                    bson::serialize_to_bson(&Progress::Done(ExecResult {
+                        // Not utf-8, and contains the byte a newline-delimited
+                        // framing would have had to escape.
+                        stdout: vec![0xff, 0x00, b'\n'],
+                        ..ExecResult::default()
+                    }))
+                    .unwrap(),
+                ),
             },
             Message::Notification(Notification::Quit),
         ]
@@ -244,16 +253,18 @@ mod tests {
     }
 
     /// A payload byte is never mistaken for structure — the whole reason not to
-    /// delimit. Every byte value goes through a `stdin` payload untouched.
+    /// delimit. Every byte value goes through an output payload untouched.
     #[test]
     fn no_payload_byte_is_special() {
-        let message = Message::Request {
+        let message = Message::Response {
             id: 2,
-            call: Call::Exec(Exec {
-                cmd: vec!["cat".into()],
-                stdin: (0..=255u8).collect(),
-                ..Exec::default()
-            }),
+            outcome: Outcome::Result(
+                bson::serialize_to_bson(&Progress::Done(ExecResult {
+                    stdout: (0..=255u8).collect(),
+                    ..ExecResult::default()
+                }))
+                .unwrap(),
+            ),
         };
         let mut buf = Vec::new();
         write(&mut buf, &message).unwrap();

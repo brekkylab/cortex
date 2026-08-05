@@ -95,31 +95,13 @@ pub struct Start {
 /// names that arrived in [`Start`].
 ///
 /// One type for both because an execution request is an execution request no matter
-/// who is asking whom: a command, some input, output, a code at the end.
+/// who is asking whom: a command, output, a code at the end.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Exec {
     /// Already split into argv. Nothing here consults a shell, so quoting and word
     /// rules stay wherever the command was composed; a caller that wants shell
     /// semantics asks for them outright — `["sh", "-c", "..."]`.
     pub cmd: Vec<String>,
-
-    // There is no working directory, so an execution runs wherever the executor
-    // runs things and a relative path in `cmd` is resolved there. Sending one
-    // would be a host path, which means nothing inside a micro-VM guest, so
-    // saying where to run something only becomes expressible once both ends
-    // agree on what a path is — which is what a workspace volume mount is for,
-    // and where it belongs.
-    /// Everything the command will read on its standard input, all of it, now.
-    ///
-    /// Here rather than in messages of its own because output is not streamed
-    /// either: a command whose input depends on its output cannot be driven across
-    /// this wire whichever way the input arrives, so the simpler shape is the
-    /// honest one.
-    ///
-    /// Empty means immediate EOF, which is also what a command that reads nothing
-    /// wants. There is no distinction between no input and no bytes of input.
-    #[serde(default, with = "bytes", skip_serializing_if = "Vec::is_empty")]
-    pub stdin: Vec<u8>,
 
     /// How long this may run before the executor kills it, in milliseconds. `None`
     /// falls back to [`Start::default_timeout_ms`], and if that is `None` too
@@ -195,11 +177,10 @@ impl<S: AsRef<str>> From<Vec<S>> for Exec {
 /// of the outer execution has to cover the sum.
 ///
 /// That is latency and not a deadlock, and only because delegated calls are
-/// independent of each other: one carries no [`stdin`](Exec::stdin) — a shim sends
-/// none and an [`ExecCall`](crate::executable::ExecCall) has nowhere to put any — so
-/// no delegated call is waiting on another being served first. **If input ever reaches
-/// a delegated call, serving them in turn stops being safe** and this is the line of
-/// reasoning that has to change.
+/// independent of each other: nothing an [`Exec`] carries is input, so no delegated
+/// call is waiting on another being served first. **If input ever reaches a delegated
+/// call, serving them in turn stops being safe** and this is the line of reasoning
+/// that has to change.
 ///
 /// A client with no delegated names never sees anything but `Done`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,13 +392,12 @@ mod tests {
         assert_eq!((read.stdout, read.stderr), (bytes.clone(), bytes));
     }
 
-    /// Empty output is absent rather than an empty `Binary`, which is what
-    /// `skip_serializing_if` on [`Exec::stdin`] buys — and it reads back as empty.
+    /// An unset timeout is absent rather than null, which is what
+    /// `skip_serializing_if` buys — and it reads back unset.
     #[test]
-    fn no_input_is_no_member() {
+    fn no_timeout_is_no_member() {
         let value = bson::serialize_to_bson(&Exec::from(["ls"])).unwrap();
         let doc = value.as_document().unwrap();
-        assert_eq!(doc.get("stdin"), None);
         assert_eq!(doc.get("timeout_ms"), None);
 
         let read: Exec = bson::deserialize_from_bson(value).unwrap();
