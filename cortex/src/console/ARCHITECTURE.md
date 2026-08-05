@@ -1,8 +1,7 @@
 # Headless Console Protocol
 
 How a client drives a console server, and how something inside that server calls back out to the client.
-
-*Headless* because there is first-intended to bot(e.g. AI agent) usage, rather than human.
+It's *headless* because there is first-intended to bot(e.g. AI agent) usage, rather than human.
 
 Two things make it more than a remote `exec`:
 
@@ -414,10 +413,11 @@ A failed `start` leaves `Idle`, so nothing thinks it is up.
 It is the client's turn and **only** a `resume` belongs there: the execution owes an answer that has not been sent, so a client asking about anything else is asking about a request it has not been answered on.
 There is at most one `Paused` execution, which is why a `resume` needs nothing to say *which* delegated call it answers.
 
-> **Barely enforced on the answering side today.**
+> **Barely enforced today, and only ever the answering side's to enforce.**
 > An answering end moves frames and reads no meaning into them, and the shared server layer that held these rules is gone.
 > A backend refuses a `resume` that nothing is waiting on, because it is the only end that knows — but `NOT_STARTED` and a second `start` are not checked, and a delegated name is linked unchecked.
-> `Console` keeps the started flag on the *asking* side, so an `exec` before `start` never reaches the channel — but that is one client being well-behaved, not the protocol being upheld.
+> The asking side keeps no second copy of any of it: `Console` sends what it is asked to send, so an `exec` before `start` reaches the channel and gets whatever that server answers.
+> Which is why the gaps above are visible rather than hidden behind one well-behaved client.
 >
 > Where they belong when they come back: not in each backend, because every backend's version would be the same and would be the same to get wrong.
 > A backend should implement only the things that differ — making a name runnable, running a command while letting a delegated call through, releasing what booting took — and never see a broken session.

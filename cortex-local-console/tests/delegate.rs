@@ -11,7 +11,8 @@
 
 use std::process::{Command, Stdio};
 
-use cortex::console::{Console, Exec, ExecResult};
+use cortex::console::stdio::StdioClient;
+use cortex::console::{Console, ExecResult};
 use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
 
 /// An executable with a canned answer — enough to tell a round trip from a coincidence.
@@ -79,13 +80,16 @@ impl Fixture {
             )
             .register("report", Report);
 
-        // Only its stderr is ours to place — the client sets the two descriptors the
-        // protocol runs on, and starts the process it owns from here on.
+        // A `Command` and not `stdio_client`'s argv, because this test wants the server's
+        // stderr on ours to read when something fails. Only that is ours to place — the
+        // client sets the two descriptors the protocol runs on, and starts the process it
+        // owns from here on.
         let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
         server.stderr(Stdio::inherit());
+        let client = StdioClient::new(server).expect("starting the console server");
 
         let console = Console::builder()
-            .stdio_client(server)
+            .client(client)
             .executables(execs)
             .default_timeout_ms(30_000)
             .build()
@@ -99,10 +103,7 @@ impl Fixture {
         self.console.start().expect("booting the server");
         let result = self
             .console
-            .exec(Exec {
-                cmd: vec!["sh".into(), "-c".into(), script.into()],
-                ..Exec::default()
-            })
+            .exec(["sh", "-c", script])
             .expect("running the command");
         self.console.stop().expect("stopping the server");
         result
@@ -204,10 +205,7 @@ fn a_console_can_be_stopped_and_started_again() {
     fixture.console.start().unwrap();
     let out = fixture
         .console
-        .exec(Exec {
-            cmd: vec!["sh".into(), "-c".into(), "command -v foo >/dev/null".into()],
-            ..Exec::default()
-        })
+        .exec(["sh", "-c", "command -v foo >/dev/null"])
         .unwrap();
     assert_eq!(out.code, 0, "foo should be on PATH while started");
     fixture.console.stop().unwrap();
@@ -215,14 +213,11 @@ fn a_console_can_be_stopped_and_started_again() {
     fixture.console.start().unwrap();
     let out = fixture
         .console
-        .exec(Exec {
-            cmd: vec![
-                "sh".into(),
-                "-c".into(),
-                "ls \"$(dirname \"$(command -v foo)\")\" | tr '\\n' ' '".into(),
-            ],
-            ..Exec::default()
-        })
+        .exec([
+            "sh",
+            "-c",
+            "ls \"$(dirname \"$(command -v foo)\")\" | tr '\\n' ' '",
+        ])
         .unwrap();
     // A fresh directory, with exactly the names this session announced.
     let listed = String::from_utf8_lossy(&out.stdout).into_owned();

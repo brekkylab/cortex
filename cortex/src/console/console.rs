@@ -70,17 +70,30 @@ impl ConsoleBuilder {
 
     /// Drive a server this console starts itself: `cmd`, over its own pipes.
     ///
-    /// [`client`](Self::client) with a [`StdioClient`] over `cmd` is the same thing said
-    /// longer, and this is the shape a caller reaches for: the program is the only part
-    /// of it a caller decides, since the two descriptors the protocol runs on are the
-    /// client's.
+    /// `cmd` is a program and its arguments — `["cortex-local-console"]`,
+    /// `["sh", "-c", "…"]` — and that is the whole of what this shape of caller decides,
+    /// since the two descriptors the protocol runs on are the client's. A caller who
+    /// wants more of the command than that — an environment, a directory, somewhere for
+    /// its stderr to go — builds the [`Command`] itself and hands it to
+    /// [`StdioClient::new`], then the client to [`client`](Self::client).
     ///
     /// Starting it is [`build`](Self::build)'s, not this method's — nothing here starts
-    /// anything, and a program that cannot be started is one of the ways building a
-    /// console fails.
-    pub fn stdio_client(mut self, cmd: Command) -> Self {
+    /// anything, and a program that cannot be started, like a `cmd` with no program in
+    /// it, is one of the ways building a console fails.
+    pub fn stdio_client(mut self, cmd: &[impl AsRef<str>]) -> Self {
+        // Owned before the closure, because the closure outlives this borrow and what it
+        // was given has to still be there when `build` runs it.
+        let cmd: Vec<String> = cmd.iter().map(|s| s.as_ref().to_string()).collect();
+
         self.client = Some(Box::new(move || {
-            let client = StdioClient::new(cmd).context("starting the console server")?;
+            let (program, args) = cmd
+                .split_first()
+                .context("a console server needs a program to run")?;
+
+            let mut server = Command::new(program);
+            server.args(args);
+
+            let client = StdioClient::new(server).context("starting the console server")?;
             Ok(Box::new(client))
         }));
         self
@@ -116,7 +129,6 @@ impl ConsoleBuilder {
             client: client()?,
             execs: self.execs,
             default_timeout_ms: self.default_timeout_ms,
-            started: false,
         })
     }
 }
@@ -128,25 +140,20 @@ impl ConsoleBuilder {
 /// there is more to do. Dropping it ends the session for good.
 ///
 /// ```no_run
-/// use std::process::Command;
-///
-/// use cortex::console::{Console, Exec};
+/// use cortex::console::Console;
 /// use cortex::executable::ExecutableSet;
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// // Whichever console server this is: the client starts it and owns it from here.
 /// let mut console = Console::builder()
-///     .stdio_client(Command::new("cortex-local-console"))
+///     .stdio_client(&["cortex-local-console"])
 ///     .executables(ExecutableSet::new())
 ///     .default_timeout_ms(30_000)
 ///     .build()?;
 ///
 /// console.start()?;
 ///
-/// let result = console.exec(Exec {
-///     cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
-///     ..Exec::default()
-/// })?;
+/// let result = console.exec(["sh", "-c", "echo hi"])?;
 /// assert_eq!(result.stdout, b"hi\n");
 ///
 /// console.stop()?;
@@ -163,12 +170,6 @@ pub struct Console {
     execs: ExecutableSet,
 
     default_timeout_ms: Option<u64>,
-
-    /// Whether [`start`](Self::start) has been answered and not yet undone.
-    ///
-    /// Kept here because nothing else keeps it: what a session allows is not a
-    /// transport's business, so the channel does not check it.
-    started: bool,
 }
 
 impl Console {
@@ -180,17 +181,16 @@ impl Console {
     ///
     /// Returning is the readiness signal: booting is not free, and this is where it is
     /// paid for rather than inside the first command.
+    ///
+    /// Whether a session may be started twice, or run something before it is started at
+    /// all, is the server's answer and not a question asked here. A session lives at the
+    /// end that has one, and this end only carries what it is told: a second `start` is
+    /// whatever that server does with one.
     pub fn start(&mut self) -> Result<(), Failure> {
-        if self.started {
-            return Err(Failure::broken("this console has already started"));
-        }
-
         self.client.start(Start {
             delegated: self.execs.names().map(str::to_string).collect(),
             default_timeout_ms: self.default_timeout_ms,
-        })?;
-        self.started = true;
-        Ok(())
+        })
     }
 
     /// Run one command, and return everything it produced.
@@ -203,12 +203,11 @@ impl Console {
     ///
     /// So a caller waits for one thing and gets one thing, and the delegated calls
     /// underneath it are served in the order the command made them.
-    pub fn exec(&mut self, exec: Exec) -> Result<ExecResult, Failure> {
-        if !self.started {
-            return Err(Failure::broken("this console has not started"));
-        }
-
-        let mut progress = self.client.exec(exec)?;
+    ///
+    /// `exec` is an [`Exec`], or an argv on its own — `["echo", "hi"]` — for an execution
+    /// that has nothing else to say.
+    pub fn exec(&mut self, exec: impl Into<Exec>) -> Result<ExecResult, Failure> {
+        let mut progress = self.client.exec(exec.into())?;
         loop {
             match progress {
                 Progress::Done(result) => return Ok(result),
@@ -225,19 +224,22 @@ impl Console {
     ///
     /// Not the end of anything: the session stays open and another `start` is allowed,
     /// which is what the protocol's `stop` means. Dropping the console is what ends it.
+    ///
+    /// Like [`start`](Self::start), what a `stop` on a session that has none comes to is
+    /// the server's to say.
     pub fn stop(&mut self) -> Result<(), Failure> {
-        if !std::mem::take(&mut self.started) {
-            return Err(Failure::broken("this console has not started"));
-        }
         self.client.stop()
     }
 }
 
 impl Drop for Console {
-    /// End the session: `stop` if it is started, then `quit`, in that order.
+    /// End the session: a `stop`, then a `quit`, in that order.
     ///
     /// The order is what the `stop` is for — the server owes us nothing once the session
-    /// is over, so anything we want undone has to be undone first.
+    /// is over, so anything we want undone has to be undone first. Unconditionally,
+    /// because whether there was anything to undo is the server's answer and this end does
+    /// not keep a second copy of it: a `stop` on a session that has none costs a round
+    /// trip and whatever the server says, which is discarded here like the rest.
     ///
     /// And ending is only here, because there is no moment where a caller would want it
     /// earlier and a result for it. What a `quit` reports is how the ending went — over
@@ -246,9 +248,7 @@ impl Drop for Console {
     /// channel took beyond this — a process that must not outlive it — is the client's,
     /// and happens when the client is dropped, immediately after.
     fn drop(&mut self) {
-        if std::mem::take(&mut self.started) {
-            let _ = self.client.stop();
-        }
+        let _ = self.client.stop();
         let _ = self.client.quit();
     }
 }
@@ -302,18 +302,39 @@ mod tests {
     use crate::console::message::{Call, Method, Notification};
     use crate::executable::{ExecResult as ExecOutput, Executable};
 
-    /// A client over canned answers, recording every call it was handed.
+    /// What a [`Recorder`] was handed, readable while it is still lent out.
     ///
-    /// The whole `Call` and not just its method, because the delegated calls a console
-    /// resolves are only visible in what its `resume`s carried.
+    /// Two lists because they answer different questions: `methods` is what went out and
+    /// in what order, including the `quit`, which is a notification and so never a `Call`;
+    /// `calls` is what those carried, because the delegated calls a console resolves are
+    /// only visible in the payload of its `resume`s.
+    #[derive(Clone)]
+    struct Log {
+        methods: Arc<Mutex<Vec<Method>>>,
+        calls: Arc<Mutex<Vec<Call>>>,
+    }
+
+    impl Log {
+        fn methods(&self) -> Vec<Method> {
+            self.methods.lock().unwrap().clone()
+        }
+
+        /// The `n`th call, counted over calls alone.
+        fn call(&self, n: usize) -> Call {
+            self.calls.lock().unwrap()[n].clone()
+        }
+    }
+
+    /// A client over canned answers, recording everything it was handed.
     struct Recorder {
         answers: Vec<Outcome>,
-        asked: Arc<Mutex<Vec<Call>>>,
+        log: Log,
     }
 
     impl Client for Recorder {
         fn call(&mut self, call: Call) -> Result<Outcome, Failure> {
-            self.asked.lock().unwrap().push(call);
+            self.log.methods.lock().unwrap().push(call.method());
+            self.log.calls.lock().unwrap().push(call);
             if self.answers.is_empty() {
                 // Not a panic: `Drop` stops a console best-effort, and a test that has
                 // said all it means to say should not have to answer that too.
@@ -322,27 +343,24 @@ mod tests {
             Ok(self.answers.remove(0))
         }
 
-        fn notify(&mut self, _: Notification) -> Result<(), Failure> {
-            self.asked.lock().unwrap().push(Call::Stop);
+        fn notify(&mut self, notification: Notification) -> Result<(), Failure> {
+            self.log.methods.lock().unwrap().push(notification.method());
             Ok(())
         }
     }
 
-    fn recorder(answers: Vec<Outcome>) -> (Recorder, Arc<Mutex<Vec<Call>>>) {
-        let asked = Arc::new(Mutex::new(Vec::new()));
+    fn recorder(answers: Vec<Outcome>) -> (Recorder, Log) {
+        let log = Log {
+            methods: Arc::new(Mutex::new(Vec::new())),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
         (
             Recorder {
                 answers,
-                asked: Arc::clone(&asked),
+                log: log.clone(),
             },
-            asked,
+            log,
         )
-    }
-
-    /// The methods that went out, in order — a notification spelled as `Stop` by
-    /// `Recorder`, so `quit` is the last one.
-    fn methods(asked: &Arc<Mutex<Vec<Call>>>) -> Vec<Method> {
-        asked.lock().unwrap().iter().map(Call::method).collect()
     }
 
     fn null() -> Outcome {
@@ -392,27 +410,44 @@ mod tests {
     #[test]
     fn a_stdio_console_starts_its_server_when_it_is_built() {
         let Err(e) = Console::builder()
-            .stdio_client(Command::new("cortex-no-such-console"))
+            .stdio_client(&["cortex-no-such-console"])
             .build()
         else {
             panic!("a console over a program that does not exist should not build");
         };
         assert!(e.to_string().contains("starting the console server"), "{e}");
 
+        // A command with nothing to run is the same kind of failure and reported the same
+        // way: at build, saying what it lacked.
+        let Err(e) = Console::builder().stdio_client(&[] as &[&str]).build() else {
+            panic!("a console over no program at all should not build");
+        };
+        assert!(e.to_string().contains("needs a program to run"), "{e}");
+
         // A program that starts is all building needs; whether it speaks the protocol is
         // `start`'s to find out, and this one is never asked. Dropping it ends the
         // session, which closes its stdin, which is what lets `cat` be waited for.
+        //
+        // Arguments are the caller's too, and go to the program as given.
         Console::builder()
-            .stdio_client(Command::new("cat"))
+            .stdio_client(&["cat", "-u"])
             .build()
             .unwrap();
     }
 
-    /// `start` announces the registered names, and `exec` before it never reaches the
-    /// channel at all.
+    /// `start` announces the registered names, and nothing about the session is kept on
+    /// this side: what a caller asks for goes out as asked, in that order, and the answer
+    /// is the server's.
     #[test]
-    fn a_session_starts_before_it_runs_anything() {
-        let (client, asked) = recorder(vec![null(), ran(b"hi\n"), null()]);
+    fn a_session_is_the_servers_to_keep() {
+        let (client, log) = recorder(vec![
+            ran(b"early\n"),
+            null(),
+            ran(b"hi\n"),
+            null(),
+            // The `stop` that dropping sends, whether or not one already went.
+            null(),
+        ]);
         let mut console = Console::builder()
             .client(client)
             .executables(ExecutableSet::new().register("foo", Greeter))
@@ -420,35 +455,45 @@ mod tests {
             .build()
             .unwrap();
 
-        // Nothing has started, so nothing is asked.
-        assert!(console.exec(Exec::default()).is_err());
-        assert!(asked.lock().unwrap().is_empty());
+        // An `exec` before any `start` is not refused here. Whether a session has to be
+        // started before it runs anything is the server's rule to keep, so this goes out
+        // and what comes back is whatever that server says — here, a result.
+        assert_eq!(console.exec(Exec::default()).unwrap().stdout, b"early\n");
 
         console.start().unwrap();
-        // A second start is refused without asking twice.
-        assert!(console.start().is_err());
-
+        // An execution that delegated nothing is one round trip: no `resume`.
         assert_eq!(console.exec(Exec::default()).unwrap().stdout, b"hi\n");
         console.stop().unwrap();
-        // Stopped is not started, so neither a second stop nor an exec goes out.
-        assert!(console.stop().is_err());
-        assert!(console.exec(Exec::default()).is_err());
 
-        // Ending is the console going away, and nothing else has to happen for it.
+        // Ending is the console going away, and nothing else has to happen for it: a
+        // `stop` for whatever booting took, then the `quit` that ends the session.
         drop(console);
 
-        // An execution that delegated nothing is one round trip: no `resume`.
         assert_eq!(
-            methods(&asked),
-            [Method::Start, Method::Exec, Method::Stop, Method::Stop]
+            log.methods(),
+            [
+                Method::Exec,
+                Method::Start,
+                Method::Exec,
+                Method::Stop,
+                Method::Stop,
+                Method::Quit
+            ]
         );
+
+        // What `start` carried: the registered names, and the fallback timeout.
+        let Call::Start(start) = log.call(1) else {
+            panic!("{:?} is not a start", log.call(1));
+        };
+        assert_eq!(start.delegated, ["foo"]);
+        assert_eq!(start.default_timeout_ms, Some(30_000));
     }
 
     /// A delegated call is resolved from the set and sent back as a `resume`, and the
     /// caller sees one result for the one `exec` it asked for.
     #[test]
     fn a_delegated_call_is_resolved_inside_one_exec() {
-        let (client, asked) = recorder(vec![
+        let (client, log) = recorder(vec![
             null(),
             // Two in a row, so the chain is a loop and not a single extra step.
             delegated(&["foo", "world"]),
@@ -465,22 +510,21 @@ mod tests {
         assert_eq!(console.exec(Exec::default()).unwrap().stdout, b"done\n");
 
         assert_eq!(
-            methods(&asked),
+            log.methods(),
             [Method::Start, Method::Exec, Method::Resume, Method::Resume]
         );
 
         // The registered name ran, and its output is what the first `resume` carried.
-        let asked = asked.lock().unwrap();
-        let Call::Resume(outcome) = &asked[2] else {
-            panic!("{:?} is not a resume", asked[2]);
+        let Call::Resume(outcome) = log.call(2) else {
+            panic!("{:?} is not a resume", log.call(2));
         };
-        let result: ExecResult = outcome.clone().take().unwrap();
+        let result: ExecResult = outcome.take().unwrap();
         assert_eq!(result.stdout, b"hello world\n");
 
         // The unregistered one is refused rather than run — a server asking for a name
         // it was never given.
-        let Call::Resume(outcome) = &asked[3] else {
-            panic!("{:?} is not a resume", asked[3]);
+        let Call::Resume(outcome) = log.call(3) else {
+            panic!("{:?} is not a resume", log.call(3));
         };
         assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
     }

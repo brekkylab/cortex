@@ -136,6 +136,36 @@ pub struct Exec {
     pub timeout_ms: Option<u64>,
 }
 
+/// An argv and the defaults for the rest, over the three ways a caller has an argv: a
+/// literal, a slice, a `Vec`.
+///
+/// Which is what most executions are — `["echo", "hi"]` rather than an `Exec` written out
+/// to say only that. Anything else to set is the struct, as before.
+fn argv<S: AsRef<str>>(cmd: impl IntoIterator<Item = S>) -> Exec {
+    Exec {
+        cmd: cmd.into_iter().map(|s| s.as_ref().to_string()).collect(),
+        ..Exec::default()
+    }
+}
+
+impl<S: AsRef<str>, const N: usize> From<[S; N]> for Exec {
+    fn from(cmd: [S; N]) -> Exec {
+        argv(cmd)
+    }
+}
+
+impl<S: AsRef<str>> From<&[S]> for Exec {
+    fn from(cmd: &[S]) -> Exec {
+        argv(cmd)
+    }
+}
+
+impl<S: AsRef<str>> From<Vec<S>> for Exec {
+    fn from(cmd: Vec<S>) -> Exec {
+        argv(cmd)
+    }
+}
+
 /// How far an execution got: finished, or waiting for the client. The `result` of
 /// both `exec` and `resume`.
 ///
@@ -392,5 +422,18 @@ mod tests {
         assert_eq!(args, ["-c", ""]);
 
         assert!(Exec::default().split().is_none());
+    }
+
+    /// The three argv shapes are the one `Exec` written out, and nothing else is set.
+    #[test]
+    fn an_argv_is_an_exec_with_the_defaults() {
+        let written = Exec {
+            cmd: vec!["echo".into(), "hi".into()],
+            ..Exec::default()
+        };
+
+        assert_eq!(Exec::from(["echo", "hi"]), written);
+        assert_eq!(Exec::from(&["echo", "hi"][..]), written);
+        assert_eq!(Exec::from(vec![String::from("echo"), "hi".into()]), written);
     }
 }
