@@ -11,7 +11,6 @@
 
 use std::process::{Command, Stdio};
 
-use cortex::console::stdio::StdioClient;
 use cortex::console::{Console, Exec, ExecResult};
 use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
 
@@ -86,7 +85,7 @@ impl Fixture {
         server.stderr(Stdio::inherit());
 
         let console = Console::builder()
-            .client(StdioClient::new(server).expect("spawning the console server"))
+            .stdio_client(server)
             .executables(execs)
             .default_timeout_ms(30_000)
             .build()

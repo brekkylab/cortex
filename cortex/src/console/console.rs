@@ -27,10 +27,13 @@
 //! [`Progress`] for why that is latency rather than a deadlock, and what would have to
 //! change for it to stop being so.
 
+use std::process::Command;
+
 use anyhow::Context as _;
 
-use crate::console::base::{Failure, Client};
+use crate::console::base::{Client, Failure};
 use crate::console::message::{Error, Exec, ExecResult, Outcome, Progress, Start};
+use crate::console::stdio::StdioClient;
 use crate::executable::{ExecCall, ExecutableSet};
 
 /// Assembles a [`Console`] from the parts it needs.
@@ -43,7 +46,12 @@ use crate::executable::{ExecCall, ExecutableSet};
 /// [`Console::start`].
 #[derive(Default)]
 pub struct ConsoleBuilder {
-    client: Option<Box<dyn Client>>,
+    /// Not a client but the making of one, because some clients are a process away:
+    /// [`stdio_client`](Self::stdio_client) is handed a program and not a channel, and
+    /// starting a program can fail. Deferring that to [`build`](Self::build) keeps every
+    /// setter infallible and leaves one place where a console either exists or says what
+    /// it lacked.
+    client: Option<Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>>>>,
     execs: ExecutableSet,
     default_timeout_ms: Option<u64>,
 }
@@ -56,7 +64,25 @@ impl ConsoleBuilder {
     /// a test. Whatever it took to have a channel is the client's, including a process if
     /// that is what it runs over, so there is nothing else here about where a server is.
     pub fn client(mut self, client: impl Client + 'static) -> Self {
-        self.client = Some(Box::new(client));
+        self.client = Some(Box::new(move || Ok(Box::new(client))));
+        self
+    }
+
+    /// Drive a server this console starts itself: `cmd`, over its own pipes.
+    ///
+    /// [`client`](Self::client) with a [`StdioClient`] over `cmd` is the same thing said
+    /// longer, and this is the shape a caller reaches for: the program is the only part
+    /// of it a caller decides, since the two descriptors the protocol runs on are the
+    /// client's.
+    ///
+    /// Starting it is [`build`](Self::build)'s, not this method's — nothing here starts
+    /// anything, and a program that cannot be started is one of the ways building a
+    /// console fails.
+    pub fn stdio_client(mut self, cmd: Command) -> Self {
+        self.client = Some(Box::new(move || {
+            let client = StdioClient::new(cmd).context("starting the console server")?;
+            Ok(Box::new(client))
+        }));
         self
     }
 
@@ -79,14 +105,15 @@ impl ConsoleBuilder {
         self
     }
 
-    /// Fails only for the one part that has no default: something to ask.
+    /// Fails for the one part that has no default — something to ask — and for whatever
+    /// having a channel took: over stdio, a server process that would not start.
     pub fn build(self) -> anyhow::Result<Console> {
         let client = self
             .client
             .context("a console needs a client to drive its server")?;
 
         Ok(Console {
-            client,
+            client: client()?,
             execs: self.execs,
             default_timeout_ms: self.default_timeout_ms,
             started: false,
@@ -103,14 +130,13 @@ impl ConsoleBuilder {
 /// ```no_run
 /// use std::process::Command;
 ///
-/// use cortex::console::stdio::StdioClient;
 /// use cortex::console::{Console, Exec};
 /// use cortex::executable::ExecutableSet;
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// // Whichever console server this is: the client starts it and owns it from here.
 /// let mut console = Console::builder()
-///     .client(StdioClient::new(Command::new("cortex-local-console"))?)
+///     .stdio_client(Command::new("cortex-local-console"))
 ///     .executables(ExecutableSet::new())
 ///     .default_timeout_ms(30_000)
 ///     .build()?;
@@ -205,7 +231,6 @@ impl Console {
         }
         self.client.stop()
     }
-
 }
 
 impl Drop for Console {
@@ -360,6 +385,27 @@ mod tests {
             panic!("a console with nothing to ask should not build");
         };
         assert!(failure.to_string().contains("needs a client"), "{failure}");
+    }
+
+    /// `stdio_client` takes a program, so building is where one that will not start is
+    /// reported — and where one that starts is a console like any other.
+    #[test]
+    fn a_stdio_console_starts_its_server_when_it_is_built() {
+        let Err(e) = Console::builder()
+            .stdio_client(Command::new("cortex-no-such-console"))
+            .build()
+        else {
+            panic!("a console over a program that does not exist should not build");
+        };
+        assert!(e.to_string().contains("starting the console server"), "{e}");
+
+        // A program that starts is all building needs; whether it speaks the protocol is
+        // `start`'s to find out, and this one is never asked. Dropping it ends the
+        // session, which closes its stdin, which is what lets `cat` be waited for.
+        Console::builder()
+            .stdio_client(Command::new("cat"))
+            .build()
+            .unwrap();
     }
 
     /// `start` announces the registered names, and `exec` before it never reaches the
