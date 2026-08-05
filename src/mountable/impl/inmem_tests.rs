@@ -68,13 +68,7 @@ fn changing_a_files_contents_advances_its_mtime() {
     // the metadata handed back already has to reflect it.
     let began = SystemTime::now();
     let (_, stat) = vol
-        .open(
-            Path::new("f"),
-            OpenOptions {
-                truncate: true,
-                ..OpenOptions::read_write()
-            },
-        )
+        .open(Path::new("f"), OpenOptions::read_write().truncate(true))
         .unwrap();
     assert_eq!(stat.size, 0);
     assert!(stat.mtime.unwrap() >= began, "truncation through the open");
@@ -352,11 +346,8 @@ fn positioned_writes_and_truncate_are_shared() {
 fn open_options_pin_the_creation_contract() {
     let vol = InMemVolume::new();
     let rw = OpenOptions::read_write();
-    let create = OpenOptions { create: true, ..rw };
-    let create_new = OpenOptions {
-        create_new: true,
-        ..create
-    };
+    let create = rw.create(true);
+    let create_new = OpenOptions::create_new().create(true);
 
     // Metadata comes back with the handle: a FUSE `create` must answer with both
     // in one message, and a follow-up `stat` is a round trip plus a window for the
@@ -379,15 +370,7 @@ fn open_options_pin_the_creation_contract() {
     ));
 
     // At open time, before the handle exists.
-    let (_, stat) = vol
-        .open(
-            Path::new("/f"),
-            OpenOptions {
-                truncate: true,
-                ..rw
-            },
-        )
-        .unwrap();
+    let (_, stat) = vol.open(Path::new("/f"), rw.truncate(true)).unwrap();
     assert_eq!(stat.size, 0);
 
     // A missing parent is never created implicitly.
@@ -417,13 +400,7 @@ fn open_options_pin_the_creation_contract() {
 
     // `O_RDONLY | O_CREAT` is legal POSIX and stays legal here.
     let (_, stat) = vol
-        .open(
-            Path::new("/ro"),
-            OpenOptions {
-                create: true,
-                ..OpenOptions::read_only()
-            },
-        )
+        .open(Path::new("/ro"), OpenOptions::read_only().create(true))
         .unwrap();
     assert_eq!(stat.size, 0);
 
@@ -535,19 +512,8 @@ fn the_namespace_operations_classify_what_they_refuse() {
 #[test]
 fn append_writes_land_at_the_end() {
     let vol = InMemVolume::new();
-    let append = OpenOptions {
-        append: true,
-        ..OpenOptions::read_write()
-    };
-    let (h, _) = vol
-        .open(
-            Path::new("log"),
-            OpenOptions {
-                create: true,
-                ..append
-            },
-        )
-        .unwrap();
+    let append = OpenOptions::read_write().append(true);
+    let (h, _) = vol.open(Path::new("log"), append.create(true)).unwrap();
 
     h.write_all_at(b"AAA", 0).unwrap();
     h.write_all_at(b"BBB", 0).unwrap();
@@ -567,12 +533,7 @@ fn a_handle_refuses_what_its_open_did_not_allow() {
     assert_eq!(ro.write_at(b"x", 0).unwrap_err().raw_os_error(), Some(9));
     assert!(matches!(ro.truncate(0), Err(CortexError::InvalidArgument)));
 
-    let write_only = OpenOptions {
-        read: false,
-        write: true,
-        ..Default::default()
-    };
-    let (wo, _) = vol.open(Path::new("f"), write_only).unwrap();
+    let (wo, _) = vol.open(Path::new("f"), OpenOptions::write_only()).unwrap();
     assert_eq!(
         wo.read_at(&mut [0u8; 1], 0).unwrap_err().raw_os_error(),
         Some(9)

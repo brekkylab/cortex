@@ -27,14 +27,7 @@ fn write_all(ws: &Workspace, path: &Path, data: &[u8]) -> Result<()> {
     // One call: the backend applies `create` and `truncate` together, so nothing can
     // slip in between them. Reaching the same place by creating, catching
     // `AlreadyExists` and reopening would leave exactly that gap.
-    let (h, _) = ws.open(
-        path,
-        OpenOptions {
-            create: true,
-            truncate: true,
-            ..OpenOptions::read_write()
-        },
-    )?;
+    let (h, _) = ws.open(path, OpenOptions::read_write().create(true).truncate(true))?;
     h.write_all_at(data, 0)?;
     Ok(())
 }

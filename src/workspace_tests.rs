@@ -321,17 +321,8 @@ fn a_mutation_aimed_at_the_mount_table_is_refused_before_the_backend_is_asked() 
     let rmdir: Op = |ws, path| Mountable::rmdir(ws, path);
     let unlink: Op = |ws, path| Mountable::unlink(ws, path);
     let mkdir: Op = |ws, path| Mountable::mkdir(ws, path);
-    let create: Op = |ws, path| {
-        Mountable::open(
-            ws,
-            path,
-            OpenOptions {
-                create: true,
-                ..OpenOptions::read_write()
-            },
-        )
-        .map(|_| ())
-    };
+    let create: Op =
+        |ws, path| Mountable::open(ws, path, OpenOptions::read_write().create(true)).map(|_| ());
 
     #[rustfmt::skip]
     let rows = [
@@ -376,10 +367,7 @@ fn creating_in_the_synthesized_namespace_is_read_only_not_missing() {
         Mountable::open(
             &ws,
             Path::new("newthing"),
-            OpenOptions {
-                create: true,
-                ..OpenOptions::read_write()
-            }
+            OpenOptions::read_write().create(true)
         ),
         Err(CortexError::ReadOnly)
     ));

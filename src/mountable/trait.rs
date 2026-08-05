@@ -70,7 +70,14 @@ impl Dirent {
 /// The only meaningless combination — neither `read` nor `write` — is rejected by
 /// [`validate`](Self::validate). `O_RDONLY | O_CREAT` is ordinary POSIX and stays
 /// legal.
+///
+/// One is built the way `open(2)` is called: an access mode, then the flags that
+/// modify it. The fields stay public because a backend has to read them, and
+/// `#[non_exhaustive]` is what keeps a caller outside the crate from *writing*
+/// them — with a struct literal available, `OpenOptions { create_new: true, .. }`
+/// is what gets written even where [`create_new`](Self::create_new) already exists.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct OpenOptions {
     pub read: bool,
     pub write: bool,
@@ -95,6 +102,13 @@ impl OpenOptions {
         }
     }
 
+    pub fn write_only() -> Self {
+        OpenOptions {
+            write: true,
+            ..Default::default()
+        }
+    }
+
     pub fn read_write() -> Self {
         OpenOptions {
             read: true,
@@ -111,11 +125,50 @@ impl OpenOptions {
     /// and, without it, the only way to say it is a six-line struct update. The
     /// combination is also the one that has to be exclusive, so spelling it once
     /// keeps every caller on the atomic form.
+    ///
+    /// It is a constructor rather than one of the setters below because the name
+    /// cannot be both. A combination that wants `O_EXCL` without both access
+    /// modes narrows this one: `create_new().read(false)`.
     pub fn create_new() -> Self {
         OpenOptions {
             create_new: true,
             ..Self::read_write()
         }
+    }
+
+    pub fn read(self, yes: bool) -> Self {
+        OpenOptions { read: yes, ..self }
+    }
+
+    pub fn write(self, yes: bool) -> Self {
+        OpenOptions { write: yes, ..self }
+    }
+
+    pub fn append(self, yes: bool) -> Self {
+        OpenOptions {
+            append: yes,
+            ..self
+        }
+    }
+
+    pub fn truncate(self, yes: bool) -> Self {
+        OpenOptions {
+            truncate: yes,
+            ..self
+        }
+    }
+
+    pub fn create(self, yes: bool) -> Self {
+        OpenOptions {
+            create: yes,
+            ..self
+        }
+    }
+
+    /// Whether the open means to modify anything, which is what a read-only
+    /// backend refuses on. `create` counts: making a file modifies its parent.
+    pub fn intends_write(&self) -> bool {
+        self.write || self.append || self.truncate || self.create || self.create_new
     }
 
     /// Reject the one self-contradictory combination, so each backend spends a

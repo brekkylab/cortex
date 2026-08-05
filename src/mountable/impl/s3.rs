@@ -550,12 +550,7 @@ impl Mountable for S3Volume {
         options.validate()?;
         // Refused before the network is touched: nothing about the object changes the
         // answer, and a caller that meant to write should hear so at once.
-        if options.write
-            || options.append
-            || options.truncate
-            || options.create
-            || options.create_new
-        {
+        if options.intends_write() {
             return Err(CortexError::ReadOnly);
         }
         match self.classify(path)? {

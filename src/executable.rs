@@ -238,12 +238,7 @@ impl Mountable for SkillDir {
         options.validate()?;
         // Refused before the path is resolved, because nothing about the doc changes
         // the answer.
-        if options.write
-            || options.append
-            || options.truncate
-            || options.create
-            || options.create_new
-        {
+        if options.intends_write() {
             return Err(CortexError::ReadOnly);
         }
         let comps = comps(path)?;

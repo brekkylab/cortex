@@ -26,6 +26,51 @@ fn an_entry_takes_its_kind_from_the_metadata_it_carries() {
     assert!(bare.stat().is_none());
 }
 
+/// A flag lands on an access mode without disturbing the others, so a caller can
+/// say one thing at a time.
+///
+/// The asymmetry worth pinning is `create_new`. It is a constructor, because a
+/// setter of that name would collide with it, so the combinations wanting `O_EXCL`
+/// without both access modes are reached by narrowing rather than by setting.
+#[test]
+fn a_flag_lands_on_an_access_mode_without_disturbing_the_others() {
+    let appending = OpenOptions::write_only().append(true);
+    assert!(!appending.read && appending.write, "the mode survived");
+    assert!(appending.append);
+    assert!(
+        !appending.truncate && !appending.create && !appending.create_new,
+        "a setter answers for its own flag only"
+    );
+
+    let exclusive_write = OpenOptions::create_new().read(false);
+    assert!(exclusive_write.create_new && exclusive_write.write);
+    assert!(
+        !exclusive_write.read,
+        "narrowed off the half it did not want"
+    );
+}
+
+/// What a read-only backend refuses on.
+///
+/// Five of the six flags mean modification, and the predicate lives here rather
+/// than in each backend, where the fifth term is the easy one to leave out.
+/// `create` counts even though it writes no bytes: it modifies the parent.
+#[test]
+fn every_flag_but_read_means_modification() {
+    let ro = OpenOptions::read_only();
+    assert!(!ro.intends_write());
+
+    for (flag, options) in [
+        ("write", ro.write(true)),
+        ("append", ro.append(true)),
+        ("truncate", ro.truncate(true)),
+        ("create", ro.create(true)),
+        ("create_new", OpenOptions::create_new()),
+    ] {
+        assert!(options.intends_write(), "{flag} means modification");
+    }
+}
+
 /// Stands in for a read-only source whose author never writes a `rename`. Its
 /// whole job is to pin what those get for free, so it must never grow an override.
 struct ReadOnlyStub;

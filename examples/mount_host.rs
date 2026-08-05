@@ -41,13 +41,7 @@ fn main() {
 
     let vol = InMemVolume::new();
     let (file, _) = vol
-        .open(
-            Path::new("hello.txt"),
-            OpenOptions {
-                create_new: true,
-                ..OpenOptions::read_write()
-            },
-        )
+        .open(Path::new("hello.txt"), OpenOptions::create_new())
         .expect("fresh volume");
     file.write_all_at(b"Hello from cortex!\n", 0).unwrap();
     vol.mkdir(Path::new("sub")).unwrap();

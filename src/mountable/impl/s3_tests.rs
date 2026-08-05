@@ -614,18 +614,9 @@ fn opening_for_writing_is_read_only() {
     let write_intents = [
         OpenOptions::read_write(),
         OpenOptions::create_new(),
-        OpenOptions {
-            append: true,
-            ..OpenOptions::read_only()
-        },
-        OpenOptions {
-            truncate: true,
-            ..OpenOptions::read_only()
-        },
-        OpenOptions {
-            create: true,
-            ..OpenOptions::read_only()
-        },
+        OpenOptions::read_only().append(true),
+        OpenOptions::read_only().truncate(true),
+        OpenOptions::read_only().create(true),
     ];
     for options in write_intents {
         assert_eq!(
