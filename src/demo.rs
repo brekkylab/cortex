@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::{
@@ -12,23 +13,25 @@ use crate::{
 };
 
 /// Read the whole file at `path`.
-fn read_all(ws: &Workspace, path: &Path) -> Result<Vec<u8>> {
+async fn read_all(ws: &Workspace, path: &Path) -> Result<Vec<u8>> {
     // No separate `stat`: `open` answers with the metadata as of the open, which is
     // both one round trip fewer and free of the window a second call would leave for
     // the file to change size.
-    let (h, stat) = ws.open(path, OpenOptions::read_only())?;
+    let (h, stat) = ws.open(path, OpenOptions::read_only()).await?;
     let mut buf = vec![0u8; stat.size as usize];
-    h.read_exact_at(&mut buf, 0)?;
+    h.read_exact_at(&mut buf, 0).await?;
     Ok(buf)
 }
 
 /// Write `data` to `path`, creating or replacing it.
-fn write_all(ws: &Workspace, path: &Path, data: &[u8]) -> Result<()> {
+async fn write_all(ws: &Workspace, path: &Path, data: &[u8]) -> Result<()> {
     // One call: the backend applies `create` and `truncate` together, so nothing can
     // slip in between them. Reaching the same place by creating, catching
     // `AlreadyExists` and reopening would leave exactly that gap.
-    let (h, _) = ws.open(path, OpenOptions::read_write().create(true).truncate(true))?;
-    h.write_all_at(data, 0)?;
+    let (h, _) = ws
+        .open(path, OpenOptions::read_write().create(true).truncate(true))
+        .await?;
+    h.write_all_at(data, 0).await?;
     Ok(())
 }
 
@@ -54,10 +57,11 @@ macro_rules! path_arg {
 
 /// `cat <path>` — print a file to stdout.
 struct Cat;
+#[async_trait]
 impl Executable for Cat {
-    fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
+    async fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
         let path = path_arg!(self, args, "<path>");
-        Ok(ExecOutput::ok(read_all(ws, Path::new(&path))?))
+        Ok(ExecOutput::ok(read_all(ws, Path::new(&path)).await?))
     }
 }
 impl Skillable for Cat {
@@ -74,11 +78,13 @@ impl Skillable for Cat {
 
 /// `ls <path>` — list a directory, one name per line (sorted).
 struct Ls;
+#[async_trait]
 impl Executable for Ls {
-    fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
+    async fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
         let path = path_arg!(self, args, "<path>");
         let mut names: Vec<String> = ws
-            .list(Path::new(&path))?
+            .list(Path::new(&path))
+            .await?
             .into_iter()
             .map(|entry| entry.name)
             .collect();
@@ -100,11 +106,12 @@ impl Skillable for Ls {
 
 /// `write <path> [content]` — write `content` (empty if omitted) to a file.
 struct Write;
+#[async_trait]
 impl Executable for Write {
-    fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
+    async fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
         let path = path_arg!(self, args, "<path> [content]");
         let content = args.get(1).map(String::as_bytes).unwrap_or(b"");
-        write_all(ws, Path::new(&path), content)?;
+        write_all(ws, Path::new(&path), content).await?;
         Ok(ExecOutput::default())
     }
 }
@@ -177,28 +184,28 @@ mod tests {
         assert_eq!(names, ["cat", "ls", "write"]);
     }
 
-    #[test]
-    fn write_then_read_back_through_bin() {
+    #[tokio::test]
+    async fn write_then_read_back_through_bin() {
         let ws = ws();
         let bin = Bin::demo();
-        bin.invoke(&ws, "write", vec!["f".into(), "hi".into()]).unwrap();
-        assert_eq!(bin.invoke(&ws, "cat", vec!["f".into()]).unwrap().stdout, b"hi");
-        assert_eq!(bin.invoke(&ws, "ls", vec!["".into()]).unwrap().stdout, b"f");
+        bin.invoke(&ws, "write", vec!["f".into(), "hi".into()]).await.unwrap();
+        assert_eq!(bin.invoke(&ws, "cat", vec!["f".into()]).await.unwrap().stdout, b"hi");
+        assert_eq!(bin.invoke(&ws, "ls", vec!["".into()]).await.unwrap().stdout, b"f");
     }
 
-    #[test]
-    fn missing_arg_is_usage_error() {
-        let out = Bin::demo().invoke(&ws(), "cat", vec![]).unwrap();
+    #[tokio::test]
+    async fn missing_arg_is_usage_error() {
+        let out = Bin::demo().invoke(&ws(), "cat", vec![]).await.unwrap();
         assert_eq!(out.code, 2);
         assert!(out.stderr.starts_with(b"usage: wsx cat"));
     }
 
-    #[test]
-    fn write_is_also_a_tool() {
+    #[tokio::test]
+    async fn write_is_also_a_tool() {
         let tool: &dyn Toolable = &Write;
         assert_eq!(tool.to_argv(&json!({ "path": "f", "content": "hi" })), ["f", "hi"]);
         let ws = ws();
-        tool.call(&ws, &json!({ "path": "f", "content": "hi" })).unwrap();
-        assert_eq!(read_all(&ws, Path::new("f")).unwrap(), b"hi");
+        tool.call(&ws, &json!({ "path": "f", "content": "hi" })).await.unwrap();
+        assert_eq!(read_all(&ws, Path::new("f")).await.unwrap(), b"hi");
     }
 }

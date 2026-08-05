@@ -23,6 +23,10 @@ fn main() -> std::io::Result<()> {
     let addr = std::env::var("WSX_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let token = std::env::var("WSX_TOKEN").ok();
 
+    // cortex's `Mountable` data plane is async; this sync server drives each
+    // exec by blocking on a runtime.
+    let rt = tokio::runtime::Runtime::new()?;
+
     let bin = Bin::demo();
     // Root: a real directory if `WSX_ROOT` is set, else in-memory scratch.
     let mut ws = match std::env::var("WSX_ROOT") {
@@ -51,7 +55,7 @@ fn main() -> std::io::Result<()> {
     );
 
     serve(&listener, token.as_deref(), |req| {
-        bin.invoke(&ws, &req.name, req.args)
+        rt.block_on(bin.invoke(&ws, &req.name, req.args))
             .map_err(|_| HandlerError::NotFound)
     })
 }

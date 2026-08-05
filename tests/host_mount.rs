@@ -66,16 +66,26 @@ fn mountpoint(tag: &str) -> PathBuf {
 }
 
 /// A volume with one file and one empty directory.
+///
+/// The seeding drives the async `Mountable`/`FileExt` surface, so it runs on a
+/// throwaway runtime here — the crate's own `block_on` is `pub(crate)`, and the
+/// test bodies themselves are synchronous because a real kernel drives the mount.
 fn volume() -> InMemVolume {
     let vol = InMemVolume::new();
-    let (file, _) = vol
-        .open(
-            std::path::Path::new("greeting.txt"),
-            OpenOptions::create_new(),
-        )
-        .unwrap();
-    cortex::FileExt::write_all_at(&file, b"Hello from cortex!\n", 0).unwrap();
-    vol.mkdir(std::path::Path::new("sub")).unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("build a runtime for volume setup");
+    rt.block_on(async {
+        let (file, _) = vol
+            .open(
+                std::path::Path::new("greeting.txt"),
+                OpenOptions::create_new(),
+            )
+            .await
+            .unwrap();
+        cortex::FileExt::write_all_at(&file, b"Hello from cortex!\n", 0)
+            .await
+            .unwrap();
+        vol.mkdir(std::path::Path::new("sub")).await.unwrap();
+    });
     vol
 }
 

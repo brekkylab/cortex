@@ -26,17 +26,21 @@
 mod demo;
 mod error;
 mod executable;
+mod hook;
 mod lock;
 mod mountable;
 mod stat;
 #[cfg(test)]
 mod test_support;
+mod volume;
 mod wire;
 mod workspace;
 
 pub use error::*;
 pub use executable::*;
+pub use hook::*;
 pub use mountable::*;
 pub use stat::*;
+pub use volume::*;
 pub use wire::*;
 pub use workspace::*;

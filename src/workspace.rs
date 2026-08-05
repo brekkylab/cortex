@@ -13,10 +13,15 @@
 use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
+use async_trait::async_trait;
+
 use crate::{
-    CortexError, Dirent, DirentKind, DynMountable, FileHandle, Mountable, OpenOptions, Result, Stat,
+    CortexError, Dirent, DirentKind, DynMountable, FileExt, FileHandle, FsEvent, FsHook, Mountable,
+    OpenOptions, Result, Stat,
 };
 
 /// A longest-prefix mount table over heterogeneous backends.
@@ -40,6 +45,11 @@ pub struct Workspace {
     /// forever. Leaving it unset is no better: it falls back to the UNIX epoch,
     /// which `find -newer`, `make` and `rsync` all read.
     born: SystemTime,
+
+    /// Fired on every mutation this workspace lands. `None` fires nothing. The
+    /// host attaches one to react to writes (ingestion, indexing, cache
+    /// invalidation) without cortex knowing what the reaction is — see [`FsHook`].
+    hook: Option<Arc<dyn FsHook>>,
 }
 
 impl Workspace {
@@ -53,7 +63,35 @@ impl Workspace {
         Self {
             mounts: BTreeMap::new(),
             born: SystemTime::now(),
+            hook: None,
         }
+    }
+
+    /// Attach an [`FsHook`] fired on every mutation (create/modify/remove). An
+    /// unset hook fires nothing.
+    pub fn with_hook(mut self, hook: Option<Arc<dyn FsHook>>) -> Self {
+        self.hook = hook;
+        self
+    }
+
+    /// Fire the attached hook, if any.
+    fn fire(&self, event: FsEvent<'_>) {
+        if let Some(h) = &self.hook {
+            h.on_change(event);
+        }
+    }
+
+    /// Build a live [`Workspace`] from a serialized [`WorkspaceSpec`]: each mount
+    /// realized via [`VolumeSpec::build_mountable`](crate::VolumeSpec::build_mountable),
+    /// in the spec's order. This is how a spec carried across a process boundary
+    /// (see [`WorkspaceSpec`]) becomes an identical live tree on the far side.
+    pub fn from_spec(spec: &crate::WorkspaceSpec) -> Result<Self> {
+        let mut ws = Workspace::new();
+        for (path, volume) in &spec.mounts {
+            ws.mounts
+                .insert(mount_key(Path::new(path))?, volume.build_mountable()?);
+        }
+        Ok(ws)
     }
 
     /// Builder-style mount that overwrites any backend already at `path`.
@@ -301,17 +339,18 @@ fn normalize(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+#[async_trait]
 impl Mountable for Workspace {
     type Handle = Box<dyn FileHandle>;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
+    async fn stat(&self, path: &Path) -> Result<Stat> {
         let key = normalize(path)?;
         // Collapsing "no mount claims this" and "a mount claimed it and answered
         // NotFound" into one `Err(NotFound)` is what makes the arm below cover
         // both. Only checking whether routing failed would miss the second, which
         // is the case a root backend produces for every path it does not know.
         let answered = match self.route(&key) {
-            Some((backend, sub)) => backend.stat(&sub),
+            Some((backend, sub)) => backend.stat(&sub).await,
             None => Err(CortexError::NotFound),
         };
         match answered {
@@ -324,7 +363,7 @@ impl Mountable for Workspace {
         }
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let key = normalize(path)?;
         let children = self.mount_children(&key);
 
@@ -332,7 +371,7 @@ impl Mountable for Workspace {
         // question. A directory that exists only in the mount table simply has no
         // backend entries to start from.
         let answered = match self.route(&key) {
-            Some((backend, sub)) => backend.list(&sub),
+            Some((backend, sub)) => backend.list(&sub).await,
             None => Err(CortexError::NotFound),
         };
         let entries = match answered {
@@ -375,49 +414,86 @@ impl Mountable for Workspace {
         Ok(out)
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
+    async fn mkdir(&self, path: &Path) -> Result<()> {
         let key = normalize(path)?;
         // Already a directory, so this is `EEXIST` — not the `Ok(())` the backends
         // give for an existing directory. Recorded as a deliberate divergence: a
         // workspace answers for the whole namespace, where POSIX wants `EEXIST`.
         self.guard_synthesized(&key, CortexError::AlreadyExists)?;
         match self.route(&key) {
-            Some((backend, sub)) => backend.mkdir(&sub),
+            Some((backend, sub)) => backend.mkdir(&sub).await,
             None => Err(self.refusal_for_create(&key)),
         }
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
+    async fn unlink(&self, path: &Path) -> Result<()> {
         let key = normalize(path)?;
         self.guard_synthesized(&key, CortexError::IsADirectory)?;
-        match self.route(&key) {
-            Some((backend, sub)) => backend.unlink(&sub),
+        let r = match self.route(&key) {
+            Some((backend, sub)) => backend.unlink(&sub).await,
             None => Err(CortexError::NotFound),
+        };
+        if r.is_ok() {
+            self.fire(FsEvent::Removed(&key.to_string_lossy()));
         }
+        r
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
+    async fn rmdir(&self, path: &Path) -> Result<()> {
         let key = normalize(path)?;
         // Not empty: it holds the mount points below it, and those are not the
         // caller's to remove through the filesystem.
         self.guard_synthesized(&key, CortexError::NotEmpty)?;
-        match self.route(&key) {
-            Some((backend, sub)) => backend.rmdir(&sub),
+        let r = match self.route(&key) {
+            Some((backend, sub)) => backend.rmdir(&sub).await,
             None => Err(CortexError::NotFound),
+        };
+        if r.is_ok() {
+            self.fire(FsEvent::Removed(&key.to_string_lossy()));
         }
+        r
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         let key = normalize(path)?;
         self.guard_synthesized(&key, CortexError::IsADirectory)?;
-        match self.route(&key) {
-            Some((backend, sub)) => backend.open(&sub, options),
-            None if options.create => Err(self.refusal_for_create(&key)),
-            None => Err(CortexError::NotFound),
+        // Whether this open can mutate — decides if a write hook is armed. The
+        // create-vs-modify split is by pre-existence at open, checked only when a
+        // hook is actually attached. (`create_new` implies `create` upstream, so
+        // the refusal below only checks `create`; the broader OR here is a
+        // harmless superset.)
+        let writing = options.write || options.create || options.create_new || options.truncate;
+        let pre_existed = if writing && self.hook.is_some() {
+            match self.route(&key) {
+                Some((b, s)) => b.stat(&s).await.is_ok(),
+                None => false,
+            }
+        } else {
+            false
+        };
+        let (handle, stat) = match self.route(&key) {
+            Some((backend, sub)) => backend.open(&sub, options).await?,
+            None if options.create => {
+                return Err(self.refusal_for_create(&key));
+            }
+            None => return Err(CortexError::NotFound),
+        };
+        match (&self.hook, writing) {
+            (Some(hook), true) => {
+                let hooked = HookedHandle {
+                    inner: handle,
+                    hook: hook.clone(),
+                    path: key.to_string_lossy().into_owned(),
+                    pre_existed,
+                    fired: AtomicBool::new(false),
+                };
+                Ok((Box::new(hooked), stat))
+            }
+            _ => Ok((handle, stat)),
         }
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let (from_key, to_key) = (normalize(from)?, normalize(to)?);
 
         // Neither end may be something the mount table owns. Checked before the
@@ -453,7 +529,92 @@ impl Mountable for Workspace {
         let to_sub = to_key
             .strip_prefix(mount)
             .expect("both paths share this mount");
-        backend.rename(&from_sub, to_sub)
+        let to_existed = self.hook.is_some() && backend.stat(to_sub).await.is_ok();
+        let r = backend.rename(&from_sub, to_sub).await;
+        if r.is_ok() {
+            let from_s = from_key.to_string_lossy();
+            let to_s = to_key.to_string_lossy();
+            self.fire(FsEvent::Removed(&from_s));
+            self.fire(if to_existed {
+                FsEvent::Modified(&to_s)
+            } else {
+                FsEvent::Created(&to_s)
+            });
+        }
+        r
+    }
+}
+
+/// A serializable description of a whole [`Workspace`]: the ordered set of
+/// `(mount_path, volume)` pairs.
+///
+/// This is the artifact a caller reuses across a process boundary. A live
+/// `Workspace` holds open clients and runtimes that cannot cross to another
+/// process, so the thing shared between (say) a WebDAV server and a sandbox's VM
+/// helper is this spec — each side calls [`Workspace::from_spec`] to build its
+/// own live tree with an identical namespace.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceSpec {
+    /// `(mount_path, volume)` in insertion order. A mount at the empty path is
+    /// the root; deeper mounts shadow it (longest-prefix, see [`Workspace`]).
+    pub mounts: Vec<(String, crate::VolumeSpec)>,
+}
+
+impl WorkspaceSpec {
+    /// Builder-style: append a mount of `volume` at `path`.
+    pub fn mount(mut self, path: impl Into<String>, volume: crate::VolumeSpec) -> Self {
+        self.mounts.push((path.into(), volume));
+        self
+    }
+}
+
+/// A [`FileHandle`] that fires a workspace [`FsHook`] once, on `flush`/`commit`,
+/// with the create-vs-modify distinction fixed at open. Wraps the backend handle
+/// so positioned I/O passes straight through; only the write-out is observed.
+struct HookedHandle {
+    inner: Box<dyn FileHandle>,
+    hook: Arc<dyn FsHook>,
+    path: String,
+    pre_existed: bool,
+    fired: AtomicBool,
+}
+
+impl HookedHandle {
+    fn fire_once(&self) {
+        if !self.fired.swap(true, Ordering::Relaxed) {
+            self.hook.on_change(if self.pre_existed {
+                FsEvent::Modified(&self.path)
+            } else {
+                FsEvent::Created(&self.path)
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl FileExt for HookedHandle {
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+        self.inner.read_at(buf, offset).await
+    }
+    async fn write_at(&self, buf: &[u8], offset: u64) -> std::io::Result<usize> {
+        self.inner.write_at(buf, offset).await
+    }
+}
+
+#[async_trait]
+impl FileHandle for HookedHandle {
+    async fn truncate(&self, size: u64) -> Result<()> {
+        self.inner.truncate(size).await
+    }
+    async fn flush(&self) -> Result<()> {
+        let r = self.inner.flush().await;
+        self.fire_once();
+        r
+    }
+    async fn commit(&self) -> Result<()> {
+        let r = self.inner.commit().await;
+        self.fire_once();
+        r
     }
 }
 

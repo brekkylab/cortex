@@ -9,6 +9,8 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+use async_trait::async_trait;
+
 use crate::{CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat};
 
 /// A volume backed by a real on-disk directory.
@@ -45,10 +47,11 @@ impl PassthroughVolume {
     }
 }
 
+#[async_trait]
 impl Mountable for PassthroughVolume {
     type Handle = fs::File;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
+    async fn stat(&self, path: &Path) -> Result<Stat> {
         let real = self.real_path(path)?;
         let meta = fs::symlink_metadata(&real)?;
         let kind = if meta.is_dir() {
@@ -63,7 +66,7 @@ impl Mountable for PassthroughVolume {
         Ok(stat)
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let real = self.real_path(path)?;
         if !fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::NotADirectory);
@@ -86,7 +89,7 @@ impl Mountable for PassthroughVolume {
         Ok(out)
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
+    async fn mkdir(&self, path: &Path) -> Result<()> {
         let real = self.real_path(path)?;
         match fs::symlink_metadata(&real) {
             Ok(meta) if meta.is_dir() => Ok(()),
@@ -99,7 +102,7 @@ impl Mountable for PassthroughVolume {
         }
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
+    async fn unlink(&self, path: &Path) -> Result<()> {
         let real = self.real_path(path)?;
         if fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::IsADirectory);
@@ -108,7 +111,7 @@ impl Mountable for PassthroughVolume {
         Ok(())
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         // The whole overwrite contract is the kernel's here, and `From<io::Error>`
         // already carries its answers across: measured on macOS, `fs::rename` gives
         // `EISDIR` for file-over-directory, `ENOTDIR` for the reverse, `ENOTEMPTY`
@@ -120,7 +123,7 @@ impl Mountable for PassthroughVolume {
         Ok(())
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
+    async fn rmdir(&self, path: &Path) -> Result<()> {
         let real = self.real_path(path)?;
         if !fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::NotADirectory);
@@ -132,7 +135,7 @@ impl Mountable for PassthroughVolume {
         Ok(())
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         options.validate()?;
         let real = self.real_path(path)?;
 

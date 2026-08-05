@@ -42,11 +42,14 @@ fn ctx() -> Context {
 /// `greeting.txt` at the root plus an empty `sub/`.
 fn fs() -> PosixFs<InMemVolume> {
     let vol = InMemVolume::new();
-    let (file, _) = vol
-        .open(Path::new("greeting.txt"), OpenOptions::create_new())
-        .unwrap();
-    file.write_all_at(CONTENT, 0).unwrap();
-    vol.mkdir(Path::new("sub")).unwrap();
+    super::super::block_on(async {
+        let (file, _) = vol
+            .open(Path::new("greeting.txt"), OpenOptions::create_new())
+            .await
+            .unwrap();
+        file.write_all_at(CONTENT, 0).await.unwrap();
+        vol.mkdir(Path::new("sub")).await.unwrap();
+    });
     PosixFs::new(vol)
 }
 

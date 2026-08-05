@@ -2,6 +2,8 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use crate::{DirentKind, Result, Stat};
 
 /// One entry in a directory listing.
@@ -196,21 +198,27 @@ impl OpenOptions {
 ///
 /// Uses an associated `Handle` type, so it is **not** object-safe — use
 /// [`DynMountable`] where a `dyn`/`Box` is needed.
+///
+/// Async: the namespace/data plane is naturally async (an object store, a
+/// document API), so the trait is too. An async-native consumer (a WebDAV/HTTP
+/// frontend) `.await`s these directly; a sync interface binding (krun/fuse/
+/// fuse-t) `block_on`s them at its callback boundary — see `binding_runtime`.
+#[async_trait]
 pub trait Mountable: Send + Sync {
     /// The open-file handle this backend hands out.
     type Handle: super::FileHandle;
 
     /// Metadata for one entry (works on files *and* directories).
-    fn stat(&self, path: &Path) -> Result<Stat>;
+    async fn stat(&self, path: &Path) -> Result<Stat>;
 
     /// The entries directly under `path`.
     ///
     /// Each entry carries metadata only if the listing already had it; see
     /// [`Dirent::stat`].
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>>;
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>>;
 
     /// Create a directory at `path`.
-    fn mkdir(&self, path: &Path) -> Result<()>;
+    async fn mkdir(&self, path: &Path) -> Result<()>;
 
     /// Remove the *file* at `path`; a directory is rejected with
     /// [`IsADirectory`]. Use [`rmdir`] for those.
@@ -222,7 +230,7 @@ pub trait Mountable: Send + Sync {
     ///
     /// [`IsADirectory`]: crate::CortexError::IsADirectory
     /// [`rmdir`]: Self::rmdir
-    fn unlink(&self, path: &Path) -> Result<()>;
+    async fn unlink(&self, path: &Path) -> Result<()>;
 
     /// Remove the *empty directory* at `path`.
     ///
@@ -231,7 +239,7 @@ pub trait Mountable: Send + Sync {
     ///
     /// [`NotADirectory`]: crate::CortexError::NotADirectory
     /// [`NotEmpty`]: crate::CortexError::NotEmpty
-    fn rmdir(&self, path: &Path) -> Result<()>;
+    async fn rmdir(&self, path: &Path) -> Result<()>;
 
     /// Open the file at `path`, returning the handle with the entry's metadata as
     /// of the open.
@@ -240,7 +248,7 @@ pub trait Mountable: Send + Sync {
     /// attributes *and* a handle in one message; a second [`stat`](Self::stat)
     /// would cost another round trip and leave a window for the entry to be
     /// replaced. See [`OpenOptions`] for which options must be atomic.
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)>;
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)>;
 
     /// Move the entry at `from` to `to`, replacing whatever was there.
     ///
@@ -264,7 +272,7 @@ pub trait Mountable: Send + Sync {
     /// directory, and the mismatched pairs are `EISDIR`/`ENOTDIR`/`ENOTEMPTY`.
     /// Renaming a path onto itself succeeds without doing anything, and moving a
     /// directory inside itself is `EINVAL`.
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let _ = (from, to);
         Err(crate::CortexError::ReadOnly)
     }
@@ -280,35 +288,36 @@ pub trait Mountable: Send + Sync {
 ///
 /// The handle type passes straight through, so sharing costs nothing on the data
 /// plane: `Arc<T>` hands out `T`'s own handles rather than erased ones.
+#[async_trait]
 impl<T: Mountable> Mountable for Arc<T> {
     type Handle = T::Handle;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
-        Mountable::stat(&**self, path)
+    async fn stat(&self, path: &Path) -> Result<Stat> {
+        Mountable::stat(&**self, path).await
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
-        Mountable::list(&**self, path)
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+        Mountable::list(&**self, path).await
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
-        Mountable::mkdir(&**self, path)
+    async fn mkdir(&self, path: &Path) -> Result<()> {
+        Mountable::mkdir(&**self, path).await
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
-        Mountable::unlink(&**self, path)
+    async fn unlink(&self, path: &Path) -> Result<()> {
+        Mountable::unlink(&**self, path).await
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
-        Mountable::rmdir(&**self, path)
+    async fn rmdir(&self, path: &Path) -> Result<()> {
+        Mountable::rmdir(&**self, path).await
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
-        Mountable::open(&**self, path, options)
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+        Mountable::open(&**self, path, options).await
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        Mountable::rename(&**self, from, to)
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        Mountable::rename(&**self, from, to).await
     }
 }
 
@@ -322,65 +331,72 @@ impl<T: Mountable> Mountable for Arc<T> {
 /// so callers never implement it by hand.
 ///
 /// [`Workspace`]: crate::Workspace
+#[async_trait]
 pub trait DynMountable: Send + Sync {
     /// See [`Mountable::stat`].
-    fn stat(&self, path: &Path) -> Result<Stat>;
+    async fn stat(&self, path: &Path) -> Result<Stat>;
 
     /// See [`Mountable::list`].
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>>;
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>>;
 
     /// See [`Mountable::mkdir`].
-    fn mkdir(&self, path: &Path) -> Result<()>;
+    async fn mkdir(&self, path: &Path) -> Result<()>;
 
     /// See [`Mountable::unlink`].
-    fn unlink(&self, path: &Path) -> Result<()>;
+    async fn unlink(&self, path: &Path) -> Result<()>;
 
     /// See [`Mountable::rmdir`].
-    fn rmdir(&self, path: &Path) -> Result<()>;
+    async fn rmdir(&self, path: &Path) -> Result<()>;
 
     /// See [`Mountable::open`], with the concrete handle boxed behind a trait
     /// object.
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)>;
+    async fn open(&self, path: &Path, options: OpenOptions)
+        -> Result<(Box<dyn FileHandle>, Stat)>;
 
     /// See [`Mountable::rename`]. No default here — the blanket impl always
     /// supplies one, forwarding to whatever the backend decided.
-    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()>;
 }
 
 /// Every [`Mountable`] is a [`DynMountable`] once its handle is boxed. The
 /// `'static` bound lets the erased handle become a `Box<dyn FileHandle>`.
+#[async_trait]
 impl<T> DynMountable for T
 where
     T: Mountable,
     T::Handle: 'static,
 {
-    fn stat(&self, path: &Path) -> Result<Stat> {
-        Mountable::stat(self, path)
+    async fn stat(&self, path: &Path) -> Result<Stat> {
+        Mountable::stat(self, path).await
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
-        Mountable::list(self, path)
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+        Mountable::list(self, path).await
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
-        Mountable::mkdir(self, path)
+    async fn mkdir(&self, path: &Path) -> Result<()> {
+        Mountable::mkdir(self, path).await
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
-        Mountable::unlink(self, path)
+    async fn unlink(&self, path: &Path) -> Result<()> {
+        Mountable::unlink(self, path).await
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
-        Mountable::rmdir(self, path)
+    async fn rmdir(&self, path: &Path) -> Result<()> {
+        Mountable::rmdir(self, path).await
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)> {
-        let (handle, stat) = Mountable::open(self, path, options)?;
+    async fn open(
+        &self,
+        path: &Path,
+        options: OpenOptions,
+    ) -> Result<(Box<dyn FileHandle>, Stat)> {
+        let (handle, stat) = Mountable::open(self, path, options).await?;
         Ok((Box::new(handle), stat))
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        Mountable::rename(self, from, to)
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        Mountable::rename(self, from, to).await
     }
 }
 
@@ -398,16 +414,17 @@ where
 /// so they work on the `Arc`-shared handles concurrent readers hold.
 ///
 /// [`truncate`]: Self::truncate
+#[async_trait]
 pub trait FileHandle: FileExt + Send + Sync {
     /// Resize the file to `size` bytes, zero-filling any growth.
-    fn truncate(&self, size: u64) -> Result<()>;
+    async fn truncate(&self, size: u64) -> Result<()>;
 
-    fn flush(&self) -> Result<()> {
+    async fn flush(&self) -> Result<()> {
         Ok(())
     }
 
-    fn commit(&self) -> Result<()> {
-        self.flush()
+    async fn commit(&self) -> Result<()> {
+        self.flush().await
     }
 }
 
@@ -428,8 +445,9 @@ pub struct SetAttr {
 /// A plain [`std::fs::File`] is a ready-made handle for a local passthrough
 /// backend: [`FileExt`] supplies the data plane, `set_len`
 /// resizes, and there is nothing buffered to flush.
+#[async_trait]
 impl FileHandle for std::fs::File {
-    fn truncate(&self, size: u64) -> Result<()> {
+    async fn truncate(&self, size: u64) -> Result<()> {
         self.set_len(size)?;
         Ok(())
     }
@@ -438,24 +456,26 @@ impl FileHandle for std::fs::File {
 /// A boxed handle is itself a handle, so it can serve as the `Handle` of an
 /// erased backend (e.g. [`Workspace`](crate::Workspace), whose handle is exactly
 /// `Box<dyn FileHandle>`). Every call forwards to the inner handle.
+#[async_trait]
 impl FileExt for Box<dyn FileHandle> {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        (**self).read_at(buf, offset)
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        (**self).read_at(buf, offset).await
     }
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
-        (**self).write_at(buf, offset)
+    async fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        (**self).write_at(buf, offset).await
     }
 }
 
+#[async_trait]
 impl FileHandle for Box<dyn FileHandle> {
-    fn truncate(&self, size: u64) -> Result<()> {
-        (**self).truncate(size)
+    async fn truncate(&self, size: u64) -> Result<()> {
+        (**self).truncate(size).await
     }
-    fn flush(&self) -> Result<()> {
-        (**self).flush()
+    async fn flush(&self) -> Result<()> {
+        (**self).flush().await
     }
-    fn commit(&self) -> Result<()> {
-        (**self).commit()
+    async fn commit(&self) -> Result<()> {
+        (**self).commit().await
     }
 }
 
@@ -470,19 +490,20 @@ impl FileHandle for Box<dyn FileHandle> {
 ///
 /// The whole-buffer helpers ([`read_exact_at`](Self::read_exact_at)/
 /// [`write_all_at`](Self::write_all_at)) come with defaults, mirroring std.
-pub trait FileExt {
+#[async_trait]
+pub trait FileExt: Send + Sync {
     /// Read into `buf` at `offset`, returning the bytes read — fewer than
     /// `buf.len()` (possibly `0`) at EOF.
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
 
     /// Write `buf` at `offset`, zero-extending the file if needed; returns the
     /// bytes written.
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
+    async fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
 
     /// Read the exact number of bytes required to fill `buf` from `offset`.
-    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+    async fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
         while !buf.is_empty() {
-            match self.read_at(buf, offset)? {
+            match self.read_at(buf, offset).await? {
                 0 => break,
                 n => {
                     buf = &mut buf[n..];
@@ -502,9 +523,9 @@ pub trait FileExt {
 
     /// Write all of `buf` starting at `offset`, erroring if a write ever
     /// reports zero bytes.
-    fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+    async fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
         while !buf.is_empty() {
-            match self.write_at(buf, offset)? {
+            match self.write_at(buf, offset).await? {
                 0 => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -524,11 +545,12 @@ pub trait FileExt {
 /// On unix, forward to `pread`/`pwrite` via std's `FileExt` — these do not move
 /// the file's cursor, so `Arc`-shared concurrent readers stay independent.
 #[cfg(unix)]
+#[async_trait]
 impl FileExt for std::fs::File {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         std::os::unix::fs::FileExt::read_at(self, buf, offset)
     }
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+    async fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         std::os::unix::fs::FileExt::write_at(self, buf, offset)
     }
 }
@@ -538,11 +560,12 @@ impl FileExt for std::fs::File {
 /// shared `File` can race on that cursor. A windows backend that needs true
 /// independent readers should open a handle per reader rather than share one.
 #[cfg(windows)]
+#[async_trait]
 impl FileExt for std::fs::File {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         std::os::windows::fs::FileExt::seek_read(self, buf, offset)
     }
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+    async fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         std::os::windows::fs::FileExt::seek_write(self, buf, offset)
     }
 }

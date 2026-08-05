@@ -9,6 +9,8 @@ use std::path::{Component, Path};
 
 use serde_json::{Value, json};
 
+use async_trait::async_trait;
+
 use crate::{
     CortexError, Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, Result, Stat,
     Workspace,
@@ -19,8 +21,9 @@ pub use crate::wire::ExecOutput;
 /// Something that runs against a [`Workspace`] and returns process-like output.
 /// `Err` is infrastructure failure; a program's own failure is a non-zero
 /// `code` in the [`ExecOutput`].
-pub trait Executable {
-    fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput>;
+#[async_trait]
+pub trait Executable: Send + Sync {
+    async fn exec(&self, ws: &Workspace, args: Vec<String>) -> Result<ExecOutput>;
 }
 
 /// An [`Executable`] packaged as a `wsx` skill: addressable by `name`, with
@@ -35,6 +38,7 @@ pub trait Skillable: Executable {
 }
 
 /// An [`Executable`] packaged as a native tool-calling tool.
+#[async_trait]
 pub trait Toolable: Executable {
     fn name(&self) -> &str;
     fn description(&self) -> &str {
@@ -56,8 +60,8 @@ pub trait Toolable: Executable {
     }
 
     /// `to_argv` → `exec` → `to_result`. `Err` is infra; a tool failure is in the `Value`.
-    fn call(&self, ws: &Workspace, args: &Value) -> Result<Value> {
-        Ok(self.to_result(self.exec(ws, self.to_argv(args))?))
+    async fn call(&self, ws: &Workspace, args: &Value) -> Result<Value> {
+        Ok(self.to_result(self.exec(ws, self.to_argv(args)).await?))
     }
 }
 
@@ -89,9 +93,9 @@ impl Bin {
 
     /// Invoke the named executable. `Err(NotFound)` = unknown name (the allowlist
     /// boundary); a program failure is a non-zero `code`, not an `Err`.
-    pub fn invoke(&self, ws: &Workspace, name: &str, args: Vec<String>) -> Result<ExecOutput> {
+    pub async fn invoke(&self, ws: &Workspace, name: &str, args: Vec<String>) -> Result<ExecOutput> {
         let exec = self.get(name).ok_or(CortexError::NotFound)?;
-        Ok(match exec.exec(ws, args) {
+        Ok(match exec.exec(ws, args).await {
             Ok(out) => out,
             Err(e) => ExecOutput {
                 code: 1,
@@ -155,8 +159,9 @@ pub struct SkillFile {
     data: Vec<u8>,
 }
 
+#[async_trait]
 impl FileExt for SkillFile {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         let off = offset as usize;
         if off >= self.data.len() {
             return Ok(0);
@@ -166,7 +171,7 @@ impl FileExt for SkillFile {
         Ok(n)
     }
 
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
+    async fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
         // `ReadOnlyFilesystem`, not `PermissionDenied`: `From<io::Error>` turns
         // exactly this kind back into `CortexError::ReadOnly`, so userspace hears
         // EROFS. EACCES would claim *this caller* lacks permission, when no caller
@@ -175,16 +180,18 @@ impl FileExt for SkillFile {
     }
 }
 
+#[async_trait]
 impl FileHandle for SkillFile {
-    fn truncate(&self, _size: u64) -> Result<()> {
+    async fn truncate(&self, _size: u64) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 }
 
+#[async_trait]
 impl Mountable for SkillDir {
     type Handle = SkillFile;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
+    async fn stat(&self, path: &Path) -> Result<Stat> {
         let comps = comps(path)?;
         match comps.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             [] => Ok(Stat::new(DirentKind::Dir, 0)),
@@ -196,7 +203,7 @@ impl Mountable for SkillDir {
         }
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let comps = comps(path)?;
         match comps.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             [] => {
@@ -222,19 +229,19 @@ impl Mountable for SkillDir {
     // operation — the distinction `S3Volume` draws for the same reason, and why
     // userspace gets EROFS (which `cp`, `rsync` and editors have a path for) rather
     // than ENOSYS.
-    fn mkdir(&self, _path: &Path) -> Result<()> {
+    async fn mkdir(&self, _path: &Path) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 
-    fn unlink(&self, _path: &Path) -> Result<()> {
+    async fn unlink(&self, _path: &Path) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 
-    fn rmdir(&self, _path: &Path) -> Result<()> {
+    async fn rmdir(&self, _path: &Path) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         options.validate()?;
         // Refused before the path is resolved, because nothing about the doc changes
         // the answer.
@@ -279,8 +286,9 @@ mod tests {
     /// A trivial executable that ignores the workspace and echoes its args —
     /// enough to exercise dispatch and the tool path without touching a backend.
     struct Echo;
+    #[async_trait]
     impl Executable for Echo {
-        fn exec(&self, _ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
+        async fn exec(&self, _ws: &Workspace, args: Vec<String>) -> Result<ExecOutput> {
             Ok(ExecOutput::ok(args.join(" ").into_bytes()))
         }
     }
@@ -313,9 +321,9 @@ mod tests {
         }
     }
 
-    fn names(m: &dyn Mountable<Handle = SkillFile>, path: &str) -> Vec<String> {
+    async fn names(m: &dyn Mountable<Handle = SkillFile>, path: &str) -> Vec<String> {
         let mut n: Vec<_> = m
-            .list(Path::new(path))
+            .list(Path::new(path)).await
             .unwrap()
             .into_iter()
             .map(|entry| entry.name)
@@ -324,58 +332,58 @@ mod tests {
         n
     }
 
-    #[test]
-    fn dispatch_and_unknown_name() {
+    #[tokio::test]
+    async fn dispatch_and_unknown_name() {
         let ws = Workspace::new();
         let bin = Bin::new().register(Echo);
         assert_eq!(
-            bin.invoke(&ws, "echo", vec!["hi".into()]).unwrap().stdout,
+            bin.invoke(&ws, "echo", vec!["hi".into()]).await.unwrap().stdout,
             b"hi"
         );
         assert!(matches!(
-            bin.invoke(&ws, "nope", vec![]),
+            bin.invoke(&ws, "nope", vec![]).await,
             Err(CortexError::NotFound)
         ));
     }
 
-    #[test]
-    fn skilldir_tree_and_read() {
+    #[tokio::test]
+    async fn skilldir_tree_and_read() {
         let docs = Bin::new().register(Echo).as_dir();
-        assert_eq!(names(&docs, ""), vec!["AGENT.md", "echo"]);
-        assert_eq!(names(&docs, "echo"), vec!["SKILL.md"]);
+        assert_eq!(names(&docs, "").await, vec!["AGENT.md", "echo"]);
+        assert_eq!(names(&docs, "echo").await, vec!["SKILL.md"]);
 
-        let st = docs.stat(Path::new("echo/SKILL.md")).unwrap();
+        let st = docs.stat(Path::new("echo/SKILL.md")).await.unwrap();
         assert_eq!(st.kind, DirentKind::File);
         let (h, opened) = docs
-            .open(Path::new("echo/SKILL.md"), OpenOptions::read_only())
+            .open(Path::new("echo/SKILL.md"), OpenOptions::read_only()).await
             .unwrap();
         assert_eq!(opened.size, st.size, "the open must agree with `stat`");
         let mut buf = vec![0u8; opened.size as usize];
-        h.read_exact_at(&mut buf, 0).unwrap();
+        h.read_exact_at(&mut buf, 0).await.unwrap();
         assert_eq!(buf, b"# echo\n`wsx echo <msg>`");
 
         // The open carries its own metadata, so there is no second `stat` here.
         let (agent, opened) = docs
-            .open(Path::new("AGENT.md"), OpenOptions::read_only())
+            .open(Path::new("AGENT.md"), OpenOptions::read_only()).await
             .unwrap();
         let mut a = vec![0u8; opened.size as usize];
-        agent.read_exact_at(&mut a, 0).unwrap();
+        agent.read_exact_at(&mut a, 0).await.unwrap();
         assert!(String::from_utf8_lossy(&a).contains("| `echo` | echo args | `echo/SKILL.md` |"));
     }
 
-    #[test]
-    fn skilldir_is_read_only_and_errors() {
+    #[tokio::test]
+    async fn skilldir_is_read_only_and_errors() {
         let docs = Bin::new().register(Echo).as_dir();
 
         // `ReadOnly`, not `Unsupported`: a rendered view of skills will not write,
         // rather than having no notion of writing — so userspace hears EROFS, which
         // it has a path for, instead of ENOSYS.
         for refused in [
-            docs.open(Path::new("x"), OpenOptions::create_new())
+            docs.open(Path::new("x"), OpenOptions::create_new()).await
                 .map(|_| ()),
-            docs.mkdir(Path::new("x")),
-            docs.unlink(Path::new("x")),
-            docs.rmdir(Path::new("x")),
+            docs.mkdir(Path::new("x")).await,
+            docs.unlink(Path::new("x")).await,
+            docs.rmdir(Path::new("x")).await,
         ] {
             assert!(
                 matches!(&refused, Err(CortexError::ReadOnly)),
@@ -384,30 +392,30 @@ mod tests {
         }
 
         assert!(matches!(
-            docs.open(Path::new(""), OpenOptions::read_only()),
+            docs.open(Path::new(""), OpenOptions::read_only()).await,
             Err(CortexError::IsADirectory)
         ));
         assert!(matches!(
-            docs.open(Path::new("nope/SKILL.md"), OpenOptions::read_only()),
+            docs.open(Path::new("nope/SKILL.md"), OpenOptions::read_only()).await,
             Err(CortexError::NotFound)
         ));
 
         // The opened handle rejects writes, and as EROFS rather than EACCES: this is
         // the one kind `From<io::Error>` turns back into `ReadOnly`.
         let (h, _) = docs
-            .open(Path::new("AGENT.md"), OpenOptions::read_only())
+            .open(Path::new("AGENT.md"), OpenOptions::read_only()).await
             .unwrap();
-        let err = h.write_at(b"x", 0).unwrap_err();
+        let err = h.write_at(b"x", 0).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ReadOnlyFilesystem);
         assert!(matches!(CortexError::from(err), CortexError::ReadOnly));
-        assert!(matches!(h.truncate(0), Err(CortexError::ReadOnly)));
+        assert!(matches!(h.truncate(0).await, Err(CortexError::ReadOnly)));
     }
 
-    #[test]
-    fn toolable_call_maps_args_and_result() {
+    #[tokio::test]
+    async fn toolable_call_maps_args_and_result() {
         let ws = Workspace::new();
         let tool: &dyn Toolable = &Echo;
         assert_eq!(tool.to_argv(&json!({ "msg": "hi" })), ["hi"]);
-        assert_eq!(tool.call(&ws, &json!({ "msg": "hi" })).unwrap(), json!("hi"));
+        assert_eq!(tool.call(&ws, &json!({ "msg": "hi" })).await.unwrap(), json!("hi"));
     }
 }
