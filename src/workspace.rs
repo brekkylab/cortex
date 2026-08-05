@@ -84,7 +84,20 @@ impl Workspace {
     /// Build a live [`Workspace`] from a serialized [`WorkspaceSpec`]: each mount
     /// realized via [`VolumeSpec::build_mountable`](crate::VolumeSpec::build_mountable),
     /// in the spec's order. This is how a spec carried across a process boundary
-    /// (see [`WorkspaceSpec`]) becomes an identical live tree on the far side.
+    /// (see [`WorkspaceSpec`]) becomes an identical *namespace* on the far side.
+    ///
+    /// Restores the namespace only — the two instance-local fields are not in the
+    /// spec, by design:
+    /// - [`hook`](Self::with_hook) cannot be: it is arbitrary host behaviour
+    ///   (closing over live channels, indexers) that no serialization can carry to
+    ///   another process, and the far side has nothing to react with anyway. The
+    ///   process that owns the reaction attaches it here: `from_spec(&spec)?
+    ///   .with_hook(hook)`.
+    /// - `born` is left fresh. Its job is to stay fixed across *one* instance's
+    ///   lifetime (so a guest's `AUTO_INVAL_DATA` cache does not churn), which a
+    ///   per-build timestamp already satisfies; only the synthesized-directory
+    ///   timestamps differ between two builds of the same spec, and each build is
+    ///   self-consistent.
     pub fn from_spec(spec: &crate::WorkspaceSpec) -> Result<Self> {
         let mut ws = Workspace::new();
         for (path, volume) in &spec.mounts {
@@ -545,14 +558,20 @@ impl Mountable for Workspace {
     }
 }
 
-/// A serializable description of a whole [`Workspace`]: the ordered set of
-/// `(mount_path, volume)` pairs.
+/// A serializable description of a whole [`Workspace`]'s *namespace*: the ordered
+/// set of `(mount_path, volume)` pairs.
 ///
 /// This is the artifact a caller reuses across a process boundary. A live
 /// `Workspace` holds open clients and runtimes that cannot cross to another
 /// process, so the thing shared between (say) a WebDAV server and a sandbox's VM
 /// helper is this spec — each side calls [`Workspace::from_spec`] to build its
 /// own live tree with an identical namespace.
+///
+/// The namespace is all that crosses. A live `Workspace`'s two instance-local
+/// fields stay behind: its [`hook`](Workspace::with_hook), which is host
+/// behaviour no serialization can carry (and which the far side has nothing to
+/// react with), and its `born` timestamp. Each side attaches its own hook after
+/// [`from_spec`](Workspace::from_spec) — see that method for the reasoning.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceSpec {
     /// `(mount_path, volume)` in insertion order. A mount at the empty path is
