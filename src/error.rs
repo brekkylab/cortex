@@ -145,9 +145,51 @@ impl From<std::io::Error> for CortexError {
             ErrorKind::PermissionDenied => CortexError::PermissionDenied,
             ErrorKind::StorageFull => CortexError::NoSpace,
             ErrorKind::ReadOnlyFilesystem => CortexError::ReadOnly,
+            // `Workspace::rename` answers `CrossDevice` for the same move, and `mv`
+            // reads EXDEV as "copy, then delete" where it has no branch for EIO.
+            ErrorKind::CrossesDevices => CortexError::CrossDevice,
             _ => CortexError::Io(e),
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, CortexError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::ErrorKind as K;
+
+    /// The whole table, not the arm that happened to be added last. Every row is
+    /// here because the `_` fallthrough would send it to userspace as EIO instead,
+    /// and a deleted arm changes nothing a compiler or another test can see.
+    #[test]
+    fn every_kind_the_table_names_keeps_its_variant() {
+        let rows = [
+            (K::NotFound, CortexError::NotFound),
+            (K::AlreadyExists, CortexError::AlreadyExists),
+            (K::DirectoryNotEmpty, CortexError::NotEmpty),
+            (K::FileTooLarge, CortexError::FileTooLarge),
+            (K::IsADirectory, CortexError::IsADirectory),
+            (K::NotADirectory, CortexError::NotADirectory),
+            (K::InvalidInput, CortexError::InvalidArgument),
+            (K::Unsupported, CortexError::Unsupported),
+            (K::PermissionDenied, CortexError::PermissionDenied),
+            (K::StorageFull, CortexError::NoSpace),
+            (K::ReadOnlyFilesystem, CortexError::ReadOnly),
+            (K::CrossesDevices, CortexError::CrossDevice),
+        ];
+        for (kind, expected) in rows {
+            let got = CortexError::from(std::io::Error::from(kind));
+            assert_eq!(format!("{got:?}"), format!("{expected:?}"), "{kind:?}");
+        }
+    }
+
+    /// And a kind the table does not name stays `Io`, which is what makes naming
+    /// the ones above a decision rather than decoration.
+    #[test]
+    fn an_unnamed_kind_stays_io() {
+        let got = CortexError::from(std::io::Error::from(K::WouldBlock));
+        assert!(matches!(got, CortexError::Io(_)));
+    }
+}
