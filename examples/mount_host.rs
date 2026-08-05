@@ -25,10 +25,8 @@
 //! cannot say "fuse or fuse-t" and naming either would lock the other out. The
 //! no-feature build gets the `main` at the bottom instead.
 
-#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
-use cortex::CortexMount as Mount;
-#[cfg(feature = "fuse-t")]
-use cortex::FuseTMount as Mount;
+#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+use cortex::HostMount;
 
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
 fn main() {
@@ -58,7 +56,7 @@ fn main() {
         .try_with_mount("", vol)
         .expect("the empty mount path never escapes the workspace root");
 
-    let mount = Mount::spawn(PosixFs::new(workspace), &mountpoint).expect("mount");
+    let mount = HostMount::spawn(PosixFs::new(workspace), &mountpoint).expect("mount");
     println!("mounted at {}", mount.mountpoint().display());
     println!("  ls {mountpoint}");
     println!("  cat {mountpoint}/hello.txt");

@@ -60,10 +60,7 @@ use cortex::{
     Dirent, FileExt, FileHandle, InMemVolume, Mountable, OpenOptions, PosixFs, Result, Stat,
 };
 
-#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
-use cortex::CortexMount as Mount;
-#[cfg(feature = "fuse-t")]
-use cortex::FuseTMount as Mount;
+use cortex::HostMount;
 
 /// Set once the mount is up, so the reads the mount itself performs while coming
 /// up do not land in the sample.
@@ -207,7 +204,7 @@ fn main() {
     }
     drop(filler);
 
-    let mount = Mount::spawn(PosixFs::new(Recorder(vol)), &mountpoint).expect("mount");
+    let mount = HostMount::spawn(PosixFs::new(Recorder(vol)), &mountpoint).expect("mount");
     let base = Path::new(&mountpoint);
     RECORDING.store(true, Ordering::Relaxed);
 

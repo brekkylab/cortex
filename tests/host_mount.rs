@@ -54,11 +54,7 @@ use cortex::{InMemVolume, Mountable, OpenOptions, PosixFs, Workspace};
 // One set of test bodies for both host bindings: they expose the same call
 // surface, so which is under test is a matter of which feature is on — making
 // these tests evidence that the two behave *alike*, not just that each behaves.
-// FUSE-T wins a tie, being the one that needs no kernel extension.
-#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
-use cortex::CortexMount as Mount;
-#[cfg(feature = "fuse-t")]
-use cortex::FuseTMount as Mount;
+use cortex::HostMount;
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {
@@ -87,7 +83,7 @@ fn volume() -> InMemVolume {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_cortex_mount() {
     let mnt = mountpoint("read");
-    let mount = Mount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
+    let mount = HostMount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
 
     // `read_dir` is a real `readdir`, so this exercises the cursor protocol as
     // the kernel drives it rather than as our unit tests drive it.
@@ -130,7 +126,7 @@ fn the_operating_system_can_read_a_multi_source_workspace() {
         .expect("mount path stays inside the workspace")
         .try_with_mount("notes", volume())
         .expect("mount path stays inside the workspace");
-    let mount = Mount::spawn(PosixFs::new(ws), &mnt).expect("mount");
+    let mount = HostMount::spawn(PosixFs::new(ws), &mnt).expect("mount");
 
     // The mount points show up as directories even though no backend serves the
     // directory that holds them.
@@ -173,7 +169,7 @@ fn the_operating_system_sees_real_timestamps() {
 
     let mnt = mountpoint("times");
     let started = SystemTime::now();
-    let mount = Mount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
+    let mount = HostMount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
 
     let modified = |name: &str| {
         fs::metadata(mnt.join(name))
@@ -224,7 +220,7 @@ fn the_operating_system_sees_real_timestamps() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
     let mnt = mountpoint("rename");
-    let mount = Mount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
+    let mount = HostMount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
 
     // Write-temp-then-rename, exactly as an editor does.
     fs::write(mnt.join("greeting.txt.tmp"), b"edited by an editor\n").unwrap();
@@ -272,7 +268,7 @@ fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_write_to_a_cortex_mount() {
     let mnt = mountpoint("write");
-    let mount = Mount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
+    let mount = HostMount::spawn(PosixFs::new(volume()), &mnt).expect("mount");
 
     // `fs::write` is create + write + close, so this covers the whole chain the
     // kernel actually sends: CREATE, WRITE, FLUSH, RELEASE.
@@ -324,7 +320,7 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn a_read_only_mount_is_enforced_by_the_kernel() {
     let mnt = mountpoint("readonly");
-    let mount = Mount::spawn_with(
+    let mount = HostMount::spawn_with(
         PosixFs::new(volume()),
         &mnt,
         vec![
