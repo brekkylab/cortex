@@ -1,3 +1,29 @@
+//! Expose any path-addressed store as a real filesystem.
+//!
+//! A store implements one trait — [`Mountable`] — and a binding puts it in front
+//! of a concrete interface. The contract names no interface, so one backend
+//! serves a host mount, a guest microVM, or a consumer that addresses files by
+//! path.
+//!
+//! # Using one
+//!
+//! Pick a backend — [`InMemVolume`], [`PassthroughVolume`], `S3Volume`, or
+//! [`Workspace`] to graft several under one tree — wrap it in [`PosixFs`], and
+//! give that to a binding. `HostMount` is whichever host binding the build
+//! enabled; `msb_krun`'s `FsBuilder::custom` takes the same [`PosixFs`] for a
+//! guest. No binding is enabled by default. `examples/mount_host.rs` and
+//! `src/bin/apply_krun.rs` walk those two paths end to end.
+//!
+//! # Implementing one
+//!
+//! [`Mountable`] is the whole contract: seven operations addressed by path plus a
+//! [`FileHandle`] for offset I/O, and its docs carry the invariants a binding
+//! relies on. [`PosixFs`] is not part of it — that is the translation a *kernel*
+//! needs, because kernels address files by number — so an implementor can ignore
+//! it.
+//!
+//! `ARCHITECTURE.md` has the long form.
+
 mod demo;
 mod error;
 mod executable;
