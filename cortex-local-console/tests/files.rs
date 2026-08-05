@@ -1,0 +1,243 @@
+//! End-to-end over the real binary: the file plane, and that it shares a namespace with
+//! the commands.
+//!
+//! A `read` and a `write` are answered by the server process, not by this one, so the only
+//! way to see what they actually do is to put a file somewhere and ask across the channel
+//! — and then to run a command that opens the same path by the same name, which is the
+//! property the two planes are supposed to have.
+
+use std::process::{Command, Stdio};
+
+use cortex::console::stdio::StdioClient;
+use cortex::console::{Console, Error, ExecResult, Failure, Read, ReadResult, Write};
+use tempfile::TempDir;
+
+/// A console over the real binary, and a directory to put files in.
+struct Fixture {
+    console: Console,
+    dir: TempDir,
+}
+
+impl Fixture {
+    fn new() -> Fixture {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+        server.stderr(Stdio::inherit());
+        let client = StdioClient::new(server).expect("starting the console server");
+
+        let mut console = Console::builder()
+            .client(client)
+            .default_timeout_ms(30_000)
+            .build()
+            .expect("building the console");
+        console.start().expect("booting the server");
+
+        Fixture {
+            console,
+            dir: tempfile::tempdir().expect("a temp directory"),
+        }
+    }
+
+    /// An absolute path under this fixture's directory. Absolute because the server is a
+    /// process of its own and its working directory is not this test's to assume.
+    fn path(&self, name: &str) -> String {
+        self.dir.path().join(name).to_str().expect("utf-8").into()
+    }
+
+    fn write(&mut self, path: &str, data: &[u8], offset: Option<u64>) -> u64 {
+        self.console
+            .write(Write {
+                path: self.path(path),
+                data: data.to_vec(),
+                offset,
+            })
+            .expect("writing")
+            .size
+    }
+
+    fn read(&mut self, path: &str, offset: Option<u64>, len: Option<u64>) -> ReadResult {
+        self.console
+            .read(Read {
+                path: self.path(path),
+                offset,
+                len,
+            })
+            .expect("reading")
+    }
+
+    fn output(&mut self, script: &str) -> ExecResult {
+        self.console
+            .exec(["sh", "-c", script])
+            .expect("running the command")
+    }
+}
+
+/// The round trip, on bytes that are not text: what a `write` sent is what a `read`
+/// brings back, and `size` is the whole of it.
+#[test]
+fn what_a_write_sent_is_what_a_read_brings_back() {
+    let mut fx = Fixture::new();
+    let bytes = [0xff, 0xfe, 0x00, b'\n', 0x00];
+
+    assert_eq!(fx.write("raw", &bytes, None), 5);
+
+    let out = fx.read("raw", None, None);
+    assert_eq!(out.data, bytes);
+    assert_eq!(out.size, 5);
+}
+
+/// The two planes name the same file. A command writes it, a `read` brings it back, a
+/// `write` replaces it, and the next command sees that.
+#[test]
+fn a_file_is_the_same_file_to_a_command() {
+    let mut fx = Fixture::new();
+    let path = fx.path("shared");
+
+    fx.output(&format!("printf 'from the command' > {path}"));
+    assert_eq!(fx.read("shared", None, None).data, b"from the command");
+
+    fx.write("shared", b"from the client", None);
+    assert_eq!(fx.output(&format!("cat {path}")).stdout, b"from the client");
+}
+
+/// No offset means the file is to *be* `data`, so a shorter write leaves nothing of a
+/// longer file behind.
+#[test]
+fn a_whole_file_write_replaces_what_was_there() {
+    let mut fx = Fixture::new();
+
+    fx.write("f", b"a much longer first version", None);
+    assert_eq!(fx.write("f", b"short", None), 5);
+
+    let out = fx.read("f", None, None);
+    assert_eq!(out.data, b"short");
+    assert_eq!(out.size, 5);
+}
+
+/// An offset speaks only for the bytes it covers, so the rest of the file stays — which
+/// is what makes `None` and `Some(0)` different requests.
+#[test]
+fn a_positioned_write_leaves_the_rest_alone() {
+    let mut fx = Fixture::new();
+
+    fx.write("f", b"aaaaaaaaaa", None);
+    assert_eq!(fx.write("f", b"BBB", Some(3)), 10);
+    assert_eq!(fx.read("f", None, None).data, b"aaaBBBaaaa");
+
+    // The same bytes at the same place, sent the other way, are the whole file instead.
+    assert_eq!(fx.write("f", b"BBB", None), 3);
+    assert_eq!(fx.read("f", None, None).data, b"BBB");
+}
+
+/// Writing past the end extends the file, and the gap reads as zeroes rather than as
+/// whatever was on the disk.
+#[test]
+fn a_write_past_the_end_zero_fills_the_gap() {
+    let mut fx = Fixture::new();
+
+    fx.write("f", b"ab", None);
+    assert_eq!(fx.write("f", b"z", Some(5)), 6);
+    assert_eq!(fx.read("f", None, None).data, b"ab\0\0\0z");
+}
+
+/// A bounded read hands back its slice, and `size` is the file rather than the slice —
+/// which is the only thing that says there is more to ask for.
+#[test]
+fn a_bounded_read_says_how_much_it_left() {
+    let mut fx = Fixture::new();
+    fx.write("f", b"0123456789", None);
+
+    let out = fx.read("f", Some(3), Some(4));
+    assert_eq!(out.data, b"3456");
+    assert_eq!(out.size, 10);
+
+    // Asking for more than is left is not an error; it is just the rest.
+    let out = fx.read("f", Some(8), Some(100));
+    assert_eq!(out.data, b"89");
+    assert_eq!(out.size, 10);
+}
+
+/// Starting past the end asks for nothing, which is an empty answer and not a failure.
+#[test]
+fn a_read_past_the_end_is_empty_and_not_an_error() {
+    let mut fx = Fixture::new();
+    fx.write("f", b"0123456789", None);
+
+    let out = fx.read("f", Some(50), None);
+    assert!(out.data.is_empty());
+    assert_eq!(out.size, 10);
+}
+
+/// A `write` makes the file but not the directories above it, so a path through one that
+/// is not there is the same `NOT_FOUND` a missing file is to a `read`.
+#[test]
+fn a_path_that_is_not_there_is_not_found() {
+    let mut fx = Fixture::new();
+
+    let missing = fx.path("nothing-here");
+    let refused = fx
+        .console
+        .read(Read {
+            path: missing,
+            ..Read::default()
+        })
+        .expect_err("reading a file that is not there");
+    assert_eq!(refused.code(), Some(Error::NOT_FOUND));
+
+    let nested = fx.path("no/such/dir/f");
+    let refused = fx
+        .console
+        .write(Write {
+            path: nested,
+            data: b"x".to_vec(),
+            offset: None,
+        })
+        .expect_err("writing under a directory that is not there");
+    assert_eq!(refused.code(), Some(Error::NOT_FOUND));
+}
+
+/// A directory has no bytes either way, and says so apart from being absent: the name is
+/// taken, and by something a retry will not turn into a file.
+#[test]
+fn a_directory_is_neither_readable_nor_writable() {
+    let mut fx = Fixture::new();
+    let dir: String = fx.dir.path().to_str().expect("utf-8").into();
+
+    let refused = fx
+        .console
+        .read(Read {
+            path: dir.clone(),
+            ..Read::default()
+        })
+        .expect_err("reading a directory");
+    assert_eq!(refused.code(), Some(Error::IS_A_DIRECTORY));
+
+    let refused = fx
+        .console
+        .write(Write {
+            path: dir,
+            data: b"x".to_vec(),
+            offset: None,
+        })
+        .expect_err("writing over a directory");
+    assert_eq!(refused.code(), Some(Error::IS_A_DIRECTORY));
+}
+
+/// A refusal is about the call and not the session: the channel is still good, and the
+/// next thing asked on it is answered.
+#[test]
+fn a_refused_file_call_leaves_the_session_usable() {
+    let mut fx = Fixture::new();
+
+    let refused: Failure = fx
+        .console
+        .read(Read {
+            path: fx.path("gone"),
+            ..Read::default()
+        })
+        .expect_err("reading a file that is not there");
+    assert!(matches!(refused, Failure::Refused(_)));
+
+    fx.write("after", b"still here", None);
+    assert_eq!(fx.read("after", None, None).data, b"still here");
+    assert_eq!(fx.output("echo ok").stdout, b"ok\n");
+}

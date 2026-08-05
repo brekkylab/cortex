@@ -1,9 +1,9 @@
 //! The server role: answer a console session by running commands on this host.
 //!
 //! A [`StdioServer`] brings the requests in and puts the responses out, and does
-//! nothing else — so what is left here is the three things that are actually ours: making
-//! a delegated name runnable, running a command, and letting a delegated call reach the
-//! client while that command waits for it.
+//! nothing else — so what is left here is what is actually ours: making a delegated name
+//! runnable, running a command, letting a delegated call reach the client while that
+//! command waits for it, and reading and writing the files a command works with.
 //!
 //! # Making a delegated name runnable
 //!
@@ -31,6 +31,15 @@
 //! Delegated calls are therefore served in turn. See [`Progress`] for why that is
 //! latency rather than a deadlock.
 //!
+//! # Files
+//!
+//! `read` and `write` reach this host's filesystem directly, at the path as given — the
+//! same namespace a command here resolves its own relative paths in, since a command here
+//! is an ordinary process of this one's.
+//!
+//! Both are answered on the spot, outside any execution: nothing is spawned, nothing can
+//! delegate, and one response ends it.
+//!
 //! # What this does not do
 //!
 //! The session rules are not enforced anywhere yet. An `exec` before `start` runs (with
@@ -41,23 +50,25 @@
 //! in-process with whoever chose them; that is the only thing standing in for the check
 //! today.
 //!
-//! [`Exec::stdin`] is also still ignored: a command is spawned with its input already at
-//! EOF. That was true of the `output()` call this replaced and is not something the
-//! restructuring changed.
+//! A `read` or a `write` is not confined to anywhere either. The path is used as it
+//! arrives, so a client can name any file this process can reach.
 
 mod bin_dir;
 
 use std::ffi::OsString;
 use std::io;
+use std::os::unix::fs::FileExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 
+use bson::Bson;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, Exec, ExecResult, Message, Outcome, Progress, RequestId, Server, Start,
+    Call, Error, Exec, ExecResult, MAX_PAYLOAD, Message, Outcome, Progress, Read, ReadResult,
+    RequestId, Server, Start, Write, WriteResult,
 };
 
 use crate::ipc::SOCK_ENV;
@@ -70,6 +81,13 @@ use bin_dir::BinDir;
 /// something a command chose.
 const NOT_EXECUTABLE: i32 = 126;
 const NOT_FOUND: i32 = 127;
+
+/// How much of a file one response may carry.
+///
+/// A frame is capped at [`MAX_PAYLOAD`], and a `read`'s answer is its `data` plus the
+/// members around it — `jsonrpc`, `id`, `result`, and the `size` beside the bytes. A
+/// kibibyte covers those several times over.
+const MAX_DATA: u64 = MAX_PAYLOAD as u64 - 1024;
 
 /// Answer requests until the client says `quit` or closes the channel.
 pub fn run() -> anyhow::Result<()> {
@@ -107,9 +125,13 @@ pub fn run() -> anyhow::Result<()> {
                     ),
                 )?,
 
+                Call::Read(read) => server.respond(id, read_file(&read))?,
+
+                Call::Write(write) => server.respond(id, write_file(&write))?,
+
                 Call::Stop => {
                     linked = None;
-                    server.respond(id, Outcome::Result(bson::Bson::Null))?;
+                    server.respond(id, Outcome::Result(Bson::Null))?;
                 }
             },
 
@@ -161,7 +183,7 @@ fn execute(
         .args(args)
         .envs(environment(linked, shims))
         // Piped and then read by `wait_with_output`, which is what carries the output
-        // back. `stdin` is already at EOF — see this module's docs.
+        // back. Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -396,8 +418,107 @@ fn finished(output: io::Result<Output>) -> Outcome {
     }))
 }
 
+/// Hand back part of a file, as the answer to the `read` that asked for it.
+///
+/// The size is taken before the bytes are, so a file that grows between the two is
+/// reported as the shorter one it was — and one that shrinks is answered with however
+/// much was still there. Either way `data` is what was read and `size` is what the file
+/// measured, which is the pair a requester needs to know whether to ask again.
+fn read_file(read: &Read) -> Outcome {
+    let path = Path::new(&read.path);
+
+    let size = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => {
+            return refused(
+                Error::IS_A_DIRECTORY,
+                format!("{}: is a directory", read.path),
+            );
+        }
+        Ok(meta) => meta.len(),
+        Err(e) => return file_error(e, &read.path),
+    };
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => return file_error(e, &read.path),
+    };
+
+    // Starting past the end asks for nothing, which is an empty answer rather than an
+    // error: `size` is there to say what the offset was past.
+    let offset = read.offset.unwrap_or(0);
+    let left = size.saturating_sub(offset);
+    let want = read.len.unwrap_or(left).min(left).min(MAX_DATA) as usize;
+
+    let mut data = vec![0u8; want];
+    let mut filled = 0;
+    while filled < want {
+        match file.read_at(&mut data[filled..], offset + filled as u64) {
+            // The file lost the bytes its size promised, so what is here is all there is.
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return file_error(e, &read.path),
+        }
+    }
+    data.truncate(filled);
+
+    encoded(bson::serialize_to_bson(&ReadResult { data, size }))
+}
+
+/// Put bytes in a file, as the answer to the `write` that sent them.
+///
+/// No offset means the file is to *be* `data`, which is what `create` does: made if it
+/// was not there, cut to nothing if it was. An offset means only those bytes are being
+/// spoken for, so the file is opened without truncating and whatever lies past them
+/// stays.
+fn write_file(write: &Write) -> Outcome {
+    let path = Path::new(&write.path);
+
+    let file = match write.offset {
+        None => std::fs::File::create(path),
+        Some(_) => std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path),
+    };
+
+    let file = match file {
+        Ok(file) => file,
+        Err(e) => return file_error(e, &write.path),
+    };
+
+    if let Err(e) = file.write_all_at(&write.data, write.offset.unwrap_or(0)) {
+        return file_error(e, &write.path);
+    }
+
+    match file.metadata() {
+        Ok(meta) => encoded(bson::serialize_to_bson(&WriteResult { size: meta.len() })),
+        Err(e) => file_error(e, &write.path),
+    }
+}
+
+/// What went wrong with a file, as one of the codes a requester branches on.
+///
+/// Everything that is not the path being absent or being a directory is
+/// [`IO_FAILED`](Error::IO_FAILED): permissions, a full disk, a name too long. The
+/// message carries what the OS said, since that is the part worth reading.
+fn file_error(e: io::Error, path: &str) -> Outcome {
+    let code = match e.kind() {
+        io::ErrorKind::NotFound => Error::NOT_FOUND,
+        io::ErrorKind::IsADirectory => Error::IS_A_DIRECTORY,
+        _ => Error::IO_FAILED,
+    };
+    refused(code, format!("{path}: {e}"))
+}
+
 fn result(progress: Progress) -> Outcome {
-    match bson::serialize_to_bson(&progress) {
+    encoded(bson::serialize_to_bson(&progress))
+}
+
+/// A `result` from something that had to be encoded to become one.
+fn encoded(value: Result<Bson, bson::error::Error>) -> Outcome {
+    match value {
         Ok(value) => Outcome::Result(value),
         Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
     }
