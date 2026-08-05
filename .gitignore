@@ -19,7 +19,9 @@ rustc-ice-*.txt
 *.swp
 
 # Local tooling
+.claude
 .omc
+.remember
 
 # Generated docs write-ups (not versioned)
 docs/

@@ -10,7 +10,8 @@ use std::path::{Component, Path};
 use serde_json::{Value, json};
 
 use crate::{
-    CortexError, Dirent, DirentKind, FileExt, FileHandle, Mountable, Result, Stat, Workspace,
+    CortexError, Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, Result, Stat,
+    Workspace,
 };
 
 pub use crate::wire::ExecOutput;
@@ -166,16 +167,17 @@ impl FileExt for SkillFile {
     }
 
     fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "SkillDir is read-only",
-        ))
+        // `ReadOnlyFilesystem`, not `PermissionDenied`: `From<io::Error>` turns
+        // exactly this kind back into `CortexError::ReadOnly`, so userspace hears
+        // EROFS. EACCES would claim *this caller* lacks permission, when no caller
+        // can write a rendered doc.
+        Err(io::Error::from(io::ErrorKind::ReadOnlyFilesystem))
     }
 }
 
 impl FileHandle for SkillFile {
     fn truncate(&self, _size: u64) -> Result<()> {
-        Err(CortexError::Unsupported)
+        Err(CortexError::ReadOnly)
     }
 }
 
@@ -198,34 +200,54 @@ impl Mountable for SkillDir {
         let comps = comps(path)?;
         match comps.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
             [] => {
-                let mut v = vec![Dirent::File("AGENT.md".into())];
-                v.extend(self.skills.keys().map(|n| Dirent::Dir(n.clone())));
+                let mut v = vec![Dirent::new("AGENT.md", DirentKind::File)];
+                v.extend(
+                    self.skills
+                        .keys()
+                        .map(|name| Dirent::new(name.clone(), DirentKind::Dir)),
+                );
                 Ok(v)
             }
-            [name] if self.skills.contains_key(*name) => Ok(vec![Dirent::File("SKILL.md".into())]),
+            [name] if self.skills.contains_key(*name) => {
+                Ok(vec![Dirent::new("SKILL.md", DirentKind::File)])
+            }
             ["AGENT.md"] => Err(CortexError::NotADirectory),
             [name, "SKILL.md"] if self.skills.contains_key(*name) => Err(CortexError::NotADirectory),
             _ => Err(CortexError::NotFound),
         }
     }
 
+    // Every write answers `ReadOnly`, not `Unsupported`. A rendered view of skills
+    // is a filesystem that *will not* write, not one with no notion of the
+    // operation — the distinction `S3Volume` draws for the same reason, and why
+    // userspace gets EROFS (which `cp`, `rsync` and editors have a path for) rather
+    // than ENOSYS.
     fn mkdir(&self, _path: &Path) -> Result<()> {
-        Err(CortexError::Unsupported)
+        Err(CortexError::ReadOnly)
     }
 
     fn unlink(&self, _path: &Path) -> Result<()> {
-        Err(CortexError::Unsupported)
+        Err(CortexError::ReadOnly)
     }
 
-    fn create(&self, _path: &Path) -> Result<Self::Handle> {
-        Err(CortexError::Unsupported)
+    fn rmdir(&self, _path: &Path) -> Result<()> {
+        Err(CortexError::ReadOnly)
     }
 
-    fn open(&self, path: &Path) -> Result<Self::Handle> {
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+        options.validate()?;
+        // Refused before the path is resolved, because nothing about the doc changes
+        // the answer.
+        if options.intends_write() {
+            return Err(CortexError::ReadOnly);
+        }
         let comps = comps(path)?;
         let slice: Vec<&str> = comps.iter().map(String::as_str).collect();
         match self.bytes(&slice) {
-            Some(b) => Ok(SkillFile { data: b.to_vec() }),
+            Some(b) => {
+                let stat = Stat::new(DirentKind::File, b.len() as u64);
+                Ok((SkillFile { data: b.to_vec() }, stat))
+            }
             None => match slice.as_slice() {
                 [] => Err(CortexError::IsADirectory),
                 [name] if self.skills.contains_key(*name) => Err(CortexError::IsADirectory),
@@ -295,8 +317,8 @@ mod tests {
         let mut n: Vec<_> = m
             .list(Path::new(path))
             .unwrap()
-            .iter()
-            .map(|e| e.name().to_string())
+            .into_iter()
+            .map(|entry| entry.name)
             .collect();
         n.sort();
         n
@@ -324,13 +346,19 @@ mod tests {
 
         let st = docs.stat(Path::new("echo/SKILL.md")).unwrap();
         assert_eq!(st.kind, DirentKind::File);
-        let h = docs.open(Path::new("echo/SKILL.md")).unwrap();
-        let mut buf = vec![0u8; st.size as usize];
+        let (h, opened) = docs
+            .open(Path::new("echo/SKILL.md"), OpenOptions::read_only())
+            .unwrap();
+        assert_eq!(opened.size, st.size, "the open must agree with `stat`");
+        let mut buf = vec![0u8; opened.size as usize];
         h.read_exact_at(&mut buf, 0).unwrap();
         assert_eq!(buf, b"# echo\n`wsx echo <msg>`");
 
-        let agent = docs.open(Path::new("AGENT.md")).unwrap();
-        let mut a = vec![0u8; docs.stat(Path::new("AGENT.md")).unwrap().size as usize];
+        // The open carries its own metadata, so there is no second `stat` here.
+        let (agent, opened) = docs
+            .open(Path::new("AGENT.md"), OpenOptions::read_only())
+            .unwrap();
+        let mut a = vec![0u8; opened.size as usize];
         agent.read_exact_at(&mut a, 0).unwrap();
         assert!(String::from_utf8_lossy(&a).contains("| `echo` | echo args | `echo/SKILL.md` |"));
     }
@@ -338,15 +366,41 @@ mod tests {
     #[test]
     fn skilldir_is_read_only_and_errors() {
         let docs = Bin::new().register(Echo).as_dir();
-        assert!(matches!(docs.create(Path::new("x")), Err(CortexError::Unsupported)));
-        assert!(matches!(docs.mkdir(Path::new("x")), Err(CortexError::Unsupported)));
-        assert!(matches!(docs.unlink(Path::new("x")), Err(CortexError::Unsupported)));
-        assert!(matches!(docs.open(Path::new("")), Err(CortexError::IsADirectory)));
-        assert!(matches!(docs.open(Path::new("nope/SKILL.md")), Err(CortexError::NotFound)));
-        // The opened handle rejects writes.
-        let h = docs.open(Path::new("AGENT.md")).unwrap();
-        assert!(h.write_at(b"x", 0).is_err());
-        assert!(matches!(h.truncate(0), Err(CortexError::Unsupported)));
+
+        // `ReadOnly`, not `Unsupported`: a rendered view of skills will not write,
+        // rather than having no notion of writing — so userspace hears EROFS, which
+        // it has a path for, instead of ENOSYS.
+        for refused in [
+            docs.open(Path::new("x"), OpenOptions::create_new())
+                .map(|_| ()),
+            docs.mkdir(Path::new("x")),
+            docs.unlink(Path::new("x")),
+            docs.rmdir(Path::new("x")),
+        ] {
+            assert!(
+                matches!(&refused, Err(CortexError::ReadOnly)),
+                "expected ReadOnly, got {refused:?}"
+            );
+        }
+
+        assert!(matches!(
+            docs.open(Path::new(""), OpenOptions::read_only()),
+            Err(CortexError::IsADirectory)
+        ));
+        assert!(matches!(
+            docs.open(Path::new("nope/SKILL.md"), OpenOptions::read_only()),
+            Err(CortexError::NotFound)
+        ));
+
+        // The opened handle rejects writes, and as EROFS rather than EACCES: this is
+        // the one kind `From<io::Error>` turns back into `ReadOnly`.
+        let (h, _) = docs
+            .open(Path::new("AGENT.md"), OpenOptions::read_only())
+            .unwrap();
+        let err = h.write_at(b"x", 0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::ReadOnlyFilesystem);
+        assert!(matches!(CortexError::from(err), CortexError::ReadOnly));
+        assert!(matches!(h.truncate(0), Err(CortexError::ReadOnly)));
     }
 
     #[test]

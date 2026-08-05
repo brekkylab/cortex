@@ -1,21 +1,25 @@
-//! Binds a [`PosixAdapter`] to `msb_krun`'s FUSE-shaped [`DynFileSystem`].
+//! Binds a [`PosixFs`] to `msb_krun`'s FUSE-shaped [`DynFileSystem`].
 //!
 //! This is the only place the inode bookkeeping in [`super::posix`] meets
 //! `msb_krun`: it translates FUSE calls into backend operations and backend
 //! errors/metadata into the `stat64`/errno shapes the guest kernel expects.
 
-use std::ffi::CStr;
+use std::ffi::{CStr, OsStr};
 use std::io::{Read, Result, Seek, SeekFrom, Write};
-use std::time::Duration;
+use std::os::unix::ffi::OsStrExt;
 
 use msb_krun::{
     DynFileSystem,
     backends::fs::{Context, DirEntry, Entry, FsOptions, stat64},
 };
 
-use super::PosixAdapter;
-use crate::mountable::{FileExt, FileHandle, Mountable};
-use crate::{CortexError, Dirent, DirentKind, Stat};
+use crate::mountable::Mountable;
+use crate::mountable::PosixFs;
+use crate::mountable::posix::{
+    BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
+    decode_open_flags, unix_time,
+};
+use crate::{CortexError, DirentKind, SetAttr, Stat};
 
 // The guest kernel is always Linux, so every reply must carry Linux errno
 // numbers. The host's `libc` values differ (e.g. ENOSYS is 78 on macOS but 38
@@ -24,13 +28,25 @@ const LINUX_ENOENT: i32 = 2;
 const LINUX_EIO: i32 = 5;
 const LINUX_EBADF: i32 = 9;
 const LINUX_EEXIST: i32 = 17;
+const LINUX_EACCES: i32 = 13;
 const LINUX_ENOTDIR: i32 = 20;
+const LINUX_ENOSPC: i32 = 28;
+const LINUX_EROFS: i32 = 30;
+const LINUX_EXDEV: i32 = 18;
+const LINUX_EFBIG: i32 = 27;
 const LINUX_EISDIR: i32 = 21;
 const LINUX_EINVAL: i32 = 22;
 const LINUX_ENOSYS: i32 = 38;
+const LINUX_ENOTEMPTY: i32 = 39;
 
-/// How long the guest may cache a lookup/attribute reply.
-const TTL: Duration = Duration::from_secs(1);
+/// Linux-numbered for the same reason the errnos are. (`O_TRUNC` is `0o1000`
+/// here and `0o2000` on a macOS host.)
+const LINUX_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
+    append: 0o2000,
+    truncate: 0o1000,
+    create: 0o100,
+    create_new: 0o200,
+};
 
 fn errno(raw: i32) -> std::io::Error {
     std::io::Error::from_raw_os_error(raw)
@@ -43,28 +59,86 @@ fn to_errno(err: CortexError) -> std::io::Error {
         CortexError::NotADirectory => LINUX_ENOTDIR,
         CortexError::IsADirectory => LINUX_EISDIR,
         CortexError::AlreadyExists => LINUX_EEXIST,
+        CortexError::NotEmpty => LINUX_ENOTEMPTY,
         CortexError::InvalidName => LINUX_EINVAL,
+        CortexError::InvalidArgument => LINUX_EINVAL,
+        CortexError::FileTooLarge => LINUX_EFBIG,
+        CortexError::BadHandle => LINUX_EBADF,
+        CortexError::PermissionDenied => LINUX_EACCES,
+        CortexError::NoSpace => LINUX_ENOSPC,
+        CortexError::ReadOnly => LINUX_EROFS,
+        CortexError::CrossDevice => LINUX_EXDEV,
         CortexError::Unsupported => LINUX_ENOSYS,
+        // The host's own errno cannot be forwarded: the guest would read the
+        // number as something else entirely. Anything not classified above
+        // therefore degrades to EIO, which is why the classification matters.
         CortexError::Io(_) => LINUX_EIO,
     })
 }
 
-/// Project a backend [`Stat`] onto the `stat64` the guest kernel reads back.
+/// Lay the shared attribute policy into the guest's `stat64`.
+///
+/// `uid`/`gid` stay 0: the guest runs as root and expects to own what it sees,
+/// where the host bindings report the mounting user.
 fn to_stat64(inode: u64, stat: &Stat) -> stat64 {
+    let attr = attr_for(stat);
+    let (mtime, mtime_nsec) = unix_time(attr.mtime);
+    let (atime, atime_nsec) = unix_time(attr.atime);
+    let (ctime, ctime_nsec) = unix_time(attr.ctime);
+
     // SAFETY: `stat64` is a repr(C) POD of integers; all-zero is a valid value
     // and we set every field the kernel inspects.
     let mut st: stat64 = unsafe { std::mem::zeroed() };
     st.st_ino = inode as _;
-    st.st_size = stat.size as _;
-    st.st_nlink = 1 as _;
-    st.st_mode = match stat.kind {
-        DirentKind::Dir => (libc::S_IFDIR | 0o755) as _,
-        DirentKind::File => (libc::S_IFREG | 0o644) as _,
-    };
+    st.st_size = attr.size as _;
+    st.st_blocks = attr.blocks as _;
+    st.st_blksize = attr.blksize as _;
+    st.st_mode = attr.mode as _;
+    st.st_nlink = attr.nlink as _;
+    st.st_mtime = mtime as _;
+    st.st_mtime_nsec = mtime_nsec as _;
+    st.st_atime = atime as _;
+    st.st_atime_nsec = atime_nsec as _;
+    st.st_ctime = ctime as _;
+    st.st_ctime_nsec = ctime_nsec as _;
     st
 }
 
-impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
+/// `CStr` is the guest's name encoding and `OsStr` is what the shared operations
+/// take; on unix those are the same bytes.
+fn guest_name(name: &CStr) -> &OsStr {
+    OsStr::from_bytes(name.to_bytes())
+}
+
+/// The reply shape `lookup`, `create`, and `mkdir` share — each hands the guest an
+/// entry *and* takes a kernel reference on it.
+fn to_entry(inode: u64, stat: &Stat) -> Entry {
+    Entry {
+        inode,
+        // Inode numbers are never reused (see `InodeTable`), so nothing needs
+        // disambiguating. Were they reused, this would become a correctness bug.
+        generation: 0,
+        attr: to_stat64(inode, stat),
+        attr_flags: 0,
+        attr_timeout: TTL,
+        entry_timeout: TTL,
+    }
+}
+
+impl<T: Mountable> DynFileSystem for PosixFs<T> {
+    /// Empty is not "no features" — it means "the server's defaults".
+    ///
+    /// What comes back here can only *add*: the server settles on
+    /// `capable & (want | supported)`, where `supported` is its own list. So
+    /// returning nothing subtracts nothing, and the set still includes
+    /// `AUTO_INVAL_DATA` (which is what makes a backend's [`Stat::mtime`]
+    /// functional rather than decorative — a guest watches it to decide when to
+    /// drop cached pages) and `MAX_PAGES` (which lets a request reach the server's
+    /// 1 MiB buffer instead of the 32-page default).
+    ///
+    /// Worth stating because the line reads like the opposite of what it does.
+    ///
+    /// [`Stat::mtime`]: crate::Stat::mtime
     fn init(&self, _capable: FsOptions) -> Result<FsOptions> {
         Ok(FsOptions::empty())
     }
@@ -72,32 +146,14 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
     fn destroy(&self) {}
 
     fn lookup(&self, _ctx: Context, parent: u64, name: &CStr) -> Result<Entry> {
-        let name = name.to_str().map_err(|_| errno(LINUX_EINVAL))?;
-
-        // Resolve the parent inode to a path, then release the lock before we
-        // touch the (possibly slow) backend.
-        let parent_path = {
-            let table = self.inodes.lock().unwrap();
-            table.path_of(parent).ok_or_else(|| errno(LINUX_ENOENT))?
-        };
-        let child = parent_path.join(name);
-
-        let stat = self.mountable.stat(&child).map_err(to_errno)?;
-
-        // Only now that the entry is known to exist do we assign it an inode.
-        let inode = self.inodes.lock().unwrap().intern(child);
-        Ok(Entry {
-            inode,
-            generation: 0,
-            attr: to_stat64(inode, &stat),
-            attr_flags: 0,
-            attr_timeout: TTL,
-            entry_timeout: TTL,
-        })
+        let (inode, stat) = self
+            .lookup_child(parent, guest_name(name))
+            .map_err(to_errno)?;
+        Ok(to_entry(inode, &stat))
     }
 
     fn forget(&self, _ctx: Context, inode: u64, count: u64) {
-        self.inodes.lock().unwrap().forget(inode, count);
+        self.forget_inode(inode, count);
     }
 
     fn batch_forget(&self, ctx: msb_krun::backends::fs::Context, requests: Vec<(u64, u64)>) {
@@ -112,105 +168,137 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         inode: u64,
         _handle: Option<u64>,
     ) -> std::io::Result<(msb_krun::backends::fs::stat64, std::time::Duration)> {
-        let path = {
-            let table = self.inodes.lock().unwrap();
-            table.path_of(inode).ok_or_else(|| errno(LINUX_ENOENT))?
-        };
-        let stat = self.mountable.stat(&path).map_err(to_errno)?;
+        let stat = self.stat_inode(inode).map_err(to_errno)?;
         Ok((to_stat64(inode, &stat), TTL))
     }
 
     fn setattr(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         inode: u64,
         attr: msb_krun::backends::fs::stat64,
         handle: Option<u64>,
         valid: msb_krun::backends::fs::SetattrValid,
     ) -> std::io::Result<(msb_krun::backends::fs::stat64, std::time::Duration)> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        use msb_krun::backends::fs::SetattrValid;
+
+        // The mask says which fields the guest means; the rest of `attr` is
+        // uninitialized as far as we are concerned. `O_TRUNC` does not arrive here
+        // (it rides the open), but an explicit `ftruncate`/`chmod`/`chown`/`touch`
+        // does — which is why this cannot stay ENOSYS.
+        let want = SetAttr {
+            size: valid
+                .contains(SetattrValid::SIZE)
+                .then_some(attr.st_size as u64),
+            mode: valid
+                .contains(SetattrValid::MODE)
+                .then_some(attr.st_mode as u32),
+            uid: valid.contains(SetattrValid::UID).then_some(attr.st_uid),
+            gid: valid.contains(SetattrValid::GID).then_some(attr.st_gid),
+            // Timestamps are read from the mask but have nowhere to go; the
+            // shared operation documents why they are accepted and dropped.
+            atime: None,
+            mtime: None,
+        };
+        let stat = self.setattr_inode(inode, handle, want).map_err(to_errno)?;
+        Ok((to_stat64(inode, &stat), TTL))
     }
 
     fn readlink(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
     ) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn symlink(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        linkname: &std::ffi::CStr,
-        parent: u64,
-        name: &std::ffi::CStr,
-        extensions: msb_krun::backends::fs::Extensions,
+        _ctx: msb_krun::backends::fs::Context,
+        _linkname: &std::ffi::CStr,
+        _parent: u64,
+        _name: &std::ffi::CStr,
+        _extensions: msb_krun::backends::fs::Extensions,
     ) -> std::io::Result<msb_krun::backends::fs::Entry> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn mknod(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        name: &std::ffi::CStr,
-        mode: u32,
-        rdev: u32,
-        umask: u32,
-        extensions: msb_krun::backends::fs::Extensions,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _name: &std::ffi::CStr,
+        _mode: u32,
+        _rdev: u32,
+        _umask: u32,
+        _extensions: msb_krun::backends::fs::Extensions,
     ) -> std::io::Result<msb_krun::backends::fs::Entry> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn mkdir(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         parent: u64,
         name: &std::ffi::CStr,
-        mode: u32,
-        umask: u32,
-        extensions: msb_krun::backends::fs::Extensions,
+        // The guest's mode and umask are dropped: the shared attribute policy
+        // reports fixed permission bits, so there is nowhere to store them.
+        _mode: u32,
+        _umask: u32,
+        _extensions: msb_krun::backends::fs::Extensions,
     ) -> std::io::Result<msb_krun::backends::fs::Entry> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        let (inode, stat) = self
+            .mkdir_child(parent, guest_name(name))
+            .map_err(to_errno)?;
+        Ok(to_entry(inode, &stat))
     }
 
     fn unlink(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         parent: u64,
         name: &std::ffi::CStr,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        self.unlink_child(parent, guest_name(name))
+            .map_err(to_errno)
     }
 
     fn rmdir(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         parent: u64,
         name: &std::ffi::CStr,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        self.rmdir_child(parent, guest_name(name)).map_err(to_errno)
     }
 
     fn rename(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         olddir: u64,
         oldname: &std::ffi::CStr,
         newdir: u64,
         newname: &std::ffi::CStr,
         flags: u32,
     ) -> std::io::Result<()> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` cannot be served: libfuse-t's
+        // `rename` has no flags argument at all, so a contract carrying them would
+        // be unhonourable in one of the three bindings. EINVAL is what Linux itself
+        // answers for a rename flag it does not implement — and unlike ENOSYS it
+        // does not make the kernel stop sending renames for the whole mount.
+        if flags != 0 {
+            return Err(errno(LINUX_EINVAL));
+        }
+        self.rename_child(olddir, guest_name(oldname), newdir, guest_name(newname))
+            .map_err(to_errno)
     }
 
     fn link(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        newparent: u64,
-        newname: &std::ffi::CStr,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _newparent: u64,
+        _newname: &std::ffi::CStr,
     ) -> std::io::Result<msb_krun::backends::fs::Entry> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
@@ -220,35 +308,47 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         _ctx: msb_krun::backends::fs::Context,
         inode: u64,
         _kill_priv: bool,
-        _flags: u32,
+        flags: u32,
     ) -> std::io::Result<(Option<u64>, msb_krun::backends::fs::OpenOptions)> {
-        let path = {
-            let table = self.inodes.lock().unwrap();
-            table.path_of(inode).ok_or_else(|| errno(LINUX_ENOENT))?
-        };
-        // Do the backend open (expensive setup happens once here), then park the
-        // handle in the table and hand the kernel its `fh`.
-        let handle = self.mountable.open(&path).map_err(to_errno)?;
-        let fh = self.handles.lock().unwrap().insert(handle);
+        // The flags must be honoured, not dropped. `msb_krun`'s server enables
+        // `capable & (want | supported)` — a *union* — and puts `ATOMIC_O_TRUNC`
+        // in its own `supported`, so `O_TRUNC` arrives here whatever `init` asks
+        // for. Ignoring it leaves `echo > existing` with the old tail in place and
+        // no error anywhere.
+        let options = decode_open_flags(flags as i32, &LINUX_OPEN_FLAGS).map_err(to_errno)?;
+        let (fh, _stat) = self.open_inode(inode, options).map_err(to_errno)?;
         Ok((Some(fh), msb_krun::backends::fs::OpenOptions::empty()))
     }
 
     fn create(
         &self,
-        ctx: msb_krun::backends::fs::Context,
+        _ctx: msb_krun::backends::fs::Context,
         parent: u64,
         name: &std::ffi::CStr,
-        mode: u32,
-        kill_priv: bool,
+        _mode: u32,
+        _kill_priv: bool,
         flags: u32,
-        umask: u32,
-        extensions: msb_krun::backends::fs::Extensions,
+        _umask: u32,
+        _extensions: msb_krun::backends::fs::Extensions,
     ) -> std::io::Result<(
         msb_krun::backends::fs::Entry,
         Option<u64>,
         msb_krun::backends::fs::OpenOptions,
     )> {
-        Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
+        // A guest `create` always means "make it if absent", whether or not it
+        // set `O_CREAT` in the flags word — the opcode itself says so.
+        let options = decode_open_flags(flags as i32, &LINUX_OPEN_FLAGS)
+            .map_err(to_errno)?
+            .create(true);
+
+        let (inode, stat, fh) = self
+            .create_child(parent, guest_name(name), options)
+            .map_err(to_errno)?;
+        Ok((
+            to_entry(inode, &stat),
+            Some(fh),
+            msb_krun::backends::fs::OpenOptions::empty(),
+        ))
     }
 
     fn read(
@@ -262,18 +362,10 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         _lock_owner: Option<u64>,
         _flags: u32,
     ) -> std::io::Result<usize> {
-        let file = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(handle)
-            .ok_or_else(|| errno(LINUX_EBADF))?;
-
-        // The kernel owns the position and hands us the exact (offset, size)
-        // window, so a single `read_at` on the open handle serves the request.
-        let mut data = vec![0u8; size as usize];
-        let n = file.read_at(&mut data, offset)?;
-        data.truncate(n);
+        // No hand-patched errno: the shared operation reports a closed handle as
+        // `BadHandle`, which `to_errno` renders as EBADF. While each binding
+        // patched this locally, only one of them actually did.
+        let data = self.read_handle(handle, offset, size).map_err(to_errno)?;
         if data.is_empty() {
             return Ok(0);
         }
@@ -303,23 +395,15 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         _kill_priv: bool,
         _flags: u32,
     ) -> std::io::Result<usize> {
-        let file = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(handle)
-            .ok_or_else(|| errno(LINUX_EBADF))?;
-
-        // `ZeroCopyReader` delivers bytes into a file descriptor, so stage the
-        // window in a temp file, read it back, then hand it to the backend.
+        // `ZeroCopyReader` delivers into a file descriptor, so stage the window in
+        // a temp file and read it back.
         let mut staging = tempfile::tempfile()?;
         r.read_exact_to(&mut staging, size as usize, 0)?;
         staging.seek(SeekFrom::Start(0))?;
         let mut buf = vec![0u8; size as usize];
         staging.read_exact(&mut buf)?;
 
-        let n = file.write_at(&buf, offset)?;
-        Ok(n)
+        self.write_handle(handle, offset, &buf).map_err(to_errno)
     }
 
     fn flush(
@@ -329,13 +413,8 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         handle: u64,
         _lock_owner: u64,
     ) -> std::io::Result<()> {
-        let file = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(handle)
-            .ok_or_else(|| errno(LINUX_EBADF))?;
-        file.flush().map_err(to_errno)
+        // Not `release_handle`: FLUSH arrives on every `close()`.
+        self.flush_handle(handle).map_err(to_errno)
     }
 
     fn fsync(
@@ -345,23 +424,17 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         _datasync: bool,
         handle: u64,
     ) -> std::io::Result<()> {
-        let file = self
-            .handles
-            .lock()
-            .unwrap()
-            .get(handle)
-            .ok_or_else(|| errno(LINUX_EBADF))?;
-        file.flush().map_err(to_errno)
+        self.flush_handle(handle).map_err(to_errno)
     }
 
     fn fallocate(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        handle: u64,
-        mode: u32,
-        offset: u64,
-        length: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _handle: u64,
+        _mode: u32,
+        _offset: u64,
+        _length: u64,
     ) -> std::io::Result<()> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
@@ -376,81 +449,85 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> std::io::Result<()> {
-        // Drop the table's reference and commit. Outstanding `Arc` clones from
-        // in-flight reads keep the handle alive until they finish.
-        if let Some(file) = self.handles.lock().unwrap().remove(handle) {
-            file.flush().map_err(to_errno)?;
-        }
-        Ok(())
+        self.release_handle(handle).map_err(to_errno)
     }
 
     fn statfs(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
     ) -> std::io::Result<msb_krun::backends::fs::statvfs64> {
         // Safe because we are zero-initializing a struct with only POD fields.
         let mut st: msb_krun::backends::fs::statvfs64 = unsafe { std::mem::zeroed() };
-        st.f_namemax = 255;
-        st.f_bsize = 512;
+        st.f_namemax = NAME_MAX as _;
+        st.f_bsize = BLOCK_SIZE as _;
+        // `f_frsize` is what glibc's `statvfs` consumers (`df` among them)
+        // divide by, so leaving it zero is a division by zero in the guest.
+        st.f_frsize = BLOCK_SIZE as _;
+        st.f_blocks = TOTAL_BLOCKS as _;
+        st.f_bfree = TOTAL_BLOCKS as _;
+        st.f_bavail = TOTAL_BLOCKS as _;
+        st.f_files = TOTAL_INODES as _;
+        st.f_ffree = TOTAL_INODES as _;
+        st.f_favail = TOTAL_INODES as _;
         Ok(st)
     }
 
     fn setxattr(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        name: &std::ffi::CStr,
-        value: &[u8],
-        flags: u32,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _name: &std::ffi::CStr,
+        _value: &[u8],
+        _flags: u32,
     ) -> std::io::Result<()> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn getxattr(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        name: &std::ffi::CStr,
-        size: u32,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _name: &std::ffi::CStr,
+        _size: u32,
     ) -> std::io::Result<msb_krun::backends::fs::GetxattrReply> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn listxattr(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        size: u32,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _size: u32,
     ) -> std::io::Result<msb_krun::backends::fs::ListxattrReply> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn removexattr(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        name: &std::ffi::CStr,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _name: &std::ffi::CStr,
     ) -> std::io::Result<()> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn opendir(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        flags: u32,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _flags: u32,
     ) -> std::io::Result<(Option<u64>, msb_krun::backends::fs::OpenOptions)> {
         Ok((None, msb_krun::backends::fs::OpenOptions::empty()))
     }
 
     fn readdir(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        handle: u64,
-        size: u32,
-        offset: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _handle: u64,
+        _size: u32,
+        _offset: u64,
     ) -> std::io::Result<Vec<msb_krun::backends::fs::DirEntry<'static>>> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
@@ -464,69 +541,31 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         offset: u64,
         add_entry: &mut msb_krun::backends::fs::AddDirEntry<'_>,
     ) -> std::io::Result<()> {
-        let dir_path = {
-            let table = self.inodes.lock().unwrap();
-            table.path_of(inode).ok_or_else(|| errno(LINUX_ENOENT))?
-        };
-        let children = self.mountable.list(&dir_path).map_err(to_errno)?;
-
-        // Entries stream in a fixed order with 1-based offsets (0 means "from
-        // the beginning"); the kernel resumes by giving us the last offset it
-        // consumed, so we skip anything at or before it. `.`/`..` occupy the
-        // first two slots. We hold the inode lock for the whole stream so the
-        // numbers we assign stay consistent; `add_entry` only copies into the
-        // kernel's buffer, never back into us.
-        let mut table = self.inodes.lock().unwrap();
-        let mut cursor = 0u64;
-
-        // `..` should point at the parent, but resolving it is unnecessary for
-        // traversal, so both dots reuse this directory's inode.
-        for name in [b".".as_slice(), b"..".as_slice()] {
-            cursor += 1;
-            if cursor <= offset {
-                continue;
-            }
-            let entry = DirEntry {
-                ino: inode,
-                offset: cursor,
-                type_: libc::DT_DIR as u32,
-                name,
-            };
-            if add_entry(entry)? == 0 {
-                return Ok(());
-            }
-        }
-
-        for child in &children {
-            cursor += 1;
-            if cursor <= offset {
-                continue;
-            }
-            let ino = table.number_for(dir_path.join(child.name()));
-            let type_ = match child {
-                Dirent::Dir(_) => libc::DT_DIR,
-                Dirent::File(_) => libc::DT_REG,
+        // The cursor protocol is the shared operation's; this closure only
+        // encodes. A zero from `add_entry` means the buffer is full — the `stop`.
+        self.for_each_dirent(inode, offset, |child_ino, child, cursor| {
+            let type_ = match child.kind {
+                DirentKind::Dir => libc::DT_DIR,
+                DirentKind::File => libc::DT_REG,
             };
             let entry = DirEntry {
-                ino,
+                ino: child_ino as _,
                 offset: cursor,
                 type_: type_ as u32,
-                name: child.name().as_bytes(),
+                name: child.name.as_bytes(),
             };
-            if add_entry(entry)? == 0 {
-                break;
-            }
-        }
-        Ok(())
+            Ok(add_entry(entry)? == 0)
+        })
+        .map_err(to_errno)
     }
 
     fn readdirplus(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        handle: u64,
-        size: u32,
-        offset: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _handle: u64,
+        _size: u32,
+        _offset: u64,
     ) -> std::io::Result<
         Vec<(
             msb_krun::backends::fs::DirEntry<'static>,
@@ -558,55 +597,55 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
 
     fn fsyncdir(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        datasync: bool,
-        handle: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _datasync: bool,
+        _handle: u64,
     ) -> std::io::Result<()> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn releasedir(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        flags: u32,
-        handle: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _flags: u32,
+        _handle: u64,
     ) -> std::io::Result<()> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn access(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        mask: u32,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _mask: u32,
     ) -> std::io::Result<()> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn lseek(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        handle: u64,
-        offset: u64,
-        whence: u32,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _handle: u64,
+        _offset: u64,
+        _whence: u32,
     ) -> std::io::Result<u64> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 
     fn copyfilerange(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode_in: u64,
-        handle_in: u64,
-        offset_in: u64,
-        inode_out: u64,
-        handle_out: u64,
-        offset_out: u64,
-        len: u64,
-        flags: u64,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode_in: u64,
+        _handle_in: u64,
+        _offset_in: u64,
+        _inode_out: u64,
+        _handle_out: u64,
+        _offset_out: u64,
+        _len: u64,
+        _flags: u64,
     ) -> std::io::Result<usize> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
@@ -617,15 +656,15 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
 
     fn ioctl(
         &self,
-        ctx: msb_krun::backends::fs::Context,
-        inode: u64,
-        handle: u64,
-        flags: u32,
-        cmd: u32,
-        arg: u64,
-        in_size: u32,
-        out_size: u32,
-        exit_code: &std::sync::Arc<std::sync::atomic::AtomicI32>,
+        _ctx: msb_krun::backends::fs::Context,
+        _inode: u64,
+        _handle: u64,
+        _flags: u32,
+        _cmd: u32,
+        _arg: u64,
+        _in_size: u32,
+        _out_size: u32,
+        _exit_code: &std::sync::Arc<std::sync::atomic::AtomicI32>,
     ) -> std::io::Result<Vec<u8>> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
@@ -654,3 +693,10 @@ impl<T: Mountable> DynFileSystem for PosixAdapter<T> {
         Err(std::io::Error::from_raw_os_error(LINUX_ENOSYS))
     }
 }
+
+// Tests live beside this file rather than inside it: they had grown longer than
+// the implementation, so a reader opening it had to scroll past them to find the
+// code. They are still a child module, so private items stay reachable.
+#[cfg(test)]
+#[path = "krun_tests.rs"]
+mod tests;

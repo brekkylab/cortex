@@ -7,6 +7,23 @@ edition = "2024"
 name = "apply_krun"
 required-features = ["krun"]
 
+# Serves both host bindings from one file, so no `required-features`: the key is
+# AND, so it cannot say "fuse or fuse-t", and naming either would lock the other
+# out. The example carries a no-feature `main` instead.
+[[example]]
+name = "mount_host"
+
+# Measures the read sizes a kernel asks for, for the S3 read-ahead window.
+[[example]]
+name = "measure_read_sizes"
+required-features = ["fuse-t"]
+
+[build-dependencies]
+# Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
+# build-dependencies cannot themselves be optional.
+cc = "1"
+pkg-config = "0.3"
+
 [dependencies]
 serde_json = "1"
 
@@ -15,13 +32,91 @@ serde_json = "1"
 # backend to the guest — the one thing the upstream libkrun C API and the
 # high-level microsandbox SDK do not offer.
 msb_krun = { version = "0.1", optional = true }
+# Host-side FUSE. Sync trait whose methods take `&self`, so it drives the same
+# `PosixAdapter` (interior mutability) that the krun binding does.
+fuser = { version = "0.17", optional = true }
 libc = { version = "0.2", optional = true }
 tempfile = { version = "3", optional = true }
+# A read-only S3 backend. `default-features = false` on purpose: the default set
+# is `["fs"]`, which is object_store's *own* local-filesystem store and drags in
+# walkdir/nix/same-file for a thing we already have in `PassthroughVolume`. The
+# `memory` module is ungated, so the in-memory store the tests build on survives.
+object_store = { version = "0.14", default-features = false, features = [
+    "aws",
+], optional = true }
+# `net` and `time` are named rather than left to feature unification, because
+# `Builder::enable_all` is cfg'd on exactly those two: with only `rt-multi-thread`
+# it still compiles and silently enables neither, leaving the runtime with no I/O
+# driver. Today reqwest happens to turn them on; that is not something to depend on.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+], optional = true }
 
 [features]
-default = ["krun"]
+# No *binding* by default. The crate's own layers — `Mountable`, `Workspace`, the
+# inode bookkeeping — need nothing, and each interface binding brings a heavy
+# dependency: enabling any by default charges every consumer for it. A consumer
+# that mounts over HTTP has no reason to compile a hypervisor.
+#
+# Measured with
+#
+#   cargo tree --features <f> -e normal --prefix none | grep -v '^cortex' \
+#       | sed 's/ (\*)$//' | sort -u | wc -l
+#
+# (normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
+# counted): bare cortex 5, `fuse-t` 6, `fuse` 38, `krun` 70, `s3` 131 — `krun`
+# being the whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP and
+# TLS stack under `object_store`.
+#
+# The bare 5 are `serde_json` and its own (itoa, memchr, serde_core, zmij), which
+# `Executable`/`wire` need unconditionally — the one thing every consumer pays for
+# whether or not it ever serializes a tool call. Gating it means gating
+# `executable`, `wire` and `demo` behind a feature.
+#
+# Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
+# because a binding's tests only exist when its feature is on. No default set fixes
+# that — `fuse` and `fuse-t` are independent, so no single configuration covers
+# every binding. Full coverage is a sweep:
+#
+#   export PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig"
+#   for f in "" "--features krun" "--features fuse" "--features fuse-t" \
+#            "--features fuse-no-mount" "--features s3" "--features fuse,fuse-t" \
+#            "--features fuse,fuse-t,krun,s3"; do cargo test $f --all-targets; done
+#
+# Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
+# unquoted expansion — under zsh pass the flags as separate arguments.
+#
+# Editors default to no features too, so a binding shows as inactive code until
+# its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
+default = []
 # Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
 krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
+# Mount a cortex filesystem on the host through FUSE.
+#
+# Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
+# `brew install --cask fuse-t`) or macFUSE; both export the libfuse2 mount ABI
+# fuser links against. FUSE-T ships `fuse-t.pc` rather than the `fuse.pc` that
+# fuser's macOS branch probes for, so point `PKG_CONFIG_PATH` at the shim in
+# `contrib/pkgconfig`:
+#
+#   PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig" cargo build --features fuse
+#
+# Linux needs no provider — fuser opens /dev/fuse directly.
+fuse = ["dep:fuser", "dep:libc"]
+# Mount on macOS through FUSE-T, which needs no kernel extension.
+#
+# A separate binding rather than a flavour of `fuse`, because the two differ in
+# who drives the session: `fuser` reads the FUSE protocol off the mount fd
+# itself, while FUSE-T hands back a socket to its own helper and expects to drive
+# the filesystem through libfuse-t's loop. Enabling both at once is fine — they
+# are independent call surfaces over the same `PosixFs`.
+fuse-t = ["dep:libc"]
+# Compile and unit-test the FUSE adapter with no libfuse provider installed:
+# skips fuser's pkg-config probe, so the adapter builds but cannot mount.
+fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
+s3 = ["dep:object_store", "dep:tokio"]
 
 [workspace]
 members = ["exec-server", "wsx"]

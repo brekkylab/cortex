@@ -7,31 +7,27 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::{
-    Bin, CortexError, ExecOutput, Executable, FileExt, FileHandle, Mountable, Result, Skillable,
-    Toolable, Workspace,
+    Bin, ExecOutput, Executable, FileExt, Mountable, OpenOptions, Result, Skillable, Toolable,
+    Workspace,
 };
 
 /// Read the whole file at `path`.
 fn read_all(ws: &Workspace, path: &Path) -> Result<Vec<u8>> {
-    let size = ws.stat(path)?.size as usize;
-    let h = ws.open(path)?;
-    let mut buf = vec![0u8; size];
+    // No separate `stat`: `open` answers with the metadata as of the open, which is
+    // both one round trip fewer and free of the window a second call would leave for
+    // the file to change size.
+    let (h, stat) = ws.open(path, OpenOptions::read_only())?;
+    let mut buf = vec![0u8; stat.size as usize];
     h.read_exact_at(&mut buf, 0)?;
     Ok(buf)
 }
 
 /// Write `data` to `path`, creating or replacing it.
 fn write_all(ws: &Workspace, path: &Path, data: &[u8]) -> Result<()> {
-    let h = match ws.create(path) {
-        Ok(h) => h,
-        // Already there: reopen and truncate to overwrite.
-        Err(CortexError::AlreadyExists) => {
-            let h = ws.open(path)?;
-            h.truncate(0)?;
-            h
-        }
-        Err(e) => return Err(e),
-    };
+    // One call: the backend applies `create` and `truncate` together, so nothing can
+    // slip in between them. Reaching the same place by creating, catching
+    // `AlreadyExists` and reopening would leave exactly that gap.
+    let (h, _) = ws.open(path, OpenOptions::read_write().create(true).truncate(true))?;
     h.write_all_at(data, 0)?;
     Ok(())
 }
@@ -83,8 +79,8 @@ impl Executable for Ls {
         let path = path_arg!(self, args, "<path>");
         let mut names: Vec<String> = ws
             .list(Path::new(&path))?
-            .iter()
-            .map(|e| e.name().to_string())
+            .into_iter()
+            .map(|entry| entry.name)
             .collect();
         names.sort();
         Ok(ExecOutput::ok(names.join("\n").into_bytes()))
