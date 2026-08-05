@@ -589,9 +589,10 @@ impl WorkspaceSpec {
     }
 }
 
-/// A [`FileHandle`] that fires a workspace [`FsHook`] once, on `flush`/`commit`,
-/// with the create-vs-modify distinction fixed at open. Wraps the backend handle
-/// so positioned I/O passes straight through; only the write-out is observed.
+/// A [`FileHandle`] that fires a workspace [`FsHook`] once, on the first
+/// *successful* `flush`/`commit`, with the create-vs-modify distinction fixed at
+/// open. Wraps the backend handle so positioned I/O passes straight through; only
+/// the write-out is observed.
 struct HookedHandle {
     inner: Box<dyn FileHandle>,
     hook: Arc<dyn FsHook>,

@@ -418,7 +418,10 @@ async fn finish(resp: reqwest::Response) -> Result<Value> {
         }
         return Err(io_other(format!("notion API {status}: {body}")));
     }
-    Ok(serde_json::from_str(&body).unwrap_or(Value::Null))
+    // A 2xx whose body will not parse is a broken response, not an empty page —
+    // surface it rather than letting `normalize_page`'s field defaults render a
+    // silently-blank page.json.
+    serde_json::from_str(&body).map_err(io_other)
 }
 
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
