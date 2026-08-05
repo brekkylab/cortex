@@ -8,9 +8,9 @@
 //! difference between the two is the whole of what JSON-RPC's `id` decides, and a
 //! method being added should have to choose a side.
 
+use bson::Bson;
 use serde::de;
 use serde::ser::SerializeMap;
-use serde_json::Value;
 
 use super::Method;
 
@@ -49,7 +49,7 @@ impl Notification {
     /// Reached only for a message that carried no `id`, which is what says nothing
     /// will answer it — so a request's method arriving here is a peer that has
     /// asked for something and left no way to be told.
-    pub(super) fn from_params<E: de::Error>(method: Method, _params: Value) -> Result<Self, E> {
+    pub(super) fn from_params<E: de::Error>(method: Method, _params: Bson) -> Result<Self, E> {
         match method {
             Method::Quit => Ok(Notification::Quit),
             _ => Err(E::custom(format!("{method} is a request and needs an id"))),

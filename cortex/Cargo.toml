@@ -5,15 +5,15 @@ edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-base64 = { workspace = true }
+# The console wire. The protocol's shape needs a *self-describing* codec — `params`
+# and `result` are typed by a method that may arrive after them, and `result` xor
+# `error` is decided by which member is present — and BSON is the self-describing
+# one with a native byte type, which is most of what this channel carries.
+bson = { workspace = true }
 futures-core = { workspace = true }
 libc = { workspace = true, optional = true }
 msb_krun = { workspace = true, optional = true }
 serde = { workspace = true }
-# The console wire is JSON-RPC 2.0, which needs a self-describing codec: `params`
-# and `result` are typed by a method that may arrive after them, and `result` xor
-# `error` is decided by which member is present.
-serde_json = { workspace = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["fs", "process", "rt", "time"] }
 

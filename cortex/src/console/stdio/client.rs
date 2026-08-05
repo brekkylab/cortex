@@ -39,7 +39,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 
 use crate::console::stdio::{read, write};
-use crate::console::{Call, Failure, Message, Notification, Outcome, RequestId, Client};
+use crate::console::{Call, Client, Failure, Message, Notification, Outcome, RequestId};
 
 /// A [`Client`] over a server process's pipes, and the process itself.
 ///
@@ -286,7 +286,7 @@ mod tests {
         Message::Response {
             id,
             outcome: Outcome::Result(
-                serde_json::to_value(Progress::Done(ExecResult {
+                bson::serialize_to_bson(&Progress::Done(ExecResult {
                     code: 0,
                     stdout: stdout.to_vec(),
                     ..ExecResult::default()
@@ -307,7 +307,7 @@ mod tests {
     fn null(id: RequestId) -> Message {
         Message::Response {
             id,
-            outcome: Outcome::Result(serde_json::Value::Null),
+            outcome: Outcome::Result(bson::Bson::Null),
         }
     }
 

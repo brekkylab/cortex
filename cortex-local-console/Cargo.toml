@@ -5,8 +5,8 @@ edition.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+bson = { workspace = true }
 cortex = { workspace = true }
-serde_json = { workspace = true }
 # `kill(pid, 0)`, to tell an abandoned scratch directory from a live one.
 libc = { workspace = true }
 

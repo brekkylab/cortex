@@ -20,19 +20,19 @@
 
 use std::fmt;
 
+use bson::Bson;
 use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
 
 /// A `result` or an `error` — never both, never neither.
 ///
-/// The `result` is held as a [`Value`] because its type depends on the method the `id`
+/// The `result` is held as a [`Bson`] because its type depends on the method the `id`
 /// was issued for, which only the end that issued it knows. [`take`](Outcome::take) is
 /// where that knowledge is applied.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
-    Result(Value),
+    Result(Bson),
     Error(Error),
 }
 
@@ -41,12 +41,20 @@ pub enum Outcome {
 /// `code` is what a program branches on and `message` is what a person reads. `data` is
 /// anything extra the sender thought was worth carrying; nothing in this protocol
 /// requires it.
+///
+/// `data` is boxed because a [`Bson`] is 112 bytes — it has to be wide enough for the
+/// widest thing BSON can say, and this protocol says almost none of them — where the
+/// whole of the rest of an `Error` is 32. Unboxed it made every `Result<_, Failure>` in
+/// the crate carry 144 bytes to describe a failure that is nearly always a code and a
+/// sentence. The box costs an allocation only when `data` is actually there, which so
+/// far is never, and it is invisible on the wire: `Option<Box<T>>` and `Option<T>`
+/// serialize the same.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Error {
     pub code: i64,
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
+    pub data: Option<Box<Bson>>,
 }
 
 impl Error {
@@ -121,7 +129,7 @@ impl Outcome {
     pub fn take<T: DeserializeOwned>(self) -> Result<T, Error> {
         match self {
             Outcome::Error(error) => Err(error),
-            Outcome::Result(value) => serde_json::from_value(value).map_err(|e| {
+            Outcome::Result(value) => bson::deserialize_from_bson(value).map_err(|e| {
                 Error::new(
                     Error::INTERNAL_ERROR,
                     format!("result is not what this method returns: {e}"),
@@ -142,7 +150,7 @@ impl Outcome {
     /// so what is wrong with it is that it is none of the three shapes; an outcome with
     /// neither is an outcome, and simply empty.
     pub(super) fn from_members<E: de::Error>(
-        result: Option<Value>,
+        result: Option<Bson>,
         error: Option<Error>,
     ) -> Result<Option<Outcome>, E> {
         match (result, error) {
@@ -188,7 +196,7 @@ impl<'de> Visitor<'de> for OutcomeVisitor {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Outcome, A::Error> {
-        let mut result: Option<Value> = None;
+        let mut result: Option<Bson> = None;
         let mut error: Option<Error> = None;
 
         while let Some(key) = map.next_key::<String>()? {
@@ -209,15 +217,24 @@ impl<'de> Visitor<'de> for OutcomeVisitor {
 
 #[cfg(test)]
 mod tests {
+    use bson::{Document, doc};
+
     use super::super::ExecResult;
     use super::*;
+
+    /// Read an outcome off the bytes a document makes, which is what a peer would
+    /// actually have sent — the whole point of going through the wire rather than
+    /// straight from a [`Bson`] is that this is the path the reader takes.
+    fn read(doc: Document) -> Result<Outcome, bson::error::Error> {
+        bson::deserialize_from_slice(&bson::serialize_to_vec(&doc).unwrap())
+    }
 
     /// A response's `result` is typed by the method its id was issued for, which only
     /// the end that issued it knows.
     #[test]
     fn a_result_is_typed_by_the_method_the_caller_remembers() {
         let result = Outcome::Result(
-            serde_json::to_value(ExecResult {
+            bson::serialize_to_bson(&ExecResult {
                 code: 3,
                 stdout: b"out".to_vec(),
                 ..ExecResult::default()
@@ -226,7 +243,7 @@ mod tests {
         );
         assert_eq!(result.clone().take::<ExecResult>().unwrap().code, 3);
         // `start` and `stop` return nothing, and nothing is what `null` is.
-        Outcome::Result(Value::Null).take::<()>().unwrap();
+        Outcome::Result(Bson::Null).take::<()>().unwrap();
 
         // Asking for the wrong type is a peer that answered the wrong request as
         // far as anyone here can tell.
@@ -245,41 +262,40 @@ mod tests {
     /// there and no other, and the xor enforced both ways.
     #[test]
     fn an_outcome_is_the_one_member_that_is_there() {
-        let wire = |outcome: &Outcome| serde_json::to_value(outcome).unwrap();
+        let wire = |outcome: &Outcome| bson::serialize_to_document(outcome).unwrap();
 
         assert_eq!(
-            wire(&Outcome::Result(serde_json::json!({"code": 0}))),
-            serde_json::json!({"result": {"code": 0}}),
+            wire(&Outcome::Result(doc! {"code": 0i64}.into())),
+            doc! {"result": {"code": 0i64}},
         );
         assert_eq!(
             wire(&Outcome::Error(Error::new(Error::TIMED_OUT, "too slow"))),
-            serde_json::json!({"error": {"code": -32000, "message": "too slow"}}),
+            doc! {"error": {"code": -32000i64, "message": "too slow"}},
         );
 
         for outcome in [
-            Outcome::Result(Value::Null),
+            Outcome::Result(Bson::Null),
             Outcome::Error(Error::new(Error::NOT_STARTED, "no start yet")),
         ] {
-            let text = serde_json::to_string(&outcome).unwrap();
-            assert_eq!(serde_json::from_str::<Outcome>(&text).unwrap(), outcome);
+            assert_eq!(read(wire(&outcome)).unwrap(), outcome);
         }
 
-        let refused = |text: &str, because: &str| {
-            let error = serde_json::from_str::<Outcome>(text)
-                .expect_err(&format!("accepted {text}"))
+        let refused = |doc: Document, because: &str| {
+            let error = read(doc.clone())
+                .expect_err(&format!("accepted {doc:?}"))
                 .to_string();
-            assert!(error.contains(because), "{text} → {error}");
+            assert!(error.contains(because), "{doc:?} → {error}");
         };
 
-        refused(r#"{}"#, "no result and no error");
+        refused(Document::new(), "no result and no error");
         refused(
-            r#"{"result":null,"error":{"code":1,"message":"x"}}"#,
+            doc! {"result": Bson::Null, "error": {"code": 1i64, "message": "x"}},
             "both a result and an error",
         );
         // Unknown members are ignored here too, so a peer may add one.
         assert_eq!(
-            serde_json::from_str::<Outcome>(r#"{"result":null,"trace_id":"abc"}"#).unwrap(),
-            Outcome::Result(Value::Null),
+            read(doc! {"result": Bson::Null, "trace_id": "abc"}).unwrap(),
+            Outcome::Result(Bson::Null),
         );
     }
 }

@@ -9,10 +9,10 @@
 //! [`Notification`](super::Notification) is the other half of the protocol: the
 //! methods nothing answers.
 
+use bson::Bson;
 use serde::de::{self, DeserializeOwned};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::{Method, Outcome};
 
@@ -280,7 +280,7 @@ impl Call {
     /// Reached only for a message that carried an `id`, which is what says it is a
     /// request at all — so a notification's method arriving here is a peer asking
     /// to be answered about something nothing answers.
-    pub(super) fn from_params<E: de::Error>(method: Method, params: Value) -> Result<Self, E> {
+    pub(super) fn from_params<E: de::Error>(method: Method, params: Bson) -> Result<Self, E> {
         Ok(match method {
             Method::Start => Call::Start(typed_params(method, params)?),
             Method::Exec => Call::Exec(typed_params(method, params)?),
@@ -308,55 +308,43 @@ impl Exec {
 ///
 /// Generic because the two methods that take parameters take different ones, and
 /// the error names the method so a rejection says which shape was expected.
-fn typed_params<T: DeserializeOwned, E: de::Error>(method: Method, params: Value) -> Result<T, E> {
-    serde_json::from_value(params).map_err(|e| E::custom(format!("{method} params: {e}")))
+fn typed_params<T: DeserializeOwned, E: de::Error>(method: Method, params: Bson) -> Result<T, E> {
+    bson::deserialize_from_bson(params).map_err(|e| E::custom(format!("{method} params: {e}")))
 }
 
-/// Raw bytes, encoded the way the codec in use wants them.
+/// Raw bytes, as themselves.
 ///
-/// JSON has no byte type, so `serialize_bytes` there would become an array of
-/// numbers: `[104,105,10]`, four characters per byte, for the bulk of what this
-/// channel carries. So base64 instead — 1.37× rather than 4×, and it survives a
-/// `Vec<u8>` that is not UTF-8, which output routinely is not.
+/// BSON has a byte type — `Binary`, subtype `Generic` — so the bulk of what this
+/// channel carries goes across at 1.0× rather than as text. This is the whole reason
+/// the codec is BSON and not JSON: JSON has no byte type, so `stdout` had to be
+/// base64 (1.37×) to avoid being an array of numbers (`[104,105,10]`, 4×).
 ///
-/// The codec is asked rather than assumed
-/// ([`is_human_readable`](serde::Serializer::is_human_readable)) because JSON-RPC
-/// does not require JSON: CBOR and MessagePack carry the same objects and have a
-/// native byte type, and on those the bytes go across as themselves.
+/// # Why this does not ask the codec
+///
+/// It used to. [`is_human_readable`](serde::Serializer::is_human_readable) was how a
+/// textual codec got base64 and a binary one got bytes, from one helper.
+///
+/// That branch cannot stay, because it silently loses. A message's `params` and
+/// `result` are held as a [`Bson`] before they reach the wire — they have to be, since
+/// a `result` is typed by a method only the caller knows — and `bson`'s *value-level*
+/// serializer reports `is_human_readable() == true`. So the branch would encode base64
+/// on the way into the `Bson`, and the wire would faithfully carry a string: 1.37×, the
+/// byte type unused, and nothing to show it had happened. `bson`'s `SerializerOptions`
+/// is `pub(crate)`, so it cannot be told otherwise.
+///
+/// One codec, and it has bytes. If a textual wire is ever wanted for a person to read,
+/// BSON's own projection is the thing to reach for — `Bson::into_relaxed_extjson`
+/// spells `Binary` as `{"$binary": ..}` — rather than a second spelling in here.
 mod bytes {
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
     use serde::de::{SeqAccess, Visitor};
     use serde::{Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
-        if s.is_human_readable() {
-            s.serialize_str(&STANDARD.encode(bytes))
-        } else {
-            s.serialize_bytes(bytes)
-        }
+        s.serialize_bytes(bytes)
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        if d.is_human_readable() {
-            d.deserialize_str(Base64)
-        } else {
-            d.deserialize_byte_buf(Raw)
-        }
-    }
-
-    struct Base64;
-
-    impl<'de> Visitor<'de> for Base64 {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-            f.write_str("base64")
-        }
-
-        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
-            STANDARD.decode(v).map_err(E::custom)
-        }
+        d.deserialize_byte_buf(Raw)
     }
 
     struct Raw;
@@ -376,7 +364,9 @@ mod bytes {
             Ok(v)
         }
 
-        /// A codec that writes bytes as a sequence reads them back as one.
+        /// A peer that spelled its bytes as an array is read rather than refused: BSON
+        /// has arrays too, and `[104,105,10]` is unambiguous even though nothing here
+        /// writes it.
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
             let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
             while let Some(b) = seq.next_element()? {
@@ -391,22 +381,47 @@ mod bytes {
 mod tests {
     use super::*;
 
-    /// Not utf-8, contains NUL and a newline: nothing about program bytes is
-    /// special, and JSON carries them as base64 rather than as an array of
-    /// numbers.
+    /// Not utf-8, contains NUL and a newline: nothing about program bytes is special,
+    /// and BSON carries them as themselves rather than as text.
+    ///
+    /// The assertion is on the *variant* and not only the round trip, because a round
+    /// trip passes either way — base64 out and base64 back is symmetric, and would be
+    /// 1.37× and the byte type unused with nothing to show it. That is the failure this
+    /// test exists to catch; see the `bytes` module on why the codec is not asked.
     #[test]
-    fn program_bytes_survive_as_base64() {
+    fn program_bytes_survive_as_bytes() {
         let bytes = vec![0xff, 0xfe, 0x00, b'\n', 0x00];
-        let value = serde_json::to_value(ExecResult {
+        let value = bson::serialize_to_bson(&ExecResult {
             stdout: bytes.clone(),
             stderr: bytes.clone(),
             ..ExecResult::default()
         })
         .unwrap();
-        assert_eq!(value["stdout"], "//4ACgA=");
 
-        let read: ExecResult = serde_json::from_value(value).unwrap();
+        let doc = value.as_document().unwrap();
+        assert_eq!(
+            doc.get("stdout"),
+            Some(&Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: bytes.clone(),
+            })),
+        );
+
+        let read: ExecResult = bson::deserialize_from_bson(value).unwrap();
         assert_eq!((read.stdout, read.stderr), (bytes.clone(), bytes));
+    }
+
+    /// Empty output is absent rather than an empty `Binary`, which is what
+    /// `skip_serializing_if` on [`Exec::stdin`] buys — and it reads back as empty.
+    #[test]
+    fn no_input_is_no_member() {
+        let value = bson::serialize_to_bson(&Exec::from(["ls"])).unwrap();
+        let doc = value.as_document().unwrap();
+        assert_eq!(doc.get("stdin"), None);
+        assert_eq!(doc.get("timeout_ms"), None);
+
+        let read: Exec = bson::deserialize_from_bson(value).unwrap();
+        assert_eq!(read, Exec::from(["ls"]));
     }
 
     /// An empty command is refused here rather than handed on as a program nobody

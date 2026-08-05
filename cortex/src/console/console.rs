@@ -284,7 +284,7 @@ fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
         stderr: result.stderr,
         truncated: false,
     };
-    match serde_json::to_value(result) {
+    match bson::serialize_to_bson(&result) {
         Ok(value) => Outcome::Result(value),
         Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
     }
@@ -364,11 +364,11 @@ mod tests {
     }
 
     fn null() -> Outcome {
-        Outcome::Result(serde_json::Value::Null)
+        Outcome::Result(bson::Bson::Null)
     }
 
     fn progress(progress: Progress) -> Outcome {
-        Outcome::Result(serde_json::to_value(progress).unwrap())
+        Outcome::Result(bson::serialize_to_bson(&progress).unwrap())
     }
 
     /// An execution that finished without delegating anything.

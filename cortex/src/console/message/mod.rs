@@ -1,26 +1,31 @@
-//! The wire: JSON-RPC 2.0.
+//! The wire: JSON-RPC 2.0's object model, encoded as BSON.
 //!
 //! One channel carries a whole session as a sequence of [`Message`]s — requests one
 //! way, the responses answering them back — and they are real JSON-RPC objects, not a
-//! shape that resembles them:
+//! shape that resembles them. Written the way BSON's own Extended JSON would show
+//! them, so that the members are readable:
 //!
 //! ```text
 //! {"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","ls"]}}
-//! {"jsonrpc":"2.0","id":2,"result":{"code":0,"stdout":"YQo=","stderr":"","truncated":false}}
+//! {"jsonrpc":"2.0","id":2,"result":{"code":0,"stdout":<Binary>,"stderr":<Binary>,"truncated":false}}
 //! {"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"timed out after 1000ms"}}
 //! {"jsonrpc":"2.0","method":"quit"}
 //! ```
 //!
-//! so an end that is not this crate — and one day one may not be — can use an
-//! off-the-shelf library rather than a bespoke implementation of ours.
+//! **The object model is the spec's; the encoding is not.** Which members are present
+//! is what decides a message's shape, the `id` pairs a response with its request, and
+//! the error codes are the spec's — all of that is JSON-RPC 2.0 and reads as it. But
+//! the bytes are BSON documents, so a peer cannot hand a frame to an off-the-shelf
+//! JSON-RPC library and have it parse: it needs a BSON codec, and then the semantics
+//! above are ordinary. That was a deliberate trade — see *Why the codec is BSON*.
 //!
 //! ```text
-//! [u32 len][serialized Message]   — a frame
+//! [u32 len][BSON document]   — a frame
 //! ```
 //!
-//! Framing is separate on purpose and lives outside this module: a serialized
-//! `Message` does not know where it ends. A length prefix is the cheapest thing
-//! that does — see [`MAX_PAYLOAD`].
+//! Framing is separate on purpose and lives outside this module — see [`MAX_PAYLOAD`].
+//! It is also now redundant, because a BSON document's first four bytes are its own
+//! length; [`stdio`](super::stdio) has what retiring the header would take.
 //!
 //! The split inside here is mostly the spec's own, between an object that is
 //! answered and one that is not:
@@ -56,19 +61,46 @@
 //! notification: no `id`, nothing answers it. **Every one of them is the client's:**
 //! there is no method a server issues, which is what [`Progress`] is for.
 //!
-//! # Why the codec is now fixed
+//! # Why the codec is BSON
 //!
-//! JSON-RPC's own structure is what fixes it. `{"method":.., "params":..}` is
-//! serde's adjacent tagging and `result` xor `error` is decided by which field is
-//! *present* — both need a deserializer that can look ahead, which
-//! non-self-describing codecs like postcard and bincode cannot do. A response's
-//! `result` type also depends on the method its `id` was issued for, so reading
-//! one means holding it as a value until the pending request identifies it, which
-//! is what [`Outcome`] is.
+//! Two requirements, and BSON is what meets both.
 //!
-//! Self-describing is not the same as textual: CBOR and MessagePack would work,
-//! and have a native byte type. So the `bytes` helper still asks the codec rather
-//! than assuming, and base64 is the answer only because JSON is the answer.
+//! **Self-describing.** JSON-RPC's own structure demands it. `{"method":.., "params":..}`
+//! is serde's adjacent tagging and `result` xor `error` is decided by which field is
+//! *present* — both need a deserializer that can look ahead, which non-self-describing
+//! codecs like postcard and bincode cannot do. A response's `result` type also depends
+//! on the method its `id` was issued for, so reading one means holding it as a value
+//! until the pending request identifies it, which is what [`Outcome`] is.
+//!
+//! **A byte type.** [`stdin`](Exec::stdin) and an [`ExecResult`]'s output are the bulk
+//! of what this channel carries and they are not text. JSON has no way to say so, which
+//! left base64 — 1.37×, and a spelling that has to be decoded before it is bytes again.
+//! BSON has `Binary`, so they travel as themselves.
+//!
+//! ## What that costs, and what it does not
+//!
+//! It costs the off-the-shelf JSON-RPC library. That was the reason for JSON, and it is
+//! a real capability given up: a peer now needs a BSON codec. It is worth less than it
+//! looks, because such a peer already needed bespoke framing (see [`MAX_PAYLOAD`]) and
+//! because both ends of this channel are in this workspace today.
+//!
+//! It does **not** cost frame size in the direction that matters. BSON is not a compact
+//! format — it writes array indices as keys (`cmd` becomes `{"0":"ls"}`) and every name
+//! as a C string — so a control frame like `stop` is *larger* than its JSON spelling, by
+//! about 20 bytes. What shrinks is the frames that carry a command's output, which are
+//! the large and frequent ones. MessagePack and CBOR would beat BSON on both, and were
+//! the obvious alternatives; BSON won on being self-delimiting, which retires this
+//! protocol's one bespoke layer, and on `doc!`/Extended JSON keeping the wire readable
+//! to a person and to the tests in here.
+//!
+//! ## Why the `bytes` helper does not ask the codec
+//!
+//! It used to, via [`is_human_readable`](serde::Serializer::is_human_readable), so that
+//! one helper served a textual codec and a binary one. That branch is gone, and
+//! [`call`](self::call)'s `bytes` module has the reason: `params` and `result` pass
+//! through a `Bson` value before they reach the wire, and `bson`'s value-level
+//! serializer reports itself human-readable, so the branch would quietly restore base64
+//! at the one place the byte type was the point.
 //!
 //! # Why errors carry codes
 //!
@@ -141,9 +173,9 @@
 //! [`Executable`](crate::executable::Executable) takes, so a name that could not be
 //! one would have nowhere to go.
 //!
-//! In JSON those payloads are base64, because JSON has no byte type and would
-//! otherwise write `[104,105,10]` — four characters per byte, for the bulk of what
-//! this channel carries.
+//! On the wire those payloads are BSON `Binary`, subtype `Generic` — themselves, at
+//! 1.0×. Getting that is why the codec is BSON and not JSON, which has no byte type and
+//! would have made them base64 at best (1.37×) or `[104,105,10]` at worst (4×).
 
 mod call;
 mod message;

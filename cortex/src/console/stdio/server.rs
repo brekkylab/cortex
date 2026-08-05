@@ -159,7 +159,7 @@ mod tests {
             // Not a request, and this end has no opinion about that.
             Message::Response {
                 id: 99,
-                outcome: Outcome::Result(serde_json::Value::Null),
+                outcome: Outcome::Result(bson::Bson::Null),
             },
             Message::Notification(Notification::Quit),
         ];
@@ -179,7 +179,7 @@ mod tests {
         let mut server = StdioServer::new(io::empty(), sent.clone());
 
         server
-            .respond(7, Outcome::Result(serde_json::Value::Null))
+            .respond(7, Outcome::Result(bson::Bson::Null))
             .unwrap();
         server
             .respond(9, Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")))
@@ -197,7 +197,7 @@ mod tests {
             [
                 Message::Response {
                     id: 7,
-                    outcome: Outcome::Result(serde_json::Value::Null),
+                    outcome: Outcome::Result(bson::Bson::Null),
                 },
                 Message::Response {
                     id: 9,

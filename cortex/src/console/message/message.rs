@@ -12,10 +12,10 @@
 
 use std::fmt;
 
+use bson::Bson;
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
 
 use super::{Call, Error, Notification, Outcome};
 
@@ -198,8 +198,8 @@ impl<'de> Visitor<'de> for MessageVisitor {
         let mut method: Option<String> = None;
         // `params` and `result` are held as values because member order is not
         // guaranteed: `method` may arrive after the `params` it types.
-        let mut params: Option<Value> = None;
-        let mut result: Option<Value> = None;
+        let mut params: Option<Bson> = None;
+        let mut result: Option<Bson> = None;
         let mut error: Option<Error> = None;
 
         while let Some(key) = map.next_key::<String>()? {
@@ -244,7 +244,7 @@ impl<'de> Visitor<'de> for MessageVisitor {
             // An `id` is what says which of the two a method is here as, and each
             // refuses the methods that are not its own. `params` is typed by the
             // method, which is why it waited.
-            let params = params.unwrap_or(Value::Null);
+            let params = params.unwrap_or(Bson::Null);
 
             return match id {
                 Some(id) => Ok(Message::Request {
@@ -269,10 +269,23 @@ impl<'de> Visitor<'de> for MessageVisitor {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use bson::{Document, doc};
 
     use super::super::{Exec, ExecResult, Progress, Start};
     use super::*;
+
+    /// What a peer would have sent, and what it reads back as.
+    ///
+    /// Ids and error codes are `i64` on the wire because they are `u64` and `i64` in
+    /// Rust and BSON has no unsigned type — so a `doc!` comparing against one writes
+    /// `2i64`, not `2`, which would be an `Int32` and not equal.
+    fn wire(message: &Message) -> Document {
+        bson::serialize_to_document(message).unwrap()
+    }
+
+    fn read(doc: Document) -> Result<Message, bson::error::Error> {
+        bson::deserialize_from_slice(&bson::serialize_to_vec(&doc).unwrap())
+    }
 
     fn exec() -> Exec {
         Exec {
@@ -302,7 +315,7 @@ mod tests {
             },
             Message::Response {
                 id: 0,
-                outcome: Outcome::Result(Value::Null),
+                outcome: Outcome::Result(Bson::Null),
             },
             Message::Request {
                 id: 1,
@@ -313,7 +326,7 @@ mod tests {
             Message::Response {
                 id: 1,
                 outcome: Outcome::Result(
-                    serde_json::to_value(Progress::Delegated(Exec {
+                    bson::serialize_to_bson(&Progress::Delegated(Exec {
                         cmd: vec!["foo".into()],
                         ..Exec::default()
                     }))
@@ -324,7 +337,7 @@ mod tests {
             Message::Request {
                 id: 2,
                 call: Call::Resume(Outcome::Result(
-                    serde_json::to_value(ExecResult {
+                    bson::serialize_to_bson(&ExecResult {
                         code: 0,
                         stdout: b"foo said this\n".to_vec(),
                         ..ExecResult::default()
@@ -335,7 +348,7 @@ mod tests {
             Message::Response {
                 id: 2,
                 outcome: Outcome::Result(
-                    serde_json::to_value(Progress::Delegated(Exec {
+                    bson::serialize_to_bson(&Progress::Delegated(Exec {
                         cmd: vec!["bar".into(), "--twice".into()],
                         ..Exec::default()
                     }))
@@ -354,7 +367,7 @@ mod tests {
             Message::Response {
                 id: 3,
                 outcome: Outcome::Result(
-                    serde_json::to_value(Progress::Done(ExecResult {
+                    bson::serialize_to_bson(&Progress::Done(ExecResult {
                         code: -1,
                         stdout: vec![0, 1, 2, 255, b'\n'],
                         stderr: vec![],
@@ -369,7 +382,7 @@ mod tests {
             },
             Message::Response {
                 id: 4,
-                outcome: Outcome::Result(Value::Null),
+                outcome: Outcome::Result(Bson::Null),
             },
             Message::Notification(Notification::Quit),
         ]
@@ -402,23 +415,18 @@ mod tests {
     }
 
     #[test]
-    fn messages_survive_a_json_roundtrip() {
+    fn messages_survive_a_roundtrip() {
         for message in all() {
-            let text = serde_json::to_string(&message).unwrap();
-            assert_eq!(
-                serde_json::from_str::<Message>(&text).unwrap(),
-                message,
-                "{text}"
-            );
+            let doc = wire(&message);
+            assert_eq!(read(doc.clone()).unwrap(), message, "{doc:?}");
         }
     }
 
-    /// The whole reason for the manual impls: these are the bytes the spec calls
-    /// for, member for member.
+    /// The whole reason for the manual impls: these are the members the spec calls
+    /// for, member for member. BSON changes how they are spelled in bytes, not which
+    /// of them are there.
     #[test]
     fn the_wire_is_json_rpc_2_0() {
-        let wire = |message: &Message| serde_json::to_value(message).unwrap();
-
         assert_eq!(
             wire(&Message::Request {
                 id: 2,
@@ -427,15 +435,15 @@ mod tests {
                     ..Exec::default()
                 }),
             }),
-            json!({"jsonrpc": "2.0", "id": 2, "method": "exec", "params": {"cmd": ["ls"]}}),
+            doc! {"jsonrpc": "2.0", "id": 2i64, "method": "exec", "params": {"cmd": ["ls"]}},
         );
 
         assert_eq!(
             wire(&Message::Response {
                 id: 2,
-                outcome: Outcome::Result(json!({"code": 0})),
+                outcome: Outcome::Result(doc! {"code": 0i64}.into()),
             }),
-            json!({"jsonrpc": "2.0", "id": 2, "result": {"code": 0}}),
+            doc! {"jsonrpc": "2.0", "id": 2i64, "result": {"code": 0i64}},
         );
 
         assert_eq!(
@@ -443,31 +451,31 @@ mod tests {
                 id: 2,
                 outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
             }),
-            json!({
+            doc! {
                 "jsonrpc": "2.0",
-                "id": 2,
-                "error": {"code": -32000, "message": "killed after 1000ms"},
-            }),
+                "id": 2i64,
+                "error": {"code": -32000i64, "message": "killed after 1000ms"},
+            },
         );
 
-        // A `Delegated` is an ordinary `result`, which is the whole point of it: an
-        // off-the-shelf peer sees a response and nothing stranger.
+        // A `Delegated` is an ordinary `result`, which is the whole point of it: a peer
+        // sees a response and nothing stranger.
         assert_eq!(
             wire(&Message::Response {
                 id: 2,
                 outcome: Outcome::Result(
-                    serde_json::to_value(super::super::Progress::Delegated(Exec {
+                    bson::serialize_to_bson(&Progress::Delegated(Exec {
                         cmd: vec!["foo".into()],
                         ..Exec::default()
                     }))
                     .unwrap()
                 ),
             }),
-            json!({
+            doc! {
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": 2i64,
                 "result": {"delegated": {"cmd": ["foo"]}},
-            }),
+            },
         );
 
         // And a `resume` carries the two members a response spells an outcome with, as
@@ -477,24 +485,24 @@ mod tests {
                 id: 3,
                 call: Call::Resume(Outcome::Error(Error::new(Error::TIMED_OUT, "too slow"))),
             }),
-            json!({
+            doc! {
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": 3i64,
                 "method": "resume",
-                "params": {"error": {"code": -32000, "message": "too slow"}},
-            }),
+                "params": {"error": {"code": -32000i64, "message": "too slow"}},
+            },
         );
         assert_eq!(
             wire(&Message::Request {
                 id: 3,
-                call: Call::Resume(Outcome::Result(json!({"code": 0}))),
+                call: Call::Resume(Outcome::Result(doc! {"code": 0i64}.into())),
             }),
-            json!({
+            doc! {
                 "jsonrpc": "2.0",
-                "id": 3,
+                "id": 3i64,
                 "method": "resume",
-                "params": {"result": {"code": 0}},
-            }),
+                "params": {"result": {"code": 0i64}},
+            },
         );
 
         // A notification has no id, and a method with no parameters has no
@@ -502,26 +510,66 @@ mod tests {
         // types it permits.
         assert_eq!(
             wire(&Message::Notification(Notification::Quit)),
-            json!({"jsonrpc": "2.0", "method": "quit"}),
+            doc! {"jsonrpc": "2.0", "method": "quit"},
         );
         assert_eq!(
             wire(&Message::Request {
                 id: 4,
                 call: Call::Stop,
             }),
-            json!({"jsonrpc": "2.0", "id": 4, "method": "stop"}),
+            doc! {"jsonrpc": "2.0", "id": 4i64, "method": "stop"},
         );
     }
 
+    /// Output travels as bytes and not as text — the whole reason the codec is BSON.
+    ///
+    /// Asserted on the frame itself, because a round trip cannot tell the difference:
+    /// base64 out and base64 back is symmetric. What proves it is that the payload's
+    /// own bytes are *in* the frame, and its base64 spelling is not.
+    #[test]
+    fn output_travels_as_bytes_not_text() {
+        // Not utf-8, and the byte a text framing would have had to escape.
+        let payload = vec![0xff, 0xfe, 0x00, b'\n', 0x00];
+        let message = Message::Response {
+            id: 1,
+            outcome: Outcome::Result(
+                bson::serialize_to_bson(&Progress::Done(ExecResult {
+                    code: 0,
+                    stdout: payload.clone(),
+                    ..ExecResult::default()
+                }))
+                .unwrap(),
+            ),
+        };
+
+        let frame = bson::serialize_to_vec(&wire(&message)).unwrap();
+        assert!(
+            frame.windows(payload.len()).any(|w| w == payload),
+            "the payload is not in the frame verbatim: {frame:?}"
+        );
+        assert!(
+            !frame.windows(8).any(|w| w == b"//4ACgA="),
+            "the frame carries base64, so the byte type went unused"
+        );
+
+        assert_eq!(read(wire(&message)).unwrap(), message);
+    }
+
     /// Member order is the sender's business, not ours — `params` may arrive
-    /// before the `method` that types it.
+    /// before the `method` that types it. A BSON document keeps the order it was
+    /// built in, so this really is out of order on the wire.
     #[test]
     fn members_may_arrive_in_any_order() {
-        let text = r#"{"params":{"cmd":["ls"]},"id":2,"method":"exec","jsonrpc":"2.0"}"#;
+        let doc = doc! {
+            "params": {"cmd": ["ls"]},
+            "id": 2i64,
+            "method": "exec",
+            "jsonrpc": "2.0",
+        };
         let Message::Request {
             id: 2,
             call: Call::Exec(exec),
-        } = serde_json::from_str(text).unwrap()
+        } = read(doc).unwrap()
         else {
             panic!("wrong message")
         };
@@ -532,49 +580,65 @@ mod tests {
     /// as one of them.
     #[test]
     fn malformed_objects_are_refused() {
-        let refused = |text: &str, because: &str| {
-            let error = serde_json::from_str::<Message>(text)
-                .expect_err(&format!("accepted {text}"))
+        let refused = |doc: Document, because: &str| {
+            let error = read(doc.clone())
+                .expect_err(&format!("accepted {doc:?}"))
                 .to_string();
-            assert!(error.contains(because), "{text} → {error}");
+            assert!(error.contains(because), "{doc:?} → {error}");
         };
 
-        refused(r#"{"id":1,"method":"stop"}"#, "jsonrpc");
-        refused(r#"{"jsonrpc":"1.0","id":1,"method":"stop"}"#, "not \"2.0\"");
+        refused(doc! {"id": 1i64, "method": "stop"}, "jsonrpc");
         refused(
-            r#"{"jsonrpc":"2.0","id":1,"method":"dance"}"#,
+            doc! {"jsonrpc": "1.0", "id": 1i64, "method": "stop"},
+            "not \"2.0\"",
+        );
+        refused(
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "dance"},
             "unknown method",
         );
         // A request without an id has no way to be answered.
-        refused(r#"{"jsonrpc":"2.0","method":"stop"}"#, "needs an id");
+        refused(doc! {"jsonrpc": "2.0", "method": "stop"}, "needs an id");
         // A notification cannot be answered, so it cannot ask to be.
         refused(
-            r#"{"jsonrpc":"2.0","id":1,"method":"quit"}"#,
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "quit"},
             "cannot carry an id",
         );
         // `result` xor `error`, and one of them.
         refused(
-            r#"{"jsonrpc":"2.0","id":1,"result":null,"error":{"code":1,"message":"x"}}"#,
+            doc! {
+                "jsonrpc": "2.0",
+                "id": 1i64,
+                "result": Bson::Null,
+                "error": {"code": 1i64, "message": "x"},
+            },
             "both a result and an error",
         );
-        refused(r#"{"jsonrpc":"2.0","id":1}"#, "no method, result or error");
         refused(
-            r#"{"jsonrpc":"2.0","id":1,"method":"stop","result":null}"#,
+            doc! {"jsonrpc": "2.0", "id": 1i64},
+            "no method, result or error",
+        );
+        refused(
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "stop", "result": Bson::Null},
             "neither a request nor a response",
         );
         // Params that are not what the method takes.
         refused(
-            r#"{"jsonrpc":"2.0","id":1,"method":"exec","params":{"cmd":"ls"}}"#,
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "params": {"cmd": "ls"}},
             "exec params",
         );
         // A `resume` carries an outcome, so the same two rules apply to its `params` as
         // to a response's members.
         refused(
-            r#"{"jsonrpc":"2.0","id":1,"method":"resume","params":{}}"#,
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "resume", "params": {}},
             "no result and no error",
         );
         refused(
-            r#"{"jsonrpc":"2.0","id":1,"method":"resume","params":{"result":null,"error":{"code":1,"message":"x"}}}"#,
+            doc! {
+                "jsonrpc": "2.0",
+                "id": 1i64,
+                "method": "resume",
+                "params": {"result": Bson::Null, "error": {"code": 1i64, "message": "x"}},
+            },
             "both a result and an error",
         );
     }
@@ -582,42 +646,18 @@ mod tests {
     /// An unknown member is ignored, so a peer can add one without breaking us.
     #[test]
     fn unknown_members_are_ignored() {
-        let text = r#"{"jsonrpc":"2.0","id":4,"method":"stop","trace_id":"abc"}"#;
         assert_eq!(
-            serde_json::from_str::<Message>(text).unwrap(),
+            read(doc! {
+                "jsonrpc": "2.0",
+                "id": 4i64,
+                "method": "stop",
+                "trace_id": "abc",
+            })
+            .unwrap(),
             Message::Request {
                 id: 4,
                 call: Call::Stop
             },
-        );
-    }
-
-    /// A response's `result` is typed by the method its id was issued for, which
-    /// only the end that issued it knows.
-    #[test]
-    fn a_result_is_typed_by_the_method_the_caller_remembers() {
-        let result = Outcome::Result(
-            serde_json::to_value(ExecResult {
-                code: 3,
-                stdout: b"out".to_vec(),
-                ..ExecResult::default()
-            })
-            .unwrap(),
-        );
-        assert_eq!(result.clone().take::<ExecResult>().unwrap().code, 3);
-        // `start` and `stop` return nothing, and nothing is what `null` is.
-        Outcome::Result(Value::Null).take::<()>().unwrap();
-
-        // Asking for the wrong type is a peer that answered the wrong request as
-        // far as anyone here can tell.
-        let wrong = result.take::<()>().unwrap_err();
-        assert_eq!(wrong.code, Error::INTERNAL_ERROR);
-
-        let error = Outcome::Error(Error::new(Error::TIMED_OUT, "killed"));
-        assert_eq!(error.error().unwrap().code, Error::TIMED_OUT);
-        assert_eq!(
-            error.take::<ExecResult>().unwrap_err().code,
-            Error::TIMED_OUT
         );
     }
 

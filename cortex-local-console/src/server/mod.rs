@@ -109,7 +109,7 @@ pub fn run() -> anyhow::Result<()> {
 
                 Call::Stop => {
                     linked = None;
-                    server.respond(id, Outcome::Result(serde_json::Value::Null))?;
+                    server.respond(id, Outcome::Result(bson::Bson::Null))?;
                 }
             },
 
@@ -138,7 +138,7 @@ fn boot(linked: &mut Option<BinDir>, start: &Start) -> Outcome {
 
     // Any previous one drops here, which takes its symlinks with it.
     *linked = Some(dir);
-    Outcome::Result(serde_json::Value::Null)
+    Outcome::Result(bson::Bson::Null)
 }
 
 /// Run one command, answering the console channel as many times as it takes.
@@ -397,7 +397,7 @@ fn finished(output: io::Result<Output>) -> Outcome {
 }
 
 fn result(progress: Progress) -> Outcome {
-    match serde_json::to_value(progress) {
+    match bson::serialize_to_bson(&progress) {
         Ok(value) => Outcome::Result(value),
         Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
     }

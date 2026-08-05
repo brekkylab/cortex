@@ -4,11 +4,27 @@
 //! [u32 len][serialized Message]
 //! ```
 //!
-//! A serialized [`Message`] does not know its own length, and a stream of them
-//! has to be cut apart somewhere. Length-prefixing is the cheapest way to say
-//! where: the reader learns how much to expect before it reads any of it, so
-//! there is no delimiter to search for and therefore none a payload could forge.
-//! Big-endian, because that is what every other length on a wire is.
+//! A stream of messages has to be cut apart somewhere. Length-prefixing is the
+//! cheapest way to say where: the reader learns how much to expect before it reads
+//! any of it, so there is no delimiter to search for and therefore none a payload
+//! could forge. Big-endian, because that is what every other length on a wire is.
+//!
+//! # This header is now redundant, and kept anyway for the moment
+//!
+//! It was here because a serialized message did not know its own length. A BSON
+//! document does: its first four bytes are an `int32`, little-endian, of the whole
+//! document including those four. So the header duplicates something the payload
+//! already carries, and a reader could take the document's own length instead —
+//! which would also retire the one part of this protocol that no off-the-shelf peer
+//! can guess.
+//!
+//! Not done yet because it is a wire change and the codec swap already was one. What
+//! it takes when it happens: read [`HEADER`] bytes, read them as a little-endian
+//! `u32`, check it against [`MAX_PAYLOAD`], and read that many *minus* the four
+//! already in hand — the length includes itself, where this one does not. The refusal
+//! of a zero-length frame becomes a refusal of anything under five, which is the
+//! smallest a document can be (`\x05\x00\x00\x00\x00`, an empty one). The three
+//! outcomes [`fill`] distinguishes do not change.
 //!
 //! # Why the transport is stdin and stdout, and nothing else
 //!
@@ -78,7 +94,7 @@ pub const HEADER: usize = 4;
 /// header with somebody else's payload, where one behind a lock cannot.
 pub fn write(w: &mut impl Write, message: &Message) -> io::Result<()> {
     let payload =
-        serde_json::to_vec(message).map_err(|e| bad(format!("serializing a message: {e}")))?;
+        bson::serialize_to_vec(message).map_err(|e| bad(format!("serializing a message: {e}")))?;
     if payload.len() > MAX_PAYLOAD {
         return Err(oversized(payload.len(), "to send"));
     }
@@ -113,7 +129,7 @@ pub fn read(r: &mut impl Read) -> io::Result<Option<Message>> {
         return Err(truncated());
     }
 
-    serde_json::from_slice(&payload)
+    bson::deserialize_from_slice(&payload)
         .map(Some)
         .map_err(|e| bad(format!("reading a message: {e}")))
 }
@@ -163,7 +179,7 @@ mod tests {
             },
             Message::Response {
                 id: 0,
-                outcome: Outcome::Result(serde_json::Value::Null),
+                outcome: Outcome::Result(bson::Bson::Null),
             },
             Message::Request {
                 id: 2,
@@ -196,10 +212,17 @@ mod tests {
         let mut buf = Vec::new();
         write(&mut buf, &message).unwrap();
 
-        let payload = serde_json::to_vec(&message).unwrap();
+        let payload = bson::serialize_to_vec(&message).unwrap();
         assert_eq!(&buf[..HEADER], &(payload.len() as u32).to_be_bytes());
         assert_eq!(&buf[HEADER..], &payload[..]);
         assert_eq!(buf.len(), HEADER + payload.len());
+
+        // And the payload says its own length too, which is why the header above is
+        // redundant — see the module docs.
+        assert_eq!(
+            u32::from_le_bytes(payload[..HEADER].try_into().unwrap()) as usize,
+            payload.len(),
+        );
     }
 
     /// Several frames back to back come out in order, which is what the length
@@ -275,9 +298,10 @@ mod tests {
     /// ending: the framing worked and the contents did not.
     #[test]
     fn a_framed_non_message_is_refused() {
-        let payload = br#"{"jsonrpc":"1.0","method":"quit"}"#;
+        let payload =
+            bson::serialize_to_vec(&bson::doc! {"jsonrpc": "1.0", "method": "quit"}).unwrap();
         let mut buf = (payload.len() as u32).to_be_bytes().to_vec();
-        buf.extend_from_slice(payload);
+        buf.extend_from_slice(&payload);
         let error = read(&mut buf.as_slice()).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("reading a message"), "{error}");

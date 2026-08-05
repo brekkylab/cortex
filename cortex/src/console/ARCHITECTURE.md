@@ -5,7 +5,8 @@ It's *headless* because there is first-intended to bot(e.g. AI agent) usage, rat
 
 Two things make it more than a remote `exec`:
 
-1. Fully compatible to JSON-RPC 2.0
+1. JSON-RPC 2.0's object model — the three shapes, the `id` pairing, the error codes — encoded as BSON rather than as JSON text.
+   The semantics are the spec's and read as it; the bytes are not, so a peer needs a BSON codec. See [Codec](#codec) for what that trade bought.
 2. Execution runs both ways.
    A tool that only the client knows how to run ends up runnable inside a sandbox — the server asks for it by *answering*, and the client runs it.
 
@@ -35,10 +36,10 @@ One pair is also all there is: delegation does not add a second channel, so this
 ### Framing
 
 ```
-[u32 len big-endian][JSON object]
+[u32 len big-endian][BSON document]
 ```
 
-A serialized message does not know its own length, and a stream of them has to be cut apart somewhere.
+A stream of messages has to be cut apart somewhere.
 A length prefix says where before any of it is read, so there is no delimiter to search for and therefore none a payload could forge.
 `len` is capped at **64 MiB** (`MAX_PAYLOAD`); a frame claiming more is refused rather than allocated, and a zero-length frame is refused because no message serializes to nothing.
 
@@ -50,15 +51,46 @@ Reading distinguishes three outcomes, which is the whole reason for the loop in 
 | bytes, then EOF | truncation — corruption, not an ending |
 | header, then `len` bytes | a frame |
 
-> **Note.**
-> This is not a standard JSON-RPC framing.
-> LSP uses `Content-Length: N\r\n\r\n`; MCP stdio uses one JSON object per line.
-> A peer with an off-the-shelf JSON-RPC library still needs its own framing for us.
-> The choice is localized to `stdio/channel.rs` if that trade stops being worth it.
+> **This header is redundant and kept anyway, for now.**
+> It was here because a serialized message did not know its own length.
+> A BSON document does — its first four bytes are an `int32`, little-endian, of the whole document including those four — so the header now duplicates what the payload already carries.
+> Retiring it would also remove the one layer of this protocol that no peer can guess, which is worth more than the four bytes.
+> Not done yet because it is a wire change and the codec swap already was one; `stdio/channel.rs` has what it takes.
+
+---
+
+## Codec
+
+The wire is **BSON**, for two reasons.
+
+**It has to be self-describing.**
+`{"method":.., "params":..}` is adjacent tagging and `result` xor `error` is decided by which member is *present*, so a reader must look ahead — which rules out postcard and bincode.
+A `result`'s type also depends on the method its `id` was issued for, so it is held as an untyped value until the pending request names it.
+
+**It has to have a byte type.**
+`stdin` and a command's output are most of what this channel carries and none of it is text.
+JSON has no way to say so, which meant base64 at 1.37× — decoded again at the far end — or `[104,105,10]` at 4×.
+BSON has `Binary`, so they travel as themselves.
+
+What it cost is the off-the-shelf JSON-RPC library, which was the reason for JSON.
+That is a real capability given up, and worth less than it looks: such a peer already needed bespoke framing (above), and both ends of this channel are in this workspace today.
+
+What it did **not** cost is size where size matters, though the accounting is not one-sided.
+BSON is not a compact format — array indices become keys (`["ls"]` is `{"0":"ls"}`) and every name is a C string — so a control frame is *larger* than its JSON spelling:
+
+| frame | JSON | BSON | MessagePack |
+|---|---|---|---|
+| `exec {"cmd":["ls"]}` | 64 B | 84 B | 46 B |
+| a 4 KiB `stdout` | ~5.5 KiB | ~4.1 KiB | ~4.1 KiB |
+
+MessagePack and CBOR beat BSON on both lines and were the real alternatives.
+BSON won on two things neither has: its documents are **self-delimiting**, which is what retires the framing header above, and it keeps a readable projection — `doc!` in the tests, Extended JSON for a person — so the wire can still be read member for member.
 
 ---
 
 ## JSON-RPC 2.0
+
+The object model below is the spec's, member for member. Only the encoding is not — every example is written as Extended JSON would show it, so that the members are legible; `stdin`, `stdout` and `stderr` are `Binary` and not the strings they appear as.
 
 Three object shapes, told apart the way the spec tells them apart — by which members are present, not by a tag we invented.
 
@@ -150,8 +182,8 @@ A backend that cannot come up answers `BOOT_FAILED`, which the old wire had no w
 ### `exec` — run this
 
 ```json
-{"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","cat && echo x"],"stdin":"aGkK","timeout_ms":5000}}
-{"jsonrpc":"2.0","id":2,"result":{"done":{"code":0,"stderr":"","stdout":"aGkK","truncated":false}}}
+{"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","cat && echo x"],"stdin":{"$binary":{"base64":"aGkK","subType":"00"}},"timeout_ms":5000}}
+{"jsonrpc":"2.0","id":2,"result":{"done":{"code":0,"stderr":{"$binary":{"base64":"","subType":"00"}},"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"truncated":false}}}
 ```
 
 Minimal form — no input, no timeout of its own:
@@ -163,10 +195,10 @@ Minimal form — no input, no timeout of its own:
 | field | |
 |---|---|
 | `cmd` | already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`. |
-| `stdin` | **all** of the input, base64, sent up front. Omitted or empty means immediate EOF. |
+| `stdin` | **all** of the input, as `Binary`, sent up front. Omitted or empty means immediate EOF. |
 | `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. Falls back to `default_timeout_ms`. |
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
-| `stdout`/`stderr` | base64, byte-exact, kept apart. |
+| `stdout`/`stderr` | `Binary`, byte-exact, kept apart. |
 | `truncated` | the command wrote more than the executor would hold, and this is the beginning of it. |
 
 The `result` is not the execution's output but **how far it got**: `done` is the whole of it, `delegated` is the execution pausing on something only the client can run.
@@ -176,8 +208,8 @@ See [Delegation](#delegation-and-execution-both-ways).
 ### `resume` — the delegated call ended like this
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"resume","params":{"result":{"code":0,"stdout":"aGkK","stderr":"","truncated":false}}}
-{"jsonrpc":"2.0","id":3,"result":{"done":{"code":0,"stdout":"aGkK","stderr":"","truncated":false}}}
+{"jsonrpc":"2.0","id":3,"method":"resume","params":{"result":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}
+{"jsonrpc":"2.0","id":3,"result":{"done":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}
 ```
 
 Only ever a reply to a `delegated`, and its `result` is the next step of the *same* execution — another `delegated`, or the end of it.
@@ -200,10 +232,14 @@ The interleaving between them is not preserved: two buffers are not one stream, 
 `truncated` exists because silence would be worse than shortness.
 A result travels in one frame under `MAX_PAYLOAD`, so an unbounded writer has to be cut off somewhere, and an agent reading output it does not know is partial will draw a conclusion from it.
 
-**Base64, not an array of numbers.**
-JSON has no byte type, so `[104,105,10]` — four characters per byte — would be the default spelling for the bulk of what this channel carries.
-Base64 is 1.37× instead of 4×, and it survives output that is not UTF-8, which output routinely is not.
-The codec is *asked* rather than assumed, so CBOR or MessagePack would carry the same objects with native bytes and no base64 at all.
+**Bytes, not text.**
+`stdin`, `stdout` and `stderr` cross as BSON `Binary`, subtype `Generic` — at 1.0×, and byte-exact whether or not the output was ever UTF-8, which routinely it was not.
+Getting this is the second half of [why the codec is BSON](#codec): JSON had no byte type, so the same payloads had to be base64 (1.37×) to avoid being `[104,105,10]` (4×).
+
+The `bytes` helper no longer asks the codec whether it is human-readable, and that is deliberate rather than a simplification.
+`params` and `result` pass through a `Bson` value before reaching the wire — they must, since a `result` is typed by a method only the caller knows — and `bson`'s value-level serializer reports itself human-readable.
+Asking would therefore re-encode base64 at exactly the point the byte type was the point, and nothing on the wire would show it had happened.
+`message/call.rs` holds the reasoning; a test asserts on the frame's bytes rather than on a round trip, because a round trip passes either way.
 
 ### `stop` — release what `start` booted
 
