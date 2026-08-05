@@ -12,8 +12,8 @@
 //! request the client is already waiting on — so nothing here has to be both.
 //!
 //! What is here is only what would otherwise be written once per transport: `start`,
-//! `exec`, `resume`, `stop` and `quit` follow from `call` and `notify`, so they follow
-//! once.
+//! `exec`, `resume`, `read`, `write`, `stop` and `quit` follow from `call` and
+//! `notify`, so they follow once.
 //!
 //! [`stdio`](crate::console::stdio) is the transport there is — framed JSON-RPC
 //! over a pipe. A micro-VM's virtio port would be another, and nothing here would
@@ -22,7 +22,8 @@
 use std::io;
 
 use crate::console::{
-    Call, Error, Exec, Message, Notification, Outcome, Progress, RequestId, Start,
+    Call, Error, Exec, Message, Notification, Outcome, Progress, Read, ReadResult, RequestId,
+    Start, Write, WriteResult,
 };
 
 /// Why a call produced no result.
@@ -130,6 +131,21 @@ pub trait Client {
         self.call(Call::Resume(outcome))?
             .take()
             .map_err(Failure::from)
+    }
+
+    /// Read part of a file where the executor runs things.
+    ///
+    /// One message holds the answer, so a file larger than that comes back in pieces:
+    /// [`size`](ReadResult::size) against what arrived says whether there are more,
+    /// and a further `read` from further along is how to get them.
+    fn read(&mut self, read: Read) -> Result<ReadResult, Failure> {
+        self.call(Call::Read(read))?.take().map_err(Failure::from)
+    }
+
+    /// Put bytes in a file where the executor runs things, and hear how big it is
+    /// afterwards.
+    fn write(&mut self, write: Write) -> Result<WriteResult, Failure> {
+        self.call(Call::Write(write))?.take().map_err(Failure::from)
     }
 
     /// Release what [`start`](Self::start) booted. Another `start` is allowed after

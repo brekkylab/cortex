@@ -80,6 +80,8 @@ pub enum Method {
     Start,
     Exec,
     Resume,
+    Read,
+    Write,
     Stop,
     Quit,
 }
@@ -91,6 +93,8 @@ impl Method {
             Method::Start => "start",
             Method::Exec => "exec",
             Method::Resume => "resume",
+            Method::Read => "read",
+            Method::Write => "write",
             Method::Stop => "stop",
             Method::Quit => "quit",
         }
@@ -101,6 +105,8 @@ impl Method {
             "start" => Method::Start,
             "exec" => Method::Exec,
             "resume" => Method::Resume,
+            "read" => Method::Read,
+            "write" => Method::Write,
             "stop" => Method::Stop,
             "quit" => Method::Quit,
             _ => return None,
@@ -271,7 +277,7 @@ impl<'de> Visitor<'de> for MessageVisitor {
 mod tests {
     use bson::{Document, doc};
 
-    use super::super::{Exec, ExecResult, Progress, Start};
+    use super::super::{Exec, ExecResult, Progress, Read, ReadResult, Start, Write, WriteResult};
     use super::*;
 
     /// What a peer would have sent, and what it reads back as.
@@ -409,6 +415,45 @@ mod tests {
                     id: 4,
                     outcome: Outcome::Error(Error::new(Error::STOP_FAILED, "guest is wedged")),
                 },
+                // The file plane. A read bounded on both ends, whose answer is shorter
+                // than the file it came from.
+                Message::Request {
+                    id: 7,
+                    call: Call::Read(Read {
+                        path: "out/log.txt".into(),
+                        offset: Some(4096),
+                        len: Some(1024),
+                    }),
+                },
+                Message::Response {
+                    id: 7,
+                    outcome: Outcome::Result(
+                        bson::serialize_to_bson(&ReadResult {
+                            data: vec![0xff, 0x00, b'\n'],
+                            size: 10_000,
+                        })
+                        .unwrap(),
+                    ),
+                },
+                Message::Response {
+                    id: 7,
+                    outcome: Outcome::Error(Error::new(Error::NOT_FOUND, "out/log.txt")),
+                },
+                // And a whole-file write, which is the offset being absent.
+                Message::Request {
+                    id: 8,
+                    call: Call::Write(Write {
+                        path: "in/data".into(),
+                        data: vec![0, 1, 2, 255],
+                        offset: None,
+                    }),
+                },
+                Message::Response {
+                    id: 8,
+                    outcome: Outcome::Result(
+                        bson::serialize_to_bson(&WriteResult { size: 4 }).unwrap(),
+                    ),
+                },
             ])
             .collect()
     }
@@ -501,6 +546,47 @@ mod tests {
                 "id": 3i64,
                 "method": "resume",
                 "params": {"result": {"code": 0i64}},
+            },
+        );
+
+        // The file plane spells its bytes as `Binary` like everything else, and the
+        // bounds it was given as plain members.
+        assert_eq!(
+            wire(&Message::Request {
+                id: 5,
+                call: Call::Read(Read {
+                    path: "out/log.txt".into(),
+                    offset: Some(4096),
+                    len: Some(1024),
+                }),
+            }),
+            doc! {
+                "jsonrpc": "2.0",
+                "id": 5i64,
+                "method": "read",
+                "params": {"path": "out/log.txt", "offset": 4096i64, "len": 1024i64},
+            },
+        );
+        assert_eq!(
+            wire(&Message::Request {
+                id: 6,
+                call: Call::Write(Write {
+                    path: "in/data".into(),
+                    data: vec![0, 1, 2],
+                    offset: None,
+                }),
+            }),
+            doc! {
+                "jsonrpc": "2.0",
+                "id": 6i64,
+                "method": "write",
+                "params": {
+                    "path": "in/data",
+                    "data": Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: vec![0, 1, 2],
+                    }),
+                },
             },
         );
 

@@ -84,6 +84,24 @@ impl Error {
     /// Any: `start` has not been answered yet, or has been undone by `stop`.
     pub const NOT_STARTED: i64 = -32004;
 
+    /// `read`, `write`: nothing is at the path — for a `write`, that means a
+    /// directory above it, since the file itself is created if it is missing.
+    pub const NOT_FOUND: i64 = -32005;
+
+    /// `read`, `write`: the path is a directory, which has no bytes either way.
+    ///
+    /// Apart from [`NOT_FOUND`](Self::NOT_FOUND) because it says the opposite thing
+    /// about the path: the name is taken, and by something a retry will not turn into
+    /// a file.
+    pub const IS_A_DIRECTORY: i64 = -32006;
+
+    /// `read`, `write`: the path named a file the executor could not go on to read or
+    /// write — permissions, a full disk, a backend that went away mid-operation.
+    ///
+    /// A `write` that fails this way says nothing about how much of `data` landed. The
+    /// file is whatever it is, and a requester that needs to know asks with a `read`.
+    pub const IO_FAILED: i64 = -32007;
+
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
     /// error) belongs to whoever reads the frame, not here.
     pub const INVALID_REQUEST: i64 = -32600;

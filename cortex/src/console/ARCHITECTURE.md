@@ -141,6 +141,8 @@ Member order is free — `params` may arrive before the `method` that types it.
 | `start` | `{delegated, default_timeout_ms?}` | `null` |
 | `exec` | `{cmd, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `resume` | `{result: ...}` or `{error: {...}}` | `{done: {...}}` or `{delegated: {...}}` |
+| `read` | `{path, offset?, len?}` | `{data, size}` |
+| `write` | `{path, data?, offset?}` | `{size}` |
 | `stop` | — | `null` |
 | `quit` | — | *(notification)* |
 
@@ -222,9 +224,6 @@ Only ever a reply to a `delegated`, and its `result` is the next step of the *sa
 The server hands whichever arrives straight to the shim that is waiting, and does not read it.
 A `resume` when nothing is paused is `INVALID_REQUEST`.
 
-There is no working directory.
-Sending one would be a host path, which means nothing inside a micro-VM guest, so *where* to run something only becomes expressible once both ends agree on what a path is — which is a workspace volume mount's job.
-
 `stdout` and `stderr` stay apart because merging is something a requester can do and un-merging is not.
 The interleaving between them is not preserved: two buffers are not one stream, and a caller that needs the order asks the command for it (`2>&1`).
 
@@ -232,13 +231,53 @@ The interleaving between them is not preserved: two buffers are not one stream, 
 A result travels in one frame under `MAX_PAYLOAD`, so an unbounded writer has to be cut off somewhere, and an agent reading output it does not know is partial will draw a conclusion from it.
 
 **Bytes, not text.**
-`stdout` and `stderr` cross as BSON `Binary`, subtype `Generic` — at 1.0×, and byte-exact whether or not the output was ever UTF-8, which routinely it was not.
+`stdout`, `stderr` and a file's `data` cross as BSON `Binary`, subtype `Generic` — at 1.0×, and byte-exact whether or not the output was ever UTF-8, which routinely it was not.
 Getting this is the second half of [why the codec is BSON](#codec): JSON had no byte type, so the same payloads had to be base64 (1.37×) to avoid being `[104,105,10]` (4×).
 
 The `bytes` helper no longer asks the codec whether it is human-readable, and that is deliberate rather than a simplification.
 `params` and `result` pass through a `Bson` value before reaching the wire — they must, since a `result` is typed by a method only the caller knows — and `bson`'s value-level serializer reports itself human-readable.
 Asking would therefore re-encode base64 at exactly the point the byte type was the point, and nothing on the wire would show it had happened.
 `message/call.rs` holds the reasoning; a test asserts on the frame's bytes rather than on a round trip, because a round trip passes either way.
+
+### `read` — hand back part of a file
+
+```json
+{"jsonrpc":"2.0","id":5,"method":"read","params":{"path":"out/log.txt","offset":4096,"len":1024}}
+{"jsonrpc":"2.0","id":5,"result":{"data":{"$binary":{"base64":"aGkK","subType":"00"}},"size":10000}}
+```
+
+The path is resolved wherever the executor runs things, exactly as a relative path in `cmd` is, so it names the file a command would open by the same name.
+
+| field | |
+|---|---|
+| `path` | UTF-8, resolved executor-side. |
+| `offset` | where to start; omitted is the beginning. Past the end is not an error — the answer is empty `data` and the `size` that says so. |
+| `len` | how many bytes at most; omitted is as many as there are. |
+| `data` | `Binary`, byte-exact. |
+| `size` | the **file's** size, not `data`'s length. |
+
+`size` is what makes a bounded read usable.
+One frame holds the answer, so a file larger than `MAX_PAYLOAD` comes back in pieces and the executor hands back less than `len` asked for when the rest would not fit.
+Comparing what arrived against `size` is the only thing that says there is more, and asking again from further along is how to get it — a reader that ignores it cannot tell a whole small file from the front of a large one.
+
+### `write` — put these bytes in a file
+
+```json
+{"jsonrpc":"2.0","id":6,"method":"write","params":{"path":"in/data","data":{"$binary":{"base64":"aGkK","subType":"00"}}}}
+{"jsonrpc":"2.0","id":6,"result":{"size":3}}
+```
+
+| field | |
+|---|---|
+| `path` | as `read`'s. Any directory above it has to exist; the file itself does not. |
+| `data` | `Binary`. Omitted is empty, which for a whole-file write means an empty file. |
+| `offset` | omitted **replaces** the file — created if it was not there, cut to length if it was. Present **overwrites** from there and leaves whatever lies past the bytes written, extending the file with zeroes if it is beyond the end. |
+| `size` | the file's size afterwards. |
+
+Omitted and `0` are therefore different, and a requester that means to replace a file sends neither: the whole-file case says nothing about what was there before, and the positioned case says nothing about the rest of the file.
+
+A `write` that fails with `IO_FAILED` says nothing about how much of `data` landed.
+The file is whatever it is, and a requester that needs to know asks with a `read`.
 
 ### `stop` — release what `start` booted
 
@@ -403,6 +442,9 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32002` | `start` | **boot failed** — the backend could not be brought up. |
 | `-32003` | `stop` | **stop failed** — the resources may still be held. |
 | `-32004` | `exec`, `stop` | **not started** — no `start` has been answered, or a `stop` has undone it. |
+| `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
+| `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
+| `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
 | `-32600` | any | invalid request — including a `resume` when nothing is paused on a delegated call. |
 | `-32601` | any | method not found |
 | `-32602` | any | invalid params — an empty `cmd`. A delegated name that is not a plain path component *should* be this and is not checked; see [`start`](#start--boot-and-make-these-names-runnable). |
@@ -469,9 +511,8 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | not possible | why not |
 |---|---|
 | watch a command work | an agent cannot use a partial answer, so early output arrives to nobody. Streaming would cost a second shape for every ending and a second code path in every consumer — and JSON-RPC has no spelling for it: a request has one response. |
-| drive an interactive command | its prompt would arrive after the answer was due. An `exec` carries no input at all, which is the same trade in the other direction. |
+| drive an interactive command | its prompt would arrive after the answer was due. An `exec` carries no input at all; what a command is to read goes where it will find it with a `write` beforehand. |
 | run something that never ends | `tail -f` has no result to send. `timeout_ms` is what ends it; without one, such an execution simply never answers. |
-| say where to run something | a host path means nothing inside a guest. Needs a workspace volume mount first. |
 | cancel one execution | `stop` releases the whole session, not a command. Let the timeout expire. |
-| output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. |
+| output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. A *file* larger than that is readable, because `read` is bounded on purpose and `size` says where to ask next. |
 | run two delegated calls at once | a response carries one `delegated`. Needs delegated calls to stop being independent before it is worth a shape that carries several — see [Consequences](#consequences). |

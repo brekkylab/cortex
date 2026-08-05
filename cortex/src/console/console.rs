@@ -32,7 +32,9 @@ use std::process::Command;
 use anyhow::Context as _;
 
 use crate::console::base::{Client, Failure};
-use crate::console::message::{Error, Exec, ExecResult, Outcome, Progress, Start};
+use crate::console::message::{
+    Error, Exec, ExecResult, Outcome, Progress, Read, ReadResult, Start, Write, WriteResult,
+};
 use crate::console::stdio::StdioClient;
 use crate::executable::{ExecCall, ExecutableSet};
 
@@ -218,6 +220,25 @@ impl Console {
                 }
             }
         }
+    }
+
+    /// Read part of a file where commands run.
+    ///
+    /// The path is the one a command would open by the same name, so this is how a
+    /// caller sees what an execution wrote to a file rather than to its output.
+    ///
+    /// A file too large for one message comes back in pieces — see
+    /// [`ReadResult::size`], which is what says whether there are any.
+    pub fn read(&mut self, read: Read) -> Result<ReadResult, Failure> {
+        self.client.read(read)
+    }
+
+    /// Put bytes in a file where commands run, and hear how big it is afterwards.
+    ///
+    /// The other direction of [`read`](Self::read), and the way to put something where
+    /// a command will find it.
+    pub fn write(&mut self, write: Write) -> Result<WriteResult, Failure> {
+        self.client.write(write)
     }
 
     /// Release what [`start`](Self::start) booted.

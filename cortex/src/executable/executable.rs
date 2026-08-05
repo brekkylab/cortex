@@ -1,9 +1,4 @@
 /// What a delegated executable was asked to do.
-///
-/// Nothing about *where* it was asked from. The caller's working directory is what
-/// would make a relative path in `args` mean anything — the executable runs in a
-/// process that has a different one — and the wire does not carry it yet, so this
-/// does not pretend to either.
 #[derive(Clone, Debug)]
 pub struct ExecCall {
     /// The name it was invoked by. The same executable can be registered under

@@ -34,7 +34,8 @@
 //!   shapes, [`Method`], the [`RequestId`] that pairs a response with its request,
 //!   and the serde impls that put all of it on the wire.
 //! - `call` — the methods something answers: [`Call`], and the `params` and
-//!   `result` they carry ([`Start`], [`Exec`], [`Progress`], [`ExecResult`]).
+//!   `result` they carry ([`Start`], [`Exec`], [`Progress`], [`ExecResult`], and the
+//!   file plane's [`Read`], [`ReadResult`], [`Write`], [`WriteResult`]).
 //! - `notification` — the methods nothing answers: [`Notification`].
 //! - `outcome` — how something ended: [`Outcome`], and the [`Error`] and codes that
 //!   are the second half of it.
@@ -54,6 +55,8 @@
 //! | `start` | [`Start`] | `null` | [`BOOT_FAILED`](Error::BOOT_FAILED) |
 //! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`NOT_STARTED`](Error::NOT_STARTED) |
 //! | `resume` | [`Outcome`] | [`Progress`] | [`INVALID_REQUEST`](Error::INVALID_REQUEST) |
+//! | `read` | [`Read`] | [`ReadResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED) |
+//! | `write` | [`Write`] | [`WriteResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED) |
 //! | `stop` | — | `null` | [`STOP_FAILED`](Error::STOP_FAILED) |
 //! | `quit` | — | *(notification — no response)* | — |
 //!
@@ -72,8 +75,8 @@
 //! on the method its `id` was issued for, so reading one means holding it as a value
 //! until the pending request identifies it, which is what [`Outcome`] is.
 //!
-//! **A byte type.** An [`ExecResult`]'s output is the bulk of what this channel
-//! carries and it is not text. JSON has no way to say so, which
+//! **A byte type.** An [`ExecResult`]'s output and a file's contents are the bulk of
+//! what this channel carries and neither is text. JSON has no way to say so, which
 //! left base64 — 1.37×, and a spelling that has to be decoded before it is bytes again.
 //! BSON has `Binary`, so they travel as themselves.
 //!
@@ -154,9 +157,11 @@
 //!
 //! Two things follow, and both are consequences rather than accidents:
 //!
-//! - **There is no input.** An exchange — read the prompt, then answer it — is not
-//!   expressible, which is the same trade in the other direction and would be
-//!   incoherent to make differently. An [`Exec`] carries none at all.
+//! - **An execution takes no input.** An exchange — read the prompt, then answer it —
+//!   is not expressible, which is the same trade in the other direction and would be
+//!   incoherent to make differently. An [`Exec`] carries none, so what a command is to
+//!   read goes where it will find it with a [`Write`] beforehand, and what it leaves
+//!   behind comes back with a [`Read`].
 //! - **A command that never ends produces nothing.** `tail -f` has no result to
 //!   send, so [`timeout_ms`](Exec::timeout_ms) is what ends it. Without a timeout
 //!   such an execution simply never answers, which is why one is worth setting.
@@ -166,11 +171,14 @@
 //!
 //! # What is not text
 //!
-//! The output on an [`ExecResult`] is raw `Vec<u8>`, because those are program bytes
-//! and nothing may touch them. A command's name and
-//! arguments are required to be UTF-8: they have to become the `String`s an
-//! [`Executable`](crate::executable::Executable) takes, so a name that could not be
-//! one would have nowhere to go.
+//! The output on an [`ExecResult`] and the file contents on a [`Read`] or a [`Write`]
+//! are raw `Vec<u8>`, because those are program bytes and nothing may touch them. A
+//! command's name and arguments are required to be UTF-8: they have to become the
+//! `String`s an [`Executable`](crate::executable::Executable) takes, so a name that
+//! could not be one would have nowhere to go. A [`path`](Read::path) is a `String` for
+//! the practical version of the same reason — the executor turns it into a path for
+//! whatever filesystem it has, and it is the one member of a file call that both ends
+//! have to read rather than carry.
 //!
 //! On the wire those payloads are BSON `Binary`, subtype `Generic` — themselves, at
 //! 1.0×. Getting that is why the codec is BSON and not JSON, which has no byte type and

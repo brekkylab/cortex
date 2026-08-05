@@ -46,6 +46,12 @@ pub enum Call {
     /// straight to the shim that is waiting.
     Resume(Outcome),
 
+    /// **client → server.** Hand back part of a file.
+    Read(Read),
+
+    /// **client → server.** Put these bytes in a file.
+    Write(Write),
+
     /// **client → server.** Release what [`Start`] booted.
     ///
     /// The other half of booting, and much what stopping a VM is: the guest goes
@@ -148,6 +154,82 @@ impl<S: AsRef<str>> From<Vec<S>> for Exec {
     }
 }
 
+/// Part of a file to hand back. The `params` of `read`.
+///
+/// A path is where the executor says it is, resolved the way a relative path in
+/// [`cmd`](Exec::cmd) is — so the file this names is the one a command would open by
+/// the same name, and reading it is how a requester sees what an execution left
+/// behind.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Read {
+    pub path: String,
+
+    /// Where in the file to start. `None` is the beginning.
+    ///
+    /// Past the end is not an error: the answer is empty [`data`](ReadResult::data)
+    /// and the [`size`](ReadResult::size) that says so.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+
+    /// How many bytes to hand back at most, `None` for as many as there are.
+    ///
+    /// Either way the answer travels in one message under
+    /// [`MAX_PAYLOAD`](super::MAX_PAYLOAD), so the executor hands back less than this
+    /// asks for when the rest would not fit. Comparing what arrives against
+    /// [`size`](ReadResult::size) is how a requester knows, and asking again from
+    /// further along is how it gets the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len: Option<u64>,
+}
+
+/// The bytes a `read` asked for, and how big the file is. The `result` of `read`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadResult {
+    /// What was there, starting at the [`offset`](Read::offset) that was asked for.
+    #[serde(with = "bytes")]
+    pub data: Vec<u8>,
+
+    /// The whole file's size, and not `data`'s length.
+    ///
+    /// The two differ whenever a read was bounded — by a [`len`](Read::len), by an
+    /// [`offset`](Read::offset) past the beginning, or by what one message holds — and
+    /// the difference is the only thing that says there is more to ask for. A reader
+    /// that ignores it has no way to tell a whole small file from the front of a large
+    /// one.
+    pub size: u64,
+}
+
+/// Bytes to put in a file. The `params` of `write`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Write {
+    /// Resolved as [`Read::path`] is. Any directory above it has to exist already;
+    /// the file itself does not.
+    pub path: String,
+
+    #[serde(default, with = "bytes", skip_serializing_if = "Vec::is_empty")]
+    pub data: Vec<u8>,
+
+    /// Where in the file to put them.
+    ///
+    /// `None` makes the file be exactly `data`: created if it was not there, cut to
+    /// length if it was. `Some(n)` overwrites from `n` and leaves whatever lies past
+    /// the bytes written, extending the file with zeroes if `n` is beyond its end.
+    ///
+    /// So the whole-file case says nothing about what was there before and the
+    /// positioned case says nothing about the rest of the file, which is why a
+    /// requester that means to replace a file sends `None` rather than `Some(0)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+}
+
+/// How big the file is now. The `result` of `write`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteResult {
+    /// Where a positioned write should carry on from, and confirmation that a
+    /// whole-file write left the length it meant to.
+    pub size: u64,
+}
+
 /// How far an execution got: finished, or waiting for the client. The `result` of
 /// both `exec` and `resume`.
 ///
@@ -236,6 +318,8 @@ impl Call {
             Call::Start(_) => Method::Start,
             Call::Exec(_) => Method::Exec,
             Call::Resume(_) => Method::Resume,
+            Call::Read(_) => Method::Read,
+            Call::Write(_) => Method::Write,
             Call::Stop => Method::Stop,
         }
     }
@@ -252,6 +336,8 @@ impl Call {
             Call::Start(start) => map.serialize_entry("params", start),
             Call::Exec(exec) => map.serialize_entry("params", exec),
             Call::Resume(outcome) => map.serialize_entry("params", outcome),
+            Call::Read(read) => map.serialize_entry("params", read),
+            Call::Write(write) => map.serialize_entry("params", write),
             Call::Stop => Ok(()),
         }
     }
@@ -266,6 +352,8 @@ impl Call {
             Method::Start => Call::Start(typed_params(method, params)?),
             Method::Exec => Call::Exec(typed_params(method, params)?),
             Method::Resume => Call::Resume(typed_params(method, params)?),
+            Method::Read => Call::Read(typed_params(method, params)?),
+            Method::Write => Call::Write(typed_params(method, params)?),
             Method::Stop => Call::Stop,
             Method::Quit => {
                 return Err(E::custom("quit is a notification and cannot carry an id"));
@@ -402,6 +490,54 @@ mod tests {
 
         let read: Exec = bson::deserialize_from_bson(value).unwrap();
         assert_eq!(read, Exec::from(["ls"]));
+    }
+
+    /// A read with no bounds and a write with no offset carry neither member, so the
+    /// two whole-file cases are the smallest thing either method can say.
+    #[test]
+    fn an_unbounded_file_call_carries_no_bounds() {
+        let read = Read {
+            path: "log.txt".into(),
+            ..Read::default()
+        };
+        let doc = bson::serialize_to_document(&read).unwrap();
+        assert_eq!(doc, bson::doc! {"path": "log.txt"});
+        assert_eq!(bson::deserialize_from_document::<Read>(doc).unwrap(), read,);
+
+        let write = Write {
+            path: "data".into(),
+            data: vec![1, 2, 3],
+            offset: None,
+        };
+        let doc = bson::serialize_to_document(&write).unwrap();
+        assert_eq!(doc.get("offset"), None);
+        assert_eq!(
+            bson::deserialize_from_document::<Write>(doc).unwrap(),
+            write,
+        );
+    }
+
+    /// A read that hands back less than the file holds is the ordinary case, and
+    /// `size` against `data` is the only thing that says so.
+    #[test]
+    fn a_read_result_says_how_much_it_left() {
+        let value = bson::serialize_to_bson(&ReadResult {
+            data: vec![0xff, 0x00],
+            size: 4096,
+        })
+        .unwrap();
+
+        let doc = value.as_document().unwrap();
+        assert_eq!(
+            doc.get("data"),
+            Some(&Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: vec![0xff, 0x00],
+            })),
+        );
+
+        let read: ReadResult = bson::deserialize_from_bson(value).unwrap();
+        assert!(read.size > read.data.len() as u64);
     }
 
     /// An empty command is refused here rather than handed on as a program nobody
