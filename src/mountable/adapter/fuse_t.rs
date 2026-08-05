@@ -449,16 +449,16 @@ pub struct FuseTMount {
 }
 
 impl FuseTMount {
-    /// Mount `fs` at `mountpoint` and serve it from a background thread.
+    /// Mount `volume` at `mountpoint` and serve it from a background thread.
     ///
     /// `mountpoint` must already exist. Requires FUSE-T
     /// (`brew install --cask fuse-t`) — no kernel extension, no reboot.
-    pub fn spawn<T>(fs: PosixFs<T>, mountpoint: impl AsRef<Path>) -> Result<Self>
+    pub fn spawn<T>(volume: T, mountpoint: impl AsRef<Path>) -> Result<Self>
     where
         T: Mountable + 'static,
         T::Handle: 'static,
     {
-        Self::spawn_named(fs, mountpoint, "cortex")
+        Self::spawn_named(volume, mountpoint, "cortex")
     }
 
     /// [`spawn`](Self::spawn) with the name the mount reports as its source.
@@ -466,7 +466,7 @@ impl FuseTMount {
     /// Private: nothing has wanted a name other than `cortex` yet, and the fuser
     /// binding's `spawn_with` is the one that has a caller. Widen it when something
     /// needs it rather than carrying the surface on the chance.
-    fn spawn_named<T>(fs: PosixFs<T>, mountpoint: impl AsRef<Path>, fsname: &str) -> Result<Self>
+    fn spawn_named<T>(volume: T, mountpoint: impl AsRef<Path>, fsname: &str) -> Result<Self>
     where
         T: Mountable + 'static,
         T::Handle: 'static,
@@ -478,7 +478,7 @@ impl FuseTMount {
 
         // Boxed and never moved again, so the pointer the shim keeps stays valid
         // for as long as this guard lives.
-        let fs: Box<PosixFs<T>> = Box::new(fs);
+        let fs: Box<PosixFs<T>> = Box::new(PosixFs::new(volume));
         let fs_ptr = &*fs as *const PosixFs<T> as *mut c_void;
         let ops = ops_for::<T>();
 

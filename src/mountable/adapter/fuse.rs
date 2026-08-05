@@ -56,16 +56,20 @@ pub struct CortexMount {
 }
 
 impl CortexMount {
-    /// Mount `fs` at `mountpoint` and serve it from a background thread.
+    /// Mount `volume` at `mountpoint` and serve it from a background thread.
     ///
     /// `mountpoint` must already exist. On Linux `fuser` opens `/dev/fuse` itself;
     /// on macOS this needs **macFUSE** — see `adapter/fuse_t.rs` for why FUSE-T
     /// needs its own binding.
-    pub fn spawn<T>(fs: PosixFs<T>, mountpoint: impl AsRef<Path>) -> Result<Self>
+    pub fn spawn<T>(volume: T, mountpoint: impl AsRef<Path>) -> Result<Self>
     where
         T: Mountable + 'static,
     {
-        Self::spawn_with(fs, mountpoint, vec![MountOption::FSName("cortex".into())])
+        Self::spawn_with(
+            volume,
+            mountpoint,
+            vec![MountOption::FSName("cortex".into())],
+        )
     }
 
     /// [`spawn`](Self::spawn) with the mount options spelled out.
@@ -73,7 +77,7 @@ impl CortexMount {
     /// [`MountOption::RO`] makes the *kernel* reject writes before they reach a
     /// backend — stronger than each backend answering `ReadOnly` by hand.
     pub fn spawn_with<T>(
-        fs: PosixFs<T>,
+        volume: T,
         mountpoint: impl AsRef<Path>,
         mount_options: Vec<MountOption>,
     ) -> Result<Self>
@@ -85,7 +89,7 @@ impl CortexMount {
         // literal from outside `fuser` — start from the default and assign.
         let mut config = Config::default();
         config.mount_options = mount_options;
-        let session = fuser::spawn_mount2(fs, &mountpoint, &config)?;
+        let session = fuser::spawn_mount2(PosixFs::new(volume), &mountpoint, &config)?;
         Ok(CortexMount {
             session: Some(session),
             mountpoint,

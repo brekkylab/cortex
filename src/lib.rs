@@ -8,10 +8,10 @@
 //! # Using one
 //!
 //! Pick a backend — [`InMemVolume`], [`PassthroughVolume`], `S3Volume`, or
-//! [`Workspace`] to graft several under one tree — wrap it in [`PosixFs`], and
-//! give that to a binding. `HostMount` is whichever host binding the build
-//! enabled; `msb_krun`'s `FsBuilder::custom` takes the same [`PosixFs`] for a
-//! guest. No binding is enabled by default. `examples/mount_host.rs` and
+//! [`Workspace`] to graft several under one tree — and hand it to a binding.
+//! `HostMount` is whichever host binding the build enabled; `msb_krun`'s
+//! `FsBuilder::custom` wants the same backend wrapped in [`PosixFs`] first. No
+//! binding is enabled by default. `examples/mount_host.rs` and
 //! `src/bin/apply_krun.rs` walk those two paths end to end.
 //!
 //! # Implementing one

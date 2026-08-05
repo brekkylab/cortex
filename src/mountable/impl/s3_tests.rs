@@ -1031,8 +1031,6 @@ mod mounted {
     use std::fs;
     use std::path::PathBuf;
 
-    use crate::PosixFs;
-
     use crate::HostMount;
 
     fn mountpoint(tag: &str) -> PathBuf {
@@ -1064,7 +1062,7 @@ mod mounted {
     fn the_operating_system_can_read_an_object_store_mount() {
         let big = ruler(READAHEAD_CHUNK as usize + 300_000);
         let mnt = mountpoint("read");
-        let mount = HostMount::spawn(PosixFs::new(bucket(&big)), &mnt).expect("mount");
+        let mount = HostMount::spawn(bucket(&big), &mnt).expect("mount");
 
         // A real `readdir`, with the collision rules applied by the kernel's rules.
         let mut names: Vec<_> = fs::read_dir(&mnt)
@@ -1117,7 +1115,7 @@ mod mounted {
     #[ignore = "needs a libfuse provider and mounts a real filesystem"]
     fn the_operating_system_is_told_the_mount_is_read_only() {
         let mnt = mountpoint("ro");
-        let mount = HostMount::spawn(PosixFs::new(bucket("x")), &mnt).expect("mount");
+        let mount = HostMount::spawn(bucket("x"), &mnt).expect("mount");
 
         let denied = [
             fs::write(mnt.join("new.txt"), b"nope").err(),

@@ -32,7 +32,7 @@ use cortex::HostMount;
 fn main() {
     use std::path::Path;
 
-    use cortex::{FileExt, InMemVolume, Mountable, OpenOptions, PosixFs, Workspace};
+    use cortex::{FileExt, InMemVolume, Mountable, OpenOptions, Workspace};
 
     let mountpoint = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: mount_host <mountpoint>   (the directory must already exist)");
@@ -50,7 +50,7 @@ fn main() {
         .try_with_mount("", vol)
         .expect("the empty mount path never escapes the workspace root");
 
-    let mount = HostMount::spawn(PosixFs::new(workspace), &mountpoint).expect("mount");
+    let mount = HostMount::spawn(workspace, &mountpoint).expect("mount");
     println!("mounted at {}", mount.mountpoint().display());
     println!("  ls {mountpoint}");
     println!("  cat {mountpoint}/hello.txt");

@@ -57,10 +57,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cortex::{
-    Dirent, FileExt, FileHandle, InMemVolume, Mountable, OpenOptions, PosixFs, Result, Stat,
+    Dirent, FileExt, FileHandle, HostMount, InMemVolume, Mountable, OpenOptions, Result, Stat,
 };
-
-use cortex::HostMount;
 
 /// Set once the mount is up, so the reads the mount itself performs while coming
 /// up do not land in the sample.
@@ -204,7 +202,7 @@ fn main() {
     }
     drop(filler);
 
-    let mount = HostMount::spawn(PosixFs::new(Recorder(vol)), &mountpoint).expect("mount");
+    let mount = HostMount::spawn(Recorder(vol), &mountpoint).expect("mount");
     let base = Path::new(&mountpoint);
     RECORDING.store(true, Ordering::Relaxed);
 
