@@ -26,12 +26,8 @@ fn an_entry_takes_its_kind_from_the_metadata_it_carries() {
     assert!(bare.stat().is_none());
 }
 
-/// A flag lands on an access mode without disturbing the others, so a caller can
-/// say one thing at a time.
-///
-/// The asymmetry worth pinning is `create_new`. It is a constructor, because a
-/// setter of that name would collide with it, so the combinations wanting `O_EXCL`
-/// without both access modes are reached by narrowing rather than by setting.
+/// A setter answers for its own flag, and `create_new` — which has none — is
+/// reached by narrowing.
 #[test]
 fn a_flag_lands_on_an_access_mode_without_disturbing_the_others() {
     let appending = OpenOptions::write_only().append(true);
@@ -50,11 +46,7 @@ fn a_flag_lands_on_an_access_mode_without_disturbing_the_others() {
     );
 }
 
-/// What a read-only backend refuses on.
-///
-/// Five of the six flags mean modification, and the predicate lives here rather
-/// than in each backend, where the fifth term is the easy one to leave out.
-/// `create` counts even though it writes no bytes: it modifies the parent.
+/// `create` is the one worth pinning: it writes no bytes, and still counts.
 #[test]
 fn every_flag_but_read_means_modification() {
     let ro = OpenOptions::read_only();

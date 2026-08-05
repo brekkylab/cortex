@@ -32,15 +32,13 @@ pub use fuse_t::FuseTMount;
 #[cfg(feature = "fuse")]
 pub use fuser::MountOption;
 
-/// Whichever host binding this build has: `CortexMount` under `fuse`,
-/// `FuseTMount` under `fuse-t`.
+/// The host binding this build has.
 ///
-/// Exported because a consumer cannot express it. Features are a crate-level
-/// concept, so "whichever of the two is enabled" has no spelling outside the
-/// crate that defines them — every consumer would otherwise repeat this pair of
-/// `cfg`s, as `tests/host_mount.rs` and `examples/mount_host.rs` both did.
+/// Exported because a consumer cannot express the condition: features are a
+/// crate-level concept, so "whichever of the two is enabled" has no spelling
+/// outside the crate that defines them.
 ///
-/// FUSE-T wins a tie, being the one that needs no kernel extension.
+/// FUSE-T wins a tie, needing no kernel extension.
 #[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
 pub type HostMount = CortexMount;
 #[cfg(feature = "fuse-t")]

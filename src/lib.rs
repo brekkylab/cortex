@@ -16,11 +16,10 @@
 //!
 //! # Implementing one
 //!
-//! [`Mountable`] is the whole contract: seven operations addressed by path plus a
-//! [`FileHandle`] for offset I/O, and its docs carry the invariants a binding
-//! relies on. [`PosixFs`] is not part of it — that is the translation a *kernel*
-//! needs, because kernels address files by number — so an implementor can ignore
-//! it.
+//! [`Mountable`] is the whole contract: seven operations addressed by path, plus a
+//! [`FileHandle`] for offset I/O. [`PosixFs`] is not part of it — that is the
+//! translation a *kernel* needs, because kernels address files by number — so an
+//! implementor can ignore it.
 //!
 //! `ARCHITECTURE.md` has the long form.
 
