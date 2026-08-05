@@ -2,23 +2,32 @@
 //! real local filesystem via `std::fs`.
 //!
 //! A `PassthroughVolume` is anchored at a `root` directory on disk. Request
-//! paths are relative to it: leading `/` and `.` are ignored, `..` and OS
-//! prefixes rejected.
+//! paths are relative to it: leading `/` and `.` are ignored, `..` is folded,
+//! and an OS prefix — or a `..` with nothing left to fold — is rejected.
 //!
-//! Rejecting `..` confines nothing on its own — a symlink inside the root can
-//! point out of it. So a path with a link in it is resolved and must land under
-//! the root; one without cannot leave and is not resolved. A link that escapes,
-//! or dangles, is refused and left out of listings.
+//! Folding `..` confines nothing on its own — a symlink inside the root can
+//! point out of it. So one walk resolves what it finds and what it arrives at
+//! must be under the root; a path with no link in it cannot leave, and the same
+//! walk finds nothing to resolve. Resolving *reads* links rather than following
+//! them, which keeps the question to where a link points: one out of the root is
+//! refused and left out of listings, one naming something not created yet is
+//! served.
 //!
 //! The check and the operation are separate calls, so a link swapped between
 //! them is not caught. No binding implements `symlink`, so nothing reachable
 //! through this crate can do that; another process on the same tree could.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::{CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat};
+
+/// The links one request may resolve through before the walk calls it a cycle.
+/// Reading links rather than having the kernel follow them moves its ceiling
+/// here: `MAXSYMLINKS` is 32 on macOS and the BSDs, 40 on Linux.
+const MAX_LINK_HOPS: u32 = 32;
 
 /// A volume backed by a real on-disk directory.
 pub struct PassthroughVolume {
@@ -58,48 +67,105 @@ impl PassthroughVolume {
     /// Where `real` lands once links are resolved, or
     /// [`NotFound`](CortexError::NotFound) if that is outside the root.
     ///
+    /// Links are *read*, not followed. `canonicalize` answers the same question,
+    /// but only for a path whose every component exists — and a link naming
+    /// something not created yet points somewhere perfectly contained. Reading
+    /// the link says where without asking whether.
+    ///
     /// `NotFound` rather than `InvalidName`, which is for a malformed request:
-    /// this one is well formed, and `list` already omits the name, so the error
-    /// says what the omission does. `find` and `rsync` skip `ENOENT` and
-    /// surface `EINVAL`.
+    /// this one is well formed, so the error says what a caller holding that
+    /// name will hear from every other operation. `find` and `rsync` skip
+    /// `ENOENT` and surface `EINVAL`.
     fn resolve_within_root(&self, real: &Path) -> Result<PathBuf> {
-        let target = real.canonicalize()?;
-        if !target.starts_with(self.canonical_root()?) {
+        let root = self.canonical_root()?;
+        // Reversed, so `pop` walks left to right and a link's own target can go
+        // back on for the walk to continue through it.
+        let mut pending: Vec<OsString> = real
+            .strip_prefix(&self.root)
+            .map_err(|_| CortexError::NotFound)?
+            .components()
+            .rev()
+            .map(|comp| comp.as_os_str().to_os_string())
+            .collect();
+        let mut resolved = root.to_path_buf();
+        let mut hops = 0u32;
+        while let Some(name) = pending.pop() {
+            if name == "." {
+                continue;
+            }
+            if name == ".." {
+                // Against what is already *resolved*, which is where the kernel
+                // applies it too: a `..` after a link climbs from the target's
+                // parent, not the link's.
+                resolved.pop();
+                continue;
+            }
+            resolved.push(&name);
+            let Ok(target) = fs::read_link(&resolved) else {
+                continue; // not a link, or not there — nothing to resolve either way
+            };
+            hops += 1;
+            if hops > MAX_LINK_HOPS {
+                // A cycle names nothing this volume can serve, which is what
+                // `NotFound` says for every other unservable name here.
+                return Err(CortexError::NotFound);
+            }
+            resolved.pop();
+            // An absolute target replaces what is resolved so far, which
+            // `PathBuf::push` does on its own for a leading `RootDir`.
+            pending.extend(
+                target
+                    .components()
+                    .rev()
+                    .map(|comp| comp.as_os_str().to_os_string()),
+            );
+        }
+        if !resolved.starts_with(root) {
             return Err(CortexError::NotFound);
         }
-        Ok(target)
+        Ok(resolved)
     }
 
     /// Map a request path to its location under `root`, refusing what would
     /// leave it. Returns the *unresolved* path: `open` and `unlink` act on the
     /// name the caller asked for, links and all.
     fn real_path(&self, path: &Path) -> Result<PathBuf> {
-        // Only a link can take one of these paths out of the root, and
-        // resolving costs ~10µs against ~1µs for an `lstat` (macOS `realpath`
-        // opens the file), so the walk looks for one and resolves only if found.
         let mut real = self.root.clone();
+        let mut depth = 0usize;
         let mut through_a_link = false;
         for comp in path.components() {
             match comp {
-                Component::RootDir | Component::CurDir => continue,
-                Component::Normal(name) => real.push(name),
-                Component::ParentDir | Component::Prefix(_) => {
-                    return Err(CortexError::InvalidName);
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(name) => {
+                    real.push(name);
+                    depth += 1;
+                    // Asked here, where it costs no allocation, so a path with no
+                    // link in it never reaches the resolving walk — which builds a
+                    // stack it would have nothing to put on. A `..` that folds a
+                    // link away leaves this set: a wasted resolve, never a missed
+                    // one.
+                    through_a_link = through_a_link || fs::read_link(&real).is_ok();
                 }
+                // Folded, not refused: `a/b/../c` names something in the root
+                // like any other request, the same fold `Workspace` applies a
+                // layer up — spelled again, a backend reaching up into that
+                // layer inverting the layering. Nothing left to fold is a climb
+                // past the root, which is what the refusal is for.
+                Component::ParentDir => {
+                    if depth == 0 {
+                        return Err(CortexError::InvalidName);
+                    }
+                    real.pop();
+                    depth -= 1;
+                }
+                Component::Prefix(_) => return Err(CortexError::InvalidName),
             }
-            through_a_link = through_a_link
-                || fs::symlink_metadata(&real).is_ok_and(|meta| meta.file_type().is_symlink());
         }
-        if through_a_link {
-            // `symlink_metadata`, never `exists()`: that follows links, so a
-            // link to nowhere answers false and gets judged by its parent —
-            // after which a creating `open` writes on the far side of it.
-            match fs::symlink_metadata(&real) {
-                Ok(_) => self.resolve_within_root(&real)?,
-                // Nothing of that name yet, reached through a link. The parent
-                // decides, or a create POSIX allows would be refused.
-                Err(_) => self.resolve_within_root(real.parent().unwrap_or(&real))?,
-            };
+        // `depth` guards the root itself, which a resolve cannot be asked about:
+        // it wants [`canonical_root`](Self::canonical_root) first, and that would
+        // cost a volume the ability to `mkdir` the directory it was anchored at.
+        if through_a_link && depth > 0 {
+            self.resolve_within_root(&real)?;
         }
         Ok(real)
     }
@@ -147,9 +213,12 @@ impl Mountable for PassthroughVolume {
             let file_type = entry.file_type()?;
             let kind = if file_type.is_symlink() {
                 let Ok(target) = self.resolve_within_root(&entry.path()) else {
-                    continue; // escapes the root, or dangles
+                    continue; // escapes the root
                 };
-                if fs::metadata(&target)?.is_dir() {
+                // A target that is not there is still a name that is, and there
+                // is no `Symlink` to report it as. Not `?`, or one link with
+                // nothing on the end of it costs the whole listing.
+                if fs::metadata(&target).is_ok_and(|meta| meta.is_dir()) {
                     DirentKind::Dir
                 } else {
                     DirentKind::File

@@ -288,3 +288,137 @@ fn list_comes_back_in_a_stable_order() {
 
     fs::remove_dir_all(&base).unwrap();
 }
+
+/// The root is the one path a containment walk must not need: asking where it
+/// lands would resolve it, and resolving needs it to be there. So a volume can
+/// still make the directory it was anchored at.
+#[test]
+fn a_volume_can_make_the_root_it_was_anchored_at() {
+    let base = scratch("passthrough", "mkroot");
+    fs::remove_dir_all(&base).unwrap();
+    let vol = PassthroughVolume::new(&base);
+
+    vol.mkdir(Path::new("")).unwrap();
+    assert!(base.is_dir());
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A link spelling its target absolutely, in the root's own *uncanonical*
+/// spelling — which on macOS every scratch path has, `/var` being a link to
+/// `/private/var`. Resolving component by component walks through that one too,
+/// where comparing the target's spelling against the root's would not.
+#[test]
+#[cfg(unix)]
+fn a_link_to_an_absolute_path_inside_the_root_is_followed() {
+    let base = scratch("passthrough", "abslink");
+    fs::create_dir_all(base.join("sub")).unwrap();
+    fs::write(base.join("sub/inner.txt"), b"INNER").unwrap();
+    link(base.join("sub/inner.txt"), base.join("abs"));
+    let vol = PassthroughVolume::new(&base);
+
+    assert_eq!(vol.stat(Path::new("abs")).unwrap().size, 5);
+    assert!(names(&vol, "").contains(&"abs".to_string()));
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// `..` that stays inside is an ordinary request, and folding it is what
+/// [`Workspace`](crate::Workspace) already does to the same spelling. One that
+/// would climb past the root stays refused — `the_volume_refuses_what_it_cannot_serve`
+/// holds that line.
+#[test]
+fn a_dotdot_that_stays_inside_the_root_is_folded_rather_than_refused() {
+    let base = scratch("passthrough", "fold");
+    fs::create_dir_all(base.join("sub")).unwrap();
+    fs::write(base.join("sub/inner.txt"), b"INNER").unwrap();
+    let vol = PassthroughVolume::new(&base);
+
+    let folding = Path::new("sub/../sub/inner.txt");
+    assert_eq!(vol.stat(folding).unwrap().size, 5);
+    let (handle, _) = vol.open(folding, OpenOptions::read_only()).unwrap();
+    let mut buf = [0u8; 5];
+    handle.read_exact_at(&mut buf, 0).unwrap();
+    assert_eq!(&buf, b"INNER");
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A `..` the request never spelled: it arrives inside a link's target, and there
+/// it applies to what is already *resolved* — the target's parent, where the
+/// kernel applies it — not to the folded request that never left the root.
+#[test]
+#[cfg(unix)]
+fn a_dotdot_in_a_link_target_cannot_climb_out_of_the_root() {
+    let base = scratch("passthrough", "targetdotdot");
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    fs::create_dir_all(root.join("sub")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), b"OUT").unwrap();
+    link("sub/../../outside/secret.txt", root.join("climb"));
+
+    let vol = PassthroughVolume::new(&root);
+    assert!(matches!(
+        vol.stat(Path::new("climb")),
+        Err(CortexError::NotFound)
+    ));
+    assert_eq!(names(&vol, ""), vec!["sub"]);
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A cycle has no answer to give, so the walk has to stop having one rather than
+/// keep asking. Reading links instead of asking the kernel to resolve them means
+/// owning the ceiling the kernel was applying.
+#[test]
+#[cfg(unix)]
+fn a_link_that_loops_is_refused_rather_than_walked_forever() {
+    let base = scratch("passthrough", "loop");
+    link("b", base.join("a"));
+    link("a", base.join("b"));
+    let vol = PassthroughVolume::new(&base);
+
+    assert!(vol.stat(Path::new("a")).is_err());
+    assert!(vol.list(Path::new("")).is_ok());
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A link that stays inside the root and names something not there yet. Where it
+/// points is what containment is about, and that is inside; whether the target
+/// exists is the OS's business, and POSIX has a creating `open` make it.
+#[test]
+#[cfg(unix)]
+fn a_create_through_a_contained_link_reaches_its_target() {
+    let base = scratch("passthrough", "pending");
+    fs::create_dir_all(base.join("sub")).unwrap();
+    link("sub/new.txt", base.join("pending"));
+    let vol = PassthroughVolume::new(&base);
+
+    let creating = OpenOptions {
+        create: true,
+        ..OpenOptions::read_write()
+    };
+    let (handle, _) = vol.open(Path::new("pending"), creating).unwrap();
+    handle.write_all_at(b"MADE", 0).unwrap();
+    assert_eq!(fs::read(base.join("sub/new.txt")).unwrap(), b"MADE");
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// And in a listing. Omitting it would claim the name is not there over a
+/// question containment never asked; `DirentKind` has no `Symlink`, so `File` is
+/// what is left to say.
+#[test]
+#[cfg(unix)]
+fn a_link_that_dangles_inside_the_root_is_listed_as_a_file() {
+    let base = scratch("passthrough", "danglelist");
+    link("absent.txt", base.join("dangle"));
+    let vol = PassthroughVolume::new(&base);
+
+    let entries = vol.list(Path::new("")).unwrap();
+    let listed = entries.iter().find(|entry| entry.name == "dangle").unwrap();
+    assert_eq!(listed.kind, DirentKind::File);
+
+    fs::remove_dir_all(&base).unwrap();
+}
