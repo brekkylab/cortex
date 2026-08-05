@@ -412,7 +412,7 @@ impl Mountable for Workspace {
         self.guard_synthesized(&key, CortexError::IsADirectory)?;
         match self.route(&key) {
             Some((backend, sub)) => backend.open(&sub, options),
-            None if options.create || options.create_new => Err(self.refusal_for_create(&key)),
+            None if options.create => Err(self.refusal_for_create(&key)),
             None => Err(CortexError::NotFound),
         }
     }

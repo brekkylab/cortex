@@ -347,7 +347,7 @@ fn open_options_pin_the_creation_contract() {
     let vol = InMemVolume::new();
     let rw = OpenOptions::read_write();
     let create = rw.create(true);
-    let create_new = OpenOptions::create_new().create(true);
+    let create_new = OpenOptions::create_new();
 
     // Metadata comes back with the handle: a FUSE `create` must answer with both
     // in one message, and a follow-up `stat` is a round trip plus a window for the

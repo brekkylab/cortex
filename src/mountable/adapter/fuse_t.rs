@@ -240,12 +240,11 @@ unsafe extern "C" fn create<T: Mountable>(
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
-    let mut options = match decode_open_flags(flags, &HOST_OPEN_FLAGS) {
-        Ok(options) => options,
+    // The opcode itself means "make it if absent", whatever the flags word says.
+    let options = match decode_open_flags(flags, &HOST_OPEN_FLAGS) {
+        Ok(options) => options.create(true),
         Err(err) => return -host_errno(&err),
     };
-    // The opcode itself means "make it if absent", whatever the flags word says.
-    options.create = true;
 
     code(
         fs.create_child(parent, name, options)

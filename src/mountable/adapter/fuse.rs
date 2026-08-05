@@ -260,11 +260,10 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         reply: fuser::ReplyCreate,
     ) {
         // The opcode means "make it if absent" whatever the flags word says.
-        let mut options = match decode_open_flags(flags, &HOST_OPEN_FLAGS) {
-            Ok(options) => options,
+        let options = match decode_open_flags(flags, &HOST_OPEN_FLAGS) {
+            Ok(options) => options.create(true),
             Err(err) => return reply.error(to_errno(err)),
         };
-        options.create = true;
 
         match self.create_child(parent.0, name, options) {
             Ok((inode, stat, fh)) => reply.created(

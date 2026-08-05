@@ -89,6 +89,10 @@ pub struct OpenOptions {
     pub create: bool,
     /// Create the file, failing with [`AlreadyExists`] if it is already there.
     ///
+    /// Meaningless without `create`, as `O_EXCL` is without `O_CREAT`. A backend
+    /// decides *whether* to create from `create`, and reads this only inside that
+    /// branch, to decide whether the creation has to be exclusive.
+    ///
     /// [`AlreadyExists`]: crate::CortexError::AlreadyExists
     pub create_new: bool,
 }
@@ -130,6 +134,7 @@ impl OpenOptions {
     /// `create_new().read(false)`.
     pub fn create_new() -> Self {
         OpenOptions {
+            create: true,
             create_new: true,
             ..Self::read_write()
         }

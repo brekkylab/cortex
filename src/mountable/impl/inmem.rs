@@ -348,7 +348,7 @@ impl Mountable for InMemVolume {
         // Creation and the existence check happen under the parent's lock, so
         // `create_new` is genuinely exclusive: no other thread can slip an entry
         // in between the two.
-        let data = if options.create || options.create_new {
+        let data = if options.create {
             let (dir, name) = self.parent_of(path)?;
             let mut node = lock(&dir);
             let created;

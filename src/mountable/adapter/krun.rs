@@ -337,8 +337,9 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
     )> {
         // A guest `create` always means "make it if absent", whether or not it
         // set `O_CREAT` in the flags word — the opcode itself says so.
-        let mut options = decode_open_flags(flags as i32, &LINUX_OPEN_FLAGS).map_err(to_errno)?;
-        options.create = true;
+        let options = decode_open_flags(flags as i32, &LINUX_OPEN_FLAGS)
+            .map_err(to_errno)?
+            .create(true);
 
         let (inode, stat, fh) = self
             .create_child(parent, guest_name(name), options)

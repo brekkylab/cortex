@@ -46,6 +46,15 @@ fn a_flag_lands_on_an_access_mode_without_disturbing_the_others() {
     );
 }
 
+/// The constructor sets `create` as well, so a backend that decides whether to
+/// create from `create` alone still honours `O_EXCL`. One that tested only `create`
+/// would otherwise not create the file at all.
+#[test]
+fn an_exclusive_create_is_also_a_create() {
+    let excl = OpenOptions::create_new();
+    assert!(excl.create_new && excl.create);
+}
+
 /// `create` is the one worth pinning: it writes no bytes, and still counts.
 #[test]
 fn every_flag_but_read_means_modification() {
