@@ -39,9 +39,9 @@ const ROOT_INODE: u64 = 1;
 /// Adapts a path-addressed [`Mountable`] into stable inode numbers with the
 /// reference-counted bookkeeping a FUSE binding needs.
 ///
-/// It owns the backend, the inode table ([`InodeTable`]) that translates the
+/// It owns the backend, the inode table (`InodeTable`) that translates the
 /// kernel's inode numbers back into backend paths, and the handle table
-/// ([`HandleTable`]) that keeps a backend handle alive for each open file.
+/// (`HandleTable`) that keeps a backend handle alive for each open file.
 /// The fields are **private**, and that is the enforcement mechanism for "a
 /// binding only translates": an adapter cannot reach the tables, so it cannot
 /// re-derive an operation that belongs here. While they were `pub(super)`, three

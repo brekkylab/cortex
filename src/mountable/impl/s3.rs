@@ -496,7 +496,7 @@ impl S3Volume {
 impl Mountable for S3Volume {
     type Handle = S3Handle;
 
-    /// Metadata for one key, or for the prefix of that name — see [`Self::classify`].
+    /// Metadata for one key, or for the prefix of that name — see `classify`.
     fn stat(&self, path: &Path) -> Result<Stat> {
         Ok(match self.classify(path)? {
             Entry::File(meta) => file_stat(&meta),
@@ -519,7 +519,7 @@ impl Mountable for S3Volume {
     /// * A name can arrive from both sides at once: as a prefix (because keys live
     ///   under it) and as an object (because a key of exactly that name exists).
     ///   A `readdir` may not repeat a name, so one side has to go — see
-    ///   [`Self::resolve_collision`].
+    ///   `resolve_collision`.
     fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let key = self.key(path)?;
         let prefix = if key.is_empty() {

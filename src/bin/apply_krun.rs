@@ -212,7 +212,7 @@ const GUEST_SCRIPT: &str = concat!(
 /// Boot a microVM with a cortex [`Workspace`] served as a virtio-fs share,
 /// tagged `cortex`, and run [`GUEST_SCRIPT`] inside it.
 ///
-/// [`Workspace`] is a path-addressed [`Mountable`](cortex::Mountable) backend;
+/// [`Workspace`] is a path-addressed [`Mountable`] backend;
 /// [`PosixFs`] wraps it into the FUSE-shaped
 /// `Box<dyn DynFileSystem + Send + Sync>` that `FsBuilder::custom` attaches to
 /// the guest — so the workspace is served straight from this process, no daemon,

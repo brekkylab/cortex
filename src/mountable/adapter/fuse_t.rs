@@ -436,8 +436,8 @@ impl SessionPtr {
 
 /// A live FUSE-T mount, unmounted when this guard is dropped.
 ///
-/// The FUSE-T counterpart of [`CortexMount`](super::fuse::CortexMount), and the
-/// one that needs no kernel extension.
+/// The FUSE-T counterpart of `CortexMount` (`adapter/fuse.rs`), and the one that
+/// needs no kernel extension.
 pub struct FuseTMount {
     session: *mut c_void,
     thread: Option<JoinHandle<c_int>>,

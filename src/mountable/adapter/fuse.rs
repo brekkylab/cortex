@@ -59,7 +59,7 @@ impl CortexMount {
     /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
     /// `mountpoint` must already exist. On Linux `fuser` opens `/dev/fuse` itself;
-    /// on macOS this needs **macFUSE** — see [`super::fuse_t`] for why FUSE-T
+    /// on macOS this needs **macFUSE** — see `adapter/fuse_t.rs` for why FUSE-T
     /// needs its own binding.
     pub fn spawn<T>(fs: PosixFs<T>, mountpoint: impl AsRef<Path>) -> Result<Self>
     where
