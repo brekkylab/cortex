@@ -206,10 +206,20 @@ impl Console {
     /// So a caller waits for one thing and gets one thing, and the delegated calls
     /// underneath it are served in the order the command made them.
     ///
-    /// `exec` is an [`Exec`], or an argv on its own — `["echo", "hi"]` — for an execution
-    /// that has nothing else to say.
-    pub fn exec(&mut self, exec: impl Into<Exec>) -> Result<ExecResult, Failure> {
-        let mut progress = self.client.exec(exec.into())?;
+    /// The command is an argv — `["echo", "hi"]` — and nothing here consults a shell, so
+    /// a caller that wants shell semantics asks for them outright: `["sh", "-c", ".."]`.
+    /// The timeout is the console's [`default_timeout_ms`](ConsoleBuilder::default_timeout_ms),
+    /// which is the only one an execution started here has.
+    pub fn exec(
+        &mut self,
+        cmd: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<ExecResult, Failure> {
+        let exec = Exec {
+            cmd: cmd.into_iter().map(|s| s.as_ref().to_string()).collect(),
+            ..Exec::default()
+        };
+
+        let mut progress = self.client.exec(exec)?;
         loop {
             match progress {
                 Progress::Done(result) => return Ok(result),
@@ -479,11 +489,11 @@ mod tests {
         // An `exec` before any `start` is not refused here. Whether a session has to be
         // started before it runs anything is the server's rule to keep, so this goes out
         // and what comes back is whatever that server says — here, a result.
-        assert_eq!(console.exec(Exec::default()).unwrap().stdout, b"early\n");
+        assert_eq!(console.exec(["echo", "early"]).unwrap().stdout, b"early\n");
 
         console.start().unwrap();
         // An execution that delegated nothing is one round trip: no `resume`.
-        assert_eq!(console.exec(Exec::default()).unwrap().stdout, b"hi\n");
+        assert_eq!(console.exec(["echo", "hi"]).unwrap().stdout, b"hi\n");
         console.stop().unwrap();
 
         // Ending is the console going away, and nothing else has to happen for it: a
@@ -528,7 +538,7 @@ mod tests {
             .unwrap();
 
         console.start().unwrap();
-        assert_eq!(console.exec(Exec::default()).unwrap().stdout, b"done\n");
+        assert_eq!(console.exec(["foo"]).unwrap().stdout, b"done\n");
 
         assert_eq!(
             log.methods(),

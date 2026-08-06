@@ -124,36 +124,6 @@ pub struct Exec {
     pub timeout_ms: Option<u64>,
 }
 
-/// An argv and the defaults for the rest, over the three ways a caller has an argv: a
-/// literal, a slice, a `Vec`.
-///
-/// Which is what most executions are — `["echo", "hi"]` rather than an `Exec` written out
-/// to say only that. Anything else to set is the struct, as before.
-fn argv<S: AsRef<str>>(cmd: impl IntoIterator<Item = S>) -> Exec {
-    Exec {
-        cmd: cmd.into_iter().map(|s| s.as_ref().to_string()).collect(),
-        ..Exec::default()
-    }
-}
-
-impl<S: AsRef<str>, const N: usize> From<[S; N]> for Exec {
-    fn from(cmd: [S; N]) -> Exec {
-        argv(cmd)
-    }
-}
-
-impl<S: AsRef<str>> From<&[S]> for Exec {
-    fn from(cmd: &[S]) -> Exec {
-        argv(cmd)
-    }
-}
-
-impl<S: AsRef<str>> From<Vec<S>> for Exec {
-    fn from(cmd: Vec<S>) -> Exec {
-        argv(cmd)
-    }
-}
-
 /// Part of a file to hand back. The `params` of `read`.
 ///
 /// A path is where the executor says it is, resolved the way a relative path in
@@ -484,12 +454,16 @@ mod tests {
     /// `skip_serializing_if` buys — and it reads back unset.
     #[test]
     fn no_timeout_is_no_member() {
-        let value = bson::serialize_to_bson(&Exec::from(["ls"])).unwrap();
+        let exec = Exec {
+            cmd: vec!["ls".into()],
+            ..Exec::default()
+        };
+        let value = bson::serialize_to_bson(&exec).unwrap();
         let doc = value.as_document().unwrap();
         assert_eq!(doc.get("timeout_ms"), None);
 
         let read: Exec = bson::deserialize_from_bson(value).unwrap();
-        assert_eq!(read, Exec::from(["ls"]));
+        assert_eq!(read, exec);
     }
 
     /// A read with no bounds and a write with no offset carry neither member, so the
@@ -553,18 +527,5 @@ mod tests {
         assert_eq!(args, ["-c", ""]);
 
         assert!(Exec::default().split().is_none());
-    }
-
-    /// The three argv shapes are the one `Exec` written out, and nothing else is set.
-    #[test]
-    fn an_argv_is_an_exec_with_the_defaults() {
-        let written = Exec {
-            cmd: vec!["echo".into(), "hi".into()],
-            ..Exec::default()
-        };
-
-        assert_eq!(Exec::from(["echo", "hi"]), written);
-        assert_eq!(Exec::from(&["echo", "hi"][..]), written);
-        assert_eq!(Exec::from(vec![String::from("echo"), "hi".into()]), written);
     }
 }
