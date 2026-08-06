@@ -43,9 +43,17 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3);
 const RENDER_TTL: Duration = Duration::from_secs(15);
 
 /// Connection settings for [`NotionVolume`].
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct NotionConfig {
     pub api_key: String,
+}
+
+impl std::fmt::Debug for NotionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotionConfig")
+            .field("api_key", &"[redacted]")
+            .finish()
+    }
 }
 
 /// A rendered `page.json`: its bytes plus the page's timestamps.
