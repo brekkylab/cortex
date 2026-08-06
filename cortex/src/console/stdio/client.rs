@@ -1,7 +1,7 @@
 //! The asking end, over a framed channel: one call out, one response back.
 //!
 //! A client only asks. Nothing arrives on this channel but the answers to what it
-//! asked, so this is a send, a read and a match — no threads, no locks, no pending
+//! asked, so this is a send, a read and a match — no tasks, no locks, no pending
 //! table. A delegated executable is *not* an exception: a server that needs one run
 //! says so in the response to the `exec` it was already going to answer
 //! ([`Progress::Delegated`](crate::console::Progress::Delegated)), so what arrives here
@@ -21,8 +21,9 @@
 //! The pipes and the process are therefore one fact, and this end holds both.
 //! [`quit`](Client::quit) is the ending: the writer is dropped — which is how a
 //! server learns the session is over — and then the process is waited for. Dropping a
-//! client that was never quit kills it instead, so a server does not outlive the channel
-//! to it either way.
+//! client that was never quit kills it instead ([`kill_on_drop`]), so a server does not
+//! outlive the channel to it either way. Which is also the only ending a `drop` can
+//! offer: collecting a process is an `await`, and nothing may await on the way out.
 //!
 //! Which is why the process is not a [`Console`]'s. What a session *is* — the methods, the
 //! delegated names, walking the delegation chain — is the same wherever a server runs;
@@ -34,9 +35,14 @@
 //! normally wants.
 //!
 //! [`Console`]: crate::console::Console
+//! [`kill_on_drop`]: tokio::process::Command::kill_on_drop
 
-use std::io::{self, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::io;
+use std::process::Stdio;
+
+use futures_core::future::BoxFuture;
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
+use tokio::process::{Child, Command};
 
 use crate::console::stdio::{read, write};
 use crate::console::{Call, Client, Failure, Message, Notification, Outcome, RequestId};
@@ -59,10 +65,10 @@ pub struct StdioClient {
     /// Buffered here, once. Nothing hands this to a command — it is the protocol's for
     /// the life of the session — so reading ahead cannot take a byte that was somebody
     /// else's.
-    incoming: BufReader<Box<dyn Read + Send>>,
+    incoming: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
 
     /// Where calls go — the server's stdin, until [`quit`](Client::quit) closes it.
-    outgoing: Box<dyn Write + Send>,
+    outgoing: Box<dyn AsyncWrite + Send + Unpin>,
 
     /// The process those pipes belong to.
     ///
@@ -80,16 +86,22 @@ impl StdioClient {
     /// Start `server` and drive the session over its own pipes.
     ///
     /// Everything about the command is the caller's — what to run, its arguments, its
-    /// environment, where its stderr goes — except the two descriptors the protocol needs,
-    /// which are set here. A caller who got those wrong would have a client with nothing
-    /// to say, so they are not something to get wrong.
+    /// environment, where its stderr goes — except the three things this end sets: the two
+    /// descriptors the protocol needs, and that the process dies with the client. A caller
+    /// who got the descriptors wrong would have a client with nothing to say, so they are
+    /// not something to get wrong.
     ///
     /// The pipes are the protocol's from here on, and so is the process: nothing else may
     /// reach either, because a reader that could would take a byte that was a response's.
+    ///
+    /// Starting a process registers it with the runtime that will reap it, so this is
+    /// called from a task or from `main` and not from anywhere at all.
     pub fn new(mut server: Command) -> io::Result<StdioClient> {
         let mut server = server
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
+            // The ending a `drop` can give. See the module docs.
+            .kill_on_drop(true)
             .spawn()?;
 
         // Both are `Some`: they were asked for immediately above.
@@ -112,8 +124,8 @@ impl StdioClient {
     /// be built without one would have a process to collect on some paths and not others.
     #[cfg(test)]
     fn over(
-        incoming: impl Read + Send + 'static,
-        outgoing: impl Write + Send + 'static,
+        incoming: impl AsyncRead + Send + Unpin + 'static,
+        outgoing: impl AsyncWrite + Send + Unpin + 'static,
     ) -> StdioClient {
         StdioClient {
             incoming: BufReader::new(Box::new(incoming)),
@@ -123,12 +135,16 @@ impl StdioClient {
         }
     }
 
-    fn send(&mut self, message: &Message) -> Result<(), Failure> {
-        write(&mut self.outgoing, message).map_err(broke("sending a message"))
+    async fn send(&mut self, message: &Message) -> Result<(), Failure> {
+        write(&mut self.outgoing, message)
+            .await
+            .map_err(broke("sending a message"))
     }
 
-    fn recv(&mut self) -> Result<Option<Message>, Failure> {
-        read(&mut self.incoming).map_err(broke("reading a message"))
+    async fn recv(&mut self) -> Result<Option<Message>, Failure> {
+        read(&mut self.incoming)
+            .await
+            .map_err(broke("reading a message"))
     }
 }
 
@@ -138,42 +154,48 @@ impl Client for StdioClient {
     /// Anything else that arrives is a server that has lost track of itself. A
     /// response to a call nobody made is noted and dropped; a *request* is a server
     /// trying to be a client, which this end has no answer for.
-    fn call(&mut self, call: Call) -> Result<Outcome, Failure> {
-        // Spent before the send rather than after the answer, so a call that fails
-        // part way does not leave its id for the next one to reuse.
-        let id = self.next_id;
-        self.next_id += 1;
+    ///
+    /// The whole round trip is one future over both descriptors, which is what makes the
+    /// pairing sound: nothing else can put a frame on the wire between the request and
+    /// the response that answers it, because nothing else holds the borrow.
+    fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Outcome, Failure>> {
+        Box::pin(async move {
+            // Spent before the send rather than after the answer, so a call that fails
+            // part way does not leave its id for the next one to reuse.
+            let id = self.next_id;
+            self.next_id += 1;
 
-        self.send(&Message::Request { id, call })?;
+            self.send(&Message::Request { id, call }).await?;
 
-        loop {
-            let Some(message) = self.recv()? else {
-                return Err(Failure::broken(format!(
-                    "the server closed the channel before answering request {id}"
-                )));
-            };
-
-            match message {
-                Message::Response {
-                    id: answered,
-                    outcome,
-                } if answered == id => return Ok(outcome),
-
-                Message::Response { id: answered, .. } => eprintln!(
-                    "console: a response arrived for request {answered}, which nobody made"
-                ),
-
-                other => {
+            loop {
+                let Some(message) = self.recv().await? else {
                     return Err(Failure::broken(format!(
-                        "the server sent {other:?}, which a client cannot answer"
+                        "the server closed the channel before answering request {id}"
                     )));
+                };
+
+                match message {
+                    Message::Response {
+                        id: answered,
+                        outcome,
+                    } if answered == id => return Ok(outcome),
+
+                    Message::Response { id: answered, .. } => eprintln!(
+                        "console: a response arrived for request {answered}, which nobody made"
+                    ),
+
+                    other => {
+                        return Err(Failure::broken(format!(
+                            "the server sent {other:?}, which a client cannot answer"
+                        )));
+                    }
                 }
             }
-        }
+        })
     }
 
-    fn notify(&mut self, notification: Notification) -> Result<(), Failure> {
-        self.send(&Message::Notification(notification))
+    fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move { self.send(&Message::Notification(notification)).await })
     }
 
     /// Say the session is over, close the pipe, and wait for the server to go.
@@ -192,36 +214,27 @@ impl Client for StdioClient {
     /// of the ending and its result is what this is.
     ///
     /// Calling this twice is not an error; the second time there is nothing left to collect.
-    fn quit(&mut self) -> Result<(), Failure> {
-        let said = self.notify(Notification::Quit);
-        self.outgoing = Box::new(io::sink());
+    fn quit(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move {
+            let said = self.notify(Notification::Quit).await;
+            self.outgoing = Box::new(tokio::io::sink());
 
-        let Some(mut server) = self.server.take() else {
-            return said;
-        };
+            let Some(mut server) = self.server.take() else {
+                return said;
+            };
 
-        let status = server
-            .wait()
-            .map_err(broke("waiting for the console server"))?;
+            let status = server
+                .wait()
+                .await
+                .map_err(broke("waiting for the console server"))?;
 
-        if !status.success() {
-            return Err(Failure::broken(format!(
-                "the console server ended with {status}"
-            )));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for StdioClient {
-    fn drop(&mut self) {
-        // A session that ended by hand has nothing here. One that did not gets no grace:
-        // there is no telling what a server left mid-session is waiting for, and a `wait`
-        // in a `drop` that guessed wrong would hang whoever is dropping it.
-        if let Some(server) = self.server.as_mut() {
-            let _ = server.kill();
-            let _ = server.wait();
-        }
+            if !status.success() {
+                return Err(Failure::broken(format!(
+                    "the console server ended with {status}"
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -234,34 +247,47 @@ fn broke(doing: &'static str) -> impl FnOnce(io::Error) -> Failure {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
 
     use super::*;
     use crate::console::{Error, Exec, ExecResult, Method, Progress, Start};
 
     /// Everything the client wrote, readable after it has been dropped or not — a
     /// `Vec` cannot be, once the client owns it.
+    ///
+    /// Never actually pends: a write into memory has nothing to wait for, so every poll
+    /// is a `Ready`.
     #[derive(Clone, Default)]
     struct Sent(Arc<Mutex<Vec<u8>>>);
 
-    impl Write for Sent {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    impl AsyncWrite for Sent {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
             self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
+            Poll::Ready(Ok(buf.len()))
         }
 
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
     impl Sent {
         /// The id and method of each message, in the order they went out.
-        fn messages(&self) -> Vec<(Option<RequestId>, Option<Method>)> {
+        async fn messages(&self) -> Vec<(Option<RequestId>, Option<Method>)> {
             let bytes = self.0.lock().unwrap().clone();
             let mut reader = bytes.as_slice();
             let mut sent = Vec::new();
-            while let Some(message) = read(&mut reader).unwrap() {
+            while let Some(message) = read(&mut reader).await.unwrap() {
                 sent.push((message.id(), message.method()));
             }
             sent
@@ -271,10 +297,10 @@ mod tests {
     /// A client over a canned stream of what a server would have said — which is
     /// enough for the whole protocol, now that everything this end reads is a
     /// response.
-    fn driving(incoming: &[Message]) -> (StdioClient, Sent) {
+    async fn driving(incoming: &[Message]) -> (StdioClient, Sent) {
         let mut bytes = Vec::new();
         for message in incoming {
-            write(&mut bytes, message).unwrap();
+            write(&mut bytes, message).await.unwrap();
         }
         let sent = Sent::default();
         (StdioClient::over(Cursor::new(bytes), sent.clone()), sent)
@@ -312,28 +338,30 @@ mod tests {
     }
 
     /// The ordinary session, and the ids it allocates: from zero, by one.
-    #[test]
-    fn a_session_is_start_then_execs_then_stop() {
-        let (mut client, sent) = driving(&[null(0), ran(1, b"hi\n"), null(2)]);
+    #[tokio::test]
+    async fn a_session_is_start_then_execs_then_stop() {
+        let (mut client, sent) = driving(&[null(0), ran(1, b"hi\n"), null(2)]).await;
 
         client
             .start(Start {
                 delegated: vec!["foo".into()],
                 default_timeout_ms: Some(30_000),
             })
+            .await
             .unwrap();
         let result = client
             .exec(Exec {
                 cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
                 ..Exec::default()
             })
+            .await
             .unwrap();
         assert_eq!(done(result).stdout, b"hi\n");
-        client.stop().unwrap();
-        client.quit().unwrap();
+        client.stop().await.unwrap();
+        client.quit().await.unwrap();
 
         assert_eq!(
-            sent.messages(),
+            sent.messages().await,
             [
                 (Some(0), Some(Method::Start)),
                 (Some(1), Some(Method::Exec)),
@@ -345,18 +373,19 @@ mod tests {
     }
 
     /// The two failures a caller does different things about.
-    #[test]
-    fn a_refusal_is_an_answer_and_a_closed_channel_is_not() {
+    #[tokio::test]
+    async fn a_refusal_is_an_answer_and_a_closed_channel_is_not() {
         let (mut client, _) = driving(&[Message::Response {
             id: 0,
             outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
-        }]);
-        let failure = client.exec(Exec::default()).unwrap_err();
+        }])
+        .await;
+        let failure = client.exec(Exec::default()).await.unwrap_err();
         assert_eq!(failure.code(), Some(Error::TIMED_OUT));
 
         // Nothing at all: the server closed without answering.
-        let (mut client, _) = driving(&[]);
-        let failure = client.exec(Exec::default()).unwrap_err();
+        let (mut client, _) = driving(&[]).await;
+        let failure = client.exec(Exec::default()).await.unwrap_err();
         assert_eq!(failure.code(), None);
         assert!(
             failure.to_string().contains("before answering request 0"),
@@ -366,17 +395,18 @@ mod tests {
 
     /// A response to a call nobody made is dropped; a request is not something this
     /// end can answer at all.
-    #[test]
-    fn a_client_answers_nothing() {
-        let (mut client, _) = driving(&[ran(99, b"who asked"), ran(0, b"mine\n")]);
-        let result = done(client.exec(Exec::default()).unwrap());
+    #[tokio::test]
+    async fn a_client_answers_nothing() {
+        let (mut client, _) = driving(&[ran(99, b"who asked"), ran(0, b"mine\n")]).await;
+        let result = done(client.exec(Exec::default()).await.unwrap());
         assert_eq!(result.stdout, b"mine\n");
 
         let (mut client, _) = driving(&[Message::Request {
             id: 1,
             call: Call::Stop,
-        }]);
-        let failure = client.exec(Exec::default()).unwrap_err();
+        }])
+        .await;
+        let failure = client.exec(Exec::default()).await.unwrap_err();
         assert!(failure.to_string().contains("cannot answer"), "{failure}");
     }
 
@@ -386,37 +416,37 @@ mod tests {
     /// Neither of these programs speaks the protocol, which is the point: what is being
     /// tested is the ending, and an ending is the one thing this end does not need an
     /// answer for.
-    #[test]
-    fn quitting_collects_the_server_and_says_how_it_went() {
+    #[tokio::test]
+    async fn quitting_collects_the_server_and_says_how_it_went() {
         let mut ends_badly = Command::new("sh");
         ends_badly.args(["-c", "exit 3"]);
         let mut client = StdioClient::new(ends_badly).unwrap();
 
-        let failure = client.quit().unwrap_err();
+        let failure = client.quit().await.unwrap_err();
         assert_eq!(failure.code(), None, "a dead server is not a refusal");
         assert!(failure.to_string().contains("exit status: 3"), "{failure}");
 
         // Collected once. A second `quit` has nothing left to wait for and says nothing
         // about a status it already reported.
-        client.quit().unwrap();
+        client.quit().await.unwrap();
 
         let mut ends_well = Command::new("sh");
         ends_well.args(["-c", "exit 0"]);
-        StdioClient::new(ends_well).unwrap().quit().unwrap();
+        StdioClient::new(ends_well).unwrap().quit().await.unwrap();
     }
 
     /// An id is spent whether or not its call worked, so a failed call cannot leave
     /// its number for the next one to reuse.
-    #[test]
-    fn a_failed_call_still_spends_its_id() {
+    #[tokio::test]
+    async fn a_failed_call_still_spends_its_id() {
         // Nothing is ever answered, so both calls fail — after their requests have
         // already gone out, which is the part that matters.
-        let (mut client, sent) = driving(&[]);
-        assert!(client.exec(Exec::default()).is_err());
-        assert!(client.stop().is_err());
+        let (mut client, sent) = driving(&[]).await;
+        assert!(client.exec(Exec::default()).await.is_err());
+        assert!(client.stop().await.is_err());
 
         assert_eq!(
-            sent.messages(),
+            sent.messages().await,
             [(Some(0), Some(Method::Exec)), (Some(1), Some(Method::Stop))]
         );
     }

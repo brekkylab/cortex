@@ -9,21 +9,25 @@
 //! use cortex::console::{Message, Outcome, Server};
 //!
 //! # fn answer(call: cortex::console::Call) -> Outcome { unimplemented!() }
-//! # fn main() -> anyhow::Result<()> {
+//! # #[tokio::main]
+//! # async fn main() -> anyhow::Result<()> {
 //! // Takes stdin and stdout for the protocol; everything else goes to stderr.
 //! let mut server = StdioServer::stdio()?;
 //!
-//! while let Some(message) = server.recv()? {
+//! while let Some(message) = server.recv().await? {
 //!     if let Message::Request { id, call } = message {
-//!         server.respond(id, answer(call))?;
+//!         server.respond(id, answer(call)).await?;
 //!     }
 //! }
 //! # Ok(())
 //! # }
 //! ```
 
-use std::io::{self, BufReader, Read, Write};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use futures_core::future::BoxFuture;
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 
 use crate::console::stdio::{read, write};
 use crate::console::{Message, Outcome, RequestId, Server};
@@ -56,18 +60,18 @@ pub struct StdioServer {
     /// Buffered here, once. Nothing hands this to a command — it is the protocol's for
     /// the life of the session — so reading ahead cannot take a byte that was somebody
     /// else's.
-    incoming: BufReader<Box<dyn Read + Send>>,
+    incoming: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
 
     /// Where responses go.
-    outgoing: Box<dyn Write + Send>,
+    outgoing: Box<dyn AsyncWrite + Send + Unpin>,
 }
 
 impl StdioServer {
-    /// Take the two descriptors, whatever they are — this process's stdin and stdout, a
-    /// virtio port out of a guest, a `Cursor` and a `Vec` for a test.
+    /// Take the two descriptors, whatever they are — this process's stdin and stdout, the
+    /// halves of a socket, a `Cursor` and a `Vec` for a test.
     pub fn new(
-        incoming: impl Read + Send + 'static,
-        outgoing: impl Write + Send + 'static,
+        incoming: impl AsyncRead + Send + Unpin + 'static,
+        outgoing: impl AsyncWrite + Send + Unpin + 'static,
     ) -> Self {
         StdioServer {
             incoming: BufReader::new(Box::new(incoming)),
@@ -81,34 +85,32 @@ impl StdioServer {
     /// than something checked — see [`read()`] and [`write()`] for why it cannot be — so
     /// diagnostics go to stderr.
     ///
-    /// The handles rather than their locks, because a lock guard is not [`Send`]. Both
-    /// are buffered already, which is fine now that neither descriptor is ever handed
-    /// to a command.
-    ///
     /// Fails if called twice: there is one stdin and one stdout, so a second of these
     /// would be a second owner of both and the two would interleave frames.
     pub fn stdio() -> anyhow::Result<Self> {
         if TAKEN.swap(true, Ordering::SeqCst) {
             anyhow::bail!("stdin and stdout are already the protocol's — there is one of each");
         }
-        Ok(StdioServer::new(io::stdin(), io::stdout()))
+        Ok(StdioServer::new(tokio::io::stdin(), tokio::io::stdout()))
     }
 }
 
 impl Server for StdioServer {
-    fn recv(&mut self) -> io::Result<Option<Message>> {
-        read(&mut self.incoming)
+    fn recv(&mut self) -> BoxFuture<'_, io::Result<Option<Message>>> {
+        Box::pin(read(&mut self.incoming))
     }
 
-    fn respond(&mut self, id: RequestId, outcome: Outcome) -> io::Result<()> {
-        write(&mut self.outgoing, &Message::Response { id, outcome })
+    fn respond(&mut self, id: RequestId, outcome: Outcome) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(async move { write(&mut self.outgoing, &Message::Response { id, outcome }).await })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context as TaskContext, Poll};
 
     use super::*;
     use crate::console::{Call, Error, Exec, Notification, Start};
@@ -118,21 +120,29 @@ mod tests {
     #[derive(Clone, Default)]
     struct Sent(Arc<Mutex<Vec<u8>>>);
 
-    impl Write for Sent {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    impl AsyncWrite for Sent {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
             self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
+            Poll::Ready(Ok(buf.len()))
         }
 
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
         }
     }
 
-    fn framed(messages: &[Message]) -> Vec<u8> {
+    async fn framed(messages: &[Message]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for message in messages {
-            write(&mut bytes, message).unwrap();
+            write(&mut bytes, message).await.unwrap();
         }
         bytes
     }
@@ -144,8 +154,8 @@ mod tests {
     /// Everything arrives, in order, and nothing is read into: a notification and a
     /// response are handed over exactly as they came, for a caller to make of what it
     /// will.
-    #[test]
-    fn every_message_arrives_as_it_was_sent() {
+    #[tokio::test]
+    async fn every_message_arrives_as_it_was_sent() {
         let sent = vec![
             request(0, Call::Start(Start::default())),
             request(
@@ -164,31 +174,33 @@ mod tests {
             Message::Notification(Notification::Quit),
         ];
 
-        let mut server = StdioServer::new(Cursor::new(framed(&sent)), Sent::default());
+        let mut server = StdioServer::new(Cursor::new(framed(&sent).await), Sent::default());
         for message in &sent {
-            assert_eq!(server.recv().unwrap().as_ref(), Some(message));
+            assert_eq!(server.recv().await.unwrap().as_ref(), Some(message));
         }
         // And the end of the channel is a clean end, not an error.
-        assert!(server.recv().unwrap().is_none());
+        assert!(server.recv().await.unwrap().is_none());
     }
 
     /// A response goes out framed, carrying the id it was given and nothing else.
-    #[test]
-    fn a_response_carries_the_id_it_was_given() {
+    #[tokio::test]
+    async fn a_response_carries_the_id_it_was_given() {
         let sent = Sent::default();
-        let mut server = StdioServer::new(io::empty(), sent.clone());
+        let mut server = StdioServer::new(tokio::io::empty(), sent.clone());
 
         server
             .respond(7, Outcome::Result(bson::Bson::Null))
+            .await
             .unwrap();
         server
             .respond(9, Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")))
+            .await
             .unwrap();
 
         let bytes = sent.0.lock().unwrap().clone();
         let mut reader = bytes.as_slice();
         let mut written = Vec::new();
-        while let Some(message) = read(&mut reader).unwrap() {
+        while let Some(message) = read(&mut reader).await.unwrap() {
             written.push(message);
         }
 
@@ -209,14 +221,14 @@ mod tests {
 
     /// A frame that is not a message cannot be resynchronised past, so it is an error
     /// rather than an ending.
-    #[test]
-    fn a_malformed_frame_is_an_error_and_not_an_end() {
+    #[tokio::test]
+    async fn a_malformed_frame_is_an_error_and_not_an_end() {
         let payload = br#"{"jsonrpc":"2.0","method":"nonsense"}"#;
         let mut bytes = (payload.len() as u32).to_be_bytes().to_vec();
         bytes.extend_from_slice(payload);
 
         let mut server = StdioServer::new(Cursor::new(bytes), Sent::default());
-        let error = server.recv().unwrap_err();
+        let error = server.recv().await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 }

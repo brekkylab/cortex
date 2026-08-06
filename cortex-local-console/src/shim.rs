@@ -8,13 +8,13 @@
 //! One connection, one call, one answer — which is the console protocol's shape too, so
 //! this speaks it rather than a wire of its own.
 
-use std::io::{self, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 
 use anyhow::bail;
 use cortex::console::stdio::{read, write};
 use cortex::console::{Call, Exec, ExecResult, Message};
+use tokio::io::AsyncWriteExt as _;
+use tokio::net::UnixStream;
 
 use crate::ipc::SOCK_ENV;
 
@@ -30,8 +30,8 @@ const NOT_EXECUTABLE: u8 = 126;
 const CALL_ID: u64 = 0;
 
 /// Forward a call named `tool` to the client and become its result.
-pub fn run(tool: &str) -> ExitCode {
-    match forward(tool) {
+pub async fn run(tool: &str) -> ExitCode {
+    match forward(tool).await {
         // A process can only exit 0..=255; a negative or oversized code cannot be
         // represented, so clamp rather than silently truncate.
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
@@ -43,11 +43,15 @@ pub fn run(tool: &str) -> ExitCode {
 }
 
 /// One call, one connection: send it, put the answer back, return the code.
-fn forward(tool: &str) -> anyhow::Result<i32> {
+///
+/// The stream is written and then read through the same borrow, which is all this needs:
+/// the answer cannot arrive before the question goes out, so there is nothing here for
+/// two halves to do at once.
+async fn forward(tool: &str) -> anyhow::Result<i32> {
     let sock = std::env::var(SOCK_ENV)
         .map_err(|_| anyhow::anyhow!("{SOCK_ENV} is unset — not running under a console"))?;
 
-    let stream = UnixStream::connect(&sock)?;
+    let mut stream = UnixStream::connect(&sock).await?;
 
     // The name is `cmd[0]`, which is how any `exec` names what to run — a delegated one
     // is not a different kind of request, only one whose program lives elsewhere.
@@ -55,7 +59,7 @@ fn forward(tool: &str) -> anyhow::Result<i32> {
     cmd.extend(std::env::args().skip(1));
 
     write(
-        &mut &stream,
+        &mut stream,
         &Message::Request {
             id: CALL_ID,
             call: Call::Exec(Exec {
@@ -63,10 +67,10 @@ fn forward(tool: &str) -> anyhow::Result<i32> {
                 ..Exec::default()
             }),
         },
-    )?;
+    )
+    .await?;
 
-    let mut reader = BufReader::new(&stream);
-    let Some(message) = read(&mut reader)? else {
+    let Some(message) = read(&mut stream).await? else {
         bail!("the console closed the connection without answering");
     };
     let Message::Response { outcome, .. } = message else {
@@ -77,13 +81,16 @@ fn forward(tool: &str) -> anyhow::Result<i32> {
     // chunks — so what makes the shim transparent is *where* the bytes go, not when.
     let result: ExecResult = outcome.take().map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(&result.stdout)?;
-    stdout.flush()?;
+    // Our own descriptors, and they are whatever ran us handed down — a pipeline, a file,
+    // a terminal. Flushed before the code goes back, because exiting is what happens next
+    // and a buffer nobody drained would be output the caller never saw.
+    let mut stdout = tokio::io::stdout();
+    stdout.write_all(&result.stdout).await?;
+    stdout.flush().await?;
 
-    let mut stderr = io::stderr().lock();
-    stderr.write_all(&result.stderr)?;
-    stderr.flush()?;
+    let mut stderr = tokio::io::stderr();
+    stderr.write_all(&result.stderr).await?;
+    stderr.flush().await?;
 
     Ok(result.code)
 }

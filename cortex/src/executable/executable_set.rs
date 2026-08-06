@@ -39,8 +39,12 @@ impl ExecutableSet {
     /// `None` is the allowlist boundary. A server that only ever exposes the
     /// names in this set should not reach it — but the name usually arrives
     /// from outside the process, so it is input, not a guarantee.
-    pub fn invoke(&self, call: &ExecCall) -> Option<ExecResult> {
+    ///
+    /// Whether the name was registered is settled before anything is awaited, and the
+    /// lookup itself is a map read — so a caller that only wants to know whether a name
+    /// is one of ours pays nothing for the waiting it did not ask for.
+    pub async fn invoke(&self, call: &ExecCall) -> Option<ExecResult> {
         let exec = self.execs.get(&call.name)?;
-        Some(exec.exec(call))
+        Some(exec.exec(call).await)
     }
 }

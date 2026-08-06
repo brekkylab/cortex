@@ -18,8 +18,37 @@
 //! [`stdio`](crate::console::stdio) is the transport there is — framed JSON-RPC
 //! over a pipe. A micro-VM's virtio port would be another, and nothing here would
 //! change.
+//!
+//! # Every method hands back a boxed future
+//!
+//! Waiting is what these two do — for a pipe to drain, for a server to answer, for a
+//! command that has not finished — so every method is something to `await`, and none of
+//! them is an `async fn`. An `async fn` in a trait returns a type only the implementation
+//! knows, which is a type a `dyn` cannot name: it would make both traits unusable behind
+//! a pointer, and a [`Console`](crate::console::Console) holds a `dyn Client` precisely so
+//! that which transport it drives is not in its type.
+//!
+//! So each method returns a [`BoxFuture`] instead — one allocation per call, against a
+//! round trip over a pipe — and the derived methods are written the same way as the two
+//! they are derived from, rather than being a second shape to read.
+//!
+//! [`Send`], because a session is a thing to hand to a task. Every future here can cross
+//! threads, which is also why both traits require it of the ends themselves.
+//!
+//! # One call at a time, and the borrow that says so
+//!
+//! `&mut self` throughout. Nothing here is `&self` with a lock behind it, and that is the
+//! protocol showing through rather than an omission: an id is allocated per call, a
+//! delegated execution owes an answer before anything else may be asked, and a second
+//! caller interleaving a `read` into the middle of that chain would be asking a question
+//! the server has no way to answer.
+//!
+//! An exclusive borrow is how that is said in a signature, and it is checked rather than
+//! documented. A caller wanting concurrency wants a second console.
 
 use std::io;
+
+use futures_core::future::BoxFuture;
 
 use crate::console::{
     Call, Error, Exec, Message, Notification, Outcome, Progress, Read, ReadResult, RequestId,
@@ -86,24 +115,35 @@ impl From<Error> for Failure {
 ///
 /// Two things are a transport's: putting a call on the wire and coming back with the
 /// response that answers *that* call, and putting a notification on the wire. The
-/// four methods below are neither, so they are written once here — which is also the
-/// one place an untyped [`Outcome`] becomes what its method returns.
-pub trait Client {
+/// rest of the methods below are neither, so they are written once here — which is also
+/// the one place an untyped [`Outcome`] becomes what its method returns.
+pub trait Client: Send {
     /// Make one call and wait for its response.
     ///
     /// Allocating the id and pairing it with what comes back is the transport's,
     /// because so is anything else that may arrive while it waits.
-    fn call(&mut self, call: Call) -> Result<Outcome, Failure>;
+    ///
+    /// Dropping this future part way is dropping the session with it. The call may
+    /// already be on the wire, and a transport that owns a descriptor for the length of
+    /// a round trip has no way to put back what it half read — so a caller that wants to
+    /// stop waiting stops using the client too. A [`timeout`](Exec::timeout_ms) is what
+    /// bounds an execution; cancelling the wait for one is not.
+    fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Outcome, Failure>>;
 
     /// Send something nothing answers, so there is nothing to wait for.
-    fn notify(&mut self, notification: Notification) -> Result<(), Failure>;
+    fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>>;
 
     /// Boot the server, and make the delegated names runnable inside it.
     ///
     /// Returning is the readiness signal: booting is not free, and this is where it
     /// is paid for rather than inside the first command.
-    fn start(&mut self, start: Start) -> Result<(), Failure> {
-        self.call(Call::Start(start))?.take().map_err(Failure::from)
+    fn start(&mut self, start: Start) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move {
+            self.call(Call::Start(start))
+                .await?
+                .take()
+                .map_err(Failure::from)
+        })
     }
 
     /// Run one command, and return how far it got.
@@ -118,8 +158,13 @@ pub trait Client {
     /// something that knows what a name *does* is not a transport's job — that is
     /// [`Console::exec`](crate::console::Console::exec), which is what a caller
     /// normally wants.
-    fn exec(&mut self, exec: Exec) -> Result<Progress, Failure> {
-        self.call(Call::Exec(exec))?.take().map_err(Failure::from)
+    fn exec(&mut self, exec: Exec) -> BoxFuture<'_, Result<Progress, Failure>> {
+        Box::pin(async move {
+            self.call(Call::Exec(exec))
+                .await?
+                .take()
+                .map_err(Failure::from)
+        })
     }
 
     /// Say how the delegated call the last response asked for ended, and carry on.
@@ -127,10 +172,13 @@ pub trait Client {
     /// Only ever a reply to a [`Delegated`](Progress::Delegated), and the answer is the
     /// next [`Progress`] of the same execution — another delegated call, or the end of
     /// it.
-    fn resume(&mut self, outcome: Outcome) -> Result<Progress, Failure> {
-        self.call(Call::Resume(outcome))?
-            .take()
-            .map_err(Failure::from)
+    fn resume(&mut self, outcome: Outcome) -> BoxFuture<'_, Result<Progress, Failure>> {
+        Box::pin(async move {
+            self.call(Call::Resume(outcome))
+                .await?
+                .take()
+                .map_err(Failure::from)
+        })
     }
 
     /// Read part of a file where the executor runs things.
@@ -138,25 +186,35 @@ pub trait Client {
     /// One message holds the answer, so a file larger than that comes back in pieces:
     /// [`size`](ReadResult::size) against what arrived says whether there are more,
     /// and a further `read` from further along is how to get them.
-    fn read(&mut self, read: Read) -> Result<ReadResult, Failure> {
-        self.call(Call::Read(read))?.take().map_err(Failure::from)
+    fn read(&mut self, read: Read) -> BoxFuture<'_, Result<ReadResult, Failure>> {
+        Box::pin(async move {
+            self.call(Call::Read(read))
+                .await?
+                .take()
+                .map_err(Failure::from)
+        })
     }
 
     /// Put bytes in a file where the executor runs things, and hear how big it is
     /// afterwards.
-    fn write(&mut self, write: Write) -> Result<WriteResult, Failure> {
-        self.call(Call::Write(write))?.take().map_err(Failure::from)
+    fn write(&mut self, write: Write) -> BoxFuture<'_, Result<WriteResult, Failure>> {
+        Box::pin(async move {
+            self.call(Call::Write(write))
+                .await?
+                .take()
+                .map_err(Failure::from)
+        })
     }
 
     /// Release what [`start`](Self::start) booted. Another `start` is allowed after
     /// it.
-    fn stop(&mut self) -> Result<(), Failure> {
-        self.call(Call::Stop)?.take().map_err(Failure::from)
+    fn stop(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move { self.call(Call::Stop).await?.take().map_err(Failure::from) })
     }
 
     /// Say the session is over.
-    fn quit(&mut self) -> Result<(), Failure> {
-        self.notify(Notification::Quit)
+    fn quit(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
+        Box::pin(async move { self.notify(Notification::Quit).await })
     }
 }
 
@@ -165,10 +223,14 @@ pub trait Client {
 /// Both halves of that are a transport's, and there is nothing else. What a message
 /// means, where a command runs, what a session allows when — none of it is here. This
 /// trait moves frames and holds no state.
-pub trait Server {
+pub trait Server: Send {
     /// The next message. `Ok(None)` is the other end closing the channel cleanly.
-    fn recv(&mut self) -> io::Result<Option<Message>>;
+    ///
+    /// Not cancel-safe: a dropped `recv` may have taken part of a frame off the
+    /// descriptor and has nowhere to put it back. An end waiting on something besides
+    /// the channel waits on it between messages rather than instead of one.
+    fn recv(&mut self) -> BoxFuture<'_, io::Result<Option<Message>>>;
 
     /// Put out one response, with the id of the request it answers.
-    fn respond(&mut self, id: RequestId, outcome: Outcome) -> io::Result<()>;
+    fn respond(&mut self, id: RequestId, outcome: Outcome) -> BoxFuture<'_, io::Result<()>>;
 }

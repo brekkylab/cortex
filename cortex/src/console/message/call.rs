@@ -217,8 +217,8 @@ pub struct WriteResult {
 ///
 /// So the server never issues a request and the client never answers one. Every
 /// channel in the system has one end that only asks and one that only answers, which
-/// is what there is to gain: no end needs a pending table, no end has a thread waiting
-/// on something only that thread could read, and there is one channel rather than one
+/// is what there is to gain: no end needs a pending table, no end has a task waiting
+/// on something only that task could read, and there is one channel rather than one
 /// per delegated call.
 ///
 /// # What it costs

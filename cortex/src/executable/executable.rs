@@ -1,3 +1,5 @@
+use futures_core::future::BoxFuture;
+
 /// What a delegated executable was asked to do.
 #[derive(Clone, Debug)]
 pub struct ExecCall {
@@ -49,6 +51,21 @@ impl ExecResult {
 /// Implementations live wherever the client does — the whole point is that a
 /// console server can put the name on a `PATH` it controls without knowing, or
 /// being able to know, what running it means.
+///
+/// # Why this waits, and why the future is boxed
+///
+/// A name is worth delegating when what it does is not something the server could
+/// have done itself: reach a service, ask a model, look something up. All of that is
+/// waiting, and an implementation that blocked while it waited would block the task
+/// walking the delegation chain — which is the same task the console channel is
+/// answered on.
+///
+/// [`BoxFuture`] rather than an `async fn` because an [`ExecutableSet`] holds these
+/// behind a `dyn`: a name is looked up at run time, so the type behind it cannot be in
+/// anyone's signature. The allocation is one per delegated call, next to a round trip
+/// out to the server and back.
+///
+/// [`ExecutableSet`]: super::ExecutableSet
 pub trait Executable: Send + Sync {
-    fn exec(&self, call: &ExecCall) -> ExecResult;
+    fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecResult>;
 }

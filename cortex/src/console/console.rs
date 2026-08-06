@@ -9,7 +9,7 @@
 //! The server does not ask for one. It *answers* with a
 //! [`Delegated`](Progress::Delegated): a complete response to the `exec` this end is
 //! already waiting on, meaning the execution is not over and here is what it needs. So
-//! this end has no pending table, no listener, no thread waiting on something it also
+//! this end has no pending table, no listener, no task waiting on something it also
 //! has to read, and no channel per delegated call.
 //!
 //! # What [`exec`](Console::exec) actually does
@@ -26,10 +26,29 @@
 //! several (`foo & bar`, `make -j8`) has them run one after another. See
 //! [`Progress`] for why that is latency rather than a deadlock, and what would have to
 //! change for it to stop being so.
-
-use std::process::Command;
+//!
+//! # Waiting is the point, and a console does none of it in a thread
+//!
+//! Everything here is something to `await`: a command runs for as long as it runs, and a
+//! delegated executable is usually a call out to something slower still. A caller with
+//! several consoles wants all of them going at once, which is what an async API gives
+//! for the price of a task each — where a thread each would have been a thread parked on
+//! a pipe.
+//!
+//! What is *not* concurrent is one console. Its methods take `&mut self`, because the
+//! protocol is one outstanding request at a time and a delegated execution owes an answer
+//! before anything else may be asked — see [`Client`] for why an exclusive borrow is the
+//! honest way to say that.
+//!
+//! # Ending one
+//!
+//! [`close`](Console::close) is the ending with a result: a `stop`, a `quit`, and what
+//! either of them had to say. Dropping a console ends it too, but a `drop` cannot
+//! `await` — so what a drop can do depends on where it happens, and
+//! [`Console::drop`](Console#impl-Drop-for-Console) says exactly what it does.
 
 use anyhow::Context as _;
+use tokio::process::Command;
 
 use crate::console::base::{Client, Failure};
 use crate::console::message::{
@@ -37,6 +56,12 @@ use crate::console::message::{
 };
 use crate::console::stdio::StdioClient;
 use crate::executable::{ExecCall, ExecutableSet};
+
+/// What a console says when it is asked something after its client has been taken.
+///
+/// Which nothing can do: the two things that take it are [`Console::close`], which
+/// consumes the console, and dropping it. There is no `&mut self` left to ask with.
+const HELD: &str = "a console holds its client until it ends";
 
 /// Assembles a [`Console`] from the parts it needs.
 ///
@@ -122,13 +147,19 @@ impl ConsoleBuilder {
 
     /// Fails for the one part that has no default — something to ask — and for whatever
     /// having a channel took: over stdio, a server process that would not start.
+    ///
+    /// Not `async`, because nothing here waits for anything. It does still want a runtime
+    /// under it: a console over [`stdio_client`](Self::stdio_client) starts a process,
+    /// and a process is registered with the runtime that will reap it. Building one from
+    /// outside a task or `main` is a panic, not an `Err` — the missing runtime is the
+    /// caller's own shape and not something the channel could report.
     pub fn build(self) -> anyhow::Result<Console> {
         let client = self
             .client
             .context("a console needs a client to drive its server")?;
 
         Ok(Console {
-            client: client()?,
+            client: Some(client()?),
             execs: self.execs,
             default_timeout_ms: self.default_timeout_ms,
         })
@@ -139,13 +170,15 @@ impl ConsoleBuilder {
 ///
 /// [`start`](Self::start) to boot it, an [`exec`](Self::exec) per command,
 /// [`stop`](Self::stop) to release what booting took — and another `start` after that if
-/// there is more to do. Dropping it ends the session for good.
+/// there is more to do. [`close`](Self::close) ends the session and says how that went;
+/// dropping it ends the session too.
 ///
 /// ```no_run
 /// use cortex::console::Console;
 /// use cortex::executable::ExecutableSet;
 ///
-/// # fn main() -> anyhow::Result<()> {
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
 /// // Whichever console server this is: the client starts it and owns it from here.
 /// let mut console = Console::builder()
 ///     .stdio_client(&["cortex-local-console"])
@@ -153,19 +186,23 @@ impl ConsoleBuilder {
 ///     .default_timeout_ms(30_000)
 ///     .build()?;
 ///
-/// console.start()?;
+/// console.start().await?;
 ///
-/// let result = console.exec(["sh", "-c", "echo hi"])?;
+/// // `None`: this command has no opinion about how long it may take, so the console's
+/// // default stands. `Some(ms)` is how one says otherwise.
+/// let result = console.exec(["sh", "-c", "echo hi"], None).await?;
 /// assert_eq!(result.stdout, b"hi\n");
 ///
-/// console.stop()?;
+/// console.stop().await?;
 ///
-/// // And the session ends when the console goes — here, at the end of the scope.
+/// // And the session ends here, with the one ending that has a result to report.
+/// console.close().await?;
 /// # Ok(())
 /// # }
 /// ```
 pub struct Console {
-    client: Box<dyn Client>,
+    /// `None` only once the ending has taken it — see [`HELD`].
+    client: Option<Box<dyn Client>>,
 
     /// What a delegated name announced by [`start`](Self::start) resolves to when one
     /// comes back as a [`Delegated`](Progress::Delegated).
@@ -188,11 +225,12 @@ impl Console {
     /// all, is the server's answer and not a question asked here. A session lives at the
     /// end that has one, and this end only carries what it is told: a second `start` is
     /// whatever that server does with one.
-    pub fn start(&mut self) -> Result<(), Failure> {
-        self.client.start(Start {
+    pub async fn start(&mut self) -> Result<(), Failure> {
+        let start = Start {
             delegated: self.execs.names().map(str::to_string).collect(),
             default_timeout_ms: self.default_timeout_ms,
-        })
+        };
+        self.client().start(start).await
     }
 
     /// Run one command, and return everything it produced.
@@ -208,25 +246,43 @@ impl Console {
     ///
     /// The command is an argv — `["echo", "hi"]` — and nothing here consults a shell, so
     /// a caller that wants shell semantics asks for them outright: `["sh", "-c", ".."]`.
-    /// The timeout is the console's [`default_timeout_ms`](ConsoleBuilder::default_timeout_ms),
-    /// which is the only one an execution started here has.
-    pub fn exec(
+    ///
+    /// `timeout_ms` bounds this execution alone. `None` is not "no timeout" but "no
+    /// opinion": the server falls back to the console's
+    /// [`default_timeout_ms`](ConsoleBuilder::default_timeout_ms), and only a console
+    /// that set no default either leaves an execution to run until it finishes, or
+    /// forever. Whichever bound applies, it covers the delegated calls the command made
+    /// on the way — they are part of the execution and not a pause in it.
+    ///
+    /// Which is the only way to bound one, and the reason the parameter is here rather
+    /// than something a caller arranges outside. The chain is a sequence of round trips on
+    /// one channel, and dropping this future between two of them leaves the server holding
+    /// an execution nobody will resume — so a caller that wants to stop waiting says so to
+    /// the server, which is the end that can also stop the command.
+    pub async fn exec(
         &mut self,
         cmd: impl IntoIterator<Item = impl AsRef<str>>,
+        timeout_ms: Option<u64>,
     ) -> Result<ExecResult, Failure> {
         let exec = Exec {
             cmd: cmd.into_iter().map(|s| s.as_ref().to_string()).collect(),
-            ..Exec::default()
+            timeout_ms,
         };
 
-        let mut progress = self.client.exec(exec)?;
+        // Split rather than borrowed through `self`, because the chain holds the client
+        // across every step and consults the set in between.
+        let Console { client, execs, .. } = self;
+        let client = client.as_deref_mut().expect(HELD);
+
+        let mut progress = client.exec(exec).await?;
         loop {
             match progress {
                 Progress::Done(result) => return Ok(result),
                 // The execution owes an answer it has not been given, so nothing else
                 // may be asked until this goes back.
                 Progress::Delegated(exec) => {
-                    progress = self.client.resume(answer(&self.execs, exec))?;
+                    let outcome = answer(execs, exec).await;
+                    progress = client.resume(outcome).await?;
                 }
             }
         }
@@ -237,55 +293,120 @@ impl Console {
     /// The path is the one a command would open by the same name, so this is how a
     /// caller sees what an execution wrote to a file rather than to its output.
     ///
-    /// A file too large for one message comes back in pieces — see
-    /// [`ReadResult::size`], which is what says whether there are any.
-    pub fn read(&mut self, read: Read) -> Result<ReadResult, Failure> {
-        self.client.read(read)
+    /// `offset` is where to start, `None` being the beginning; `len` is how much to ask
+    /// for, `None` being the rest. Neither is a promise about what comes back — a file
+    /// too large for one message arrives in pieces, and [`ReadResult::size`] against what
+    /// did arrive is the only thing that says there are more.
+    pub async fn read(
+        &mut self,
+        path: impl AsRef<str>,
+        offset: Option<u64>,
+        len: Option<u64>,
+    ) -> Result<ReadResult, Failure> {
+        let read = Read {
+            path: path.as_ref().to_string(),
+            offset,
+            len,
+        };
+        self.client().read(read).await
     }
 
     /// Put bytes in a file where commands run, and hear how big it is afterwards.
     ///
     /// The other direction of [`read`](Self::read), and the way to put something where
     /// a command will find it.
-    pub fn write(&mut self, write: Write) -> Result<WriteResult, Failure> {
-        self.client.write(write)
+    ///
+    /// `offset` is the difference between replacing a file and writing into one. `None`
+    /// makes the file *be* `data` — created if it was not there, cut to length if it was
+    /// — where `Some(0)` writes the same bytes at the same place and leaves whatever lay
+    /// past them. A caller that means to replace a file sends `None`.
+    pub async fn write(
+        &mut self,
+        path: impl AsRef<str>,
+        data: impl Into<Vec<u8>>,
+        offset: Option<u64>,
+    ) -> Result<WriteResult, Failure> {
+        let write = Write {
+            path: path.as_ref().to_string(),
+            data: data.into(),
+            offset,
+        };
+        self.client().write(write).await
     }
 
     /// Release what [`start`](Self::start) booted.
     ///
     /// Not the end of anything: the session stays open and another `start` is allowed,
-    /// which is what the protocol's `stop` means. Dropping the console is what ends it.
+    /// which is what the protocol's `stop` means. [`close`](Self::close) is what ends it.
     ///
     /// Like [`start`](Self::start), what a `stop` on a session that has none comes to is
     /// the server's to say.
-    pub fn stop(&mut self) -> Result<(), Failure> {
-        self.client.stop()
+    pub async fn stop(&mut self) -> Result<(), Failure> {
+        self.client().stop().await
+    }
+
+    /// End the session: a `stop`, then a `quit`, in that order — and say how it went.
+    ///
+    /// The order is what the `stop` is for. The server owes us nothing once the session
+    /// is over, so anything we want undone has to be undone first. Unconditionally,
+    /// because whether there was anything to undo is the server's answer and this end
+    /// does not keep a second copy of it: a `stop` on a session that has none costs a
+    /// round trip and whatever the server says.
+    ///
+    /// Both go out whatever the first one answered — an ending that gave up half way
+    /// would be an ending that left a process running — and what comes back is the first
+    /// failure of the two. Over stdio that is where the server process's exit status is
+    /// reported, which is the last thing a session has to say.
+    ///
+    /// This is the ending worth having, and the reason it consumes the console is that
+    /// there is nothing to do with one afterwards.
+    pub async fn close(mut self) -> Result<(), Failure> {
+        // Taken, so the `Drop` that runs at the end of this function finds nothing left
+        // to end. There is no other way to end twice.
+        let Some(mut client) = self.client.take() else {
+            return Ok(());
+        };
+
+        let stopped = client.stop().await;
+        let ended = client.quit().await;
+        stopped.and(ended)
+    }
+
+    fn client(&mut self) -> &mut dyn Client {
+        self.client.as_deref_mut().expect(HELD)
     }
 }
 
 impl Drop for Console {
-    /// End the session: a `stop`, then a `quit`, in that order.
+    /// End the session the only way a `drop` can: hand the ending to the runtime and let
+    /// go.
     ///
-    /// The order is what the `stop` is for — the server owes us nothing once the session
-    /// is over, so anything we want undone has to be undone first. Unconditionally,
-    /// because whether there was anything to undo is the server's answer and this end does
-    /// not keep a second copy of it: a `stop` on a session that has none costs a round
-    /// trip and whatever the server says, which is discarded here like the rest.
+    /// A `stop` and a `quit` are two round trips, and a `drop` cannot `await` one. So the
+    /// pair is spawned as a task that owns the client, and this returns immediately. What
+    /// that ending answered goes nowhere, which is the whole reason
+    /// [`close`](Self::close) exists — by the time a console is being dropped there is
+    /// nobody left to tell.
     ///
-    /// And ending is only here, because there is no moment where a caller would want it
-    /// earlier and a result for it. What a `quit` reports is how the ending went — over
-    /// stdio, the server process's exit status — and by then the channel is shut and the
-    /// process collected, so nothing can be done about it either way. What having a
-    /// channel took beyond this — a process that must not outlive it — is the client's,
-    /// and happens when the client is dropped, immediately after.
+    /// Off a runtime, or on one that shuts down before the task is polled, the client is
+    /// simply dropped instead. That is still an ending: whatever having a channel took
+    /// goes with it, and over stdio the server process is killed rather than asked. A
+    /// caller who would rather it be asked calls `close`.
     fn drop(&mut self) {
-        let _ = self.client.stop();
-        let _ = self.client.quit();
+        let Some(mut client) = self.client.take() else {
+            return;
+        };
+
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = client.stop().await;
+                let _ = client.quit().await;
+            });
+        }
     }
 }
 
 /// What one delegated call comes to: the `params` of the `resume` that answers it.
-fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
+async fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
     let Some((name, args)) = exec.cmd.split_first() else {
         return refused(Error::INVALID_PARAMS, "an empty command");
     };
@@ -298,7 +419,7 @@ fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
     // `None` is the allowlist boundary. Nothing honest reaches it — the only names the
     // server was given are the ones in this set — so this is a server asking for
     // something it was never told about.
-    let Some(result) = execs.invoke(&call) else {
+    let Some(result) = execs.invoke(&call).await else {
         return refused(
             Error::NOT_EXECUTABLE,
             format!("{}: not a delegated executable", call.name),
@@ -328,6 +449,8 @@ fn refused(code: i64, message: impl Into<String>) -> Outcome {
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    use futures_core::future::BoxFuture;
 
     use super::*;
     use crate::console::message::{Call, Method, Notification};
@@ -363,20 +486,22 @@ mod tests {
     }
 
     impl Client for Recorder {
-        fn call(&mut self, call: Call) -> Result<Outcome, Failure> {
+        fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Outcome, Failure>> {
             self.log.methods.lock().unwrap().push(call.method());
             self.log.calls.lock().unwrap().push(call);
-            if self.answers.is_empty() {
-                // Not a panic: `Drop` stops a console best-effort, and a test that has
+            let answer = if self.answers.is_empty() {
+                // Not a panic: an ending stops a console best-effort, and a test that has
                 // said all it means to say should not have to answer that too.
-                return Err(Failure::broken("nothing left to answer with"));
-            }
-            Ok(self.answers.remove(0))
+                Err(Failure::broken("nothing left to answer with"))
+            } else {
+                Ok(self.answers.remove(0))
+            };
+            Box::pin(async move { answer })
         }
 
-        fn notify(&mut self, notification: Notification) -> Result<(), Failure> {
+        fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>> {
             self.log.methods.lock().unwrap().push(notification.method());
-            Ok(())
+            Box::pin(async { Ok(()) })
         }
     }
 
@@ -422,14 +547,14 @@ mod tests {
     struct Greeter;
 
     impl Executable for Greeter {
-        fn exec(&self, call: &ExecCall) -> ExecOutput {
-            ExecOutput::ok(format!("hello {}\n", call.args.join(" ")))
+        fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+            Box::pin(async move { ExecOutput::ok(format!("hello {}\n", call.args.join(" "))) })
         }
     }
 
     /// A builder needs exactly one thing, and says which when it does not have it.
-    #[test]
-    fn a_console_needs_something_to_ask() {
+    #[tokio::test]
+    async fn a_console_needs_something_to_ask() {
         let Err(failure) = Console::builder().build() else {
             panic!("a console with nothing to ask should not build");
         };
@@ -438,8 +563,8 @@ mod tests {
 
     /// `stdio_client` takes a program, so building is where one that will not start is
     /// reported — and where one that starts is a console like any other.
-    #[test]
-    fn a_stdio_console_starts_its_server_when_it_is_built() {
+    #[tokio::test]
+    async fn a_stdio_console_starts_its_server_when_it_is_built() {
         let Err(e) = Console::builder()
             .stdio_client(&["cortex-no-such-console"])
             .build()
@@ -456,27 +581,31 @@ mod tests {
         assert!(e.to_string().contains("needs a program to run"), "{e}");
 
         // A program that starts is all building needs; whether it speaks the protocol is
-        // `start`'s to find out, and this one is never asked. Dropping it ends the
-        // session, which closes its stdin, which is what lets `cat` be waited for.
+        // `start`'s to find out, and this one never answers. Dropped rather than closed,
+        // because `cat` echoes whatever the ending says to it and an ending that reports
+        // what it heard would report that — see `close`, which is the ending with a
+        // result, and this program has no result to give.
         //
         // Arguments are the caller's too, and go to the program as given.
-        Console::builder()
-            .stdio_client(&["cat", "-u"])
-            .build()
-            .unwrap();
+        drop(
+            Console::builder()
+                .stdio_client(&["cat", "-u"])
+                .build()
+                .unwrap(),
+        );
     }
 
     /// `start` announces the registered names, and nothing about the session is kept on
     /// this side: what a caller asks for goes out as asked, in that order, and the answer
     /// is the server's.
-    #[test]
-    fn a_session_is_the_servers_to_keep() {
+    #[tokio::test]
+    async fn a_session_is_the_servers_to_keep() {
         let (client, log) = recorder(vec![
             ran(b"early\n"),
             null(),
             ran(b"hi\n"),
             null(),
-            // The `stop` that dropping sends, whether or not one already went.
+            // The `stop` that ending sends, whether or not one already went.
             null(),
         ]);
         let mut console = Console::builder()
@@ -489,16 +618,22 @@ mod tests {
         // An `exec` before any `start` is not refused here. Whether a session has to be
         // started before it runs anything is the server's rule to keep, so this goes out
         // and what comes back is whatever that server says — here, a result.
-        assert_eq!(console.exec(["echo", "early"]).unwrap().stdout, b"early\n");
+        assert_eq!(
+            console.exec(["echo", "early"], None).await.unwrap().stdout,
+            b"early\n"
+        );
 
-        console.start().unwrap();
+        console.start().await.unwrap();
         // An execution that delegated nothing is one round trip: no `resume`.
-        assert_eq!(console.exec(["echo", "hi"]).unwrap().stdout, b"hi\n");
-        console.stop().unwrap();
+        assert_eq!(
+            console.exec(["echo", "hi"], None).await.unwrap().stdout,
+            b"hi\n"
+        );
+        console.stop().await.unwrap();
 
-        // Ending is the console going away, and nothing else has to happen for it: a
-        // `stop` for whatever booting took, then the `quit` that ends the session.
-        drop(console);
+        // Ending: a `stop` for whatever booting took, then the `quit` that ends the
+        // session — and this is the one that reports how either went.
+        console.close().await.unwrap();
 
         assert_eq!(
             log.methods(),
@@ -520,10 +655,24 @@ mod tests {
         assert_eq!(start.default_timeout_ms, Some(30_000));
     }
 
+    /// Dropping a console ends it too — as a task, since a `drop` cannot wait for one.
+    /// The `stop` and the `quit` still go out, and nobody hears what they answered.
+    #[tokio::test]
+    async fn dropping_a_console_ends_its_session() {
+        let (client, log) = recorder(vec![null(), null()]);
+        let console = Console::builder().client(client).build().unwrap();
+
+        drop(console);
+
+        // The ending is somebody else's turn to run, so wait for one.
+        tokio::task::yield_now().await;
+        assert_eq!(log.methods(), [Method::Stop, Method::Quit]);
+    }
+
     /// A delegated call is resolved from the set and sent back as a `resume`, and the
     /// caller sees one result for the one `exec` it asked for.
-    #[test]
-    fn a_delegated_call_is_resolved_inside_one_exec() {
+    #[tokio::test]
+    async fn a_delegated_call_is_resolved_inside_one_exec() {
         let (client, log) = recorder(vec![
             null(),
             // Two in a row, so the chain is a loop and not a single extra step.
@@ -537,8 +686,8 @@ mod tests {
             .build()
             .unwrap();
 
-        console.start().unwrap();
-        assert_eq!(console.exec(["foo"]).unwrap().stdout, b"done\n");
+        console.start().await.unwrap();
+        assert_eq!(console.exec(["foo"], None).await.unwrap().stdout, b"done\n");
 
         assert_eq!(
             log.methods(),

@@ -38,12 +38,11 @@
 //! rather than merely cluttering it.
 //!
 //! It is a rule and not something enforced here, which is worth saying plainly.
-//! Holding [`StdoutLock`](io::StdoutLock) for the process would turn the mistake
-//! into a hang, and a hang can be found — but that guard is not [`Send`], and a
-//! writer has to be movable to whatever thread writes it. So an end holds the
-//! [`Stdout`](io::Stdout) handle instead, which locks per write. Two frames of ours
-//! cannot interleave — whoever owns the writer serializes them — and a `println!`
-//! from elsewhere is not caught by anything.
+//! Nothing can hold stdout for the process in a way that would turn the mistake into
+//! a hang: what an end holds is [`tokio::io::Stdout`], a handle that hands each write
+//! to a blocking thread, and a `println!` from elsewhere goes to the same descriptor
+//! without passing through it. Two frames of *ours* cannot interleave, because
+//! whoever owns the writer serializes them; nothing else is caught by anything.
 //!
 //! *Which* descriptors an end takes is not this module's. Framing is the same over
 //! a pipe, a virtio port or a `Vec<u8>`, whereas taking **the process's** stdin and
@@ -69,16 +68,30 @@
 //! [`ExecResult`](super::ExecResult) — which is what makes one pair of
 //! descriptors enough, where the old wire needed four.
 //!
-//! # Why buffering is fine now
+//! # Neither of these is cancel-safe
 //!
-//! The old wire could not buffer its reads of fd 0: the command's stdin followed
-//! the command on the same descriptor, so a byte read early was a byte the
-//! command never saw. Nothing is handed over here — the descriptors belong to the
-//! protocol for the life of the process — so a buffered reader is not merely
-//! allowed but wanted. The [`Stdin`](io::Stdin) handle is buffered already, which is
-//! why an end that takes it needs no wrapper of its own.
+//! Both take a `&mut` to a descriptor and leave it part way through a frame if the
+//! future is dropped mid-await — a header written with no payload behind it, or a
+//! payload half consumed. There is no way to resume from that and no way to tell
+//! from the descriptor that it happened, so a peer on the other side of one is
+//! reading garbage from then on.
+//!
+//! Which is why nothing here is put in a [`select!`](tokio::select) branch. An end
+//! that has to wait on something else as well waits on it *around* a frame and not
+//! during one — see [`StdioClient::call`](super::StdioClient::call), which owns its
+//! descriptors for the whole of a round trip.
+//!
+//! # Why buffering is fine
+//!
+//! Nothing is ever handed over: the descriptors belong to the protocol for the life
+//! of the process, so a byte read early is never a byte a command needed. Both ends
+//! therefore wrap what they read in a [`BufReader`](tokio::io::BufReader) once, at
+//! construction, which is what keeps a header and its payload from being two
+//! syscalls every time.
 
-use std::io::{self, Read, Write};
+use std::io;
+
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::console::{MAX_PAYLOAD, Message};
 
@@ -92,25 +105,31 @@ pub const HEADER: usize = 4;
 /// descriptor has a single writer at a time. A writer that ends up in several
 /// places wants to be *shared* rather than cloned — two owners would interleave a
 /// header with somebody else's payload, where one behind a lock cannot.
-pub fn write(w: &mut impl Write, message: &Message) -> io::Result<()> {
+pub async fn write<W>(w: &mut W, message: &Message) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + ?Sized,
+{
     let payload =
         bson::serialize_to_vec(message).map_err(|e| bad(format!("serializing a message: {e}")))?;
     if payload.len() > MAX_PAYLOAD {
         return Err(oversized(payload.len(), "to send"));
     }
 
-    w.write_all(&(payload.len() as u32).to_be_bytes())?;
-    w.write_all(&payload)?;
-    w.flush()
+    w.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+    w.write_all(&payload).await?;
+    w.flush().await
 }
 
 /// Read one frame. `Ok(None)` is a clean end of channel.
 ///
 /// The length is read first and then exactly that many bytes, so a frame cannot
 /// run into the one after it however the payload is spelled.
-pub fn read(r: &mut impl Read) -> io::Result<Option<Message>> {
+pub async fn read<R>(r: &mut R) -> io::Result<Option<Message>>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     let mut header = [0u8; HEADER];
-    if !fill(r, &mut header)? {
+    if !fill(r, &mut header).await? {
         return Ok(None);
     }
 
@@ -125,7 +144,7 @@ pub fn read(r: &mut impl Read) -> io::Result<Option<Message>> {
     }
 
     let mut payload = vec![0u8; len];
-    if !fill(r, &mut payload)? {
+    if !fill(r, &mut payload).await? {
         return Err(truncated());
     }
 
@@ -137,10 +156,16 @@ pub fn read(r: &mut impl Read) -> io::Result<Option<Message>> {
 /// Fill `buf` completely. `Ok(false)` means a clean end of stream *before any
 /// byte arrived* — the peer closed between frames, which is how a channel ends.
 /// Stopping part way through is corruption, not an ending.
-fn fill(r: &mut impl Read, buf: &mut [u8]) -> io::Result<bool> {
+///
+/// Written out rather than [`read_exact`](AsyncReadExt::read_exact), which cannot
+/// tell those two apart: it reports both as `UnexpectedEof`.
+async fn fill<R>(r: &mut R, buf: &mut [u8]) -> io::Result<bool>
+where
+    R: AsyncRead + Unpin + ?Sized,
+{
     let mut filled = 0;
     while filled < buf.len() {
-        match r.read(&mut buf[filled..])? {
+        match r.read(&mut buf[filled..]).await? {
             0 if filled == 0 => return Ok(false),
             0 => return Err(truncated()),
             n => filled += n,
@@ -204,22 +229,22 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn a_message_survives_a_frame() {
+    #[tokio::test]
+    async fn a_message_survives_a_frame() {
         for message in messages() {
             let mut buf = Vec::new();
-            write(&mut buf, &message).unwrap();
-            assert_eq!(read(&mut buf.as_slice()).unwrap().unwrap(), message);
+            write(&mut buf, &message).await.unwrap();
+            assert_eq!(read(&mut buf.as_slice()).await.unwrap().unwrap(), message);
         }
     }
 
     /// A frame is its length and then exactly that many bytes of payload —
     /// nothing else, and no delimiter.
-    #[test]
-    fn a_frame_is_a_length_and_a_payload() {
+    #[tokio::test]
+    async fn a_frame_is_a_length_and_a_payload() {
         let message = Message::Notification(Notification::Quit);
         let mut buf = Vec::new();
-        write(&mut buf, &message).unwrap();
+        write(&mut buf, &message).await.unwrap();
 
         let payload = bson::serialize_to_vec(&message).unwrap();
         assert_eq!(&buf[..HEADER], &(payload.len() as u32).to_be_bytes());
@@ -236,17 +261,17 @@ mod tests {
 
     /// Several frames back to back come out in order, which is what the length
     /// prefix is for: nothing has to be scanned to find the boundaries.
-    #[test]
-    fn frames_stream_back_in_order() {
+    #[tokio::test]
+    async fn frames_stream_back_in_order() {
         let sent = messages();
         let mut buf = Vec::new();
         for message in &sent {
-            write(&mut buf, message).unwrap();
+            write(&mut buf, message).await.unwrap();
         }
 
         let mut reader = buf.as_slice();
         let mut read_back = Vec::new();
-        while let Some(message) = read(&mut reader).unwrap() {
+        while let Some(message) = read(&mut reader).await.unwrap() {
             read_back.push(message);
         }
         assert_eq!(read_back, sent);
@@ -254,8 +279,8 @@ mod tests {
 
     /// A payload byte is never mistaken for structure — the whole reason not to
     /// delimit. Every byte value goes through an output payload untouched.
-    #[test]
-    fn no_payload_byte_is_special() {
+    #[tokio::test]
+    async fn no_payload_byte_is_special() {
         let message = Message::Response {
             id: 2,
             outcome: Outcome::Result(
@@ -267,75 +292,77 @@ mod tests {
             ),
         };
         let mut buf = Vec::new();
-        write(&mut buf, &message).unwrap();
-        assert_eq!(read(&mut buf.as_slice()).unwrap().unwrap(), message);
+        write(&mut buf, &message).await.unwrap();
+        assert_eq!(read(&mut buf.as_slice()).await.unwrap().unwrap(), message);
     }
 
-    #[test]
-    fn a_clean_close_ends_the_channel_but_a_partial_frame_does_not() {
-        assert!(read(&mut [].as_slice()).unwrap().is_none());
+    #[tokio::test]
+    async fn a_clean_close_ends_the_channel_but_a_partial_frame_does_not() {
+        assert!(read(&mut [].as_slice()).await.unwrap().is_none());
 
         let mut buf = Vec::new();
-        write(&mut buf, &Message::Notification(Notification::Quit)).unwrap();
+        write(&mut buf, &Message::Notification(Notification::Quit))
+            .await
+            .unwrap();
         buf.truncate(buf.len() - 1);
         assert_eq!(
-            read(&mut buf.as_slice()).unwrap_err().kind(),
+            read(&mut buf.as_slice()).await.unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
 
         // A header that stops part way is the same kind of ending: something
         // arrived, so the peer did not close between frames.
         assert_eq!(
-            read(&mut [0u8, 0].as_slice()).unwrap_err().kind(),
+            read(&mut [0u8, 0].as_slice()).await.unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
     }
 
-    #[test]
-    fn a_length_that_could_only_be_wrong_is_refused_rather_than_allocated() {
+    #[tokio::test]
+    async fn a_length_that_could_only_be_wrong_is_refused_rather_than_allocated() {
         let mut absurd = u32::MAX.to_be_bytes().to_vec();
         absurd.extend_from_slice(b"{}");
-        let error = read(&mut absurd.as_slice()).unwrap_err();
+        let error = read(&mut absurd.as_slice()).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("more than"), "{error}");
 
         // And nothing serializes to nothing.
-        let error = read(&mut [0u8; HEADER].as_slice()).unwrap_err();
+        let error = read(&mut [0u8; HEADER].as_slice()).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("no bytes"), "{error}");
     }
 
     /// A well-framed payload that is not a message is a data error, not an
     /// ending: the framing worked and the contents did not.
-    #[test]
-    fn a_framed_non_message_is_refused() {
+    #[tokio::test]
+    async fn a_framed_non_message_is_refused() {
         let payload =
             bson::serialize_to_vec(&bson::doc! {"jsonrpc": "1.0", "method": "quit"}).unwrap();
         let mut buf = (payload.len() as u32).to_be_bytes().to_vec();
         buf.extend_from_slice(&payload);
-        let error = read(&mut buf.as_slice()).unwrap_err();
+        let error = read(&mut buf.as_slice()).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("reading a message"), "{error}");
     }
 
     /// The two directions are independent, so what one descriptor was written with
     /// reads back off another with nothing pairing them.
-    #[test]
-    fn the_two_directions_are_independent() {
+    #[tokio::test]
+    async fn the_two_directions_are_independent() {
         let sent = messages();
 
         let mut outgoing = Vec::new();
         for message in &sent {
-            write(&mut outgoing, message).unwrap();
+            write(&mut outgoing, message).await.unwrap();
         }
 
         // A reader that was never written to is a clean close, not an error.
-        assert!(read(&mut io::empty()).unwrap().is_none());
+        assert!(read(&mut tokio::io::empty()).await.unwrap().is_none());
 
         let mut incoming = outgoing.as_slice();
         for message in &sent {
-            assert_eq!(read(&mut incoming).unwrap().as_ref(), Some(message));
+            assert_eq!(read(&mut incoming).await.unwrap().as_ref(), Some(message));
         }
-        assert!(read(&mut incoming).unwrap().is_none());
+        assert!(read(&mut incoming).await.unwrap().is_none());
     }
 }

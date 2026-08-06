@@ -64,15 +64,22 @@ fn role() -> Role {
     }
 }
 
-fn main() -> ExitCode {
+/// Both roles wait on something they do not drive — a socket, a pipe, a command — so
+/// both are async, and one runtime serves either.
+///
+/// Multi-threaded because the server's is: an execution waits on its command and on the
+/// shims that command dials, and a delegated call is answered while the command that made
+/// it is still running. A shim is one round trip and would not have noticed either way.
+#[tokio::main]
+async fn main() -> ExitCode {
     match role() {
         // A shim exits with somebody else's code — the delegated executable's — which is
         // the whole point of it. A process can only exit 0..=255, so `shim` clamps.
-        Role::Shim(name) => shim::run(&name),
+        Role::Shim(name) => shim::run(&name).await,
 
         // A server does not. Each command's code travels back inside its own answer, so
         // this one only says whether the session itself worked.
-        Role::Server => match server::run() {
+        Role::Server => match server::run().await {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));

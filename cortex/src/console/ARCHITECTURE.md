@@ -413,16 +413,21 @@ That is latency and not a deadlock, and **only because delegated calls are indep
 > If input ever reaches a delegated call, serving them in turn stops being safe, and delegation needs a shape that can carry more than one at a time.
 
 **The client is purely an asking end.**
-No listener, no accept loop, no thread per delegated call, and nothing to join at shutdown.
-`Console::exec` walks the chain in the caller's own thread and returns one result for the one command it was given.
+No listener, no accept loop, no task per delegated call, and nothing to join at shutdown.
+`Console::exec` walks the chain on the caller's own task and returns one result for the one command it was given.
 
 **The server interleaves.**
 It cannot run a command to completion and then answer, because the delegated call arrives while the command is still running.
-So an execution is a loop over *a shim connected* and *the command ended*, which is where the concurrency that used to be the client's now lives.
+So an execution is a `select!` over *a shim connected* and *the command ended*, which is where the concurrency that used to be the client's now lives.
+
+**Both ends are async, and neither is concurrent with itself.**
+Every method that waits is a future, so a caller can drive many consoles from one runtime — but one console's methods take `&mut self`, because the protocol has one call outstanding at a time and a delegated execution owes an answer before anything else may be asked.
+Concurrency is *across* sessions, never within one.
 
 **Shutting down is one-sided.**
 Ending the session ends the console channel.
-The server's shim socket is bound for the life of the process, not of a session, because a thread blocked in `accept` cannot be told to stop.
+`Console::close` is the ending that reports how it went; dropping a console spawns the same pair of calls and cannot wait for them, which is the whole difference between the two.
+The server's shim socket is bound for the life of the process, not of a session, so that the path in every execution's environment stays the one a shim can dial.
 
 ---
 

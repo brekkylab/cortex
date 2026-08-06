@@ -18,9 +18,19 @@
 //!
 //! [`Command`], captured — but spawned rather than run to completion, because a
 //! delegated call arrives *while* it runs and has to be answered before it can finish.
-//! So an execution is a loop over two things that can happen next: a shim connects, or
-//! the command ends. Both arrive on one queue ([`Shims`]), because waiting for either is
-//! what the loop does and there is no way to wait on two.
+//! So an execution is a [`select!`](tokio::select) over the two things that can happen
+//! next: a shim connects, or the command ends.
+//!
+//! The command is waited for in a task of its own rather than in a branch of that
+//! `select!`. Waiting for it means draining its stdout and stderr as they fill, and a
+//! command that fills a pipe while nobody is reading it stops there — which would happen
+//! every time an execution paused on a delegated call, since answering one is round trips
+//! on the console channel and not polling of anything else. A task keeps the pipes moving
+//! throughout, and what the `select!` waits on is the task ending.
+//!
+//! Shims first, when both are ready: a connection that arrived is a delegated call that
+//! has not been answered, and the process behind it is still waiting to hear. Reporting
+//! the command's ending while one sat unserved would strand it.
 //!
 //! A shim connecting means answering the console request with a
 //! [`Delegated`](Progress::Delegated) and waiting for the client's `resume` — which is
@@ -40,6 +50,17 @@
 //! Both are answered on the spot, outside any execution: nothing is spawned, nothing can
 //! delegate, and one response ends it.
 //!
+//! # One session at a time, on one task
+//!
+//! Everything above happens on the task that reads the channel, and nothing is answered
+//! out of order: a request is taken, answered, and only then is the next one read. That is
+//! the protocol rather than a shortcut — a client has one call outstanding at a time — and
+//! it is what lets an execution own the channel for as long as its delegation chain runs.
+//!
+//! What concurrency there is sits underneath: a command runs while we wait, its output
+//! drains while we answer a delegated call, and a shim's connection waits in the socket's
+//! backlog until the execution that will serve it is ready.
+//!
 //! # What this does not do
 //!
 //! The session rules are not enforced anywhere yet. An `exec` before `start` runs (with
@@ -52,17 +73,21 @@
 //!
 //! A `read` or a `write` is not confined to anywhere either. The path is used as it
 //! arrives, so a client can name any file this process can reach.
+//!
+//! Neither timeout is enforced. An `exec` carries a `timeout_ms` and a `start` carries the
+//! `default_timeout_ms` to fall back on, and this server reads both and applies neither —
+//! so a command that never ends is a command this server waits on forever, and the client
+//! waits with it. What it takes is a bound around the `select!` in [`execute`] and an
+//! answer for what a delegated call already in flight becomes when it expires, which is
+//! the part that is a decision and not a line of code.
 
 mod bin_dir;
 
 use std::ffi::OsString;
-use std::io;
-use std::os::unix::fs::FileExt as _;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{self, SeekFrom};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::process::{ExitStatus, Output, Stdio};
 
 use bson::Bson;
 use cortex::console::stdio::StdioServer;
@@ -70,6 +95,9 @@ use cortex::console::{
     Call, Error, Exec, ExecResult, MAX_PAYLOAD, Message, Outcome, Progress, Read, ReadResult,
     RequestId, Server, Start, Write, WriteResult,
 };
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::process::Command;
 
 use crate::ipc::SOCK_ENV;
 use bin_dir::BinDir;
@@ -90,7 +118,7 @@ const NOT_FOUND: i32 = 127;
 const MAX_DATA: u64 = MAX_PAYLOAD as u64 - 1024;
 
 /// Answer requests until the client says `quit` or closes the channel.
-pub fn run() -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     let mut server = StdioServer::stdio()?;
 
     // Bound once, before anything can be running, and kept for the process. See
@@ -101,7 +129,7 @@ pub fn run() -> anyhow::Result<()> {
     // which takes the symlinks with it every time.
     let mut linked: Option<BinDir> = None;
 
-    while let Some(message) = server.recv()? {
+    while let Some(message) = server.recv().await? {
         match message {
             // The session is over.
             Message::Notification(_) => return Ok(()),
@@ -109,29 +137,42 @@ pub fn run() -> anyhow::Result<()> {
             Message::Request { id, call } => match call {
                 Call::Start(start) => {
                     let outcome = boot(&mut linked, &start);
-                    server.respond(id, outcome)?;
+                    server.respond(id, outcome).await?;
                 }
 
-                Call::Exec(exec) => execute(&mut server, id, &exec, linked.as_ref(), &shims)?,
+                Call::Exec(exec) => {
+                    execute(&mut server, id, &exec, linked.as_ref(), &shims).await?
+                }
 
                 // Only an execution paused on a delegated call has anything to resume,
                 // and one of those is answered inside `execute` — so reaching here is a
                 // client resuming something that is not waiting.
-                Call::Resume(_) => server.respond(
-                    id,
-                    refused(
-                        Error::INVALID_REQUEST,
-                        "nothing is waiting on a delegated call, so there is nothing to resume",
-                    ),
-                )?,
+                Call::Resume(_) => {
+                    server
+                        .respond(
+                            id,
+                            refused(
+                                Error::INVALID_REQUEST,
+                                "nothing is waiting on a delegated call, so there is nothing \
+                                 to resume",
+                            ),
+                        )
+                        .await?
+                }
 
-                Call::Read(read) => server.respond(id, read_file(&read))?,
+                Call::Read(read) => {
+                    let outcome = read_file(&read).await;
+                    server.respond(id, outcome).await?;
+                }
 
-                Call::Write(write) => server.respond(id, write_file(&write))?,
+                Call::Write(write) => {
+                    let outcome = write_file(&write).await;
+                    server.respond(id, outcome).await?;
+                }
 
                 Call::Stop => {
                     linked = None;
-                    server.respond(id, Outcome::Result(Bson::Null))?;
+                    server.respond(id, Outcome::Result(Bson::Null)).await?;
                 }
             },
 
@@ -168,7 +209,7 @@ fn boot(linked: &mut Option<BinDir>, start: &Start) -> Outcome {
 /// Exactly one of those answers is the execution's own — a [`Done`](Progress::Done) or an
 /// error — and it goes to whichever request is owed one by then: the `exec` if nothing was
 /// delegated, or the last `resume` if something was.
-fn execute(
+async fn execute(
     server: &mut StdioServer,
     id: RequestId,
     exec: &Exec,
@@ -176,7 +217,9 @@ fn execute(
     shims: &Shims,
 ) -> io::Result<()> {
     let Some((program, args)) = exec.split() else {
-        return server.respond(id, refused(Error::INVALID_PARAMS, "an empty command"));
+        return server
+            .respond(id, refused(Error::INVALID_PARAMS, "an empty command"))
+            .await;
     };
 
     let child = Command::new(program)
@@ -196,39 +239,49 @@ fn execute(
                 io::ErrorKind::NotFound => NOT_FOUND,
                 _ => NOT_EXECUTABLE,
             };
-            return server.respond(
-                id,
-                refused(
-                    Error::NOT_EXECUTABLE,
-                    format!("{program}: {e} (a shell would report {code})"),
-                ),
-            );
+            return server
+                .respond(
+                    id,
+                    refused(
+                        Error::NOT_EXECUTABLE,
+                        format!("{program}: {e} (a shell would report {code})"),
+                    ),
+                )
+                .await;
         }
     };
 
-    // On the shims' queue rather than one of its own, so that this loop has a single
-    // thing to wait on. `wait_with_output` reads both pipes as it waits, which is what
-    // keeps a command that fills one from blocking on it.
-    let ending = shims.sender();
-    std::thread::spawn(move || {
-        let _ = ending.send(Event::Exited(child.wait_with_output()));
-    });
+    // In a task of its own, so both pipes keep draining while this function is busy
+    // answering a delegated call. See the module docs.
+    let mut running = tokio::spawn(child.wait_with_output());
 
     // Which request this execution owes its answer to. The `exec` to begin with, and each
     // `resume` after that — a `Delegated` spends the one it is sent on.
     let mut owed = id;
 
     loop {
-        match shims.next() {
-            Event::Shim(stream) => match delegate(server, owed, stream)? {
-                Some(next) => owed = next,
-                // The client stopped saying anything that could resume the execution, so
-                // there is nobody left to answer. The command is left to the process's
-                // ending, which is moments away: the main loop reads the same channel.
-                None => return Ok(()),
+        tokio::select! {
+            // A shim that has already connected is a delegated call already waiting, so
+            // it is served before an ending is reported.
+            biased;
+
+            accepted = shims.accept() => match accepted {
+                Some(stream) => match delegate(server, owed, stream).await? {
+                    Some(next) => owed = next,
+                    // The client stopped saying anything that could resume the execution,
+                    // so there is nobody left to answer. The command is left to the
+                    // process's ending, which is moments away: the main loop reads the
+                    // same channel.
+                    None => return Ok(()),
+                },
+                // The socket is gone, so no delegated call will ever arrive again. The
+                // command still can end, which is the only thing left to wait for.
+                None => return server.respond(owed, finished(join(&mut running).await)).await,
             },
 
-            Event::Exited(output) => return server.respond(owed, finished(output)),
+            output = &mut running => {
+                return server.respond(owed, finished(joined(output))).await;
+            }
         }
     }
 }
@@ -239,17 +292,20 @@ fn execute(
 /// answers what this execution currently owes, and the `resume` that brings the result.
 /// What is returned is the id of the request now owed the execution's own answer, or
 /// `None` when the client said nothing that could be one.
-fn delegate(
+async fn delegate(
     server: &mut StdioServer,
     owed: RequestId,
     stream: UnixStream,
 ) -> io::Result<Option<RequestId>> {
-    let mut shim = StdioServer::new(stream.try_clone()?, stream);
+    // Owned halves, because the two directions are separate fields of a `StdioServer` and
+    // have to outlive the borrow the stream came in on.
+    let (incoming, outgoing) = stream.into_split();
+    let mut shim = StdioServer::new(incoming, outgoing);
 
     // A connection carrying anything but a shim's one `exec` is not something to forward,
     // and the execution still owes what it owed. Dropping the connection is all there is
     // to say to it.
-    let (shim_id, exec) = match shim.recv()? {
+    let (shim_id, exec) = match shim.recv().await? {
         Some(Message::Request {
             id,
             call: Call::Exec(exec),
@@ -263,18 +319,20 @@ fn delegate(
         }
     };
 
-    server.respond(owed, result(Progress::Delegated(exec)))?;
+    server
+        .respond(owed, result(Progress::Delegated(exec)))
+        .await?;
 
     // Only a `resume` can arrive now. This end owes an answer it has not sent, so there is
     // nothing else the client could be asking about.
-    match server.recv()? {
+    match server.recv().await? {
         Some(Message::Request {
             id,
             call: Call::Resume(outcome),
         }) => {
             // Whatever the client said, verbatim: a refusal is as much an answer as a
             // result, and the shim is what turns either into an exit code.
-            shim.respond(shim_id, outcome)?;
+            shim.respond(shim_id, outcome).await?;
             Ok(Some(id))
         }
 
@@ -313,37 +371,25 @@ fn environment(linked: Option<&BinDir>, shims: &Shims) -> Vec<(OsString, OsStrin
     env
 }
 
-/// The socket every shim dials, and the queue of what an execution is waiting for.
+/// The socket every shim dials.
 ///
 /// # Why the process binds it and not a session
 ///
-/// A thread blocked in `accept` cannot be told to stop, so there is one of them and it
-/// lives as long as the process — which means the socket does too. Binding it per `start`
-/// would leave a thread behind on every `stop`, each blocked on a socket nobody will ever
-/// dial again.
+/// The path is in the environment of everything an execution spawns, and a socket bound
+/// per `start` would be a path that changes under anything long-lived a previous session
+/// left behind. One socket for the process is one answer to "where do I dial", for as
+/// long as there is a process to dial into.
 ///
-/// The cost is a socket a server with nothing delegated never uses, and the window
-/// between a `stop` and the next `start` in which a connection could queue up unserved.
+/// Nothing accepts on it except an execution, and only while one is running. A shim that
+/// connects at any other moment — between a `stop` and the next `start`, or between two
+/// commands — waits in the socket's backlog until something accepts it or this process
+/// goes away. Which is what a shim does anyway: it is a program waiting for its own
+/// output, and it has nothing else to do.
 struct Shims {
     /// Handed to every execution's environment, which is how a shim finds it.
     sock: PathBuf,
 
-    /// Cloned per execution, so a command's ending queues where its shims do.
-    ending: Sender<Event>,
-
-    incoming: Receiver<Event>,
-}
-
-/// Something an execution is waiting for.
-///
-/// One enum and one queue because an execution waits for whichever comes first, and
-/// `std`'s channels cannot be selected over.
-enum Event {
-    /// A delegated executable has run and is waiting to be told what it produced.
-    Shim(UnixStream),
-
-    /// The command itself is over, and this is everything it wrote.
-    Exited(io::Result<Output>),
+    listener: UnixListener,
 }
 
 impl Shims {
@@ -356,44 +402,31 @@ impl Shims {
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock)?;
 
-        let (ending, incoming) = mpsc::channel();
-        let accepting = ending.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                let queued = match stream {
-                    Ok(stream) => accepting.send(Event::Shim(stream)),
-                    Err(e) => {
-                        eprintln!("{}: no more shims: {e}", env!("CARGO_BIN_NAME"));
-                        return;
-                    }
-                };
-                // The receiver is held for the life of the process, so this only fails
-                // once there is nothing left to serve.
-                if queued.is_err() {
-                    return;
+        Ok(Shims { sock, listener })
+    }
+
+    /// The next shim to connect, or `None` if none ever will again.
+    ///
+    /// Cancel-safe, which is what lets this sit in a `select!` that an ending command may
+    /// win: a connection is either accepted whole or not accepted at all, and one left in
+    /// the backlog is still there for the next execution.
+    ///
+    /// A failed accept is not the end of anything by itself — a peer that hung up between
+    /// connecting and being accepted is one — so it is reported and waited past. What ends
+    /// this is the listener itself failing, which no later accept would survive either.
+    async fn accept(&self) -> Option<UnixStream> {
+        loop {
+            match self.listener.accept().await {
+                Ok((stream, _)) => return Some(stream),
+                Err(e) if transient(&e) => {
+                    eprintln!("{}: a shim went away: {e}", env!("CARGO_BIN_NAME"))
+                }
+                Err(e) => {
+                    eprintln!("{}: no more shims: {e}", env!("CARGO_BIN_NAME"));
+                    return None;
                 }
             }
-        });
-
-        Ok(Shims {
-            sock,
-            ending,
-            incoming,
-        })
-    }
-
-    fn sender(&self) -> Sender<Event> {
-        self.ending.clone()
-    }
-
-    /// The next thing an execution is waiting for.
-    ///
-    /// Cannot fail: this struct holds a sender of its own, so the queue cannot be
-    /// disconnected while it is alive.
-    fn next(&self) -> Event {
-        self.incoming
-            .recv()
-            .expect("a queue whose sender is held cannot disconnect")
+        }
     }
 }
 
@@ -401,6 +434,30 @@ impl Drop for Shims {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.sock);
     }
+}
+
+/// Whether an `accept` failure was about the one connection rather than the listener.
+fn transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
+}
+
+/// Wait for the task that is collecting a command, once there is nothing else to wait
+/// for.
+async fn join(running: &mut tokio::task::JoinHandle<io::Result<Output>>) -> io::Result<Output> {
+    joined(running.await)
+}
+
+/// What the collecting task came back with.
+///
+/// Two layers: whether the task itself got to finish, and whether waiting for the command
+/// worked. A task that did not finish is this process being torn down or a panic in the
+/// waiting itself; either way there is no output to report and the execution has to say
+/// so.
+fn joined(joined: Result<io::Result<Output>, tokio::task::JoinError>) -> io::Result<Output> {
+    joined.unwrap_or_else(|e| Err(io::Error::other(format!("collecting a command: {e}"))))
 }
 
 /// A command that ended, as the answer to whatever asked for it.
@@ -424,10 +481,10 @@ fn finished(output: io::Result<Output>) -> Outcome {
 /// reported as the shorter one it was — and one that shrinks is answered with however
 /// much was still there. Either way `data` is what was read and `size` is what the file
 /// measured, which is the pair a requester needs to know whether to ask again.
-fn read_file(read: &Read) -> Outcome {
+async fn read_file(read: &Read) -> Outcome {
     let path = Path::new(&read.path);
 
-    let size = match std::fs::metadata(path) {
+    let size = match tokio::fs::metadata(path).await {
         Ok(meta) if meta.is_dir() => {
             return refused(
                 Error::IS_A_DIRECTORY,
@@ -438,7 +495,7 @@ fn read_file(read: &Read) -> Outcome {
         Err(e) => return file_error(e, &read.path),
     };
 
-    let file = match std::fs::File::open(path) {
+    let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(e) => return file_error(e, &read.path),
     };
@@ -449,10 +506,16 @@ fn read_file(read: &Read) -> Outcome {
     let left = size.saturating_sub(offset);
     let want = read.len.unwrap_or(left).min(left).min(MAX_DATA) as usize;
 
+    // The handle is this call's alone, so a cursor is as good as a position on every
+    // read: nothing else can move it.
+    if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
+        return file_error(e, &read.path);
+    }
+
     let mut data = vec![0u8; want];
     let mut filled = 0;
     while filled < want {
-        match file.read_at(&mut data[filled..], offset + filled as u64) {
+        match file.read(&mut data[filled..]).await {
             // The file lost the bytes its size promised, so what is here is all there is.
             Ok(0) => break,
             Ok(n) => filled += n,
@@ -471,28 +534,43 @@ fn read_file(read: &Read) -> Outcome {
 /// was not there, cut to nothing if it was. An offset means only those bytes are being
 /// spoken for, so the file is opened without truncating and whatever lies past them
 /// stays.
-fn write_file(write: &Write) -> Outcome {
+async fn write_file(write: &Write) -> Outcome {
     let path = Path::new(&write.path);
 
     let file = match write.offset {
-        None => std::fs::File::create(path),
-        Some(_) => std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path),
+        None => tokio::fs::File::create(path).await,
+        Some(_) => {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .await
+        }
     };
 
-    let file = match file {
+    let mut file = match file {
         Ok(file) => file,
         Err(e) => return file_error(e, &write.path),
     };
 
-    if let Err(e) = file.write_all_at(&write.data, write.offset.unwrap_or(0)) {
+    // Seeking past the end and writing there is what leaves zeroes in the gap, the same
+    // as a positioned write would.
+    if let Err(e) = file.seek(SeekFrom::Start(write.offset.unwrap_or(0))).await {
         return file_error(e, &write.path);
     }
 
-    match file.metadata() {
+    if let Err(e) = file.write_all(&write.data).await {
+        return file_error(e, &write.path);
+    }
+
+    // Before the size is asked for, because these writes are buffered and a size taken
+    // over a buffer that has not gone out is the size the file used to be.
+    if let Err(e) = file.flush().await {
+        return file_error(e, &write.path);
+    }
+
+    match file.metadata().await {
         Ok(meta) => encoded(bson::serialize_to_bson(&WriteResult { size: meta.len() })),
         Err(e) => file_error(e, &write.path),
     }
