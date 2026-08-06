@@ -9,6 +9,7 @@
 //! stdout — four processes and one channel. Nothing smaller than the whole thing exercises
 //! it.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use cortex::BoxFuture;
@@ -255,27 +256,44 @@ async fn a_console_can_be_stopped_and_started_again() {
     fixture.console.stop().await.unwrap();
 }
 
-/// A started session can be closed without stopping it first, and closing reports how the
-/// ending went: the `stop` and the `quit` go out, the server exits on hearing them, and
-/// the wait for it comes back clean. A server that ignored either would hang here.
+/// What `quit` is actually for: the server hears it, releases what it took, and exits —
+/// rather than being killed with what it took still on disk.
+///
+/// A started session is dropped without being stopped first, which is the whole point.
+/// Nobody says `stop`, and the server still lets go of everything, because a server on its
+/// way out does that on its own.
+///
+/// The socket is what proves it, and the scratch directory would not. Nothing ever sweeps
+/// an abandoned socket — a server removes its own on the way out and no later run looks
+/// for anyone else's — so a socket that disappears is a server that reached its own
+/// `Drop`. The directory of symlinks is swept by the *next* server to boot, which in a
+/// test binary running several at once would tidy up after a killed one and say nothing.
 #[tokio::test]
-async fn a_started_session_can_just_be_closed() {
+async fn dropping_a_console_lets_the_server_clean_up_after_itself() {
     let mut fixture = Fixture::new();
     fixture.console.start().await.unwrap();
 
-    fixture.console.close().await.expect("ending the session");
-}
-
-/// And a started session can simply be dropped, which ends it as a task. What that ending
-/// answered is nobody's, but it does have to happen: a server that never heard `quit`
-/// would still be running when this test's runtime goes.
-#[tokio::test]
-async fn a_started_session_can_just_be_dropped() {
-    let mut fixture = Fixture::new();
-    fixture.console.start().await.unwrap();
+    // The server puts this in the environment of everything it runs, which is how a shim
+    // finds its way home — and how this test finds the one thing only an ending removes.
+    let out = fixture
+        .console
+        .exec(["sh", "-c", "echo $CORTEX_CONSOLE_SOCK"], None)
+        .await
+        .unwrap();
+    let sock = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim());
+    assert!(sock.exists(), "the server should have bound {sock:?}");
 
     drop(fixture);
-    tokio::task::yield_now().await;
+
+    // The ending is a task, and the server has to hear it, stop reading and leave — so
+    // this is waited for rather than looked at once.
+    for _ in 0..200 {
+        if !sock.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{sock:?} is still there, so the server was killed rather than asked to leave");
 }
 
 /// The point of the whole thing being async: two consoles, two server processes, two
