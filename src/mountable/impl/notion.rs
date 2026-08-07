@@ -304,7 +304,8 @@ impl Mountable for NotionVolume {
     async fn stat(&self, path: &Path) -> Result<Stat> {
         let segs = segments(path);
         match segs.as_slice() {
-            [] | [_] => Ok(Stat::new(DirentKind::Dir, 0)),
+            [] => Ok(Stat::new(DirentKind::Dir, 0)),
+            [p] if p == "pages" => Ok(Stat::new(DirentKind::Dir, 0)),
             [p, rest @ ..] if p == "pages" && !rest.is_empty() => {
                 let is_json = rest.last().map(String::as_str) == Some("page.json");
                 let dir = if is_json {
