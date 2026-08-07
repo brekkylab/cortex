@@ -367,6 +367,11 @@ impl<T: Mountable> PosixFs<T> {
                     let path = self.path_of(inode)?;
                     let (handle, _) = self.mountable.open(&path, OpenOptions::read_write()).await?;
                     handle.truncate(size).await?;
+                    // This handle was opened solely to truncate and is about to
+                    // drop, so finalize it: persists the resize for a backend that
+                    // buffers (an S3 multipart), and — since a bare `truncate` never
+                    // flushes — is what lets a workspace hook observe the change.
+                    handle.commit().await?;
                 }
             }
         }

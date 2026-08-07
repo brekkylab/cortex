@@ -203,6 +203,17 @@ impl OpenOptions {
 /// document API), so the trait is too. An async-native consumer (a WebDAV/HTTP
 /// frontend) `.await`s these directly; a sync interface binding (krun/fuse/
 /// fuse-t) `block_on`s them at its callback boundary — see `binding_runtime`.
+///
+/// Awaiting directly is only truly non-blocking for backends whose I/O is
+/// actually async — [`S3Volume`](crate::S3Volume), [`NotionVolume`](crate::NotionVolume).
+/// [`PassthroughVolume`](crate::PassthroughVolume) and
+/// [`InMemVolume`](crate::InMemVolume) are async in signature only: they call
+/// blocking `std::fs` (or lock a map) with no `.await`/yield, so driving them
+/// from an executor thread stalls that worker for the syscall. Inert today —
+/// every binding `block_on`s from its own thread — but an async-native frontend
+/// that drives a local passthrough mount should wrap those calls in
+/// `tokio::task::block_in_place` (gated on a multi-thread runtime), which costs
+/// nothing when the call is already quick, rather than `spawn_blocking`.
 #[async_trait]
 pub trait Mountable: Send + Sync {
     /// The open-file handle this backend hands out.

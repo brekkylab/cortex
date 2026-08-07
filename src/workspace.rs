@@ -433,10 +433,16 @@ impl Mountable for Workspace {
         // give for an existing directory. Recorded as a deliberate divergence: a
         // workspace answers for the whole namespace, where POSIX wants `EEXIST`.
         self.guard_synthesized(&key, CortexError::AlreadyExists)?;
-        match self.route(&key) {
+        let r = match self.route(&key) {
             Some((backend, sub)) => backend.mkdir(&sub).await,
             None => Err(self.refusal_for_create(&key)),
+        };
+        // Symmetric with `rmdir`'s `Removed`: a created directory is a change too.
+        // `Created` may name a directory (see the module docs on directory events).
+        if r.is_ok() {
+            self.fire(FsEvent::Created(&key.to_string_lossy()));
         }
+        r
     }
 
     async fn unlink(&self, path: &Path) -> Result<()> {
@@ -630,9 +636,12 @@ impl FileHandle for HookedHandle {
     }
     async fn flush(&self) -> Result<()> {
         let r = self.inner.flush().await;
-        // Only a write that landed is a change to announce — firing on a failed
-        // flush would have a consumer index bytes the backend never persisted.
-        // Matches the `is_ok` gate on `unlink`/`rmdir`/`rename`.
+        // Fires here because the intended host is a flush-is-finalize frontend (a
+        // WebDAV `PUT` flushes once at the end); see the module docs on why a
+        // mid-write-flush mount is not an intended hook host. Only a write that
+        // landed is a change to announce — firing on a failed flush would have a
+        // consumer index bytes the backend never persisted. Matches the `is_ok`
+        // gate on `unlink`/`rmdir`/`rename`.
         if r.is_ok() {
             self.fire_once();
         }

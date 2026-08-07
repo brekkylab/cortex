@@ -6,17 +6,25 @@
 //! nothing. Any classification ("is this under `knowledge/`?") and identity
 //! ("which workspace") live in the impl, not here.
 //!
-//! A write fires exactly once, on the first *successful* `flush` or `commit`,
-//! with the create-vs-modify distinction decided by whether the path existed at
-//! open. A failed write-out fires nothing.
+//! A file write fires exactly once, on the first *successful* `flush` or
+//! `commit`, with the create-vs-modify distinction decided by whether the path
+//! existed at open. The other mutations fire on success too: `mkdir`/`rmdir` as
+//! `Created`/`Removed`, a `rename` as `Removed(old)` + `Created`/`Modified(new)`,
+//! and a metadata `truncate` as `Modified` (it finalizes the handle it opens to
+//! resize). A failed mutation fires nothing.
 //!
-//! "Finished bytes, not a half-written file" holds only when the frontend's
-//! `flush` is its finalize — as it is for a WebDAV `PUT`, which flushes once at
-//! the end. A frontend that flushes mid-write (a FUSE `fsync`, or a `close` on a
-//! `dup`ed descriptor while writes still come through another) fires on that
-//! first flush and then latches, so a hook attached to such a mount can observe
-//! an intermediate state. Attach hooks to a flush-is-finalize frontend, or don't
-//! rely on the tail of a mid-write mount.
+//! **The intended host is a flush-is-finalize frontend.** "Finished bytes, not a
+//! half-written file" holds only when the frontend's `flush` *is* its finalize —
+//! as it is for a WebDAV `PUT`, which flushes once at the end, and which is
+//! cortex's actual hook consumer. A FUSE-style mount is **not** an intended hook
+//! host: there `flush` is a mid-write push (it arrives on every `close()`,
+//! including a `dup`ed descriptor while other writes still come through, and on
+//! every `fsync`), and only `RELEASE` finalizes — so a hook attached there fires
+//! on the first mid-write flush and then latches, observing an intermediate state
+//! and missing the finished file. Attach a hook on the flush-is-finalize side
+//! only; the sandbox/FUSE mounts of the same workspace attach none. Making a
+//! mid-write mount a valid hook host would mean promoting fire-on-finalize to a
+//! per-frontend policy (fire on `RELEASE`/`commit` there, on `flush` for WebDAV).
 //!
 //! Events are path-level and not recursive: a directory `rename` fires
 //! `Removed(old)` + `Created(new)` for the directory itself, not one event per
