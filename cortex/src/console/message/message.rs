@@ -36,7 +36,7 @@ pub const VERSION: &str = "2.0";
 /// exchange together. An execution that pauses for a delegated call is answered once per
 /// round trip, and each round trip is an `exec` of its own — so each response carries the
 /// id of the request it is the answer to, and the one the client is carrying on from is
-/// named again in [`PrevExecResult::id`](super::PrevExecResult::id).
+/// named again in the [`ExecCmd::Resume`](super::ExecCmd::Resume) that carries it on.
 ///
 /// JSON-RPC also allows a string or null id. This protocol issues numbers, which
 /// is what an off-the-shelf peer will happily accept; nothing reads any other
@@ -231,7 +231,7 @@ mod tests {
     use bson::{Document, doc};
 
     use super::super::{
-        Exec, ExecResult, Init, PrevExecResult, Progress, Read, ReadResult, Write, WriteResult,
+        Exec, ExecCmd, ExecResult, Init, Progress, Read, ReadResult, Write, WriteResult,
     };
     use super::*;
 
@@ -252,23 +252,27 @@ mod tests {
         Exec {
             // A multi-line `sh -c` script is one argument, and argv's last element
             // can be empty — both are ordinary argv.
-            cmd: vec!["sh".into(), "-c".into(), "echo a\necho b".into(), "".into()],
+            cmd: ExecCmd::New(vec![
+                "sh".into(),
+                "-c".into(),
+                "echo a\necho b".into(),
+                "".into(),
+            ]),
             timeout_ms: Some(1_000),
-            ..Exec::default()
         }
     }
 
     /// How a delegated call went, as the `exec` that carries it back.
     ///
-    /// No `cmd`, because this asks for nothing to be run: the execution it is carrying
-    /// on is already running on the far end, and all this adds is the answer it was
-    /// waiting for.
+    /// Nothing to run, because this asks for nothing to be run: the execution it is
+    /// carrying on is already running on the far end, and all this adds is the answer it
+    /// was waiting for.
     fn carry_on(answering: RequestId, outcome: Outcome) -> Exec {
         Exec {
-            prev: Some(PrevExecResult {
+            cmd: ExecCmd::Resume {
                 id: answering,
                 outcome,
-            }),
+            },
             ..Exec::default()
         }
     }
@@ -289,8 +293,8 @@ mod tests {
     /// that delegates twice on the way, release it, exit.
     ///
     /// The execution in the middle is the shape worth reading: the first `exec` is
-    /// answered with a `Delegated` rather than a result, each `exec` carrying a
-    /// [`prev`](Exec::prev) is answered with the next one, and the last of them carries
+    /// answered with a `Delegated` rather than a result, each `exec` carrying an
+    /// [`ExecCmd::Resume`] is answered with the next one, and the last of them carries
     /// the execution's own ending. Every request is the client's and every response the
     /// server's throughout, and the three notifications go unanswered because nothing
     /// answers one.
@@ -319,7 +323,7 @@ mod tests {
                 id: 1,
                 outcome: Outcome::Result(
                     bson::serialize_to_bson(&Progress::Delegated(Exec {
-                        cmd: vec!["foo".into()],
+                        cmd: ExecCmd::New(vec!["foo".into()]),
                         ..Exec::default()
                     }))
                     .unwrap(),
@@ -335,13 +339,13 @@ mod tests {
                 id: 2,
                 outcome: Outcome::Result(
                     bson::serialize_to_bson(&Progress::Delegated(Exec {
-                        cmd: vec!["bar".into(), "--twice".into()],
+                        cmd: ExecCmd::New(vec!["bar".into(), "--twice".into()]),
                         ..Exec::default()
                     }))
                     .unwrap(),
                 ),
             },
-            // And one that produced nothing at all, which is why `prev` carries an
+            // And one that produced nothing at all, which is why a resume carries an
             // outcome and not a result.
             Message::Request {
                 id: 3,
@@ -454,7 +458,7 @@ mod tests {
             wire(&Message::Request {
                 id: 2,
                 call: Call::Exec(Exec {
-                    cmd: vec!["ls".into()],
+                    cmd: ExecCmd::New(vec!["ls".into()]),
                     ..Exec::default()
                 }),
             }),
@@ -488,7 +492,7 @@ mod tests {
                 id: 2,
                 outcome: Outcome::Result(
                     bson::serialize_to_bson(&Progress::Delegated(Exec {
-                        cmd: vec!["foo".into()],
+                        cmd: ExecCmd::New(vec!["foo".into()]),
                         ..Exec::default()
                     }))
                     .unwrap()
@@ -502,9 +506,8 @@ mod tests {
         );
 
         // And carrying on from a delegated call is an `exec` like any other, whose `cmd`
-        // is empty because it is asking for nothing new to be run — the whole of what it
-        // says is in `prev`, where the outcome spells the same two members a response
-        // does.
+        // is an object rather than an argv because it asks for nothing new to be run —
+        // and the outcome in it spells the same two members a response does.
         assert_eq!(
             wire(&Message::Request {
                 id: 3,
@@ -515,8 +518,7 @@ mod tests {
                 "id": 3i64,
                 "method": "exec",
                 "params": {
-                    "cmd": [],
-                    "prev": {"id": 2i64, "outcome": {"result": {"code": 0i64}}},
+                    "cmd": {"id": 2i64, "outcome": {"result": {"code": 0i64}}},
                 },
             },
         );
@@ -533,8 +535,7 @@ mod tests {
                 "id": 3i64,
                 "method": "exec",
                 "params": {
-                    "cmd": [],
-                    "prev": {
+                    "cmd": {
                         "id": 2i64,
                         "outcome": {"error": {"code": -32000i64, "message": "too slow"}},
                     },
@@ -668,7 +669,7 @@ mod tests {
         else {
             panic!("wrong message")
         };
-        assert_eq!(exec.cmd, ["ls"]);
+        assert_eq!(exec.cmd, ExecCmd::New(vec!["ls".into()]));
     }
 
     /// Nothing a peer could send that is not one of the three shapes gets through
@@ -724,14 +725,14 @@ mod tests {
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "params": {"cmd": "ls"}},
             "exec params",
         );
-        // Carrying on from a delegated call is a member of `exec` and not a method of
-        // its own, so the name a peer written against the old protocol would send is
+        // Carrying on from a delegated call is a shape of `exec`'s `cmd` and not a method
+        // of its own, so the name a peer written against the old protocol would send is
         // not one this speaks.
         refused(
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "resume", "params": {}},
             "unknown method",
         );
-        // And the outcome inside a `prev` is an outcome, so the same xor applies to it
+        // And the outcome a `cmd` carries is an outcome, so the same xor applies to it
         // as to a response's own two members — nested one level down, which is the only
         // difference.
         refused(
@@ -739,7 +740,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 1i64,
                 "method": "exec",
-                "params": {"cmd": [], "prev": {"id": 0i64, "outcome": {}}},
+                "params": {"cmd": {"id": 0i64, "outcome": {}}},
             },
             "no result and no error",
         );
@@ -749,8 +750,7 @@ mod tests {
                 "id": 1i64,
                 "method": "exec",
                 "params": {
-                    "cmd": [],
-                    "prev": {
+                    "cmd": {
                         "id": 0i64,
                         "outcome": {
                             "result": Bson::Null,

@@ -124,8 +124,8 @@ pub trait Client: Send {
     /// so is anything else that may arrive while it waits. Handing the number back is
     /// what lets a caller quote a request it has made: a delegated call is answered by
     /// another `exec` naming the one it carries on from
-    /// ([`PrevExecResult::id`](crate::console::PrevExecResult::id)), and the end that
-    /// resolves a delegated name is above the transport that numbered it.
+    /// ([`ExecCmd::Resume`](crate::console::ExecCmd::Resume)), and the end that resolves a
+    /// delegated name is above the transport that numbered it.
     ///
     /// Outside the `Result`, because an id is spent either way — the request may well be
     /// on the wire when the answer to it never comes — so it is there to be reported with
@@ -159,8 +159,9 @@ pub trait Client: Send {
     ///
     /// [`Delegated`](Progress::Delegated) is the execution pausing on a name whose
     /// behaviour lives out here, and it has to be answered before anything else is
-    /// asked — by another `exec` carrying what the name produced as its
-    /// [`prev`](Exec::prev). Resolving those against something that knows what a name
+    /// asked — by another `exec` carrying what the name produced as an
+    /// [`ExecCmd::Resume`](crate::console::ExecCmd::Resume). Resolving those against
+    /// something that knows what a name
     /// *does* is not a transport's job — that is
     /// [`Console::exec`](crate::console::Console::exec), which is what a caller
     /// normally wants.

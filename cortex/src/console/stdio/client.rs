@@ -262,7 +262,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
-    use crate::console::{Error, Exec, ExecResult, Init, Method, Progress, Read};
+    use crate::console::{Error, Exec, ExecCmd, ExecResult, Init, Method, Progress, Read};
 
     /// Everything the client wrote, readable after it has been dropped or not — a
     /// `Vec` cannot be, once the client owns it.
@@ -365,7 +365,7 @@ mod tests {
         // under: `init` took zero, and the two notifications between them take none.
         let (id, result) = client
             .exec(Exec {
-                cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
+                cmd: ExecCmd::New(vec!["sh".into(), "-c".into(), "echo hi".into()]),
                 ..Exec::default()
             })
             .await;

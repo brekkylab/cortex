@@ -9,15 +9,15 @@
 //! and `error` are two of a *response's* members, and a response is one of
 //! [`Message`](super::Message)'s three shapes.
 //!
-//! [`PrevExecResult`](super::PrevExecResult) is what changed that. A delegated call runs in
-//! the client, and how it ended is the whole of what the `exec` carrying it back has to
+//! [`ExecCmd::Resume`](super::ExecCmd::Resume) is what changed that. A delegated call runs
+//! in the client, and how it ended is the whole of what the `exec` carrying it back has to
 //! say — so an outcome travels inside a **request** too, which is why it has a serde impl
 //! of its own and a file of its own. It is no longer "what a response carries"; it is how
 //! anything in this protocol ended, whichever direction it is travelling.
 //!
 //! And it has to be an outcome there rather than an [`ExecResult`](super::ExecResult),
 //! because a delegated call can fail to produce one at all — see
-//! [`PrevExecResult::result`](super::PrevExecResult::result).
+//! [`ExecCmd::Resume`](super::ExecCmd::Resume).
 //!
 //! One rule about it is shared with the envelope rather than written twice — see
 //! [`Outcome::from_members`].
@@ -163,7 +163,7 @@ impl Outcome {
     /// because there are two that read these members: [`Message`](super::Message)'s
     /// deserializer, which finds them among a response's own members, and
     /// [`Outcome`]'s, which finds them nested in an `exec`'s
-    /// [`prev`](super::Exec::prev).
+    /// [`cmd`](super::ExecCmd::Resume).
     ///
     /// Neither is `None` rather than an error because the two callers mean different
     /// things by it. A message with no `result` and no `error` has no `method` either,
@@ -278,9 +278,9 @@ mod tests {
         );
     }
 
-    /// An outcome on its own, which is how an `exec`'s [`prev`](super::super::Exec::prev)
-    /// carries one: the member that is there and no other, and the xor enforced both
-    /// ways.
+    /// An outcome on its own, which is how an `exec`'s
+    /// [`cmd`](super::super::ExecCmd::Resume) carries one: the member that is there and no
+    /// other, and the xor enforced both ways.
     #[test]
     fn an_outcome_is_the_one_member_that_is_there() {
         let wire = |outcome: &Outcome| bson::serialize_to_document(outcome).unwrap();

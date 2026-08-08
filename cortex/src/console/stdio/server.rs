@@ -113,7 +113,7 @@ mod tests {
     use std::task::{Context as TaskContext, Poll};
 
     use super::*;
-    use crate::console::{Call, Error, Exec, Init, Notification};
+    use crate::console::{Call, Error, Exec, ExecCmd, Init, Notification};
 
     /// Everything this end wrote, readable after it has been dropped or not — a `Vec`
     /// cannot be, once the server owns it.
@@ -162,7 +162,7 @@ mod tests {
             request(
                 1,
                 Call::Exec(Exec {
-                    cmd: vec!["echo".into(), "hi".into()],
+                    cmd: ExecCmd::New(vec!["echo".into(), "hi".into()]),
                     ..Exec::default()
                 }),
             ),

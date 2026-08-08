@@ -65,7 +65,7 @@ use tokio::process::Command;
 
 use crate::console::base::{Client, Failure};
 use crate::console::message::{
-    Call, Error, Exec, ExecResult, Init, Notification, Outcome, PrevExecResult, Progress, Read,
+    Call, Error, Exec, ExecCmd, ExecResult, Init, Notification, Outcome, Progress, Read,
     ReadResult, RequestId, Write, WriteResult,
 };
 use crate::console::stdio::StdioClient;
@@ -100,6 +100,10 @@ pub struct ConsoleBuilder {
 }
 
 impl ConsoleBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Drive the server over `client`.
     ///
     /// Anything that asks will do — a [`StdioClient`](crate::console::stdio::StdioClient)
@@ -298,8 +302,9 @@ impl Console {
     /// Every delegated call the command makes is resolved here, against the
     /// [`ExecutableSet`] this console was built with, before this returns: the server
     /// answers with a [`Delegated`](Progress::Delegated) instead of a result, the name
-    /// runs in *this* process, and what it produced goes back as the `prev` of another
-    /// `exec`. However many times that happens is not something a caller sees.
+    /// runs in *this* process, and what it produced goes back as the
+    /// [`Resume`](ExecCmd::Resume) of another `exec`. However many times that happens is
+    /// not something a caller sees.
     ///
     /// So a caller waits for one thing and gets one thing, and the delegated calls
     /// underneath it are served in the order the command made them.
@@ -323,10 +328,9 @@ impl Console {
         timeout_ms: Option<u64>,
     ) -> Result<ExecResult, Failure> {
         let exec = Exec {
-            cmd: cmd.into_iter().map(|s| s.as_ref().to_string()).collect(),
-            timeout_ms,
             // A command a caller asked for, so it carries on from nothing.
-            prev: None,
+            cmd: ExecCmd::New(cmd.into_iter().map(|s| s.as_ref().to_string()).collect()),
+            timeout_ms,
         };
 
         // Split rather than borrowed through `self`, because the chain holds the client
@@ -348,11 +352,10 @@ impl Console {
                 // command of its own to run.
                 Progress::Delegated(delegated) => {
                     let carry_on = Exec {
-                        cmd: Vec::new(),
-                        prev: Some(PrevExecResult {
+                        cmd: ExecCmd::Resume {
                             id,
                             outcome: answer(execs, delegated).await,
-                        }),
+                        },
                         // The execution this belongs to is already running under its own,
                         // and this is not a second execution to bound.
                         timeout_ms: None,
@@ -469,10 +472,10 @@ impl Drop for Console {
     }
 }
 
-/// What one delegated call comes to: the [`prev`](Exec::prev) of the `exec` that carries
+/// What one delegated call comes to: the outcome of the [`ExecCmd::Resume`] that carries
 /// it back.
 async fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
-    let Some((name, args)) = exec.cmd.split_first() else {
+    let Some((name, args)) = exec.cmd.split() else {
         return refused(Error::INVALID_PARAMS, "an empty command");
     };
 
@@ -526,7 +529,7 @@ mod tests {
     /// Two lists because they answer different questions: `methods` is what went out and
     /// in what order, including the `quit`, which is a notification and so never a `Call`;
     /// `calls` is what those carried, because the delegated calls a console resolves are
-    /// only visible in the `prev` of the `exec`s that carry them back.
+    /// only visible in the `cmd` of the `exec`s that carry them back.
     #[derive(Clone)]
     struct Log {
         methods: Arc<Mutex<Vec<Method>>>,
@@ -548,7 +551,7 @@ mod tests {
     struct Recorder {
         answers: Vec<Outcome>,
         /// Numbered as a real client numbers: from zero, by one, over calls alone. What
-        /// a console quotes back in a `prev` comes from here, so it has to be the same
+        /// a console quotes back in a resume comes from here, so it has to be the same
         /// sequence a transport would have produced.
         next_id: RequestId,
         log: Log,
@@ -612,7 +615,7 @@ mod tests {
     /// An execution pausing on a delegated name.
     fn delegated(cmd: &[&str]) -> Outcome {
         progress(Progress::Delegated(Exec {
-            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            cmd: ExecCmd::New(cmd.iter().map(|s| s.to_string()).collect()),
             ..Exec::default()
         }))
     }
@@ -757,9 +760,9 @@ mod tests {
     /// A delegated call is resolved from the set and carried back on an `exec` of its
     /// own, and the caller sees one result for the one command it asked for.
     ///
-    /// So the chain is `exec`s all the way down, told apart by what they carry: the
-    /// caller's has a command and no `prev`, and every one after it is the other way
-    /// round.
+    /// So the chain is `exec`s all the way down, told apart by the shape of the `cmd` they
+    /// carry: the caller's is a command, and every one after it is an answer to what the
+    /// last response asked for.
     #[tokio::test]
     async fn a_delegated_call_is_resolved_inside_one_exec() {
         let (client, log) = recorder(vec![
@@ -783,34 +786,35 @@ mod tests {
             [Method::Init, Method::Exec, Method::Exec, Method::Exec]
         );
 
+        /// The `n`th call, as the resume it must be: which request it carries on from, and
+        /// what it has to say about it.
+        fn resumed(log: &Log, n: usize) -> (RequestId, Outcome) {
+            match log.call(n) {
+                Call::Exec(Exec {
+                    cmd: ExecCmd::Resume { id, outcome },
+                    ..
+                }) => (id, outcome),
+                other => panic!("{other:?} is not an exec carrying on from anything"),
+            }
+        }
+
         // What the caller asked for: a command, carrying on from nothing.
         let Call::Exec(asked) = log.call(1) else {
             panic!("{:?} is not an exec", log.call(1));
         };
-        assert_eq!(asked.cmd, ["foo"]);
-        assert!(asked.prev.is_none());
+        assert_eq!(asked.cmd, ExecCmd::New(vec!["foo".into()]));
 
         // The registered name ran, and its output is what the next `exec` carried — under
         // the id of the request that asked for it, which is the one above.
-        let Call::Exec(carried) = log.call(2) else {
-            panic!("{:?} is not an exec", log.call(2));
-        };
-        let prev = carried.prev.unwrap();
-        assert!(carried.cmd.is_empty(), "carrying on runs nothing new");
-        assert_eq!(prev.id, 1);
-        let result: ExecResult = prev.outcome.take().unwrap();
+        let (id, outcome) = resumed(&log, 2);
+        assert_eq!(id, 1);
+        let result: ExecResult = outcome.take().unwrap();
         assert_eq!(result.stdout, b"hello world\n");
 
         // The unregistered one is refused rather than run — a server asking for a name
         // it was never given — and an outcome is what makes saying so possible at all.
-        let Call::Exec(carried) = log.call(3) else {
-            panic!("{:?} is not an exec", log.call(3));
-        };
-        let prev = carried.prev.unwrap();
-        assert_eq!(prev.id, 2);
-        assert_eq!(
-            prev.outcome.error().map(|e| e.code),
-            Some(Error::NOT_EXECUTABLE)
-        );
+        let (id, outcome) = resumed(&log, 3);
+        assert_eq!(id, 2);
+        assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
     }
 }

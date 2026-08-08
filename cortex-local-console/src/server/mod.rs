@@ -103,8 +103,8 @@ use std::process::{ExitStatus, Output, Stdio};
 use bson::Bson;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, Exec, ExecResult, Init, MAX_PAYLOAD, Message, Notification, Outcome, Progress,
-    Read, ReadResult, RequestId, Server, Write, WriteResult,
+    Call, Error, Exec, ExecCmd, ExecResult, Init, MAX_PAYLOAD, Message, Notification, Outcome,
+    Progress, Read, ReadResult, RequestId, Server, Write, WriteResult,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
@@ -162,12 +162,11 @@ pub async fn run() -> anyhow::Result<()> {
                     server.respond(id, Outcome::Result(Bson::Null)).await?;
                 }
 
-                // An `exec` carrying a `prev` is not a command but the answer to a
-                // delegated call, and one of those is read inside `execute` by the
-                // execution that is waiting for it. Reaching the main loop means nothing
-                // is: the client is carrying on from an execution this end is not
-                // holding.
-                Call::Exec(exec) if exec.prev.is_some() => {
+                // An `exec` whose `cmd` is an answer rather than a command is read
+                // inside `execute`, by the execution that is waiting for it. Reaching the
+                // main loop means nothing is: the client is carrying on from an execution
+                // this end is not holding.
+                Call::Exec(exec) if matches!(exec.cmd, ExecCmd::Resume { .. }) => {
                     server
                         .respond(
                             id,
@@ -283,7 +282,7 @@ async fn execute(
     linked: &BinDir,
     shims: &Shims,
 ) -> io::Result<()> {
-    let Some((program, args)) = exec.split() else {
+    let Some((program, args)) = exec.cmd.split() else {
         return server
             .respond(id, refused(Error::INVALID_PARAMS, "an empty command"))
             .await;
@@ -357,9 +356,9 @@ async fn execute(
 /// Hand one delegated call to the client, and give the shim what comes back.
 ///
 /// Two messages on the console channel: the [`Delegated`](Progress::Delegated) that
-/// answers what this execution currently owes, and the `exec` that carries the answer
-/// back in its `prev`. What is returned is the id of the request now owed the execution's
-/// own answer, or `None` when the client said nothing that could be one.
+/// answers what this execution currently owes, and the `exec` whose `cmd` carries the
+/// answer back. What is returned is the id of the request now owed the execution's own
+/// answer, or `None` when the client said nothing that could be one.
 async fn delegate(
     server: &mut StdioServer,
     owed: RequestId,
@@ -391,17 +390,17 @@ async fn delegate(
         .respond(owed, result(Progress::Delegated(exec)))
         .await?;
 
-    // Only the answer to what was just asked for can arrive now: an `exec` carrying a
-    // `prev` that names the request the `Delegated` above went out on. This end owes an
-    // answer it has not sent, so there is nothing else the client could be asking about —
-    // and a `prev` naming anything else is a client that has lost its place, which is the
-    // whole of what that id is for.
+    // Only the answer to what was just asked for can arrive now: an `exec` whose `cmd`
+    // names the request the `Delegated` above went out on. This end owes an answer it has
+    // not sent, so there is nothing else the client could be asking about — and a `cmd`
+    // naming anything else is a client that has lost its place, which is the whole of what
+    // that id is for.
     let carried = match server.recv().await? {
         Some(Message::Request {
             id,
             call: Call::Exec(exec),
-        }) => match exec.prev {
-            Some(prev) if prev.id == owed => Some((id, prev.outcome)),
+        }) => match exec.cmd {
+            ExecCmd::Resume { id: from, outcome } if from == owed => Some((id, outcome)),
             _ => None,
         },
         _ => None,

@@ -191,7 +191,7 @@ fn bad(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::{Call, Exec, ExecResult, Init, Notification, Outcome, Progress};
+    use crate::console::{Call, Exec, ExecCmd, ExecResult, Init, Notification, Outcome, Progress};
 
     fn messages() -> Vec<Message> {
         vec![
@@ -208,7 +208,7 @@ mod tests {
             Message::Request {
                 id: 2,
                 call: Call::Exec(Exec {
-                    cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
+                    cmd: ExecCmd::New(vec!["sh".into(), "-c".into(), "echo hi".into()]),
                     ..Exec::default()
                 }),
             },

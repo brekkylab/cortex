@@ -158,14 +158,14 @@
 //! [`Progress`] is the spelling that does not. The server *answers* with a
 //! [`Delegated`](Progress::Delegated): a complete, ordinary response to the request the
 //! client is already waiting on, meaning *not finished, and here is what I need*. The
-//! client runs the name and sends another `exec` carrying what it got as
-//! [`prev`](Exec::prev), whose answer is the next `Progress`.
+//! client runs the name and sends another `exec` carrying what it got as an
+//! [`ExecCmd::Resume`], whose answer is the next `Progress`.
 //!
-//! Carrying on is that field and not a `resume` method of its own, because the two would
-//! be the same request under two names: an execution the server is holding, and the
-//! output it was waiting for. What the client has to say is *this is where the last one
-//! got to*, which is a member — and one method fewer is one fewer place for the two ends
-//! to disagree about which of them a response is answering.
+//! Carrying on is a shape of that method's `cmd` and not a `resume` method of its own,
+//! because the two would be the same request under two names: an execution the server is
+//! holding, and the output it was waiting for. What the client has to say is *this is where
+//! the last one got to*, which is what an `exec` is for — and one method fewer is one fewer
+//! place for the two ends to disagree about which of them a response is answering.
 //!
 //! So one channel, one end that asks, one end that answers — and one [`Exec`] type, since
 //! a delegated call is the same shape as any other execution request: a command,

@@ -5,7 +5,7 @@
 //! Which is the only way to test the interesting part. A delegated executable works only
 //! if `execvp` finds a symlink, re-enters this binary as a shim, the shim dials the socket
 //! the *server* bound, the server passes the call up the console channel as a `Delegated`,
-//! this process answers it with an `exec` carrying the result in its `prev`, and the bytes
+//! this process answers it with an `exec` whose `cmd` carries the result, and the bytes
 //! come back out of the shim's own stdout — four processes and one channel. Nothing
 //! smaller than the whole thing exercises it.
 
@@ -277,10 +277,7 @@ async fn a_command_runs_in_a_session_that_delegates_nothing() {
         .await
         .expect("building the console");
 
-    let out = console
-        .exec(["sh", "-c", "echo hi"], None)
-        .await
-        .unwrap();
+    let out = console.exec(["sh", "-c", "echo hi"], None).await.unwrap();
     assert_eq!(out.stdout, b"hi\n");
 
     let out = console

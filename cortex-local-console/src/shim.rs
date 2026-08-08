@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::bail;
 use cortex::console::stdio::{read, write};
-use cortex::console::{Call, Exec, ExecResult, Message};
+use cortex::console::{Call, Exec, ExecCmd, ExecResult, Message};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
 
@@ -53,8 +53,9 @@ async fn forward(tool: &str) -> anyhow::Result<i32> {
 
     let mut stream = UnixStream::connect(&sock).await?;
 
-    // The name is `cmd[0]`, which is how any `exec` names what to run — a delegated one
-    // is not a different kind of request, only one whose program lives elsewhere.
+    // The name is the first word of the command, which is how any `exec` names what to
+    // run — a delegated one is not a different kind of request, only one whose program
+    // lives elsewhere.
     let mut cmd = vec![tool.to_string()];
     cmd.extend(std::env::args().skip(1));
 
@@ -63,7 +64,7 @@ async fn forward(tool: &str) -> anyhow::Result<i32> {
         &Message::Request {
             id: CALL_ID,
             call: Call::Exec(Exec {
-                cmd,
+                cmd: ExecCmd::New(cmd),
                 ..Exec::default()
             }),
         },
