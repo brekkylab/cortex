@@ -3,7 +3,12 @@ resolver = "3"
 members = [
     "cortex",
     "cortex-local-console",
+    "cortex-uvm-console",
 ]
+# The guest half of `cortex-uvm-console`. Its own workspace root, because it is
+# cross-compiled to `*-unknown-linux-musl` and a member would be built for the
+# host by a bare `cargo build` — for a target that has no host to run on.
+exclude = ["cortex-uvm-guest"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,6 +25,11 @@ cortex-fs = { path = "cortex-fs", default-features = false }
 futures-core = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+# Verifying a downloaded base rootfs against a pinned digest. A tarball that arrives over
+# a link nobody controls decides what every command in every guest runs, so the check is
+# not optional and a `shasum` binary that may or may not be spelled that way is not a
+# dependency worth having.
+sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
 
@@ -28,6 +38,14 @@ tokio = "1"
 # backend to the guest — the one thing the upstream libkrun C API and the
 # high-level microsandbox SDK do not offer.
 msb_krun = "0.1"
+
+# Two image formats, in pure Rust, with no `mkfs` to shell out to: `ext4` formats
+# the per-session writable upper, `erofs` writes the read-only base the guest
+# overlays it onto, and `tar`/`tree` turn a rootfs tarball into the tree `erofs`
+# encodes. Only `cortex-uvm-console` takes it — the crate that already links a
+# hypervisor — so the tree it drags in is charged to the one consumer that boots
+# a guest at all.
+microsandbox-image = "0.6.7"
 
 # Host-side FUSE. A sync trait whose methods take `&self`, so it drives the same
 # `PosixFs` (interior mutability) that the krun binding does.
