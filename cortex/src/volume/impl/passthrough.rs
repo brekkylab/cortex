@@ -9,10 +9,8 @@
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
-use crate::{
-    CortexError, Result,
-    volume::{Dirent, DirentKind, Mountable, Stat},
-};
+use crate::{CortexError, Result};
+use crate::volume::{Dirent, DirentKind, Mountable, OpenOptions, Stat};
 
 /// A volume backed by a real on-disk directory.
 pub struct PassthroughVolume {
@@ -75,11 +73,16 @@ impl Mountable for PassthroughVolume {
         for entry in fs::read_dir(&real)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if entry.file_type()?.is_dir() {
-                out.push(Dirent::Dir(name));
+            // `file_type` comes from the directory entry itself (`d_type`), so
+            // the kind is free. Size and timestamps are not — they would be an
+            // `lstat` per entry, which a plain `ls` never asked for. So this
+            // listing leaves `Dirent::stat` unset and lets the caller decide.
+            let kind = if entry.file_type()?.is_dir() {
+                DirentKind::Dir
             } else {
-                out.push(Dirent::File(name));
-            }
+                DirentKind::File
+            };
+            out.push(Dirent::new(name, kind));
         }
         Ok(out)
     }
@@ -99,143 +102,66 @@ impl Mountable for PassthroughVolume {
 
     fn unlink(&self, path: &Path) -> Result<()> {
         let real = self.real_path(path)?;
-        let meta = fs::symlink_metadata(&real)?;
-        if meta.is_dir() {
-            fs::remove_dir_all(&real)?;
-        } else {
-            fs::remove_file(&real)?;
-        }
-        Ok(())
-    }
-
-    fn open(&self, path: &Path) -> Result<Self::Handle> {
-        let real = self.real_path(path)?;
         if fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::IsADirectory);
         }
-        // Open for positioned reads and writes. Creating a missing file is
-        // `create`, not `open`, so a missing path surfaces as `NotFound` here.
-        Ok(fs::OpenOptions::new().read(true).write(true).open(&real)?)
+        fs::remove_file(&real)?;
+        Ok(())
     }
 
-    fn create(&self, path: &Path) -> Result<Self::Handle> {
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        // The whole overwrite contract is the kernel's here, and `From<io::Error>`
+        // already carries its answers across: measured on macOS, `fs::rename` gives
+        // `EISDIR` for file-over-directory, `ENOTDIR` for the reverse, `ENOTEMPTY`
+        // for a non-empty destination, `EINVAL` for a directory into its own
+        // descendant, `ENOENT` for a missing source or destination parent, and
+        // silently replaces file-over-file. Re-deriving any of that here could only
+        // introduce disagreement with the platform.
+        fs::rename(self.real_path(from)?, self.real_path(to)?)?;
+        Ok(())
+    }
+
+    fn rmdir(&self, path: &Path) -> Result<()> {
         let real = self.real_path(path)?;
-        // `create_new`: parent must exist, a clash is `AlreadyExists`.
-        Ok(fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(&real)?)
+        if !fs::symlink_metadata(&real)?.is_dir() {
+            return Err(CortexError::NotADirectory);
+        }
+        // `remove_dir` — never `remove_dir_all`. The emptiness check is the
+        // kernel's own (`ENOTEMPTY`), which `From<io::Error>` maps to
+        // `NotEmpty`.
+        fs::remove_dir(&real)?;
+        Ok(())
+    }
+
+    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+        options.validate()?;
+        let real = self.real_path(path)?;
+
+        // Hand the whole option set to the OS in one `open`, so `O_EXCL` and
+        // `O_TRUNC` are as atomic here as they are for any other program. A
+        // pre-flight `symlink_metadata` check would only add a race — the kernel
+        // already reports `EISDIR` for a directory.
+        let file = fs::OpenOptions::new()
+            .read(options.read)
+            .write(options.write)
+            .append(options.append)
+            .truncate(options.truncate)
+            .create(options.create)
+            .create_new(options.create_new)
+            .open(&real)?;
+
+        let meta = file.metadata()?;
+        let mut stat = Stat::new(DirentKind::File, meta.len());
+        stat.mtime = meta.modified().ok();
+        stat.atime = meta.accessed().ok();
+        stat.created = meta.created().ok();
+        Ok((file, stat))
     }
 }
 
+// Tests live beside this file rather than inside it: they had grown longer than
+// the implementation, so a reader opening it had to scroll past them to find the
+// code. They are still a child module, so private items stay reachable.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::volume::{FileExt, FileHandle};
-
-    /// Create a unique scratch directory under the system temp dir without
-    /// pulling in extra crates.
-    fn scratch(tag: &str) -> PathBuf {
-        let mut dir = std::env::temp_dir();
-        dir.push(format!(
-            "cortex-passthrough-test-{}-{}",
-            std::process::id(),
-            tag
-        ));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn names(vol: &dyn Mountable<Handle = fs::File>, path: &str) -> Vec<String> {
-        let mut names: Vec<_> = vol
-            .list(Path::new(path))
-            .unwrap()
-            .iter()
-            .map(|e| e.name().to_string())
-            .collect();
-        names.sort();
-        names
-    }
-
-    #[test]
-    fn stat_open_read_write() {
-        let base = scratch("rwlu");
-        let vol = PassthroughVolume::new(&base);
-
-        vol.mkdir(Path::new("sub")).unwrap();
-        // Files are created out-of-band (the volume has no `create` yet), then
-        // driven through its handle.
-        fs::write(base.join("hello.txt"), b"world").unwrap();
-
-        let st = vol.stat(Path::new("hello.txt")).unwrap();
-        assert_eq!(st.kind, DirentKind::File);
-        assert_eq!(st.size, 5);
-        assert_eq!(vol.stat(Path::new("sub")).unwrap().kind, DirentKind::Dir);
-
-        // Positioned read through the open handle.
-        let handle = vol.open(Path::new("hello.txt")).unwrap();
-        let mut buf = [0u8; 5];
-        handle.read_exact_at(&mut buf, 0).unwrap();
-        assert_eq!(&buf, b"world");
-
-        // Positioned write, then truncate, both observable on disk.
-        handle.write_all_at(b"HELLO", 0).unwrap();
-        handle.truncate(3).unwrap();
-        assert_eq!(fs::read(base.join("hello.txt")).unwrap(), b"HEL");
-
-        assert_eq!(names(&vol, ""), vec!["hello.txt", "sub"]);
-
-        vol.unlink(Path::new("hello.txt")).unwrap();
-        assert!(matches!(
-            vol.stat(Path::new("hello.txt")),
-            Err(CortexError::NotFound)
-        ));
-
-        fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
-    fn kind_errors() {
-        let base = scratch("kind");
-        let vol = PassthroughVolume::new(&base);
-        vol.mkdir(Path::new("dir")).unwrap();
-        fs::write(base.join("file"), b"x").unwrap();
-
-        assert!(matches!(
-            vol.open(Path::new("dir")),
-            Err(CortexError::IsADirectory)
-        ));
-        assert!(matches!(
-            vol.list(Path::new("file")),
-            Err(CortexError::NotADirectory)
-        ));
-        assert!(matches!(
-            vol.mkdir(Path::new("file")),
-            Err(CortexError::AlreadyExists)
-        ));
-
-        fs::remove_dir_all(&base).unwrap();
-    }
-
-    #[test]
-    fn escapes_and_missing_root_rejected() {
-        let base = scratch("escape");
-        let vol = PassthroughVolume::new(&base);
-        assert!(matches!(
-            vol.open(Path::new("../secret")),
-            Err(CortexError::InvalidName)
-        ));
-        fs::remove_dir_all(&base).unwrap();
-
-        // `new` doesn't touch disk, so a missing root only surfaces on use.
-        let missing = scratch("missing");
-        fs::remove_dir_all(&missing).unwrap();
-        let vol = PassthroughVolume::new(&missing);
-        assert!(matches!(
-            vol.list(Path::new("")),
-            Err(CortexError::NotFound)
-        ));
-    }
-}
+#[path = "passthrough_tests.rs"]
+mod tests;

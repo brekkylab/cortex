@@ -1,3 +1,19 @@
+//! Two halves, and they do not know about each other.
+//!
+//! * [`volume`] — expose any path-addressed store as a real filesystem. A store
+//!   implements [`Mountable`](volume::Mountable) and a binding puts it in front of a
+//!   concrete interface: a host FUSE mount, a guest microVM's virtio-fs, whatever else
+//!   addresses files by path. `volume/ARCHITECTURE.md` has the long form.
+//! * [`console`] — run commands somewhere else, over one JSON-RPC channel, with the
+//!   executables only *this* side knows how to run reachable from inside that somewhere
+//!   else. `console/ARCHITECTURE.md` has the long form.
+//!
+//! What they share is a crate and an error type, and that is deliberate: a console
+//! backend that projects a volume into its sandbox is a thing to build on top of both,
+//! not a coupling to bake into either.
+//!
+//! # The file layout
+//!
 //! A module here is a directory whose `mod.rs` holds the module's own documentation and
 //! its re-exports, and whose siblings hold the code — including one named after the
 //! module itself, for the type the module exists for: `console/console.rs` has
@@ -13,6 +29,9 @@
 pub mod console;
 mod error;
 pub mod executable;
+mod lock;
+#[cfg(test)]
+mod test_support;
 pub mod volume;
 
 pub use error::*;

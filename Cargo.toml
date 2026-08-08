@@ -28,3 +28,17 @@ tokio = "1"
 # backend to the guest — the one thing the upstream libkrun C API and the
 # high-level microsandbox SDK do not offer.
 msb_krun = "0.1"
+
+# Host-side FUSE. A sync trait whose methods take `&self`, so it drives the same
+# `PosixFs` (interior mutability) that the krun binding does.
+fuser = "0.17"
+# A read-only S3 backend. `default-features = false` on purpose: the default set
+# is `["fs"]`, which is object_store's *own* local-filesystem store and drags in
+# walkdir/nix/same-file for a thing we already have in `PassthroughVolume`. The
+# `memory` module is ungated, so the in-memory store the tests build on survives.
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+
+# Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
+# build-dependencies cannot themselves be optional.
+cc = "1"
+pkg-config = "0.3"
