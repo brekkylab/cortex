@@ -11,4 +11,3 @@ pub use adapter::*;
 pub use r#impl::*;
 pub use stat::*;
 pub use r#trait::*;
-pub use volume::*;

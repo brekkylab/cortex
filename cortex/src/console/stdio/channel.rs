@@ -191,15 +191,14 @@ fn bad(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::{Call, Exec, ExecResult, Notification, Outcome, Progress, Start};
+    use crate::console::{Call, Exec, ExecResult, Init, Notification, Outcome, Progress};
 
     fn messages() -> Vec<Message> {
         vec![
             Message::Request {
                 id: 0,
-                call: Call::Start(Start {
+                call: Call::Init(Init {
                     delegated: vec!["foo".into()],
-                    default_timeout_ms: Some(30_000),
                 }),
             },
             Message::Response {
@@ -210,7 +209,7 @@ mod tests {
                 id: 2,
                 call: Call::Exec(Exec {
                     cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
-                    timeout_ms: None,
+                    ..Exec::default()
                 }),
             },
             Message::Response {

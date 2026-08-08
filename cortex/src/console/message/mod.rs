@@ -27,42 +27,70 @@
 //! It is also now redundant, because a BSON document's first four bytes are its own
 //! length; [`stdio`](super::stdio) has what retiring the header would take.
 //!
-//! The split inside here is mostly the spec's own, between an object that is
-//! answered and one that is not:
+//! The split inside here is the envelope, the methods, and the two things that are
+//! neither:
 //!
 //! - `message` — the envelope every object shares: [`Message`] and its three
-//!   shapes, [`Method`], the [`RequestId`] that pairs a response with its request,
-//!   and the serde impls that put all of it on the wire.
-//! - `call` — the methods something answers: [`Call`], and the `params` and
-//!   `result` they carry ([`Start`], [`Exec`], [`Progress`], [`ExecResult`], and the
-//!   file plane's [`Read`], [`ReadResult`], [`Write`], [`WriteResult`]).
-//! - `notification` — the methods nothing answers: [`Notification`].
+//!   shapes, the [`RequestId`] that pairs a response with its request, and the serde
+//!   impls that put all of it on the wire.
+//! - `method` — the methods and what each of them carries, one file apiece ([`Init`],
+//!   [`Exec`] and [`Progress`], the file plane's [`Read`] and [`Write`], the three that
+//!   carry nothing). [`Method`] names them; [`Call`] is the four that are answered and
+//!   [`Notification`] the three that are not.
 //! - `outcome` — how something ended: [`Outcome`], and the [`Error`] and codes that
 //!   are the second half of it.
 //!
 //! A `Call` and a `Notification` each write and read their own `params`, so adding
-//! a method means touching the side it belongs to and not the envelope.
-//!
-//! `outcome` is the one that is not one of the spec's shapes, and it earned its place
-//! by being on both sides of the request/response line: a response carries an outcome,
-//! and so does the `resume` reporting a delegated call that ran in the client. It was
-//! part of the envelope for as long as it was only ever a response's.
+//! a method means touching the side it belongs to and not the envelope. Which of the
+//! two a method is, is the whole of what JSON-RPC's `id` decides, and it is why those
+//! are the types the envelope names — while *what* each method carries is one file of
+//! its own, so that changing a method is one place to look.
 //!
 //! # What the protocol is
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
-//! | `start` | [`Start`] | `null` | [`BOOT_FAILED`](Error::BOOT_FAILED) |
-//! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`NOT_STARTED`](Error::NOT_STARTED) |
-//! | `resume` | [`Outcome`] | [`Progress`] | [`INVALID_REQUEST`](Error::INVALID_REQUEST) |
-//! | `read` | [`Read`] | [`ReadResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED) |
-//! | `write` | [`Write`] | [`WriteResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED) |
-//! | `stop` | — | `null` | [`STOP_FAILED`](Error::STOP_FAILED) |
+//! | `init` | [`Init`] | `null` | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
+//! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED) |
+//! | `read` | [`Read`] | [`ReadResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED) |
+//! | `write` | [`Write`] | [`WriteResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED) |
+//! | `start` | — | *(notification — no response)* | — |
+//! | `stop` | — | *(notification — no response)* | — |
 //! | `quit` | — | *(notification — no response)* | — |
 //!
-//! Every request gets exactly one response, correlated by `id`. `quit` is a
-//! notification: no `id`, nothing answers it. **Every one of them is the client's:**
-//! there is no method a server issues, which is what [`Progress`] is for.
+//! Every request gets exactly one response, correlated by `id`; the three notifications
+//! have no `id` and nothing answers them. **Every one of them is the client's:** there
+//! is no method a server issues, which is what [`Progress`] is for.
+//!
+//! # Why booting is not a method
+//!
+//! **Anything that needs a booted session boots one** — an `exec`, a `read`, a `write` —
+//! so a client that sends neither `start` nor `stop` still works, and one that sends
+//! `stop` and then an `exec` gets the `exec`.
+//!
+//! That leaves the pair as **the protocol's resource management, and nothing else**.
+//! Neither changes what a session can do; both change what the far end is holding, and
+//! when it paid to hold it:
+//!
+//! - **`stop` gives occupancy back.** What booting took — a guest, a socket, a scratch
+//!   directory — is memory, descriptors and disk on the far end, and it is only worth
+//!   anything while something is running. A client that knows it will be idle hands them
+//!   back and takes them again for the price of one boot when it has work.
+//! - **`start` hides the cold start.** A backend with a kernel to bring up makes the
+//!   first command pay for that inside its own latency. A client that says this as soon
+//!   as it has a console pays for it in parallel with whatever else it is doing, and the
+//!   command that follows finds a session already up.
+//!
+//! Neither is a question, which is why neither is answered: what a client does next is
+//! the same either way, and a session that failed to boot behaves like one that has not
+//! booted yet, since the next call that needs one tries again. A failure reaches whoever
+//! asked for that call, as [`BOOT_FAILED`](Error::BOOT_FAILED).
+//!
+//! `init` is the exception and is a call, because it is not about resources. It
+//! says what the session *is* — the delegated names, the fallback timeout — and its
+//! response is the one thing a client can act on before it has asked for any work: that
+//! there is a server on the far end, that it speaks this protocol, and that it has taken
+//! what it was told.
 //!
 //! # Why the codec is BSON
 //!
@@ -98,12 +126,12 @@
 //!
 //! ## Why the `bytes` helper does not ask the codec
 //!
-//! It used to, via [`is_human_readable`](serde::Serializer::is_human_readable), so that
-//! one helper served a textual codec and a binary one. That branch is gone, and
-//! [`call`](self::call)'s `bytes` module has the reason: `params` and `result` pass
-//! through a `Bson` value before they reach the wire, and `bson`'s value-level
-//! serializer reports itself human-readable, so the branch would quietly restore base64
-//! at the one place the byte type was the point.
+//! [`is_human_readable`](serde::Serializer::is_human_readable) is the obvious way for
+//! one helper to serve a textual codec and a binary one, and `method`'s `bytes` module
+//! has why it cannot be used: `params` and `result` pass through a `Bson` value before
+//! they reach the wire, and `bson`'s value-level serializer reports itself
+//! human-readable, so the branch would quietly restore base64 at the one place the byte
+//! type was the point.
 //!
 //! # Why errors carry codes
 //!
@@ -130,7 +158,14 @@
 //! [`Progress`] is the spelling that does not. The server *answers* with a
 //! [`Delegated`](Progress::Delegated): a complete, ordinary response to the request the
 //! client is already waiting on, meaning *not finished, and here is what I need*. The
-//! client runs the name and says so with `resume`, whose answer is the next `Progress`.
+//! client runs the name and sends another `exec` carrying what it got as
+//! [`prev`](Exec::prev), whose answer is the next `Progress`.
+//!
+//! Carrying on is that field and not a `resume` method of its own, because the two would
+//! be the same request under two names: an execution the server is holding, and the
+//! output it was waiting for. What the client has to say is *this is where the last one
+//! got to*, which is a member — and one method fewer is one fewer place for the two ends
+//! to disagree about which of them a response is answering.
 //!
 //! So one channel, one end that asks, one end that answers — and one [`Exec`] type, since
 //! a delegated call is the same shape as any other execution request: a command,
@@ -184,12 +219,10 @@
 //! 1.0×. Getting that is why the codec is BSON and not JSON, which has no byte type and
 //! would have made them base64 at best (1.37×) or `[104,105,10]` at worst (4×).
 
-mod call;
 mod message;
-mod notification;
+mod method;
 mod outcome;
 
-pub use call::*;
 pub use message::*;
-pub use notification::*;
+pub use method::*;
 pub use outcome::*;

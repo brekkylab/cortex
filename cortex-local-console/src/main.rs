@@ -1,12 +1,16 @@
 //! `cortex-local-console` — entry point for the host-local backend.
 //!
-//! Answers a console session on stdin and stdout: `start` to put the delegated names on
-//! `PATH`, an `exec` per command, `stop` to take them away, `quit` to end. See
-//! [`cortex::console`] for the shape of what those descriptors carry.
+//! Answers a console session on stdin and stdout: `init` to say which names the session
+//! delegates, an `exec` per command, `quit` to end. See [`cortex::console`] for the
+//! shape of what those descriptors carry.
 //!
-//! Boot is a request of its own and comes before any command, so a client can start a
-//! server before it knows what to run — and `start` being answered is proof the server is
-//! ready.
+//! Putting those names on `PATH` is booting, and nothing has to ask for it: the first
+//! `exec`, `read` or `write` to find a session without one is served by a session that
+//! has just booted. `start` and `stop` are resource management on top of that and
+//! nothing more — boot early so no command pays the cold start, release while idle so
+//! the directory is not sitting there — which is why neither is answered and neither is
+//! required. On this backend what they hand back and forth is a directory of symlinks,
+//! which is cheap; on one with a guest to bring up it is not.
 //!
 //! # Two roles, one binary
 //!
@@ -20,8 +24,8 @@
 //!   its code (see [`shim`]).
 //!
 //! There is nothing to build or ship for the second role. A delegated executable costs one
-//! name in `start` and one `symlink(2)`, and the whole thing deploys as the single file
-//! cargo already produces.
+//! name in `init` and one `symlink(2)`, and the whole thing deploys as the single
+//! file cargo already produces.
 //!
 //! So a delegated `foo` plus a command of `sh -c 'foo | tr a-z A-Z'` prints `BAR`: `foo`
 //! is not a file anyone built, it is a symlink to this binary, and what it printed came

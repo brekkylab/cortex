@@ -7,8 +7,8 @@
 //! it.
 //!
 //! What a particular method carries is [`Call`]'s and [`Notification`]'s, and how
-//! something *ended* is [`Outcome`]'s: a response carries one, and so does a
-//! `resume`, which is why it is not in here.
+//! something *ended* is [`Outcome`]'s — a shape of its own because a `result` is typed
+//! by the method its `id` was issued for, which this half does not know.
 
 use std::fmt;
 
@@ -17,7 +17,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use super::{Call, Error, Notification, Outcome};
+use crate::console::{Call, Error, Method, Notification, Outcome};
 
 /// The only `jsonrpc` member this protocol accepts.
 pub const VERSION: &str = "2.0";
@@ -33,10 +33,10 @@ pub const VERSION: &str = "2.0";
 /// mistaken for the answer that was due.
 ///
 /// It is also what threads a [`Progress::Delegated`](super::Progress::Delegated)
-/// exchange together. An execution that pauses for a delegated call is answered
-/// once per round trip — the `exec`, then each `resume` — and each of those
-/// responses carries the id of the request it is the answer to, so a client waiting
-/// on one is never handed the answer to another.
+/// exchange together. An execution that pauses for a delegated call is answered once per
+/// round trip, and each round trip is an `exec` of its own — so each response carries the
+/// id of the request it is the answer to, and the one the client is carrying on from is
+/// named again in [`PrevExecResult::id`](super::PrevExecResult::id).
 ///
 /// JSON-RPC also allows a string or null id. This protocol issues numbers, which
 /// is what an off-the-shelf peer will happily accept; nothing reads any other
@@ -71,53 +71,6 @@ pub enum Message {
 
     /// `{"jsonrpc":"2.0","id":N,"result":..}` or `{..,"error":..}`
     Response { id: RequestId, outcome: Outcome },
-}
-
-/// Which method a request called, and its response answers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Method {
-    Start,
-    Exec,
-    Resume,
-    Read,
-    Write,
-    Stop,
-    Quit,
-}
-
-impl Method {
-    /// The name as it appears in a `method` member.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Method::Start => "start",
-            Method::Exec => "exec",
-            Method::Resume => "resume",
-            Method::Read => "read",
-            Method::Write => "write",
-            Method::Stop => "stop",
-            Method::Quit => "quit",
-        }
-    }
-
-    fn parse(name: &str) -> Option<Method> {
-        Some(match name {
-            "start" => Method::Start,
-            "exec" => Method::Exec,
-            "resume" => Method::Resume,
-            "read" => Method::Read,
-            "write" => Method::Write,
-            "stop" => Method::Stop,
-            "quit" => Method::Quit,
-            _ => return None,
-        })
-    }
-}
-
-impl fmt::Display for Method {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
 }
 
 impl Message {
@@ -277,7 +230,9 @@ impl<'de> Visitor<'de> for MessageVisitor {
 mod tests {
     use bson::{Document, doc};
 
-    use super::super::{Exec, ExecResult, Progress, Read, ReadResult, Start, Write, WriteResult};
+    use super::super::{
+        Exec, ExecResult, Init, PrevExecResult, Progress, Read, ReadResult, Write, WriteResult,
+    };
     use super::*;
 
     /// What a peer would have sent, and what it reads back as.
@@ -299,29 +254,61 @@ mod tests {
             // can be empty — both are ordinary argv.
             cmd: vec!["sh".into(), "-c".into(), "echo a\necho b".into(), "".into()],
             timeout_ms: Some(1_000),
+            ..Exec::default()
         }
     }
 
-    /// A whole session on one channel, in order: boot, run something that delegates
-    /// twice on the way, release, exit.
+    /// How a delegated call went, as the `exec` that carries it back.
     ///
-    /// The execution in the middle is the shape worth reading: the `exec` is answered
-    /// with a `Delegated` rather than a result, each `resume` is answered with the
-    /// next one, and the last of them carries the execution's own ending. Every
-    /// request is the client's and every response the server's throughout.
+    /// No `cmd`, because this asks for nothing to be run: the execution it is carrying
+    /// on is already running on the far end, and all this adds is the answer it was
+    /// waiting for.
+    fn carry_on(answering: RequestId, outcome: Outcome) -> Exec {
+        Exec {
+            prev: Some(PrevExecResult {
+                id: answering,
+                outcome,
+            }),
+            ..Exec::default()
+        }
+    }
+
+    /// A delegated call that ran and produced something.
+    fn produced(stdout: &[u8]) -> Outcome {
+        Outcome::Result(
+            bson::serialize_to_bson(&ExecResult {
+                code: 0,
+                stdout: stdout.to_vec(),
+                ..ExecResult::default()
+            })
+            .unwrap(),
+        )
+    }
+
+    /// A whole session on one channel, in order: announce it, boot it, run something
+    /// that delegates twice on the way, release it, exit.
+    ///
+    /// The execution in the middle is the shape worth reading: the first `exec` is
+    /// answered with a `Delegated` rather than a result, each `exec` carrying a
+    /// [`prev`](Exec::prev) is answered with the next one, and the last of them carries
+    /// the execution's own ending. Every request is the client's and every response the
+    /// server's throughout, and the three notifications go unanswered because nothing
+    /// answers one.
     fn session() -> Vec<Message> {
         vec![
             Message::Request {
                 id: 0,
-                call: Call::Start(Start {
+                call: Call::Init(Init {
                     delegated: vec!["bar".into(), "foo".into()],
-                    default_timeout_ms: Some(30_000),
                 }),
             },
             Message::Response {
                 id: 0,
                 outcome: Outcome::Result(Bson::Null),
             },
+            // Optional, and nothing answers it: booting early rather than inside the
+            // execution below.
+            Message::Notification(Notification::Start),
             Message::Request {
                 id: 1,
                 call: Call::Exec(exec()),
@@ -338,17 +325,11 @@ mod tests {
                     .unwrap(),
                 ),
             },
-            // A delegated call that produced something.
+            // What `foo` produced, carried back as an `exec` of its own — naming the
+            // request whose response asked for it, and asking for nothing new to be run.
             Message::Request {
                 id: 2,
-                call: Call::Resume(Outcome::Result(
-                    bson::serialize_to_bson(&ExecResult {
-                        code: 0,
-                        stdout: b"foo said this\n".to_vec(),
-                        ..ExecResult::default()
-                    })
-                    .unwrap(),
-                )),
+                call: Call::Exec(carry_on(1, produced(b"foo said this\n"))),
             },
             Message::Response {
                 id: 2,
@@ -360,14 +341,17 @@ mod tests {
                     .unwrap(),
                 ),
             },
-            // And one that did not, which is why a `resume` carries an outcome and not
-            // a result.
+            // And one that produced nothing at all, which is why `prev` carries an
+            // outcome and not a result.
             Message::Request {
                 id: 3,
-                call: Call::Resume(Outcome::Error(Error::new(
-                    Error::NOT_EXECUTABLE,
-                    "bar: no such executable on the client",
-                ))),
+                call: Call::Exec(carry_on(
+                    2,
+                    Outcome::Error(Error::new(
+                        Error::NOT_EXECUTABLE,
+                        "bar: no such executable on the client",
+                    )),
+                )),
             },
             Message::Response {
                 id: 3,
@@ -381,14 +365,7 @@ mod tests {
                     .unwrap(),
                 ),
             },
-            Message::Request {
-                id: 4,
-                call: Call::Stop,
-            },
-            Message::Response {
-                id: 4,
-                outcome: Outcome::Result(Bson::Null),
-            },
+            Message::Notification(Notification::Stop),
             Message::Notification(Notification::Quit),
         ]
     }
@@ -401,19 +378,21 @@ mod tests {
                 // Delegating nothing, and waiting forever, is a client too.
                 Message::Request {
                     id: 6,
-                    call: Call::Start(Start::default()),
+                    call: Call::Init(Init::default()),
                 },
                 Message::Response {
                     id: 6,
+                    outcome: Outcome::Result(Bson::Null),
+                },
+                // Booting is nothing's own request, so a backend that cannot come up
+                // says so to whatever asked for the thing that needed one.
+                Message::Response {
+                    id: 1,
                     outcome: Outcome::Error(Error::new(Error::BOOT_FAILED, "no kvm")),
                 },
                 Message::Response {
                     id: 1,
                     outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
-                },
-                Message::Response {
-                    id: 4,
-                    outcome: Outcome::Error(Error::new(Error::STOP_FAILED, "guest is wedged")),
                 },
                 // The file plane. A read bounded on both ends, whose answer is shorter
                 // than the file it came from.
@@ -522,30 +501,44 @@ mod tests {
             },
         );
 
-        // And a `resume` carries the two members a response spells an outcome with, as
-        // its `params`.
+        // And carrying on from a delegated call is an `exec` like any other, whose `cmd`
+        // is empty because it is asking for nothing new to be run — the whole of what it
+        // says is in `prev`, where the outcome spells the same two members a response
+        // does.
         assert_eq!(
             wire(&Message::Request {
                 id: 3,
-                call: Call::Resume(Outcome::Error(Error::new(Error::TIMED_OUT, "too slow"))),
+                call: Call::Exec(carry_on(2, Outcome::Result(doc! {"code": 0i64}.into()))),
             }),
             doc! {
                 "jsonrpc": "2.0",
                 "id": 3i64,
-                "method": "resume",
-                "params": {"error": {"code": -32000i64, "message": "too slow"}},
+                "method": "exec",
+                "params": {
+                    "cmd": [],
+                    "prev": {"id": 2i64, "outcome": {"result": {"code": 0i64}}},
+                },
             },
         );
         assert_eq!(
             wire(&Message::Request {
                 id: 3,
-                call: Call::Resume(Outcome::Result(doc! {"code": 0i64}.into())),
+                call: Call::Exec(carry_on(
+                    2,
+                    Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")),
+                )),
             }),
             doc! {
                 "jsonrpc": "2.0",
                 "id": 3i64,
-                "method": "resume",
-                "params": {"result": {"code": 0i64}},
+                "method": "exec",
+                "params": {
+                    "cmd": [],
+                    "prev": {
+                        "id": 2i64,
+                        "outcome": {"error": {"code": -32000i64, "message": "too slow"}},
+                    },
+                },
             },
         );
 
@@ -590,19 +583,36 @@ mod tests {
             },
         );
 
-        // A notification has no id, and a method with no parameters has no
-        // `params`: the spec allows omitting it, and `null` is not one of the two
-        // types it permits.
+        // A notification has no id, and none of them takes parameters — so no `params`
+        // either, which the spec allows leaving out and where `null` is not one of the
+        // two types it permits.
+        assert_eq!(
+            wire(&Message::Notification(Notification::Start)),
+            doc! {"jsonrpc": "2.0", "method": "start"},
+        );
+        assert_eq!(
+            wire(&Message::Notification(Notification::Stop)),
+            doc! {"jsonrpc": "2.0", "method": "stop"},
+        );
         assert_eq!(
             wire(&Message::Notification(Notification::Quit)),
             doc! {"jsonrpc": "2.0", "method": "quit"},
         );
+
+        // And the session's one call, which is a request like any other.
         assert_eq!(
             wire(&Message::Request {
-                id: 4,
-                call: Call::Stop,
+                id: 0,
+                call: Call::Init(Init {
+                    delegated: vec!["fetch".into()],
+                }),
             }),
-            doc! {"jsonrpc": "2.0", "id": 4i64, "method": "stop"},
+            doc! {
+                "jsonrpc": "2.0",
+                "id": 0i64,
+                "method": "init",
+                "params": {"delegated": ["fetch"]},
+            },
         );
     }
 
@@ -672,9 +682,9 @@ mod tests {
             assert!(error.contains(because), "{doc:?} → {error}");
         };
 
-        refused(doc! {"id": 1i64, "method": "stop"}, "jsonrpc");
+        refused(doc! {"id": 1i64, "method": "exec"}, "jsonrpc");
         refused(
-            doc! {"jsonrpc": "1.0", "id": 1i64, "method": "stop"},
+            doc! {"jsonrpc": "1.0", "id": 1i64, "method": "exec"},
             "not \"2.0\"",
         );
         refused(
@@ -682,12 +692,15 @@ mod tests {
             "unknown method",
         );
         // A request without an id has no way to be answered.
-        refused(doc! {"jsonrpc": "2.0", "method": "stop"}, "needs an id");
-        // A notification cannot be answered, so it cannot ask to be.
-        refused(
-            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "quit"},
-            "cannot carry an id",
-        );
+        refused(doc! {"jsonrpc": "2.0", "method": "exec"}, "needs an id");
+        // And a notification cannot be answered, so it cannot ask to be — which is the
+        // whole of what the `id` decides, for every one of the three.
+        for name in ["start", "stop", "quit"] {
+            refused(
+                doc! {"jsonrpc": "2.0", "id": 1i64, "method": name},
+                "cannot carry an id",
+            );
+        }
         // `result` xor `error`, and one of them.
         refused(
             doc! {
@@ -703,7 +716,7 @@ mod tests {
             "no method, result or error",
         );
         refused(
-            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "stop", "result": Bson::Null},
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "result": Bson::Null},
             "neither a request nor a response",
         );
         // Params that are not what the method takes.
@@ -711,18 +724,40 @@ mod tests {
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "params": {"cmd": "ls"}},
             "exec params",
         );
-        // A `resume` carries an outcome, so the same two rules apply to its `params` as
-        // to a response's members.
+        // Carrying on from a delegated call is a member of `exec` and not a method of
+        // its own, so the name a peer written against the old protocol would send is
+        // not one this speaks.
         refused(
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "resume", "params": {}},
+            "unknown method",
+        );
+        // And the outcome inside a `prev` is an outcome, so the same xor applies to it
+        // as to a response's own two members — nested one level down, which is the only
+        // difference.
+        refused(
+            doc! {
+                "jsonrpc": "2.0",
+                "id": 1i64,
+                "method": "exec",
+                "params": {"cmd": [], "prev": {"id": 0i64, "outcome": {}}},
+            },
             "no result and no error",
         );
         refused(
             doc! {
                 "jsonrpc": "2.0",
                 "id": 1i64,
-                "method": "resume",
-                "params": {"result": Bson::Null, "error": {"code": 1i64, "message": "x"}},
+                "method": "exec",
+                "params": {
+                    "cmd": [],
+                    "prev": {
+                        "id": 0i64,
+                        "outcome": {
+                            "result": Bson::Null,
+                            "error": {"code": 1i64, "message": "x"},
+                        },
+                    },
+                },
             },
             "both a result and an error",
         );
@@ -734,15 +769,11 @@ mod tests {
         assert_eq!(
             read(doc! {
                 "jsonrpc": "2.0",
-                "id": 4i64,
                 "method": "stop",
                 "trace_id": "abc",
             })
             .unwrap(),
-            Message::Request {
-                id: 4,
-                call: Call::Stop
-            },
+            Message::Notification(Notification::Stop),
         );
     }
 

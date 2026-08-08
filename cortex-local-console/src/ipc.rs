@@ -11,7 +11,7 @@
 //! answer. But the shim does not reach it directly. It reaches *us*, and we hand the call
 //! to the client as a [`Delegated`](cortex::console::Progress::Delegated) — a response on
 //! the console channel, on the request the client is already waiting on — then hand back
-//! whatever the client resumes with.
+//! whatever the client carries on with.
 //!
 //! Which is what keeps every channel one-directional. The alternative was for the client
 //! to bind this socket and be dialled directly, and it worked; what it cost was a client

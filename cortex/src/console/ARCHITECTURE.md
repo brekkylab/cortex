@@ -111,7 +111,9 @@ There is a single request outstanding at a time.
 So what an `id` earns is not concurrency but **certainty about what an answer answers** — a response carrying an id nobody issued is a peer that has lost its place, and it can be dropped instead of being mistaken for the answer that was due.
 
 It is also what threads a delegation together.
-One execution is answered once per round trip — the `exec`, then each `resume` — and each response carries the id of the request it answers, so the client is never handed the answer to a different step than the one it is waiting on.
+One execution is answered once per round trip, and every round trip is an `exec` of its own — the one a caller asked for, then one per delegated call — so each response carries the id of the request it answers, and the client is never handed the answer to a different step than the one it is waiting on.
+
+The same number goes back the other way. An `exec` that carries on from a delegated call names the request it is carrying on from, in `prev.id`, which is how a server holding a paused execution can tell an answer to *that* one from a client that has lost its place.
 
 **Pair by `id`, not by position.**
 
@@ -125,7 +127,7 @@ Nothing here departs from that on the wire — but it means a response's `result
 - `jsonrpc` missing, or not exactly `"2.0"`
 - an unknown `method`
 - `params` that are not what the method takes
-- a request with no `id`; a `quit` **with** one
+- a request with no `id`; a notification — `start`, `stop`, `quit` — **with** one
 - `result` and `error` together, or neither
 - `method` together with `result` or `error`
 
@@ -138,12 +140,12 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `start` | `{delegated, default_timeout_ms?}` | `null` |
-| `exec` | `{cmd, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
-| `resume` | `{result: ...}` or `{error: {...}}` | `{done: {...}}` or `{delegated: {...}}` |
+| `init` | `{delegated}` | `null` |
+| `exec` | `{cmd, prev?, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
-| `stop` | — | `null` |
+| `start` | — | *(notification)* |
+| `stop` | — | *(notification)* |
 | `quit` | — | *(notification)* |
 
 **Every method is the client's.**
@@ -152,10 +154,31 @@ There is no method a server issues, which is what [Delegation](#delegation-and-e
 
 `params` is omitted entirely for a method that takes none: the spec allows leaving it out, and `null` is not one of the two types it permits.
 
-### `start` — boot, and make these names runnable
+### Booting is not a method
+
+**Anything that needs a booted session boots one.**
+An `exec`, a `read` and a `write` are each served by a server that brings the session up first if it is not up already — so `start` and `stop` are entirely optional, and a client that sends neither runs the same commands to the same results.
+
+That leaves the pair as **this protocol's resource management, and nothing else**.
+Neither unlocks anything; both are about what the far end is *holding*, and when it paid to hold it.
+
+| | what it is for |
+|---|---|
+| `stop` | **give occupancy back.** A booted session is a guest's memory, a socket and a scratch directory on the far end, useful only while something is running. A client that knows it is going idle hands them back. |
+| `start` | **hide the cold start.** A backend with a kernel to bring up otherwise makes the first command pay for that inside its own latency. A client that sends this as soon as it has a console pays for it in parallel with whatever it does next — choosing what to run, waiting on a model, reading a file — and the command that follows finds the session already up. |
+
+The two are the same trade in opposite directions, and the cost of a `stop` is the `start` that will have to happen again — so it is worth sending when the idle stretch is long and not when it is two commands apart.
+
+That is also what makes them notifications: neither is a question.
+A session that failed to boot and one that has not booted yet behave identically, since the next call that needs one tries again, so there is no answer a client would act on.
+A boot that fails is reported to whoever asked for the call that needed it, as `BOOT_FAILED`.
+
+`init` is the exception, and it is a call, because it is not about resources at all.
+
+### `init` — this is the session
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"start","params":{"delegated":["fetch","ask"],"default_timeout_ms":30000}}
+{"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":["fetch","ask"]}}
 {"jsonrpc":"2.0","id":0,"result":null}
 ```
 
@@ -170,16 +193,28 @@ Empty is not an error.
 A client with nothing to delegate is still a client:
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"start","params":{"delegated":[]}}
+{"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":[]}}
 ```
 
-`default_timeout_ms` is the fallback for executions that set none — including the delegated calls the client did not write.
-Omitted means no default, and then an execution without its own timeout runs until it finishes, or forever.
+The names outlive any one execution, which is why they are here and not on an `exec`: they have to be in place before a command that invokes one runs, so they are said once instead of on every command.
 
-The response is the **readiness signal**.
-Booting is not free — a micro-VM backend has a kernel to start — and a client should be able to pay for it before it knows what to run.
-The old wire got this for nothing, because the server's blocking read of fd 0 *was* readiness; nothing blocks here, so it is said out loud.
-A backend that cannot come up answers `BOOT_FAILED`, which the old wire had no way to report at all: a server that failed to set itself up could only die.
+**Nothing is booted by it**, and the response is not a readiness signal — it is the one thing about a session a client can hear before it asks for work: that there is a server on the far end, that it read the frame, that it speaks this protocol, and that it has taken what it was told.
+A notification could say none of that, which is the whole reason this one method is answered.
+
+Which is also why the asking side sends it when a console is *constructed* rather than leaving it to a caller to remember: a `Console` that exists is one that got this answer back. See [Session](#session).
+
+A second `init` replaces the first and takes whatever was booted under it with it.
+The delegated names are built into what booting produced, so a session that changes them has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived.
+
+### `start` — boot now, to hide the cold start
+
+```json
+{"jsonrpc":"2.0","method":"start"}
+```
+
+No `id`, no response, and nothing that has to send it.
+It unlocks nothing and buys only who waits for the boot — see [Booting is not a method](#booting-is-not-a-method).
+Sent to a session that is already booted, it does nothing.
 
 ### `exec` — run this
 
@@ -196,8 +231,9 @@ Minimal form — no timeout of its own:
 
 | field | |
 |---|---|
-| `cmd` | already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`. |
-| `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. Falls back to `default_timeout_ms`. |
+| `cmd` | already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`, unless `prev` is there. |
+| `prev` | omitted for a command a caller asked for. Present, this is not a command at all but the answer to a delegated call — see below. |
+| `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. |
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
 | `stdout`/`stderr` | `Binary`, byte-exact, kept apart. |
 | `truncated` | the command wrote more than the executor would hold, and this is the beginning of it. |
@@ -206,23 +242,37 @@ The `result` is not the execution's output but **how far it got**: `done` is the
 A client with nothing delegated never sees the second.
 See [Delegation](#delegation-and-execution-both-ways).
 
-### `resume` — the delegated call ended like this
+### `exec` with `prev` — the delegated call ended like this
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"resume","params":{"result":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}
+{"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":[],"prev":{"id":2,"outcome":{"result":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}}}
 {"jsonrpc":"2.0","id":3,"result":{"done":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}
 ```
 
 Only ever a reply to a `delegated`, and its `result` is the next step of the *same* execution — another `delegated`, or the end of it.
 
-`params` is the two members a response spells an outcome with, because a delegated call can fail to produce one at all:
+`cmd` is empty because this asks for nothing new to be run: the execution it belongs to is already running on the far end, and all this adds is the answer it was waiting for.
+
+| field | |
+|---|---|
+| `prev.id` | the request whose *response* carried the `delegated`. There is never more than one execution paused, so a server could have worked it out — what this earns is the same thing an `id` earns anywhere here: an answer naming a request nobody is waiting on is a peer that has lost its place, and can be refused rather than mistaken for the one that was due. |
+| `prev.outcome` | the two members a response spells an outcome with, `result` xor `error`. |
+
+An **outcome** and not a result, because a delegated call can fail to produce one at all:
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"resume","params":{"error":{"code":-32001,"message":"fetch: not a delegated executable"}}}
+{"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":[],"prev":{"id":2,"outcome":{"error":{"code":-32001,"message":"fetch: not a delegated executable"}}}}}
 ```
 
+An exit code could not have said that. 127 for a program that was not there and 126 for one that would not start are codes any command reaches by an ordinary `exit()`, so a result carrying one never proves the call failed rather than ran and failed — the same reason [an error is not an exit code](#why-an-error-is-not-an-exit-code) anywhere else here.
+
 The server hands whichever arrives straight to the shim that is waiting, and does not read it.
-A `resume` when nothing is paused is `INVALID_REQUEST`.
+An `exec` carrying a `prev` when nothing is paused is `INVALID_REQUEST`.
+
+> **Why this is a member and not a method of its own.**
+> A method for it would be the same request under a second name: an execution the server is holding, and the output it was waiting for.
+> What the client has to say is *this is where the last one got to*, which is a member — and one method fewer is one fewer place for the two ends to disagree about which of them a response is answering.
+> It also keeps the chain one shape: every step of an execution is an `exec`, whoever asked for it.
 
 `stdout` and `stderr` stay apart because merging is something a requester can do and un-merging is not.
 The interleaving between them is not preserved: two buffers are not one stream, and a caller that needs the order asks the command for it (`2>&1`).
@@ -237,7 +287,7 @@ Getting this is the second half of [why the codec is BSON](#codec): JSON had no 
 The `bytes` helper no longer asks the codec whether it is human-readable, and that is deliberate rather than a simplification.
 `params` and `result` pass through a `Bson` value before reaching the wire — they must, since a `result` is typed by a method only the caller knows — and `bson`'s value-level serializer reports itself human-readable.
 Asking would therefore re-encode base64 at exactly the point the byte type was the point, and nothing on the wire would show it had happened.
-`message/call.rs` holds the reasoning; a test asserts on the frame's bytes rather than on a round trip, because a round trip passes either way.
+`message/method/mod.rs` holds the reasoning; a test asserts on the frame's bytes rather than on a round trip, because a round trip passes either way.
 
 ### `read` — hand back part of a file
 
@@ -279,18 +329,19 @@ Omitted and `0` are therefore different, and a requester that means to replace a
 A `write` that fails with `IO_FAILED` says nothing about how much of `data` landed.
 The file is whatever it is, and a requester that needs to know asks with a `read`.
 
-### `stop` — release what `start` booted
+### `stop` — release what booting took, to stop occupying it
 
 ```json
-{"jsonrpc":"2.0","id":4,"method":"stop"}
-{"jsonrpc":"2.0","id":4,"result":null}
+{"jsonrpc":"2.0","method":"stop"}
 ```
 
 Much what stopping a VM is: the guest goes away, the socket and the symlinks go with it, and a scratch directory is cleaned up by whoever made it rather than left for someone to find later.
-Backends differ in what that costs, which is why the client asks rather than assuming.
+Those are memory, descriptors and disk held on the far end for as long as the session is booted, and worth holding only while something is running — which is the whole reason a client is given a way to say it is going idle.
 
-Afterwards the session is back where it was before `start`, so **another `start` is allowed** — a server process can outlive the resources it booted, which is worth something when booting is the expensive part.
-`Console::stop` is therefore not the end of anything; dropping the `Console` is what sends `quit`.
+Afterwards the session is where it was before it booted, and **the next call that needs a boot gets one** — under the same `init`, with nothing having to ask.
+So a server process outlives the resources it booted, which is what makes handing them back cheap: it costs one cold start later and nothing else.
+
+`Console::stop` is therefore not the end of anything and not owed; dropping the `Console` is what sends `quit`, and a server on its way out releases what a `stop` would have released.
 What `quit` costs to carry out is the transport's — over stdio it also closes the server's stdin and waits for the process, because that client is what started it.
 
 `stop` does **not** wait for an `exec` that is still running.
@@ -302,7 +353,7 @@ A client that wants its commands finished first waits for their responses — wh
 {"jsonrpc":"2.0","method":"quit"}
 ```
 
-The one notification, so no `id` and no response: there is nothing a process can say after this that a closed channel does not say better.
+No `id` and no response: there is nothing a process can say after this that a closed channel does not say better.
 Sending it at all is what lets the other end tell a finished session from a peer that died.
 
 An `exec` still running is still answered — a request the server accepted is one it owes a response for, and `quit` arriving first is the client's ordering rather than permission to drop it.
@@ -324,8 +375,10 @@ So the server has to ask the client for it.
 
 A `delegated` is a complete, ordinary JSON-RPC response to the `exec` the client is already waiting on.
 It means *this execution is not over, and here is what I need from you*.
-The client runs the name, says so with `resume`, and gets the next step back.
+The client runs the name and says so with another `exec`, carrying the answer as its `prev`, and gets the next step back.
 The chain ends at `done`.
+
+So the whole chain is `exec`s, told apart by what they carry: the caller's has a command and no `prev`, and every one after it is the other way round.
 
 So the server never issues a request and the client never answers one.
 There is one channel, one end that asks, one end that answers — no pending table anywhere, no reader that must not block, and no channel per delegated call.
@@ -366,11 +419,11 @@ sequenceDiagram
         participant shim as fetch
     end
 
-    client->>server: id:0 start {delegated:["fetch"]}
-    Note over client,server: server symlinks `fetch` into a bin/ dir
+    client->>server: id:0 init {delegated:["fetch"]}
     server-->>client: id:0 result null
 
     client->>server: id:1 exec {cmd:["sh","-c","fetch x"]}
+    Note over server: nothing is booted yet, so this boots it:<br/>`fetch` is symlinked into a bin/ dir
     server->>sh: spawn
     activate sh
     sh->>shim: runs `fetch x`
@@ -379,7 +432,7 @@ sequenceDiagram
     Note over sh,shim: both blocked until this is answered
     server-->>client: id:1 result {delegated:{cmd:["fetch","x"]}}
     Note over client,server: client runs ExecutableSet::invoke("fetch", ["x"])
-    client->>server: id:2 resume {result:{code:0, stdout:"…"}}
+    client->>server: id:2 exec {cmd:[], prev:{id:1, outcome:{result:{code:0, stdout:"…"}}}}
     server-->>shim: {code:0, stdout:"…"}
     shim-->>sh: onto its own stdout, exits 0
     deactivate shim
@@ -387,12 +440,11 @@ sequenceDiagram
     deactivate sh
     server-->>client: id:2 result {done:{code:0, stdout:"…"}}
 
-    client->>server: id:3 stop
-    server-->>client: id:3 result null
+    client->>server: stop — no id, so nothing answers
     client->>server: quit — no id, so nothing answers
 ```
 
-Note that `id:1` is answered **once**, with `delegated`, and the execution's own ending goes to `id:2` — the `resume` that was outstanding by then.
+Note that `id:1` is answered **once**, with `delegated`, and the execution's own ending goes to `id:2` — the `exec` that was outstanding by then, and the one whose `prev` named `id:1`.
 Every request still gets exactly one response.
 
 The shim's dial is the only arrow that is not this protocol: it is server-local, and the server is what turns it into the `delegated` above it.
@@ -425,8 +477,8 @@ Every method that waits is a future, so a caller can drive many consoles from on
 Concurrency is *across* sessions, never within one.
 
 **Shutting down is one-sided.**
-Ending the session ends the console channel.
-`Console::close` is the ending that reports how it went; dropping a console spawns the same pair of calls and cannot wait for them, which is the whole difference between the two.
+Ending the session ends the console channel, and it is a lifetime rather than a decision: dropping a `Console` says `quit`, which is owed exactly once and at exactly one moment.
+Nobody hears what it answered, because nothing answers it and there is no caller left to tell.
 The server's shim socket is bound for the life of the process, not of a session, so that the path in every execution's environment stays the one a shim can dial.
 
 ---
@@ -444,16 +496,17 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 |---|---|---|
 | `-32000` | `exec` | **timed out** — killed at `timeout_ms`. There is no result: a killed command has no exit code, and whatever it wrote is gone with it. |
 | `-32001` | `exec` | **not executable** — the program was not there, or would not start. |
-| `-32002` | `start` | **boot failed** — the backend could not be brought up. |
-| `-32003` | `stop` | **stop failed** — the resources may still be held. |
-| `-32004` | `exec`, `stop` | **not started** — no `start` has been answered, or a `stop` has undone it. |
+| `-32002` | `exec`, `read`, `write` | **boot failed** — the backend could not be brought up. Booting is nobody's own request, so this reaches whoever asked for the call that needed one. |
 | `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
 | `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
-| `-32600` | any | invalid request — including a `resume` when nothing is paused on a delegated call. |
+| `-32600` | any | invalid request — including an `exec` carrying a `prev` when nothing is paused on a delegated call. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty `cmd`. A delegated name that is not a plain path component *should* be this and is not checked; see [`start`](#start--boot-and-make-these-names-runnable). |
+| `-32602` | any | invalid params — an empty `cmd` with no `prev`. A delegated name that is not a plain path component *should* be this and is not checked; see [`init`](#init--this-is-the-session). |
 | `-32603` | any | internal error |
+
+`-32003` and `-32004` are unassigned and stay that way.
+A code is a wire contract, so a gap is left as a gap rather than filled by the next thing that needs a number: a peer holding an older table should find nothing there rather than something else.
 
 `-32000`…`-32099` is the range the spec reserves for implementation-defined server errors.
 `-32700` (parse error) belongs to whoever reads the frame, not to a method.
@@ -476,29 +529,35 @@ An `error` cannot be mistaken for a command's own status, because it does not ca
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Up: start → result
-    Idle --> Idle: start → BOOT_FAILED
-    Up --> Paused: exec / resume → delegated
-    Paused --> Paused: resume → delegated
-    Paused --> Up: resume → done / error
-    Up --> Up: exec → done / error
-    Up --> Idle: stop → result
+    Idle --> Up: start
+    Idle --> Up: exec / read / write — boots first
+    Idle --> Idle: boot failed → BOOT_FAILED
+    Up --> Paused: exec → delegated
+    Paused --> Paused: exec+prev → delegated
+    Paused --> Up: exec+prev → done / error
+    Up --> Up: exec / read / write → result
+    Up --> Idle: stop
     Idle --> [*]: quit
     Up --> [*]: quit
 ```
 
-From `Idle`, an `exec` or a `stop` is `NOT_STARTED`.
-From `Up`, a second `start` is `INVALID_REQUEST`, and so is a `resume` — nothing is paused.
-A failed `start` leaves `Idle`, so nothing thinks it is up.
+**Nothing is refused for being in `Idle`**, which is what makes `start` and `stop` optional: every edge out of it that needs a booted session boots one on the way.
+`Idle` is therefore not a session that cannot work — it is a session that is not occupying anything, and the two edges a client controls by hand are there to keep it in that state while it is idle and out of it before it is busy.
+A boot that fails leaves `Idle`, so nothing thinks it is up, and the call that needed one hears `BOOT_FAILED`.
 
-`Paused` is an execution that has been answered with `delegated` and not yet resumed.
-It is the client's turn and **only** a `resume` belongs there: the execution owes an answer that has not been sent, so a client asking about anything else is asking about a request it has not been answered on.
-There is at most one `Paused` execution, which is why a `resume` needs nothing to say *which* delegated call it answers.
+`init` is not an edge at all. It is legal in either state, it boots nothing, and what it changes is the shape a future boot will take — which is why it drops back to `Idle` when it arrives in `Up`.
 
-> **Barely enforced today, and only ever the answering side's to enforce.**
+An `exec` carrying a `prev` outside `Paused` is `INVALID_REQUEST`: nothing is waiting on a delegated call.
+
+`Paused` is an execution that has been answered with `delegated` and not yet carried on.
+It is the client's turn and **only** an `exec` carrying a `prev` belongs there: the execution owes an answer that has not been sent, so a client asking about anything else is asking about a request it has not been answered on.
+There is at most one `Paused` execution, so `prev.id` is not what tells a server *which* one — it is what tells it the client is answering the one it is actually holding.
+
+> **Barely enforced today, and mostly the answering side's to enforce.**
 > An answering end moves frames and reads no meaning into them, and the shared server layer that held these rules is gone.
-> A backend refuses a `resume` that nothing is waiting on, because it is the only end that knows — but `NOT_STARTED` and a second `start` are not checked, and a delegated name is linked unchecked.
-> The asking side keeps no second copy of any of it: `Console` sends what it is asked to send, so an `exec` before `start` reaches the channel and gets whatever that server answers.
+> A backend refuses an `exec` with a `prev` that nothing is waiting on, and one whose `prev.id` names a request it is not holding, because it is the only end that knows — but a delegated name is linked unchecked.
+> The asking side keeps no second copy of any of it, with one exception: `init` is sent when a `Console` is constructed, so the one ordering rule that is guaranteed on this side is that it comes first.
+> Everything after that is what a caller asked for, in the order it asked.
 > Which is why the gaps above are visible rather than hidden behind one well-behaved client.
 >
 > Where they belong when they come back: not in each backend, because every backend's version would be the same and would be the same to get wrong.
@@ -518,6 +577,6 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | watch a command work | an agent cannot use a partial answer, so early output arrives to nobody. Streaming would cost a second shape for every ending and a second code path in every consumer — and JSON-RPC has no spelling for it: a request has one response. |
 | drive an interactive command | its prompt would arrive after the answer was due. An `exec` carries no input at all; what a command is to read goes where it will find it with a `write` beforehand. |
 | run something that never ends | `tail -f` has no result to send. `timeout_ms` is what ends it; without one, such an execution simply never answers. |
-| cancel one execution | `stop` releases the whole session, not a command. Let the timeout expire. |
+| cancel one execution | `stop` hands back the whole session's resources, not a command, and nothing answers it. Let the timeout expire. |
 | output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. A *file* larger than that is readable, because `read` is bounded on purpose and `size` says where to ask next. |
 | run two delegated calls at once | a response carries one `delegated`. Needs delegated calls to stop being independent before it is worth a shape that carries several — see [Consequences](#consequences). |

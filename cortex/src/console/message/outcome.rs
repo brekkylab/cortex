@@ -9,11 +9,15 @@
 //! and `error` are two of a *response's* members, and a response is one of
 //! [`Message`](super::Message)'s three shapes.
 //!
-//! [`Resume`](super::Call::Resume) is what changed that. A delegated call runs in the
-//! client and how it ended is the whole of what the `resume` reporting it has to say, so
-//! an outcome now travels inside a **request** too — which is why it has a serde impl of
-//! its own and a file of its own. It is no longer "what a response carries"; it is how
+//! [`PrevExecResult`](super::PrevExecResult) is what changed that. A delegated call runs in
+//! the client, and how it ended is the whole of what the `exec` carrying it back has to
+//! say — so an outcome travels inside a **request** too, which is why it has a serde impl
+//! of its own and a file of its own. It is no longer "what a response carries"; it is how
 //! anything in this protocol ended, whichever direction it is travelling.
+//!
+//! And it has to be an outcome there rather than an [`ExecResult`](super::ExecResult),
+//! because a delegated call can fail to produce one at all — see
+//! [`PrevExecResult::result`](super::PrevExecResult::result).
 //!
 //! One rule about it is shared with the envelope rather than written twice — see
 //! [`Outcome::from_members`].
@@ -71,18 +75,15 @@ impl Error {
     /// `exec`: the program was not there, or could not be started.
     pub const NOT_EXECUTABLE: i64 = -32001;
 
-    /// `start`: the backend could not be brought up.
+    /// `exec`, `read`, `write`: the backend could not be brought up.
     ///
-    /// Worth its own code because it is the failure the old wire could not report
-    /// at all: a server that could not set itself up had nothing to say and could
-    /// only die, leaving the client to guess from an exit status.
+    /// Booting is nobody's own request —
+    /// [`Start`](super::Notification::Start) only asks for it early, and anything that
+    /// needs a booted session boots one — so this is reported to whoever asked for the
+    /// call that needed it. Which is the point of it having a code: that requester is
+    /// waiting on something, and this says the failure was the session's rather than
+    /// the command's or the path's.
     pub const BOOT_FAILED: i64 = -32002;
-
-    /// `stop`: the resources could not be released, and may still be held.
-    pub const STOP_FAILED: i64 = -32003;
-
-    /// Any: `start` has not been answered yet, or has been undone by `stop`.
-    pub const NOT_STARTED: i64 = -32004;
 
     /// `read`, `write`: nothing is at the path — for a `write`, that means a
     /// directory above it, since the file itself is created if it is missing.
@@ -135,8 +136,8 @@ impl Outcome {
         }
     }
 
-    /// The `result`, as the type the method returns — `Progress` for `exec` and
-    /// `resume`, `()` for `start` and `stop`.
+    /// The `result`, as the type the method returns — `Progress` for `exec`, `()` for
+    /// `init`.
     ///
     /// The caller supplies `T` because the caller is the end that issued the `id`
     /// and so is the only one that knows the method. A `result` that will not
@@ -161,7 +162,8 @@ impl Outcome {
     /// The xor is the whole of what this enforces, and it is enforced in one place
     /// because there are two that read these members: [`Message`](super::Message)'s
     /// deserializer, which finds them among a response's own members, and
-    /// [`Outcome`]'s, which finds them in a `resume`'s `params`.
+    /// [`Outcome`]'s, which finds them nested in an `exec`'s
+    /// [`prev`](super::Exec::prev).
     ///
     /// Neither is `None` rather than an error because the two callers mean different
     /// things by it. A message with no `result` and no `error` has no `method` either,
@@ -260,7 +262,7 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(result.clone().take::<ExecResult>().unwrap().code, 3);
-        // `start` and `stop` return nothing, and nothing is what `null` is.
+        // `init` returns nothing, and nothing is what `null` is.
         Outcome::Result(Bson::Null).take::<()>().unwrap();
 
         // Asking for the wrong type is a peer that answered the wrong request as
@@ -276,8 +278,9 @@ mod tests {
         );
     }
 
-    /// An outcome on its own, which is how a `resume` carries one: the member that is
-    /// there and no other, and the xor enforced both ways.
+    /// An outcome on its own, which is how an `exec`'s [`prev`](super::super::Exec::prev)
+    /// carries one: the member that is there and no other, and the xor enforced both
+    /// ways.
     #[test]
     fn an_outcome_is_the_one_member_that_is_there() {
         let wire = |outcome: &Outcome| bson::serialize_to_document(outcome).unwrap();
@@ -293,7 +296,7 @@ mod tests {
 
         for outcome in [
             Outcome::Result(Bson::Null),
-            Outcome::Error(Error::new(Error::NOT_STARTED, "no start yet")),
+            Outcome::Error(Error::new(Error::BOOT_FAILED, "no kvm")),
         ] {
             assert_eq!(read(wire(&outcome)).unwrap(), outcome);
         }

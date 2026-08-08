@@ -25,12 +25,13 @@ impl Fixture {
         server.stderr(Stdio::inherit());
         let client = StdioClient::new(server).expect("starting the console server");
 
-        let mut console = Console::builder()
+        // Building announces the session; nothing here delegates anything, which is a
+        // session too.
+        let console = Console::builder()
             .client(client)
-            .default_timeout_ms(30_000)
             .build()
+            .await
             .expect("building the console");
-        console.start().await.expect("booting the server");
 
         Fixture {
             console,

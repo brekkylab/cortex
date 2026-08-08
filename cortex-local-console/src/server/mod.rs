@@ -14,6 +14,16 @@
 //! Host-local by nature: a micro-VM backend can use neither a symlink on our filesystem
 //! nor a socket on it.
 //!
+//! Building that directory is what booting is here, and [`Session`] is where it is kept.
+//! It is built when something needs it and not when a client asks, so every request that
+//! runs anything goes through [`Session::booted`] and none of them can find a session
+//! that has not got one.
+//!
+//! `start` and `stop` are the client managing that resource rather than asking for it:
+//! `start` builds the directory before a command has to wait for it, `stop` drops it so
+//! nothing sits in `$TMPDIR` while the console is idle. Neither is answered and neither
+//! changes what an `exec` can do.
+//!
 //! # Running the command, and pausing it
 //!
 //! [`Command`], captured — but spawned rather than run to completion, because a
@@ -33,10 +43,11 @@
 //! the command's ending while one sat unserved would strand it.
 //!
 //! A shim connecting means answering the console request with a
-//! [`Delegated`](Progress::Delegated) and waiting for the client's `resume` — which is
-//! why the console channel is threaded through [`execute`] rather than being answered
-//! once at the end. The client is still the only end that asks; this end just answers
-//! more than once per execution.
+//! [`Delegated`](Progress::Delegated) and waiting for the `exec` that carries the answer
+//! back — which is why the console channel is threaded through [`execute`] rather than
+//! being answered once at the end. The client is still the only end that asks; this end
+//! just answers more than once per execution, and each of those answers is to a request
+//! of its own.
 //!
 //! Delegated calls are therefore served in turn. See [`Progress`] for why that is
 //! latency rather than a deadlock.
@@ -48,7 +59,9 @@
 //! is an ordinary process of this one's.
 //!
 //! Both are answered on the spot, outside any execution: nothing is spawned, nothing can
-//! delegate, and one response ends it.
+//! delegate, and one response ends it. They boot the session first all the same, because
+//! that rule is the protocol's rather than this backend's — here it buys nothing, and on
+//! a backend whose files are inside a guest it is the only way to have a file at all.
 //!
 //! # One session at a time, on one task
 //!
@@ -63,9 +76,7 @@
 //!
 //! # What this does not do
 //!
-//! The session rules are not enforced anywhere yet. An `exec` before `start` runs (with
-//! no delegated names on `PATH`, since there are none), a second `start` re-boots, and a
-//! delegated name is linked **without being checked as a plain path component** — so a
+//! A delegated name is linked **without being checked as a plain path component** — so a
 //! name like `../../etc/foo` would put a symlink somewhere this process does not reach
 //! and cannot clean up. Every name that gets here came from the client, which is
 //! in-process with whoever chose them; that is the only thing standing in for the check
@@ -74,12 +85,12 @@
 //! A `read` or a `write` is not confined to anywhere either. The path is used as it
 //! arrives, so a client can name any file this process can reach.
 //!
-//! Neither timeout is enforced. An `exec` carries a `timeout_ms` and a `start` carries the
-//! `default_timeout_ms` to fall back on, and this server reads both and applies neither —
-//! so a command that never ends is a command this server waits on forever, and the client
-//! waits with it. What it takes is a bound around the `select!` in [`execute`] and an
-//! answer for what a delegated call already in flight becomes when it expires, which is
-//! the part that is a decision and not a line of code.
+//! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
+//! the `default_timeout_ms` to fall back on, and this server reads both and
+//! applies neither — so a command that never ends is a command this server waits on
+//! forever, and the client waits with it. What it takes is a bound around the `select!`
+//! in [`execute`] and an answer for what a delegated call already in flight becomes when
+//! it expires, which is the part that is a decision and not a line of code.
 
 mod bin_dir;
 
@@ -92,8 +103,8 @@ use std::process::{ExitStatus, Output, Stdio};
 use bson::Bson;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, Exec, ExecResult, MAX_PAYLOAD, Message, Outcome, Progress, Read, ReadResult,
-    RequestId, Server, Start, Write, WriteResult,
+    Call, Error, Exec, ExecResult, Init, MAX_PAYLOAD, Message, Notification, Outcome, Progress,
+    Read, ReadResult, RequestId, Server, Write, WriteResult,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
@@ -125,54 +136,73 @@ pub async fn run() -> anyhow::Result<()> {
     // [`Shims::bind`] for why its lifetime is the process's and not a session's.
     let shims = Shims::bind()?;
 
-    // Dropped on `stop`, and on the way out of this function whichever way it leaves —
-    // which takes the symlinks with it every time.
-    let mut linked: Option<BinDir> = None;
+    // Whatever it holds is dropped on `stop` and on the way out of this function
+    // whichever way it leaves, which takes the symlinks with it every time.
+    let mut session = Session::default();
 
     while let Some(message) = server.recv().await? {
         match message {
             // The session is over.
-            Message::Notification(_) => return Ok(()),
+            Message::Notification(Notification::Quit) => return Ok(()),
+
+            // Booting early rather than under whichever call would have paid for it.
+            // Nothing answers this, so a failure is only said here — the next call that
+            // needs a boot tries again and tells whoever asked for it.
+            Message::Notification(Notification::Start) => {
+                if let Err(e) = session.booted() {
+                    eprintln!("{}: linking delegated names: {e}", env!("CARGO_BIN_NAME"));
+                }
+            }
+
+            Message::Notification(Notification::Stop) => session.release(),
 
             Message::Request { id, call } => match call {
-                Call::Start(start) => {
-                    let outcome = boot(&mut linked, &start);
-                    server.respond(id, outcome).await?;
+                Call::Init(init) => {
+                    session.configure(init);
+                    server.respond(id, Outcome::Result(Bson::Null)).await?;
                 }
 
-                Call::Exec(exec) => {
-                    execute(&mut server, id, &exec, linked.as_ref(), &shims).await?
-                }
-
-                // Only an execution paused on a delegated call has anything to resume,
-                // and one of those is answered inside `execute` — so reaching here is a
-                // client resuming something that is not waiting.
-                Call::Resume(_) => {
+                // An `exec` carrying a `prev` is not a command but the answer to a
+                // delegated call, and one of those is read inside `execute` by the
+                // execution that is waiting for it. Reaching the main loop means nothing
+                // is: the client is carrying on from an execution this end is not
+                // holding.
+                Call::Exec(exec) if exec.prev.is_some() => {
                     server
                         .respond(
                             id,
                             refused(
                                 Error::INVALID_REQUEST,
                                 "nothing is waiting on a delegated call, so there is nothing \
-                                 to resume",
+                                 to carry on from",
                             ),
                         )
                         .await?
                 }
 
+                Call::Exec(exec) => match session.booted() {
+                    Ok(linked) => execute(&mut server, id, &exec, linked, &shims).await?,
+                    Err(e) => server.respond(id, boot_failed(e)).await?,
+                },
+
+                // The bytes a file call moves need nothing that booting produces on this
+                // host — the filesystem is there either way — but booting first is the
+                // protocol's rule and not this backend's, and a backend whose files live
+                // inside a guest could not answer one any other way.
                 Call::Read(read) => {
-                    let outcome = read_file(&read).await;
+                    let outcome = match session.booted() {
+                        Ok(_) => read_file(&read).await,
+                        Err(e) => boot_failed(e),
+                    };
                     server.respond(id, outcome).await?;
                 }
 
                 Call::Write(write) => {
-                    let outcome = write_file(&write).await;
+                    let outcome = match session.booted() {
+                        Ok(_) => write_file(&write).await,
+                        Err(e) => boot_failed(e),
+                    };
                     server.respond(id, outcome).await?;
-                }
-
-                Call::Stop => {
-                    linked = None;
-                    server.respond(id, Outcome::Result(Bson::Null)).await?;
                 }
             },
 
@@ -186,34 +216,71 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Put the delegated names somewhere `execvp` will find them, as symlinks back to this
-/// binary.
+/// What a session is on this host: what the client announced, and whatever booting it
+/// took.
 ///
-/// The directory is not put on `PATH` here. Every execution is given its own environment
-/// (see [`environment`]), which is what an inherited `PATH` and a `set_var` used to be
-/// for — and doing it per command rather than per process is what lets this program have
-/// more than one thread.
-fn boot(linked: &mut Option<BinDir>, start: &Start) -> Outcome {
-    let dir = match BinDir::create(start.delegated.iter().map(String::as_str)) {
-        Ok(dir) => dir,
-        Err(e) => return refused(Error::BOOT_FAILED, format!("linking delegated names: {e}")),
-    };
+/// The two are apart because they are wanted at different moments. What [`Init`] carries
+/// is the session's shape and costs nothing to hold; the directory of symlinks is a real
+/// thing on disk, and the point of `start` and `stop` being optional is that it may come
+/// and go underneath a session that does not change.
+#[derive(Default)]
+struct Session {
+    /// What `init` said, or the defaults for a client that never sent one — which is a
+    /// session with nothing delegated, and that is a session.
+    config: Init,
 
-    // Any previous one drops here, which takes its symlinks with it.
-    *linked = Some(dir);
-    Outcome::Result(bson::Bson::Null)
+    /// `None` until something boots it: a `start`, or the first call that needs one.
+    linked: Option<BinDir>,
+}
+
+impl Session {
+    /// Take a new shape, and let go of anything booted under the old one.
+    ///
+    /// The delegated names are built into the directory, so a boot from before this is a
+    /// boot that no longer matches the session. Dropping it is enough — the next call
+    /// that needs one builds it again, from what has just arrived.
+    fn configure(&mut self, config: Init) {
+        self.linked = None;
+        self.config = config;
+    }
+
+    fn release(&mut self) {
+        self.linked = None;
+    }
+
+    /// The delegated names somewhere `execvp` will find them, booting if nothing has.
+    ///
+    /// Booting here is a directory of symlinks back to this binary, one per name. The
+    /// directory is not put on `PATH`: every execution is given its own environment (see
+    /// [`environment`]), which is what an inherited `PATH` and a `set_var` would
+    /// otherwise be for — and doing it per command rather than per process is what lets
+    /// this program have more than one thread.
+    fn booted(&mut self) -> io::Result<&BinDir> {
+        if self.linked.is_none() {
+            self.linked = Some(BinDir::create(
+                self.config.delegated.iter().map(String::as_str),
+            )?);
+        }
+        Ok(self.linked.as_ref().expect("just booted"))
+    }
+}
+
+/// A boot that did not happen, as the answer to whatever needed one.
+fn boot_failed(e: io::Error) -> Outcome {
+    refused(Error::BOOT_FAILED, format!("linking delegated names: {e}"))
 }
 
 /// Run one command, answering the console channel as many times as it takes.
 ///
 /// Exactly one of those answers is the execution's own — a [`Done`](Progress::Done) or an
-/// error — and it goes to whichever request is owed one by then: the `exec` if nothing was
-/// delegated, or the last `resume` if something was.
+/// error — and it goes to whichever request is owed one by then: the `exec` a caller
+/// asked for if nothing was delegated, or the last `exec` that carried an answer back if
+/// something was.
 async fn execute(
     server: &mut StdioServer,
     id: RequestId,
     exec: &Exec,
-    linked: Option<&BinDir>,
+    linked: &BinDir,
     shims: &Shims,
 ) -> io::Result<()> {
     let Some((program, args)) = exec.split() else {
@@ -255,8 +322,9 @@ async fn execute(
     // answering a delegated call. See the module docs.
     let mut running = tokio::spawn(child.wait_with_output());
 
-    // Which request this execution owes its answer to. The `exec` to begin with, and each
-    // `resume` after that — a `Delegated` spends the one it is sent on.
+    // Which request this execution owes its answer to. The `exec` a caller asked for to
+    // begin with, and each `exec` carrying an answer back after that — a `Delegated`
+    // spends the one it is sent on.
     let mut owed = id;
 
     loop {
@@ -268,7 +336,7 @@ async fn execute(
             accepted = shims.accept() => match accepted {
                 Some(stream) => match delegate(server, owed, stream).await? {
                     Some(next) => owed = next,
-                    // The client stopped saying anything that could resume the execution,
+                    // The client stopped saying anything that could carry the execution on,
                     // so there is nobody left to answer. The command is left to the
                     // process's ending, which is moments away: the main loop reads the
                     // same channel.
@@ -289,9 +357,9 @@ async fn execute(
 /// Hand one delegated call to the client, and give the shim what comes back.
 ///
 /// Two messages on the console channel: the [`Delegated`](Progress::Delegated) that
-/// answers what this execution currently owes, and the `resume` that brings the result.
-/// What is returned is the id of the request now owed the execution's own answer, or
-/// `None` when the client said nothing that could be one.
+/// answers what this execution currently owes, and the `exec` that carries the answer
+/// back in its `prev`. What is returned is the id of the request now owed the execution's
+/// own answer, or `None` when the client said nothing that could be one.
 async fn delegate(
     server: &mut StdioServer,
     owed: RequestId,
@@ -323,52 +391,55 @@ async fn delegate(
         .respond(owed, result(Progress::Delegated(exec)))
         .await?;
 
-    // Only a `resume` can arrive now. This end owes an answer it has not sent, so there is
-    // nothing else the client could be asking about.
-    match server.recv().await? {
+    // Only the answer to what was just asked for can arrive now: an `exec` carrying a
+    // `prev` that names the request the `Delegated` above went out on. This end owes an
+    // answer it has not sent, so there is nothing else the client could be asking about —
+    // and a `prev` naming anything else is a client that has lost its place, which is the
+    // whole of what that id is for.
+    let carried = match server.recv().await? {
         Some(Message::Request {
             id,
-            call: Call::Resume(outcome),
-        }) => {
-            // Whatever the client said, verbatim: a refusal is as much an answer as a
-            // result, and the shim is what turns either into an exit code.
-            shim.respond(shim_id, outcome).await?;
-            Ok(Some(id))
-        }
+            call: Call::Exec(exec),
+        }) => match exec.prev {
+            Some(prev) if prev.id == owed => Some((id, prev.outcome)),
+            _ => None,
+        },
+        _ => None,
+    };
 
+    let Some((id, outcome)) = carried else {
         // The shim goes unanswered on purpose. There is nothing to tell it, and a dropped
         // connection is what says so — the shim reports that on its own stderr.
-        other => {
-            if let Some(message) = other {
-                eprintln!(
-                    "{}: the client sent {message:?} instead of resuming",
-                    env!("CARGO_BIN_NAME")
-                );
-            }
-            Ok(None)
-        }
-    }
+        eprintln!(
+            "{}: the client sent nothing that carries on from request {owed}",
+            env!("CARGO_BIN_NAME")
+        );
+        return Ok(None);
+    };
+
+    // Whatever the client said, verbatim: a refusal is as much an answer as a result, and
+    // the shim is what turns either into an exit code.
+    shim.respond(shim_id, outcome).await?;
+    Ok(Some(id))
 }
 
 /// The environment variables an execution is given: the way home for a shim, and a `PATH`
 /// with the delegated names on it.
 ///
 /// Per command rather than per process. `std::env::set_var` is unsound with any other
-/// thread running and this program now has one, so what used to be a `PATH` this process
-/// mutated at `start` is a `PATH` each `Command` is handed.
-fn environment(linked: Option<&BinDir>, shims: &Shims) -> Vec<(OsString, OsString)> {
-    let mut env = vec![(SOCK_ENV.into(), shims.sock.clone().into_os_string())];
+/// thread running and this program has one, so a `PATH` this process mutates once is a
+/// `PATH` each [`Command`] is handed instead.
+fn environment(linked: &BinDir, shims: &Shims) -> Vec<(OsString, OsString)> {
+    // Appended, not prepended: these names are meant to add commands, not to quietly
+    // shadow a real `git` or `python` a caller meant to run.
+    let mut path = std::env::var_os("PATH").unwrap_or_default();
+    path.push(":");
+    path.push(linked.bin());
 
-    if let Some(bin) = linked.map(BinDir::bin) {
-        // Appended, not prepended: these names are meant to add commands, not to quietly
-        // shadow a real `git` or `python` a caller meant to run.
-        let mut path = std::env::var_os("PATH").unwrap_or_default();
-        path.push(":");
-        path.push(bin);
-        env.push(("PATH".into(), path));
-    }
-
-    env
+    vec![
+        (SOCK_ENV.into(), shims.sock.clone().into_os_string()),
+        ("PATH".into(), path),
+    ]
 }
 
 /// The socket every shim dials.

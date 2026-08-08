@@ -14,9 +14,9 @@
 //!
 //! # What [`exec`](Console::exec) actually does
 //!
-//! It walks that chain. The server's answer is either the execution's
-//! [`ExecResult`] or a delegated call; the second is resolved against the
-//! [`ExecutableSet`] and sent back as a `resume`, until an answer is the first.
+//! It walks that chain. The server's answer is either the execution's [`ExecResult`] or a
+//! delegated call; the second is resolved against the [`ExecutableSet`] and carried back
+//! on an `exec` of its own, until an answer is the first.
 //!
 //! Which is why the loop is here and not in a transport: `Progress` is a
 //! [`Client`]'s and resolving a *name* is an [`ExecutableSet`]'s, and this is the
@@ -47,10 +47,17 @@
 //! when the console goes away. That is a lifetime, not a decision, so it is a
 //! [`Drop`](Console#impl-Drop-for-Console) and not a method somebody has to remember.
 //!
-//! [`stop`](Console::stop) is not that. It releases what a [`start`](Console::start)
-//! booted and leaves the session open for another one, which is a thing a caller does in
-//! the middle rather than at the end — and being in the middle, it is awaited and its
-//! answer reported like any other call.
+//! [`start`](Console::start) and [`stop`](Console::stop) are neither an ending nor
+//! something to remember. They are **how a caller manages what the far end is holding**,
+//! and that is the whole of what they do: a `stop` hands back the guest, the socket and
+//! the scratch directory a booted session occupies while nothing is running, and a
+//! `start` pays the cold start early so the first command does not pay it in its own
+//! latency. Nothing is unlocked by either — the next command boots what it needs — so a
+//! console that sends neither works, and one that sends both is one that knows when it
+//! will be busy and when it will be idle.
+//!
+//! Neither is awaited for an answer, because there is nothing a caller would do
+//! differently if one failed.
 
 use anyhow::Context as _;
 use futures_core::future::BoxFuture;
@@ -58,11 +65,19 @@ use tokio::process::Command;
 
 use crate::console::base::{Client, Failure};
 use crate::console::message::{
-    Call, Error, Exec, ExecResult, Notification, Outcome, Progress, Read, ReadResult, Start, Write,
-    WriteResult,
+    Call, Error, Exec, ExecResult, Init, Notification, Outcome, PrevExecResult, Progress, Read,
+    ReadResult, RequestId, Write, WriteResult,
 };
 use crate::console::stdio::StdioClient;
 use crate::executable::{ExecCall, ExecutableSet};
+
+/// Whatever it takes to have a channel, deferred until there is a console to hold one.
+///
+/// [`Send`], because [`build`](ConsoleBuilder::build) awaits the `init` it sends and so
+/// holds this across an await — which is what makes a builder something a task can be
+/// spawned around, like everything else here. It costs nothing: a [`Client`] is already
+/// `Send`, and so is what either setter captures.
+type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>;
 
 /// Assembles a [`Console`] from the parts it needs.
 ///
@@ -70,8 +85,8 @@ use crate::executable::{ExecCall, ExecutableSet};
 /// volumes to project, limits, a backend of its own choosing — and each should be
 /// something a caller can leave out.
 ///
-/// Nothing here starts anything. The channel is described, not driven, until
-/// [`Console::start`].
+/// Nothing here starts anything. The channel is described, not driven, until something
+/// is asked over it.
 #[derive(Default)]
 pub struct ConsoleBuilder {
     /// Not a client but the making of one, because some clients are a process away:
@@ -79,9 +94,9 @@ pub struct ConsoleBuilder {
     /// starting a program can fail. Deferring that to [`build`](Self::build) keeps every
     /// setter infallible and leaves one place where a console either exists or says what
     /// it lacked.
-    client: Option<Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>>>>,
+    client_factory: Option<ClientFactory>,
+
     execs: ExecutableSet,
-    default_timeout_ms: Option<u64>,
 }
 
 impl ConsoleBuilder {
@@ -92,7 +107,7 @@ impl ConsoleBuilder {
     /// a test. Whatever it took to have a channel is the client's, including a process if
     /// that is what it runs over, so there is nothing else here about where a server is.
     pub fn client(mut self, client: impl Client + 'static) -> Self {
-        self.client = Some(Box::new(move || Ok(Box::new(client))));
+        self.client_factory = Some(Box::new(move || Ok(Box::new(client))));
         self
     }
 
@@ -113,7 +128,7 @@ impl ConsoleBuilder {
         // was given has to still be there when `build` runs it.
         let cmd: Vec<String> = cmd.iter().map(|s| s.as_ref().to_string()).collect();
 
-        self.client = Some(Box::new(move || {
+        self.client_factory = Some(Box::new(move || {
             let (program, args) = cmd
                 .split_first()
                 .context("a console server needs a program to run")?;
@@ -129,50 +144,38 @@ impl ConsoleBuilder {
 
     /// The names this console offers, and what each one does.
     ///
-    /// These are announced to the server by [`start`](Console::start) and resolved here
-    /// when one comes back as a [`Delegated`](Progress::Delegated). Leaving it out means
-    /// a client with nothing to delegate, which is still a client.
+    /// These are announced to the server as the console is built, and resolved here when
+    /// one comes back as a [`Delegated`](Progress::Delegated). Leaving it out means a
+    /// client with nothing to delegate, which is still a client.
     pub fn executables(mut self, execs: ExecutableSet) -> Self {
         self.execs = execs;
         self
     }
 
-    /// The fallback for executions that set no timeout of their own.
+    /// Fails for the one part that has no default — something to ask — for whatever having
+    /// a channel took (over stdio, a server process that would not start), and for the
+    /// `init` this then sends.
     ///
-    /// `None` is no fallback, and then such an execution runs until it finishes, or
-    /// forever.
-    pub fn default_timeout_ms(mut self, ms: u64) -> Self {
-        self.default_timeout_ms = Some(ms);
-        self
-    }
-
-    /// Fails for the one part that has no default — something to ask — and for whatever
-    /// having a channel took: over stdio, a server process that would not start.
-    ///
-    /// Not `async`, because nothing here waits for anything. It does still want a runtime
-    /// under it: a console over [`stdio_client`](Self::stdio_client) starts a process,
-    /// and a process is registered with the runtime that will reap it. Building one from
-    /// outside a task or `main` is a panic, not an `Err` — the missing runtime is the
-    /// caller's own shape and not something the channel could report.
-    pub fn build(self) -> anyhow::Result<Console> {
-        let client = self
-            .client
-            .context("a console needs a client to drive its server")?;
-
-        Ok(Console {
-            client: client()?,
-            execs: self.execs,
-            default_timeout_ms: self.default_timeout_ms,
-        })
+    /// A runtime has to be under it: a console over [`stdio_client`](Self::stdio_client)
+    /// starts a process, and a process is registered with the runtime that will reap it.
+    /// Building one from outside a task or `main` is a panic, not an `Err` — the missing
+    /// runtime is the caller's own shape and not something the channel could report.
+    pub async fn build(self) -> anyhow::Result<Console> {
+        Console::new(self).await
     }
 }
 
 /// A console: something to run commands in, and the executables it may call back into.
 ///
-/// [`start`](Self::start) to boot it, an [`exec`](Self::exec) per command,
-/// [`stop`](Self::stop) to release what booting took — and another `start` after that if
-/// there is more to do. [`close`](Self::close) ends the session and says how that went;
-/// dropping it ends the session too.
+/// An [`exec`](Self::exec) per command, and dropping it to end the session. That is the
+/// whole of what a caller has to do: what the session *is* was said when the console was
+/// built, booting happens under the first command that needs it, and whatever it took
+/// goes away with the console.
+///
+/// [`start`](Self::start) and [`stop`](Self::stop) are how a caller manages what the far
+/// end is holding — pay the cold start early, hand the resources back while idle — and
+/// neither is required: a console that sends neither runs the same commands to the same
+/// results.
 ///
 /// ```no_run
 /// use cortex::console::Console;
@@ -181,23 +184,24 @@ impl ConsoleBuilder {
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
 /// // Whichever console server this is: the client starts it and owns it from here.
+/// // Building also says what the session is — the delegated names and the fallback
+/// // timeout — so a console that exists is one the server has answered. Nothing is
+/// // booted by that; the command below pays for the boot, unless a `start` gets there
+/// // first.
 /// let mut console = Console::builder()
 ///     .stdio_client(&["cortex-local-console"])
 ///     .executables(ExecutableSet::new())
-///     .default_timeout_ms(30_000)
-///     .build()?;
-///
-/// console.start().await?;
+///     .build()
+///     .await?;
 ///
 /// // `None`: this command has no opinion about how long it may take, so the console's
 /// // default stands. `Some(ms)` is how one says otherwise.
 /// let result = console.exec(["sh", "-c", "echo hi"], None).await?;
 /// assert_eq!(result.stdout, b"hi\n");
 ///
-/// console.stop().await?;
-///
 /// // And the session ends when the console goes — here, at the end of the scope. The
-/// // server hears `quit` and exits rather than being killed.
+/// // server hears `quit` and exits rather than being killed, releasing what it booted
+/// // on the way out, so no `stop` is owed.
 /// # Ok(())
 /// # }
 /// ```
@@ -206,11 +210,9 @@ pub struct Console {
     /// for it to be *replaced* — see [`Console::drop`](Console#impl-Drop-for-Console).
     client: Box<dyn Client>,
 
-    /// What a delegated name announced by [`start`](Self::start) resolves to when one
-    /// comes back as a [`Delegated`](Progress::Delegated).
+    /// What a delegated name — announced to the server when this console was built —
+    /// resolves to when one comes back as a [`Delegated`](Progress::Delegated).
     execs: ExecutableSet,
-
-    default_timeout_ms: Option<u64>,
 }
 
 impl Console {
@@ -218,21 +220,77 @@ impl Console {
         ConsoleBuilder::default()
     }
 
-    /// Boot the server, and announce the names it may call back into.
+    /// Take a channel and announce the session on it.
     ///
-    /// Returning is the readiness signal: booting is not free, and this is where it is
-    /// paid for rather than inside the first command.
+    /// `init` is here rather than a method a caller remembers, because a session's shape
+    /// is not something a console is ever without: the delegated names and the fallback
+    /// timeout are what the builder was given, they outlive every execution, and there is
+    /// no useful console in between having a channel and having said what is on it. So a
+    /// `Console` that exists is one the server has heard from and answered — which is the
+    /// one thing about a session a caller can act on before asking for work.
     ///
-    /// Whether a session may be started twice, or run something before it is started at
-    /// all, is the server's answer and not a question asked here. A session lives at the
-    /// end that has one, and this end only carries what it is told: a second `start` is
-    /// whatever that server does with one.
+    /// Nothing is booted by it. The first command that needs a session boots one, unless
+    /// a [`start`](Self::start) gets there first.
+    ///
+    /// A failure here takes the channel with it. The client is dropped rather than told
+    /// `quit`, because there is no `Console` to owe one: over stdio that kills the server
+    /// process instead of asking it to leave, which is the same ending a console dropped
+    /// off a runtime gets.
+    pub async fn new(builder: ConsoleBuilder) -> anyhow::Result<Self> {
+        let ConsoleBuilder {
+            client_factory,
+            execs,
+        } = builder;
+
+        let client_factory =
+            client_factory.context("a console needs a client to drive its server")?;
+        let mut client = client_factory()?;
+
+        client
+            .init(Init {
+                delegated: execs.names().map(str::to_string).collect(),
+            })
+            .await?;
+
+        Ok(Console { client, execs })
+    }
+
+    /// Boot the far end now, to hide the cold start.
+    ///
+    /// Entirely optional, and it unlocks nothing: an [`exec`](Self::exec),
+    /// [`read`](Self::read) or [`write`](Self::write) that reaches a stopped session is
+    /// served by a server that boots one first. **What it buys is who waits.** Booting is
+    /// the expensive part on a backend with a kernel to bring up, and a caller that sends
+    /// this as soon as it has a console pays for it in parallel with whatever it does
+    /// next — deciding what to run, waiting on a model, reading a file — instead of
+    /// inside the latency of its first command.
+    ///
+    /// So it is worth sending exactly when a caller knows a console will be used and does
+    /// not yet know what for, which is most of them.
+    ///
+    /// `Ok` is the message having gone out and not the server having booted: nothing
+    /// answers it. A boot that fails is heard by whoever asks for the next thing that
+    /// needed one, as [`BOOT_FAILED`](Error::BOOT_FAILED).
     pub async fn start(&mut self) -> Result<(), Failure> {
-        let start = Start {
-            delegated: self.execs.names().map(str::to_string).collect(),
-            default_timeout_ms: self.default_timeout_ms,
-        };
-        self.client.start(start).await
+        self.client.start().await
+    }
+
+    /// Release what booting took, to stop occupying it while nothing is running.
+    ///
+    /// Not the end of anything, and not owed: the next call that needs a booted session
+    /// gets one, and dropping the console releases everything anyway. **What it buys is
+    /// what a booted session is not holding in the meantime** — a guest's memory, a
+    /// socket, a scratch directory — which is worth a message when a caller knows it is
+    /// going idle, and worth nothing between two commands a second apart.
+    ///
+    /// The other half of [`start`](Self::start)'s trade, and the cost is the same one:
+    /// the next command pays a cold start again. A caller that will be idle for minutes
+    /// takes that gladly; one that will be idle for a moment should not.
+    ///
+    /// `Ok` is the message having gone out. Like [`start`](Self::start), nothing answers
+    /// it.
+    pub async fn stop(&mut self) -> Result<(), Failure> {
+        self.client.stop().await
     }
 
     /// Run one command, and return everything it produced.
@@ -240,8 +298,8 @@ impl Console {
     /// Every delegated call the command makes is resolved here, against the
     /// [`ExecutableSet`] this console was built with, before this returns: the server
     /// answers with a [`Delegated`](Progress::Delegated) instead of a result, the name
-    /// runs in *this* process, and what it produced goes back as a `resume`. However
-    /// many times that happens is not something a caller sees.
+    /// runs in *this* process, and what it produced goes back as the `prev` of another
+    /// `exec`. However many times that happens is not something a caller sees.
     ///
     /// So a caller waits for one thing and gets one thing, and the delegated calls
     /// underneath it are served in the order the command made them.
@@ -249,18 +307,16 @@ impl Console {
     /// The command is an argv — `["echo", "hi"]` — and nothing here consults a shell, so
     /// a caller that wants shell semantics asks for them outright: `["sh", "-c", ".."]`.
     ///
-    /// `timeout_ms` bounds this execution alone. `None` is not "no timeout" but "no
-    /// opinion": the server falls back to the console's
-    /// [`default_timeout_ms`](ConsoleBuilder::default_timeout_ms), and only a console
-    /// that set no default either leaves an execution to run until it finishes, or
-    /// forever. Whichever bound applies, it covers the delegated calls the command made
-    /// on the way — they are part of the execution and not a pause in it.
+    /// `timeout_ms` bounds this execution, and `None` leaves it to run until it finishes
+    /// — or forever, if it is the kind of command that does not finish. Whichever it is,
+    /// it covers the delegated calls the command made on the way: they are part of the
+    /// execution and not a pause in it.
     ///
     /// Which is the only way to bound one, and the reason the parameter is here rather
     /// than something a caller arranges outside. The chain is a sequence of round trips on
     /// one channel, and dropping this future between two of them leaves the server holding
-    /// an execution nobody will resume — so a caller that wants to stop waiting says so to
-    /// the server, which is the end that can also stop the command.
+    /// an execution nobody will carry on — so a caller that wants to stop waiting says so
+    /// to the server, which is the end that can also stop the command.
     pub async fn exec(
         &mut self,
         cmd: impl IntoIterator<Item = impl AsRef<str>>,
@@ -269,21 +325,41 @@ impl Console {
         let exec = Exec {
             cmd: cmd.into_iter().map(|s| s.as_ref().to_string()).collect(),
             timeout_ms,
+            // A command a caller asked for, so it carries on from nothing.
+            prev: None,
         };
 
         // Split rather than borrowed through `self`, because the chain holds the client
         // across every step and consults the set in between.
         let Console { client, execs, .. } = self;
 
-        let mut progress = client.exec(exec).await?;
+        // The id of the request the *next* answer will be to, which is what carrying on
+        // from a delegated call has to quote. Every step of the chain is a request of its
+        // own, so it moves along with the chain.
+        let (mut id, progress) = client.exec(exec).await;
+        let mut progress = progress?;
+
         loop {
             match progress {
                 Progress::Done(result) => return Ok(result),
+
                 // The execution owes an answer it has not been given, so nothing else
-                // may be asked until this goes back.
-                Progress::Delegated(exec) => {
-                    let outcome = answer(execs, exec).await;
-                    progress = client.resume(outcome).await?;
+                // may be asked until this goes back — as an `exec` of its own, with no
+                // command of its own to run.
+                Progress::Delegated(delegated) => {
+                    let carry_on = Exec {
+                        cmd: Vec::new(),
+                        prev: Some(PrevExecResult {
+                            id,
+                            outcome: answer(execs, delegated).await,
+                        }),
+                        // The execution this belongs to is already running under its own,
+                        // and this is not a second execution to bound.
+                        timeout_ms: None,
+                    };
+
+                    let (next, answered) = client.exec(carry_on).await;
+                    (id, progress) = (next, answered?);
                 }
             }
         }
@@ -334,17 +410,6 @@ impl Console {
         };
         self.client.write(write).await
     }
-
-    /// Release what [`start`](Self::start) booted.
-    ///
-    /// Not the end of anything: the session stays open and another `start` is allowed,
-    /// which is what the protocol's `stop` means. [`close`](Self::close) is what ends it.
-    ///
-    /// Like [`start`](Self::start), what a `stop` on a session that has none comes to is
-    /// the server's to say.
-    pub async fn stop(&mut self) -> Result<(), Failure> {
-        self.client.stop().await
-    }
 }
 
 impl Drop for Console {
@@ -382,8 +447,10 @@ impl Drop for Console {
         struct Spent;
 
         impl Client for Spent {
-            fn call(&mut self, _: Call) -> BoxFuture<'_, Result<Outcome, Failure>> {
-                Box::pin(async { Err(Failure::broken("the session has ended")) })
+            /// Id zero because nothing was numbered: no request went out for this to be
+            /// the id of.
+            fn call(&mut self, _: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
+                Box::pin(async { (0, Err(Failure::broken("the session has ended"))) })
             }
 
             fn notify(&mut self, _: Notification) -> BoxFuture<'_, Result<(), Failure>> {
@@ -402,7 +469,8 @@ impl Drop for Console {
     }
 }
 
-/// What one delegated call comes to: the `params` of the `resume` that answers it.
+/// What one delegated call comes to: the [`prev`](Exec::prev) of the `exec` that carries
+/// it back.
 async fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
     let Some((name, args)) = exec.cmd.split_first() else {
         return refused(Error::INVALID_PARAMS, "an empty command");
@@ -458,7 +526,7 @@ mod tests {
     /// Two lists because they answer different questions: `methods` is what went out and
     /// in what order, including the `quit`, which is a notification and so never a `Call`;
     /// `calls` is what those carried, because the delegated calls a console resolves are
-    /// only visible in the payload of its `resume`s.
+    /// only visible in the `prev` of the `exec`s that carry them back.
     #[derive(Clone)]
     struct Log {
         methods: Arc<Mutex<Vec<Method>>>,
@@ -479,11 +547,18 @@ mod tests {
     /// A client over canned answers, recording everything it was handed.
     struct Recorder {
         answers: Vec<Outcome>,
+        /// Numbered as a real client numbers: from zero, by one, over calls alone. What
+        /// a console quotes back in a `prev` comes from here, so it has to be the same
+        /// sequence a transport would have produced.
+        next_id: RequestId,
         log: Log,
     }
 
     impl Client for Recorder {
-        fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Outcome, Failure>> {
+        fn call(&mut self, call: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
+            let id = self.next_id;
+            self.next_id += 1;
+
             self.log.methods.lock().unwrap().push(call.method());
             self.log.calls.lock().unwrap().push(call);
             let answer = if self.answers.is_empty() {
@@ -493,7 +568,7 @@ mod tests {
             } else {
                 Ok(self.answers.remove(0))
             };
-            Box::pin(async move { answer })
+            Box::pin(async move { (id, answer) })
         }
 
         fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>> {
@@ -510,6 +585,7 @@ mod tests {
         (
             Recorder {
                 answers,
+                next_id: 0,
                 log: log.clone(),
             },
             log,
@@ -552,19 +628,20 @@ mod tests {
     /// A builder needs exactly one thing, and says which when it does not have it.
     #[tokio::test]
     async fn a_console_needs_something_to_ask() {
-        let Err(failure) = Console::builder().build() else {
+        let Err(failure) = Console::builder().build().await else {
             panic!("a console with nothing to ask should not build");
         };
         assert!(failure.to_string().contains("needs a client"), "{failure}");
     }
 
-    /// `stdio_client` takes a program, so building is where one that will not start is
-    /// reported — and where one that starts is a console like any other.
+    /// Every way building can fail says which one it was, and all of them are here rather
+    /// than spread over the first few methods a caller would have reached for.
     #[tokio::test]
     async fn a_stdio_console_starts_its_server_when_it_is_built() {
         let Err(e) = Console::builder()
             .stdio_client(&["cortex-no-such-console"])
             .build()
+            .await
         else {
             panic!("a console over a program that does not exist should not build");
         };
@@ -572,54 +649,51 @@ mod tests {
 
         // A command with nothing to run is the same kind of failure and reported the same
         // way: at build, saying what it lacked.
-        let Err(e) = Console::builder().stdio_client(&[] as &[&str]).build() else {
+        let Err(e) = Console::builder()
+            .stdio_client(&[] as &[&str])
+            .build()
+            .await
+        else {
             panic!("a console over no program at all should not build");
         };
         assert!(e.to_string().contains("needs a program to run"), "{e}");
 
-        // A program that starts is all building needs; whether it speaks the protocol is
-        // `start`'s to find out, and this one never answers. Dropped rather than closed,
-        // because `cat` echoes whatever the ending says to it and an ending that reports
-        // what it heard would report that — see `close`, which is the ending with a
-        // result, and this program has no result to give.
-        //
-        // Arguments are the caller's too, and go to the program as given.
-        drop(
-            Console::builder()
-                .stdio_client(&["cat", "-u"])
-                .build()
-                .unwrap(),
-        );
+        // And a program that starts but does not speak the protocol fails here too, which
+        // is what moved when `init` became the builder's: it is answered or the console
+        // does not exist. `cat` echoes the request back, so what arrives is a request and
+        // not the response that was due — arguments are the caller's, and go to the
+        // program as given.
+        let Err(e) = Console::builder()
+            .stdio_client(&["cat", "-u"])
+            .build()
+            .await
+        else {
+            panic!("a console over a program that cannot answer should not build");
+        };
+        assert!(e.to_string().contains("cannot answer"), "{e}");
     }
 
-    /// `start` announces the registered names, and nothing about the session is kept on
-    /// this side: what a caller asks for goes out as asked, in that order, and the answer
-    /// is the server's.
+    /// Building announces the registered names, and nothing about the session is kept on
+    /// this side afterwards: what a caller asks for goes out as asked, in that order, and
+    /// the answer is the server's.
     #[tokio::test]
     async fn a_session_is_the_servers_to_keep() {
-        let (client, log) = recorder(vec![ran(b"early\n"), null(), ran(b"hi\n"), null()]);
+        let (client, log) = recorder(vec![null(), ran(b"hi\n")]);
         let mut console = Console::builder()
             .client(client)
             .executables(ExecutableSet::new().register("foo", Greeter))
-            .default_timeout_ms(30_000)
             .build()
+            .await
             .unwrap();
 
-        // An `exec` before any `start` is not refused here. Whether a session has to be
-        // started before it runs anything is the server's rule to keep, so this goes out
-        // and what comes back is whatever that server says — here, a result.
-        assert_eq!(
-            console.exec(["echo", "early"], None).await.unwrap().stdout,
-            b"early\n"
-        );
-
+        // Optional, and unanswered: only the timing of the boot below changes.
         console.start().await.unwrap();
-        // An execution that delegated nothing is one round trip: no `resume`.
+        // An execution that delegated nothing is one round trip.
         assert_eq!(
             console.exec(["echo", "hi"], None).await.unwrap().stdout,
             b"hi\n"
         );
-        // A `stop` in the middle: what booting took is released and the session stays
+        // A `stop` in the middle: what booting took is handed back and the session stays
         // open, which is the only thing `stop` is for.
         console.stop().await.unwrap();
 
@@ -632,7 +706,7 @@ mod tests {
         assert_eq!(
             log.methods(),
             [
-                Method::Exec,
+                Method::Init,
                 Method::Start,
                 Method::Exec,
                 Method::Stop,
@@ -640,12 +714,30 @@ mod tests {
             ]
         );
 
-        // What `start` carried: the registered names, and the fallback timeout.
-        let Call::Start(start) = log.call(1) else {
-            panic!("{:?} is not a start", log.call(1));
+        // What `init` carried: the registered names. It is the first thing on the
+        // channel, before anything a caller asked for.
+        let Call::Init(init) = log.call(0) else {
+            panic!("{:?} is not an init", log.call(0));
         };
-        assert_eq!(start.delegated, ["foo"]);
-        assert_eq!(start.default_timeout_ms, Some(30_000));
+        assert_eq!(init.delegated, ["foo"]);
+    }
+
+    /// A session the server refuses to have is not a console, so there is nothing for a
+    /// caller to hold and nothing to end.
+    #[tokio::test]
+    async fn a_console_the_server_will_not_have_does_not_exist() {
+        let (client, log) = recorder(vec![Outcome::Error(Error::new(
+            Error::INVALID_PARAMS,
+            "delegated names are not a list",
+        ))]);
+        let Err(e) = Console::builder().client(client).build().await else {
+            panic!("a console whose init was refused should not build");
+        };
+        assert!(e.to_string().contains("delegated names"), "{e}");
+
+        // And no `quit`: what would owe one is a `Console`, and there is not one.
+        tokio::task::yield_now().await;
+        assert_eq!(log.methods(), [Method::Init]);
     }
 
     /// A console that was never started is ended the same way, because what `quit` is for
@@ -653,17 +745,21 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_console_ends_its_session() {
         let (client, log) = recorder(vec![null()]);
-        let console = Console::builder().client(client).build().unwrap();
+        let console = Console::builder().client(client).build().await.unwrap();
 
         drop(console);
 
         // The ending is somebody else's turn to run, so wait for one.
         tokio::task::yield_now().await;
-        assert_eq!(log.methods(), [Method::Quit]);
+        assert_eq!(log.methods(), [Method::Init, Method::Quit]);
     }
 
-    /// A delegated call is resolved from the set and sent back as a `resume`, and the
-    /// caller sees one result for the one `exec` it asked for.
+    /// A delegated call is resolved from the set and carried back on an `exec` of its
+    /// own, and the caller sees one result for the one command it asked for.
+    ///
+    /// So the chain is `exec`s all the way down, told apart by what they carry: the
+    /// caller's has a command and no `prev`, and every one after it is the other way
+    /// round.
     #[tokio::test]
     async fn a_delegated_call_is_resolved_inside_one_exec() {
         let (client, log) = recorder(vec![
@@ -677,28 +773,44 @@ mod tests {
             .client(client)
             .executables(ExecutableSet::new().register("foo", Greeter))
             .build()
+            .await
             .unwrap();
 
-        console.start().await.unwrap();
         assert_eq!(console.exec(["foo"], None).await.unwrap().stdout, b"done\n");
 
         assert_eq!(
             log.methods(),
-            [Method::Start, Method::Exec, Method::Resume, Method::Resume]
+            [Method::Init, Method::Exec, Method::Exec, Method::Exec]
         );
 
-        // The registered name ran, and its output is what the first `resume` carried.
-        let Call::Resume(outcome) = log.call(2) else {
-            panic!("{:?} is not a resume", log.call(2));
+        // What the caller asked for: a command, carrying on from nothing.
+        let Call::Exec(asked) = log.call(1) else {
+            panic!("{:?} is not an exec", log.call(1));
         };
-        let result: ExecResult = outcome.take().unwrap();
+        assert_eq!(asked.cmd, ["foo"]);
+        assert!(asked.prev.is_none());
+
+        // The registered name ran, and its output is what the next `exec` carried — under
+        // the id of the request that asked for it, which is the one above.
+        let Call::Exec(carried) = log.call(2) else {
+            panic!("{:?} is not an exec", log.call(2));
+        };
+        let prev = carried.prev.unwrap();
+        assert!(carried.cmd.is_empty(), "carrying on runs nothing new");
+        assert_eq!(prev.id, 1);
+        let result: ExecResult = prev.outcome.take().unwrap();
         assert_eq!(result.stdout, b"hello world\n");
 
         // The unregistered one is refused rather than run — a server asking for a name
-        // it was never given.
-        let Call::Resume(outcome) = log.call(3) else {
-            panic!("{:?} is not a resume", log.call(3));
+        // it was never given — and an outcome is what makes saying so possible at all.
+        let Call::Exec(carried) = log.call(3) else {
+            panic!("{:?} is not an exec", log.call(3));
         };
-        assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
+        let prev = carried.prev.unwrap();
+        assert_eq!(prev.id, 2);
+        assert_eq!(
+            prev.outcome.error().map(|e| e.code),
+            Some(Error::NOT_EXECUTABLE)
+        );
     }
 }

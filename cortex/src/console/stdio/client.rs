@@ -146,6 +146,40 @@ impl StdioClient {
             .await
             .map_err(broke("reading a message"))
     }
+
+    /// Put a request out under `id` and read until the response carrying it arrives.
+    ///
+    /// Split from [`call`](Client::call) so that the id can be spent before this runs and
+    /// handed back whichever way this goes — a `?` in here would otherwise take the
+    /// number with it.
+    async fn round_trip(&mut self, id: RequestId, call: Call) -> Result<Outcome, Failure> {
+        self.send(&Message::Request { id, call }).await?;
+
+        loop {
+            let Some(message) = self.recv().await? else {
+                return Err(Failure::broken(format!(
+                    "the server closed the channel before answering request {id}"
+                )));
+            };
+
+            match message {
+                Message::Response {
+                    id: answered,
+                    outcome,
+                } if answered == id => return Ok(outcome),
+
+                Message::Response { id: answered, .. } => eprintln!(
+                    "console: a response arrived for request {answered}, which nobody made"
+                ),
+
+                other => {
+                    return Err(Failure::broken(format!(
+                        "the server sent {other:?}, which a client cannot answer"
+                    )));
+                }
+            }
+        }
+    }
 }
 
 impl Client for StdioClient {
@@ -158,39 +192,15 @@ impl Client for StdioClient {
     /// The whole round trip is one future over both descriptors, which is what makes the
     /// pairing sound: nothing else can put a frame on the wire between the request and
     /// the response that answers it, because nothing else holds the borrow.
-    fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Outcome, Failure>> {
+    fn call(&mut self, call: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
         Box::pin(async move {
             // Spent before the send rather than after the answer, so a call that fails
-            // part way does not leave its id for the next one to reuse.
+            // part way does not leave its id for the next one to reuse — and so that it
+            // is there to report either way.
             let id = self.next_id;
             self.next_id += 1;
 
-            self.send(&Message::Request { id, call }).await?;
-
-            loop {
-                let Some(message) = self.recv().await? else {
-                    return Err(Failure::broken(format!(
-                        "the server closed the channel before answering request {id}"
-                    )));
-                };
-
-                match message {
-                    Message::Response {
-                        id: answered,
-                        outcome,
-                    } if answered == id => return Ok(outcome),
-
-                    Message::Response { id: answered, .. } => eprintln!(
-                        "console: a response arrived for request {answered}, which nobody made"
-                    ),
-
-                    other => {
-                        return Err(Failure::broken(format!(
-                            "the server sent {other:?}, which a client cannot answer"
-                        )));
-                    }
-                }
-            }
+            (id, self.round_trip(id, call).await)
         })
     }
 
@@ -252,7 +262,7 @@ mod tests {
     use std::task::{Context, Poll};
 
     use super::*;
-    use crate::console::{Error, Exec, ExecResult, Method, Progress, Start};
+    use crate::console::{Error, Exec, ExecResult, Init, Method, Progress, Read};
 
     /// Everything the client wrote, readable after it has been dropped or not — a
     /// `Vec` cannot be, once the client owns it.
@@ -337,36 +347,40 @@ mod tests {
         }
     }
 
-    /// The ordinary session, and the ids it allocates: from zero, by one.
+    /// The ordinary session, and the ids it allocates: from zero, by one — over the
+    /// calls alone, since the three notifications in here are not answered and so are
+    /// not numbered.
     #[tokio::test]
-    async fn a_session_is_start_then_execs_then_stop() {
-        let (mut client, sent) = driving(&[null(0), ran(1, b"hi\n"), null(2)]).await;
+    async fn a_session_is_init_then_execs() {
+        let (mut client, sent) = driving(&[null(0), ran(1, b"hi\n")]).await;
 
         client
-            .start(Start {
+            .init(Init {
                 delegated: vec!["foo".into()],
-                default_timeout_ms: Some(30_000),
             })
             .await
             .unwrap();
-        let result = client
+        client.start().await.unwrap();
+        // The id comes back with the answer, and it is the one the request went out
+        // under: `init` took zero, and the two notifications between them take none.
+        let (id, result) = client
             .exec(Exec {
                 cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
                 ..Exec::default()
             })
-            .await
-            .unwrap();
-        assert_eq!(done(result).stdout, b"hi\n");
+            .await;
+        assert_eq!(id, 1);
+        assert_eq!(done(result.unwrap()).stdout, b"hi\n");
         client.stop().await.unwrap();
         client.quit().await.unwrap();
 
         assert_eq!(
             sent.messages().await,
             [
-                (Some(0), Some(Method::Start)),
+                (Some(0), Some(Method::Init)),
+                (None, Some(Method::Start)),
                 (Some(1), Some(Method::Exec)),
-                (Some(2), Some(Method::Stop)),
-                // A notification: no id, because nothing answers it.
+                (None, Some(Method::Stop)),
                 (None, Some(Method::Quit)),
             ]
         );
@@ -380,12 +394,12 @@ mod tests {
             outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
         }])
         .await;
-        let failure = client.exec(Exec::default()).await.unwrap_err();
+        let failure = client.exec(Exec::default()).await.1.unwrap_err();
         assert_eq!(failure.code(), Some(Error::TIMED_OUT));
 
         // Nothing at all: the server closed without answering.
         let (mut client, _) = driving(&[]).await;
-        let failure = client.exec(Exec::default()).await.unwrap_err();
+        let failure = client.exec(Exec::default()).await.1.unwrap_err();
         assert_eq!(failure.code(), None);
         assert!(
             failure.to_string().contains("before answering request 0"),
@@ -398,15 +412,15 @@ mod tests {
     #[tokio::test]
     async fn a_client_answers_nothing() {
         let (mut client, _) = driving(&[ran(99, b"who asked"), ran(0, b"mine\n")]).await;
-        let result = done(client.exec(Exec::default()).await.unwrap());
+        let result = done(client.exec(Exec::default()).await.1.unwrap());
         assert_eq!(result.stdout, b"mine\n");
 
         let (mut client, _) = driving(&[Message::Request {
             id: 1,
-            call: Call::Stop,
+            call: Call::Exec(Exec::default()),
         }])
         .await;
-        let failure = client.exec(Exec::default()).await.unwrap_err();
+        let failure = client.exec(Exec::default()).await.1.unwrap_err();
         assert!(failure.to_string().contains("cannot answer"), "{failure}");
     }
 
@@ -436,18 +450,21 @@ mod tests {
     }
 
     /// An id is spent whether or not its call worked, so a failed call cannot leave
-    /// its number for the next one to reuse.
+    /// its number for the next one to reuse — and it is reported either way, which is
+    /// why it is outside the `Result`.
     #[tokio::test]
     async fn a_failed_call_still_spends_its_id() {
         // Nothing is ever answered, so both calls fail — after their requests have
         // already gone out, which is the part that matters.
         let (mut client, sent) = driving(&[]).await;
-        assert!(client.exec(Exec::default()).await.is_err());
-        assert!(client.stop().await.is_err());
+        let (failed, outcome) = client.exec(Exec::default()).await;
+        assert_eq!(failed, 0);
+        assert!(outcome.is_err());
+        assert!(client.read(Read::default()).await.is_err());
 
         assert_eq!(
             sent.messages().await,
-            [(Some(0), Some(Method::Exec)), (Some(1), Some(Method::Stop))]
+            [(Some(0), Some(Method::Exec)), (Some(1), Some(Method::Read))]
         );
     }
 }

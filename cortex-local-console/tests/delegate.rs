@@ -5,9 +5,9 @@
 //! Which is the only way to test the interesting part. A delegated executable works only
 //! if `execvp` finds a symlink, re-enters this binary as a shim, the shim dials the socket
 //! the *server* bound, the server passes the call up the console channel as a `Delegated`,
-//! this process answers it with a `resume`, and the bytes come back out of the shim's own
-//! stdout — four processes and one channel. Nothing smaller than the whole thing exercises
-//! it.
+//! this process answers it with an `exec` carrying the result in its `prev`, and the bytes
+//! come back out of the shim's own stdout — four processes and one channel. Nothing
+//! smaller than the whole thing exercises it.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -73,7 +73,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Fixture {
+    async fn new() -> Fixture {
         let execs = ExecutableSet::new()
             .register(
                 "foo",
@@ -111,31 +111,33 @@ impl Fixture {
         server.stderr(Stdio::inherit());
         let client = StdioClient::new(server).expect("starting the console server");
 
+        // Building announces the session, so a fixture that exists is one the server has
+        // answered — and the delegated names below are already linked by the time any
+        // command runs.
         let console = Console::builder()
             .client(client)
             .executables(execs)
-            .default_timeout_ms(30_000)
             .build()
+            .await
             .expect("building the console");
 
         Fixture { console }
     }
 
-    /// Boot, run one command, and return what it produced.
+    /// Run one command and return what it produced.
+    ///
+    /// No `start` and no `stop` around it, because neither is owed: the command is what
+    /// boots the session, and dropping the fixture is what releases it.
     async fn output(&mut self, script: &str) -> ExecResult {
-        self.console.start().await.expect("booting the server");
-        let result = self
-            .console
+        self.console
             .exec(["sh", "-c", script], None)
             .await
-            .expect("running the command");
-        self.console.stop().await.expect("stopping the server");
-        result
+            .expect("running the command")
     }
 }
 
 async fn output(script: &str) -> ExecResult {
-    Fixture::new().output(script).await
+    Fixture::new().await.output(script).await
 }
 
 /// The baseline: nothing delegated is involved, and a real command still runs.
@@ -220,22 +222,23 @@ async fn an_unregistered_name_is_not_on_path() {
     assert_eq!(out.stdout, b"code=127\n");
 }
 
-/// `stop` takes the symlinks away and another `start` puts them back, because releasing
-/// what booting took is not the end of the session.
+/// The whole of what makes `start` and `stop` optional: a command that finds a stopped
+/// session gets one booted under it, and nothing had to ask.
+///
+/// `stop` takes the symlinks away, and the second command below — with no `start` in
+/// front of it — finds them there again, in a directory built from the same `init`.
 #[tokio::test]
-async fn a_console_can_be_stopped_and_started_again() {
-    let mut fixture = Fixture::new();
+async fn a_stopped_session_boots_again_for_the_next_command() {
+    let mut fixture = Fixture::new().await;
 
-    fixture.console.start().await.unwrap();
     let out = fixture
         .console
         .exec(["sh", "-c", "command -v foo >/dev/null"], None)
         .await
         .unwrap();
-    assert_eq!(out.code, 0, "foo should be on PATH while started");
+    assert_eq!(out.code, 0, "foo should be on PATH");
     fixture.console.stop().await.unwrap();
 
-    fixture.console.start().await.unwrap();
     let out = fixture
         .console
         .exec(
@@ -253,13 +256,44 @@ async fn a_console_can_be_stopped_and_started_again() {
     let mut names: Vec<&str> = listed.split_whitespace().collect();
     names.sort_unstable();
     assert_eq!(names, ["boom", "foo", "rawbytes", "report", "slow"]);
-    fixture.console.stop().await.unwrap();
+}
+
+/// A client with nothing to delegate is still a client: no `start`, no executables, just
+/// the one thing it came to ask for.
+///
+/// What it does not get is delegated names — it announced none — so `foo` is a command
+/// that is not there, which is the same 127 any shell would report for a name it cannot
+/// find. That it is the *fixture's* name makes the point: what puts one on `PATH` is
+/// having said so, and nothing else.
+#[tokio::test]
+async fn a_command_runs_in_a_session_that_delegates_nothing() {
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+    server.stderr(Stdio::inherit());
+    let client = StdioClient::new(server).expect("starting the console server");
+
+    let mut console = Console::builder()
+        .client(client)
+        .build()
+        .await
+        .expect("building the console");
+
+    let out = console
+        .exec(["sh", "-c", "echo hi"], None)
+        .await
+        .unwrap();
+    assert_eq!(out.stdout, b"hi\n");
+
+    let out = console
+        .exec(["sh", "-c", "foo 2>/dev/null; echo code=$?"], None)
+        .await
+        .unwrap();
+    assert_eq!(out.stdout, b"code=127\n");
 }
 
 /// What `quit` is actually for: the server hears it, releases what it took, and exits —
 /// rather than being killed with what it took still on disk.
 ///
-/// A started session is dropped without being stopped first, which is the whole point.
+/// A booted session is dropped without being stopped first, which is the whole point.
 /// Nobody says `stop`, and the server still lets go of everything, because a server on its
 /// way out does that on its own.
 ///
@@ -270,7 +304,7 @@ async fn a_console_can_be_stopped_and_started_again() {
 /// test binary running several at once would tidy up after a killed one and say nothing.
 #[tokio::test]
 async fn dropping_a_console_lets_the_server_clean_up_after_itself() {
-    let mut fixture = Fixture::new();
+    let mut fixture = Fixture::new().await;
     fixture.console.start().await.unwrap();
 
     // The server puts this in the environment of everything it runs, which is how a shim
@@ -311,8 +345,8 @@ async fn dropping_a_console_lets_the_server_clean_up_after_itself() {
 async fn two_consoles_run_at_the_same_time() {
     let began = std::time::Instant::now();
 
-    let one = tokio::spawn(async { Fixture::new().output("slow; slow").await });
-    let two = tokio::spawn(async { Fixture::new().output("slow; slow").await });
+    let one = tokio::spawn(async { Fixture::new().await.output("slow; slow").await });
+    let two = tokio::spawn(async { Fixture::new().await.output("slow; slow").await });
 
     let (one, two) = tokio::join!(one, two);
     assert_eq!(one.unwrap().stdout, b"slept\nslept\n");

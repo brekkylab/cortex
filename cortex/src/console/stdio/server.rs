@@ -113,7 +113,7 @@ mod tests {
     use std::task::{Context as TaskContext, Poll};
 
     use super::*;
-    use crate::console::{Call, Error, Exec, Notification, Start};
+    use crate::console::{Call, Error, Exec, Init, Notification};
 
     /// Everything this end wrote, readable after it has been dropped or not — a `Vec`
     /// cannot be, once the server owns it.
@@ -157,7 +157,8 @@ mod tests {
     #[tokio::test]
     async fn every_message_arrives_as_it_was_sent() {
         let sent = vec![
-            request(0, Call::Start(Start::default())),
+            request(0, Call::Init(Init::default())),
+            Message::Notification(Notification::Start),
             request(
                 1,
                 Call::Exec(Exec {
@@ -165,7 +166,7 @@ mod tests {
                     ..Exec::default()
                 }),
             ),
-            request(2, Call::Stop),
+            Message::Notification(Notification::Stop),
             // Not a request, and this end has no opinion about that.
             Message::Response {
                 id: 99,
