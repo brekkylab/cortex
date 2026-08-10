@@ -225,17 +225,57 @@ fn a_link_cannot_take_a_request_out_of_the_root() {
     }
     assert!(!outside.join("new.txt").exists(), "a create wrote outside");
 
-    // Omission and the error have to tell one story, or a caller holding the
-    // name from a stale cache hears something the listing contradicts.
-    assert_eq!(names(&vol, ""), vec!["real.txt"]);
+    // None of it reached the far side.
+    assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"OUT");
 
     fs::remove_dir_all(&base).unwrap();
 }
 
-/// `stat` follows and `unlink` does not, which is what makes the size `stat`
-/// reports the size `open` hands back while `rm` still takes the name and leaves
-/// the file. Held here so a later tidy-up making them agree has to argue with a
-/// test rather than with a comment.
+/// Refusing to *traverse* a link out of the root is not refusing to admit it is
+/// there. The name is an entry in a directory this volume owns, and `unlink`
+/// takes it out of that directory without touching what it points at — so the
+/// listing has to show it, or a caller meets a `NotEmpty` with nothing in the
+/// listing to account for it and no way to clear it.
+#[test]
+#[cfg(unix)]
+fn a_link_out_of_the_root_is_listed_and_can_be_removed() {
+    let base = scratch("passthrough", "escapelist");
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    fs::create_dir_all(root.join(".venv/bin")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("python3.12"), b"BINARY").unwrap();
+    // What `python -m venv` leaves behind, and pnpm after it.
+    link(outside.join("python3.12"), root.join(".venv/bin/python"));
+
+    let vol = PassthroughVolume::new(&root);
+
+    // Reported as `File`: what it points at is outside, so it is not asked.
+    let listed = vol.list(Path::new(".venv/bin")).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "python");
+    assert_eq!(listed[0].kind, DirentKind::File);
+
+    // Still not traversable — the target is no more reachable than before.
+    assert!(matches!(
+        vol.stat(Path::new(".venv/bin/python")),
+        Err(CortexError::NotFound)
+    ));
+
+    // And the directory can be emptied, which is the whole point.
+    vol.unlink(Path::new(".venv/bin/python")).unwrap();
+    vol.rmdir(Path::new(".venv/bin")).unwrap();
+    vol.rmdir(Path::new(".venv")).unwrap();
+    assert!(!root.join(".venv").exists());
+
+    // The link went; what it pointed at did not.
+    assert_eq!(fs::read(outside.join("python3.12")).unwrap(), b"BINARY");
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A link *inside* the root, to make the same point from the other side: the
+/// entry goes and the file it named stays. `stat` follows and `unlink` does not,
+/// so this is the assertion that stops a later tidy-up making them agree.
 #[test]
 #[cfg(unix)]
 fn unlink_removes_the_link_and_not_what_it_points_at() {
@@ -254,6 +294,37 @@ fn unlink_removes_the_link_and_not_what_it_points_at() {
     link("sub", base.join("dirlnk"));
     vol.unlink(Path::new("dirlnk")).unwrap();
     assert!(base.join("sub").is_dir());
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// The parent is what an entry operation has to have contained, and a link
+/// standing in for a *directory* mid-path is still a way out of the root.
+#[test]
+#[cfg(unix)]
+fn an_entry_operation_cannot_reach_through_a_link_out_of_the_root() {
+    let base = scratch("passthrough", "entryescape");
+    let (root, outside) = (base.join("root"), base.join("outside"));
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), b"OUT").unwrap();
+    fs::write(root.join("bait.txt"), b"IN").unwrap();
+    link(&outside, root.join("inmiddle"));
+
+    let vol = PassthroughVolume::new(&root);
+    let victim = Path::new("inmiddle/secret.txt");
+    assert!(matches!(vol.unlink(victim), Err(CortexError::NotFound)));
+    assert!(matches!(vol.mkdir(victim), Err(CortexError::NotFound)));
+    assert!(matches!(vol.rmdir(victim), Err(CortexError::NotFound)));
+    assert!(matches!(
+        vol.rename(Path::new("bait.txt"), victim),
+        Err(CortexError::NotFound)
+    ));
+    assert!(matches!(
+        vol.rename(victim, Path::new("bait.txt")),
+        Err(CortexError::NotFound)
+    ));
+    assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"OUT");
 
     fs::remove_dir_all(&base).unwrap();
 }
@@ -420,7 +491,10 @@ fn a_dotdot_in_a_link_target_cannot_climb_out_of_the_root() {
         vol.stat(Path::new("climb")),
         Err(CortexError::NotFound)
     ));
-    assert_eq!(names(&vol, ""), vec!["sub"]);
+    // Listed, as any other entry is; being unable to traverse it is a different
+    // answer from its not being there.
+    assert_eq!(names(&vol, ""), vec!["climb", "sub"]);
+    assert_eq!(fs::read(outside.join("secret.txt")).unwrap(), b"OUT");
 
     fs::remove_dir_all(&base).unwrap();
 }

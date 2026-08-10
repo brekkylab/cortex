@@ -9,9 +9,13 @@
 //! point out of it. So one walk resolves what it finds and what it arrives at
 //! must be under the root; a path with no link in it cannot leave, and the same
 //! walk finds nothing to resolve. Resolving *reads* links rather than following
-//! them, which keeps the question to where a link points: one out of the root is
-//! refused and left out of listings, one naming something not created yet is
-//! served.
+//! them, which keeps the question to where a link points: one out of the root
+//! cannot be traversed, one naming something not created yet is served.
+//!
+//! Only an operation that follows a link has to ask. `mkdir`, `unlink`, `rmdir`
+//! and `rename` act on a name in the directory holding it and never touch what
+//! it points at, so for them that directory is what containment is about — a
+//! link out of the root is still listed, and can still be taken away.
 //!
 //! `..` is folded lexically, and has to be: [`Workspace`](crate::Workspace)
 //! routes on a normalized key and hands a backend the folded remainder, and
@@ -137,25 +141,28 @@ impl PassthroughVolume {
         Ok(resolved)
     }
 
-    /// Map a request path to its location under `root`, refusing what would
-    /// leave it. Returns the *unresolved* path: `open` and `unlink` act on the
-    /// name the caller asked for, links and all.
-    fn real_path(&self, path: &Path) -> Result<PathBuf> {
-        let mut real = self.root.clone();
-        let mut depth = 0usize;
-        let mut through_a_link = false;
+    /// Fold a request onto `root`: `.` dropped, `..` applied, an OS prefix or a
+    /// climb past the root refused. Containment is not asked about here — the
+    /// two callers below ask it of different things.
+    fn fold(&self, path: &Path) -> Result<Folded> {
+        let mut folded = Folded {
+            real: self.root.clone(),
+            depth: 0,
+            through_a_link: false,
+        };
         for comp in path.components() {
             match comp {
                 Component::RootDir | Component::CurDir => {}
                 Component::Normal(name) => {
-                    real.push(name);
-                    depth += 1;
+                    folded.real.push(name);
+                    folded.depth += 1;
                     // Asked here, where it costs no allocation, so a path with no
                     // link in it never reaches the resolving walk — which builds a
                     // stack it would have nothing to put on. A `..` that folds a
                     // link away leaves this set: a wasted resolve, never a missed
                     // one.
-                    through_a_link = through_a_link || fs::read_link(&real).is_ok();
+                    folded.through_a_link =
+                        folded.through_a_link || fs::read_link(&folded.real).is_ok();
                 }
                 // Folded, not refused: `a/b/../c` names something in the root
                 // like any other request, the same fold `Workspace` applies a
@@ -163,23 +170,59 @@ impl PassthroughVolume {
                 // layer inverting the layering. Nothing left to fold is a climb
                 // past the root, which is what the refusal is for.
                 Component::ParentDir => {
-                    if depth == 0 {
+                    if folded.depth == 0 {
                         return Err(CortexError::InvalidName);
                     }
-                    real.pop();
-                    depth -= 1;
+                    folded.real.pop();
+                    folded.depth -= 1;
                 }
                 Component::Prefix(_) => return Err(CortexError::InvalidName),
             }
         }
+        Ok(folded)
+    }
+
+    /// Map a request path to its location under `root`, refusing one that would
+    /// leave it *through* a link. For the operations that follow one: `stat`,
+    /// `list`, `open`.
+    ///
+    /// Returns the *unresolved* path, so the OS acts on the name the caller
+    /// asked for, links and all.
+    fn real_path(&self, path: &Path) -> Result<PathBuf> {
+        let folded = self.fold(path)?;
         // `depth` guards the root itself, which a resolve cannot be asked about:
         // it wants [`canonical_root`](Self::canonical_root) first, and that would
         // cost a volume the ability to `mkdir` the directory it was anchored at.
-        if through_a_link && depth > 0 {
-            self.resolve_within_root(&real)?;
+        if folded.through_a_link && folded.depth > 0 {
+            self.resolve_within_root(&folded.real)?;
         }
-        Ok(real)
+        Ok(folded.real)
     }
+
+    /// The same, for the operations that act on a *name* rather than on what it
+    /// points at: `mkdir`, `unlink`, `rmdir`, `rename`. None of `create_dir`,
+    /// `remove_file`, `remove_dir` or `rename` follows a trailing link, so the
+    /// directory holding the name is all they can reach and all containment has
+    /// to cover — which is what keeps a link out of the root removable.
+    fn entry_path(&self, path: &Path) -> Result<PathBuf> {
+        let folded = self.fold(path)?;
+        // `depth > 1`, not `> 0`: one component down the parent *is* the root,
+        // contained by definition and not yet resolvable if it does not exist.
+        if folded.through_a_link && folded.depth > 1 {
+            let parent = folded.real.parent().expect("depth > 1 leaves a parent");
+            self.resolve_within_root(parent)?;
+        }
+        Ok(folded.real)
+    }
+}
+
+/// A request folded onto the root, before containment is asked about.
+struct Folded {
+    real: PathBuf,
+    /// Components below the root, so the root itself stays recognisable.
+    depth: usize,
+    /// Whether a link lies anywhere on the way.
+    through_a_link: bool,
 }
 
 impl Mountable for PassthroughVolume {
@@ -223,16 +266,18 @@ impl Mountable for PassthroughVolume {
             // pay for it.
             let file_type = entry.file_type()?;
             let kind = if file_type.is_symlink() {
-                let Ok(target) = self.resolve_within_root(&entry.path()) else {
-                    continue; // escapes the root
-                };
-                // A target that is not there is still a name that is, and there
-                // is no `Symlink` to report it as. Not `?`, or one link with
-                // nothing on the end of it costs the whole listing.
-                if fs::metadata(&target).is_ok_and(|meta| meta.is_dir()) {
-                    DirentKind::Dir
-                } else {
-                    DirentKind::File
+                // Only a target inside the root can be asked what it is; one
+                // outside is not this volume's to describe. `File` is what is
+                // left either way — `DirentKind` has no `Symlink` — and it is
+                // what a link with nothing on the end of it gets too.
+                //
+                // Reported either way: omitting the name would claim it is not
+                // there, which `unlink` removing it contradicts.
+                match self.resolve_within_root(&entry.path()) {
+                    Ok(target) if fs::metadata(&target).is_ok_and(|meta| meta.is_dir()) => {
+                        DirentKind::Dir
+                    }
+                    _ => DirentKind::File,
                 }
             } else if file_type.is_dir() {
                 DirentKind::Dir
@@ -249,7 +294,7 @@ impl Mountable for PassthroughVolume {
     }
 
     fn mkdir(&self, path: &Path) -> Result<()> {
-        let real = self.real_path(path)?;
+        let real = self.entry_path(path)?;
         match fs::symlink_metadata(&real) {
             Ok(meta) if meta.is_dir() => Ok(()),
             Ok(_) => Err(CortexError::AlreadyExists),
@@ -262,7 +307,7 @@ impl Mountable for PassthroughVolume {
     }
 
     fn unlink(&self, path: &Path) -> Result<()> {
-        let real = self.real_path(path)?;
+        let real = self.entry_path(path)?;
         if fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::IsADirectory);
         }
@@ -278,12 +323,12 @@ impl Mountable for PassthroughVolume {
         // descendant, `ENOENT` for a missing source or destination parent, and
         // silently replaces file-over-file. Re-deriving any of that here could only
         // introduce disagreement with the platform.
-        fs::rename(self.real_path(from)?, self.real_path(to)?)?;
+        fs::rename(self.entry_path(from)?, self.entry_path(to)?)?;
         Ok(())
     }
 
     fn rmdir(&self, path: &Path) -> Result<()> {
-        let real = self.real_path(path)?;
+        let real = self.entry_path(path)?;
         if !fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::NotADirectory);
         }
