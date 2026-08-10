@@ -370,6 +370,38 @@ fn a_dotdot_that_stays_inside_the_root_is_folded_rather_than_refused() {
     fs::remove_dir_all(&base).unwrap();
 }
 
+/// The fold is lexical, so a `..` behind a directory link returns to the link's
+/// own parent rather than to the target's, where the kernel would go.
+///
+/// Pinned because the difference reads as a bug, and closing it would break what
+/// it is holding up: [`Workspace`](crate::Workspace) routes on a normalized key
+/// and hands this backend the folded remainder, so folding the kernel's way here
+/// would answer one way called directly and another way through the mount table.
+/// Moving to the kernel's `..` is `Workspace::normalize`'s question first.
+#[test]
+#[cfg(unix)]
+fn a_dotdot_behind_a_directory_link_folds_lexically_rather_than_as_the_kernel_would() {
+    let base = scratch("passthrough", "linkdotdot");
+    fs::create_dir_all(base.join("sub/deep")).unwrap();
+    fs::write(base.join("sub/beside.txt"), b"BESIDE").unwrap();
+    fs::write(base.join("atroot.txt"), b"ROOT").unwrap();
+    link("sub/deep", base.join("deeplink"));
+    let vol = PassthroughVolume::new(&base);
+
+    // The kernel would read `sub/beside.txt` here, `deeplink/..` being `sub`.
+    assert!(matches!(
+        vol.stat(Path::new("deeplink/../beside.txt")),
+        Err(CortexError::NotFound)
+    ));
+    // It lands at the root instead, where the fold takes it.
+    assert_eq!(
+        vol.stat(Path::new("deeplink/../atroot.txt")).unwrap().size,
+        4
+    );
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
 /// A `..` the request never spelled: it arrives inside a link's target, and there
 /// it applies to what is already *resolved* — the target's parent, where the
 /// kernel applies it — not to the folded request that never left the root.

@@ -13,6 +13,17 @@
 //! refused and left out of listings, one naming something not created yet is
 //! served.
 //!
+//! `..` is folded lexically, and has to be: [`Workspace`](crate::Workspace)
+//! routes on a normalized key and hands a backend the folded remainder, and
+//! `PosixFs` never sends one, the kernel folding it against the parent inode
+//! first. Folding some other way here would answer one way called directly and
+//! another through the mount table.
+//!
+//! It does part ways with the kernel behind a directory link — `dirlink/..`
+//! returns to the link's own parent, not the target's — so `RESOLVE_BENEATH` is
+//! the *escape* policy here but not the `..`, that flag resolving in full before
+//! judging where it landed.
+//!
 //! The check and the operation are separate calls, so a link swapped between
 //! them is not caught. No binding implements `symlink`, so nothing reachable
 //! through this crate can do that; another process on the same tree could.
