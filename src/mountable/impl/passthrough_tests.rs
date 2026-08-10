@@ -232,6 +232,32 @@ fn a_link_cannot_take_a_request_out_of_the_root() {
     fs::remove_dir_all(&base).unwrap();
 }
 
+/// `stat` follows and `unlink` does not, which is what makes the size `stat`
+/// reports the size `open` hands back while `rm` still takes the name and leaves
+/// the file. Held here so a later tidy-up making them agree has to argue with a
+/// test rather than with a comment.
+#[test]
+#[cfg(unix)]
+fn unlink_removes_the_link_and_not_what_it_points_at() {
+    let base = scratch("passthrough", "unlinklink");
+    fs::create_dir_all(base.join("sub")).unwrap();
+    fs::write(base.join("sub/target.txt"), b"KEEP").unwrap();
+    link("sub/target.txt", base.join("lnk"));
+    let vol = PassthroughVolume::new(&base);
+
+    assert_eq!(vol.stat(Path::new("lnk")).unwrap().size, 4); // follows
+    vol.unlink(Path::new("lnk")).unwrap(); // does not
+    assert!(fs::symlink_metadata(base.join("lnk")).is_err());
+    assert_eq!(fs::read(base.join("sub/target.txt")).unwrap(), b"KEEP");
+
+    // A directory link, where following would have meant `IsADirectory`.
+    link("sub", base.join("dirlnk"));
+    vol.unlink(Path::new("dirlnk")).unwrap();
+    assert!(base.join("sub").is_dir());
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
 /// A link that stays inside is followed, so what `stat` and `list` report is
 /// what `open` will hand back.
 #[test]
