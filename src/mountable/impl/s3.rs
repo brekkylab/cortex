@@ -19,52 +19,31 @@
 //! `ReadOnly` and not [`Unsupported`](CortexError::Unsupported): the store *could*
 //! write, it is this backend that will not, and userspace acts on the difference.
 //!
-//! # The runtime, and where you may not call this
+//! # Async
 //!
-//! `object_store` is async and [`Mountable`] is not, so each operation blocks on a
-//! Tokio runtime. That is safe for the callers that reach a backend today — the
-//! FUSE and krun bindings drive it on threads that exist in order to block.
-//!
-//! **It is not safe from a thread that is already driving a Tokio runtime**: a
-//! `block_on` there panics with "Cannot start a runtime from within a runtime". A
-//! future async consumer (an HTTP handler, say) must bridge — `block_in_place` on a
-//! multi-thread runtime, `spawn_blocking` otherwise — before touching any method on
-//! this type.
-//!
-//! The runtime is one per crate rather than one per volume: `block_on` occupies the
-//! calling thread either way, so a worker pool is only worth anything to tasks
-//! spawned inside it, while `Runtime::new` costs a worker per logical core — three
-//! mounted volumes measured 37 threads against a shared runtime's 12.
+//! `object_store` is async and so is [`Mountable`], so each operation `.await`s the
+//! client directly — no runtime lives here. An async-native consumer drives it with
+//! its own runtime; a sync interface binding (krun/fuse/fuse-t) `block_on`s at its
+//! callback boundary (see `binding_runtime`).
 
-use std::collections::BTreeSet;
-use std::io;
-use std::path::{Component, Path};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    collections::BTreeSet,
+    io,
+    path::{Component, Path},
+    sync::{Arc, Mutex},
+};
 
-use object_store::aws::AmazonS3Builder;
-use object_store::path::Path as OsPath;
-use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt};
-use tokio::runtime::Runtime;
+use async_trait::async_trait;
+use object_store::{
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, aws::AmazonS3Builder,
+    path::Path as OsPath,
+};
 
-use crate::lock::lock;
-use crate::mountable::{FileExt, FileHandle};
-use crate::{CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat};
-
-/// The one Tokio runtime this crate drives object-store calls on.
-///
-/// Fallible rather than a `static` initialiser: building a runtime spawns threads
-/// and can fail, and a volume failing to open is not a reason to take the process
-/// down. `OnceLock::get_or_try_init` would say this in one call but is unstable, so
-/// the fallible build happens outside the cell and a lost race simply drops the
-/// runtime it built — safe, and at most once per process.
-fn runtime() -> Result<&'static Runtime> {
-    static RT: OnceLock<Runtime> = OnceLock::new();
-    if let Some(rt) = RT.get() {
-        return Ok(rt);
-    }
-    let built = Runtime::new()?;
-    Ok(RT.get_or_init(|| built))
-}
+use crate::{
+    CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat,
+    lock::lock,
+    mountable::{FileExt, FileHandle},
+};
 
 /// Connection settings for [`S3Volume`].
 ///
@@ -76,6 +55,12 @@ fn runtime() -> Result<&'static Runtime> {
 /// The built store needs no such care from us, though it is also printable:
 /// `ObjectStore` requires `Debug` and `AmazonS3` derives it, but `AwsCredential`
 /// writes its own that prints `"******"` for the secret and the session token.
+///
+/// `Clone`/`Serialize`/`Deserialize` (but not `Debug`) are derived so a
+/// [`VolumeSpec`](crate::VolumeSpec) can carry this across a process boundary and
+/// rebuild the volume. Serialization keeps the secret — that is the point, a
+/// far-side rebuild needs it — while the hand-written `Debug` still redacts it.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
@@ -121,11 +106,9 @@ impl S3Volume {
         if let Some(endpoint) = &cfg.endpoint {
             builder = builder.with_endpoint(endpoint).with_allow_http(true);
         }
-        // Inside the runtime: the client builds an async HTTP stack that wants a
-        // reactor in scope.
-        let store = runtime()?
-            .block_on(async { builder.build() })
-            .map_err(to_cortex_error)?;
+        // Synchronous — the builder just assembles config; requests run later on
+        // whatever runtime drives the async ops.
+        let store = builder.build().map_err(to_cortex_error)?;
         Ok(Self::with_store(
             Arc::new(store),
             cfg.key_prefix.clone().unwrap_or_default(),
@@ -160,8 +143,8 @@ impl S3Volume {
     ///
     /// It does not cover credentials that expire mid-session; nothing at mount time
     /// can.
-    pub fn check_reachable(&self) -> Result<()> {
-        self.list(Path::new(""))?;
+    pub async fn check_reachable(&self) -> Result<()> {
+        self.list(Path::new("")).await?;
         Ok(())
     }
 
@@ -387,7 +370,7 @@ impl S3Volume {
     /// Shared by `stat` and `open` so the two cannot disagree about a name — the
     /// same reason `list` decides collisions from the object's size rather than by
     /// consulting `stat`.
-    fn classify(&self, path: &Path) -> Result<Entry> {
+    async fn classify(&self, path: &Path) -> Result<Entry> {
         let key = self.key(path)?;
         // The volume's own root is a directory by construction — there need not be
         // any object or prefix of that name, and every mount opens by asking for it.
@@ -395,29 +378,27 @@ impl S3Volume {
             return Ok(Entry::Dir);
         }
         let os = os_path(&key)?;
-        runtime()?.block_on(async {
-            match self.store.head(&os).await {
-                Ok(meta) if meta.size > 0 => Ok(Entry::File(meta)),
-                // Ambiguous: empty body, so it may be standing in for a prefix.
-                Ok(meta) => {
-                    if self.has_children(&os).await? {
-                        Ok(Entry::Dir)
-                    } else {
-                        Ok(Entry::File(meta))
-                    }
+        match self.store.head(&os).await {
+            Ok(meta) if meta.size > 0 => Ok(Entry::File(meta)),
+            // Ambiguous: empty body, so it may be standing in for a prefix.
+            Ok(meta) => {
+                if self.has_children(&os).await? {
+                    Ok(Entry::Dir)
+                } else {
+                    Ok(Entry::File(meta))
                 }
-                // No object with that exact key. Still a directory if keys live
-                // under it — a prefix is not an object.
-                Err(object_store::Error::NotFound { .. }) => {
-                    if self.has_children(&os).await? {
-                        Ok(Entry::Dir)
-                    } else {
-                        Err(CortexError::NotFound)
-                    }
-                }
-                Err(err) => Err(to_cortex_error(err)),
             }
-        })
+            // No object with that exact key. Still a directory if keys live
+            // under it — a prefix is not an object.
+            Err(object_store::Error::NotFound { .. }) => {
+                if self.has_children(&os).await? {
+                    Ok(Entry::Dir)
+                } else {
+                    Err(CortexError::NotFound)
+                }
+            }
+            Err(err) => Err(to_cortex_error(err)),
+        }
     }
 
     /// Whether any key lives under `prefix`.
@@ -493,12 +474,13 @@ impl S3Volume {
     }
 }
 
+#[async_trait]
 impl Mountable for S3Volume {
     type Handle = S3Handle;
 
     /// Metadata for one key, or for the prefix of that name — see `classify`.
-    fn stat(&self, path: &Path) -> Result<Stat> {
-        Ok(match self.classify(path)? {
+    async fn stat(&self, path: &Path) -> Result<Stat> {
+        Ok(match self.classify(path).await? {
             Entry::File(meta) => file_stat(&meta),
             Entry::Dir => dir_stat(),
         })
@@ -520,24 +502,22 @@ impl Mountable for S3Volume {
     ///   under it) and as an object (because a key of exactly that name exists).
     ///   A `readdir` may not repeat a name, so one side has to go — see
     ///   `resolve_collision`.
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let key = self.key(path)?;
         let prefix = if key.is_empty() {
             None
         } else {
             Some(os_path(&key)?)
         };
-        runtime()?.block_on(async {
-            let listed = self
-                .store
-                .list_with_delimiter(prefix.as_ref())
-                .await
-                .map_err(to_cortex_error)?;
-            Ok(Self::resolve_collision(
-                listed,
-                prefix.as_ref().map(|p| p.as_ref()).unwrap_or(""),
-            ))
-        })
+        let listed = self
+            .store
+            .list_with_delimiter(prefix.as_ref())
+            .await
+            .map_err(to_cortex_error)?;
+        Ok(Self::resolve_collision(
+            listed,
+            prefix.as_ref().map(|p| p.as_ref()).unwrap_or(""),
+        ))
     }
 
     /// Open a file for reading.
@@ -546,14 +526,14 @@ impl Mountable for S3Volume {
     /// through `opendir`, so an `open` that lands on one is a caller mistake, and the
     /// marker case (a 0-byte object standing for a prefix) has to be refused too or
     /// the guest would read a directory as an empty file.
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         options.validate()?;
         // Refused before the network is touched: nothing about the object changes the
         // answer, and a caller that meant to write should hear so at once.
         if options.intends_write() {
             return Err(CortexError::ReadOnly);
         }
-        match self.classify(path)? {
+        match self.classify(path).await? {
             Entry::Dir => Err(CortexError::IsADirectory),
             Entry::File(meta) => {
                 let stat = file_stat(&meta);
@@ -573,15 +553,15 @@ impl Mountable for S3Volume {
         }
     }
 
-    fn mkdir(&self, _path: &Path) -> Result<()> {
+    async fn mkdir(&self, _path: &Path) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 
-    fn unlink(&self, _path: &Path) -> Result<()> {
+    async fn unlink(&self, _path: &Path) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 
-    fn rmdir(&self, _path: &Path) -> Result<()> {
+    async fn rmdir(&self, _path: &Path) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 
@@ -636,27 +616,25 @@ impl S3Handle {
     }
 
     /// One ranged GET. No lock is held here — see the loop in [`FileExt::read_at`].
-    fn fetch(&self, at: u64, end: u64) -> io::Result<Vec<u8>> {
+    async fn fetch(&self, at: u64, end: u64) -> io::Result<Vec<u8>> {
         let options = GetOptions {
             range: Some(GetRange::Bounded(at..end)),
             ..Default::default()
         };
-        let rt = runtime().map_err(to_io_error)?;
-        rt.block_on(async {
-            let got = self
-                .store
-                .get_opts(&self.key, options)
-                .await
-                .map_err(|err| to_io_error(to_cortex_error(err)))?;
-            let bytes = got
-                .bytes()
-                .await
-                .map_err(|err| to_io_error(to_cortex_error(err)))?;
-            Ok(bytes.to_vec())
-        })
+        let got = self
+            .store
+            .get_opts(&self.key, options)
+            .await
+            .map_err(|err| to_io_error(to_cortex_error(err)))?;
+        let bytes = got
+            .bytes()
+            .await
+            .map_err(|err| to_io_error(to_cortex_error(err)))?;
+        Ok(bytes.to_vec())
     }
 }
 
+#[async_trait]
 impl FileExt for S3Handle {
     /// Fill `buf` from `offset`, fetching only what the cache cannot answer.
     ///
@@ -678,7 +656,7 @@ impl FileExt for S3Handle {
     /// sends the same size whether access is sequential or random.
     ///
     /// The lock is never held across a fetch, so `last_end` is re-read after each one.
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         // `Bounded(0..0)` is an error rather than an empty answer, so an empty request
         // is settled here — and without disturbing `last_end`, which a zero-length
         // read in the middle of a stream would otherwise push off the sequence.
@@ -712,7 +690,7 @@ impl FileExt for S3Handle {
             } else {
                 (want - filled) as u64
             };
-            let data = self.fetch(at, (at + span).min(self.size))?;
+            let data = self.fetch(at, (at + span).min(self.size)).await?;
             if data.is_empty() {
                 // Defensive. A store answering a non-empty range with no bytes has no
                 // defined meaning here, and looping on it would not terminate.
@@ -736,7 +714,7 @@ impl FileExt for S3Handle {
         Ok(filled)
     }
 
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
+    async fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
         // `ReadOnlyFilesystem`, not `Unsupported`: this is the only way a handle can
         // say "read-only", and the conversion in `error.rs` turns exactly this kind
         // back into `CortexError::ReadOnly`. `Unsupported` here would reach the
@@ -745,8 +723,9 @@ impl FileExt for S3Handle {
     }
 }
 
+#[async_trait]
 impl FileHandle for S3Handle {
-    fn truncate(&self, _size: u64) -> Result<()> {
+    async fn truncate(&self, _size: u64) -> Result<()> {
         Err(CortexError::ReadOnly)
     }
 }

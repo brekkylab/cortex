@@ -37,8 +37,10 @@
 //! a real check: without it `cat` after `echo >` prints the right bytes from the
 //! guest's own cache even if none reached the backend.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use cortex::{FileExt, InMemVolume, Mountable, OpenOptions, PosixFs, Workspace};
 use msb_krun::VmBuilder;
@@ -166,11 +168,19 @@ fn resolve_kernel() -> PathBuf {
 /// both resolve; the file itself lives at `hello.txt` under that mount.
 fn build_workspace() -> Workspace {
     let vol = InMemVolume::new();
-    let (file, _) = vol
-        .open(Path::new("hello.txt"), OpenOptions::create_new())
-        .expect("fresh volume: root exists and hello.txt is free");
-    file.write_all_at(FILE_CONTENT, 0)
-        .expect("in-memory positioned write is infallible");
+    // The `Mountable` data plane is async; drive this one-off setup on a
+    // throwaway runtime before the volume is mounted.
+    tokio::runtime::Runtime::new()
+        .expect("build setup runtime")
+        .block_on(async {
+            let (file, _) = vol
+                .open(Path::new("hello.txt"), OpenOptions::create_new())
+                .await
+                .expect("fresh volume: root exists and hello.txt is free");
+            file.write_all_at(FILE_CONTENT, 0)
+                .await
+                .expect("in-memory positioned write is infallible");
+        });
 
     Workspace::new()
         .try_with_mount("", vol)

@@ -26,6 +26,10 @@ pkg-config = "0.3"
 
 [dependencies]
 serde_json = "1"
+# `VolumeSpec`/`WorkspaceSpec` derive Serialize/Deserialize so a caller (ailoy)
+# can carry a volume catalog across a process boundary and rebuild it. Core: the
+# specs are part of the always-on API, usable without any backend feature.
+serde = { version = "1", features = ["derive"] }
 
 # The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
 # `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
@@ -53,6 +57,20 @@ tokio = { version = "1", features = [
     "net",
     "time",
 ], optional = true }
+# Notion Mountable backend (async reqwest client + render-on-read). reqwest 0.13
+# renamed `rustls-tls` → `rustls` and made `query`/`form` optional; we use
+# `.query()` for pagination, so `query` is named explicitly.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+    "query",
+], optional = true }
+uuid = { version = "1", optional = true }
+chrono = { version = "0.4", optional = true }
+# The `Mountable`/`DynMountable`/`FileHandle`/`FileExt` traits are async and
+# object-safe (`Box<dyn DynMountable>`, `Box<dyn FileHandle>`), so their futures
+# are boxed via async-trait. Core, since the traits are the crate's spine.
+async-trait = "0.1"
 
 [features]
 # No *binding* by default. The crate's own layers — `Mountable`, `Workspace`, the
@@ -92,7 +110,7 @@ tokio = { version = "1", features = [
 # its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
 default = []
 # Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
-krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
+krun = ["dep:msb_krun", "dep:libc", "dep:tempfile", "dep:tokio"]
 # Mount a cortex filesystem on the host through FUSE.
 #
 # Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
@@ -104,7 +122,7 @@ krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
 #   PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig" cargo build --features fuse
 #
 # Linux needs no provider — fuser opens /dev/fuse directly.
-fuse = ["dep:fuser", "dep:libc"]
+fuse = ["dep:fuser", "dep:libc", "dep:tokio"]
 # Mount on macOS through FUSE-T, which needs no kernel extension.
 #
 # A separate binding rather than a flavour of `fuse`, because the two differ in
@@ -112,11 +130,17 @@ fuse = ["dep:fuser", "dep:libc"]
 # itself, while FUSE-T hands back a socket to its own helper and expects to drive
 # the filesystem through libfuse-t's loop. Enabling both at once is fine — they
 # are independent call surfaces over the same `PosixFs`.
-fuse-t = ["dep:libc"]
+fuse-t = ["dep:libc", "dep:tokio"]
 # Compile and unit-test the FUSE adapter with no libfuse provider installed:
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.
 fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
 s3 = ["dep:object_store", "dep:tokio"]
+# A Notion-backed Mountable (read path: pages/blocks rendered to page.json).
+notion = ["dep:reqwest", "dep:uuid", "dep:chrono", "dep:tokio"]
+
+[dev-dependencies]
+# The async trait methods are driven from tests with `#[tokio::test]`.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [workspace]
 members = ["exec-server", "wsx"]

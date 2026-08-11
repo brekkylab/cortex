@@ -5,8 +5,7 @@
 //! since two copies agreeing on a name would have tests deleting each other's
 //! fixtures.
 
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 /// A fresh, empty directory under the system temp dir, wiped first if a previous
 /// run left one behind.

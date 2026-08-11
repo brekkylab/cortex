@@ -43,3 +43,29 @@ pub use fuser::MountOption;
 pub type HostMount = CortexMount;
 #[cfg(feature = "fuse-t")]
 pub type HostMount = FuseTMount;
+
+/// Drive an async [`PosixFs`](super::PosixFs) operation to completion from a
+/// binding's *synchronous* callback.
+///
+/// This is the one place the sync↔async boundary is crossed. A guest kernel
+/// (krun) or a libfuse loop (fuse/fuse-t) calls the binding on its own thread —
+/// never a Tokio worker — while `PosixFs` and the backends beneath it are async.
+/// The bindings block here at their callback boundary rather than embedding a
+/// runtime in every leaf backend; an async-native frontend (WebDAV/HTTP) drives
+/// the same backends with no `block_on` at all.
+///
+/// One process-wide runtime serves every mount, created on first use and **never
+/// dropped** — a `Runtime`'s `Drop` blocks, which would panic on the binding
+/// threads that reach this.
+#[cfg(any(feature = "krun", feature = "fuse", feature = "fuse-t"))]
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build cortex binding runtime")
+    })
+    .block_on(fut)
+}

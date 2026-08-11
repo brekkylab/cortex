@@ -14,14 +14,20 @@
 //! bind an ephemeral port, and treat a missing token as fail-closed; the channel
 //! travels in plaintext, so it must be trusted (or add TLS).
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::{
+    io::{self, BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+};
 
 use cortex::{Bin, ExecOutput, ExecRequest, InMemVolume, PassthroughVolume, Workspace};
 
 fn main() -> std::io::Result<()> {
     let addr = std::env::var("WSX_LISTEN").unwrap_or_else(|_| "127.0.0.1:8080".into());
     let token = std::env::var("WSX_TOKEN").ok();
+
+    // cortex's `Mountable` data plane is async; this sync server drives each
+    // exec by blocking on a runtime.
+    let rt = tokio::runtime::Runtime::new()?;
 
     let bin = Bin::demo();
     // Root: a real directory if `WSX_ROOT` is set, else in-memory scratch.
@@ -51,7 +57,7 @@ fn main() -> std::io::Result<()> {
     );
 
     serve(&listener, token.as_deref(), |req| {
-        bin.invoke(&ws, &req.name, req.args)
+        rt.block_on(bin.invoke(&ws, &req.name, req.args))
             .map_err(|_| HandlerError::NotFound)
     })
 }
@@ -136,7 +142,12 @@ fn handle_connection(
     }
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &[u8]) -> io::Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()

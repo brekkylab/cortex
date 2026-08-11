@@ -23,15 +23,19 @@
 // wholesale, and coverage is what keeps it honest.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use crate::lock::lock;
-use crate::mountable::{Dirent, FileExt, FileHandle, Mountable, OpenOptions, SetAttr};
-use crate::{CortexError, DirentKind, Result, Stat};
+use crate::{
+    CortexError, DirentKind, Result, Stat,
+    lock::lock,
+    mountable::{Dirent, FileExt, FileHandle, Mountable, OpenOptions, SetAttr},
+};
 
 /// FUSE's fixed inode number for the root directory.
 const ROOT_INODE: u64 = 1;
@@ -236,19 +240,19 @@ impl<T: Mountable> PosixFs<T> {
     ///
     /// Takes a kernel reference on the inode, so it must be balanced by
     /// [`forget`](InodeTable::forget) — that is the `lookup` contract.
-    pub(super) fn lookup_child(&self, parent: u64, name: &OsStr) -> Result<(u64, Stat)> {
+    pub(super) async fn lookup_child(&self, parent: u64, name: &OsStr) -> Result<(u64, Stat)> {
         let parent_path = self.path_of(parent)?;
         let child = parent_path.join(name);
-        let stat = self.mountable.stat(&child)?;
+        let stat = self.mountable.stat(&child).await?;
         // Only mint an inode once the entry is known to exist.
         let inode = lock(&self.inodes).intern(child);
         Ok((inode, stat))
     }
 
     /// Metadata for an inode already known to the kernel.
-    pub(super) fn stat_inode(&self, inode: u64) -> Result<Stat> {
+    pub(super) async fn stat_inode(&self, inode: u64) -> Result<Stat> {
         let path = self.path_of(inode)?;
-        self.mountable.stat(&path)
+        self.mountable.stat(&path).await
     }
 
     /// Open `inode` and park the backend handle, returning the `fh` the kernel
@@ -257,41 +261,41 @@ impl<T: Mountable> PosixFs<T> {
     ///
     /// The options are the caller's: a binding decodes them from whatever flags
     /// word its kernel speaks (see [`decode_open_flags`]).
-    pub(super) fn open_inode(&self, inode: u64, options: OpenOptions) -> Result<(u64, Stat)> {
+    pub(super) async fn open_inode(&self, inode: u64, options: OpenOptions) -> Result<(u64, Stat)> {
         let path = self.path_of(inode)?;
-        let (handle, stat) = self.mountable.open(&path, options)?;
+        let (handle, stat) = self.mountable.open(&path, options).await?;
         Ok((lock(&self.handles).insert(handle), stat))
     }
 
     /// Read the `(offset, size)` window the kernel asked for. A short read is
     /// EOF, so the returned buffer is only as long as what actually arrived.
-    pub(super) fn read_handle(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
+    pub(super) async fn read_handle(&self, fh: u64, offset: u64, size: u32) -> Result<Vec<u8>> {
         let file = self.handle_of(fh)?;
         let mut buf = vec![0u8; size as usize];
-        let n = file.read_at(&mut buf, offset)?;
+        let n = file.read_at(&mut buf, offset).await?;
         buf.truncate(n);
         Ok(buf)
     }
 
     /// Write `data` at `offset` through `fh`, returning the byte count.
-    pub(super) fn write_handle(&self, fh: u64, offset: u64, data: &[u8]) -> Result<usize> {
+    pub(super) async fn write_handle(&self, fh: u64, offset: u64, data: &[u8]) -> Result<usize> {
         let file = self.handle_of(fh)?;
         // `write_all_at`, not one `write_at`: a short write is legal and the
         // kernel would resend, but looping here spares both bindings that.
-        file.write_all_at(data, offset)?;
+        file.write_all_at(data, offset).await?;
         Ok(data.len())
     }
 
     /// Create — or open, if `options` allows — a child of `parent`, returning
     /// everything a `create` reply needs at once.
-    pub(super) fn create_child(
+    pub(super) async fn create_child(
         &self,
         parent: u64,
         name: &OsStr,
         options: OpenOptions,
     ) -> Result<(u64, Stat, u64)> {
         let path = self.path_of(parent)?.join(name);
-        let (handle, stat) = self.mountable.open(&path, options)?;
+        let (handle, stat) = self.mountable.open(&path, options).await?;
         // `intern`, not `number_for`: a `create` reply carries an entry, which
         // takes a kernel reference just as `lookup` does. The reference-free path
         // would leave the count short and the inode evictable too early.
@@ -301,19 +305,19 @@ impl<T: Mountable> PosixFs<T> {
     }
 
     /// Create a subdirectory of `parent`, returning its inode and metadata.
-    pub(super) fn mkdir_child(&self, parent: u64, name: &OsStr) -> Result<(u64, Stat)> {
+    pub(super) async fn mkdir_child(&self, parent: u64, name: &OsStr) -> Result<(u64, Stat)> {
         let path = self.path_of(parent)?.join(name);
-        self.mountable.mkdir(&path)?;
-        let stat = self.mountable.stat(&path)?;
+        self.mountable.mkdir(&path).await?;
+        let stat = self.mountable.stat(&path).await?;
         // Reference-taking, for the same reason as `create_child`.
         let inode = lock(&self.inodes).intern(path);
         Ok((inode, stat))
     }
 
     /// Remove the file named `name` under `parent`.
-    pub(super) fn unlink_child(&self, parent: u64, name: &OsStr) -> Result<()> {
+    pub(super) async fn unlink_child(&self, parent: u64, name: &OsStr) -> Result<()> {
         let path = self.path_of(parent)?.join(name);
-        self.mountable.unlink(&path)?;
+        self.mountable.unlink(&path).await?;
         // Only after the backend agreed: evicting first would strand the mapping
         // if the removal failed.
         lock(&self.inodes).evict_path(&path);
@@ -321,9 +325,9 @@ impl<T: Mountable> PosixFs<T> {
     }
 
     /// Remove the empty directory named `name` under `parent`.
-    pub(super) fn rmdir_child(&self, parent: u64, name: &OsStr) -> Result<()> {
+    pub(super) async fn rmdir_child(&self, parent: u64, name: &OsStr) -> Result<()> {
         let path = self.path_of(parent)?.join(name);
-        self.mountable.rmdir(&path)?;
+        self.mountable.rmdir(&path).await?;
         lock(&self.inodes).evict_subtree(&path);
         Ok(())
     }
@@ -336,7 +340,7 @@ impl<T: Mountable> PosixFs<T> {
     /// object is still there under a new name, and the kernel goes on quoting the
     /// inode it was given, so dropping the mapping would turn its next `getattr`
     /// into `ESTALE`.
-    pub(super) fn rename_child(
+    pub(super) async fn rename_child(
         &self,
         from_parent: u64,
         name: &OsStr,
@@ -345,7 +349,7 @@ impl<T: Mountable> PosixFs<T> {
     ) -> Result<()> {
         let from = self.path_of(from_parent)?.join(name);
         let to = self.path_of(to_parent)?.join(to_name);
-        self.mountable.rename(&from, &to)?;
+        self.mountable.rename(&from, &to).await?;
         lock(&self.inodes).rekey_subtree(&from, &to);
         Ok(())
     }
@@ -356,21 +360,29 @@ impl<T: Mountable> PosixFs<T> {
     /// dropped — nothing stores them, and the attribute policy reports fixed
     /// permission bits. Failing instead would break `cp -p`, `tar -x`, and
     /// `touch` for no gain; the caller's next `getattr` shows what stuck.
-    pub(super) fn setattr_inode(&self, inode: u64, fh: Option<u64>, attr: SetAttr) -> Result<Stat> {
+    pub(super) async fn setattr_inode(
+        &self,
+        inode: u64,
+        fh: Option<u64>,
+        attr: SetAttr,
+    ) -> Result<Stat> {
         if let Some(size) = attr.size {
             match fh {
                 // Prefer the open handle: it may hold state a path alone cannot
                 // reach (a range writer, an in-flight upload), and a `setattr`
                 // carrying an `fh` is the kernel saying it has one.
-                Some(fh) => self.handle_of(fh)?.truncate(size)?,
+                Some(fh) => self.handle_of(fh)?.truncate(size).await?,
                 None => {
                     let path = self.path_of(inode)?;
-                    let (handle, _) = self.mountable.open(&path, OpenOptions::read_write())?;
-                    handle.truncate(size)?;
+                    let (handle, _) = self
+                        .mountable
+                        .open(&path, OpenOptions::read_write())
+                        .await?;
+                    handle.truncate(size).await?;
                 }
             }
         }
-        self.stat_inode(inode)
+        self.stat_inode(inode).await
     }
 
     /// Push `fh`'s buffered writes out without finalizing it.
@@ -379,18 +391,18 @@ impl<T: Mountable> PosixFs<T> {
     /// [`release_handle`](Self::release_handle): FLUSH arrives on every `close()`
     /// while RELEASE arrives only for the last, so finalizing here would cut off
     /// writes still coming through a `dup`ed descriptor.
-    pub(super) fn flush_handle(&self, fh: u64) -> Result<()> {
-        self.handle_of(fh)?.flush()
+    pub(super) async fn flush_handle(&self, fh: u64) -> Result<()> {
+        self.handle_of(fh)?.flush().await
     }
 
     /// Drop the table's reference to `fh` and finalize it. Outstanding `Arc`
     /// clones from in-flight reads keep the handle alive until they finish.
-    pub(super) fn release_handle(&self, fh: u64) -> Result<()> {
+    pub(super) async fn release_handle(&self, fh: u64) -> Result<()> {
         let file = lock(&self.handles).remove(fh);
         match file {
             // `commit`, not `flush`: this is the last descriptor, so a backend
             // that has been holding a multipart upload open may now complete it.
-            Some(file) => file.commit(),
+            Some(file) => file.commit().await,
             // A release for a handle we never issued is the kernel tidying up;
             // there is nothing to commit and nothing to complain about.
             None => Ok(()),
@@ -407,9 +419,9 @@ impl<T: Mountable> PosixFs<T> {
     ///
     /// `..` reuses this directory's inode: resolving the real parent buys
     /// nothing for traversal, which goes through `lookup`.
-    pub(super) fn dir_entries(&self, inode: u64) -> Result<Vec<(u64, Dirent)>> {
+    pub(super) async fn dir_entries(&self, inode: u64) -> Result<Vec<(u64, Dirent)>> {
         let dir = self.path_of(inode)?;
-        let children = self.mountable.list(&dir)?;
+        let children = self.mountable.list(&dir).await?;
 
         let mut entries = Vec::with_capacity(children.len() + 2);
         entries.push((inode, Dirent::new(".", DirentKind::Dir)));
@@ -432,11 +444,16 @@ impl<T: Mountable> PosixFs<T> {
     /// The cursor protocol is here because every binding must agree on it
     /// exactly: offsets are 1-based positions in the listing, and the kernel
     /// resumes by quoting the last one it consumed.
-    pub(super) fn for_each_dirent<E>(&self, inode: u64, offset: u64, mut emit: E) -> Result<()>
+    pub(super) async fn for_each_dirent<E>(
+        &self,
+        inode: u64,
+        offset: u64,
+        mut emit: E,
+    ) -> Result<()>
     where
         E: FnMut(u64, &Dirent, u64) -> Result<bool>,
     {
-        for (position, (child_inode, child)) in self.dir_entries(inode)?.iter().enumerate() {
+        for (position, (child_inode, child)) in self.dir_entries(inode).await?.iter().enumerate() {
             let cursor = position as u64 + 1;
             if cursor <= offset {
                 continue;

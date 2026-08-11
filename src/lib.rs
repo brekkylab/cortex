@@ -31,6 +31,7 @@ mod mountable;
 mod stat;
 #[cfg(test)]
 mod test_support;
+mod volume;
 mod wire;
 mod workspace;
 
@@ -38,5 +39,6 @@ pub use error::*;
 pub use executable::*;
 pub use mountable::*;
 pub use stat::*;
+pub use volume::*;
 pub use wire::*;
 pub use workspace::*;

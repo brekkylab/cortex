@@ -3,11 +3,13 @@
 //! Exercises the transport end to end — 200 / 404 / 401 and program failure as
 //! a non-zero code — against the demo `Bin` backed by a temp-dir workspace.
 
-use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
-use std::process::{Child, Command};
-use std::thread::sleep;
-use std::time::Duration;
+use std::{
+    net::{TcpListener, TcpStream},
+    path::PathBuf,
+    process::{Child, Command},
+    thread::sleep,
+    time::Duration,
+};
 
 use cortex::ExecRequest;
 use wsx::post;

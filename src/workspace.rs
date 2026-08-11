@@ -10,10 +10,14 @@
 //! so it can be driven by the same adapters as any single backend — and even
 //! mounted inside another workspace.
 
-use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
-use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::{
+    collections::BTreeMap,
+    ops::Bound::{Excluded, Unbounded},
+    path::{Component, Path, PathBuf},
+    time::SystemTime,
+};
+
+use async_trait::async_trait;
 
 use crate::{
     CortexError, Dirent, DirentKind, DynMountable, FileHandle, Mountable, OpenOptions, Result, Stat,
@@ -54,6 +58,33 @@ impl Workspace {
             mounts: BTreeMap::new(),
             born: SystemTime::now(),
         }
+    }
+
+    /// Build a live [`Workspace`] from a serialized [`WorkspaceSpec`]: each mount
+    /// realized via [`VolumeSpec::build_mountable`](crate::VolumeSpec::build_mountable),
+    /// in the spec's order. This is how a spec carried across a process boundary
+    /// (see [`WorkspaceSpec`]) becomes an identical *namespace* on the far side.
+    ///
+    /// Restores the namespace only — the instance-local `born` is not in the spec,
+    /// by design: its job is to stay fixed across *one* instance's lifetime (so a
+    /// guest's `AUTO_INVAL_DATA` cache does not churn), which a per-build timestamp
+    /// already satisfies; only the synthesized-directory timestamps differ between
+    /// two builds of the same spec, and each build is self-consistent.
+    ///
+    /// A duplicate mount path is rejected with [`AlreadyExists`](CortexError::AlreadyExists),
+    /// the same as [`mount`](Self::mount) — and the check comes *before*
+    /// `build_mountable`, so a spec with a repeated path never opens a client only
+    /// to drop it.
+    pub fn from_spec(spec: &crate::WorkspaceSpec) -> Result<Self> {
+        let mut ws = Workspace::new();
+        for (path, volume) in &spec.mounts {
+            let key = mount_key(Path::new(path))?;
+            if ws.mounts.contains_key(&key) {
+                return Err(CortexError::AlreadyExists);
+            }
+            ws.mounts.insert(key, volume.build_mountable()?);
+        }
+        Ok(ws)
     }
 
     /// Builder-style mount that overwrites any backend already at `path`.
@@ -301,17 +332,18 @@ fn normalize(path: &Path) -> Result<PathBuf> {
     Ok(out)
 }
 
+#[async_trait]
 impl Mountable for Workspace {
     type Handle = Box<dyn FileHandle>;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
+    async fn stat(&self, path: &Path) -> Result<Stat> {
         let key = normalize(path)?;
         // Collapsing "no mount claims this" and "a mount claimed it and answered
         // NotFound" into one `Err(NotFound)` is what makes the arm below cover
         // both. Only checking whether routing failed would miss the second, which
         // is the case a root backend produces for every path it does not know.
         let answered = match self.route(&key) {
-            Some((backend, sub)) => backend.stat(&sub),
+            Some((backend, sub)) => backend.stat(&sub).await,
             None => Err(CortexError::NotFound),
         };
         match answered {
@@ -324,7 +356,7 @@ impl Mountable for Workspace {
         }
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let key = normalize(path)?;
         let children = self.mount_children(&key);
 
@@ -332,7 +364,7 @@ impl Mountable for Workspace {
         // question. A directory that exists only in the mount table simply has no
         // backend entries to start from.
         let answered = match self.route(&key) {
-            Some((backend, sub)) => backend.list(&sub),
+            Some((backend, sub)) => backend.list(&sub).await,
             None => Err(CortexError::NotFound),
         };
         let entries = match answered {
@@ -375,49 +407,51 @@ impl Mountable for Workspace {
         Ok(out)
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
+    async fn mkdir(&self, path: &Path) -> Result<()> {
         let key = normalize(path)?;
         // Already a directory, so this is `EEXIST` — not the `Ok(())` the backends
         // give for an existing directory. Recorded as a deliberate divergence: a
         // workspace answers for the whole namespace, where POSIX wants `EEXIST`.
         self.guard_synthesized(&key, CortexError::AlreadyExists)?;
         match self.route(&key) {
-            Some((backend, sub)) => backend.mkdir(&sub),
+            Some((backend, sub)) => backend.mkdir(&sub).await,
             None => Err(self.refusal_for_create(&key)),
         }
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
+    async fn unlink(&self, path: &Path) -> Result<()> {
         let key = normalize(path)?;
         self.guard_synthesized(&key, CortexError::IsADirectory)?;
         match self.route(&key) {
-            Some((backend, sub)) => backend.unlink(&sub),
+            Some((backend, sub)) => backend.unlink(&sub).await,
             None => Err(CortexError::NotFound),
         }
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
+    async fn rmdir(&self, path: &Path) -> Result<()> {
         let key = normalize(path)?;
         // Not empty: it holds the mount points below it, and those are not the
         // caller's to remove through the filesystem.
         self.guard_synthesized(&key, CortexError::NotEmpty)?;
         match self.route(&key) {
-            Some((backend, sub)) => backend.rmdir(&sub),
+            Some((backend, sub)) => backend.rmdir(&sub).await,
             None => Err(CortexError::NotFound),
         }
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         let key = normalize(path)?;
         self.guard_synthesized(&key, CortexError::IsADirectory)?;
+        // The refusal below only checks `create` because `create_new` implies
+        // `create` upstream.
         match self.route(&key) {
-            Some((backend, sub)) => backend.open(&sub, options),
+            Some((backend, sub)) => backend.open(&sub, options).await,
             None if options.create => Err(self.refusal_for_create(&key)),
             None => Err(CortexError::NotFound),
         }
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let (from_key, to_key) = (normalize(from)?, normalize(to)?);
 
         // Neither end may be something the mount table owns. Checked before the
@@ -453,7 +487,34 @@ impl Mountable for Workspace {
         let to_sub = to_key
             .strip_prefix(mount)
             .expect("both paths share this mount");
-        backend.rename(&from_sub, to_sub)
+        backend.rename(&from_sub, to_sub).await
+    }
+}
+
+/// A serializable description of a whole [`Workspace`]'s *namespace*: the ordered
+/// set of `(mount_path, volume)` pairs.
+///
+/// This is the artifact a caller reuses across a process boundary. A live
+/// `Workspace` holds open clients and runtimes that cannot cross to another
+/// process, so the thing shared between (say) a WebDAV server and a sandbox's VM
+/// helper is this spec — each side calls [`Workspace::from_spec`] to build its
+/// own live tree with an identical namespace.
+///
+/// The namespace is all that crosses. A live `Workspace`'s instance-local `born`
+/// timestamp stays behind; each [`from_spec`](Workspace::from_spec) build sets its
+/// own (see that method for why it need not cross).
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct WorkspaceSpec {
+    /// `(mount_path, volume)` in insertion order. A mount at the empty path is
+    /// the root; deeper mounts shadow it (longest-prefix, see [`Workspace`]).
+    pub mounts: Vec<(String, crate::VolumeSpec)>,
+}
+
+impl WorkspaceSpec {
+    /// Builder-style: append a mount of `volume` at `path`.
+    pub fn mount(mut self, path: impl Into<String>, volume: crate::VolumeSpec) -> Self {
+        self.mounts.push((path.into(), volume));
+        self
     }
 }
 

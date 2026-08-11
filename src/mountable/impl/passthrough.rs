@@ -32,10 +32,14 @@
 //! them is not caught. No binding implements `symlink`, so nothing reachable
 //! through this crate can do that; another process on the same tree could.
 
-use std::ffi::OsString;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::OnceLock,
+};
+
+use async_trait::async_trait;
 
 use crate::{CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat};
 
@@ -225,10 +229,11 @@ struct Folded {
     through_a_link: bool,
 }
 
+#[async_trait]
 impl Mountable for PassthroughVolume {
     type Handle = fs::File;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
+    async fn stat(&self, path: &Path) -> Result<Stat> {
         let real = self.real_path(path)?;
         // Follows, where `unlink` below does not — POSIX, and it is what makes
         // the reported size the one `open` returns. An `lstat` gives the link
@@ -246,7 +251,7 @@ impl Mountable for PassthroughVolume {
         Ok(stat)
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let real = self.real_path(path)?;
         // Follows, like `stat`, which has just called such a link a directory.
         if !fs::metadata(&real)?.is_dir() {
@@ -293,7 +298,7 @@ impl Mountable for PassthroughVolume {
         Ok(out)
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
+    async fn mkdir(&self, path: &Path) -> Result<()> {
         let real = self.entry_path(path)?;
         match fs::symlink_metadata(&real) {
             Ok(meta) if meta.is_dir() => Ok(()),
@@ -306,7 +311,7 @@ impl Mountable for PassthroughVolume {
         }
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
+    async fn unlink(&self, path: &Path) -> Result<()> {
         let real = self.entry_path(path)?;
         if fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::IsADirectory);
@@ -315,7 +320,7 @@ impl Mountable for PassthroughVolume {
         Ok(())
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         // The whole overwrite contract is the kernel's here, and `From<io::Error>`
         // already carries its answers across: measured on macOS, `fs::rename` gives
         // `EISDIR` for file-over-directory, `ENOTDIR` for the reverse, `ENOTEMPTY`
@@ -327,7 +332,7 @@ impl Mountable for PassthroughVolume {
         Ok(())
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
+    async fn rmdir(&self, path: &Path) -> Result<()> {
         let real = self.entry_path(path)?;
         if !fs::symlink_metadata(&real)?.is_dir() {
             return Err(CortexError::NotADirectory);
@@ -339,7 +344,7 @@ impl Mountable for PassthroughVolume {
         Ok(())
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         options.validate()?;
         let real = self.real_path(path)?;
 

@@ -49,7 +49,10 @@ fn get_bytes(r: &mut impl Read) -> io::Result<Vec<u8>> {
     r.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len);
     if len > MAX_FIELD {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "field too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "field too large",
+        ));
     }
     let mut buf = vec![0u8; len as usize];
     r.read_exact(&mut buf)?;
@@ -83,7 +86,10 @@ impl ExecRequest {
         let name = get_str(&mut r)?;
         let count = get_u32(&mut r)?;
         if count > MAX_FIELD {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "arg count too large"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "arg count too large",
+            ));
         }
         let mut args = Vec::with_capacity(count as usize);
         for _ in 0..count {

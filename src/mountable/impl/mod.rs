@@ -6,11 +6,15 @@
 //! not compile an HTTP and TLS stack to do it.
 
 mod inmem;
+#[cfg(feature = "notion")]
+mod notion;
 mod passthrough;
 #[cfg(feature = "s3")]
 mod s3;
 
 pub use inmem::*;
+#[cfg(feature = "notion")]
+pub use notion::*;
 pub use passthrough::*;
 #[cfg(feature = "s3")]
 pub use s3::*;
