@@ -33,7 +33,8 @@ flowchart TB
         mem["InMemVolume"]
         pass["PassthroughVolume"]
         s3["S3Volume <i>(읽기 전용)</i>"]
-        future["Notion · … <i>(예정)</i>"]
+        notion["NotionVolume <i>(읽기 전용)</i>"]
+        future["… <i>(예정)</i>"]
     end
 
     krun --> posix
@@ -45,10 +46,16 @@ flowchart TB
     mountable --- mem
     mountable --- pass
     mountable --- s3
+    mountable --- notion
     mountable --- future
     ws -->|"합성"| mem
     ws -->|"합성"| pass
 ```
+
+마운트 테이블은 코드로 조립할 수도, **직렬화된 [`WorkspaceSpec`](src/workspace.rs)에서 복원**할
+수도 있습니다. 각 마운트는 [`VolumeSpec`](src/volume.rs)(`Local`/`S3`/`Notion`)으로 기술되고,
+`Workspace::from_spec`이 프로세스 경계 반대편에서 동일한 namespace를 다시 세웁니다 —
+아래 **`VolumeSpec`** 절 참조.
 
 점선이 이 구조에서 가장 중요한 부분입니다. **`PosixFs`는 공통 기반이 아니라
 "커널은 파일을 번호로 지칭한다"는 사실 때문에 필요한 번역 계층**입니다. 모든 동작이
@@ -61,6 +68,10 @@ flowchart TB
 
 backend가 구현하는 유일한 인터페이스입니다. **namespace/metadata 평면**은 경로로
 주소를 매기고, **data 평면**은 상태를 가진 핸들을 거칩니다.
+
+trait은 **async**입니다 — namespace/data 평면이 본래 비동기(객체 스토어, 문서 API)이기
+때문입니다. async-native 소비자(WebDAV/HTTP)는 이 메서드들을 곧바로 `.await`하고, 동기
+인터페이스 바인딩(krun/fuse/fuse-t)은 자기 콜백 경계에서 `block_on`합니다.
 
 | 연산 | 역할 |
 | --- | --- |
@@ -87,6 +98,16 @@ backend가 구현하는 유일한 인터페이스입니다. **namespace/metadata
 - **`rename`에 flags가 없는 이유** — `RENAME_NOREPLACE`/`RENAME_EXCHANGE`는 세 바인딩 중
   둘에는 도달하는데 libfuse-t의 `rename`에는 flags 인자 자체가 없습니다. 어디서나
   지킬 수 없는 계약은 계약이 아니므로, flags를 받는 바인딩이 `EINVAL`로 답합니다.
+- **`FileHandle::flush`와 `commit`이 갈라져 있는 이유** — `flush`는 버퍼를 밀어낼 뿐
+  **확정이 아닙니다**. FUSE `flush`는 매 `close()`마다(아직 쓰기가 들어오는 `dup`된 fd
+  포함), `fsync`는 도중에 옵니다. **확정은 `commit`**입니다 — 마지막 디스크립터가 닫힐 때
+  (FUSE `RELEASE`) S3 multipart 업로드 같은 걸 완결합니다. `flush`가 곧 자기 finalize인
+  프론트엔드(WebDAV `PUT`은 끝에서 한 번 flush)만 예외이고, 그건 그 프론트엔드의 몫입니다.
+- **`.await`가 진짜 non-blocking인 backend는 S3/Notion뿐** — `PassthroughVolume`/
+  `InMemVolume`은 시그니처만 async이고 안에서 블로킹 `std::fs`(또는 맵 락)를 yield 없이
+  부릅니다. 세 바인딩이 각자 스레드에서 `block_on`하는 지금은 무해하지만, executor에서
+  로컬 마운트를 곧바로 몰면 그 워커가 syscall 동안 멈춥니다 — async-native 프론트엔드는
+  `spawn_blocking`이 아니라 `block_in_place`로 감싸는 게 맞습니다.
 
 ### 곁딸린 타입들
 
@@ -183,6 +204,35 @@ let ws = Workspace::new()
 커널이 실제 마운트 두 개 사이의 이동은 스스로 처리하지만, `Workspace`의 내부 마운트
 테이블은 커널이 볼 수 없습니다. 그래서 커널은 물어보고, 이 계층이 답해야 합니다.
 
+## `VolumeSpec` — 프로세스 경계를 건너는 namespace
+
+[`src/volume.rs`](src/volume.rs) · [`WorkspaceSpec`](src/workspace.rs)
+
+라이브 `Workspace`는 열린 클라이언트와 런타임(S3 커넥션, Notion HTTP 클라이언트, tokio
+핸들)을 들고 있어 **다른 프로세스로 건너갈 수 없습니다.** 그런데 하나의 workspace를 사람은
+WebDAV로, 에이전트는 격리된 게스트 안에서 봐야 하고, 그 둘은 서로 다른 프로세스입니다.
+건너가는 것은 라이브 트리가 아니라 **namespace를 기술한 값**입니다.
+
+- **[`VolumeSpec`](src/volume.rs)** — 마운트 하나를 무엇으로 채울지 적은 serde 값:
+  `Local { host }` / `S3(S3Config)` / `Notion(NotionConfig)`. 벤더 설정과 크리덴셜만
+  담을 뿐 라이브 상태는 없습니다.
+- **[`WorkspaceSpec`](src/workspace.rs)** — 순서 있는 `(mount_path, VolumeSpec)` 목록,
+  즉 workspace의 namespace 그 자체. 프로세스 경계를 넘겨받은 쪽이
+  `Workspace::from_spec`으로 자기 쪽 라이브 트리를 세우면 양쪽 namespace가 동일해집니다.
+
+`VolumeSpec`은 두 갈래로 실체화됩니다 — 소비자가 어느 문으로 들어오는지에 따라:
+
+| 빌더 | 반환 | 쓰는 곳 |
+| --- | --- | --- |
+| `build_mountable()` | `Box<dyn DynMountable>` | `Workspace`(`from_spec`)가 마운트 테이블에 담음 |
+| `build()` | `Box<dyn msb_krun::DynFileSystem>` (`PosixFs`로 감쌈) | krun 바인딩이 `VolumeSpec` 하나를 게스트 fs로 바로 붙임 |
+
+namespace만 건너갑니다. 라이브 인스턴스의 `born` 타임스탬프는 넘어가지 않고 각
+`from_spec` 빌드가 자기 것을 새로 잡습니다(합성 디렉터리 mtime이 한 인스턴스 수명 동안만
+고정이면 충분하기 때문 — 위 **합성 디렉터리** 절 참조).
+같은 경로가 spec에 두 번 나오면 `mount`과 똑같이 `AlreadyExists`로 거부하며, 그 검사는
+`build_mountable`보다 **먼저** 일어나 중복 경로가 클라이언트를 열었다 버리는 일이 없습니다.
+
 ## `PosixFs<T>` — 커널을 위한 번역
 
 [`volume/posix.rs`](posix.rs)
@@ -272,8 +322,15 @@ cortex 탓이 아님도 확인했습니다 — 하드코딩된 `fuser` 파일시
   모든 연산을 `std::fs`로 통과시킵니다. 선행 `/`와 `.`은 무시하고 `..`(및 OS prefix)는
   거절해서 요청이 root를 벗어날 수 없습니다. `std::fs::File`이 그대로 `FileHandle`이라
   핸들 구현이 필요 없습니다.
-- **S3 · Notion 등** *(예정)* — 이들이 `Stat`의 필드 대부분을 `Option`으로 만들고
-  `Dirent::stat`을 존재하게 한 이유입니다.
+- **[`S3Volume`](src/mountable/impl/s3.rs)** *(`s3` feature, 읽기 경로)* — 버킷을
+  `object_store`로 읽습니다. 쓰기는 `ReadOnly`로 답합니다 — `Unsupported`가 아닌 이유는
+  스토어가 *할 수는* 있고 이 마운트가 안 여는 것뿐이라, 옆의 쓰기 가능한 마운트까지
+  막지 않기 위해서입니다.
+- **[`NotionVolume`](src/mountable/impl/notion.rs)** *(`notion` feature, 읽기 경로)* —
+  Notion workspace의 페이지 트리를 파일로 노출합니다(HTTP API). 마찬가지로 쓰기는
+  `ReadOnly`.
+- 이 둘이 `Stat`의 필드 대부분을 `Option`으로 만들고 `Dirent::stat`을 존재하게 한
+  이유입니다 — 로컬 파일과 달리 객체·페이지는 노출하는 메타데이터 집합이 다릅니다.
 
 ## 설계 원칙
 
@@ -285,9 +342,10 @@ cortex 탓이 아님도 확인했습니다 — 하드코딩된 `fuser` 파일시
    쓰기까지 함께 앗아갑니다. 그래서 `ReadOnly`와 `CrossDevice`가 별도 변형으로 있습니다.
    `EACCES`와 `EIO`를 합치면 읽을 수 없는 파일 하나에 `find`/`rsync`/`tar`의 순회 전체를
    잃습니다.
-3. **기본값은 의존성 0이다.** 크레이트의 자체 계층(`Mountable`, `Workspace`, inode 부기)은
-   의존성이 전혀 필요 없고, 인터페이스 바인딩은 각각 무거운 걸 하나씩 들고 옵니다.
-   하나라도 기본으로 켜면 모든 소비자에게 그 값을 청구합니다.
+3. **기본값은 인터페이스 바인딩 0이다.** 크레이트의 자체 계층(`Mountable`, `Workspace`,
+   inode 부기)은 인터페이스 의존성이 없고(wire용 `serde_json`, async trait용 `async-trait`
+   뿐), 인터페이스 바인딩은 각각 무거운 걸 하나씩 들고 옵니다. 하나라도 기본으로 켜면
+   모든 소비자에게 그 값을 청구합니다.
 4. **계층의 책임 경계** — cortex는 **저장소의 모양과 파일시스템 프로토콜**을 압니다.
    벤더, 크리덴셜, 에이전트, 세션은 알지 못합니다. 그것들은 위 계층의 몫입니다.
 
@@ -295,16 +353,20 @@ cortex 탓이 아님도 확인했습니다 — 하드코딩된 `fuser` 파일시
 
 | feature | 내용 | 딸려 오는 크레이트 |
 | --- | --- | --- |
-| `default = []` | 크레이트의 자체 계층만 | **0** |
-| `fuse-t` | `dep:libc` | **1** |
-| `fuse` | `dep:fuser`, `dep:libc` | **34** |
-| `krun` | `dep:msb_krun`, `dep:libc`, `dep:tempfile` | **65** (VMM 트리 전체) |
-| `fuse-no-mount` | `fuse` + `fuser/macos-no-mount` — 마운트 제공자 없이 컴파일·테스트 | 34 |
+| `default = []` | 자체 계층 + 항상 필요한 `serde_json`(wire)·`async-trait`(async trait) | **12** |
+| `fuse-t` | `dep:libc`, `dep:tokio` | **17** |
+| `fuse` | `dep:fuser`, `dep:libc`, `dep:tokio` | **45** |
+| `krun` | `dep:msb_krun`, `dep:libc`, `dep:tempfile`, `dep:tokio` | **74** (VMM 트리 전체) |
+| `s3` | `dep:object_store`, `dep:tokio` | **131** (HTTP·TLS 스택) |
+| `notion` | `dep:reqwest`, `dep:uuid`, `dep:chrono`, `dep:tokio` | **95** |
+| `fuse-no-mount` | `fuse` + `fuser/macos-no-mount` — 마운트 제공자 없이 컴파일·테스트 | 45 |
 
-실측한 크레이트 수가 `default = []`의 근거입니다. HTTP로 파일만 서빙하려는 소비자가
-하이퍼바이저를 컴파일할 이유가 없습니다. (측정 명령은 `Cargo.toml`의 `[features]` 주석에
-적혀 있습니다. normal 엣지만 세므로 무조건 딸려 오는 build-dep `cc`/`pkg-config`는
-제외됩니다.)
+실측한 크레이트 수가 **기본값이 인터페이스 바인딩을 하나도 켜지 않는** 근거입니다. HTTP로
+파일만 서빙하려는 소비자가 하이퍼바이저(krun 74)나 객체 스토어 스택(s3 131)을 컴파일할
+이유가 없습니다. `default`의 12개는 인터페이스가 아니라 wire/`Executable`용 `serde_json`과
+async trait용 `async-trait`이며, 모든 바인딩이 async 실행을 위해 `tokio`를 더 얹습니다.
+(측정 명령은 `Cargo.toml`의 `[features]` 주석에 있습니다. normal 엣지만 세므로 무조건
+딸려 오는 build-dep `cc`/`pkg-config`는 제외됩니다.)
 
 `fuse`와 `fuse-t`가 **서로 독립**이라 어떤 기본 조합으로도 모든 바인딩을 한 번에 덮을 수
 없습니다. 그래서 전체 커버리지는 처음부터 스윕이고, 명령은
@@ -346,8 +408,8 @@ WebDAV는 agent-k가 의존성으로 직접 들고 씁니다.
 
 | 층 | 방법 |
 | --- | --- |
-| 단위 | `cargo test -p cortex --lib` — 기본 107개, `--features fuse-no-mount,krun,s3` 167개. 두 숫자 모두 `console` 쪽 테스트를 포함합니다. 테스트는 `#[path]`로 `*_tests.rs` 형제 파일에 두면서 private 항목 접근을 유지합니다 |
-| 조합 | feature 조합 7개 스윕 — 명령은 `Cargo.toml`의 `[features]` 주석에 |
+| 단위 | `cargo test -p cortex --lib` — 기본 131개, `--features fuse-no-mount,krun,s3,notion` 184개. 두 숫자 모두 `console` 쪽 테스트를 포함합니다. 테스트는 `#[path]`로 `*_tests.rs` 형제 파일에 두면서 private 항목 접근을 유지합니다 |
+| 조합 | feature 조합 9개 스윕 — 명령은 `Cargo.toml`의 `[features]` 주석에 |
 | 실제 마운트 | [`cortex/tests/host_mount.rs`](../../tests/host_mount.rs) — `#[ignore]`, `--test-threads=1` **필수**. FUSE-T의 `go-nfsv4` 헬퍼가 동시 마운트 3개에서 멈춥니다 |
 | 실제 게스트 | [`cortex/src/bin/apply_krun.rs`](../bin/apply_krun.rs) — microVM을 띄워 게스트 안에서 읽고 씁니다. macOS는 `com.apple.security.hypervisor` 엔타이틀먼트로 재서명 필요 |
 | 수동 | [`cortex/examples/mount_host.rs`](../../examples/mount_host.rs) |

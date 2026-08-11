@@ -18,8 +18,10 @@
 //! covered only by `tests/host_mount.rs`, which is `#[ignore]`d because it needs a
 //! real mount — so a plain `cargo test` exercises none of it.
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
@@ -27,14 +29,12 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
-use crate::volume::Mountable;
-use crate::volume::PosixFs;
 use crate::volume::posix::{
     BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
     decode_open_flags, host_errno,
 };
+use crate::volume::{DirentKind, Mountable, PosixFs, SetAttr, Stat};
 use crate::{CortexError, Result};
-use crate::volume::{DirentKind, SetAttr, Stat};
 
 /// Host numbering, where the krun binding's is Linux's — `O_TRUNC` is not the
 /// same number on the two.
@@ -165,7 +165,7 @@ fn to_file_attr(inode: u64, stat: &Stat) -> FileAttr {
 /// needs no such bound.
 impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self.lookup_child(parent.0, name) {
+        match super::block_on(self.lookup_child(parent.0, name)) {
             Ok((inode, stat)) => reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0)),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -176,7 +176,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.stat_inode(ino.0) {
+        match super::block_on(self.stat_inode(ino.0)) {
             Ok(stat) => reply.attr(&TTL, &to_file_attr(ino.0, &stat)),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -187,7 +187,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
             Ok(options) => options,
             Err(err) => return reply.error(to_errno(err)),
         };
-        match self.open_inode(ino.0, options) {
+        match super::block_on(self.open_inode(ino.0, options)) {
             Ok((fh, _stat)) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -205,7 +205,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        match self.read_handle(fh.0, offset, size) {
+        match super::block_on(self.read_handle(fh.0, offset, size)) {
             Ok(data) => reply.data(&data),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -221,7 +221,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        match self.release_handle(fh.0) {
+        match super::block_on(self.release_handle(fh.0)) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -237,13 +237,16 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
     ) {
         // The cursor protocol is the shared operation's; this closure only
         // encodes. `add` returning true is the `stop` flag.
-        let streamed = self.for_each_dirent(ino.0, offset, |child_inode, child, cursor| {
-            let kind = match child.kind {
-                DirentKind::Dir => FileType::Directory,
-                DirentKind::File => FileType::RegularFile,
-            };
-            Ok(reply.add(INodeNo(child_inode), cursor, kind, &child.name))
-        });
+        let streamed =
+            super::block_on(
+                self.for_each_dirent(ino.0, offset, |child_inode, child, cursor| {
+                    let kind = match child.kind {
+                        DirentKind::Dir => FileType::Directory,
+                        DirentKind::File => FileType::RegularFile,
+                    };
+                    Ok(reply.add(INodeNo(child_inode), cursor, kind, &child.name))
+                }),
+            );
         match streamed {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
@@ -266,7 +269,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
             Err(err) => return reply.error(to_errno(err)),
         };
 
-        match self.create_child(parent.0, name, options) {
+        match super::block_on(self.create_child(parent.0, name, options)) {
             Ok((inode, stat, fh)) => reply.created(
                 &TTL,
                 &to_file_attr(inode, &stat),
@@ -292,7 +295,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         reply: fuser::ReplyWrite,
     ) {
         // No staging temp file, unlike krun: `fuser` hands over a plain slice.
-        match self.write_handle(fh.0, offset, data) {
+        match super::block_on(self.write_handle(fh.0, offset, data)) {
             Ok(written) => reply.written(written as u32),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -307,7 +310,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         reply: ReplyEmpty,
     ) {
         // Not `release_handle`: this arrives on every `close()`.
-        match self.flush_handle(fh.0) {
+        match super::block_on(self.flush_handle(fh.0)) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -321,7 +324,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        match self.flush_handle(fh.0) {
+        match super::block_on(self.flush_handle(fh.0)) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -336,21 +339,21 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        match self.mkdir_child(parent.0, name) {
+        match super::block_on(self.mkdir_child(parent.0, name)) {
             Ok((inode, stat)) => reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0)),
             Err(err) => reply.error(to_errno(err)),
         }
     }
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.unlink_child(parent.0, name) {
+        match super::block_on(self.unlink_child(parent.0, name)) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
         }
     }
 
     fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        match self.rmdir_child(parent.0, name) {
+        match super::block_on(self.rmdir_child(parent.0, name)) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -376,7 +379,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
             reply.error(Errno::from_i32(libc::EINVAL));
             return;
         }
-        match self.rename_child(parent.0, name, newparent.0, newname) {
+        match super::block_on(self.rename_child(parent.0, name, newparent.0, newname)) {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),
         }
@@ -411,7 +414,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
             atime: None,
             mtime: None,
         };
-        match self.setattr_inode(ino.0, fh.map(|fh| fh.0), want) {
+        match super::block_on(self.setattr_inode(ino.0, fh.map(|fh| fh.0), want)) {
             Ok(stat) => reply.attr(&TTL, &to_file_attr(ino.0, &stat)),
             Err(err) => reply.error(to_errno(err)),
         }

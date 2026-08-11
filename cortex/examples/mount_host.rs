@@ -40,11 +40,16 @@ fn main() {
     });
 
     let vol = InMemVolume::new();
-    let (file, _) = vol
-        .open(Path::new("hello.txt"), OpenOptions::create_new())
-        .expect("fresh volume");
-    file.write_all_at(b"Hello from cortex!\n", 0).unwrap();
-    vol.mkdir(Path::new("sub")).unwrap();
+    // The `Mountable` data plane is async; drive this one-off setup on a
+    // throwaway runtime before mounting.
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let (file, _) = vol
+            .open(Path::new("hello.txt"), OpenOptions::create_new())
+            .await
+            .expect("fresh volume");
+        file.write_all_at(b"Hello from cortex!\n", 0).await.unwrap();
+        vol.mkdir(Path::new("sub")).await.unwrap();
+    });
 
     let workspace = Workspace::new()
         .try_with_mount("", vol)

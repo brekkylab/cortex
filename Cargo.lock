@@ -381,17 +381,22 @@ name = "cortex"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bson",
  "cc",
+ "chrono",
  "fuser",
  "futures-core",
  "libc",
  "msb_krun",
  "object_store",
  "pkg-config",
+ "reqwest",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

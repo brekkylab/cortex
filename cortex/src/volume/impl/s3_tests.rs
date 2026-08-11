@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use object_store::ObjectStoreExt;
-use object_store::memory::InMemory;
-use object_store::path::Path as OsPath;
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path as OsPath};
 
 use super::*;
 
@@ -25,16 +23,14 @@ fn under(prefix: &str) -> S3Volume {
 
 /// A volume holding `keys`, each with the given body. Keys are absolute in the
 /// store, so a test that also wants a prefix states it in both places.
-fn holding(prefix: &str, keys: &[(&str, &str)]) -> S3Volume {
+async fn holding(prefix: &str, keys: &[(&str, &str)]) -> S3Volume {
     let store = Arc::new(InMemory::new());
-    runtime().expect("runtime").block_on(async {
-        for (key, body) in keys {
-            store
-                .put(&OsPath::from(*key), body.to_string().into())
-                .await
-                .expect("put");
-        }
-    });
+    for (key, body) in keys {
+        store
+            .put(&OsPath::from(*key), body.to_string().into())
+            .await
+            .expect("put");
+    }
     S3Volume::with_store(store, prefix.to_string())
 }
 
@@ -299,14 +295,27 @@ fn curdir_and_root_components_are_ignored() {
 
 /// Every write answers `ReadOnly`, never `Unsupported`: the store could write, this
 /// backend will not, and `EROFS` is the state userspace has a path for.
-#[test]
-fn every_namespace_write_is_read_only() {
+#[tokio::test]
+async fn every_namespace_write_is_read_only() {
     let vol = empty();
-    assert_eq!(label(&vol.mkdir(Path::new("d")).unwrap_err()), "ReadOnly");
-    assert_eq!(label(&vol.unlink(Path::new("f")).unwrap_err()), "ReadOnly");
-    assert_eq!(label(&vol.rmdir(Path::new("d")).unwrap_err()), "ReadOnly");
     assert_eq!(
-        label(&Mountable::rename(&vol, Path::new("a"), Path::new("b")).unwrap_err()),
+        label(&vol.mkdir(Path::new("d")).await.unwrap_err()),
+        "ReadOnly"
+    );
+    assert_eq!(
+        label(&vol.unlink(Path::new("f")).await.unwrap_err()),
+        "ReadOnly"
+    );
+    assert_eq!(
+        label(&vol.rmdir(Path::new("d")).await.unwrap_err()),
+        "ReadOnly"
+    );
+    assert_eq!(
+        label(
+            &Mountable::rename(&vol, Path::new("a"), Path::new("b"))
+                .await
+                .unwrap_err()
+        ),
         "ReadOnly"
     );
 }
@@ -314,18 +323,18 @@ fn every_namespace_write_is_read_only() {
 /// `write_at` returns `io::Error`, so read-only has to travel as
 /// `ErrorKind::ReadOnlyFilesystem` — the one kind `From<io::Error>` turns back into
 /// `ReadOnly`. `ErrorKind::Unsupported` would arrive as ENOSYS instead.
-#[test]
-fn a_handle_refuses_writes_as_read_only_not_unsupported() {
+#[tokio::test]
+async fn a_handle_refuses_writes_as_read_only_not_unsupported() {
     let handle = S3Handle {
         store: Arc::new(InMemory::new()),
         key: OsPath::from("f"),
         size: 0,
         cache: Mutex::default(),
     };
-    let err = FileExt::write_at(&handle, b"x", 0).unwrap_err();
+    let err = FileExt::write_at(&handle, b"x", 0).await.unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::ReadOnlyFilesystem);
     assert_eq!(label(&CortexError::from(err)), "ReadOnly");
-    assert_eq!(label(&handle.truncate(1).unwrap_err()), "ReadOnly");
+    assert_eq!(label(&handle.truncate(1).await.unwrap_err()), "ReadOnly");
 }
 
 /// A listing that fails must not read as "no children" — [`children_from`] gives the
@@ -359,10 +368,10 @@ fn a_failed_listing_is_not_an_absent_path() {
 
 /// A file carries everything the listing knew, not just its size — the fields a
 /// consumer needs for cache validation.
-#[test]
-fn a_file_reports_its_size_and_metadata() {
-    let vol = holding("", &[("a.txt", "hello")]);
-    let stat = vol.stat(Path::new("a.txt")).expect("stat");
+#[tokio::test]
+async fn a_file_reports_its_size_and_metadata() {
+    let vol = holding("", &[("a.txt", "hello")]).await;
+    let stat = vol.stat(Path::new("a.txt")).await.expect("stat");
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, 5);
     assert!(
@@ -374,39 +383,43 @@ fn a_file_reports_its_size_and_metadata() {
 
 /// The root is a directory by construction. Answering it without a round trip
 /// matters because every mount begins with a `getattr` on it.
-#[test]
-fn the_root_is_a_directory() {
+#[tokio::test]
+async fn the_root_is_a_directory() {
     let stat = holding("", &[("a.txt", "x")])
+        .await
         .stat(Path::new(""))
+        .await
         .expect("stat root");
     assert_eq!(stat.kind, DirentKind::Dir);
 
     // Same when the volume is rooted under a key prefix that has no object of its
     // own — the prefix root is still a directory.
     let stat = holding("root", &[("root/a.txt", "x")])
+        .await
         .stat(Path::new(""))
+        .await
         .expect("stat prefix root");
     assert_eq!(stat.kind, DirentKind::Dir);
 }
 
 /// A prefix is a directory even though no object has that key. `head` 404s and the
 /// listing fallback is what finds the children.
-#[test]
-fn a_prefix_with_children_is_a_directory() {
-    let vol = holding("", &[("dir/a.txt", "x")]);
+#[tokio::test]
+async fn a_prefix_with_children_is_a_directory() {
+    let vol = holding("", &[("dir/a.txt", "x")]).await;
     assert_eq!(
-        vol.stat(Path::new("dir")).expect("stat dir").kind,
+        vol.stat(Path::new("dir")).await.expect("stat dir").kind,
         DirentKind::Dir
     );
 }
 
 /// An object whose key equals a prefix and whose body is empty is a folder marker. `head` *succeeds* on it, so reporting what `head` said would call
 /// the directory a 0-byte file and the guest could not descend into it.
-#[test]
-fn a_zero_byte_marker_with_children_is_a_directory() {
-    let vol = holding("", &[("dir", ""), ("dir/a.txt", "x")]);
+#[tokio::test]
+async fn a_zero_byte_marker_with_children_is_a_directory() {
+    let vol = holding("", &[("dir", ""), ("dir/a.txt", "x")]).await;
     assert_eq!(
-        vol.stat(Path::new("dir")).expect("stat marker").kind,
+        vol.stat(Path::new("dir")).await.expect("stat marker").kind,
         DirentKind::Dir,
         "a marker with children must be traversable"
     );
@@ -414,10 +427,13 @@ fn a_zero_byte_marker_with_children_is_a_directory() {
 
 /// The other side of that: a genuinely empty file is a file. `_SUCCESS` and
 /// `.gitkeep` are not directories just because they are empty.
-#[test]
-fn a_zero_byte_file_without_children_stays_a_file() {
-    let vol = holding("", &[("_SUCCESS", "")]);
-    let stat = vol.stat(Path::new("_SUCCESS")).expect("stat empty file");
+#[tokio::test]
+async fn a_zero_byte_file_without_children_stays_a_file() {
+    let vol = holding("", &[("_SUCCESS", "")]).await;
+    let stat = vol
+        .stat(Path::new("_SUCCESS"))
+        .await
+        .expect("stat empty file");
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, 0);
 }
@@ -426,12 +442,12 @@ fn a_zero_byte_file_without_children_stays_a_file() {
 /// cannot answer this by itself: a missing prefix returns an empty result rather
 /// than an error, so without the emptiness check every path would look like a
 /// directory.
-#[test]
-fn a_missing_path_is_not_found() {
-    let vol = holding("", &[("dir/a.txt", "x")]);
+#[tokio::test]
+async fn a_missing_path_is_not_found() {
+    let vol = holding("", &[("dir/a.txt", "x")]).await;
     for missing in ["nope", "dir/nope", "nope/deeper"] {
         assert_eq!(
-            label(&vol.stat(Path::new(missing)).unwrap_err()),
+            label(&vol.stat(Path::new(missing)).await.unwrap_err()),
             "NotFound",
             "path {missing:?}"
         );
@@ -440,12 +456,12 @@ fn a_missing_path_is_not_found() {
 
 /// The prefix composes with the request path, so a volume rooted at `root` sees
 /// `root/a.txt` when asked for `a.txt` — and cannot see anything outside it.
-#[test]
-fn stat_resolves_through_the_key_prefix() {
-    let vol = holding("root", &[("root/a.txt", "hello"), ("outside.txt", "no")]);
-    assert_eq!(vol.stat(Path::new("a.txt")).expect("stat").size, 5);
+#[tokio::test]
+async fn stat_resolves_through_the_key_prefix() {
+    let vol = holding("root", &[("root/a.txt", "hello"), ("outside.txt", "no")]).await;
+    assert_eq!(vol.stat(Path::new("a.txt")).await.expect("stat").size, 5);
     assert_eq!(
-        label(&vol.stat(Path::new("outside.txt")).unwrap_err()),
+        label(&vol.stat(Path::new("outside.txt")).await.unwrap_err()),
         "NotFound",
         "a key beside the prefix is not visible through it"
     );
@@ -455,9 +471,10 @@ fn stat_resolves_through_the_key_prefix() {
 
 /// Names in a listing, as `kind:name`, sorted — enough to assert both what is there
 /// and what kind each entry claims to be.
-fn listed(vol: &S3Volume, path: &str) -> Vec<String> {
+async fn listed(vol: &S3Volume, path: &str) -> Vec<String> {
     let mut names: Vec<_> = vol
         .list(Path::new(path))
+        .await
         .expect("list")
         .into_iter()
         .map(|entry| {
@@ -474,8 +491,8 @@ fn listed(vol: &S3Volume, path: &str) -> Vec<String> {
 
 /// One level, not the whole subtree: a listing names the entries directly under the
 /// path, with deeper keys rolled into the directory they sit in.
-#[test]
-fn a_listing_names_one_level() {
+#[tokio::test]
+async fn a_listing_names_one_level() {
     let vol = holding(
         "",
         &[
@@ -484,17 +501,21 @@ fn a_listing_names_one_level() {
             ("dir/sub/c.txt", "z"),
             ("dir2/d.txt", "w"),
         ],
+    )
+    .await;
+    assert_eq!(
+        listed(&vol, "").await,
+        ["dir:dir", "dir:dir2", "file:a.txt"]
     );
-    assert_eq!(listed(&vol, ""), ["dir:dir", "dir:dir2", "file:a.txt"]);
-    assert_eq!(listed(&vol, "dir"), ["dir:sub", "file:b.txt"]);
+    assert_eq!(listed(&vol, "dir").await, ["dir:sub", "file:b.txt"]);
 }
 
 /// The listing already carries each object's metadata, so the entry does too.
 /// This is what lets a `readdirplus` answer without a `stat` per name.
-#[test]
-fn a_listing_carries_metadata_it_already_had() {
-    let vol = holding("", &[("a.txt", "hello")]);
-    let entries = vol.list(Path::new("")).expect("list");
+#[tokio::test]
+async fn a_listing_carries_metadata_it_already_had() {
+    let vol = holding("", &[("a.txt", "hello")]).await;
+    let entries = vol.list(Path::new("")).await.expect("list");
     let file = entries
         .iter()
         .find(|e| e.name == "a.txt")
@@ -507,11 +528,12 @@ fn a_listing_carries_metadata_it_already_had() {
 
 /// A directory has no metadata to carry: a prefix is not an object, so there is
 /// nothing the listing could have known about it.
-#[test]
-fn a_listed_directory_carries_no_metadata() {
-    let vol = holding("", &[("dir/a.txt", "x")]);
+#[tokio::test]
+async fn a_listed_directory_carries_no_metadata() {
+    let vol = holding("", &[("dir/a.txt", "x")]).await;
     let dir = vol
         .list(Path::new(""))
+        .await
         .expect("list")
         .into_iter()
         .find(|e| e.name == "dir")
@@ -521,20 +543,20 @@ fn a_listed_directory_carries_no_metadata() {
 
 /// A folder marker surfaces as an object *at its own level* — the key equals the
 /// prefix being listed. It is this directory, not an entry inside it.
-#[test]
-fn a_marker_is_not_an_entry_in_its_own_directory() {
-    let vol = holding("", &[("dir", ""), ("dir/a.txt", "x")]);
-    assert_eq!(listed(&vol, "dir"), ["file:a.txt"]);
+#[tokio::test]
+async fn a_marker_is_not_an_entry_in_its_own_directory() {
+    let vol = holding("", &[("dir", ""), ("dir/a.txt", "x")]).await;
+    assert_eq!(listed(&vol, "dir").await, ["file:a.txt"]);
 }
 
 /// The zero-byte branch of a name collision: it arrives from both `common_prefixes` and
 /// `objects`, and a `readdir` may not repeat a name. An empty body means the object
 /// stands for the directory, so the object goes and the directory stays.
-#[test]
-fn a_zero_byte_object_yields_to_the_directory_of_the_same_name() {
-    let vol = holding("", &[("dir/sub", ""), ("dir/sub/c.txt", "z")]);
+#[tokio::test]
+async fn a_zero_byte_object_yields_to_the_directory_of_the_same_name() {
+    let vol = holding("", &[("dir/sub", ""), ("dir/sub/c.txt", "z")]).await;
     assert_eq!(
-        listed(&vol, "dir"),
+        listed(&vol, "dir").await,
         ["dir:sub"],
         "the name must appear once, as the directory"
     );
@@ -543,11 +565,11 @@ fn a_zero_byte_object_yields_to_the_directory_of_the_same_name() {
 /// The other branch: an object with a body is real content and cannot be
 /// hidden, so the directory yields instead. Its subtree becomes unreachable — the
 /// cost this rule accepts, and the reason the branch turns on size.
-#[test]
-fn an_object_with_content_wins_over_the_directory_of_the_same_name() {
-    let vol = holding("", &[("dir/sub", "eleven byte"), ("dir/sub/c.txt", "z")]);
+#[tokio::test]
+async fn an_object_with_content_wins_over_the_directory_of_the_same_name() {
+    let vol = holding("", &[("dir/sub", "eleven byte"), ("dir/sub/c.txt", "z")]).await;
     assert_eq!(
-        listed(&vol, "dir"),
+        listed(&vol, "dir").await,
         ["file:sub"],
         "the name must appear once, as the file"
     );
@@ -556,18 +578,19 @@ fn an_object_with_content_wins_over_the_directory_of_the_same_name() {
 /// `list` and `stat` have to agree, or a kernel gets a directory from `readdir` and a
 /// file from the `lookup` that follows. They agree by reading the same fact — the
 /// object's size — rather than by consulting each other.
-#[test]
-fn list_and_stat_agree_on_a_name_that_is_both() {
+#[tokio::test]
+async fn list_and_stat_agree_on_a_name_that_is_both() {
     for (body, want) in [("", DirentKind::Dir), ("eleven byte", DirentKind::File)] {
-        let vol = holding("", &[("dir/sub", body), ("dir/sub/c.txt", "z")]);
+        let vol = holding("", &[("dir/sub", body), ("dir/sub/c.txt", "z")]).await;
         let listed_kind = vol
             .list(Path::new("dir"))
+            .await
             .expect("list")
             .into_iter()
             .find(|e| e.name == "sub")
             .expect("sub listed")
             .kind;
-        let stat_kind = vol.stat(Path::new("dir/sub")).expect("stat").kind;
+        let stat_kind = vol.stat(Path::new("dir/sub")).await.expect("stat").kind;
         assert_eq!(listed_kind, want, "list disagreed for body {body:?}");
         assert_eq!(stat_kind, want, "stat disagreed for body {body:?}");
     }
@@ -575,25 +598,26 @@ fn list_and_stat_agree_on_a_name_that_is_both() {
 
 /// An empty directory lists as empty rather than failing — and a path that is not a
 /// directory at all is `NotFound`, which is `stat`'s job to have established.
-#[test]
-fn listing_a_missing_prefix_is_empty() {
-    let vol = holding("", &[("dir/a.txt", "x")]);
-    assert!(listed(&vol, "nope").is_empty());
+#[tokio::test]
+async fn listing_a_missing_prefix_is_empty() {
+    let vol = holding("", &[("dir/a.txt", "x")]).await;
+    assert!(listed(&vol, "nope").await.is_empty());
 }
 
-#[test]
-fn list_resolves_through_the_key_prefix() {
-    let vol = holding("root", &[("root/a.txt", "x"), ("outside.txt", "no")]);
-    assert_eq!(listed(&vol, ""), ["file:a.txt"]);
+#[tokio::test]
+async fn list_resolves_through_the_key_prefix() {
+    let vol = holding("root", &[("root/a.txt", "x"), ("outside.txt", "no")]).await;
+    assert_eq!(listed(&vol, "").await, ["file:a.txt"]);
 }
 
 // ----------------------------------------------------------------------- open
 
-#[test]
-fn opening_a_file_yields_its_metadata_with_the_handle() {
-    let vol = holding("", &[("a.txt", "hello")]);
+#[tokio::test]
+async fn opening_a_file_yields_its_metadata_with_the_handle() {
+    let vol = holding("", &[("a.txt", "hello")]).await;
     let (handle, stat) = vol
         .open(Path::new("a.txt"), OpenOptions::read_only())
+        .await
         .expect("open");
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, 5);
@@ -608,9 +632,9 @@ fn opening_a_file_yields_its_metadata_with_the_handle() {
 
 /// Every write intent is refused, and before the network is touched — the answer does
 /// not depend on the object.
-#[test]
-fn opening_for_writing_is_read_only() {
-    let vol = holding("", &[("a.txt", "hello")]);
+#[tokio::test]
+async fn opening_for_writing_is_read_only() {
+    let vol = holding("", &[("a.txt", "hello")]).await;
     let write_intents = [
         OpenOptions::read_write(),
         OpenOptions::create_new(),
@@ -620,7 +644,7 @@ fn opening_for_writing_is_read_only() {
     ];
     for options in write_intents {
         assert_eq!(
-            label(&vol.open(Path::new("a.txt"), options).unwrap_err()),
+            label(&vol.open(Path::new("a.txt"), options).await.unwrap_err()),
             "ReadOnly",
             "options {options:?}"
         );
@@ -629,12 +653,13 @@ fn opening_for_writing_is_read_only() {
 
 /// The one self-contradictory combination is the trait's to reject, and this backend
 /// routes through it rather than re-deriving the rule.
-#[test]
-fn opening_for_neither_reading_nor_writing_is_invalid() {
-    let vol = holding("", &[("a.txt", "hello")]);
+#[tokio::test]
+async fn opening_for_neither_reading_nor_writing_is_invalid() {
+    let vol = holding("", &[("a.txt", "hello")]).await;
     assert_eq!(
         label(
             &vol.open(Path::new("a.txt"), OpenOptions::default())
+                .await
                 .unwrap_err()
         ),
         "InvalidArgument"
@@ -644,13 +669,14 @@ fn opening_for_neither_reading_nor_writing_is_invalid() {
 /// A directory cannot be opened — including the root, a bare prefix, and a 0-byte
 /// marker standing for one. The last is the case that would otherwise read as an
 /// empty file.
-#[test]
-fn opening_a_directory_says_so() {
-    let vol = holding("", &[("dir", ""), ("dir/a.txt", "x"), ("plain/b.txt", "y")]);
+#[tokio::test]
+async fn opening_a_directory_says_so() {
+    let vol = holding("", &[("dir", ""), ("dir/a.txt", "x"), ("plain/b.txt", "y")]).await;
     for dir in ["", "dir", "plain"] {
         assert_eq!(
             label(
                 &vol.open(Path::new(dir), OpenOptions::read_only())
+                    .await
                     .unwrap_err()
             ),
             "IsADirectory",
@@ -659,12 +685,13 @@ fn opening_a_directory_says_so() {
     }
 }
 
-#[test]
-fn opening_a_missing_key_is_not_found() {
-    let vol = holding("", &[("a.txt", "x")]);
+#[tokio::test]
+async fn opening_a_missing_key_is_not_found() {
+    let vol = holding("", &[("a.txt", "x")]).await;
     assert_eq!(
         label(
             &vol.open(Path::new("nope"), OpenOptions::read_only())
+                .await
                 .unwrap_err()
         ),
         "NotFound"
@@ -679,51 +706,52 @@ fn ruler(len: usize) -> String {
     (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect()
 }
 
-fn open_reader(body: &str) -> S3Handle {
-    let vol = holding("", &[("big.bin", body)]);
+async fn open_reader(body: &str) -> S3Handle {
+    let vol = holding("", &[("big.bin", body)]).await;
     vol.open(Path::new("big.bin"), OpenOptions::read_only())
+        .await
         .expect("open")
         .0
 }
 
-#[test]
-fn a_read_returns_the_bytes_at_that_offset() {
+#[tokio::test]
+async fn a_read_returns_the_bytes_at_that_offset() {
     let body = ruler(1000);
-    let handle = open_reader(&body);
+    let handle = open_reader(&body).await;
     let mut buf = vec![0u8; 100];
-    assert_eq!(handle.read_at(&mut buf, 400).expect("read"), 100);
+    assert_eq!(handle.read_at(&mut buf, 400).await.expect("read"), 100);
     assert_eq!(buf, body.as_bytes()[400..500]);
 }
 
 /// Past the end is EOF, and answered without asking the store — the size the open
 /// recorded is enough.
-#[test]
-fn a_read_past_the_end_is_empty() {
-    let handle = open_reader(&ruler(100));
+#[tokio::test]
+async fn a_read_past_the_end_is_empty() {
+    let handle = open_reader(&ruler(100)).await;
     let mut buf = vec![0u8; 10];
-    assert_eq!(handle.read_at(&mut buf, 100).expect("read"), 0);
-    assert_eq!(handle.read_at(&mut buf, 1000).expect("read"), 0);
+    assert_eq!(handle.read_at(&mut buf, 100).await.expect("read"), 0);
+    assert_eq!(handle.read_at(&mut buf, 1000).await.expect("read"), 0);
 }
 
 /// A request straddling the end is clamped, not rejected. An unclamped range would
 /// come back as the store's generic error, indistinguishable from a real failure.
-#[test]
-fn a_read_crossing_the_end_returns_what_exists() {
+#[tokio::test]
+async fn a_read_crossing_the_end_returns_what_exists() {
     let body = ruler(100);
-    let handle = open_reader(&body);
+    let handle = open_reader(&body).await;
     let mut buf = vec![0u8; 50];
-    assert_eq!(handle.read_at(&mut buf, 80).expect("read"), 20);
+    assert_eq!(handle.read_at(&mut buf, 80).await.expect("read"), 20);
     assert_eq!(&buf[..20], &body.as_bytes()[80..]);
 }
 
 /// An empty request is settled without a fetch — `Bounded(0..0)` is an error at the
 /// store — and it must not disturb the sequence, or a zero-length read in the middle
 /// of a stream would cost the next read its read-ahead.
-#[test]
-fn an_empty_read_changes_nothing() {
-    let handle = open_reader(&ruler(1000));
+#[tokio::test]
+async fn an_empty_read_changes_nothing() {
+    let handle = open_reader(&ruler(1000)).await;
     let mut probe: [u8; 0] = [];
-    assert_eq!(handle.read_at(&mut probe, 500).expect("read"), 0);
+    assert_eq!(handle.read_at(&mut probe, 500).await.expect("read"), 0);
     assert_eq!(
         handle.cache.lock().unwrap().last_end,
         None,
@@ -733,11 +761,11 @@ fn an_empty_read_changes_nothing() {
 
 /// The first read cannot be known to be sequential, so it fetches exactly what was
 /// asked. Observed through the window, which is what a fetch leaves behind.
-#[test]
-fn the_first_read_does_not_read_ahead() {
-    let handle = open_reader(&ruler(1_000_000));
+#[tokio::test]
+async fn the_first_read_does_not_read_ahead() {
+    let handle = open_reader(&ruler(1_000_000)).await;
     let mut buf = vec![0u8; 4096];
-    handle.read_at(&mut buf, 0).expect("read");
+    handle.read_at(&mut buf, 0).await.expect("read");
     let cache = handle.cache.lock().unwrap();
     let (start, data) = cache.window.as_ref().expect("window filled");
     assert_eq!(*start, 0);
@@ -747,12 +775,12 @@ fn the_first_read_does_not_read_ahead() {
 
 /// A read that continues where the last ended earns a window: continuity is the
 /// signal, not the request size.
-#[test]
-fn a_contiguous_read_fetches_a_window() {
-    let handle = open_reader(&ruler(1_000_000));
+#[tokio::test]
+async fn a_contiguous_read_fetches_a_window() {
+    let handle = open_reader(&ruler(1_000_000)).await;
     let mut buf = vec![0u8; 4096];
-    handle.read_at(&mut buf, 0).expect("first");
-    handle.read_at(&mut buf, 4096).expect("second");
+    handle.read_at(&mut buf, 0).await.expect("first");
+    handle.read_at(&mut buf, 4096).await.expect("second");
     let cache = handle.cache.lock().unwrap();
     let (start, data) = cache.window.as_ref().expect("window filled");
     assert_eq!(*start, 4096);
@@ -765,18 +793,22 @@ fn a_contiguous_read_fetches_a_window() {
 
 /// A read landing inside the window is served from it. Proven by the window: a fetch
 /// would have replaced it.
-#[test]
-fn a_read_inside_the_window_does_not_fetch() {
+#[tokio::test]
+async fn a_read_inside_the_window_does_not_fetch() {
     let body = ruler(1_000_000);
-    let handle = open_reader(&body);
+    let handle = open_reader(&body).await;
     let mut buf = vec![0u8; 4096];
-    handle.read_at(&mut buf, 0).expect("first");
+    handle.read_at(&mut buf, 0).await.expect("first");
     handle
         .read_at(&mut buf, 4096)
+        .await
         .expect("second, fetches ahead");
     let before = handle.cache.lock().unwrap().window.clone();
 
-    handle.read_at(&mut buf, 8192).expect("third, from cache");
+    handle
+        .read_at(&mut buf, 8192)
+        .await
+        .expect("third, from cache");
     assert_eq!(buf, body.as_bytes()[8192..12288]);
     assert_eq!(
         handle.cache.lock().unwrap().window,
@@ -790,17 +822,19 @@ fn a_read_inside_the_window_does_not_fetch() {
 ///
 /// The file has to be larger than a window for this to be observable: a jump within
 /// one the read-ahead already covers is a cache hit, and rightly fetches nothing.
-#[test]
-fn a_scattered_read_does_not_fetch_a_window() {
+#[tokio::test]
+async fn a_scattered_read_does_not_fetch_a_window() {
     let jump = READAHEAD_CHUNK + 500_000;
-    let handle = open_reader(&ruler(jump as usize + 100_000));
+    let handle = open_reader(&ruler(jump as usize + 100_000)).await;
     let mut buf = vec![0u8; 4096];
-    handle.read_at(&mut buf, 0).expect("first");
+    handle.read_at(&mut buf, 0).await.expect("first");
     handle
         .read_at(&mut buf, 4096)
+        .await
         .expect("second, fetches ahead");
     handle
         .read_at(&mut buf, jump)
+        .await
         .expect("jump beyond the window");
     let cache = handle.cache.lock().unwrap();
     let (start, data) = cache.window.as_ref().expect("window");
@@ -814,17 +848,18 @@ fn a_scattered_read_does_not_fetch_a_window() {
 /// The offsets are deliberately unaligned to the window, which is how the real case
 /// arises — a guest's read-ahead ramps through 16K/32K/64K/128K and lands off any
 /// fixed boundary.
-#[test]
-fn a_read_crossing_the_window_edge_is_filled() {
+#[tokio::test]
+async fn a_read_crossing_the_window_edge_is_filled() {
     let size = READAHEAD_CHUNK as usize + 100_000;
     let body = ruler(size);
-    let handle = open_reader(&body);
+    let handle = open_reader(&body).await;
 
     // Establish a window: two contiguous reads, the second fetching ahead.
     let mut buf = vec![0u8; 7000];
-    handle.read_at(&mut buf, 0).expect("first");
+    handle.read_at(&mut buf, 0).await.expect("first");
     handle
         .read_at(&mut buf, 7000)
+        .await
         .expect("second, fetches ahead");
     let window_end = {
         let cache = handle.cache.lock().unwrap();
@@ -835,7 +870,7 @@ fn a_read_crossing_the_window_edge_is_filled() {
     // A request straddling that edge.
     let at = window_end - 1000;
     let mut buf = vec![0u8; 5000];
-    let read = handle.read_at(&mut buf, at).expect("straddling read");
+    let read = handle.read_at(&mut buf, at).await.expect("straddling read");
     assert_eq!(
         read, 5000,
         "a partial hit must be filled, not returned short"
@@ -846,18 +881,18 @@ fn a_read_crossing_the_window_edge_is_filled() {
 /// Sequential streaming over a file larger than one window keeps its read-ahead
 /// across every boundary. This is what fails if `last_end` is only updated on a
 /// fetch: the hits in between would leave it stale and every boundary would reset.
-#[test]
-fn streaming_past_a_window_boundary_keeps_reading_ahead() {
+#[tokio::test]
+async fn streaming_past_a_window_boundary_keeps_reading_ahead() {
     let size = READAHEAD_CHUNK as usize + 500_000;
     let body = ruler(size);
-    let handle = open_reader(&body);
+    let handle = open_reader(&body).await;
 
     let step = 128 * 1024;
     let mut buf = vec![0u8; step];
     let mut at = 0u64;
     while at < size as u64 {
         let want = step.min(size - at as usize);
-        let read = handle.read_at(&mut buf[..want], at).expect("read");
+        let read = handle.read_at(&mut buf[..want], at).await.expect("read");
         assert_eq!(read, want, "short read mid-file at offset {at}");
         assert_eq!(
             &buf[..want],
@@ -908,19 +943,25 @@ fn debugging_a_config_does_not_print_the_secret() {
 /// Two path layers meet here, written independently: `Workspace` strips the mount
 /// path, then `key()` prepends the key prefix. Neither knows about the other, so this
 /// asserts the composition rather than either half.
-#[test]
-fn a_mount_path_composes_with_the_key_prefix() {
-    let vol = holding("bucket-root", &[("bucket-root/a.txt", "hello")]);
+#[tokio::test]
+async fn a_mount_path_composes_with_the_key_prefix() {
+    let vol = holding("bucket-root", &[("bucket-root/a.txt", "hello")]).await;
     let ws = crate::volume::Workspace::new()
         .try_with_mount("data", vol)
         .expect("mount");
 
-    let stat = Mountable::stat(&ws, Path::new("data/a.txt")).expect("stat through workspace");
+    let stat = Mountable::stat(&ws, Path::new("data/a.txt"))
+        .await
+        .expect("stat through workspace");
     assert_eq!(stat.size, 5, "mount path stripped, key prefix prepended");
 
     // And the composition does not open a way past the prefix.
     assert_eq!(
-        label(&Mountable::stat(&ws, Path::new("data/../a.txt")).unwrap_err()),
+        label(
+            &Mountable::stat(&ws, Path::new("data/../a.txt"))
+                .await
+                .unwrap_err()
+        ),
         "NotFound",
         "`..` is resolved by the workspace before the backend sees it"
     );
@@ -929,9 +970,9 @@ fn a_mount_path_composes_with_the_key_prefix() {
 /// The point of `Mountable for Arc<T>`: one volume served two ways at once. A
 /// workspace takes its backend by value, so without the `Arc` impl a bucket could
 /// feed exactly one consumer.
-#[test]
-fn a_shared_volume_serves_a_workspace_and_its_owner() {
-    let vol = Arc::new(holding("", &[("a.txt", "hello")]));
+#[tokio::test]
+async fn a_shared_volume_serves_a_workspace_and_its_owner() {
+    let vol = Arc::new(holding("", &[("a.txt", "hello")]).await);
     let scratch = crate::volume::InMemVolume::new();
     let ws = crate::volume::Workspace::new()
         .try_with_mount("s3", Arc::clone(&vol))
@@ -942,15 +983,17 @@ fn a_shared_volume_serves_a_workspace_and_its_owner() {
     // Through the workspace, beside a different backend.
     assert_eq!(
         Mountable::stat(&ws, Path::new("s3/a.txt"))
+            .await
             .expect("stat")
             .size,
         5
     );
     // And directly, through the handle the caller kept.
-    assert_eq!(vol.stat(Path::new("a.txt")).expect("stat").size, 5);
+    assert_eq!(vol.stat(Path::new("a.txt")).await.expect("stat").size, 5);
 
     // The synthesized root names both mounts.
     let mut names: Vec<_> = Mountable::list(&ws, Path::new(""))
+        .await
         .expect("list root")
         .into_iter()
         .map(|e| e.name)
@@ -962,19 +1005,20 @@ fn a_shared_volume_serves_a_workspace_and_its_owner() {
 /// A read through the workspace goes through its erased handle
 /// (`Handle = Box<dyn FileHandle>`), which is a different path from the concrete one
 /// every other test here takes.
-#[test]
-fn a_read_through_a_workspace_reaches_the_object() {
+#[tokio::test]
+async fn a_read_through_a_workspace_reaches_the_object() {
     let body = ruler(9000);
-    let vol = holding("", &[("big.bin", &body)]);
+    let vol = holding("", &[("big.bin", &body)]).await;
     let ws = crate::volume::Workspace::new()
         .try_with_mount("s3", vol)
         .expect("mount");
 
     let (handle, stat) = Mountable::open(&ws, Path::new("s3/big.bin"), OpenOptions::read_only())
+        .await
         .expect("open through workspace");
     assert_eq!(stat.size, 9000);
     let mut buf = vec![0u8; 5000];
-    assert_eq!(handle.read_at(&mut buf, 2000).expect("read"), 5000);
+    assert_eq!(handle.read_at(&mut buf, 2000).await.expect("read"), 5000);
     assert_eq!(buf, &body.as_bytes()[2000..7000]);
 }
 
@@ -982,14 +1026,15 @@ fn a_read_through_a_workspace_reaches_the_object() {
 /// of file data. Asserted for the same reason as the config's secret: swapping the
 /// hand-written impl for a derive would restore the leak and nothing else would
 /// notice.
-#[test]
-fn debugging_a_handle_does_not_print_the_window() {
+#[tokio::test]
+async fn debugging_a_handle_does_not_print_the_window() {
     let body = ruler(200_000);
-    let handle = open_reader(&body);
+    let handle = open_reader(&body).await;
     let mut buf = vec![0u8; 4096];
-    handle.read_at(&mut buf, 0).expect("first");
+    handle.read_at(&mut buf, 0).await.expect("first");
     handle
         .read_at(&mut buf, 4096)
+        .await
         .expect("second, fetches ahead");
 
     let shown = format!("{handle:?}");
@@ -1027,10 +1072,9 @@ fn debugging_a_handle_does_not_print_the_window() {
 /// ```
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
 mod mounted {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
+    use super::*;
     use crate::volume::HostMount;
 
     fn mountpoint(tag: &str) -> PathBuf {
@@ -1044,7 +1088,7 @@ mod mounted {
     /// A bucket shaped like the cases this backend had to reason about: a file, a
     /// prefix, a zero-byte folder marker with children, and a body long enough to
     /// cross a read-ahead window.
-    fn bucket(big: &str) -> S3Volume {
+    async fn bucket(big: &str) -> S3Volume {
         holding(
             "",
             &[
@@ -1055,6 +1099,7 @@ mod mounted {
                 ("big.bin", big),
             ],
         )
+        .await
     }
 
     #[test]
@@ -1062,7 +1107,12 @@ mod mounted {
     fn the_operating_system_can_read_an_object_store_mount() {
         let big = ruler(READAHEAD_CHUNK as usize + 300_000);
         let mnt = mountpoint("read");
-        let mount = HostMount::spawn(bucket(&big), &mnt).expect("mount");
+        // `bucket` is async (its in-memory store is), but this is a sync mount
+        // test, so build the volume on a throwaway runtime before handing it over.
+        let vol = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(bucket(&big));
+        let mount = HostMount::spawn(vol, &mnt).expect("mount");
 
         // A real `readdir`, with the collision rules applied by the kernel's rules.
         let mut names: Vec<_> = fs::read_dir(&mnt)
@@ -1115,7 +1165,10 @@ mod mounted {
     #[ignore = "needs a libfuse provider and mounts a real filesystem"]
     fn the_operating_system_is_told_the_mount_is_read_only() {
         let mnt = mountpoint("ro");
-        let mount = HostMount::spawn(bucket("x"), &mnt).expect("mount");
+        let vol = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(bucket("x"));
+        let mount = HostMount::spawn(vol, &mnt).expect("mount");
 
         let denied = [
             fs::write(mnt.join("new.txt"), b"nope").err(),
@@ -1161,14 +1214,4 @@ fn a_trailing_slash_cannot_be_stored_so_the_console_shape_is_untested() {
         "dir/sub",
         "the trailing slash is stripped, so `dir/sub/` and `dir/sub` are one key"
     );
-}
-
-// -------------------------------------------------------------------- plumbing
-
-/// One runtime for the whole crate, however many volumes exist.
-#[test]
-fn every_volume_shares_one_runtime() {
-    let first = runtime().expect("runtime") as *const Runtime;
-    let second = runtime().expect("runtime") as *const Runtime;
-    assert_eq!(first, second);
 }

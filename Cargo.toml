@@ -16,6 +16,10 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
+# `Mountable`/`DynMountable`/`FileHandle`/`FileExt` are async *and* object-safe
+# (`Box<dyn DynMountable>`), which native `async fn` in traits cannot be — so
+# their futures are boxed here.
+async-trait = "0.1"
 # The console wire. Declared here rather than per crate because `Outcome::Result`
 # carries a `Bson` in public API: two versions of it in one build would be a type
 # error nobody could read.
@@ -55,6 +59,21 @@ fuser = "0.17"
 # walkdir/nix/same-file for a thing we already have in `PassthroughVolume`. The
 # `memory` module is ungated, so the in-memory store the tests build on survives.
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
+
+# The Notion backend: an async HTTP client, plus the two things its payloads are
+# made of — page ids are UUIDs, and its timestamps are RFC 3339. reqwest 0.13
+# renamed `rustls-tls` → `rustls` and made `query`/`form` optional; pagination
+# uses `.query()`, so it is named.
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "rustls",
+    "query",
+] }
+uuid = "1"
+chrono = "0.4"
+# Notion answers in JSON and `page.json` is rendered back to it, so the backend
+# holds pages as `Value` rather than a mirror of a schema it does not own.
+serde_json = "1"
 
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.

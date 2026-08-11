@@ -46,15 +46,13 @@
 
 #![cfg(any(feature = "fuse", feature = "fuse-t"))]
 
-use std::fs;
-use std::path::PathBuf;
-
-use cortex::volume::{InMemVolume, Mountable, OpenOptions, Workspace};
+use std::{fs, path::PathBuf};
 
 // One set of test bodies for both host bindings: they expose the same call
 // surface, so which is under test is a matter of which feature is on — making
 // these tests evidence that the two behave *alike*, not just that each behaves.
 use cortex::volume::HostMount;
+use cortex::volume::{InMemVolume, Mountable, OpenOptions, Workspace};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {
@@ -66,16 +64,26 @@ fn mountpoint(tag: &str) -> PathBuf {
 }
 
 /// A volume with one file and one empty directory.
+///
+/// The seeding drives the async `Mountable`/`FileExt` surface, so it runs on a
+/// throwaway runtime here — the crate's own `block_on` is `pub(crate)`, and the
+/// test bodies themselves are synchronous because a real kernel drives the mount.
 fn volume() -> InMemVolume {
     let vol = InMemVolume::new();
-    let (file, _) = vol
-        .open(
-            std::path::Path::new("greeting.txt"),
-            OpenOptions::create_new(),
-        )
-        .unwrap();
-    cortex::volume::FileExt::write_all_at(&file, b"Hello from cortex!\n", 0).unwrap();
-    vol.mkdir(std::path::Path::new("sub")).unwrap();
+    let rt = tokio::runtime::Runtime::new().expect("build a runtime for volume setup");
+    rt.block_on(async {
+        let (file, _) = vol
+            .open(
+                std::path::Path::new("greeting.txt"),
+                OpenOptions::create_new(),
+            )
+            .await
+            .unwrap();
+        cortex::volume::FileExt::write_all_at(&file, b"Hello from cortex!\n", 0)
+            .await
+            .unwrap();
+        vol.mkdir(std::path::Path::new("sub")).await.unwrap();
+    });
     vol
 }
 

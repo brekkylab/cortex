@@ -15,6 +15,10 @@
 //! metadata a backend answers with, and [`workspace`], which grafts several
 //! backends under one tree and is itself a [`Mountable`].
 //!
+//! [`spec`] is the same tree written down: a [`WorkspaceSpec`] is plain data, so a
+//! caller that builds its workspace in one process and needs it in another sends
+//! the description rather than the thing.
+//!
 //! `ARCHITECTURE.md` in this directory has the long form.
 
 // The bindings themselves are trait impls, which apply wherever `PosixFs` and
@@ -23,6 +27,7 @@
 mod adapter;
 mod r#impl;
 mod posix;
+mod spec;
 mod stat;
 mod r#trait;
 mod workspace;
@@ -33,6 +38,7 @@ mod workspace;
 pub use adapter::*;
 pub use r#impl::*;
 pub use posix::*;
+pub use spec::*;
 pub use stat::*;
 pub use r#trait::*;
 pub use workspace::*;

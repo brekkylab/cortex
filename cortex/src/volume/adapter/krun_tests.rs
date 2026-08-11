@@ -5,15 +5,15 @@
 //! here is the projection onto the guest's `stat64` and the Linux errno numbering,
 //! neither of which the host bindings share.
 
+use std::{fs::File, path::Path};
+
+use msb_krun::backends::fs::{Extensions, ZeroCopyWriter};
+
 use super::*;
 // Named explicitly: `msb_krun::backends::fs::OpenOptions` is a different
 // type with the same name, and `super::*` brings the module into scope.
 use crate::volume::{FileExt, OpenOptions};
 use crate::volume::{InMemVolume, PosixFs};
-use msb_krun::backends::fs::Extensions;
-use msb_krun::backends::fs::ZeroCopyWriter;
-use std::fs::File;
-use std::path::Path;
 
 const CONTENT: &[u8] = b"Hello from cortex!\n";
 const ROOT: u64 = 1;
@@ -42,11 +42,14 @@ fn ctx() -> Context {
 /// `greeting.txt` at the root plus an empty `sub/`.
 fn fs() -> PosixFs<InMemVolume> {
     let vol = InMemVolume::new();
-    let (file, _) = vol
-        .open(Path::new("greeting.txt"), OpenOptions::create_new())
-        .unwrap();
-    file.write_all_at(CONTENT, 0).unwrap();
-    vol.mkdir(Path::new("sub")).unwrap();
+    super::super::block_on(async {
+        let (file, _) = vol
+            .open(Path::new("greeting.txt"), OpenOptions::create_new())
+            .await
+            .unwrap();
+        file.write_all_at(CONTENT, 0).await.unwrap();
+        vol.mkdir(Path::new("sub")).await.unwrap();
+    });
     PosixFs::new(vol)
 }
 
@@ -204,7 +207,7 @@ fn the_guest_stat64_carries_the_whole_shared_policy() {
     assert_eq!(file.attr.st_gid, 0);
 
     // The guest dedups by `st_ino`, so a zero there collapses every entry to one.
-    assert_eq!(file.attr.st_ino as u64, file.inode);
+    assert_eq!(file.attr.st_ino, file.inode);
     assert_ne!(dir.inode, file.inode);
 
     // The guest compares what it cached from LOOKUP against GETATTR.

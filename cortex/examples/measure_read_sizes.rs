@@ -51,13 +51,20 @@
 //!     /tmp/cortex-measure | tee /tmp/reads.log | grep SUMMARY
 //! ```
 
-use std::io::{self, Read};
-use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io::{self, Read},
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
+use async_trait::async_trait;
 use cortex::Result;
-use cortex::volume::{Dirent, FileExt, FileHandle, HostMount, InMemVolume, Mountable, OpenOptions, Stat};
+use cortex::volume::{
+    Dirent, FileExt, FileHandle, HostMount, InMemVolume, Mountable, OpenOptions, Stat,
+};
 
 /// Set once the mount is up, so the reads the mount itself performs while coming
 /// up do not land in the sample.
@@ -85,66 +92,69 @@ struct Recorder<T>(T);
 
 struct RecHandle<H>(H);
 
+#[async_trait]
 impl<H: FileExt> FileExt for RecHandle<H> {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         if RECORDING.load(Ordering::Relaxed) {
             // `buf.len()` *is* the kernel's `size`: `read_handle` allocates the
             // buffer from it and does not split or coalesce.
             println!("READ {offset} {}", buf.len());
             SAMPLES.lock().expect("samples").push((offset, buf.len()));
         }
-        self.0.read_at(buf, offset)
+        self.0.read_at(buf, offset).await
     }
 
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
-        self.0.write_at(buf, offset)
+    async fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        self.0.write_at(buf, offset).await
     }
 }
 
+#[async_trait]
 impl<H: FileHandle> FileHandle for RecHandle<H> {
-    fn truncate(&self, size: u64) -> Result<()> {
-        self.0.truncate(size)
+    async fn truncate(&self, size: u64) -> Result<()> {
+        self.0.truncate(size).await
     }
 
-    fn flush(&self) -> Result<()> {
-        self.0.flush()
+    async fn flush(&self) -> Result<()> {
+        self.0.flush().await
     }
 
-    fn commit(&self) -> Result<()> {
-        self.0.commit()
+    async fn commit(&self) -> Result<()> {
+        self.0.commit().await
     }
 }
 
+#[async_trait]
 impl<T: Mountable> Mountable for Recorder<T> {
     type Handle = RecHandle<T::Handle>;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
-        self.0.stat(path)
+    async fn stat(&self, path: &Path) -> Result<Stat> {
+        self.0.stat(path).await
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
-        self.0.list(path)
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+        self.0.list(path).await
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
-        self.0.mkdir(path)
+    async fn mkdir(&self, path: &Path) -> Result<()> {
+        self.0.mkdir(path).await
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
-        self.0.unlink(path)
+    async fn unlink(&self, path: &Path) -> Result<()> {
+        self.0.unlink(path).await
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
-        self.0.rmdir(path)
+    async fn rmdir(&self, path: &Path) -> Result<()> {
+        self.0.rmdir(path).await
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
-        let (handle, stat) = self.0.open(path, options)?;
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+        let (handle, stat) = self.0.open(path, options).await?;
         Ok((RecHandle(handle), stat))
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
-        self.0.rename(from, to)
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        self.0.rename(from, to).await
     }
 }
 
@@ -193,12 +203,17 @@ fn main() {
 
     let vol = InMemVolume::new();
     let filler = vec![0xABu8; FILE_SIZE];
-    for name in PHASES {
-        let (file, _) = vol
-            .open(Path::new(name), OpenOptions::create_new())
-            .expect("fresh volume");
-        file.write_all_at(&filler, 0).expect("fill");
-    }
+    // The `Mountable` data plane is async; fill the files on a throwaway runtime
+    // before mounting.
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        for name in PHASES {
+            let (file, _) = vol
+                .open(Path::new(name), OpenOptions::create_new())
+                .await
+                .expect("fresh volume");
+            file.write_all_at(&filler, 0).await.expect("fill");
+        }
+    });
     drop(filler);
 
     let mount = HostMount::spawn(Recorder(vol), &mountpoint).expect("mount");

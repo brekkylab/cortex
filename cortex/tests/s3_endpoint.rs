@@ -21,8 +21,7 @@
 
 #![cfg(feature = "s3")]
 
-use std::path::Path;
-use std::process::Command;
+use std::{path::Path, process::Command};
 
 use cortex::volume::{DirentKind, FileExt, Mountable, OpenOptions, S3Config, S3Volume};
 
@@ -126,7 +125,7 @@ fn config(principal: &Principal, secret: &str) -> S3Config {
 /// when the corpus is rebuilt with different people in it. The principal comes back
 /// with the volume so a test that needs a *second* client for the same caller does not
 /// have to fetch the roster again and guess which one it was.
-fn volume() -> Option<(S3Volume, Principal)> {
+async fn volume() -> Option<(S3Volume, Principal)> {
     let Some(roster) = fetch_roster() else {
         eprintln!("skipped: cannot reach {HOST} (see this file's docs)");
         return None;
@@ -142,7 +141,7 @@ fn volume() -> Option<(S3Volume, Principal)> {
         // The one request `check_reachable` exists to make. A caller without access is
         // told the bucket does not exist — the mock hides existence rather than
         // admitting it, which is what real S3 tends to do too.
-        if vol.check_reachable().is_ok() {
+        if vol.check_reachable().await.is_ok() {
             eprintln!(
                 "using {} ({denied} earlier callers were denied {BUCKET})",
                 principal.email
@@ -162,50 +161,60 @@ const MAX_READ: u64 = 8 << 20;
 /// Discovered rather than hardcoded so this test does not encode one corpus. Also
 /// evidence in itself: every step is a real `ListObjectsV2` with a delimiter, and a
 /// prefix has to come back as a directory for the descent to continue at all.
-fn find_a_file(vol: &S3Volume, at: &Path, depth: usize) -> Option<(std::path::PathBuf, u64)> {
-    if depth == 0 {
-        return None;
-    }
-    let entries = vol.list(at).expect("list");
-    for entry in &entries {
-        if entry.kind == DirentKind::File {
-            let path = at.join(&entry.name);
-            let size = entry
-                .stat()
-                .map(|s| s.size)
-                .unwrap_or_else(|| vol.stat(&path).expect("stat").size);
-            // Keep looking rather than read something the assertions cannot hold, or
-            // something empty that has no bytes to compare.
-            if size == 0 || size > MAX_READ {
-                continue;
+/// A boxed, borrowing future — named so the recursive `find_a_file` can spell its
+/// own return type without a clippy `type_complexity` warning.
+type FindFileFut<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<(std::path::PathBuf, u64)>> + 'a>>;
+
+fn find_a_file<'a>(vol: &'a S3Volume, at: &'a Path, depth: usize) -> FindFileFut<'a> {
+    Box::pin(async move {
+        if depth == 0 {
+            return None;
+        }
+        let entries = vol.list(at).await.expect("list");
+        for entry in &entries {
+            if entry.kind == DirentKind::File {
+                let path = at.join(&entry.name);
+                let size = match entry.stat() {
+                    Some(s) => s.size,
+                    None => vol.stat(&path).await.expect("stat").size,
+                };
+                // Keep looking rather than read something the assertions cannot hold, or
+                // something empty that has no bytes to compare.
+                if size == 0 || size > MAX_READ {
+                    continue;
+                }
+                return Some((path, size));
             }
-            return Some((path, size));
         }
-    }
-    for entry in &entries {
-        if entry.kind == DirentKind::Dir
-            && let Some(found) = find_a_file(vol, &at.join(&entry.name), depth - 1)
-        {
-            return Some(found);
+        for entry in &entries {
+            if entry.kind == DirentKind::Dir {
+                let sub = at.join(&entry.name);
+                if let Some(found) = find_a_file(vol, &sub, depth - 1).await {
+                    return Some(found);
+                }
+            }
         }
-    }
-    None
+        None
+    })
 }
 
-#[test]
+#[tokio::test]
 #[ignore = "needs a reachable object-store endpoint; see this file's docs"]
-fn a_real_endpoint_answers_the_whole_read_surface() {
-    let Some((vol, _)) = volume() else { return };
+async fn a_real_endpoint_answers_the_whole_read_surface() {
+    let Some((vol, _)) = volume().await else {
+        return;
+    };
 
     // The root is a directory without asking anyone.
     assert_eq!(
-        vol.stat(Path::new("")).expect("stat root").kind,
+        vol.stat(Path::new("")).await.expect("stat root").kind,
         DirentKind::Dir
     );
 
     // Real `ListObjectsV2` with a delimiter: prefixes have to come back as
     // directories, or nothing below the root is reachable.
-    let root = vol.list(Path::new("")).expect("list root");
+    let root = vol.list(Path::new("")).await.expect("list root");
     assert!(!root.is_empty(), "the bucket looks empty; pick another");
     println!(
         "root: {} entries ({} dirs)",
@@ -213,12 +222,14 @@ fn a_real_endpoint_answers_the_whole_read_surface() {
         root.iter().filter(|e| e.kind == DirentKind::Dir).count()
     );
 
-    let (path, size) = find_a_file(&vol, Path::new(""), 6).expect("a file somewhere in the bucket");
+    let (path, size) = find_a_file(&vol, Path::new(""), 6)
+        .await
+        .expect("a file somewhere in the bucket");
     println!("found {} ({size} bytes)", path.display());
     assert!(size > 0, "expected a non-empty object to read");
 
     // Real `HEAD`: the metadata a listing promised has to match what the object says.
-    let stat = vol.stat(&path).expect("stat the file");
+    let stat = vol.stat(&path).await.expect("stat the file");
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, size);
     assert!(stat.mtime.is_some(), "LastModified should reach Stat");
@@ -228,42 +239,56 @@ fn a_real_endpoint_answers_the_whole_read_surface() {
     // the second is what exercises `Range`/206 rather than a plain body.
     let (handle, opened) = vol
         .open(&path, OpenOptions::read_only())
+        .await
         .expect("open the file");
     assert_eq!(opened.size, size);
 
     let mut whole = vec![0u8; size as usize];
-    let read = handle.read_at(&mut whole, 0).expect("read from 0");
+    let read = handle.read_at(&mut whole, 0).await.expect("read from 0");
     assert_eq!(read as u64, size, "a short read here would mean EOF");
 
     let at = size / 2;
     let mut middle = vec![0u8; (size - at) as usize];
     // A fresh handle, so this is a miss rather than the first read's window.
-    let (fresh, _) = vol.open(&path, OpenOptions::read_only()).expect("reopen");
-    let read = fresh.read_at(&mut middle, at).expect("ranged read");
+    let (fresh, _) = vol
+        .open(&path, OpenOptions::read_only())
+        .await
+        .expect("reopen");
+    let read = fresh.read_at(&mut middle, at).await.expect("ranged read");
     assert_eq!(read, middle.len(), "the ranged read came back short");
     assert_eq!(middle, whole[at as usize..], "ranged bytes disagree");
 
     // Past the end is EOF, answered from the size the open recorded rather than by
     // sending a range the store would reject.
     let mut past = [0u8; 16];
-    assert_eq!(fresh.read_at(&mut past, size).expect("read past end"), 0);
+    assert_eq!(
+        fresh.read_at(&mut past, size).await.expect("read past end"),
+        0
+    );
 }
 
 /// A real 404 has to arrive as `NotFound` — the status is upstream's to produce, and
 /// the error table's inputs are only ever synthesised elsewhere.
-#[test]
+#[tokio::test]
 #[ignore = "needs a reachable object-store endpoint; see this file's docs"]
-fn a_missing_key_on_a_real_endpoint_is_not_found() {
-    let Some((vol, _)) = volume() else { return };
+async fn a_missing_key_on_a_real_endpoint_is_not_found() {
+    let Some((vol, _)) = volume().await else {
+        return;
+    };
     let missing = Path::new("cortex-e2e-no-such-key-8f2a1c");
-    let err = vol.stat(missing).expect_err("a missing key must not stat");
+    let err = vol
+        .stat(missing)
+        .await
+        .expect_err("a missing key must not stat");
     assert!(
         matches!(err, cortex::CortexError::NotFound),
         "expected NotFound, got {err:?}"
     );
     assert!(
         matches!(
-            vol.open(missing, OpenOptions::read_only()).map(|_| ()),
+            vol.open(missing, OpenOptions::read_only())
+                .await
+                .map(|_| ()),
             Err(cortex::CortexError::NotFound)
         ),
         "open should agree with stat"
@@ -280,18 +305,23 @@ fn a_missing_key_on_a_real_endpoint_is_not_found() {
 /// It has to be *this* caller's key id, corrupted. Anyone else's would leave two
 /// reasons to refuse — a bad signature and no access to the bucket — and no way to tell
 /// from the answer which one was tested.
-#[test]
+#[tokio::test]
 #[ignore = "needs a reachable object-store endpoint; see this file's docs"]
-fn a_bad_signature_on_a_real_endpoint_is_permission_denied() {
-    let Some((good, principal)) = volume() else {
+async fn a_bad_signature_on_a_real_endpoint_is_permission_denied() {
+    let Some((good, principal)) = volume().await else {
         return;
     };
-    let (path, _size) = find_a_file(&good, Path::new(""), 6).expect("a file to ask about");
+    let (path, _size) = find_a_file(&good, Path::new(""), 6)
+        .await
+        .expect("a file to ask about");
 
     let wrong = format!("{}x", principal.secret_access_key);
     let vol = S3Volume::new(&config(&principal, &wrong)).expect("build the S3 client");
 
-    let err = vol.stat(&path).expect_err("a bad signature must not stat");
+    let err = vol
+        .stat(&path)
+        .await
+        .expect_err("a bad signature must not stat");
     assert!(
         matches!(err, cortex::CortexError::PermissionDenied),
         "expected PermissionDenied from a 403 on HEAD, got {err:?}"

@@ -11,15 +11,19 @@
 //! (via [`OpenOptions`]), so there is exactly one path by which bytes enter the
 //! store — and `create_new` can be genuinely exclusive.
 
-use std::collections::HashMap;
-use std::io;
-use std::path::{Component, Path};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::{
+    collections::HashMap,
+    io,
+    path::{Component, Path},
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
+
+use async_trait::async_trait;
 
 use crate::lock::lock;
-use crate::{CortexError, Result};
 use crate::volume::{Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, Stat};
+use crate::{CortexError, Result};
 
 /// The largest file this volume will represent — a safety ceiling, not a capacity
 /// plan.
@@ -218,16 +222,17 @@ impl Default for InMemVolume {
     }
 }
 
+#[async_trait]
 impl Mountable for InMemVolume {
     type Handle = InMemHandle;
 
-    fn stat(&self, path: &Path) -> Result<Stat> {
+    async fn stat(&self, path: &Path) -> Result<Stat> {
         let comps = components(path)?;
         let link = self.navigate(&comps)?;
         Ok(lock(&link).stat())
     }
 
-    fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
+    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let comps = components(path)?;
         let link = self.navigate(&comps)?;
         let node = lock(&link);
@@ -243,7 +248,7 @@ impl Mountable for InMemVolume {
         }
     }
 
-    fn mkdir(&self, path: &Path) -> Result<()> {
+    async fn mkdir(&self, path: &Path) -> Result<()> {
         let comps = components(path)?;
         let (parent, name) = split_last(&comps)?;
         let dir = self.navigate(parent)?;
@@ -267,15 +272,15 @@ impl Mountable for InMemVolume {
         }
     }
 
-    fn unlink(&self, path: &Path) -> Result<()> {
+    async fn unlink(&self, path: &Path) -> Result<()> {
         self.remove(path, DirentKind::File)
     }
 
-    fn rmdir(&self, path: &Path) -> Result<()> {
+    async fn rmdir(&self, path: &Path) -> Result<()> {
         self.remove(path, DirentKind::Dir)
     }
 
-    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn rename(&self, from: &Path, to: &Path) -> Result<()> {
         let (from_comps, to_comps) = (components(from)?, components(to)?);
 
         // Onto itself is a no-op, checked before anything is detached — POSIX says
@@ -341,7 +346,7 @@ impl Mountable for InMemVolume {
         Ok(())
     }
 
-    fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
         options.validate()?;
 
         // Creation and the existence check happen under the parent's lock, so
@@ -425,8 +430,9 @@ pub struct InMemHandle {
     append: bool,
 }
 
+#[async_trait]
 impl FileExt for InMemHandle {
-    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         if !self.read {
             return Err(io::Error::from_raw_os_error(EBADF));
         }
@@ -442,7 +448,7 @@ impl FileExt for InMemHandle {
         Ok(n)
     }
 
-    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+    async fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         if !self.write {
             return Err(io::Error::from_raw_os_error(EBADF));
         }
@@ -467,8 +473,9 @@ impl FileExt for InMemHandle {
     }
 }
 
+#[async_trait]
 impl FileHandle for InMemHandle {
-    fn truncate(&self, size: u64) -> Result<()> {
+    async fn truncate(&self, size: u64) -> Result<()> {
         // `InvalidArgument`, which is what `ftruncate` gives a read-only
         // descriptor and so what `PassthroughVolume` answers.
         if !self.write {

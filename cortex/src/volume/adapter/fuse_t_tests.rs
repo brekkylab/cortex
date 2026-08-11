@@ -34,11 +34,14 @@ impl Shim {
     /// `greeting.txt` at the root plus an empty `sub/`.
     fn new() -> Self {
         let vol = Arc::new(InMemVolume::new());
-        let (file, _) = vol
-            .open(Path::new("greeting.txt"), OpenOptions::create_new())
-            .unwrap();
-        file.write_all_at(CONTENT, 0).unwrap();
-        vol.mkdir(Path::new("sub")).unwrap();
+        super::super::block_on(async {
+            let (file, _) = vol
+                .open(Path::new("greeting.txt"), OpenOptions::create_new())
+                .await
+                .unwrap();
+            file.write_all_at(CONTENT, 0).await.unwrap();
+            vol.mkdir(Path::new("sub")).await.unwrap();
+        });
         Shim {
             fs: Box::new(PosixFs::new(Arc::clone(&vol))),
             ops: ops_for::<Arc<InMemVolume>>(),
@@ -462,7 +465,7 @@ fn readdir_streams_through_the_sink_and_honours_its_stop() {
 fn a_name_with_an_interior_nul_is_refused() {
     let shim = Shim::new();
     // Past the vtable, whose `*const c_char` cannot carry this name.
-    Mountable::mkdir(&*shim.vol, Path::new("a\0b")).unwrap();
+    super::super::block_on(Mountable::mkdir(&*shim.vol, Path::new("a\0b"))).unwrap();
 
     let mut sink = Collected::default();
     assert_eq!(shim.readdir(ROOT, 0, &mut sink), -libc::EINVAL);

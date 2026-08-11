@@ -24,6 +24,10 @@ pkg-config = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
+# The volume traits are async and object-safe at once, which native `async fn` in
+# traits is not — so their futures are boxed. Unconditional: those traits are the
+# volume half's spine, not something a feature turns on.
+async-trait = { workspace = true }
 # The console wire. The protocol's shape needs a *self-describing* codec — `params`
 # and `result` are typed by a method that may arrive after them, and `result` xor
 # `error` is decided by which member is present — and BSON is the self-describing
@@ -36,7 +40,11 @@ fuser = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
 msb_krun = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "process", "rt", "time"] }
 
@@ -66,8 +74,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 #
 #   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
 #   for f in "" "--features krun" "--features fuse" "--features fuse-t" \
-#            "--features fuse-no-mount" "--features s3" "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,krun,s3"; do cargo test -p cortex $f --all-targets; done
+#            "--features fuse-no-mount" "--features s3" "--features notion" \
+#            "--features fuse,fuse-t" \
+#            "--features fuse,fuse-t,krun,s3,notion"; do cargo test -p cortex $f --all-targets; done
 #
 # Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
 # unquoted expansion — under zsh pass the flags as separate arguments.
@@ -75,8 +84,20 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Editors default to no features too, so a binding shows as inactive code until
 # its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
 default = []
+# Every binding below also asks for `tokio/rt-multi-thread` and `tokio/net`: a
+# binding is a *synchronous* callback over async backends, so it blocks on one
+# process-wide runtime (`volume::adapter::block_on`), and `Builder::enable_all` is
+# cfg'd on `net` and `time` — built without them the runtime silently has no I/O
+# driver. `time` is already in the base set the console asks for.
+#
 # Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
-krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
+krun = [
+    "dep:msb_krun",
+    "dep:libc",
+    "dep:tempfile",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+]
 # Mount a cortex filesystem on the host through FUSE.
 #
 # Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
@@ -88,7 +109,7 @@ krun = ["dep:msb_krun", "dep:libc", "dep:tempfile"]
 #   PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig" cargo build -p cortex --features fuse
 #
 # Linux needs no provider — fuser opens /dev/fuse directly.
-fuse = ["dep:fuser", "dep:libc"]
+fuse = ["dep:fuser", "dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # Mount on macOS through FUSE-T, which needs no kernel extension.
 #
 # A separate binding rather than a flavour of `fuse`, because the two differ in
@@ -96,11 +117,18 @@ fuse = ["dep:fuser", "dep:libc"]
 # itself, while FUSE-T hands back a socket to its own helper and expects to drive
 # the filesystem through libfuse-t's loop. Enabling both at once is fine — they
 # are independent call surfaces over the same `PosixFs`.
-fuse-t = ["dep:libc"]
+fuse-t = ["dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # Compile and unit-test the FUSE adapter with no libfuse provider installed:
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.
 fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
-# `net` and `rt-multi-thread` on top of what the console already asks for, because
-# `Builder::enable_all` is cfg'd on `net` and `time`: without them the runtime
-# silently has no I/O driver.
 s3 = ["dep:object_store", "tokio/net", "tokio/rt-multi-thread"]
+# A Notion workspace as a read-only backend: pages and their block trees rendered
+# to `page.json` on read.
+notion = [
+    "dep:reqwest",
+    "dep:uuid",
+    "dep:chrono",
+    "dep:serde_json",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+]

@@ -4,23 +4,23 @@
 //! `msb_krun`: it translates FUSE calls into backend operations and backend
 //! errors/metadata into the `stat64`/errno shapes the guest kernel expects.
 
-use std::ffi::{CStr, OsStr};
-use std::io::{Read, Result, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::{
+    ffi::{CStr, OsStr},
+    io::{Read, Result, Seek, SeekFrom, Write},
+    os::unix::ffi::OsStrExt,
+};
 
 use msb_krun::{
     DynFileSystem,
     backends::fs::{Context, DirEntry, Entry, FsOptions, stat64},
 };
 
-use crate::volume::Mountable;
-use crate::volume::PosixFs;
+use crate::CortexError;
 use crate::volume::posix::{
     BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
     decode_open_flags, unix_time,
 };
-use crate::CortexError;
-use crate::volume::{DirentKind, SetAttr, Stat};
+use crate::volume::{DirentKind, Mountable, PosixFs, SetAttr, Stat};
 
 // The guest kernel is always Linux, so every reply must carry Linux errno
 // numbers. The host's `libc` values differ (e.g. ENOSYS is 78 on macOS but 38
@@ -147,9 +147,8 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
     fn destroy(&self) {}
 
     fn lookup(&self, _ctx: Context, parent: u64, name: &CStr) -> Result<Entry> {
-        let (inode, stat) = self
-            .lookup_child(parent, guest_name(name))
-            .map_err(to_errno)?;
+        let (inode, stat) =
+            super::block_on(self.lookup_child(parent, guest_name(name))).map_err(to_errno)?;
         Ok(to_entry(inode, &stat))
     }
 
@@ -169,7 +168,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         inode: u64,
         _handle: Option<u64>,
     ) -> std::io::Result<(msb_krun::backends::fs::stat64, std::time::Duration)> {
-        let stat = self.stat_inode(inode).map_err(to_errno)?;
+        let stat = super::block_on(self.stat_inode(inode)).map_err(to_errno)?;
         Ok((to_stat64(inode, &stat), TTL))
     }
 
@@ -201,7 +200,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
             atime: None,
             mtime: None,
         };
-        let stat = self.setattr_inode(inode, handle, want).map_err(to_errno)?;
+        let stat = super::block_on(self.setattr_inode(inode, handle, want)).map_err(to_errno)?;
         Ok((to_stat64(inode, &stat), TTL))
     }
 
@@ -248,9 +247,8 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         _umask: u32,
         _extensions: msb_krun::backends::fs::Extensions,
     ) -> std::io::Result<msb_krun::backends::fs::Entry> {
-        let (inode, stat) = self
-            .mkdir_child(parent, guest_name(name))
-            .map_err(to_errno)?;
+        let (inode, stat) =
+            super::block_on(self.mkdir_child(parent, guest_name(name))).map_err(to_errno)?;
         Ok(to_entry(inode, &stat))
     }
 
@@ -260,8 +258,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         parent: u64,
         name: &std::ffi::CStr,
     ) -> std::io::Result<()> {
-        self.unlink_child(parent, guest_name(name))
-            .map_err(to_errno)
+        super::block_on(self.unlink_child(parent, guest_name(name))).map_err(to_errno)
     }
 
     fn rmdir(
@@ -270,7 +267,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         parent: u64,
         name: &std::ffi::CStr,
     ) -> std::io::Result<()> {
-        self.rmdir_child(parent, guest_name(name)).map_err(to_errno)
+        super::block_on(self.rmdir_child(parent, guest_name(name))).map_err(to_errno)
     }
 
     fn rename(
@@ -290,7 +287,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         if flags != 0 {
             return Err(errno(LINUX_EINVAL));
         }
-        self.rename_child(olddir, guest_name(oldname), newdir, guest_name(newname))
+        super::block_on(self.rename_child(olddir, guest_name(oldname), newdir, guest_name(newname)))
             .map_err(to_errno)
     }
 
@@ -317,7 +314,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         // for. Ignoring it leaves `echo > existing` with the old tail in place and
         // no error anywhere.
         let options = decode_open_flags(flags as i32, &LINUX_OPEN_FLAGS).map_err(to_errno)?;
-        let (fh, _stat) = self.open_inode(inode, options).map_err(to_errno)?;
+        let (fh, _stat) = super::block_on(self.open_inode(inode, options)).map_err(to_errno)?;
         Ok((Some(fh), msb_krun::backends::fs::OpenOptions::empty()))
     }
 
@@ -342,9 +339,9 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
             .map_err(to_errno)?
             .create(true);
 
-        let (inode, stat, fh) = self
-            .create_child(parent, guest_name(name), options)
-            .map_err(to_errno)?;
+        let (inode, stat, fh) =
+            super::block_on(self.create_child(parent, guest_name(name), options))
+                .map_err(to_errno)?;
         Ok((
             to_entry(inode, &stat),
             Some(fh),
@@ -366,7 +363,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         // No hand-patched errno: the shared operation reports a closed handle as
         // `BadHandle`, which `to_errno` renders as EBADF. While each binding
         // patched this locally, only one of them actually did.
-        let data = self.read_handle(handle, offset, size).map_err(to_errno)?;
+        let data = super::block_on(self.read_handle(handle, offset, size)).map_err(to_errno)?;
         if data.is_empty() {
             return Ok(0);
         }
@@ -404,7 +401,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         let mut buf = vec![0u8; size as usize];
         staging.read_exact(&mut buf)?;
 
-        self.write_handle(handle, offset, &buf).map_err(to_errno)
+        super::block_on(self.write_handle(handle, offset, &buf)).map_err(to_errno)
     }
 
     fn flush(
@@ -415,7 +412,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         _lock_owner: u64,
     ) -> std::io::Result<()> {
         // Not `release_handle`: FLUSH arrives on every `close()`.
-        self.flush_handle(handle).map_err(to_errno)
+        super::block_on(self.flush_handle(handle)).map_err(to_errno)
     }
 
     fn fsync(
@@ -425,7 +422,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         _datasync: bool,
         handle: u64,
     ) -> std::io::Result<()> {
-        self.flush_handle(handle).map_err(to_errno)
+        super::block_on(self.flush_handle(handle)).map_err(to_errno)
     }
 
     fn fallocate(
@@ -450,7 +447,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         _flock_release: bool,
         _lock_owner: Option<u64>,
     ) -> std::io::Result<()> {
-        self.release_handle(handle).map_err(to_errno)
+        super::block_on(self.release_handle(handle)).map_err(to_errno)
     }
 
     fn statfs(
@@ -544,19 +541,21 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
     ) -> std::io::Result<()> {
         // The cursor protocol is the shared operation's; this closure only
         // encodes. A zero from `add_entry` means the buffer is full — the `stop`.
-        self.for_each_dirent(inode, offset, |child_ino, child, cursor| {
-            let type_ = match child.kind {
-                DirentKind::Dir => libc::DT_DIR,
-                DirentKind::File => libc::DT_REG,
-            };
-            let entry = DirEntry {
-                ino: child_ino as _,
-                offset: cursor,
-                type_: type_ as u32,
-                name: child.name.as_bytes(),
-            };
-            Ok(add_entry(entry)? == 0)
-        })
+        super::block_on(
+            self.for_each_dirent(inode, offset, |child_ino, child, cursor| {
+                let type_ = match child.kind {
+                    DirentKind::Dir => libc::DT_DIR,
+                    DirentKind::File => libc::DT_REG,
+                };
+                let entry = DirEntry {
+                    ino: child_ino as _,
+                    offset: cursor,
+                    type_: type_ as u32,
+                    name: child.name.as_bytes(),
+                };
+                Ok(add_entry(entry)? == 0)
+            }),
+        )
         .map_err(to_errno)
     }
 
