@@ -2,10 +2,12 @@
 //! responder (the test owns the listener) and confirm it replays the returned
 //! stdout/stderr and exit code. No real server needed.
 
-use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::process::Command;
-use std::thread;
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    process::Command,
+    thread,
+};
 
 use cortex::ExecOutput;
 

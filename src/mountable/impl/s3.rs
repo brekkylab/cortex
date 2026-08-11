@@ -26,19 +26,24 @@
 //! its own runtime; a sync interface binding (krun/fuse/fuse-t) `block_on`s at its
 //! callback boundary (see `binding_runtime`).
 
-use std::collections::BTreeSet;
-use std::io;
-use std::path::{Component, Path};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeSet,
+    io,
+    path::{Component, Path},
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
-use object_store::aws::AmazonS3Builder;
-use object_store::path::Path as OsPath;
-use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, aws::AmazonS3Builder,
+    path::Path as OsPath,
+};
 
-use crate::lock::lock;
-use crate::mountable::{FileExt, FileHandle};
-use crate::{CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat};
+use crate::{
+    CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat,
+    lock::lock,
+    mountable::{FileExt, FileHandle},
+};
 
 /// Connection settings for [`S3Volume`].
 ///

@@ -4,22 +4,27 @@
 //! `msb_krun`: it translates FUSE calls into backend operations and backend
 //! errors/metadata into the `stat64`/errno shapes the guest kernel expects.
 
-use std::ffi::{CStr, OsStr};
-use std::io::{Read, Result, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
+use std::{
+    ffi::{CStr, OsStr},
+    io::{Read, Result, Seek, SeekFrom, Write},
+    os::unix::ffi::OsStrExt,
+};
 
 use msb_krun::{
     DynFileSystem,
     backends::fs::{Context, DirEntry, Entry, FsOptions, stat64},
 };
 
-use crate::mountable::Mountable;
-use crate::mountable::PosixFs;
-use crate::mountable::posix::{
-    BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
-    decode_open_flags, unix_time,
+use crate::{
+    CortexError, DirentKind, SetAttr, Stat,
+    mountable::{
+        Mountable, PosixFs,
+        posix::{
+            BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
+            decode_open_flags, unix_time,
+        },
+    },
 };
-use crate::{CortexError, DirentKind, SetAttr, Stat};
 
 // The guest kernel is always Linux, so every reply must carry Linux errno
 // numbers. The host's `libc` values differ (e.g. ENOSYS is 78 on macOS but 38
@@ -146,8 +151,8 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
     fn destroy(&self) {}
 
     fn lookup(&self, _ctx: Context, parent: u64, name: &CStr) -> Result<Entry> {
-        let (inode, stat) = super::block_on(self.lookup_child(parent, guest_name(name)))
-            .map_err(to_errno)?;
+        let (inode, stat) =
+            super::block_on(self.lookup_child(parent, guest_name(name))).map_err(to_errno)?;
         Ok(to_entry(inode, &stat))
     }
 
@@ -246,8 +251,8 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         _umask: u32,
         _extensions: msb_krun::backends::fs::Extensions,
     ) -> std::io::Result<msb_krun::backends::fs::Entry> {
-        let (inode, stat) = super::block_on(self.mkdir_child(parent, guest_name(name)))
-            .map_err(to_errno)?;
+        let (inode, stat) =
+            super::block_on(self.mkdir_child(parent, guest_name(name))).map_err(to_errno)?;
         Ok(to_entry(inode, &stat))
     }
 
@@ -257,8 +262,7 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
         parent: u64,
         name: &std::ffi::CStr,
     ) -> std::io::Result<()> {
-        super::block_on(self.unlink_child(parent, guest_name(name)))
-            .map_err(to_errno)
+        super::block_on(self.unlink_child(parent, guest_name(name))).map_err(to_errno)
     }
 
     fn rmdir(
@@ -339,8 +343,9 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
             .map_err(to_errno)?
             .create(true);
 
-        let (inode, stat, fh) = super::block_on(self.create_child(parent, guest_name(name), options))
-            .map_err(to_errno)?;
+        let (inode, stat, fh) =
+            super::block_on(self.create_child(parent, guest_name(name), options))
+                .map_err(to_errno)?;
         Ok((
             to_entry(inode, &stat),
             Some(fh),
@@ -540,19 +545,21 @@ impl<T: Mountable> DynFileSystem for PosixFs<T> {
     ) -> std::io::Result<()> {
         // The cursor protocol is the shared operation's; this closure only
         // encodes. A zero from `add_entry` means the buffer is full — the `stop`.
-        super::block_on(self.for_each_dirent(inode, offset, |child_ino, child, cursor| {
-            let type_ = match child.kind {
-                DirentKind::Dir => libc::DT_DIR,
-                DirentKind::File => libc::DT_REG,
-            };
-            let entry = DirEntry {
-                ino: child_ino as _,
-                offset: cursor,
-                type_: type_ as u32,
-                name: child.name.as_bytes(),
-            };
-            Ok(add_entry(entry)? == 0)
-        }))
+        super::block_on(
+            self.for_each_dirent(inode, offset, |child_ino, child, cursor| {
+                let type_ = match child.kind {
+                    DirentKind::Dir => libc::DT_DIR,
+                    DirentKind::File => libc::DT_REG,
+                };
+                let entry = DirEntry {
+                    ino: child_ino as _,
+                    offset: cursor,
+                    type_: type_ as u32,
+                    name: child.name.as_bytes(),
+                };
+                Ok(add_entry(entry)? == 0)
+            }),
+        )
         .map_err(to_errno)
     }
 

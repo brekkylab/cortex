@@ -37,8 +37,10 @@
 //! a real check: without it `cat` after `echo >` prints the right bytes from the
 //! guest's own cache even if none reached the backend.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use cortex::{FileExt, InMemVolume, Mountable, OpenOptions, PosixFs, Workspace};
 use msb_krun::VmBuilder;

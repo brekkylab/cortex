@@ -21,8 +21,7 @@
 
 #![cfg(feature = "s3")]
 
-use std::path::Path;
-use std::process::Command;
+use std::{path::Path, process::Command};
 
 use cortex::{DirentKind, FileExt, Mountable, OpenOptions, S3Config, S3Volume};
 
@@ -162,11 +161,12 @@ const MAX_READ: u64 = 8 << 20;
 /// Discovered rather than hardcoded so this test does not encode one corpus. Also
 /// evidence in itself: every step is a real `ListObjectsV2` with a delimiter, and a
 /// prefix has to come back as a directory for the descent to continue at all.
-fn find_a_file<'a>(
-    vol: &'a S3Volume,
-    at: &'a Path,
-    depth: usize,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<(std::path::PathBuf, u64)>> + 'a>> {
+/// A boxed, borrowing future — named so the recursive `find_a_file` can spell its
+/// own return type without a clippy `type_complexity` warning.
+type FindFileFut<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Option<(std::path::PathBuf, u64)>> + 'a>>;
+
+fn find_a_file<'a>(vol: &'a S3Volume, at: &'a Path, depth: usize) -> FindFileFut<'a> {
     Box::pin(async move {
         if depth == 0 {
             return None;
@@ -202,7 +202,9 @@ fn find_a_file<'a>(
 #[tokio::test]
 #[ignore = "needs a reachable object-store endpoint; see this file's docs"]
 async fn a_real_endpoint_answers_the_whole_read_surface() {
-    let Some((vol, _)) = volume().await else { return };
+    let Some((vol, _)) = volume().await else {
+        return;
+    };
 
     // The root is a directory without asking anyone.
     assert_eq!(
@@ -220,8 +222,9 @@ async fn a_real_endpoint_answers_the_whole_read_surface() {
         root.iter().filter(|e| e.kind == DirentKind::Dir).count()
     );
 
-    let (path, size) =
-        find_a_file(&vol, Path::new(""), 6).await.expect("a file somewhere in the bucket");
+    let (path, size) = find_a_file(&vol, Path::new(""), 6)
+        .await
+        .expect("a file somewhere in the bucket");
     println!("found {} ({size} bytes)", path.display());
     assert!(size > 0, "expected a non-empty object to read");
 
@@ -247,7 +250,10 @@ async fn a_real_endpoint_answers_the_whole_read_surface() {
     let at = size / 2;
     let mut middle = vec![0u8; (size - at) as usize];
     // A fresh handle, so this is a miss rather than the first read's window.
-    let (fresh, _) = vol.open(&path, OpenOptions::read_only()).await.expect("reopen");
+    let (fresh, _) = vol
+        .open(&path, OpenOptions::read_only())
+        .await
+        .expect("reopen");
     let read = fresh.read_at(&mut middle, at).await.expect("ranged read");
     assert_eq!(read, middle.len(), "the ranged read came back short");
     assert_eq!(middle, whole[at as usize..], "ranged bytes disagree");
@@ -255,7 +261,10 @@ async fn a_real_endpoint_answers_the_whole_read_surface() {
     // Past the end is EOF, answered from the size the open recorded rather than by
     // sending a range the store would reject.
     let mut past = [0u8; 16];
-    assert_eq!(fresh.read_at(&mut past, size).await.expect("read past end"), 0);
+    assert_eq!(
+        fresh.read_at(&mut past, size).await.expect("read past end"),
+        0
+    );
 }
 
 /// A real 404 has to arrive as `NotFound` — the status is upstream's to produce, and
@@ -263,16 +272,23 @@ async fn a_real_endpoint_answers_the_whole_read_surface() {
 #[tokio::test]
 #[ignore = "needs a reachable object-store endpoint; see this file's docs"]
 async fn a_missing_key_on_a_real_endpoint_is_not_found() {
-    let Some((vol, _)) = volume().await else { return };
+    let Some((vol, _)) = volume().await else {
+        return;
+    };
     let missing = Path::new("cortex-e2e-no-such-key-8f2a1c");
-    let err = vol.stat(missing).await.expect_err("a missing key must not stat");
+    let err = vol
+        .stat(missing)
+        .await
+        .expect_err("a missing key must not stat");
     assert!(
         matches!(err, cortex::CortexError::NotFound),
         "expected NotFound, got {err:?}"
     );
     assert!(
         matches!(
-            vol.open(missing, OpenOptions::read_only()).await.map(|_| ()),
+            vol.open(missing, OpenOptions::read_only())
+                .await
+                .map(|_| ()),
             Err(cortex::CortexError::NotFound)
         ),
         "open should agree with stat"
@@ -295,12 +311,17 @@ async fn a_bad_signature_on_a_real_endpoint_is_permission_denied() {
     let Some((good, principal)) = volume().await else {
         return;
     };
-    let (path, _size) = find_a_file(&good, Path::new(""), 6).await.expect("a file to ask about");
+    let (path, _size) = find_a_file(&good, Path::new(""), 6)
+        .await
+        .expect("a file to ask about");
 
     let wrong = format!("{}x", principal.secret_access_key);
     let vol = S3Volume::new(&config(&principal, &wrong)).expect("build the S3 client");
 
-    let err = vol.stat(&path).await.expect_err("a bad signature must not stat");
+    let err = vol
+        .stat(&path)
+        .await
+        .expect_err("a bad signature must not stat");
     assert!(
         matches!(err, cortex::CortexError::PermissionDenied),
         "expected PermissionDenied from a 403 on HEAD, got {err:?}"

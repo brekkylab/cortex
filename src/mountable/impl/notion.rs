@@ -18,18 +18,21 @@
 //! Writes surface as [`CortexError::ReadOnly`] (not `Unsupported`) so one
 //! read-only source does not disable writes for a whole workspace mount.
 
-use std::collections::HashMap;
-use std::io;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
-
-use serde_json::{Value, json};
+use std::{
+    collections::HashMap,
+    io,
+    path::Path,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime},
+};
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
-use crate::mountable::{FileExt, FileHandle};
-use crate::{CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat};
+use crate::{
+    CortexError, Dirent, DirentKind, Mountable, OpenOptions, Result, Stat,
+    mountable::{FileExt, FileHandle},
+};
 
 const API: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2022-06-28";
@@ -107,6 +110,10 @@ impl NotionVolume {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
+        // `attempt` indexes `RETRY_BACKOFF`, but the range is `0..=len` (one past,
+        // the final no-backoff try) and the index also gates that last attempt, so
+        // an `.iter()` rewrite would not capture the loop — keep the range.
+        #[allow(clippy::needless_range_loop)]
         for attempt in 0..=RETRY_BACKOFF.len() {
             let Some(this) = req.try_clone() else {
                 return finish(self.authed(req).send().await.map_err(io_other)?).await;
@@ -160,7 +167,8 @@ impl NotionVolume {
         if !valid_notion_id(id) {
             return Err(CortexError::NotFound);
         }
-        self.send(self.client.get(format!("{API}/pages/{id}"))).await
+        self.send(self.client.get(format!("{API}/pages/{id}")))
+            .await
     }
 
     /// All immediate block children of `id`, paging through every result.
@@ -238,10 +246,10 @@ impl NotionVolume {
 
     /// The rendered `page.json` for `page_id`, served from cache when fresh.
     async fn render_cached(&self, page_id: &str) -> Result<Rendered> {
-        if let Some((at, r)) = self.cache.lock().unwrap().get(page_id) {
-            if at.elapsed() < RENDER_TTL {
-                return Ok(r.clone());
-            }
+        if let Some((at, r)) = self.cache.lock().unwrap().get(page_id)
+            && at.elapsed() < RENDER_TTL
+        {
+            return Ok(r.clone());
         }
         let page = self.get_page(page_id).await?;
         let blocks = self.list_block_tree(page_id.to_string(), 0).await?;
@@ -368,7 +376,9 @@ impl Mountable for NotionVolume {
             return Err(CortexError::ReadOnly);
         }
         let segs = segments(path);
-        if segs.len() >= 3 && segs[0] == "pages" && segs.last().map(String::as_str) == Some("page.json")
+        if segs.len() >= 3
+            && segs[0] == "pages"
+            && segs.last().map(String::as_str) == Some("page.json")
         {
             let id = page_id(&segs[segs.len() - 2]);
             let r = self.render_cached(&id).await?;
@@ -514,7 +524,10 @@ fn page_time(v: &Value, key: &str) -> Option<SystemTime> {
 fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
     let parent = page.get("parent").cloned().unwrap_or_else(|| json!({}));
     let parent_type = parent.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let parent_id = parent.get(parent_type).and_then(|v| v.as_str()).unwrap_or("");
+    let parent_id = parent
+        .get(parent_type)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let content_blocks: Vec<Value> = blocks
         .iter()
         .filter(|b| {
@@ -633,7 +646,10 @@ fn block_to_md(block: &Value, indent: usize) -> String {
         }
         "toggle" => format!("{prefix}<details><summary>{text}</summary></details>"),
         "code" => {
-            let language = content.get("language").and_then(|v| v.as_str()).unwrap_or("");
+            let language = content
+                .get("language")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             format!("```{language}\n{text}\n```")
         }
         "quote" => format!("{prefix}> {text}"),
@@ -772,7 +788,10 @@ mod tests {
         let dir = &first.name;
 
         let json_path = format!("/pages/{dir}/page.json");
-        let st = vol.stat(Path::new(&json_path)).await.expect("stat page.json");
+        let st = vol
+            .stat(Path::new(&json_path))
+            .await
+            .expect("stat page.json");
         assert_eq!(st.kind, DirentKind::File);
         assert!(st.size > 0, "page.json size should be non-zero");
 

@@ -1,8 +1,10 @@
-use super::*;
 use std::time::UNIX_EPOCH;
 
+use super::*;
+
 async fn mtime_of(vol: &InMemVolume, path: &str) -> SystemTime {
-    vol.stat(Path::new(path)).await
+    vol.stat(Path::new(path))
+        .await
         .unwrap()
         .mtime
         .expect("every entry reports an mtime")
@@ -12,12 +14,18 @@ async fn mtime_of(vol: &InMemVolume, path: &str) -> SystemTime {
 async fn a_new_entry_reports_a_real_timestamp() {
     let started = SystemTime::now();
     let vol = InMemVolume::new();
-    let (_, stat) = vol.open(Path::new("f"), OpenOptions::create_new()).await.unwrap();
+    let (_, stat) = vol
+        .open(Path::new("f"), OpenOptions::create_new())
+        .await
+        .unwrap();
     vol.mkdir(Path::new("d")).await.unwrap();
 
     for (what, mtime) in [
         ("file (from open)", stat.mtime),
-        ("file (from stat)", vol.stat(Path::new("f")).await.unwrap().mtime),
+        (
+            "file (from stat)",
+            vol.stat(Path::new("f")).await.unwrap().mtime,
+        ),
         ("directory", vol.stat(Path::new("d")).await.unwrap().mtime),
         ("root", vol.stat(Path::new("")).await.unwrap().mtime),
     ] {
@@ -45,7 +53,10 @@ async fn a_new_entry_reports_a_real_timestamp() {
 #[tokio::test]
 async fn changing_a_files_contents_advances_its_mtime() {
     let vol = InMemVolume::new();
-    let (handle, _) = vol.open(Path::new("f"), OpenOptions::create_new()).await.unwrap();
+    let (handle, _) = vol
+        .open(Path::new("f"), OpenOptions::create_new())
+        .await
+        .unwrap();
 
     // Not `after > before`: two `now()` calls can land on the same tick. "At or
     // after the moment it began" is the real contract, and needs no sleep.
@@ -85,7 +96,8 @@ async fn changing_a_directorys_children_advances_its_mtime() {
     assert!(mtime_of(&vol, "d").await >= began, "mkdir of a child");
 
     let began = SystemTime::now();
-    vol.open(Path::new("d/f"), OpenOptions::create_new()).await
+    vol.open(Path::new("d/f"), OpenOptions::create_new())
+        .await
         .unwrap();
     assert!(mtime_of(&vol, "d").await >= began, "creating a file in it");
 
@@ -104,7 +116,8 @@ async fn a_childs_write_leaves_the_parent_directory_alone() {
     let vol = InMemVolume::new();
     vol.mkdir(Path::new("d")).await.unwrap();
     let (handle, _) = vol
-        .open(Path::new("d/f"), OpenOptions::create_new()).await
+        .open(Path::new("d/f"), OpenOptions::create_new())
+        .await
         .unwrap();
 
     let before = mtime_of(&vol, "d").await;
@@ -115,7 +128,10 @@ async fn a_childs_write_leaves_the_parent_directory_alone() {
 #[tokio::test]
 async fn reading_and_listing_leave_timestamps_alone() {
     let vol = InMemVolume::new();
-    let (handle, _) = vol.open(Path::new("f"), OpenOptions::create_new()).await.unwrap();
+    let (handle, _) = vol
+        .open(Path::new("f"), OpenOptions::create_new())
+        .await
+        .unwrap();
     handle.write_all_at(b"hello", 0).await.unwrap();
     vol.mkdir(Path::new("d")).await.unwrap();
 
@@ -126,14 +142,21 @@ async fn reading_and_listing_leave_timestamps_alone() {
     vol.list(Path::new("")).await.unwrap();
     vol.stat(Path::new("f")).await.unwrap();
 
-    assert_eq!(mtime_of(&vol, "f").await, file, "a read is not a modification");
+    assert_eq!(
+        mtime_of(&vol, "f").await,
+        file,
+        "a read is not a modification"
+    );
     assert_eq!(mtime_of(&vol, "d").await, dir, "nor is a listing");
 }
 
 #[tokio::test]
 async fn created_is_set_once_and_does_not_move() {
     let vol = InMemVolume::new();
-    let (handle, stat) = vol.open(Path::new("f"), OpenOptions::create_new()).await.unwrap();
+    let (handle, stat) = vol
+        .open(Path::new("f"), OpenOptions::create_new())
+        .await
+        .unwrap();
     let born = stat.created.expect("a new file records its birth time");
 
     handle.write_all_at(b"hello", 0).await.unwrap();
@@ -159,11 +182,17 @@ async fn rename_follows_the_overwrite_table() {
     file(&vol, "a").await;
     assert!(vol.rename(Path::new("a"), Path::new("b")).await.is_ok());
     assert!(vol.stat(Path::new("a")).await.is_err());
-    assert_eq!(vol.stat(Path::new("b")).await.unwrap().kind, DirentKind::File);
+    assert_eq!(
+        vol.stat(Path::new("b")).await.unwrap().kind,
+        DirentKind::File
+    );
 
     // file -> file: replaces, silently
     let vol = InMemVolume::new();
-    let (src, _) = vol.open(Path::new("a"), OpenOptions::create_new()).await.unwrap();
+    let (src, _) = vol
+        .open(Path::new("a"), OpenOptions::create_new())
+        .await
+        .unwrap();
     src.write_all_at(b"new", 0).await.unwrap();
     file(&vol, "b").await;
     assert!(vol.rename(Path::new("a"), Path::new("b")).await.is_ok());
@@ -256,19 +285,25 @@ async fn rename_touches_both_directories_but_not_the_file() {
     vol.mkdir(Path::new("from")).await.unwrap();
     vol.mkdir(Path::new("to")).await.unwrap();
     let (handle, _) = vol
-        .open(Path::new("from/f"), OpenOptions::create_new()).await
+        .open(Path::new("from/f"), OpenOptions::create_new())
+        .await
         .unwrap();
     handle.write_all_at(b"payload", 0).await.unwrap();
     let file_mtime = mtime_of(&vol, "from/f").await;
 
     let began = SystemTime::now();
-    vol.rename(Path::new("from/f"), Path::new("to/f")).await.unwrap();
+    vol.rename(Path::new("from/f"), Path::new("to/f"))
+        .await
+        .unwrap();
 
     assert!(
         mtime_of(&vol, "from").await >= began,
         "a name left this directory"
     );
-    assert!(mtime_of(&vol, "to").await >= began, "and arrived in this one");
+    assert!(
+        mtime_of(&vol, "to").await >= began,
+        "and arrived in this one"
+    );
     assert_eq!(
         mtime_of(&vol, "to/f").await,
         file_mtime,
@@ -280,7 +315,10 @@ async fn rename_touches_both_directories_but_not_the_file() {
 async fn an_open_handle_survives_a_rename() {
     // The handle shares the body, not the place in the tree — as an open fd does.
     let vol = InMemVolume::new();
-    let (handle, _) = vol.open(Path::new("a"), OpenOptions::create_new()).await.unwrap();
+    let (handle, _) = vol
+        .open(Path::new("a"), OpenOptions::create_new())
+        .await
+        .unwrap();
     handle.write_all_at(b"kept", 0).await.unwrap();
 
     vol.rename(Path::new("a"), Path::new("b")).await.unwrap();
@@ -295,7 +333,8 @@ async fn an_open_handle_survives_a_rename() {
 
 async fn names(vol: &InMemVolume, path: &str) -> Vec<String> {
     let mut names: Vec<_> = vol
-        .list(Path::new(path)).await
+        .list(Path::new(path))
+        .await
         .unwrap()
         .iter()
         .map(|e| e.name.clone())
@@ -307,13 +346,17 @@ async fn names(vol: &InMemVolume, path: &str) -> Vec<String> {
 /// Create a file and fill it with `data` in one step.
 async fn write_file(vol: &InMemVolume, path: &str, data: &[u8]) {
     let (handle, _) = vol
-        .open(Path::new(path), OpenOptions::create_new()).await
+        .open(Path::new(path), OpenOptions::create_new())
+        .await
         .unwrap();
     handle.write_all_at(data, 0).await.unwrap();
 }
 
 async fn read_file(vol: &InMemVolume, path: &str) -> Vec<u8> {
-    let (handle, stat) = vol.open(Path::new(path), OpenOptions::read_only()).await.unwrap();
+    let (handle, stat) = vol
+        .open(Path::new(path), OpenOptions::read_only())
+        .await
+        .unwrap();
     let mut buf = vec![0u8; stat.size as usize];
     handle.read_exact_at(&mut buf, 0).await.unwrap();
     buf
@@ -326,10 +369,12 @@ async fn positioned_writes_and_truncate_are_shared() {
 
     // Both handles share the tree's buffer, so `stat` sees the new size.
     let (a, _) = vol
-        .open(Path::new("/f"), OpenOptions::read_write()).await
+        .open(Path::new("/f"), OpenOptions::read_write())
+        .await
         .unwrap();
     let (b, _) = vol
-        .open(Path::new("/f"), OpenOptions::read_write()).await
+        .open(Path::new("/f"), OpenOptions::read_write())
+        .await
         .unwrap();
     a.write_all_at(b"HELLO", 0).await.unwrap();
     let mut buf = [0u8; 5];
@@ -373,10 +418,7 @@ async fn open_options_pin_the_creation_contract() {
     ));
 
     // At open time, before the handle exists.
-    let (_, stat) = vol
-        .open(Path::new("/f"), rw.truncate(true))
-        .await
-        .unwrap();
+    let (_, stat) = vol.open(Path::new("/f"), rw.truncate(true)).await.unwrap();
     assert_eq!(stat.size, 0);
 
     // A missing parent is never created implicitly.
@@ -422,7 +464,8 @@ async fn open_options_pin_the_creation_contract() {
 async fn absurd_offsets_are_refused_rather_than_allocated() {
     let vol = InMemVolume::new();
     let (handle, _) = vol
-        .open(Path::new("/f"), OpenOptions::create_new()).await
+        .open(Path::new("/f"), OpenOptions::create_new())
+        .await
         .unwrap();
     handle.write_all_at(b"keep", 0).await.unwrap();
 
@@ -559,7 +602,10 @@ async fn a_handle_refuses_what_its_open_did_not_allow() {
         .await
         .unwrap();
     assert_eq!(
-        wo.read_at(&mut [0u8; 1], 0).await.unwrap_err().raw_os_error(),
+        wo.read_at(&mut [0u8; 1], 0)
+            .await
+            .unwrap_err()
+            .raw_os_error(),
         Some(9)
     );
 }

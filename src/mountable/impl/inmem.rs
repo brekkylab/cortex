@@ -11,16 +11,19 @@
 //! (via [`OpenOptions`]), so there is exactly one path by which bytes enter the
 //! store — and `create_new` can be genuinely exclusive.
 
-use std::collections::HashMap;
-use std::io;
-use std::path::{Component, Path};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::{
+    collections::HashMap,
+    io,
+    path::{Component, Path},
+    sync::{Arc, Mutex},
+    time::SystemTime,
+};
 
-use crate::lock::lock;
 use async_trait::async_trait;
+
 use crate::{
     CortexError, Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, Result, Stat,
+    lock::lock,
 };
 
 /// The largest file this volume will represent — a safety ceiling, not a capacity

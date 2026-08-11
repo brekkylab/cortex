@@ -7,9 +7,7 @@
 
 use std::sync::Arc;
 
-use object_store::ObjectStoreExt;
-use object_store::memory::InMemory;
-use object_store::path::Path as OsPath;
+use object_store::{ObjectStoreExt, memory::InMemory, path::Path as OsPath};
 
 use super::*;
 
@@ -300,11 +298,24 @@ fn curdir_and_root_components_are_ignored() {
 #[tokio::test]
 async fn every_namespace_write_is_read_only() {
     let vol = empty();
-    assert_eq!(label(&vol.mkdir(Path::new("d")).await.unwrap_err()), "ReadOnly");
-    assert_eq!(label(&vol.unlink(Path::new("f")).await.unwrap_err()), "ReadOnly");
-    assert_eq!(label(&vol.rmdir(Path::new("d")).await.unwrap_err()), "ReadOnly");
     assert_eq!(
-        label(&Mountable::rename(&vol, Path::new("a"), Path::new("b")).await.unwrap_err()),
+        label(&vol.mkdir(Path::new("d")).await.unwrap_err()),
+        "ReadOnly"
+    );
+    assert_eq!(
+        label(&vol.unlink(Path::new("f")).await.unwrap_err()),
+        "ReadOnly"
+    );
+    assert_eq!(
+        label(&vol.rmdir(Path::new("d")).await.unwrap_err()),
+        "ReadOnly"
+    );
+    assert_eq!(
+        label(
+            &Mountable::rename(&vol, Path::new("a"), Path::new("b"))
+                .await
+                .unwrap_err()
+        ),
         "ReadOnly"
     );
 }
@@ -374,15 +385,19 @@ async fn a_file_reports_its_size_and_metadata() {
 /// matters because every mount begins with a `getattr` on it.
 #[tokio::test]
 async fn the_root_is_a_directory() {
-    let stat = holding("", &[("a.txt", "x")]).await
-        .stat(Path::new("")).await
+    let stat = holding("", &[("a.txt", "x")])
+        .await
+        .stat(Path::new(""))
+        .await
         .expect("stat root");
     assert_eq!(stat.kind, DirentKind::Dir);
 
     // Same when the volume is rooted under a key prefix that has no object of its
     // own — the prefix root is still a directory.
-    let stat = holding("root", &[("root/a.txt", "x")]).await
-        .stat(Path::new("")).await
+    let stat = holding("root", &[("root/a.txt", "x")])
+        .await
+        .stat(Path::new(""))
+        .await
         .expect("stat prefix root");
     assert_eq!(stat.kind, DirentKind::Dir);
 }
@@ -415,7 +430,10 @@ async fn a_zero_byte_marker_with_children_is_a_directory() {
 #[tokio::test]
 async fn a_zero_byte_file_without_children_stays_a_file() {
     let vol = holding("", &[("_SUCCESS", "")]).await;
-    let stat = vol.stat(Path::new("_SUCCESS")).await.expect("stat empty file");
+    let stat = vol
+        .stat(Path::new("_SUCCESS"))
+        .await
+        .expect("stat empty file");
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, 0);
 }
@@ -455,7 +473,8 @@ async fn stat_resolves_through_the_key_prefix() {
 /// and what kind each entry claims to be.
 async fn listed(vol: &S3Volume, path: &str) -> Vec<String> {
     let mut names: Vec<_> = vol
-        .list(Path::new(path)).await
+        .list(Path::new(path))
+        .await
         .expect("list")
         .into_iter()
         .map(|entry| {
@@ -482,8 +501,12 @@ async fn a_listing_names_one_level() {
             ("dir/sub/c.txt", "z"),
             ("dir2/d.txt", "w"),
         ],
-    ).await;
-    assert_eq!(listed(&vol, "").await, ["dir:dir", "dir:dir2", "file:a.txt"]);
+    )
+    .await;
+    assert_eq!(
+        listed(&vol, "").await,
+        ["dir:dir", "dir:dir2", "file:a.txt"]
+    );
     assert_eq!(listed(&vol, "dir").await, ["dir:sub", "file:b.txt"]);
 }
 
@@ -509,7 +532,8 @@ async fn a_listing_carries_metadata_it_already_had() {
 async fn a_listed_directory_carries_no_metadata() {
     let vol = holding("", &[("dir/a.txt", "x")]).await;
     let dir = vol
-        .list(Path::new("")).await
+        .list(Path::new(""))
+        .await
         .expect("list")
         .into_iter()
         .find(|e| e.name == "dir")
@@ -559,7 +583,8 @@ async fn list_and_stat_agree_on_a_name_that_is_both() {
     for (body, want) in [("", DirentKind::Dir), ("eleven byte", DirentKind::File)] {
         let vol = holding("", &[("dir/sub", body), ("dir/sub/c.txt", "z")]).await;
         let listed_kind = vol
-            .list(Path::new("dir")).await
+            .list(Path::new("dir"))
+            .await
             .expect("list")
             .into_iter()
             .find(|e| e.name == "sub")
@@ -591,7 +616,8 @@ async fn list_resolves_through_the_key_prefix() {
 async fn opening_a_file_yields_its_metadata_with_the_handle() {
     let vol = holding("", &[("a.txt", "hello")]).await;
     let (handle, stat) = vol
-        .open(Path::new("a.txt"), OpenOptions::read_only()).await
+        .open(Path::new("a.txt"), OpenOptions::read_only())
+        .await
         .expect("open");
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, 5);
@@ -632,7 +658,8 @@ async fn opening_for_neither_reading_nor_writing_is_invalid() {
     let vol = holding("", &[("a.txt", "hello")]).await;
     assert_eq!(
         label(
-            &vol.open(Path::new("a.txt"), OpenOptions::default()).await
+            &vol.open(Path::new("a.txt"), OpenOptions::default())
+                .await
                 .unwrap_err()
         ),
         "InvalidArgument"
@@ -648,7 +675,8 @@ async fn opening_a_directory_says_so() {
     for dir in ["", "dir", "plain"] {
         assert_eq!(
             label(
-                &vol.open(Path::new(dir), OpenOptions::read_only()).await
+                &vol.open(Path::new(dir), OpenOptions::read_only())
+                    .await
                     .unwrap_err()
             ),
             "IsADirectory",
@@ -662,7 +690,8 @@ async fn opening_a_missing_key_is_not_found() {
     let vol = holding("", &[("a.txt", "x")]).await;
     assert_eq!(
         label(
-            &vol.open(Path::new("nope"), OpenOptions::read_only()).await
+            &vol.open(Path::new("nope"), OpenOptions::read_only())
+                .await
                 .unwrap_err()
         ),
         "NotFound"
@@ -679,7 +708,8 @@ fn ruler(len: usize) -> String {
 
 async fn open_reader(body: &str) -> S3Handle {
     let vol = holding("", &[("big.bin", body)]).await;
-    vol.open(Path::new("big.bin"), OpenOptions::read_only()).await
+    vol.open(Path::new("big.bin"), OpenOptions::read_only())
+        .await
         .expect("open")
         .0
 }
@@ -770,11 +800,15 @@ async fn a_read_inside_the_window_does_not_fetch() {
     let mut buf = vec![0u8; 4096];
     handle.read_at(&mut buf, 0).await.expect("first");
     handle
-        .read_at(&mut buf, 4096).await
+        .read_at(&mut buf, 4096)
+        .await
         .expect("second, fetches ahead");
     let before = handle.cache.lock().unwrap().window.clone();
 
-    handle.read_at(&mut buf, 8192).await.expect("third, from cache");
+    handle
+        .read_at(&mut buf, 8192)
+        .await
+        .expect("third, from cache");
     assert_eq!(buf, body.as_bytes()[8192..12288]);
     assert_eq!(
         handle.cache.lock().unwrap().window,
@@ -795,10 +829,12 @@ async fn a_scattered_read_does_not_fetch_a_window() {
     let mut buf = vec![0u8; 4096];
     handle.read_at(&mut buf, 0).await.expect("first");
     handle
-        .read_at(&mut buf, 4096).await
+        .read_at(&mut buf, 4096)
+        .await
         .expect("second, fetches ahead");
     handle
-        .read_at(&mut buf, jump).await
+        .read_at(&mut buf, jump)
+        .await
         .expect("jump beyond the window");
     let cache = handle.cache.lock().unwrap();
     let (start, data) = cache.window.as_ref().expect("window");
@@ -822,7 +858,8 @@ async fn a_read_crossing_the_window_edge_is_filled() {
     let mut buf = vec![0u8; 7000];
     handle.read_at(&mut buf, 0).await.expect("first");
     handle
-        .read_at(&mut buf, 7000).await
+        .read_at(&mut buf, 7000)
+        .await
         .expect("second, fetches ahead");
     let window_end = {
         let cache = handle.cache.lock().unwrap();
@@ -913,12 +950,18 @@ async fn a_mount_path_composes_with_the_key_prefix() {
         .try_with_mount("data", vol)
         .expect("mount");
 
-    let stat = Mountable::stat(&ws, Path::new("data/a.txt")).await.expect("stat through workspace");
+    let stat = Mountable::stat(&ws, Path::new("data/a.txt"))
+        .await
+        .expect("stat through workspace");
     assert_eq!(stat.size, 5, "mount path stripped, key prefix prepended");
 
     // And the composition does not open a way past the prefix.
     assert_eq!(
-        label(&Mountable::stat(&ws, Path::new("data/../a.txt")).await.unwrap_err()),
+        label(
+            &Mountable::stat(&ws, Path::new("data/../a.txt"))
+                .await
+                .unwrap_err()
+        ),
         "NotFound",
         "`..` is resolved by the workspace before the backend sees it"
     );
@@ -939,7 +982,8 @@ async fn a_shared_volume_serves_a_workspace_and_its_owner() {
 
     // Through the workspace, beside a different backend.
     assert_eq!(
-        Mountable::stat(&ws, Path::new("s3/a.txt")).await
+        Mountable::stat(&ws, Path::new("s3/a.txt"))
+            .await
             .expect("stat")
             .size,
         5
@@ -948,7 +992,8 @@ async fn a_shared_volume_serves_a_workspace_and_its_owner() {
     assert_eq!(vol.stat(Path::new("a.txt")).await.expect("stat").size, 5);
 
     // The synthesized root names both mounts.
-    let mut names: Vec<_> = Mountable::list(&ws, Path::new("")).await
+    let mut names: Vec<_> = Mountable::list(&ws, Path::new(""))
+        .await
         .expect("list root")
         .into_iter()
         .map(|e| e.name)
@@ -968,7 +1013,8 @@ async fn a_read_through_a_workspace_reaches_the_object() {
         .try_with_mount("s3", vol)
         .expect("mount");
 
-    let (handle, stat) = Mountable::open(&ws, Path::new("s3/big.bin"), OpenOptions::read_only()).await
+    let (handle, stat) = Mountable::open(&ws, Path::new("s3/big.bin"), OpenOptions::read_only())
+        .await
         .expect("open through workspace");
     assert_eq!(stat.size, 9000);
     let mut buf = vec![0u8; 5000];
@@ -987,7 +1033,8 @@ async fn debugging_a_handle_does_not_print_the_window() {
     let mut buf = vec![0u8; 4096];
     handle.read_at(&mut buf, 0).await.expect("first");
     handle
-        .read_at(&mut buf, 4096).await
+        .read_at(&mut buf, 4096)
+        .await
         .expect("second, fetches ahead");
 
     let shown = format!("{handle:?}");
@@ -1025,10 +1072,9 @@ async fn debugging_a_handle_does_not_print_the_window() {
 /// ```
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
 mod mounted {
-    use super::*;
-    use std::fs;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
 
+    use super::*;
     use crate::HostMount;
 
     fn mountpoint(tag: &str) -> PathBuf {
@@ -1052,7 +1098,8 @@ mod mounted {
                 ("marker/inside.txt", "inside\n"),
                 ("big.bin", big),
             ],
-        ).await
+        )
+        .await
     }
 
     #[test]
@@ -1060,7 +1107,12 @@ mod mounted {
     fn the_operating_system_can_read_an_object_store_mount() {
         let big = ruler(READAHEAD_CHUNK as usize + 300_000);
         let mnt = mountpoint("read");
-        let mount = HostMount::spawn(bucket(&big), &mnt).expect("mount");
+        // `bucket` is async (its in-memory store is), but this is a sync mount
+        // test, so build the volume on a throwaway runtime before handing it over.
+        let vol = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(bucket(&big));
+        let mount = HostMount::spawn(vol, &mnt).expect("mount");
 
         // A real `readdir`, with the collision rules applied by the kernel's rules.
         let mut names: Vec<_> = fs::read_dir(&mnt)
@@ -1111,16 +1163,19 @@ mod mounted {
     /// actually told, which is the only thing tools act on.
     #[test]
     #[ignore = "needs a libfuse provider and mounts a real filesystem"]
-    async fn the_operating_system_is_told_the_mount_is_read_only() {
+    fn the_operating_system_is_told_the_mount_is_read_only() {
         let mnt = mountpoint("ro");
-        let mount = HostMount::spawn(bucket("x"), &mnt).expect("mount");
+        let vol = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(bucket("x"));
+        let mount = HostMount::spawn(vol, &mnt).expect("mount");
 
         let denied = [
             fs::write(mnt.join("new.txt"), b"nope").err(),
             fs::write(mnt.join("greeting.txt"), b"nope").err(),
             fs::create_dir(mnt.join("newdir")).err(),
             fs::remove_file(mnt.join("greeting.txt")).err(),
-            fs::rename(mnt.join("greeting.txt"), mnt.join("moved.txt")).await.err(),
+            fs::rename(mnt.join("greeting.txt"), mnt.join("moved.txt")).err(),
         ];
         for err in denied {
             let err = err.expect("a write on a read-only mount must fail");

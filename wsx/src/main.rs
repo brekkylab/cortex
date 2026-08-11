@@ -7,8 +7,7 @@
 //!
 //! Config via env: `WSX_HOST=host:port`, `WSX_TOKEN=<x-cortex-token>`.
 
-use std::io::Write;
-use std::process::ExitCode;
+use std::{io::Write, process::ExitCode};
 
 use cortex::ExecRequest;
 use wsx::post;

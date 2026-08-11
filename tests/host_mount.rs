@@ -46,15 +46,13 @@
 
 #![cfg(any(feature = "fuse", feature = "fuse-t"))]
 
-use std::fs;
-use std::path::PathBuf;
-
-use cortex::{InMemVolume, Mountable, OpenOptions, Workspace};
+use std::{fs, path::PathBuf};
 
 // One set of test bodies for both host bindings: they expose the same call
 // surface, so which is under test is a matter of which feature is on — making
 // these tests evidence that the two behave *alike*, not just that each behaves.
 use cortex::HostMount;
+use cortex::{InMemVolume, Mountable, OpenOptions, Workspace};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {

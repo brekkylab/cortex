@@ -1,7 +1,7 @@
-use super::*;
-use crate::test_support::scratch;
-use crate::{FileExt, InMemVolume, PassthroughVolume};
 use std::fs;
+
+use super::*;
+use crate::{FileExt, InMemVolume, PassthroughVolume, test_support::scratch};
 
 /// Only the mount table matters here, so the cheapest backend will do.
 fn table(paths: &[&str]) -> Workspace {
@@ -61,7 +61,10 @@ async fn a_rootless_workspace_has_a_root_directory() {
     );
     // A mount point itself is still its backend's answer.
     assert_eq!(
-        Mountable::stat(&ws, Path::new("notion")).await.unwrap().kind,
+        Mountable::stat(&ws, Path::new("notion"))
+            .await
+            .unwrap()
+            .kind,
         DirentKind::Dir
     );
     // Neither a mount nor on the way to one.
@@ -79,7 +82,10 @@ async fn every_step_toward_a_deep_mount_is_a_directory_listing_the_next_one() {
 
     for (on_the_way, next) in [("", "a"), ("a", "b"), ("a/b", "c")] {
         assert_eq!(
-            Mountable::stat(&ws, Path::new(on_the_way)).await.unwrap().kind,
+            Mountable::stat(&ws, Path::new(on_the_way))
+                .await
+                .unwrap()
+                .kind,
             DirentKind::Dir,
             "{on_the_way:?} leads to a mount"
         );
@@ -156,7 +162,8 @@ async fn a_broken_root_backend_is_not_hidden_behind_a_synthesized_root() {
 }
 
 async fn listing(ws: &Workspace, at: &str) -> Vec<(String, DirentKind, bool)> {
-    Mountable::list(ws, Path::new(at)).await
+    Mountable::list(ws, Path::new(at))
+        .await
         .unwrap()
         .into_iter()
         // `stat()` borrows, so it has to be read before `name` is moved out.
@@ -212,7 +219,9 @@ async fn a_mount_shadows_a_backend_entry_of_the_same_name() {
     // The topology `apply_krun` recommends — a root backend with mounts on top —
     // where the root holds a *file* named `data` and a directory lands over it.
     let root = InMemVolume::new();
-    let (file, _) = Mountable::open(&root, Path::new("data"), OpenOptions::create_new()).await.unwrap();
+    let (file, _) = Mountable::open(&root, Path::new("data"), OpenOptions::create_new())
+        .await
+        .unwrap();
     drop(file);
     let ws = Workspace::new()
         .try_with_mount("", root)
@@ -244,7 +253,11 @@ async fn backend_entries_that_are_not_mount_paths_come_after_the_mount_derived_o
         .try_with_mount("mmm", InMemVolume::new())
         .unwrap();
 
-    let names: Vec<_> = listing(&ws, "").await.into_iter().map(|(n, ..)| n).collect();
+    let names: Vec<_> = listing(&ws, "")
+        .await
+        .into_iter()
+        .map(|(n, ..)| n)
+        .collect();
     assert_eq!(
         names[0], "mmm",
         "the mount holds position 1 however the backend sorts, so its churn \
@@ -258,7 +271,9 @@ async fn a_list_error_other_than_not_found_is_not_papered_over() {
     // A *file* at `data` with `data/raw` mounted below it: `list` has to surface
     // ENOTDIR rather than pretend `data` is a directory it can enumerate.
     let root = InMemVolume::new();
-    let (file, _) = Mountable::open(&root, Path::new("data"), OpenOptions::create_new()).await.unwrap();
+    let (file, _) = Mountable::open(&root, Path::new("data"), OpenOptions::create_new())
+        .await
+        .unwrap();
     drop(file);
     let ws = Workspace::new()
         .try_with_mount("", root)
@@ -278,7 +293,10 @@ async fn a_list_error_other_than_not_found_is_not_papered_over() {
         DirentKind::File
     );
     assert_eq!(
-        Mountable::stat(&ws, Path::new("data/raw")).await.unwrap().kind,
+        Mountable::stat(&ws, Path::new("data/raw"))
+            .await
+            .unwrap()
+            .kind,
         DirentKind::Dir
     );
 }
@@ -300,7 +318,9 @@ async fn shadowing_backend(holder: Holder) -> Workspace {
     match holder {
         Holder::EmptyDir => Mountable::mkdir(&root, Path::new("holder")).await.unwrap(),
         Holder::File => {
-            Mountable::open(&root, Path::new("holder"), OpenOptions::create_new()).await.unwrap();
+            Mountable::open(&root, Path::new("holder"), OpenOptions::create_new())
+                .await
+                .unwrap();
         }
         Holder::Absent => {}
     }
@@ -352,7 +372,8 @@ async fn a_mutation_aimed_at_the_mount_table_is_refused_before_the_backend_is_as
             "expected {expected:?}, got {got:?} — unguarded this {damage}"
         );
         assert_eq!(
-            Mountable::stat(&ws, Path::new("holder/inner")).await
+            Mountable::stat(&ws, Path::new("holder/inner"))
+                .await
                 .unwrap()
                 .kind,
             DirentKind::Dir,
@@ -377,7 +398,8 @@ async fn creating_in_the_synthesized_namespace_is_read_only_not_missing() {
             &ws,
             Path::new("newthing"),
             OpenOptions::read_write().create(true)
-        ).await,
+        )
+        .await,
         Err(CortexError::ReadOnly)
     ));
 
@@ -387,7 +409,9 @@ async fn creating_in_the_synthesized_namespace_is_read_only_not_missing() {
         Err(CortexError::NotFound)
     ));
     assert!(
-        Mountable::mkdir(&ws, Path::new("notion/fresh")).await.is_ok(),
+        Mountable::mkdir(&ws, Path::new("notion/fresh"))
+            .await
+            .is_ok(),
         "a real mount still writes"
     );
 }
@@ -396,8 +420,7 @@ async fn creating_in_the_synthesized_namespace_is_read_only_not_missing() {
 /// must not disagree.
 #[test]
 fn a_mount_path_that_cannot_be_keyed_is_refused() {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
+    use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
     // A listing name is a `String`, so a non-UTF-8 component could only be
     // reported lossily — and a lossy name does not round-trip, giving an entry
@@ -438,7 +461,10 @@ async fn a_workspace_mounted_inside_a_workspace_serves_through_both() {
     let outer = Workspace::new().try_with_mount("nested", inner).unwrap();
 
     assert_eq!(
-        Mountable::stat(&outer, Path::new("nested")).await.unwrap().kind,
+        Mountable::stat(&outer, Path::new("nested"))
+            .await
+            .unwrap()
+            .kind,
         DirentKind::Dir
     );
     assert_eq!(
@@ -446,16 +472,20 @@ async fn a_workspace_mounted_inside_a_workspace_serves_through_both() {
         [("leaf".into(), DirentKind::Dir, false)]
     );
     assert_eq!(
-        Mountable::stat(&outer, Path::new("nested/leaf")).await
+        Mountable::stat(&outer, Path::new("nested/leaf"))
+            .await
             .unwrap()
             .kind,
         DirentKind::Dir
     );
 
     // And a write reaches the innermost backend through both hops.
-    Mountable::mkdir(&outer, Path::new("nested/leaf/deep")).await.unwrap();
+    Mountable::mkdir(&outer, Path::new("nested/leaf/deep"))
+        .await
+        .unwrap();
     assert_eq!(
-        Mountable::stat(&outer, Path::new("nested/leaf/deep")).await
+        Mountable::stat(&outer, Path::new("nested/leaf/deep"))
+            .await
             .unwrap()
             .kind,
         DirentKind::Dir
@@ -465,16 +495,23 @@ async fn a_workspace_mounted_inside_a_workspace_serves_through_both() {
 #[tokio::test]
 async fn a_rename_inside_one_mount_reaches_its_backend() {
     let ws = table(&["work"]);
-    Mountable::open(&ws, Path::new("work/a"), OpenOptions::create_new()).await.unwrap();
+    Mountable::open(&ws, Path::new("work/a"), OpenOptions::create_new())
+        .await
+        .unwrap();
 
-    Mountable::rename(&ws, Path::new("work/a"), Path::new("work/b")).await.unwrap();
+    Mountable::rename(&ws, Path::new("work/a"), Path::new("work/b"))
+        .await
+        .unwrap();
 
     assert!(matches!(
         Mountable::stat(&ws, Path::new("work/a")).await,
         Err(CortexError::NotFound)
     ));
     assert_eq!(
-        Mountable::stat(&ws, Path::new("work/b")).await.unwrap().kind,
+        Mountable::stat(&ws, Path::new("work/b"))
+            .await
+            .unwrap()
+            .kind,
         DirentKind::File
     );
 }
@@ -484,14 +521,18 @@ async fn a_rename_across_two_mounts_is_a_cross_device_move() {
     // One kernel mount, two backends. The kernel cannot see the workspace's mount
     // table, so it asks — and `EXDEV` is the answer `mv` recovers from by copying.
     let ws = table(&["notion", "s3"]);
-    Mountable::open(&ws, Path::new("notion/draft.md"), OpenOptions::create_new()).await.unwrap();
+    Mountable::open(&ws, Path::new("notion/draft.md"), OpenOptions::create_new())
+        .await
+        .unwrap();
 
     assert!(matches!(
         Mountable::rename(&ws, Path::new("notion/draft.md"), Path::new("s3/draft.md")).await,
         Err(CortexError::CrossDevice)
     ));
     assert!(
-        Mountable::stat(&ws, Path::new("notion/draft.md")).await.is_ok(),
+        Mountable::stat(&ws, Path::new("notion/draft.md"))
+            .await
+            .is_ok(),
         "nothing moved"
     );
 }
@@ -524,7 +565,9 @@ async fn the_mount_table_is_not_the_filesystems_to_rearrange() {
 #[tokio::test]
 async fn a_rename_with_nowhere_to_come_from_or_go_to() {
     let ws = table(&["work"]);
-    Mountable::open(&ws, Path::new("work/a"), OpenOptions::create_new()).await.unwrap();
+    Mountable::open(&ws, Path::new("work/a"), OpenOptions::create_new())
+        .await
+        .unwrap();
 
     // Nothing claims the source at all.
     assert!(matches!(
@@ -590,17 +633,23 @@ async fn longest_prefix_routing() {
     // Both traits are in scope via the blanket impl, so shared method names have
     // to be qualified. `top.txt` is the root backend's.
     assert_eq!(
-        Mountable::stat(&ws, Path::new("top.txt")).await.unwrap().kind,
+        Mountable::stat(&ws, Path::new("top.txt"))
+            .await
+            .unwrap()
+            .kind,
         DirentKind::File
     );
-    let (h, _) = Mountable::open(&ws, Path::new("top.txt"), OpenOptions::read_only()).await.unwrap();
+    let (h, _) = Mountable::open(&ws, Path::new("top.txt"), OpenOptions::read_only())
+        .await
+        .unwrap();
     let mut buf = [0u8; 4];
     h.read_exact_at(&mut buf, 0).await.unwrap();
     assert_eq!(&buf, b"root");
 
     // Routed to the deeper mount, re-based to `inner.txt`.
-    let (h, _) =
-        Mountable::open(&ws, Path::new("data/inner.txt"), OpenOptions::read_only()).await.unwrap();
+    let (h, _) = Mountable::open(&ws, Path::new("data/inner.txt"), OpenOptions::read_only())
+        .await
+        .unwrap();
     let mut buf = [0u8; 5];
     h.read_exact_at(&mut buf, 0).await.unwrap();
     assert_eq!(&buf, b"inner");

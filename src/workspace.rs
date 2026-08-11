@@ -10,10 +10,12 @@
 //! so it can be driven by the same adapters as any single backend — and even
 //! mounted inside another workspace.
 
-use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
-use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::{
+    collections::BTreeMap,
+    ops::Bound::{Excluded, Unbounded},
+    path::{Component, Path, PathBuf},
+    time::SystemTime,
+};
 
 use async_trait::async_trait;
 

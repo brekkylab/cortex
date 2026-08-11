@@ -14,8 +14,10 @@
 //! bind an ephemeral port, and treat a missing token as fail-closed; the channel
 //! travels in plaintext, so it must be trusted (or add TLS).
 
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::{
+    io::{self, BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+};
 
 use cortex::{Bin, ExecOutput, ExecRequest, InMemVolume, PassthroughVolume, Workspace};
 
@@ -140,7 +142,12 @@ fn handle_connection(
     }
 }
 
-fn write_response(stream: &mut TcpStream, status: u16, reason: &str, body: &[u8]) -> io::Result<()> {
+fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    body: &[u8],
+) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()

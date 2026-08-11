@@ -3,20 +3,20 @@
 //! (a native tool). [`Bin`] is a named set of them; [`Bin::as_dir`] projects
 //! their docs as a read-only [`SkillDir`] mount.
 
-use std::collections::BTreeMap;
-use std::io;
-use std::path::{Component, Path};
-
-use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    io,
+    path::{Component, Path},
+};
 
 use async_trait::async_trait;
+use serde_json::{Value, json};
 
+pub use crate::wire::ExecOutput;
 use crate::{
     CortexError, Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, Result, Stat,
     Workspace,
 };
-
-pub use crate::wire::ExecOutput;
 
 /// Something that runs against a [`Workspace`] and returns process-like output.
 /// `Err` is infrastructure failure; a program's own failure is a non-zero
@@ -93,7 +93,12 @@ impl Bin {
 
     /// Invoke the named executable. `Err(NotFound)` = unknown name (the allowlist
     /// boundary); a program failure is a non-zero `code`, not an `Err`.
-    pub async fn invoke(&self, ws: &Workspace, name: &str, args: Vec<String>) -> Result<ExecOutput> {
+    pub async fn invoke(
+        &self,
+        ws: &Workspace,
+        name: &str,
+        args: Vec<String>,
+    ) -> Result<ExecOutput> {
         let exec = self.get(name).ok_or(CortexError::NotFound)?;
         Ok(match exec.exec(ws, args).await {
             Ok(out) => out,
@@ -139,7 +144,8 @@ impl SkillDir {
         agent_md.push_str("```\nwsx <name> [args...]\n```\n\n");
         agent_md.push_str("It runs on the host against this workspace and returns its output.\n");
         agent_md.push_str("For a specific executable, read its skill first.\n\n");
-        agent_md.push_str("## Available\n\n| name | summary | skill |\n|------|---------|-------|\n");
+        agent_md
+            .push_str("## Available\n\n| name | summary | skill |\n|------|---------|-------|\n");
         agent_md.push_str(&rows);
         SkillDir { agent_md, skills }
     }
@@ -193,7 +199,12 @@ impl Mountable for SkillDir {
 
     async fn stat(&self, path: &Path) -> Result<Stat> {
         let comps = comps(path)?;
-        match comps.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        match comps
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
             [] => Ok(Stat::new(DirentKind::Dir, 0)),
             [name] if self.skills.contains_key(*name) => Ok(Stat::new(DirentKind::Dir, 0)),
             slice => self
@@ -205,7 +216,12 @@ impl Mountable for SkillDir {
 
     async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
         let comps = comps(path)?;
-        match comps.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
+        match comps
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
             [] => {
                 let mut v = vec![Dirent::new("AGENT.md", DirentKind::File)];
                 v.extend(
@@ -219,7 +235,9 @@ impl Mountable for SkillDir {
                 Ok(vec![Dirent::new("SKILL.md", DirentKind::File)])
             }
             ["AGENT.md"] => Err(CortexError::NotADirectory),
-            [name, "SKILL.md"] if self.skills.contains_key(*name) => Err(CortexError::NotADirectory),
+            [name, "SKILL.md"] if self.skills.contains_key(*name) => {
+                Err(CortexError::NotADirectory)
+            }
             _ => Err(CortexError::NotFound),
         }
     }
@@ -323,7 +341,8 @@ mod tests {
 
     async fn names(m: &dyn Mountable<Handle = SkillFile>, path: &str) -> Vec<String> {
         let mut n: Vec<_> = m
-            .list(Path::new(path)).await
+            .list(Path::new(path))
+            .await
             .unwrap()
             .into_iter()
             .map(|entry| entry.name)
@@ -337,7 +356,10 @@ mod tests {
         let ws = Workspace::new();
         let bin = Bin::new().register(Echo);
         assert_eq!(
-            bin.invoke(&ws, "echo", vec!["hi".into()]).await.unwrap().stdout,
+            bin.invoke(&ws, "echo", vec!["hi".into()])
+                .await
+                .unwrap()
+                .stdout,
             b"hi"
         );
         assert!(matches!(
@@ -355,7 +377,8 @@ mod tests {
         let st = docs.stat(Path::new("echo/SKILL.md")).await.unwrap();
         assert_eq!(st.kind, DirentKind::File);
         let (h, opened) = docs
-            .open(Path::new("echo/SKILL.md"), OpenOptions::read_only()).await
+            .open(Path::new("echo/SKILL.md"), OpenOptions::read_only())
+            .await
             .unwrap();
         assert_eq!(opened.size, st.size, "the open must agree with `stat`");
         let mut buf = vec![0u8; opened.size as usize];
@@ -364,7 +387,8 @@ mod tests {
 
         // The open carries its own metadata, so there is no second `stat` here.
         let (agent, opened) = docs
-            .open(Path::new("AGENT.md"), OpenOptions::read_only()).await
+            .open(Path::new("AGENT.md"), OpenOptions::read_only())
+            .await
             .unwrap();
         let mut a = vec![0u8; opened.size as usize];
         agent.read_exact_at(&mut a, 0).await.unwrap();
@@ -379,7 +403,8 @@ mod tests {
         // rather than having no notion of writing — so userspace hears EROFS, which
         // it has a path for, instead of ENOSYS.
         for refused in [
-            docs.open(Path::new("x"), OpenOptions::create_new()).await
+            docs.open(Path::new("x"), OpenOptions::create_new())
+                .await
                 .map(|_| ()),
             docs.mkdir(Path::new("x")).await,
             docs.unlink(Path::new("x")).await,
@@ -396,14 +421,16 @@ mod tests {
             Err(CortexError::IsADirectory)
         ));
         assert!(matches!(
-            docs.open(Path::new("nope/SKILL.md"), OpenOptions::read_only()).await,
+            docs.open(Path::new("nope/SKILL.md"), OpenOptions::read_only())
+                .await,
             Err(CortexError::NotFound)
         ));
 
         // The opened handle rejects writes, and as EROFS rather than EACCES: this is
         // the one kind `From<io::Error>` turns back into `ReadOnly`.
         let (h, _) = docs
-            .open(Path::new("AGENT.md"), OpenOptions::read_only()).await
+            .open(Path::new("AGENT.md"), OpenOptions::read_only())
+            .await
             .unwrap();
         let err = h.write_at(b"x", 0).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ReadOnlyFilesystem);
@@ -416,6 +443,9 @@ mod tests {
         let ws = Workspace::new();
         let tool: &dyn Toolable = &Echo;
         assert_eq!(tool.to_argv(&json!({ "msg": "hi" })), ["hi"]);
-        assert_eq!(tool.call(&ws, &json!({ "msg": "hi" })).await.unwrap(), json!("hi"));
+        assert_eq!(
+            tool.call(&ws, &json!({ "msg": "hi" })).await.unwrap(),
+            json!("hi")
+        );
     }
 }

@@ -5,8 +5,10 @@
 //! `Connection: close`: the server closes after replying, so the body is simply
 //! everything after the header terminator. `post` is the only public item.
 
-use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::{
+    io::{self, Read, Write},
+    net::{TcpStream, ToSocketAddrs},
+};
 
 use cortex::{ExecOutput, ExecRequest};
 

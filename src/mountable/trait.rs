@@ -1,6 +1,4 @@
-use std::io;
-use std::path::Path;
-use std::sync::Arc;
+use std::{io, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 
@@ -361,8 +359,7 @@ pub trait DynMountable: Send + Sync {
 
     /// See [`Mountable::open`], with the concrete handle boxed behind a trait
     /// object.
-    async fn open(&self, path: &Path, options: OpenOptions)
-        -> Result<(Box<dyn FileHandle>, Stat)>;
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)>;
 
     /// See [`Mountable::rename`]. No default here — the blanket impl always
     /// supplies one, forwarding to whatever the backend decided.
@@ -397,11 +394,7 @@ where
         Mountable::rmdir(self, path).await
     }
 
-    async fn open(
-        &self,
-        path: &Path,
-        options: OpenOptions,
-    ) -> Result<(Box<dyn FileHandle>, Stat)> {
+    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Box<dyn FileHandle>, Stat)> {
         let (handle, stat) = Mountable::open(self, path, options).await?;
         Ok((Box::new(handle), stat))
     }

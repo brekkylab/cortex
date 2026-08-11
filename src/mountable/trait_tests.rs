@@ -1,7 +1,8 @@
-use super::*;
-use async_trait::async_trait;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
+use super::*;
 use crate::{CortexError, InMemVolume, Workspace};
 
 /// A `Dirent` cannot claim one kind and carry metadata saying another.
@@ -129,13 +130,15 @@ async fn a_backend_that_does_not_write_refuses_rename_without_implementing_it() 
 async fn an_arc_backend_is_a_backend_and_shares_one_store() {
     let vol = Arc::new(InMemVolume::new());
 
-    let (handle, _) = Mountable::open(&vol, Path::new("shared.txt"), OpenOptions::create_new()).await
+    let (handle, _) = Mountable::open(&vol, Path::new("shared.txt"), OpenOptions::create_new())
+        .await
         .expect("fresh volume");
     handle.write_all_at(b"once", 0).await.unwrap();
 
     // Read back through a *different* clone: one store, not a copy per owner.
     let other = Arc::clone(&vol);
-    let (handle, stat) = Mountable::open(&other, Path::new("shared.txt"), OpenOptions::read_only()).await
+    let (handle, stat) = Mountable::open(&other, Path::new("shared.txt"), OpenOptions::read_only())
+        .await
         .expect("every clone sees the same store");
     assert_eq!(stat.size, 4);
     let mut buf = [0u8; 4];
@@ -148,8 +151,16 @@ async fn an_arc_backend_is_a_backend_and_shares_one_store() {
     let ws = Workspace::new()
         .try_with_mount("", Arc::clone(&vol))
         .expect("Arc<InMemVolume> erases to DynMountable via the blanket impl");
-    assert_eq!(Mountable::list(&ws, Path::new("dir")).await.unwrap().len(), 0);
+    assert_eq!(
+        Mountable::list(&ws, Path::new("dir")).await.unwrap().len(),
+        0
+    );
 
-    Mountable::mkdir(&vol, Path::new("dir/deeper")).await.unwrap();
-    assert_eq!(Mountable::list(&ws, Path::new("dir")).await.unwrap().len(), 1);
+    Mountable::mkdir(&vol, Path::new("dir/deeper"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Mountable::list(&ws, Path::new("dir")).await.unwrap().len(),
+        1
+    );
 }

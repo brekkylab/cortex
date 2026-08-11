@@ -21,21 +21,26 @@
 //! silent memory corruption, not a compile error, so `contrib/fuse_t/shim.c`
 //! owns all of them and exposes a flat vtable of our own design instead.
 
-use std::any::Any;
-use std::ffi::{CStr, CString, OsStr, c_char, c_int, c_long, c_void};
-use std::io;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
-
-use crate::mountable::PosixFs;
-use crate::mountable::posix::{
-    BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, attr_for, decode_open_flags,
-    host_errno, mode_for, unix_time,
+use std::{
+    any::Any,
+    ffi::{CStr, CString, OsStr, c_char, c_int, c_long, c_void},
+    io,
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
-use crate::mountable::{Mountable, SetAttr};
-use crate::{CortexError, Result, Stat};
+
+use crate::{
+    CortexError, Result, Stat,
+    mountable::{
+        Mountable, PosixFs, SetAttr,
+        posix::{
+            BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, attr_for,
+            decode_open_flags, host_errno, mode_for, unix_time,
+        },
+    },
+};
 
 /// Open flags in the host's numbering, exactly as the `fuser` binding uses —
 /// this reply also goes to this host's kernel.
@@ -175,10 +180,12 @@ unsafe extern "C" fn lookup<T: Mountable>(
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
-    code(super::block_on(fs.lookup_child(parent, name)).map(|(inode, stat)| unsafe {
-        *out_inode = inode;
-        *out = to_cortex_stat(inode, &stat);
-    }))
+    code(
+        super::block_on(fs.lookup_child(parent, name)).map(|(inode, stat)| unsafe {
+            *out_inode = inode;
+            *out = to_cortex_stat(inode, &stat);
+        }),
+    )
 }
 
 unsafe extern "C" fn getattr<T: Mountable>(
@@ -208,9 +215,11 @@ unsafe extern "C" fn setattr<T: Mountable>(
         ..Default::default()
     };
     let handle = (has_fh != 0).then_some(fh);
-    code(super::block_on(fs.setattr_inode(inode, handle, want)).map(|stat| unsafe {
-        *out = to_cortex_stat(inode, &stat);
-    }))
+    code(
+        super::block_on(fs.setattr_inode(inode, handle, want)).map(|stat| unsafe {
+            *out = to_cortex_stat(inode, &stat);
+        }),
+    )
 }
 
 unsafe extern "C" fn open<T: Mountable>(
@@ -224,9 +233,11 @@ unsafe extern "C" fn open<T: Mountable>(
         Ok(options) => options,
         Err(err) => return -host_errno(&err),
     };
-    code(super::block_on(fs.open_inode(inode, options)).map(|(fh, _stat)| unsafe {
-        *out_fh = fh;
-    }))
+    code(
+        super::block_on(fs.open_inode(inode, options)).map(|(fh, _stat)| unsafe {
+            *out_fh = fh;
+        }),
+    )
 }
 
 unsafe extern "C" fn create<T: Mountable>(
@@ -247,12 +258,11 @@ unsafe extern "C" fn create<T: Mountable>(
     };
 
     code(
-        super::block_on(fs.create_child(parent, name, options))
-            .map(|(inode, stat, fh)| unsafe {
-                *out_inode = inode;
-                *out_fh = fh;
-                *out = to_cortex_stat(inode, &stat);
-            }),
+        super::block_on(fs.create_child(parent, name, options)).map(|(inode, stat, fh)| unsafe {
+            *out_inode = inode;
+            *out_fh = fh;
+            *out = to_cortex_stat(inode, &stat);
+        }),
     )
 }
 
@@ -309,10 +319,12 @@ unsafe extern "C" fn mkdir<T: Mountable>(
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
-    code(super::block_on(fs.mkdir_child(parent, name)).map(|(inode, stat)| unsafe {
-        *out_inode = inode;
-        *out = to_cortex_stat(inode, &stat);
-    }))
+    code(
+        super::block_on(fs.mkdir_child(parent, name)).map(|(inode, stat)| unsafe {
+            *out_inode = inode;
+            *out = to_cortex_stat(inode, &stat);
+        }),
+    )
 }
 
 unsafe extern "C" fn unlink<T: Mountable>(
@@ -348,7 +360,9 @@ unsafe extern "C" fn rename<T: Mountable>(
     let fs = unsafe { recover::<T>(fs) };
     let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
     let newname = OsStr::from_bytes(unsafe { CStr::from_ptr(newname) }.to_bytes());
-    code(super::block_on(fs.rename_child(parent, name, newparent, newname)))
+    code(super::block_on(
+        fs.rename_child(parent, name, newparent, newname),
+    ))
 }
 
 unsafe extern "C" fn readdir<T: Mountable>(

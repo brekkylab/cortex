@@ -23,15 +23,19 @@
 // wholesale, and coverage is what keeps it honest.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::{HashMap, VecDeque},
+    ffi::OsStr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
-use crate::lock::lock;
-use crate::mountable::{Dirent, FileExt, FileHandle, Mountable, OpenOptions, SetAttr};
-use crate::{CortexError, DirentKind, Result, Stat};
+use crate::{
+    CortexError, DirentKind, Result, Stat,
+    lock::lock,
+    mountable::{Dirent, FileExt, FileHandle, Mountable, OpenOptions, SetAttr},
+};
 
 /// FUSE's fixed inode number for the root directory.
 const ROOT_INODE: u64 = 1;
@@ -356,7 +360,12 @@ impl<T: Mountable> PosixFs<T> {
     /// dropped — nothing stores them, and the attribute policy reports fixed
     /// permission bits. Failing instead would break `cp -p`, `tar -x`, and
     /// `touch` for no gain; the caller's next `getattr` shows what stuck.
-    pub(super) async fn setattr_inode(&self, inode: u64, fh: Option<u64>, attr: SetAttr) -> Result<Stat> {
+    pub(super) async fn setattr_inode(
+        &self,
+        inode: u64,
+        fh: Option<u64>,
+        attr: SetAttr,
+    ) -> Result<Stat> {
         if let Some(size) = attr.size {
             match fh {
                 // Prefer the open handle: it may hold state a path alone cannot
@@ -365,7 +374,10 @@ impl<T: Mountable> PosixFs<T> {
                 Some(fh) => self.handle_of(fh)?.truncate(size).await?,
                 None => {
                     let path = self.path_of(inode)?;
-                    let (handle, _) = self.mountable.open(&path, OpenOptions::read_write()).await?;
+                    let (handle, _) = self
+                        .mountable
+                        .open(&path, OpenOptions::read_write())
+                        .await?;
                     handle.truncate(size).await?;
                 }
             }
@@ -432,7 +444,12 @@ impl<T: Mountable> PosixFs<T> {
     /// The cursor protocol is here because every binding must agree on it
     /// exactly: offsets are 1-based positions in the listing, and the kernel
     /// resumes by quoting the last one it consumed.
-    pub(super) async fn for_each_dirent<E>(&self, inode: u64, offset: u64, mut emit: E) -> Result<()>
+    pub(super) async fn for_each_dirent<E>(
+        &self,
+        inode: u64,
+        offset: u64,
+        mut emit: E,
+    ) -> Result<()>
     where
         E: FnMut(u64, &Dirent, u64) -> Result<bool>,
     {

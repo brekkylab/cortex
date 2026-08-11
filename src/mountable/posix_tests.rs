@@ -1,8 +1,7 @@
+use std::{ffi::OsStr, path::Path, time::Duration};
+
 use super::*;
 use crate::InMemVolume;
-use std::ffi::OsStr;
-use std::path::Path;
-use std::time::Duration;
 
 const CONTENT: &[u8] = b"Hello from cortex!\n";
 
@@ -10,7 +9,8 @@ const CONTENT: &[u8] = b"Hello from cortex!\n";
 async fn adapter() -> PosixFs<InMemVolume> {
     let vol = InMemVolume::new();
     let (file, _) = vol
-        .open(Path::new("greeting.txt"), OpenOptions::create_new()).await
+        .open(Path::new("greeting.txt"), OpenOptions::create_new())
+        .await
         .unwrap();
     file.write_all_at(CONTENT, 0).await.unwrap();
     vol.mkdir(Path::new("sub")).await.unwrap();
@@ -20,7 +20,8 @@ async fn adapter() -> PosixFs<InMemVolume> {
 /// The names a directory lists, minus the dots, sorted.
 async fn child_names<T: Mountable>(fs: &PosixFs<T>, inode: u64) -> Vec<String> {
     let mut names: Vec<_> = fs
-        .dir_entries(inode).await
+        .dir_entries(inode)
+        .await
         .unwrap()
         .into_iter()
         .map(|(_, child)| child.name)
@@ -50,7 +51,10 @@ async fn walks_the_root() {
 
     // A number readdir hands out must be the one lookup confirms, or the kernel
     // would see two inodes for one file.
-    let (looked_up, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap();
+    let (looked_up, _) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("sub"))
+        .await
+        .unwrap();
     assert_eq!(sub.0, looked_up);
 
     // And what the root does not hold resolves to nothing — by name, and by a
@@ -59,7 +63,10 @@ async fn walks_the_root() {
         fs.lookup_child(ROOT_INODE, OsStr::new("nope")).await,
         Err(CortexError::NotFound)
     ));
-    assert!(matches!(fs.stat_inode(9999).await, Err(CortexError::NotFound)));
+    assert!(matches!(
+        fs.stat_inode(9999).await,
+        Err(CortexError::NotFound)
+    ));
 }
 
 #[tokio::test]
@@ -70,7 +77,8 @@ async fn a_created_file_is_reachable_by_every_route() {
             ROOT_INODE,
             OsStr::new("fresh.txt"),
             OpenOptions::create_new(),
-        ).await
+        )
+        .await
         .unwrap();
     assert_eq!(stat.size, 0);
 
@@ -79,10 +87,15 @@ async fn a_created_file_is_reachable_by_every_route() {
     assert_eq!(fs.read_handle(fh, 0, 5).await.unwrap(), b"hello");
     assert_eq!(fs.stat_inode(inode).await.unwrap().size, 5);
     let (looked_up, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("fresh.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("fresh.txt"))
+        .await
         .unwrap();
     assert_eq!(looked_up, inode);
-    assert!(child_names(&fs, ROOT_INODE).await.contains(&"fresh.txt".to_string()));
+    assert!(
+        child_names(&fs, ROOT_INODE)
+            .await
+            .contains(&"fresh.txt".to_string())
+    );
 
     // `create_new` is exclusive, and it is the backend that says so.
     assert!(matches!(
@@ -90,7 +103,8 @@ async fn a_created_file_is_reachable_by_every_route() {
             ROOT_INODE,
             OsStr::new("fresh.txt"),
             OpenOptions::create_new()
-        ).await,
+        )
+        .await,
         Err(CortexError::AlreadyExists)
     ));
 }
@@ -99,7 +113,8 @@ async fn a_created_file_is_reachable_by_every_route() {
 async fn setattr_resizes_and_swallows_what_it_cannot_store() {
     let fs = adapter().await;
     let (inode, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
 
     // The one field that is really applied.
@@ -111,10 +126,14 @@ async fn setattr_resizes_and_swallows_what_it_cannot_store() {
                 size: Some(4),
                 ..Default::default()
             },
-        ).await
+        )
+        .await
         .unwrap();
     assert_eq!(stat.size, 4);
-    let (fh, _) = fs.open_inode(inode, OpenOptions::read_only()).await.unwrap();
+    let (fh, _) = fs
+        .open_inode(inode, OpenOptions::read_only())
+        .await
+        .unwrap();
     assert_eq!(fs.read_handle(fh, 0, 16).await.unwrap(), &CONTENT[..4]);
 
     // Mode and ownership are accepted and dropped rather than refused:
@@ -130,7 +149,8 @@ async fn setattr_resizes_and_swallows_what_it_cannot_store() {
                 gid: Some(42),
                 ..Default::default()
             },
-        ).await
+        )
+        .await
         .unwrap();
     assert_eq!(stat.size, 4);
     assert_eq!(attr_for(&stat).mode, 0o100000 | 0o644);
@@ -140,11 +160,13 @@ async fn setattr_resizes_and_swallows_what_it_cannot_store() {
 async fn a_removed_name_does_not_resolve_to_the_old_inode() {
     let fs = adapter().await;
     let (old, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
     let (fh, _) = fs.open_inode(old, OpenOptions::read_only()).await.unwrap();
 
-    fs.unlink_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+    fs.unlink_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
 
     // The open handle survives the removal, and so does `getattr` on the old
@@ -160,7 +182,8 @@ async fn a_removed_name_does_not_resolve_to_the_old_inode() {
             ROOT_INODE,
             OsStr::new("greeting.txt"),
             OpenOptions::create_new(),
-        ).await
+        )
+        .await
         .unwrap();
     assert_ne!(new, old);
 }
@@ -168,9 +191,13 @@ async fn a_removed_name_does_not_resolve_to_the_old_inode() {
 #[tokio::test]
 async fn rmdir_evicts_the_whole_subtree() {
     let fs = adapter().await;
-    let (dir, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap();
+    let (dir, _) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("sub"))
+        .await
+        .unwrap();
     let (_, _, fh) = fs
-        .create_child(dir, OsStr::new("inner"), OpenOptions::create_new()).await
+        .create_child(dir, OsStr::new("inner"), OpenOptions::create_new())
+        .await
         .unwrap();
     let (child_before, _) = fs.lookup_child(dir, OsStr::new("inner")).await.unwrap();
 
@@ -190,17 +217,25 @@ async fn rmdir_evicts_the_whole_subtree() {
     fs.mkdir_child(ROOT_INODE, OsStr::new("sub")).await.unwrap();
     let (_, _, fh) = fs
         .create_child(
-            fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap().0,
+            fs.lookup_child(ROOT_INODE, OsStr::new("sub"))
+                .await
+                .unwrap()
+                .0,
             OsStr::new("inner"),
             OpenOptions::create_new(),
-        ).await
+        )
+        .await
         .unwrap();
     fs.release_handle(fh).await.unwrap();
     let (child_after, _) = fs
         .lookup_child(
-            fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap().0,
+            fs.lookup_child(ROOT_INODE, OsStr::new("sub"))
+                .await
+                .unwrap()
+                .0,
             OsStr::new("inner"),
-        ).await
+        )
+        .await
         .unwrap();
     assert_ne!(child_after, child_before);
 }
@@ -209,9 +244,13 @@ async fn rmdir_evicts_the_whole_subtree() {
 async fn flush_does_not_finalize_but_release_does() {
     let fs = adapter().await;
     let (inode, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
-    let (fh, _) = fs.open_inode(inode, OpenOptions::read_write()).await.unwrap();
+    let (fh, _) = fs
+        .open_inode(inode, OpenOptions::read_write())
+        .await
+        .unwrap();
 
     // FLUSH arrives on every `close()` of a descriptor, so it must be
     // repeatable and must leave the handle usable. RELEASE comes once, for
@@ -221,7 +260,10 @@ async fn flush_does_not_finalize_but_release_does() {
     assert_eq!(fs.write_handle(fh, 0, b"X").await.unwrap(), 1);
 
     fs.release_handle(fh).await.unwrap();
-    assert!(matches!(fs.flush_handle(fh).await, Err(CortexError::BadHandle)));
+    assert!(matches!(
+        fs.flush_handle(fh).await,
+        Err(CortexError::BadHandle)
+    ));
     // A release for a handle we never issued is the kernel tidying up.
     fs.release_handle(fh).await.unwrap();
 }
@@ -331,12 +373,16 @@ async fn a_listing_carries_metadata_when_the_backend_had_it() {
 async fn reads_a_file_through_a_handle() {
     let fs = adapter().await;
     let (inode, stat) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
     assert_eq!(stat.kind, DirentKind::File);
     assert_eq!(stat.size, CONTENT.len() as u64);
 
-    let (fh, _) = fs.open_inode(inode, OpenOptions::read_only()).await.unwrap();
+    let (fh, _) = fs
+        .open_inode(inode, OpenOptions::read_only())
+        .await
+        .unwrap();
     assert_eq!(
         fs.read_handle(fh, 0, CONTENT.len() as u32).await.unwrap(),
         CONTENT
@@ -345,7 +391,8 @@ async fn reads_a_file_through_a_handle() {
     // Short rather than an error, which is how the kernel finds the end.
     assert!(fs.read_handle(fh, 0, 4096).await.unwrap().len() == CONTENT.len());
     assert!(
-        fs.read_handle(fh, CONTENT.len() as u64, 16).await
+        fs.read_handle(fh, CONTENT.len() as u64, 16)
+            .await
             .unwrap()
             .is_empty()
     );
@@ -369,9 +416,12 @@ async fn source() -> InMemVolume {
         &vol,
         Path::new("greeting.txt"),
         crate::OpenOptions::create_new(),
-    ).await
+    )
+    .await
     .unwrap();
-    crate::FileExt::write_all_at(&file, CONTENT, 0).await.unwrap();
+    crate::FileExt::write_all_at(&file, CONTENT, 0)
+        .await
+        .unwrap();
     vol
 }
 
@@ -388,29 +438,42 @@ async fn a_multi_source_workspace_walks_from_its_root() {
     let fs = PosixFs::new(ws);
 
     // The kernel's first question about any mount.
-    assert_eq!(fs.stat_inode(ROOT_INODE).await.unwrap().kind, DirentKind::Dir);
+    assert_eq!(
+        fs.stat_inode(ROOT_INODE).await.unwrap().kind,
+        DirentKind::Dir
+    );
     assert_eq!(child_names(&fs, ROOT_INODE).await, ["notes", "s3-like"]);
 
     // readdir's number is the one lookup confirms, and the child is walkable.
     let listed = fs
-        .dir_entries(ROOT_INODE).await
+        .dir_entries(ROOT_INODE)
+        .await
         .unwrap()
         .into_iter()
         .find(|(_, entry)| entry.name == "s3-like")
         .unwrap()
         .0;
-    let (child, stat) = fs.lookup_child(ROOT_INODE, OsStr::new("s3-like")).await.unwrap();
+    let (child, stat) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("s3-like"))
+        .await
+        .unwrap();
     assert_eq!(listed, child);
     assert_eq!(stat.kind, DirentKind::Dir);
     assert_eq!(child_names(&fs, child).await, ["greeting.txt"]);
 
     // Reading exercises the erased handle.
-    let (file, _) = fs.lookup_child(child, OsStr::new("greeting.txt")).await.unwrap();
+    let (file, _) = fs
+        .lookup_child(child, OsStr::new("greeting.txt"))
+        .await
+        .unwrap();
     let (handle, _) = fs
-        .open_inode(file, crate::OpenOptions::read_only()).await
+        .open_inode(file, crate::OpenOptions::read_only())
+        .await
         .unwrap();
     assert_eq!(
-        fs.read_handle(handle, 0, CONTENT.len() as u32).await.unwrap(),
+        fs.read_handle(handle, 0, CONTENT.len() as u32)
+            .await
+            .unwrap(),
         CONTENT
     );
 }
@@ -421,8 +484,9 @@ async fn a_multi_source_workspace_walks_from_its_root() {
 #[tokio::test]
 async fn readdir_and_lookup_agree_on_a_shadowed_mount_point() {
     let root = InMemVolume::new();
-    let (file, _) =
-        Mountable::open(&root, Path::new("data"), crate::OpenOptions::create_new()).await.unwrap();
+    let (file, _) = Mountable::open(&root, Path::new("data"), crate::OpenOptions::create_new())
+        .await
+        .unwrap();
     drop(file);
 
     let ws = crate::Workspace::new()
@@ -433,12 +497,16 @@ async fn readdir_and_lookup_agree_on_a_shadowed_mount_point() {
     let fs = PosixFs::new(ws);
 
     let listed = fs
-        .dir_entries(ROOT_INODE).await
+        .dir_entries(ROOT_INODE)
+        .await
         .unwrap()
         .into_iter()
         .find(|(_, entry)| entry.name == "data")
         .unwrap();
-    let (inode, stat) = fs.lookup_child(ROOT_INODE, OsStr::new("data")).await.unwrap();
+    let (inode, stat) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("data"))
+        .await
+        .unwrap();
 
     assert_eq!(listed.0, inode);
     assert_eq!(
@@ -473,12 +541,17 @@ async fn one_workspace_can_feed_two_independent_consumers() {
 
     // What one consumer creates, the other sees — neither knows the other exists.
     let (notes, _) = agent_side
-        .lookup_child(ROOT_INODE, OsStr::new("notes")).await
+        .lookup_child(ROOT_INODE, OsStr::new("notes"))
+        .await
         .unwrap();
-    agent_side.mkdir_child(notes, OsStr::new("added")).await.unwrap();
+    agent_side
+        .mkdir_child(notes, OsStr::new("added"))
+        .await
+        .unwrap();
 
     let (same_notes, _) = user_side
-        .lookup_child(ROOT_INODE, OsStr::new("notes")).await
+        .lookup_child(ROOT_INODE, OsStr::new("notes"))
+        .await
         .unwrap();
     assert_eq!(
         child_names(&user_side, same_notes).await,
@@ -486,7 +559,13 @@ async fn one_workspace_can_feed_two_independent_consumers() {
     );
 
     // And the third shape: no inode layer, as a path-addressed binding reaches it.
-    assert_eq!(Mountable::list(&*ws, Path::new("notes")).await.unwrap().len(), 2);
+    assert_eq!(
+        Mountable::list(&*ws, Path::new("notes"))
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 /// The number the kernel was given survives the move, so it keeps resolving —
@@ -495,7 +574,8 @@ async fn one_workspace_can_feed_two_independent_consumers() {
 async fn rename_keeps_the_inode_the_kernel_is_holding() {
     let fs = adapter().await;
     let (inode, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
 
     fs.rename_child(
@@ -503,18 +583,24 @@ async fn rename_keeps_the_inode_the_kernel_is_holding() {
         OsStr::new("greeting.txt"),
         ROOT_INODE,
         OsStr::new("moved.txt"),
-    ).await
+    )
+    .await
     .unwrap();
 
     // The kernel still quotes `inode`, and the new name resolves to it — two
     // numbers for one file would break its cache.
-    assert_eq!(fs.stat_inode(inode).await.unwrap().size, CONTENT.len() as u64);
+    assert_eq!(
+        fs.stat_inode(inode).await.unwrap().size,
+        CONTENT.len() as u64
+    );
     let (again, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("moved.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("moved.txt"))
+        .await
         .unwrap();
     assert_eq!(again, inode);
     assert!(matches!(
-        fs.lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await,
+        fs.lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+            .await,
         Err(CortexError::NotFound)
     ));
 }
@@ -523,8 +609,12 @@ async fn rename_keeps_the_inode_the_kernel_is_holding() {
 #[tokio::test]
 async fn rename_carries_a_whole_subtree() {
     let fs = adapter().await;
-    let (sub, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap();
-    fs.create_child(sub, OsStr::new("inner.txt"), OpenOptions::create_new()).await
+    let (sub, _) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("sub"))
+        .await
+        .unwrap();
+    fs.create_child(sub, OsStr::new("inner.txt"), OpenOptions::create_new())
+        .await
         .unwrap();
     let (inner, _) = fs.lookup_child(sub, OsStr::new("inner.txt")).await.unwrap();
 
@@ -533,7 +623,8 @@ async fn rename_carries_a_whole_subtree() {
         OsStr::new("sub"),
         ROOT_INODE,
         OsStr::new("moved"),
-    ).await
+    )
+    .await
     .unwrap();
 
     assert_eq!(fs.stat_inode(sub).await.unwrap().kind, DirentKind::Dir);
@@ -541,7 +632,10 @@ async fn rename_carries_a_whole_subtree() {
         fs.stat_inode(inner).await.is_ok(),
         "a descendant's number must still resolve"
     );
-    let (moved_dir, _) = fs.lookup_child(ROOT_INODE, OsStr::new("moved")).await.unwrap();
+    let (moved_dir, _) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("moved"))
+        .await
+        .unwrap();
     assert_eq!(moved_dir, sub);
     assert_eq!(child_names(&fs, moved_dir).await, ["inner.txt"]);
 }
@@ -552,9 +646,13 @@ async fn rename_carries_a_whole_subtree() {
 async fn a_refused_rename_does_not_touch_the_table() {
     let fs = adapter().await;
     let (file, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
-    let (dir, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap();
+    let (dir, _) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("sub"))
+        .await
+        .unwrap();
 
     // file over directory: EISDIR, straight from the backend.
     assert!(matches!(
@@ -563,7 +661,8 @@ async fn a_refused_rename_does_not_touch_the_table() {
             OsStr::new("greeting.txt"),
             ROOT_INODE,
             OsStr::new("sub")
-        ).await,
+        )
+        .await,
         Err(CortexError::IsADirectory)
     ));
 
@@ -686,21 +785,34 @@ async fn inode_references_are_counted_and_the_root_is_spared() {
 
     // One lookup, one reference: forgetting it evicts the entry.
     let (inode, _) = fs
-        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt")).await
+        .lookup_child(ROOT_INODE, OsStr::new("greeting.txt"))
+        .await
         .unwrap();
     assert!(fs.stat_inode(inode).await.is_ok());
     fs.forget_inode(inode, 1);
-    assert!(matches!(fs.stat_inode(inode).await, Err(CortexError::NotFound)));
+    assert!(matches!(
+        fs.stat_inode(inode).await,
+        Err(CortexError::NotFound)
+    ));
 
     // Looked up twice is one inode with two references, so the first forget has
     // to leave it live.
-    let (first, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap();
-    let (second, _) = fs.lookup_child(ROOT_INODE, OsStr::new("sub")).await.unwrap();
+    let (first, _) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("sub"))
+        .await
+        .unwrap();
+    let (second, _) = fs
+        .lookup_child(ROOT_INODE, OsStr::new("sub"))
+        .await
+        .unwrap();
     assert_eq!(first, second);
     fs.forget_inode(first, 1);
     assert!(fs.stat_inode(first).await.is_ok());
     fs.forget_inode(first, 1);
-    assert!(matches!(fs.stat_inode(first).await, Err(CortexError::NotFound)));
+    assert!(matches!(
+        fs.stat_inode(first).await,
+        Err(CortexError::NotFound)
+    ));
 
     // The root survives any amount: every path resolves through it.
     fs.forget_inode(ROOT_INODE, 1_000);

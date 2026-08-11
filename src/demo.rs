@@ -188,9 +188,20 @@ mod tests {
     async fn write_then_read_back_through_bin() {
         let ws = ws();
         let bin = Bin::demo();
-        bin.invoke(&ws, "write", vec!["f".into(), "hi".into()]).await.unwrap();
-        assert_eq!(bin.invoke(&ws, "cat", vec!["f".into()]).await.unwrap().stdout, b"hi");
-        assert_eq!(bin.invoke(&ws, "ls", vec!["".into()]).await.unwrap().stdout, b"f");
+        bin.invoke(&ws, "write", vec!["f".into(), "hi".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            bin.invoke(&ws, "cat", vec!["f".into()])
+                .await
+                .unwrap()
+                .stdout,
+            b"hi"
+        );
+        assert_eq!(
+            bin.invoke(&ws, "ls", vec!["".into()]).await.unwrap().stdout,
+            b"f"
+        );
     }
 
     #[tokio::test]
@@ -203,9 +214,14 @@ mod tests {
     #[tokio::test]
     async fn write_is_also_a_tool() {
         let tool: &dyn Toolable = &Write;
-        assert_eq!(tool.to_argv(&json!({ "path": "f", "content": "hi" })), ["f", "hi"]);
+        assert_eq!(
+            tool.to_argv(&json!({ "path": "f", "content": "hi" })),
+            ["f", "hi"]
+        );
         let ws = ws();
-        tool.call(&ws, &json!({ "path": "f", "content": "hi" })).await.unwrap();
+        tool.call(&ws, &json!({ "path": "f", "content": "hi" }))
+            .await
+            .unwrap();
         assert_eq!(read_all(&ws, Path::new("f")).await.unwrap(), b"hi");
     }
 }

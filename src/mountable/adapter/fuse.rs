@@ -18,8 +18,10 @@
 //! covered only by `tests/host_mount.rs`, which is `#[ignore]`d because it needs a
 //! real mount — so a plain `cargo test` exercises none of it.
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
 use fuser::{
     Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
@@ -27,13 +29,16 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
-use crate::mountable::Mountable;
-use crate::mountable::PosixFs;
-use crate::mountable::posix::{
-    BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
-    decode_open_flags, host_errno,
+use crate::{
+    CortexError, DirentKind, Result, SetAttr, Stat,
+    mountable::{
+        Mountable, PosixFs,
+        posix::{
+            BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
+            decode_open_flags, host_errno,
+        },
+    },
 };
-use crate::{CortexError, DirentKind, Result, SetAttr, Stat};
 
 /// Host numbering, where the krun binding's is Linux's — `O_TRUNC` is not the
 /// same number on the two.
@@ -236,17 +241,16 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
     ) {
         // The cursor protocol is the shared operation's; this closure only
         // encodes. `add` returning true is the `stop` flag.
-        let streamed = super::block_on(self.for_each_dirent(
-            ino.0,
-            offset,
-            |child_inode, child, cursor| {
-                let kind = match child.kind {
-                    DirentKind::Dir => FileType::Directory,
-                    DirentKind::File => FileType::RegularFile,
-                };
-                Ok(reply.add(INodeNo(child_inode), cursor, kind, &child.name))
-            },
-        ));
+        let streamed =
+            super::block_on(
+                self.for_each_dirent(ino.0, offset, |child_inode, child, cursor| {
+                    let kind = match child.kind {
+                        DirentKind::Dir => FileType::Directory,
+                        DirentKind::File => FileType::RegularFile,
+                    };
+                    Ok(reply.add(INodeNo(child_inode), cursor, kind, &child.name))
+                }),
+            );
         match streamed {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(to_errno(err)),

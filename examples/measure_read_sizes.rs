@@ -51,10 +51,14 @@
 //!     /tmp/cortex-measure | tee /tmp/reads.log | grep SUMMARY
 //! ```
 
-use std::io::{self, Read};
-use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io::{self, Read},
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use async_trait::async_trait;
 use cortex::{

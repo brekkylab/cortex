@@ -32,10 +32,12 @@
 //! them is not caught. No binding implements `symlink`, so nothing reachable
 //! through this crate can do that; another process on the same tree could.
 
-use std::ffi::OsString;
-use std::fs;
-use std::path::{Component, Path, PathBuf};
-use std::sync::OnceLock;
+use std::{
+    ffi::OsString,
+    fs,
+    path::{Component, Path, PathBuf},
+    sync::OnceLock,
+};
 
 use async_trait::async_trait;
 
