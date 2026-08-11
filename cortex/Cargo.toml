@@ -1,0 +1,134 @@
+[package]
+name = "cortex"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "apply_krun"
+required-features = ["krun"]
+
+# Serves both host bindings from one file, so no `required-features`: the key is
+# AND, so it cannot say "fuse or fuse-t", and naming either would lock the other
+# out. The example carries a no-feature `main` instead.
+[[example]]
+name = "mount_host"
+
+# Measures the read sizes a kernel asks for, for the S3 read-ahead window.
+[[example]]
+name = "measure_read_sizes"
+required-features = ["fuse-t"]
+
+[build-dependencies]
+cc = { workspace = true }
+pkg-config = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+# The volume traits are async and object-safe at once, which native `async fn` in
+# traits is not — so their futures are boxed. Unconditional: those traits are the
+# volume half's spine, not something a feature turns on.
+async-trait = { workspace = true }
+# The console wire. The protocol's shape needs a *self-describing* codec — `params`
+# and `result` are typed by a method that may arrive after them, and `result` xor
+# `error` is decided by which member is present — and BSON is the self-describing
+# one with a native byte type, which is most of what this channel carries.
+bson = { workspace = true }
+# `BoxFuture`, which is what every method on `Client`, `Server` and `Executable`
+# hands back — see `console::base` for why they are boxed rather than `async fn`.
+futures-core = { workspace = true }
+fuser = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+msb_krun = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true, features = ["io-std", "io-util", "process", "rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+# No *binding* by default. The crate's own layers — `Mountable`, `Workspace`, the
+# inode bookkeeping, the console — need nothing, and each interface binding brings
+# a heavy dependency: enabling any by default charges every consumer for it. A
+# consumer that mounts over HTTP has no reason to compile a hypervisor.
+#
+# Measured with
+#
+#   cargo tree --features <f> -e normal --prefix none | grep -v '^cortex' \
+#       | sed 's/ (\*)$//' | sort -u | wc -l
+#
+# (normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
+# counted): `fuse-t` adds 1, `fuse` 33, `krun` 65, `s3` 126 — `krun` being the
+# whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP and TLS stack
+# under `object_store`.
+#
+# Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
+# because a binding's tests only exist when its feature is on. No default set fixes
+# that — `fuse` and `fuse-t` are independent, so no single configuration covers
+# every binding. Full coverage is a sweep:
+#
+#   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
+#   for f in "" "--features krun" "--features fuse" "--features fuse-t" \
+#            "--features fuse-no-mount" "--features s3" "--features notion" \
+#            "--features fuse,fuse-t" \
+#            "--features fuse,fuse-t,krun,s3,notion"; do cargo test -p cortex $f --all-targets; done
+#
+# Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
+# unquoted expansion — under zsh pass the flags as separate arguments.
+#
+# Editors default to no features too, so a binding shows as inactive code until
+# its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
+default = []
+# Every binding below also asks for `tokio/rt-multi-thread` and `tokio/net`: a
+# binding is a *synchronous* callback over async backends, so it blocks on one
+# process-wide runtime (`volume::adapter::block_on`), and `Builder::enable_all` is
+# cfg'd on `net` and `time` — built without them the runtime silently has no I/O
+# driver. `time` is already in the base set the console asks for.
+#
+# Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
+krun = [
+    "dep:msb_krun",
+    "dep:libc",
+    "dep:tempfile",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+]
+# Mount a cortex filesystem on the host through FUSE.
+#
+# Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
+# `brew install --cask fuse-t`) or macFUSE; both export the libfuse2 mount ABI
+# fuser links against. FUSE-T ships `fuse-t.pc` rather than the `fuse.pc` that
+# fuser's macOS branch probes for, so point `PKG_CONFIG_PATH` at the shim in
+# `cortex/contrib/pkgconfig`:
+#
+#   PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig" cargo build -p cortex --features fuse
+#
+# Linux needs no provider — fuser opens /dev/fuse directly.
+fuse = ["dep:fuser", "dep:libc", "tokio/net", "tokio/rt-multi-thread"]
+# Mount on macOS through FUSE-T, which needs no kernel extension.
+#
+# A separate binding rather than a flavour of `fuse`, because the two differ in
+# who drives the session: `fuser` reads the FUSE protocol off the mount fd
+# itself, while FUSE-T hands back a socket to its own helper and expects to drive
+# the filesystem through libfuse-t's loop. Enabling both at once is fine — they
+# are independent call surfaces over the same `PosixFs`.
+fuse-t = ["dep:libc", "tokio/net", "tokio/rt-multi-thread"]
+# Compile and unit-test the FUSE adapter with no libfuse provider installed:
+# skips fuser's pkg-config probe, so the adapter builds but cannot mount.
+fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
+s3 = ["dep:object_store", "tokio/net", "tokio/rt-multi-thread"]
+# A Notion workspace as a read-only backend: pages and their block trees rendered
+# to `page.json` on read.
+notion = [
+    "dep:reqwest",
+    "dep:uuid",
+    "dep:chrono",
+    "dep:serde_json",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+]

@@ -1,0 +1,24 @@
+[package]
+name = "cortex-local-console"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+bson = { workspace = true }
+cortex = { workspace = true }
+# `kill(pid, 0)`, to tell an abandoned scratch directory from a live one.
+libc = { workspace = true }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

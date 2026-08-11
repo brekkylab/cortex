@@ -1,7 +1,0 @@
-[package]
-name = "wsx"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-cortex = { path = "..", default-features = false }

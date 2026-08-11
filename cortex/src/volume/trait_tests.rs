@@ -1,0 +1,167 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
+
+use super::*;
+use crate::CortexError;
+use crate::volume::{InMemVolume, Workspace};
+
+/// A `Dirent` cannot claim one kind and carry metadata saying another.
+///
+/// `kind` exists twice — once on the entry, once inside its [`Stat`] — so the only
+/// thing keeping them honest is that `with_stat` derives one from the other. That is
+/// why `stat` is not a public field: with one, `Dirent { kind: Dir, stat: <a file's>
+/// }` would compile, and nothing would be wrong until a kernel believed it.
+#[tokio::test]
+async fn an_entry_takes_its_kind_from_the_metadata_it_carries() {
+    let carried = Dirent::with_stat("d", Stat::new(DirentKind::Dir, 0));
+    assert_eq!(carried.kind, DirentKind::Dir);
+    assert_eq!(
+        carried.stat().expect("metadata was given").kind,
+        carried.kind,
+        "the entry's kind and its metadata's kind are the same fact"
+    );
+
+    // And an entry the listing knew nothing about says so, rather than inventing a
+    // `Stat` whose fields would all be guesses.
+    let bare = Dirent::new("f", DirentKind::File);
+    assert_eq!(bare.kind, DirentKind::File);
+    assert!(bare.stat().is_none());
+}
+
+/// A setter answers for its own flag, and `create_new` — which has none — is
+/// reached by narrowing.
+#[test]
+fn a_flag_lands_on_an_access_mode_without_disturbing_the_others() {
+    let appending = OpenOptions::write_only().append(true);
+    assert!(!appending.read && appending.write, "the mode survived");
+    assert!(appending.append);
+    assert!(
+        !appending.truncate && !appending.create && !appending.create_new,
+        "a setter answers for its own flag only"
+    );
+
+    let exclusive_write = OpenOptions::create_new().read(false);
+    assert!(exclusive_write.create_new && exclusive_write.write);
+    assert!(
+        !exclusive_write.read,
+        "narrowed off the half it did not want"
+    );
+}
+
+/// The constructor sets `create` as well, so a backend that decides whether to
+/// create from `create` alone still honours `O_EXCL`. One that tested only `create`
+/// would otherwise not create the file at all.
+#[test]
+fn an_exclusive_create_is_also_a_create() {
+    let excl = OpenOptions::create_new();
+    assert!(excl.create_new && excl.create);
+}
+
+/// `create` is the one worth pinning: it writes no bytes, and still counts.
+#[test]
+fn every_flag_but_read_means_modification() {
+    let ro = OpenOptions::read_only();
+    assert!(!ro.intends_write());
+
+    for (flag, options) in [
+        ("write", ro.write(true)),
+        ("append", ro.append(true)),
+        ("truncate", ro.truncate(true)),
+        ("create", ro.create(true)),
+        ("create_new", OpenOptions::create_new()),
+    ] {
+        assert!(options.intends_write(), "{flag} means modification");
+    }
+}
+
+/// Stands in for a read-only source whose author never writes a `rename`. Its
+/// whole job is to pin what those get for free, so it must never grow an override.
+struct ReadOnlyStub;
+
+#[async_trait]
+impl Mountable for ReadOnlyStub {
+    type Handle = Box<dyn FileHandle>;
+
+    async fn stat(&self, _: &Path) -> Result<Stat> {
+        Ok(Stat::new(DirentKind::Dir, 0))
+    }
+    async fn list(&self, _: &Path) -> Result<Vec<Dirent>> {
+        Ok(Vec::new())
+    }
+    async fn mkdir(&self, _: &Path) -> Result<()> {
+        Err(CortexError::ReadOnly)
+    }
+    async fn unlink(&self, _: &Path) -> Result<()> {
+        Err(CortexError::ReadOnly)
+    }
+    async fn rmdir(&self, _: &Path) -> Result<()> {
+        Err(CortexError::ReadOnly)
+    }
+    async fn open(&self, _: &Path, _: OpenOptions) -> Result<(Self::Handle, Stat)> {
+        Err(CortexError::ReadOnly)
+    }
+}
+
+/// `EROFS`, per-request — unlike the `ENOSYS` a kernel applies to the whole mount.
+#[tokio::test]
+async fn a_backend_that_does_not_write_refuses_rename_without_implementing_it() {
+    let backend = ReadOnlyStub;
+
+    assert!(matches!(
+        Mountable::rename(&backend, Path::new("a"), Path::new("b")).await,
+        Err(CortexError::ReadOnly)
+    ));
+    // Through the erased face, which a mount table stores it as.
+    assert!(matches!(
+        DynMountable::rename(&backend, Path::new("a"), Path::new("b")).await,
+        Err(CortexError::ReadOnly)
+    ));
+    // And through a shared handle, which is how one store feeds two consumers.
+    assert!(matches!(
+        Mountable::rename(&Arc::new(ReadOnlyStub), Path::new("a"), Path::new("b")).await,
+        Err(CortexError::ReadOnly)
+    ));
+}
+
+/// One store, several owners, through both faces. Necessary because every
+/// consumer takes its backend *by value* and offers no way back, so without this
+/// impl a store feeds exactly one consumer.
+#[tokio::test]
+async fn an_arc_backend_is_a_backend_and_shares_one_store() {
+    let vol = Arc::new(InMemVolume::new());
+
+    let (handle, _) = Mountable::open(&vol, Path::new("shared.txt"), OpenOptions::create_new())
+        .await
+        .expect("fresh volume");
+    handle.write_all_at(b"once", 0).await.unwrap();
+
+    // Read back through a *different* clone: one store, not a copy per owner.
+    let other = Arc::clone(&vol);
+    let (handle, stat) = Mountable::open(&other, Path::new("shared.txt"), OpenOptions::read_only())
+        .await
+        .expect("every clone sees the same store");
+    assert_eq!(stat.size, 4);
+    let mut buf = [0u8; 4];
+    handle.read_exact_at(&mut buf, 0).await.unwrap();
+    assert_eq!(&buf, b"once");
+
+    // The blanket `DynMountable` impl reaches `Arc<T>` too, and the workspace
+    // *shares* the store: a write bypassing it is still visible through it.
+    Mountable::mkdir(&vol, Path::new("dir")).await.unwrap();
+    let ws = Workspace::new()
+        .try_with_mount("", Arc::clone(&vol))
+        .expect("Arc<InMemVolume> erases to DynMountable via the blanket impl");
+    assert_eq!(
+        Mountable::list(&ws, Path::new("dir")).await.unwrap().len(),
+        0
+    );
+
+    Mountable::mkdir(&vol, Path::new("dir/deeper"))
+        .await
+        .unwrap();
+    assert_eq!(
+        Mountable::list(&ws, Path::new("dir")).await.unwrap().len(),
+        1
+    );
+}
