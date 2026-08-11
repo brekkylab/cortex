@@ -430,10 +430,23 @@ pub trait FileHandle: FileExt + Send + Sync {
     /// Resize the file to `size` bytes, zero-filling any growth.
     async fn truncate(&self, size: u64) -> Result<()>;
 
+    /// Push buffered writes out — but **not** a finalize.
+    ///
+    /// This is not a "done" signal. A FUSE `flush` arrives on every `close()` —
+    /// including a `close` on a `dup`ed descriptor while writes still come through
+    /// another — and an `fsync` arrives mid-stream, so a `flush` can land while the
+    /// file is still being written. Making a durable write durable belongs here;
+    /// treating "flush happened" as "the finished file" does not — that is
+    /// [`commit`](Self::commit). (A frontend whose own finalize *is* a single
+    /// flush, e.g. a WebDAV `PUT`, is the exception, and its own concern.)
     async fn flush(&self) -> Result<()> {
         Ok(())
     }
 
+    /// Finalize the handle: the last descriptor is closing (a FUSE `RELEASE`), so a
+    /// backend that has held a write open — an S3 multipart upload — can complete
+    /// it now. Unlike [`flush`](Self::flush) this happens once, at the end.
+    /// Defaults to [`flush`](Self::flush), for a backend with nothing to finalize.
     async fn commit(&self) -> Result<()> {
         self.flush().await
     }
