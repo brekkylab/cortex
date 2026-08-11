@@ -19,8 +19,10 @@ use std::{
 
 use async_trait::async_trait;
 
-use crate::volume::{Dirent, DirentKind, DynMountable, FileHandle, Mountable, OpenOptions, Stat};
-use crate::{CortexError, Result};
+use crate::{
+    CortexError, Result,
+    volume::{Dirent, DirentKind, DynMountable, FileHandle, Mountable, OpenOptions, Stat},
+};
 
 /// A longest-prefix mount table over heterogeneous backends.
 pub struct Workspace {

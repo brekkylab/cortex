@@ -33,13 +33,18 @@ use std::process::Stdio;
 use cortex::BoxFuture;
 use cortex::console::{Console, ExecResult, ReadResult};
 use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
+use cortex::volume::Workspace;
 use tokio::process::Command;
 
 /// Reports everything it was told, so a round trip can be told from a coincidence.
 struct Report;
 
 impl Executable for Report {
-    fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        _workspace: &'a Workspace,
+    ) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move { ExecOutput::ok(format!("{}|{}\n", call.name, call.args.join(","))) })
     }
 }
@@ -49,7 +54,11 @@ impl Executable for Report {
 struct RawBytes;
 
 impl Executable for RawBytes {
-    fn exec<'a>(&'a self, _call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+    fn exec<'a>(
+        &'a self,
+        _call: &'a ExecCall,
+        _workspace: &'a Workspace,
+    ) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move { ExecOutput::ok([0xff, 0xfe, 0x00, b'\n'].as_slice()) })
     }
 }

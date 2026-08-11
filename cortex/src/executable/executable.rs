@@ -1,5 +1,7 @@
 use futures_core::future::BoxFuture;
 
+use crate::volume::Workspace;
+
 /// What a delegated executable was asked to do.
 #[derive(Clone, Debug)]
 pub struct ExecCall {
@@ -65,7 +67,25 @@ impl ExecResult {
 /// anyone's signature. The allocation is one per delegated call, next to a round trip
 /// out to the server and back.
 ///
+/// # Why the workspace is an argument
+///
+/// A delegated name is called from inside an execution, and the files it is asked
+/// about are the ones that execution can see. That namespace is the console's — it
+/// is what the console projects into the server, one per session — so an
+/// implementation cannot have captured the right one: the same `Executable` may be
+/// registered on several consoles, and each call belongs to whichever one is asking.
+///
+/// A shared borrow, because mounting is not a delegated name's to do. Everything a
+/// name does *to files* — stat, list, open, read, write, rename — is a
+/// [`Mountable`](crate::volume::Mountable) operation on `&self`, while
+/// [`mount`](Workspace::mount) needs `&mut self` and would rewrite the namespace an
+/// execution is already running against.
+///
 /// [`ExecutableSet`]: super::ExecutableSet
 pub trait Executable: Send + Sync {
-    fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecResult>;
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        workspace: &'a Workspace,
+    ) -> BoxFuture<'a, ExecResult>;
 }
