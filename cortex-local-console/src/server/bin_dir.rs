@@ -183,7 +183,8 @@ fn mounts_under(root: &Path) -> Vec<PathBuf> {
 ///
 /// `false` means a mount under it survived, so the directory has to stay:
 /// removing it would block, and a leaked directory is recoverable by a person
-/// where a wedged request loop is not.
+/// where a wedged request loop is not. Whether one survived is asked of the
+/// mount table afterwards rather than of `umount`'s exit status — see below.
 ///
 /// The unmount runs in a **child process** because that is the only shape that
 /// can be given up on. `libc::unmount` is a syscall with no timeout, and a
@@ -241,7 +242,6 @@ fn unmount_stale(root: &Path, charged: &mut bool) -> bool {
     }
     *charged = !mounts.is_empty();
 
-    let mut all_gone = true;
     for mountpoint in mounts {
         // Plain `umount`. `-f` needs root and answers EPERM; `diskutil unmount
         // force` hangs. Both established by hand on a wedged mount.
@@ -249,14 +249,13 @@ fn unmount_stale(root: &Path, charged: &mut bool) -> bool {
             .arg(&mountpoint)
             .spawn()
         else {
-            all_gone = false;
             continue;
         };
 
         let deadline = std::time::Instant::now() + UNMOUNT_DEADLINE;
-        let released = loop {
+        loop {
             match child.try_wait() {
-                Ok(Some(status)) => break status.success(),
+                Ok(Some(_)) => break,
                 Ok(None) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -269,21 +268,32 @@ fn unmount_stale(root: &Path, charged: &mut bool) -> bool {
                 // and it is the same trade as leaving the directory.
                 _ => {
                     let _ = child.kill();
-                    break false;
+                    break;
                 }
             }
-        };
-
-        if !released {
-            eprintln!(
-                "{}: leaving {} — its mount did not come back",
-                env!("CARGO_BIN_NAME"),
-                mountpoint.display()
-            );
-            all_gone = false;
         }
     }
-    all_gone
+
+    // What survived is the mount table's answer and not `umount`'s exit status, which cannot
+    // tell the two cases apart: it is 1 both for a mount it could not release and for a path
+    // that was never mounted — measured, `umount` on a plain directory prints "not currently
+    // mounted" and exits 1.
+    //
+    // The two disagree by design. `getmntinfo` is asked with `MNT_NOWAIT` so that it cannot
+    // block on a wedged filesystem, which means it answers from a cache that may still name a
+    // mount already gone. Reading a failed `umount` as "it survived" therefore costs a phantom
+    // row three things: the root stays another boot, a [`SWEEP_BUDGET`] slot is spent where a
+    // genuinely wedged root behind it goes untouched, and the log says a mount is stuck when
+    // nothing is there.
+    let survivors = mounts_under(&root);
+    for mountpoint in &survivors {
+        eprintln!(
+            "{}: leaving {} — its mount did not come back",
+            env!("CARGO_BIN_NAME"),
+            mountpoint.display()
+        );
+    }
+    survivors.is_empty()
 }
 
 /// Remove scratch directories whose owning process is gone.
