@@ -113,7 +113,7 @@ So what an `id` earns is not concurrency but **certainty about what an answer an
 It is also what threads a delegation together.
 One execution is answered once per round trip, and every round trip is an `exec` of its own — the one a caller asked for, then one per delegated call — so each response carries the id of the request it answers, and the client is never handed the answer to a different step than the one it is waiting on.
 
-The same number goes back the other way. An `exec` that carries on from a delegated call names the request it is carrying on from, in `prev.id`, which is how a server holding a paused execution can tell an answer to *that* one from a client that has lost its place.
+The same number goes back the other way. An `exec` that carries on from a delegated call names the request it is carrying on from, in its `cmd.id`, which is how a server holding a paused execution can tell an answer to *that* one from a client that has lost its place.
 
 **Pair by `id`, not by position.**
 
@@ -141,7 +141,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 | method | `params` | `result` |
 |---|---|---|
 | `init` | `{delegated}` | `null` |
-| `exec` | `{cmd, prev?, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
+| `exec` | `{cmd, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
 | `start` | — | *(notification)* |
@@ -231,8 +231,7 @@ Minimal form — no timeout of its own:
 
 | field | |
 |---|---|
-| `cmd` | already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`, unless `prev` is there. |
-| `prev` | omitted for a command a caller asked for. Present, this is not a command at all but the answer to a delegated call — see below. |
+| `cmd` | an **array** is a command, already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`. An **object** is not a command at all but the answer to a delegated call — see below. |
 | `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. |
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
 | `stdout`/`stderr` | `Binary`, byte-exact, kept apart. |
@@ -242,37 +241,40 @@ The `result` is not the execution's output but **how far it got**: `done` is the
 A client with nothing delegated never sees the second.
 See [Delegation](#delegation-and-execution-both-ways).
 
-### `exec` with `prev` — the delegated call ended like this
+### `exec` with an object `cmd` — the delegated call ended like this
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":[],"prev":{"id":2,"outcome":{"result":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}}}
+{"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":{"id":2,"outcome":{"result":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}}}
 {"jsonrpc":"2.0","id":3,"result":{"done":{"code":0,"stdout":{"$binary":{"base64":"aGkK","subType":"00"}},"stderr":{"$binary":{"base64":"","subType":"00"}},"truncated":false}}}
 ```
 
 Only ever a reply to a `delegated`, and its `result` is the next step of the *same* execution — another `delegated`, or the end of it.
 
-`cmd` is empty because this asks for nothing new to be run: the execution it belongs to is already running on the far end, and all this adds is the answer it was waiting for.
+`cmd` holds an answer rather than an argv because this asks for nothing new to be run: the execution it belongs to is already running on the far end, and all this adds is the output it was waiting for.
 
 | field | |
 |---|---|
-| `prev.id` | the request whose *response* carried the `delegated`. There is never more than one execution paused, so a server could have worked it out — what this earns is the same thing an `id` earns anywhere here: an answer naming a request nobody is waiting on is a peer that has lost its place, and can be refused rather than mistaken for the one that was due. |
-| `prev.outcome` | the two members a response spells an outcome with, `result` xor `error`. |
+| `cmd.id` | the request whose *response* carried the `delegated`. There is never more than one execution paused, so a server could have worked it out — what this earns is the same thing an `id` earns anywhere here: an answer naming a request nobody is waiting on is a peer that has lost its place, and can be refused rather than mistaken for the one that was due. |
+| `cmd.outcome` | the two members a response spells an outcome with, `result` xor `error`. |
 
 An **outcome** and not a result, because a delegated call can fail to produce one at all:
 
 ```json
-{"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":[],"prev":{"id":2,"outcome":{"error":{"code":-32001,"message":"fetch: not a delegated executable"}}}}}
+{"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":{"id":2,"outcome":{"error":{"code":-32001,"message":"fetch: not a delegated executable"}}}}}
 ```
 
 An exit code could not have said that. 127 for a program that was not there and 126 for one that would not start are codes any command reaches by an ordinary `exit()`, so a result carrying one never proves the call failed rather than ran and failed — the same reason [an error is not an exit code](#why-an-error-is-not-an-exit-code) anywhere else here.
 
 The server hands whichever arrives straight to the shim that is waiting, and does not read it.
-An `exec` carrying a `prev` when nothing is paused is `INVALID_REQUEST`.
+An `exec` answering a delegated call when nothing is paused is `INVALID_REQUEST`.
 
-> **Why this is a member and not a method of its own.**
+> **Why this is `cmd` and not a method, or a member beside `cmd`.**
 > A method for it would be the same request under a second name: an execution the server is holding, and the output it was waiting for.
-> What the client has to say is *this is where the last one got to*, which is a member — and one method fewer is one fewer place for the two ends to disagree about which of them a response is answering.
+> What the client has to say is *this is where the last one got to*, which is what `cmd` is already for — and one method fewer is one fewer place for the two ends to disagree about which of them a response is answering.
 > It also keeps the chain one shape: every step of an execution is an `exec`, whoever asked for it.
+>
+> Neither form is tagged, because neither needs to be: an argv is an array and an answer is an object, and a reader with the value in front of it has already been told which one it has.
+> A member *beside* `cmd` would cost states nobody means — both present is a command that is also an answer, neither is an execution asking for nothing — where two shapes have exactly the two cases there are.
 
 `stdout` and `stderr` stay apart because merging is something a requester can do and un-merging is not.
 The interleaving between them is not preserved: two buffers are not one stream, and a caller that needs the order asks the command for it (`2>&1`).
@@ -375,10 +377,10 @@ So the server has to ask the client for it.
 
 A `delegated` is a complete, ordinary JSON-RPC response to the `exec` the client is already waiting on.
 It means *this execution is not over, and here is what I need from you*.
-The client runs the name and says so with another `exec`, carrying the answer as its `prev`, and gets the next step back.
+The client runs the name and says so with another `exec`, carrying the answer as its `cmd`, and gets the next step back.
 The chain ends at `done`.
 
-So the whole chain is `exec`s, told apart by what they carry: the caller's has a command and no `prev`, and every one after it is the other way round.
+So the whole chain is `exec`s, told apart by the shape of what they carry: the caller's `cmd` is an argv, and every one after it is an object saying how the last delegated call ended.
 
 So the server never issues a request and the client never answers one.
 There is one channel, one end that asks, one end that answers — no pending table anywhere, no reader that must not block, and no channel per delegated call.
@@ -432,7 +434,7 @@ sequenceDiagram
     Note over sh,shim: both blocked until this is answered
     server-->>client: id:1 result {delegated:{cmd:["fetch","x"]}}
     Note over client,server: client runs ExecutableSet::invoke("fetch", ["x"])
-    client->>server: id:2 exec {cmd:[], prev:{id:1, outcome:{result:{code:0, stdout:"…"}}}}
+    client->>server: id:2 exec {cmd:{id:1, outcome:{result:{code:0, stdout:"…"}}}}
     server-->>shim: {code:0, stdout:"…"}
     shim-->>sh: onto its own stdout, exits 0
     deactivate shim
@@ -444,7 +446,7 @@ sequenceDiagram
     client->>server: quit — no id, so nothing answers
 ```
 
-Note that `id:1` is answered **once**, with `delegated`, and the execution's own ending goes to `id:2` — the `exec` that was outstanding by then, and the one whose `prev` named `id:1`.
+Note that `id:1` is answered **once**, with `delegated`, and the execution's own ending goes to `id:2` — the `exec` that was outstanding by then, and the one whose `cmd` named `id:1`.
 Every request still gets exactly one response.
 
 The shim's dial is the only arrow that is not this protocol: it is server-local, and the server is what turns it into the `delegated` above it.
@@ -500,9 +502,9 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
 | `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
-| `-32600` | any | invalid request — including an `exec` carrying a `prev` when nothing is paused on a delegated call. |
+| `-32600` | any | invalid request — including an `exec` answering a delegated call when nothing is paused on one. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty `cmd` with no `prev`. A delegated name that is not a plain path component *should* be this and is not checked; see [`init`](#init--this-is-the-session). |
+| `-32602` | any | invalid params — an empty argv `cmd`. A delegated name that is not a plain path component *should* be this and is not checked; see [`init`](#init--this-is-the-session). |
 | `-32603` | any | internal error |
 
 `-32003` and `-32004` are unassigned and stay that way.
@@ -533,8 +535,8 @@ stateDiagram-v2
     Idle --> Up: exec / read / write — boots first
     Idle --> Idle: boot failed → BOOT_FAILED
     Up --> Paused: exec → delegated
-    Paused --> Paused: exec+prev → delegated
-    Paused --> Up: exec+prev → done / error
+    Paused --> Paused: exec answering it → delegated
+    Paused --> Up: exec answering it → done / error
     Up --> Up: exec / read / write → result
     Up --> Idle: stop
     Idle --> [*]: quit
@@ -547,15 +549,15 @@ A boot that fails leaves `Idle`, so nothing thinks it is up, and the call that n
 
 `init` is not an edge at all. It is legal in either state, it boots nothing, and what it changes is the shape a future boot will take — which is why it drops back to `Idle` when it arrives in `Up`.
 
-An `exec` carrying a `prev` outside `Paused` is `INVALID_REQUEST`: nothing is waiting on a delegated call.
+An `exec` answering a delegated call outside `Paused` is `INVALID_REQUEST`: nothing is waiting on one.
 
 `Paused` is an execution that has been answered with `delegated` and not yet carried on.
-It is the client's turn and **only** an `exec` carrying a `prev` belongs there: the execution owes an answer that has not been sent, so a client asking about anything else is asking about a request it has not been answered on.
-There is at most one `Paused` execution, so `prev.id` is not what tells a server *which* one — it is what tells it the client is answering the one it is actually holding.
+It is the client's turn and **only** an `exec` answering it belongs there: the execution owes an answer that has not been sent, so a client asking about anything else is asking about a request it has not been answered on.
+There is at most one `Paused` execution, so `cmd.id` is not what tells a server *which* one — it is what tells it the client is answering the one it is actually holding.
 
 > **Barely enforced today, and mostly the answering side's to enforce.**
 > An answering end moves frames and reads no meaning into them, and the shared server layer that held these rules is gone.
-> A backend refuses an `exec` with a `prev` that nothing is waiting on, and one whose `prev.id` names a request it is not holding, because it is the only end that knows — but a delegated name is linked unchecked.
+> A backend refuses an `exec` answering a delegated call that nothing is waiting on, and one whose `cmd.id` names a request it is not holding, because it is the only end that knows — but a delegated name is linked unchecked.
 > The asking side keeps no second copy of any of it, with one exception: `init` is sent when a `Console` is constructed, so the one ordering rule that is guaranteed on this side is that it comes first.
 > Everything after that is what a caller asked for, in the order it asked.
 > Which is why the gaps above are visible rather than hidden behind one well-behaved client.
