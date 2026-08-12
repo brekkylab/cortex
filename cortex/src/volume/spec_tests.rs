@@ -156,6 +156,40 @@ fn a_spec_that_is_wrong_two_ways_is_answered_the_same_in_every_build() {
     ));
 }
 
+/// **How many mounts a spec has is a peer's choice, so realizing one cannot be quadratic in
+/// it.** One frame under `MAX_PAYLOAD` holds around a million minimal mounts; at 32k, a
+/// duplicate check that scanned what came before took 8.4s, which extrapolates past two hours.
+///
+/// Asserted as a *ratio* measured in this same run, not against a clock. Quadruple the mounts
+/// and quadratic work is 16× where `n log n` is nearer 4×, and a loaded machine slows both
+/// sides of the ratio equally — which a wall-clock bound would not survive.
+#[test]
+fn realizing_a_spec_is_not_quadratic_in_the_mount_count() {
+    fn timed(n: usize) -> std::time::Duration {
+        let mut spec = WorkspaceSpec::default();
+        for i in 0..n {
+            spec = spec.mount(
+                format!("m{i}"),
+                VolumeSpec::Local {
+                    host: "/tmp".into(),
+                },
+            );
+        }
+        let started = std::time::Instant::now();
+        crate::volume::Workspace::from_spec(&spec).expect("realizes");
+        started.elapsed()
+    }
+
+    let small = timed(8_000);
+    let large = timed(32_000);
+    let growth = large.as_secs_f64() / small.as_secs_f64();
+    assert!(
+        growth < 8.0,
+        "4x the mounts took {growth:.1}x the time ({small:?} -> {large:?}), which is closer to \
+         quadratic than to linear"
+    );
+}
+
 /// A repeated path is answered before anything is opened, so the same spelling twice is
 /// `AlreadyExists` rather than whatever realizing the first one happened to do.
 #[test]

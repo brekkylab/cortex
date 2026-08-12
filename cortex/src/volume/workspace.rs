@@ -74,14 +74,18 @@ impl Workspace {
     /// one answers [`InvalidName`](CortexError::InvalidName) for the same document. Telling
     /// those apart is why the wire tags do not depend on the build, so the answer must not.
     pub fn from_spec(spec: &crate::volume::WorkspaceSpec) -> Result<Self> {
-        // Linear rather than a set: a handful of mounts, and the order is needed below anyway.
         let mut keys: Vec<PathBuf> = Vec::with_capacity(spec.mounts.len());
         for mount in &spec.mounts {
-            let key = mount_key(Path::new(&mount.path))?;
-            if keys.contains(&key) {
-                return Err(CortexError::AlreadyExists);
-            }
-            keys.push(key);
+            keys.push(mount_key(Path::new(&mount.path))?);
+        }
+
+        // Sorted rather than scanning what came before, because how many mounts there are is a
+        // peer's choice and a scan is quadratic in it: 32k mounts took 8.4s measured, where one
+        // frame under `MAX_PAYLOAD` holds about a million of them.
+        let mut sorted: Vec<&PathBuf> = keys.iter().collect();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CortexError::AlreadyExists);
         }
 
         let mut ws = Workspace::new();
