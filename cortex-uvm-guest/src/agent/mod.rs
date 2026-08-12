@@ -129,7 +129,7 @@ const MAX_DATA: u64 = MAX_PAYLOAD as u64 - 1024;
 /// `port` is the virtio-console port, open read-write. It becomes two halves here, from
 /// one `dup`: the driver refuses a second opener, and the framing wants to read and write
 /// through borrows that do not have to take turns.
-pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
+pub async fn run(port: std::fs::File, root: Option<PathBuf>) -> anyhow::Result<()> {
     // SAFETY: `dup` hands back a fresh descriptor for the same open file, and the
     // `File` built from it is the only owner of that number.
     let duplicate = unsafe { libc::dup(port.as_raw_fd()) };
@@ -205,7 +205,9 @@ pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
                 }
 
                 Call::Exec(exec) => match session.booted() {
-                    Ok(linked) => execute(&mut server, id, &exec, linked, &shims).await?,
+                    Ok(linked) => {
+                        execute(&mut server, id, &exec, linked, &shims, root.as_deref()).await?
+                    }
                     Err(e) => server.respond(id, boot_failed(e)).await?,
                 },
 
@@ -304,12 +306,25 @@ fn boot_failed(e: io::Error) -> Outcome {
 /// error — and it goes to whichever request is owed one by then: the `exec` a caller
 /// asked for if nothing was delegated, or the last `exec` that carried an answer back if
 /// something was.
+///
+/// # No `current_dir` here, and `root` is not for one
+///
+/// A command inherits this process's working directory, which
+/// [`init::prepare`](crate::init::prepare) set to the workspace root; `read_file` and
+/// `write_file` use their paths as given and resolve against the same one. **One setting, read
+/// two ways** — and one setting cannot disagree with itself, which is why a command and a file
+/// call name the same file here. `cortex-local-console` has to join an explicit root onto both
+/// instead, because its process outlives many boots.
+///
+/// So do not add `.current_dir(root)`: a no-op today, and two settings that must stay equal
+/// with nothing saying so. `root` is here for [`delegate`], which needs it as a value to strip.
 async fn execute(
     server: &mut StdioServer,
     id: RequestId,
     exec: &Exec,
     linked: &BinDir,
     shims: &Shims,
+    root: Option<&Path>,
 ) -> io::Result<()> {
     let Some((program, args)) = exec.cmd.split() else {
         return server
@@ -362,7 +377,7 @@ async fn execute(
             biased;
 
             accepted = shims.accept() => match accepted {
-                Some(stream) => match delegate(server, owed, stream).await? {
+                Some(stream) => match delegate(server, owed, stream, root).await? {
                     Some(next) => owed = next,
                     // The client stopped saying anything that could carry the execution
                     // on, so there is nobody left to answer. The command is left to the
@@ -392,6 +407,7 @@ async fn delegate(
     server: &mut StdioServer,
     owed: RequestId,
     stream: UnixStream,
+    root: Option<&Path>,
 ) -> io::Result<Option<RequestId>> {
     // Owned halves, because the two directions are separate fields of a `StdioServer` and
     // have to outlive the borrow the stream came in on.
@@ -413,6 +429,18 @@ async fn delegate(
             );
             return Ok(Some(owed));
         }
+    };
+
+    // Workspace-relative, or `None` — the rule is `reported_cwd`'s, shared with the local
+    // console.
+    //
+    // No canonicalization, deliberately: the root is `GUEST_WORKSPACE_ROOT`, a constant with
+    // no symlink in it, in a filesystem the guest built. The local backend has to resolve its
+    // mount point because macOS puts `$TMPDIR` under a `/var` symlink and reports the resolved
+    // path. A root under a symlinked prefix would break here.
+    let exec = Exec {
+        cwd: cortex::executable::reported_cwd(exec.cwd.as_deref(), root),
+        ..exec
     };
 
     server

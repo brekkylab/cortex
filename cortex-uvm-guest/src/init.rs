@@ -60,10 +60,16 @@ const PORT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// Build the root, mount what the session was given, and open the channel the host is
 /// waiting on.
 ///
+/// Returns the port and the workspace root, when there is one. The root is also this
+/// process's working directory, and it is returned as well as applied because the agent
+/// needs it as a *value*: a delegated call reports an absolute guest path, and turning that
+/// back into a workspace-relative one means having the prefix to remove. Reading the cwd
+/// back later would work today and would be a different thing tomorrow.
+///
 /// The order is the only one that works: pseudo-filesystems first because `/proc` is how
 /// this binary finds itself and `/dev` is where the block devices are, the overlay next
 /// because it replaces everything mounted so far, then the share, then the port.
-pub fn prepare() -> anyhow::Result<File> {
+pub fn prepare() -> anyhow::Result<(File, Option<PathBuf>)> {
     mount_pseudo();
 
     if let (Ok(lower), Ok(upper)) = (std::env::var(LOWER_ENV), std::env::var(UPPER_ENV)) {
@@ -77,12 +83,13 @@ pub fn prepare() -> anyhow::Result<File> {
     // A workspace is where a command's relative paths should resolve, so it is also the
     // working directory. Without one, `/` — a session with nothing projected into it
     // still has a root.
-    match share()? {
-        Some(root) => set_cwd(&root)?,
+    let root = share()?;
+    match &root {
+        Some(root) => set_cwd(root)?,
         None => set_cwd(Path::new("/"))?,
     }
 
-    open_port()
+    Ok((open_port()?, root))
 }
 
 /// `mount(2)`, creating the target first.

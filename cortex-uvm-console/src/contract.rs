@@ -51,13 +51,14 @@ pub const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
 /// Guest memory in MiB, if the caller overrode it.
 pub const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
 
-/// The host directory to project into the guest as the workspace, and where it lands:
-/// `/host/path:/guest/path`.
+/// The file holding this session's [`WorkspaceSpec`](cortex::volume::WorkspaceSpec), as BSON.
 ///
-/// Read by whoever *starts* the console, which is why it is a host path pair rather than
-/// something richer: a console server is configured by its environment, and this is the
-/// one knob whose value is a caller's own filesystem.
-pub const WORKSPACE_ENV: &str = "CORTEX_UVM_WORKSPACE";
+/// A file and not an environment value because a spec carries credentials: `environ` is
+/// readable by any same-uid process for the life of the process, where a `0600` file stops
+/// being readable once the boot child has unlinked it. It also has no size limit.
+///
+/// Unset means a session that declared no namespace, which is a session.
+pub const SPEC_ENV: &str = "CORTEX_UVM_SPEC";
 
 /// The read-only base image, as a host path (the child) — and as a guest block device
 /// (the guest). Both ends of the overlay are named twice for that reason: one side has a
@@ -86,3 +87,10 @@ pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
 /// The virtio-fs tag the workspace is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
 pub const WORKSPACE_TAG: &str = "cortexws";
+
+/// Where the workspace is mounted inside the guest.
+///
+/// A constant and not a caller's choice: a spec's mount paths are relative to the workspace's
+/// own root, so where that root lands is this backend's business. Fixing it is also what gives
+/// the guest agent a prefix to strip when it reports a `cwd`.
+pub const GUEST_WORKSPACE_ROOT: &str = "/workspace";
