@@ -40,50 +40,15 @@ use object_store::{
 };
 
 use crate::lock::lock;
-use crate::volume::{Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, Stat};
+use crate::volume::{
+    Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, S3Config, Stat,
+};
 use crate::{CortexError, Result};
 
-/// Connection settings for [`S3Volume`].
-///
-/// [`Debug`] is written by hand rather than derived, and it redacts
-/// `secret_access_key`. Deriving it would put the key in plain text into whatever
-/// `{:?}` reaches — a log line, a panic message, an error wrapping this config — and
-/// nothing about the derive would announce that.
-///
-/// The built store needs no such care from us, though it is also printable:
-/// `ObjectStore` requires `Debug` and `AmazonS3` derives it, but `AwsCredential`
-/// writes its own that prints `"******"` for the secret and the session token.
-///
-/// `Clone`/`Serialize`/`Deserialize` (but not `Debug`) are derived so a
-/// [`VolumeSpec`](crate::volume::VolumeSpec) can carry this across a process boundary and
-/// rebuild the volume. Serialization keeps the secret — that is the point, a
-/// far-side rebuild needs it — while the hand-written `Debug` still redacts it.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct S3Config {
-    pub bucket: String,
-    pub region: String,
-    pub access_key_id: String,
-    pub secret_access_key: String,
-    /// Custom endpoint (MinIO / R2 / localstack); `None` for real AWS.
-    pub endpoint: Option<String>,
-    /// Key prefix every path is rooted under. Composes with whatever mount path a
-    /// [`Workspace`](crate::volume::Workspace) puts this volume at: the workspace strips
-    /// its mount path first, then this prefix is prepended.
-    pub key_prefix: Option<String>,
-}
-
-impl std::fmt::Debug for S3Config {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("S3Config")
-            .field("bucket", &self.bucket)
-            .field("region", &self.region)
-            .field("access_key_id", &self.access_key_id)
-            .field("secret_access_key", &"[redacted]")
-            .field("endpoint", &self.endpoint)
-            .field("key_prefix", &self.key_prefix)
-            .finish()
-    }
-}
+// `S3Config` lives in `volume/spec.rs`, not here. It is a wire type: a build without
+// this feature still has to parse a spec that names an S3 volume, so the settings
+// cannot be behind the feature the *provider* is behind. Its hand-written `Debug`,
+// which redacts the secret, went with it.
 
 /// A read-only volume over an object store.
 pub struct S3Volume {
