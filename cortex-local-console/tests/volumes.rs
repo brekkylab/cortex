@@ -428,3 +428,94 @@ async fn a_delegated_call_resolves_the_file_the_command_would_have() {
         "the executable resolved against the same namespace, from where the command stood"
     );
 }
+
+/// **One name, one file, three ways.** A command, a `read`, and a delegated executable each
+/// name `work/report.md`, and all three come back with the same bytes.
+///
+/// The test above shows the executable *resolving* the caller's name. This one shows it
+/// **opening** the result — against a `Workspace` this process built from the same spec the
+/// server was sent, so nothing here reads through the server's tree. Agreement on arithmetic
+/// and agreement on a file are two claims, and only the second is the point.
+#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+#[tokio::test]
+async fn one_name_is_one_file_to_a_command_a_read_and_a_delegated_call() {
+    use std::sync::Arc;
+
+    use cortex::BoxFuture;
+    use cortex::executable::{ExecCall, ExecResult, Executable, ExecutableSet};
+    use cortex::volume::{Mountable as _, OpenOptions, Workspace};
+
+    /// Resolves the caller's argument and **opens** it, through a tree this process built.
+    struct Reader(Arc<Workspace>);
+
+    impl Executable for Reader {
+        fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecResult> {
+            Box::pin(async move {
+                let path = match call.resolve(&call.args[0]) {
+                    Ok(path) => path,
+                    Err(e) => return ExecResult::failed(1, format!("resolve: {e}")),
+                };
+                let (handle, stat) = match self.0.open(&path, OpenOptions::read_only()).await {
+                    Ok(open) => open,
+                    Err(e) => return ExecResult::failed(1, format!("open {path:?}: {e}")),
+                };
+                let mut buf = vec![0u8; stat.size as usize];
+                if let Err(e) = handle.read_exact_at(&mut buf, 0).await {
+                    return ExecResult::failed(1, format!("read: {e}"));
+                }
+                // Both halves, so a right answer can be told from a right-looking one.
+                ExecResult::ok(format!(
+                    "{}|{}",
+                    path.display(),
+                    String::from_utf8_lossy(&buf)
+                ))
+            })
+        }
+    }
+
+    let _mounted = one_mount_at_a_time();
+
+    let host = tempfile::tempdir().unwrap();
+    std::fs::write(host.path().join("report.md"), b"the same bytes\n").unwrap();
+
+    let spec = WorkspaceSpec::default().mount(
+        "work",
+        VolumeSpec::Local {
+            host: host.path().to_path_buf(),
+        },
+    );
+    // Two `from_spec` calls, one description: the server's happens when it boots.
+    let mine = Arc::new(Workspace::from_spec(&spec).expect("the client realizes it too"));
+
+    let mut console = Console::builder()
+        .client(server())
+        .volumes(spec)
+        .executables(ExecutableSet::new().register("readit", Reader(mine)))
+        .build()
+        .await
+        .unwrap();
+
+    let by_command = console
+        .exec(["cat", "work/report.md"], None)
+        .await
+        .expect("a command runs in the mounted namespace");
+    let by_read = console
+        .read("work/report.md", None, None)
+        .await
+        .expect("a file call resolves in the same one");
+    // Relative, from inside `work`, so this only works if `cwd` arrived.
+    let by_delegate = console
+        .exec(["sh", "-c", "cd work && readit report.md"], None)
+        .await
+        .expect("the delegated call is served");
+
+    let reported = String::from_utf8_lossy(&by_delegate.stdout).into_owned();
+    let (resolved, content) = reported
+        .split_once('|')
+        .unwrap_or_else(|| panic!("the executable failed: {reported}"));
+
+    assert_eq!(by_command.stdout, b"the same bytes\n", "the command");
+    assert_eq!(by_read.data, b"the same bytes\n", "the protocol's own read");
+    assert_eq!(resolved, "work/report.md", "what the executable resolved to");
+    assert_eq!(content, "the same bytes\n", "what the executable read");
+}
