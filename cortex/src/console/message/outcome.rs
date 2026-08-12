@@ -103,6 +103,19 @@ impl Error {
     /// file is whatever it is, and a requester that needs to know asks with a `read`.
     pub const IO_FAILED: i64 = -32007;
 
+    /// A volume kind the server cannot realize. Answered by whatever call needed a session,
+    /// since `init` boots nothing.
+    ///
+    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the spec is
+    /// well formed and the server is the wrong build for it.
+    pub const UNSUPPORTED_VOLUME: i64 = -32008;
+
+    /// The workspace built and binding it to a filesystem interface did not — no mount
+    /// binding compiled in, no FUSE provider installed, the mount point busy.
+    ///
+    /// The volume kinds were all fine; the environment is what has to change.
+    pub const MOUNT_FAILED: i64 = -32009;
+
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
     /// error) belongs to whoever reads the frame, not here.
     pub const INVALID_REQUEST: i64 = -32600;

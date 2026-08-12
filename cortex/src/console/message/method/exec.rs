@@ -40,6 +40,36 @@ pub struct Exec {
     /// thing means. The requester hears [`TIMED_OUT`](super::Error::TIMED_OUT).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+
+    /// Where the command was invoked, **relative to the workspace root** — `"work/sub"`,
+    /// or `""` for the root itself.
+    ///
+    /// It is what makes a delegated call's relative paths resolvable. The client runs the
+    /// executable in a process of its own, against its own tree built from the same
+    /// namespace, so an argv alone would name a file relative to nothing.
+    ///
+    /// Workspace-relative and not the executor's own path, because the two ends share a
+    /// namespace and not a filesystem: a server strips whatever prefix it mounted the tree
+    /// at before answering.
+    ///
+    /// **Reported, never instructed.** A shim fills it because it knows where it stood; a
+    /// server rewrites it; a client reads it off a [`Delegated`](Progress::Delegated). A
+    /// client's own [`New`](ExecCmd::New) leaves it `None`, because a caller-chosen
+    /// directory would be a second way to decide where a command runs beside the mount
+    /// point that already decides it.
+    ///
+    /// `None` when there is no workspace, when the command stood outside it, or when the
+    /// directory's name has no `String` form — a path inside a passthrough volume may
+    /// legitimately not be UTF-8. It is never *guessed*: substituting the root would name
+    /// a different file and say nothing about having done so, which is the failure this
+    /// field exists to prevent.
+    ///
+    /// Like [`timeout_ms`](Self::timeout_ms) it belongs to a `New` and means nothing on a
+    /// [`Resume`](ExecCmd::Resume) — and, like it, nothing enforces that. Putting it inside
+    /// `New` would make that variant an object, and the shape of `cmd`'s value is the only
+    /// thing telling the two apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// A command to run, or the answer a paused execution is waiting for.
@@ -422,5 +452,47 @@ mod tests {
             .split()
             .is_none()
         );
+    }
+
+    /// The invariant a new sibling field must not disturb: `cmd`'s two variants are told
+    /// apart by the shape of their *value* and nothing else, so a member beside `cmd`
+    /// leaves that alone.
+    #[test]
+    fn a_new_field_does_not_disturb_the_shape_that_names_the_variant() {
+        let exec = Exec {
+            cmd: ExecCmd::New(vec!["ls".into()]),
+            timeout_ms: Some(5_000),
+            cwd: Some("work/sub".into()),
+        };
+        let doc = bson::serialize_to_document(&exec).expect("serializes");
+        assert!(
+            doc.get_array("cmd").is_ok(),
+            "a New's cmd is still an array"
+        );
+
+        let back = read(doc).expect("deserializes");
+        assert!(
+            matches!(back.cmd, ExecCmd::New(_)),
+            "still reads back as New"
+        );
+        assert_eq!(back.cwd.as_deref(), Some("work/sub"));
+    }
+
+    #[test]
+    fn no_cwd_is_absent_from_the_frame() {
+        let exec = Exec {
+            cmd: ExecCmd::New(vec!["ls".into()]),
+            ..Exec::default()
+        };
+        assert_eq!(
+            bson::serialize_to_document(&exec).unwrap(),
+            doc! {"cmd": ["ls"]}
+        );
+    }
+
+    #[test]
+    fn an_absent_cwd_reads_as_none() {
+        let exec = read(doc! {"cmd": ["ls"]}).expect("deserializes");
+        assert_eq!(exec.cwd, None);
     }
 }

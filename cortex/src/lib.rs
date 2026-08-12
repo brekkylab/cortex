@@ -1,4 +1,4 @@
-//! Two halves, and they do not know about each other.
+//! Two halves. They share a vocabulary for describing a namespace, and no behaviour.
 //!
 //! * [`volume`] — expose any path-addressed store as a real filesystem. A store
 //!   implements [`Mountable`](volume::Mountable) and a binding puts it in front of a
@@ -8,9 +8,16 @@
 //!   executables only *this* side knows how to run reachable from inside that somewhere
 //!   else. `console/ARCHITECTURE.md` has the long form.
 //!
-//! What they share is a crate and an error type, and that is deliberate: a console
-//! backend that projects a volume into its sandbox is a thing to build on top of both,
-//! not a coupling to bake into either.
+//! What they share is a crate, an error type, and one vocabulary:
+//! [`Init`](console::Init) carries a [`WorkspaceSpec`](volume::WorkspaceSpec), and both ends
+//! call [`Workspace::from_spec`](volume::Workspace::from_spec) to build their own live tree —
+//! which is what makes a path mean the same thing to a command and to the delegated executable
+//! it invoked.
+//!
+//! That is data, not behaviour, and the distinction is the arrangement: nothing in [`console`]
+//! builds a workspace, calls [`Mountable`](volume::Mountable) or touches an adapter. **A
+//! backend that projects a volume into its sandbox is built on top of both**, which is what
+//! `cortex-local-console` and `cortex-uvm-console` are.
 //!
 //! # The file layout
 //!
