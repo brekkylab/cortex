@@ -54,14 +54,22 @@
 //!
 //! # Files
 //!
-//! `read` and `write` reach this host's filesystem directly, at the path as given — the
-//! same namespace a command here resolves its own relative paths in, since a command here
-//! is an ordinary process of this one's.
+//! `read` and `write` reach this host's filesystem directly, at the path resolved against
+//! the session's namespace — the same directory a command runs in, so the two halves of
+//! the protocol name the same file.
+//!
+//! That used to hold for free: with no per-command directory set, a spawned command and a
+//! file call both inherited this process's cwd. Running commands *in* a mount removes that
+//! reason, so the agreement is now something this module does — see [`at`] and
+//! [`Booted::cwd`]. A session with no namespace still uses the path as it arrives.
+//!
+//! It is a namespace and not a confinement: an absolute path, or one with enough `..`,
+//! still leaves the mount.
 //!
 //! Both are answered on the spot, outside any execution: nothing is spawned, nothing can
-//! delegate, and one response ends it. They boot the session first all the same, because
-//! that rule is the protocol's rather than this backend's — here it buys nothing, and on
-//! a backend whose files are inside a guest it is the only way to have a file at all.
+//! delegate, and one response ends it. They boot the session first because that rule is
+//! the protocol's rather than this backend's — and here it is also what produces the
+//! directory they resolve in.
 //!
 //! # One session at a time, on one task
 //!
@@ -101,17 +109,19 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 
 use bson::Bson;
+use cortex::CortexError;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
     Call, Error, Exec, ExecCmd, ExecResult, Init, MAX_PAYLOAD, Message, Notification, Outcome,
     Progress, Read, ReadResult, RequestId, Server, Write, WriteResult,
 };
+use cortex::volume::Workspace;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 
 use crate::ipc::SOCK_ENV;
-use bin_dir::BinDir;
+use bin_dir::SessionScratch;
 
 /// A command we found but could not start, and one we could not find at all.
 ///
@@ -148,9 +158,16 @@ pub async fn run() -> anyhow::Result<()> {
             // Booting early rather than under whichever call would have paid for it.
             // Nothing answers this, so a failure is only said here — the next call that
             // needs a boot tries again and tells whoever asked for it.
+            //
+            // The message rather than the `Outcome`: the code belongs to whoever gets
+            // answered, and nobody is being answered here. This line is for a person.
             Message::Notification(Notification::Start) => {
-                if let Err(e) = session.booted() {
-                    eprintln!("{}: linking delegated names: {e}", env!("CARGO_BIN_NAME"));
+                if let Err(Outcome::Error(e)) = session.booted() {
+                    eprintln!(
+                        "{}: booting a session: {}",
+                        env!("CARGO_BIN_NAME"),
+                        e.message
+                    );
                 }
             }
 
@@ -180,26 +197,24 @@ pub async fn run() -> anyhow::Result<()> {
                 }
 
                 Call::Exec(exec) => match session.booted() {
-                    Ok(linked) => execute(&mut server, id, &exec, linked, &shims).await?,
-                    Err(e) => server.respond(id, boot_failed(e)).await?,
+                    Ok(booted) => execute(&mut server, id, &exec, booted, &shims).await?,
+                    Err(outcome) => server.respond(id, outcome).await?,
                 },
 
-                // The bytes a file call moves need nothing that booting produces on this
-                // host — the filesystem is there either way — but booting first is the
-                // protocol's rule and not this backend's, and a backend whose files live
-                // inside a guest could not answer one any other way.
+                // Booting first is the protocol's rule, and here it also decides *where*: a
+                // file call resolves in the namespace booting produced.
                 Call::Read(read) => {
                     let outcome = match session.booted() {
-                        Ok(_) => read_file(&read).await,
-                        Err(e) => boot_failed(e),
+                        Ok(booted) => read_file(booted.cwd(), &read).await,
+                        Err(outcome) => outcome,
                     };
                     server.respond(id, outcome).await?;
                 }
 
                 Call::Write(write) => {
                     let outcome = match session.booted() {
-                        Ok(_) => write_file(&write).await,
-                        Err(e) => boot_failed(e),
+                        Ok(booted) => write_file(booted.cwd(), &write).await,
+                        Err(outcome) => outcome,
                     };
                     server.respond(id, outcome).await?;
                 }
@@ -229,44 +244,187 @@ struct Session {
     config: Init,
 
     /// `None` until something boots it: a `start`, or the first call that needs one.
-    linked: Option<BinDir>,
+    booted: Option<Booted>,
+}
+
+/// What a boot produced. Built together, released together.
+struct Booted {
+    /// Released before `scratch`, whose removal would otherwise block on a live mount.
+    ///
+    /// Field order is the backstop — `Drop` runs fields in declaration order — but
+    /// [`Session::release`] does it explicitly, being the only path that *can* report a
+    /// failure. `FuseTMount::unmount` has no fallible step, so the log below fires on a `fuse`
+    /// build and never on a `fuse-t` one.
+    #[cfg(any(feature = "fuse", feature = "fuse-t"))]
+    mount: Option<cortex::volume::HostMount>,
+
+    scratch: SessionScratch,
+}
+
+impl Booted {
+    /// Where an execution runs, and where a file call resolves its path.
+    ///
+    /// The mount point when there is one, and otherwise whatever this process inherited —
+    /// which is what a session with no declared namespace gets, exactly as before.
+    fn cwd(&self) -> Option<&Path> {
+        #[cfg(any(feature = "fuse", feature = "fuse-t"))]
+        return self.mount.as_ref().map(|m| m.mountpoint());
+        #[cfg(not(any(feature = "fuse", feature = "fuse-t")))]
+        return None;
+    }
 }
 
 impl Session {
     /// Take a new shape, and let go of anything booted under the old one.
     ///
     /// The delegated names are built into the directory, so a boot from before this is a
-    /// boot that no longer matches the session. Dropping it is enough — the next call
+    /// boot that no longer matches the session. Releasing it is enough — the next call
     /// that needs one builds it again, from what has just arrived.
+    ///
+    /// Through [`release`](Self::release) rather than nulling the field: what a boot has
+    /// to give back grows, and a re-`init` while a session is live has exactly as much
+    /// reason to go through the one ordered teardown as a `stop` does.
     fn configure(&mut self, config: Init) {
-        self.linked = None;
+        self.release();
         self.config = config;
     }
 
+    /// Give back what booting took, mount first.
+    ///
+    /// Not left to field drop order: removing the scratch directory **blocks** on a live
+    /// mount, and [`HostMount::unmount`](cortex::volume::HostMount) is the one path that
+    /// can report a failure — `Drop` swallows it, because a `Drop` that panics mid-unwind
+    /// aborts the process.
+    ///
+    /// # This can hang, and one of its callers is a call somebody is waiting on
+    ///
+    /// `unmount` joins the serving thread and that join has no timeout. Measured on a mac:
+    /// five `FuseTMount`s torn down at once left one in uninterruptible sleep for 145
+    /// seconds, out of reach of `kill`, until it was unmounted from outside by hand.
+    ///
+    /// Not reachable as things stand — one session per process, one mount per session — and
+    /// whether the race exists *between* processes was never measured. What makes it worth
+    /// writing down is that [`configure`](Self::configure) calls this, so a re-`init` over a
+    /// wedged mount leaves a **request** unanswered where a `stop` could only cost silence.
+    ///
+    /// So: if a bounded teardown is ever needed, it belongs in `cortex`'s FUSE adapters
+    /// rather than here, and both callers would need a way to give up.
     fn release(&mut self) {
-        self.linked = None;
+        let Some(booted) = self.booted.take() else {
+            return;
+        };
+        #[cfg(any(feature = "fuse", feature = "fuse-t"))]
+        if let Some(mount) = booted.mount {
+            // Nothing is waiting on this — `stop` is a notification and `init` answers
+            // `null` — so a failure is said here and nowhere else, as a failed boot is.
+            if let Err(e) = mount.unmount() {
+                eprintln!("{}: unmounting the namespace: {e}", env!("CARGO_BIN_NAME"));
+            }
+        }
+
+        // Without a mount binding there is nothing to give back in order, so releasing is
+        // just letting go — said outright, because a binding this build does not have is
+        // not a step it skips.
+        #[cfg(not(any(feature = "fuse", feature = "fuse-t")))]
+        drop(booted);
+
+        // `scratch` drops here, with nothing mounted over it.
     }
 
-    /// The delegated names somewhere `execvp` will find them, booting if nothing has.
+    /// The session, booting if nothing has: the namespace realized, and the delegated
+    /// names somewhere `execvp` will find them.
     ///
-    /// Booting here is a directory of symlinks back to this binary, one per name. The
-    /// directory is not put on `PATH`: every execution is given its own environment (see
-    /// [`environment`]), which is what an inherited `PATH` and a `set_var` would
-    /// otherwise be for — and doing it per command rather than per process is what lets
-    /// this program have more than one thread.
-    fn booted(&mut self) -> io::Result<&BinDir> {
-        if self.linked.is_none() {
-            self.linked = Some(BinDir::create(
-                self.config.delegated.iter().map(String::as_str),
-            )?);
+    /// The directory of symlinks is not put on `PATH`: every execution is given its own
+    /// environment (see [`environment`]), which is what an inherited `PATH` and a
+    /// `set_var` would otherwise be for — and doing it per command rather than per
+    /// process is what lets this program have more than one thread.
+    fn booted(&mut self) -> Result<&Booted, Outcome> {
+        if self.booted.is_none() {
+            // Cheapest first, and nothing is installed until all of it succeeded: a
+            // failure here leaves the session unbooted, and the next call tries again —
+            // which is the shape a client already has to handle.
+            //
+            // The workspace is not kept. Mounting moves it into the mount, which is the
+            // only thing that reads it — nothing here asks a `Workspace` a question, and a
+            // second handle would be state nobody looks at. What survives realization is
+            // the mount, and where a build has none, what survives is the knowledge that
+            // the spec was one this build could make sense of.
+            let ws = Workspace::from_spec(&self.config.volumes).map_err(unsupported_volume)?;
+            let scratch = SessionScratch::create(self.config.delegated.iter().map(String::as_str))
+                .map_err(boot_failed)?;
+
+            #[cfg(any(feature = "fuse", feature = "fuse-t"))]
+            let mount = if self.config.volumes.is_empty() {
+                // Nothing to make visible, and a mount is not free. A session that
+                // declares no namespace pays for none.
+                drop(ws);
+                None
+            } else {
+                Some(cortex::volume::HostMount::spawn(ws, scratch.mnt()).map_err(mount_failed)?)
+            };
+
+            #[cfg(not(any(feature = "fuse", feature = "fuse-t")))]
+            {
+                drop(ws);
+                // A namespace was declared and there is nothing here that could show it to
+                // a command. The kinds were all fine, so this is about the build and not
+                // the spec — see `MOUNT_FAILED`.
+                if !self.config.volumes.is_empty() {
+                    return Err(refused(
+                        Error::MOUNT_FAILED,
+                        "no mount binding compiled in: this build cannot make a namespace \
+                         visible to a command",
+                    ));
+                }
+            }
+
+            self.booted = Some(Booted {
+                #[cfg(any(feature = "fuse", feature = "fuse-t"))]
+                mount,
+                scratch,
+            });
         }
-        Ok(self.linked.as_ref().expect("just booted"))
+        Ok(self.booted.as_ref().expect("just booted"))
     }
 }
 
 /// A boot that did not happen, as the answer to whatever needed one.
 fn boot_failed(e: io::Error) -> Outcome {
     refused(Error::BOOT_FAILED, format!("linking delegated names: {e}"))
+}
+
+/// The path a file call names, in the namespace an execution would resolve it in.
+///
+/// A workspace path is relative and a mount point is where it starts, so this is a join —
+/// the same one a spawned command's `current_dir` performs for it. With no mount there is
+/// no directory to join, and the path is used as it arrives, which is what this backend did
+/// before there were namespaces at all.
+///
+/// **A join, not containment.** An absolute path, or one with enough `..`, still leaves the
+/// mount. What this buys is that the two halves of the protocol name the same file, not
+/// that either half is confined.
+fn at(root: Option<&Path>, path: &str) -> PathBuf {
+    match root {
+        Some(root) => root.join(path),
+        None => PathBuf::from(path),
+    }
+}
+
+/// A namespace that could not be bound to a filesystem interface. The kinds were fine.
+#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+fn mount_failed(e: CortexError) -> Outcome {
+    refused(Error::MOUNT_FAILED, format!("mounting the namespace: {e}"))
+}
+
+/// A volume kind this build cannot realize, as the answer to whatever needed a session.
+fn unsupported_volume(e: CortexError) -> Outcome {
+    let code = match e {
+        CortexError::UnsupportedVolume(_) => Error::UNSUPPORTED_VOLUME,
+        // Anything else from `from_spec` is a spec this server cannot make sense of — a
+        // mount path that escapes the root, or two at one path.
+        _ => Error::INVALID_PARAMS,
+    };
+    refused(code, format!("realizing the namespace: {e}"))
 }
 
 /// Run one command, answering the console channel as many times as it takes.
@@ -279,7 +437,7 @@ async fn execute(
     server: &mut StdioServer,
     id: RequestId,
     exec: &Exec,
-    linked: &BinDir,
+    booted: &Booted,
     shims: &Shims,
 ) -> io::Result<()> {
     let Some((program, args)) = exec.cmd.split() else {
@@ -288,15 +446,22 @@ async fn execute(
             .await;
     };
 
-    let child = Command::new(program)
-        .args(args)
-        .envs(environment(linked, shims))
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .envs(environment(booted, shims))
         // Piped and then read by `wait_with_output`, which is what carries the output
         // back. Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+
+    // In the namespace, when there is one — which is what makes a relative path in a
+    // command mean the same thing as one in a `read`.
+    if let Some(dir) = booted.cwd() {
+        cmd.current_dir(dir);
+    }
+
+    let child = cmd.spawn();
 
     let child = match child {
         Ok(child) => child,
@@ -333,7 +498,7 @@ async fn execute(
             biased;
 
             accepted = shims.accept() => match accepted {
-                Some(stream) => match delegate(server, owed, stream).await? {
+                Some(stream) => match delegate(server, owed, stream, booted.cwd()).await? {
                     Some(next) => owed = next,
                     // The client stopped saying anything that could carry the execution on,
                     // so there is nobody left to answer. The command is left to the
@@ -363,6 +528,7 @@ async fn delegate(
     server: &mut StdioServer,
     owed: RequestId,
     stream: UnixStream,
+    root: Option<&Path>,
 ) -> io::Result<Option<RequestId>> {
     // Owned halves, because the two directions are separate fields of a `StdioServer` and
     // have to outlive the borrow the stream came in on.
@@ -384,6 +550,13 @@ async fn delegate(
             );
             return Ok(Some(owed));
         }
+    };
+
+    // Workspace-relative, or `None`. The rule is `cortex`'s and not this backend's — see
+    // `reported_cwd`, which the uvm guest agent calls for the same reason.
+    let exec = Exec {
+        cwd: cortex::executable::reported_cwd(exec.cwd.as_deref(), root),
+        ..exec
     };
 
     server
@@ -428,12 +601,12 @@ async fn delegate(
 /// Per command rather than per process. `std::env::set_var` is unsound with any other
 /// thread running and this program has one, so a `PATH` this process mutates once is a
 /// `PATH` each [`Command`] is handed instead.
-fn environment(linked: &BinDir, shims: &Shims) -> Vec<(OsString, OsString)> {
+fn environment(booted: &Booted, shims: &Shims) -> Vec<(OsString, OsString)> {
     // Appended, not prepended: these names are meant to add commands, not to quietly
     // shadow a real `git` or `python` a caller meant to run.
     let mut path = std::env::var_os("PATH").unwrap_or_default();
     path.push(":");
-    path.push(linked.bin());
+    path.push(booted.scratch.bin());
 
     vec![
         (SOCK_ENV.into(), shims.sock.clone().into_os_string()),
@@ -551,8 +724,9 @@ fn finished(output: io::Result<Output>) -> Outcome {
 /// reported as the shorter one it was — and one that shrinks is answered with however
 /// much was still there. Either way `data` is what was read and `size` is what the file
 /// measured, which is the pair a requester needs to know whether to ask again.
-async fn read_file(read: &Read) -> Outcome {
-    let path = Path::new(&read.path);
+async fn read_file(root: Option<&Path>, read: &Read) -> Outcome {
+    let path = at(root, &read.path);
+    let path = path.as_path();
 
     let size = match tokio::fs::metadata(path).await {
         Ok(meta) if meta.is_dir() => {
@@ -604,8 +778,9 @@ async fn read_file(read: &Read) -> Outcome {
 /// was not there, cut to nothing if it was. An offset means only those bytes are being
 /// spoken for, so the file is opened without truncating and whatever lies past them
 /// stays.
-async fn write_file(write: &Write) -> Outcome {
-    let path = Path::new(&write.path);
+async fn write_file(root: Option<&Path>, write: &Write) -> Outcome {
+    let path = at(root, &write.path);
+    let path = path.as_path();
 
     let file = match write.offset {
         None => tokio::fs::File::create(path).await,

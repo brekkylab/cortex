@@ -407,6 +407,7 @@ dependencies = [
  "bson",
  "cortex",
  "libc",
+ "pkg-config",
  "tempfile",
  "tokio",
 ]
