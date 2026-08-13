@@ -59,17 +59,24 @@
 //! Neither is awaited for an answer, because there is nothing a caller would do
 //! differently if one failed.
 
+use std::sync::Arc;
+
 use anyhow::Context as _;
 use futures_core::future::BoxFuture;
 use tokio::process::Command;
 
-use crate::console::base::{Client, Failure};
-use crate::console::message::{
-    Call, Error, Exec, ExecCmd, ExecResult, Init, Notification, Outcome, Progress, Read,
-    ReadResult, RequestId, Write, WriteResult,
+use crate::{
+    console::{
+        base::{Client, Failure},
+        message::{
+            Call, Error, Exec, ExecCmd, ExecResult, Init, Notification, Outcome, Progress, Read,
+            ReadResult, RequestId, Write, WriteResult,
+        },
+        stdio::StdioClient,
+    },
+    executable::{ExecCall, ExecutableSet},
+    volume::Workspace,
 };
-use crate::console::stdio::StdioClient;
-use crate::executable::{ExecCall, ExecutableSet};
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
 ///
@@ -97,6 +104,13 @@ pub struct ConsoleBuilder {
     client_factory: Option<ClientFactory>,
 
     execs: ExecutableSet,
+
+    /// `None` is a console whose delegated names have nothing to read, which is
+    /// [`Workspace::new`] — an empty namespace rather than an absent one, so
+    /// [`Executable::exec`](crate::executable::Executable::exec) always has a tree to
+    /// be handed and a name that touches no files never had to say so. Left unfilled
+    /// here so the default is the console's and not the setter's.
+    workspace: Option<Arc<Workspace>>,
 
     volumes: crate::volume::WorkspaceSpec,
 }
@@ -158,14 +172,33 @@ impl ConsoleBuilder {
         self
     }
 
+    /// The namespace this console's delegated executables are handed.
+    ///
+    /// One per console and fixed for the session, because it is what an execution's
+    /// delegated calls are resolved *against*: a name that reads a file is asked about
+    /// the tree the command that called it can see.
+    ///
+    /// [`Arc`], so the same `Workspace` can also be served somewhere else — mounted on
+    /// the host, or projected into the server the commands themselves run in — which is
+    /// the arrangement that makes a delegated name and its caller talk about the same
+    /// files. Takes a plain [`Workspace`] too, for a caller that shares it with nobody.
+    pub fn workspace(mut self, workspace: impl Into<Arc<Workspace>>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
+    }
+
     /// The namespace to announce, which the server realizes and this side does not.
     ///
-    /// The caller keeps the spec and realizes it for itself too — a delegated executable
-    /// works on the files the command was working on, so it needs its own live tree from
-    /// the same description. That is deliberately two explicit
-    /// [`Workspace::from_spec`](crate::volume::Workspace::from_spec) calls rather than one
-    /// hidden here: the caller needs its tree *before* it can register the executables
-    /// that capture it, so a builder owning the tree would have to hand it back mid-chain.
+    /// Separate from [`workspace`](Self::workspace), and deliberately not the thing this
+    /// builder realizes into one: what the far end must project and what *this* side can
+    /// read are not the same tree. A spec naming a volume kind this build has no provider
+    /// for is still a legitimate thing to announce — the server may well have it — so a
+    /// builder that realized the spec for itself would refuse sessions that work.
+    ///
+    /// Which is why a caller who wants both ends to agree about a file says so twice: the
+    /// spec here, and a tree from the same description — its own
+    /// [`Workspace::from_spec`](crate::volume::Workspace::from_spec), or the very volumes
+    /// the spec describes — to `workspace`.
     ///
     /// Leaving it out is a session with no namespace, which is still a session.
     pub fn volumes(mut self, volumes: crate::volume::WorkspaceSpec) -> Self {
@@ -234,6 +267,12 @@ pub struct Console {
     /// What a delegated name — announced to the server when this console was built —
     /// resolves to when one comes back as a [`Delegated`](Progress::Delegated).
     execs: ExecutableSet,
+
+    /// The namespace those names are resolved against, handed to each one as it runs.
+    /// Shared rather than owned: whoever also serves this tree to the commands
+    /// themselves is holding the same `Workspace`, which is what makes the two ends
+    /// agree about a file.
+    workspace: Arc<Workspace>,
 }
 
 impl Console {
@@ -261,6 +300,7 @@ impl Console {
         let ConsoleBuilder {
             client_factory,
             execs,
+            workspace,
             volumes,
         } = builder;
 
@@ -282,7 +322,11 @@ impl Console {
             })
             .await?;
 
-        Ok(Console { client, execs })
+        Ok(Console {
+            client,
+            execs,
+            workspace: workspace.unwrap_or_else(|| Arc::new(Workspace::new())),
+        })
     }
 
     /// Boot the far end now, to hide the cold start.
@@ -364,8 +408,13 @@ impl Console {
         };
 
         // Split rather than borrowed through `self`, because the chain holds the client
-        // across every step and consults the set in between.
-        let Console { client, execs, .. } = self;
+        // across every step and consults the set — and the tree it resolves against —
+        // in between.
+        let Console {
+            client,
+            execs,
+            workspace,
+        } = self;
 
         // The id of the request the *next* answer will be to, which is what carrying on
         // from a delegated call has to quote. Every step of the chain is a request of its
@@ -384,7 +433,7 @@ impl Console {
                     let carry_on = Exec {
                         cmd: ExecCmd::Resume {
                             id,
-                            outcome: answer(execs, delegated).await,
+                            outcome: answer(execs, workspace, delegated).await,
                         },
                         // The execution this belongs to is already running under its own,
                         // and this is not a second execution to bound.
@@ -506,7 +555,7 @@ impl Drop for Console {
 
 /// What one delegated call comes to: the outcome of the [`ExecCmd::Resume`] that carries
 /// it back.
-async fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
+async fn answer(execs: &ExecutableSet, workspace: &Workspace, exec: Exec) -> Outcome {
     let Some((name, args)) = exec.cmd.split() else {
         return refused(Error::INVALID_PARAMS, "an empty command");
     };
@@ -522,7 +571,7 @@ async fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
     // `None` is the allowlist boundary. Nothing honest reaches it — the only names the
     // server was given are the ones in this set — so this is a server asking for
     // something it was never told about.
-    let Some(result) = execs.invoke(&call).await else {
+    let Some(result) = execs.invoke(&call, workspace).await else {
         return refused(
             Error::NOT_EXECUTABLE,
             format!("{}: not a delegated executable", call.name),
@@ -556,8 +605,11 @@ mod tests {
     use futures_core::future::BoxFuture;
 
     use super::*;
-    use crate::console::message::{Call, Method, Notification};
-    use crate::executable::{ExecResult as ExecOutput, Executable};
+    use crate::{
+        console::message::{Call, Method, Notification},
+        executable::{ExecResult as ExecOutput, Executable},
+        volume::{FileExt, InMemVolume, Mountable, OpenOptions},
+    };
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.
     ///
@@ -667,7 +719,11 @@ mod tests {
     struct Greeter;
 
     impl Executable for Greeter {
-        fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+        fn exec<'a>(
+            &'a self,
+            call: &'a ExecCall,
+            _workspace: &'a Workspace,
+        ) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move { ExecOutput::ok(format!("hello {}\n", call.args.join(" "))) })
         }
     }
@@ -677,7 +733,11 @@ mod tests {
     struct Where;
 
     impl Executable for Where {
-        fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+        fn exec<'a>(
+            &'a self,
+            call: &'a ExecCall,
+            _workspace: &'a Workspace,
+        ) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move {
                 match call.resolve(&call.args[0]) {
                     Ok(path) => ExecOutput::ok(path.to_string_lossy().into_owned()),
@@ -931,6 +991,70 @@ mod tests {
         let (id, outcome) = resumed(&log, 3);
         assert_eq!(id, 2);
         assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
+    }
+
+    /// A delegated name is handed the console's own workspace, so what it reads is what
+    /// the session projects rather than whatever the host process happens to have.
+    #[tokio::test]
+    async fn a_delegated_call_reads_the_consoles_workspace() {
+        /// Answers with the contents of the file it was asked for.
+        struct Cat;
+
+        impl Executable for Cat {
+            fn exec<'a>(
+                &'a self,
+                call: &'a ExecCall,
+                workspace: &'a Workspace,
+            ) -> BoxFuture<'a, ExecOutput> {
+                Box::pin(async move {
+                    let path = std::path::Path::new(&call.args[0]);
+                    let (file, stat) = match workspace.open(path, OpenOptions::read_only()).await {
+                        Ok(opened) => opened,
+                        Err(e) => return ExecOutput::failed(1, e.to_string()),
+                    };
+                    let mut bytes = vec![0; stat.size as usize];
+                    match file.read_exact_at(&mut bytes, 0).await {
+                        Ok(()) => ExecOutput::ok(bytes),
+                        Err(e) => ExecOutput::failed(1, e.to_string()),
+                    }
+                })
+            }
+        }
+
+        let volume = InMemVolume::new();
+        let (file, _) = volume
+            .open(std::path::Path::new("note.txt"), OpenOptions::create_new())
+            .await
+            .unwrap();
+        file.write_all_at(b"from the workspace\n", 0).await.unwrap();
+
+        let (client, log) = recorder(vec![
+            null(),
+            delegated(&["cat", "note.txt"]),
+            ran(b"done\n"),
+        ]);
+        let mut console = Console::builder()
+            .client(client)
+            .executables(ExecutableSet::new().register("cat", Cat))
+            .workspace(Workspace::new().try_with_mount("", volume).unwrap())
+            .build()
+            .await
+            .unwrap();
+
+        console
+            .exec(["sh", "-c", "cat note.txt"], None)
+            .await
+            .unwrap();
+
+        let Call::Exec(Exec {
+            cmd: ExecCmd::Resume { outcome, .. },
+            ..
+        }) = log.call(2)
+        else {
+            panic!("{:?} is not an exec carrying on from anything", log.call(2));
+        };
+        let result: ExecResult = outcome.take().unwrap();
+        assert_eq!(result.stdout, b"from the workspace\n");
     }
 
     /// The one line that copies `exec.cwd` onto the `ExecCall` has no other coverage: every

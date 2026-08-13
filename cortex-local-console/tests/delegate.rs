@@ -16,6 +16,7 @@ use cortex::BoxFuture;
 use cortex::console::stdio::StdioClient;
 use cortex::console::{Console, ExecResult};
 use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
+use cortex::volume::Workspace;
 use tokio::process::Command;
 
 /// An executable with a canned answer — enough to tell a round trip from a coincidence.
@@ -26,7 +27,11 @@ struct Fixed {
 }
 
 impl Executable for Fixed {
-    fn exec<'a>(&'a self, _call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+    fn exec<'a>(
+        &'a self,
+        _call: &'a ExecCall,
+        _workspace: &'a Workspace,
+    ) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move {
             ExecOutput {
                 stdout: self.stdout.to_vec(),
@@ -42,7 +47,11 @@ impl Executable for Fixed {
 struct Report;
 
 impl Executable for Report {
-    fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        _workspace: &'a Workspace,
+    ) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move { ExecOutput::ok(format!("{}|{}\n", call.name, call.args.join(","))) })
     }
 }
@@ -56,7 +65,11 @@ const SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
 struct Slow;
 
 impl Executable for Slow {
-    fn exec<'a>(&'a self, _call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+    fn exec<'a>(
+        &'a self,
+        _call: &'a ExecCall,
+        _workspace: &'a Workspace,
+    ) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move {
             tokio::time::sleep(SLEEP).await;
             ExecOutput::ok("slept\n")

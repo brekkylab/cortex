@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::executable::{ExecCall, ExecResult, Executable};
+use crate::{
+    executable::{ExecCall, ExecResult, Executable},
+    volume::Workspace,
+};
 
 /// A named set of [`Executable`]s — the allowlist one console server offers.
 ///
@@ -33,8 +36,13 @@ impl ExecutableSet {
         self.execs.keys().map(String::as_str)
     }
 
-    /// Run the executable `call` names, or `None` if nothing is registered under
-    /// it.
+    /// Run the executable `call` names against `workspace`, or `None` if nothing is
+    /// registered under it.
+    ///
+    /// `workspace` is the namespace the execution that made this call is running in,
+    /// and it is passed through rather than held: a set is a name table, and the same
+    /// one is registered on consoles that project different trees (see
+    /// [`Executable::exec`]).
     ///
     /// `None` is the allowlist boundary. A server that only ever exposes the
     /// names in this set should not reach it — but the name usually arrives
@@ -43,8 +51,8 @@ impl ExecutableSet {
     /// Whether the name was registered is settled before anything is awaited, and the
     /// lookup itself is a map read — so a caller that only wants to know whether a name
     /// is one of ours pays nothing for the waiting it did not ask for.
-    pub async fn invoke(&self, call: &ExecCall) -> Option<ExecResult> {
+    pub async fn invoke(&self, call: &ExecCall, workspace: &Workspace) -> Option<ExecResult> {
         let exec = self.execs.get(&call.name)?;
-        Some(exec.exec(call).await)
+        Some(exec.exec(call, workspace).await)
     }
 }

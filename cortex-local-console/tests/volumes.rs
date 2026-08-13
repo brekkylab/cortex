@@ -380,11 +380,16 @@ async fn a_delegated_call_resolves_the_file_the_command_would_have() {
     // `tests/delegate.rs` reaches it the same way.
     use cortex::BoxFuture;
     use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
+    use cortex::volume::Workspace;
 
     /// Reports what it resolved, against the same spec the server was given.
     struct Where;
     impl Executable for Where {
-        fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+        fn exec<'a>(
+            &'a self,
+            call: &'a ExecCall,
+            _workspace: &'a Workspace,
+        ) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move {
                 match call.resolve(&call.args[0]) {
                     Ok(p) => ExecOutput::ok(p.to_string_lossy().into_owned()),
@@ -439,23 +444,26 @@ async fn a_delegated_call_resolves_the_file_the_command_would_have() {
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
 #[tokio::test]
 async fn one_name_is_one_file_to_a_command_a_read_and_a_delegated_call() {
-    use std::sync::Arc;
-
     use cortex::BoxFuture;
     use cortex::executable::{ExecCall, ExecResult, Executable, ExecutableSet};
     use cortex::volume::{Mountable as _, OpenOptions, Workspace};
 
-    /// Resolves the caller's argument and **opens** it, through a tree this process built.
-    struct Reader(Arc<Workspace>);
+    /// Resolves the caller's argument and **opens** it, through the tree it was handed —
+    /// the console's, which this process built from the spec the server was sent.
+    struct Reader;
 
     impl Executable for Reader {
-        fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecResult> {
+        fn exec<'a>(
+            &'a self,
+            call: &'a ExecCall,
+            workspace: &'a Workspace,
+        ) -> BoxFuture<'a, ExecResult> {
             Box::pin(async move {
                 let path = match call.resolve(&call.args[0]) {
                     Ok(path) => path,
                     Err(e) => return ExecResult::failed(1, format!("resolve: {e}")),
                 };
-                let (handle, stat) = match self.0.open(&path, OpenOptions::read_only()).await {
+                let (handle, stat) = match workspace.open(&path, OpenOptions::read_only()).await {
                     Ok(open) => open,
                     Err(e) => return ExecResult::failed(1, format!("open {path:?}: {e}")),
                 };
@@ -485,12 +493,13 @@ async fn one_name_is_one_file_to_a_command_a_read_and_a_delegated_call() {
         },
     );
     // Two `from_spec` calls, one description: the server's happens when it boots.
-    let mine = Arc::new(Workspace::from_spec(&spec).expect("the client realizes it too"));
+    let mine = Workspace::from_spec(&spec).expect("the client realizes it too");
 
     let mut console = Console::builder()
         .client(server())
         .volumes(spec)
-        .executables(ExecutableSet::new().register("readit", Reader(mine)))
+        .workspace(mine)
+        .executables(ExecutableSet::new().register("readit", Reader))
         .build()
         .await
         .unwrap();
@@ -516,6 +525,9 @@ async fn one_name_is_one_file_to_a_command_a_read_and_a_delegated_call() {
 
     assert_eq!(by_command.stdout, b"the same bytes\n", "the command");
     assert_eq!(by_read.data, b"the same bytes\n", "the protocol's own read");
-    assert_eq!(resolved, "work/report.md", "what the executable resolved to");
+    assert_eq!(
+        resolved, "work/report.md",
+        "what the executable resolved to"
+    );
     assert_eq!(content, "the same bytes\n", "what the executable read");
 }
