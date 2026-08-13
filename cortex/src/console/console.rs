@@ -97,6 +97,8 @@ pub struct ConsoleBuilder {
     client_factory: Option<ClientFactory>,
 
     execs: ExecutableSet,
+
+    volumes: crate::volume::WorkspaceSpec,
 }
 
 impl ConsoleBuilder {
@@ -153,6 +155,21 @@ impl ConsoleBuilder {
     /// client with nothing to delegate, which is still a client.
     pub fn executables(mut self, execs: ExecutableSet) -> Self {
         self.execs = execs;
+        self
+    }
+
+    /// The namespace to announce, which the server realizes and this side does not.
+    ///
+    /// The caller keeps the spec and realizes it for itself too — a delegated executable
+    /// works on the files the command was working on, so it needs its own live tree from
+    /// the same description. That is deliberately two explicit
+    /// [`Workspace::from_spec`](crate::volume::Workspace::from_spec) calls rather than one
+    /// hidden here: the caller needs its tree *before* it can register the executables
+    /// that capture it, so a builder owning the tree would have to hand it back mid-chain.
+    ///
+    /// Leaving it out is a session with no namespace, which is still a session.
+    pub fn volumes(mut self, volumes: crate::volume::WorkspaceSpec) -> Self {
+        self.volumes = volumes;
         self
     }
 
@@ -244,7 +261,15 @@ impl Console {
         let ConsoleBuilder {
             client_factory,
             execs,
+            volumes,
         } = builder;
+
+        // Before a server is started, not after: a spec that cannot be written down is the
+        // caller's to fix, and starting a process to tell them so costs a process and buries
+        // the reason under whatever the channel says when it is dropped.
+        volumes
+            .check()
+            .context("the declared namespace cannot be put on the wire")?;
 
         let client_factory =
             client_factory.context("a console needs a client to drive its server")?;
@@ -253,6 +278,7 @@ impl Console {
         client
             .init(Init {
                 delegated: execs.names().map(str::to_string).collect(),
+                volumes,
             })
             .await?;
 
@@ -331,6 +357,10 @@ impl Console {
             // A command a caller asked for, so it carries on from nothing.
             cmd: ExecCmd::New(cmd.into_iter().map(|s| s.as_ref().to_string()).collect()),
             timeout_ms,
+            // A caller asking for a command names no directory: where an execution runs is
+            // the server's, decided by the namespace it mounted. The field reports where
+            // one *did* run, which only the end that ran it can say.
+            cwd: None,
         };
 
         // Split rather than borrowed through `self`, because the chain holds the client
@@ -359,6 +389,8 @@ impl Console {
                         // The execution this belongs to is already running under its own,
                         // and this is not a second execution to bound.
                         timeout_ms: None,
+                        // Nor a command to be run anywhere: this carries an answer back.
+                        cwd: None,
                     };
 
                     let (next, answered) = client.exec(carry_on).await;
@@ -482,6 +514,9 @@ async fn answer(execs: &ExecutableSet, exec: Exec) -> Outcome {
     let call = ExecCall {
         name: name.clone(),
         args: args.to_vec(),
+        // Where the command that invoked this stood, as the server reported it —
+        // workspace-relative, so it means the same thing against this side's own tree.
+        cwd: exec.cwd.clone(),
     };
 
     // `None` is the allowlist boundary. Nothing honest reaches it — the only names the
@@ -620,11 +655,35 @@ mod tests {
         }))
     }
 
+    /// An execution pausing on a delegated name, invoked in `cwd`.
+    fn delegated_in(cmd: &[&str], cwd: &str) -> Outcome {
+        progress(Progress::Delegated(Exec {
+            cmd: ExecCmd::New(cmd.iter().map(|s| s.to_string()).collect()),
+            cwd: Some(cwd.to_string()),
+            ..Exec::default()
+        }))
+    }
+
     struct Greeter;
 
     impl Executable for Greeter {
         fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move { ExecOutput::ok(format!("hello {}\n", call.args.join(" "))) })
+        }
+    }
+
+    /// Reports what it was told about where it ran, so a test can see whether anything
+    /// arrived — and, since it resolves an argument, whether the directory is usable.
+    struct Where;
+
+    impl Executable for Where {
+        fn exec<'a>(&'a self, call: &'a ExecCall) -> BoxFuture<'a, ExecOutput> {
+            Box::pin(async move {
+                match call.resolve(&call.args[0]) {
+                    Ok(path) => ExecOutput::ok(path.to_string_lossy().into_owned()),
+                    Err(e) => ExecOutput::failed(1, format!("{e}")),
+                }
+            })
         }
     }
 
@@ -635,6 +694,36 @@ mod tests {
             panic!("a console with nothing to ask should not build");
         };
         assert!(failure.to_string().contains("needs a client"), "{failure}");
+    }
+
+    /// A namespace that cannot be written down is refused before a server is started, so the
+    /// reason reaches the caller rather than a dropped channel's.
+    ///
+    /// The client here would answer an `init`; it is never asked, which is the assertion —
+    /// `recorder`'s log stays empty and the caller is told what is wrong with its own spec.
+    #[tokio::test]
+    async fn a_namespace_the_wire_cannot_carry_is_refused_before_anything_starts() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe"));
+        let (client, log) = recorder(vec![null()]);
+        let Err(failure) = Console::builder()
+            .client(client)
+            .volumes(
+                crate::volume::WorkspaceSpec::default()
+                    .mount("work", crate::volume::VolumeSpec::Local { host }),
+            )
+            .build()
+            .await
+        else {
+            panic!("a namespace BSON cannot carry should not build");
+        };
+
+        assert!(
+            failure.to_string().contains("cannot be put on the wire"),
+            "{failure}"
+        );
+        assert_eq!(log.methods(), [], "nothing should have been asked");
     }
 
     /// Every way building can fail says which one it was, and all of them are here rather
@@ -743,6 +832,32 @@ mod tests {
         assert_eq!(log.methods(), [Method::Init]);
     }
 
+    /// The namespace a caller declared is what the server hears, on the one call that
+    /// describes a session. The caller keeps the spec and realizes it for itself too —
+    /// that second tree is what a delegated executable works against.
+    #[tokio::test]
+    async fn the_builder_announces_the_namespace_it_was_given() {
+        let spec = crate::volume::WorkspaceSpec::default().mount(
+            "work",
+            crate::volume::VolumeSpec::Local {
+                host: "/tmp/p".into(),
+            },
+        );
+
+        let (client, log) = recorder(vec![null()]);
+        let _console = Console::builder()
+            .client(client)
+            .volumes(spec.clone())
+            .build()
+            .await
+            .unwrap();
+
+        match log.call(0) {
+            Call::Init(init) => assert_eq!(init.volumes, spec),
+            other => panic!("call 0 should be the init, got {other:?}"),
+        }
+    }
+
     /// A console that was never started is ended the same way, because what `quit` is for
     /// is the server going away and a server exists whether or not it was ever booted.
     #[tokio::test]
@@ -816,5 +931,71 @@ mod tests {
         let (id, outcome) = resumed(&log, 3);
         assert_eq!(id, 2);
         assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
+    }
+
+    /// The one line that copies `exec.cwd` onto the `ExecCall` has no other coverage: every
+    /// other test here builds a delegated `Exec` from `Exec::default()`, so `cwd` is `None`
+    /// and `Greeter` reads only `args`. Without this, reverting that assignment leaves the
+    /// whole suite green.
+    #[tokio::test]
+    async fn a_delegated_call_receives_the_directory_it_ran_in() {
+        let (client, log) = recorder(vec![
+            null(),
+            delegated_in(&["where", "report.md"], "docs/sub"),
+            ran(b"done\n"),
+        ]);
+        let mut console = Console::builder()
+            .client(client)
+            .executables(ExecutableSet::new().register("where", Where))
+            .build()
+            .await
+            .unwrap();
+
+        console.exec(["sh"], None).await.unwrap();
+
+        // The executable resolved its argument against the directory the server reported,
+        // which is only possible if the field crossed onto the call.
+        let Call::Exec(Exec {
+            cmd: ExecCmd::Resume { outcome, .. },
+            ..
+        }) = log.call(2)
+        else {
+            panic!("{:?} is not an exec carrying on from anything", log.call(2));
+        };
+        let result: ExecResult = outcome.take().unwrap();
+        assert_eq!(result.stdout, b"docs/sub/report.md");
+    }
+
+    /// And when nothing said where it ran, the executable is told so rather than handed a
+    /// root that would name a different file.
+    #[tokio::test]
+    async fn a_delegated_call_with_no_directory_says_so() {
+        let (client, log) = recorder(vec![
+            null(),
+            delegated(&["where", "report.md"]),
+            ran(b"done\n"),
+        ]);
+        let mut console = Console::builder()
+            .client(client)
+            .executables(ExecutableSet::new().register("where", Where))
+            .build()
+            .await
+            .unwrap();
+
+        console.exec(["sh"], None).await.unwrap();
+
+        let Call::Exec(Exec {
+            cmd: ExecCmd::Resume { outcome, .. },
+            ..
+        }) = log.call(2)
+        else {
+            panic!("{:?} is not an exec carrying on from anything", log.call(2));
+        };
+        let result: ExecResult = outcome.take().unwrap();
+        assert_eq!(
+            result.code, 1,
+            "a relative path with no directory is refused"
+        );
+        assert!(result.stdout.is_empty());
     }
 }

@@ -3,6 +3,14 @@ name = "cortex-local-console"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Mount a declared namespace where commands can see it. Without either, a session that
+# declares volumes is answered MOUNT_FAILED — a console that only delegates needs neither,
+# and neither is cheap (see cortex's own [features] for what each binding costs).
+fuse = ["cortex/fuse"]
+fuse-t = ["cortex/fuse-t"]
+
 [dependencies]
 anyhow = { workspace = true }
 bson = { workspace = true }
@@ -18,6 +26,11 @@ tokio = { workspace = true, features = [
     "process",
     "rt-multi-thread",
 ] }
+
+[build-dependencies]
+# Only to learn where `libfuse-t.dylib` lives, so the binary can carry an rpath to it.
+# See `build.rs` for why nothing else can supply that.
+pkg-config = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

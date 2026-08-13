@@ -70,6 +70,10 @@ fn to_errno(err: CortexError) -> std::io::Error {
         CortexError::ReadOnly => LINUX_EROFS,
         CortexError::CrossDevice => LINUX_EXDEV,
         CortexError::Unsupported => LINUX_ENOSYS,
+        // Unreachable: a mounted workspace is one whose volumes were all realized, so no
+        // request the guest makes can produce this. Classified rather than left to the
+        // catch-all so that adding a variant stays a compile error here.
+        CortexError::UnsupportedVolume(_) => LINUX_EIO,
         // The host's own errno cannot be forwarded: the guest would read the
         // number as something else entirely. Anything not classified above
         // therefore degrades to EIO, which is why the classification matters.

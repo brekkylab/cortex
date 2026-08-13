@@ -15,6 +15,18 @@ fn main() {
         .probe("fuse-t")
         .expect("the `fuse-t` feature needs FUSE-T installed: brew install --cask fuse-t");
 
+    // `libfuse-t.dylib`'s install name is `@rpath/libfuse-t.dylib`, so a linking binary needs
+    // an `LC_RPATH`. `fuse-t.pc` asks for one in its `Libs:`, but `pkg_config::probe` forwards
+    // only `-L` and `-l`.
+    //
+    // Without it the binary loads only when `DYLD_FALLBACK_LIBRARY_PATH` is set, which is not
+    // something to rely on: macOS strips every `DYLD_*` when it execs a system binary, so a
+    // command run through `/bin/sh` — how a console runs anything — loses it. Measured with
+    // the variable exported, `sh -c 'echo "[$DYLD_…]"'` prints `[]`.
+    for path in &fuse_t.link_paths {
+        println!("cargo::rustc-link-arg=-Wl,-rpath,{}", path.display());
+    }
+
     let mut build = cc::Build::new();
     build
         .file("contrib/fuse_t/shim.c")

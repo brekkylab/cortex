@@ -57,15 +57,20 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # a heavy dependency: enabling any by default charges every consumer for it. A
 # consumer that mounts over HTTP has no reason to compile a hypervisor.
 #
-# Measured with
+# Count them with
 #
-#   cargo tree --features <f> -e normal --prefix none | grep -v '^cortex' \
-#       | sed 's/ (\*)$//' | sort -u | wc -l
+#   cargo tree -p cortex --features <f> -e normal --prefix none | grep -v '^cortex' \
+#       | sed 's/ (\*)$//' | sort -u | grep -c .
 #
-# (normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
-# counted): `fuse-t` adds 1, `fuse` 33, `krun` 65, `s3` 126 — `krun` being the
-# whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP and TLS stack
-# under `object_store`.
+# `grep -c .` and not `wc -l`, which also counts the blank line `cargo tree` puts
+# between workspace members and `sort -u` collapses to one. `-p cortex` matters
+# too: without it the answer is the whole workspace's. Normal edges only, so the
+# unconditional build-deps `cc`/`pkg-config` are not counted.
+#
+# The numbers themselves are deliberately not written down: they go stale on every
+# dependency bump, and the conclusion does not depend on what they are — `krun`
+# brings the whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP
+# and TLS stack under `object_store`, whatever this month's count is.
 #
 # Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
 # because a binding's tests only exist when its feature is on. No default set fixes

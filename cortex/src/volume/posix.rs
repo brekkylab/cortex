@@ -147,6 +147,10 @@ pub(super) fn host_errno(err: &CortexError) -> i32 {
         CortexError::ReadOnly => libc::EROFS,
         CortexError::CrossDevice => libc::EXDEV,
         CortexError::Unsupported => libc::ENOSYS,
+        // Unreachable: a mounted workspace is one whose volumes were all realized, so no
+        // request reaching this binding can produce it. Classified rather than left to the
+        // catch-all so that adding a variant stays a compile error here.
+        CortexError::UnsupportedVolume(_) => libc::EIO,
         CortexError::Io(err) => err.raw_os_error().unwrap_or(libc::EIO),
     }
 }

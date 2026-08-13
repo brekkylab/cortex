@@ -65,6 +65,15 @@ async fn forward(tool: &str) -> anyhow::Result<i32> {
             id: CALL_ID,
             call: Call::Exec(Exec {
                 cmd: ExecCmd::New(cmd),
+                // Absolute, in this host's filesystem; the server strips the prefix it
+                // mounted at, since only the server knows what that was.
+                //
+                // `to_str` and not `to_string_lossy`, and this is the last place the bytes
+                // exist: lossy would substitute U+FFFD and hand on a `String` that looks
+                // valid and names something else, which nothing downstream could detect.
+                cwd: std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(str::to_owned)),
                 ..Exec::default()
             }),
         },

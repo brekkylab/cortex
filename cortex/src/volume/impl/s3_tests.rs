@@ -185,6 +185,7 @@ fn label(err: &CortexError) -> &'static str {
         CortexError::NotEmpty => "NotEmpty",
         CortexError::InvalidName => "InvalidName",
         CortexError::InvalidArgument => "InvalidArgument",
+        CortexError::UnsupportedVolume(_) => "UnsupportedVolume",
         CortexError::FileTooLarge => "FileTooLarge",
         CortexError::BadHandle => "BadHandle",
         CortexError::PermissionDenied => "PermissionDenied",

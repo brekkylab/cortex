@@ -1,4 +1,4 @@
-//! The four things a boot needs on disk, and where each one comes from.
+//! The five things a boot needs on disk, and where each one comes from.
 //!
 //! | | lifetime | cost |
 //! |---|---|---|
@@ -6,12 +6,14 @@
 //! | the base image (EROFS) | cached, shared | built once per rootfs, from a tarball |
 //! | the session image (ext4) | one session | formatted per boot, sparse |
 //! | the boot root | one session | a directory with one file in it |
+//! | the spec file (BSON) | one session, or less | a few kilobytes, `0600`, unlinked on sight |
 //!
 //! The split down the middle of that table is the point. Two of them are shared and
-//! expensive and live under [`home`]; two are this session's, live in a temp directory,
+//! expensive and live under [`home`]; three are this session's, live in a temp directory,
 //! and are deleted when the value holding them drops. Nothing a session writes can reach
 //! anything another session reads — which is the whole reason the guest boots onto an
-//! overlay instead of onto a writable directory.
+//! overlay instead of onto a writable directory, and the reason the spec file is here
+//! rather than anywhere the guest can see.
 //!
 //! # The base image, and what is deliberately not here
 //!
@@ -186,6 +188,56 @@ fn format(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// This session's namespace, written where the boot child can read it.
+///
+/// Owns the file: dropping this unlinks it. The boot child unlinks it too, as soon as it
+/// has read it — a spec on disk is credentials on disk, and the child is the last reader.
+/// Both removals are best-effort for that reason; the first one to succeed is the one that
+/// mattered.
+///
+/// Deliberately **not** under [`BootRoot`], which libkrun serves to the guest as its root
+/// filesystem: that would put the credentials on the far side of the boundary the VM is
+/// here to be.
+pub struct SpecFile {
+    path: PathBuf,
+}
+
+impl SpecFile {
+    pub fn create(spec: &cortex::volume::WorkspaceSpec) -> anyhow::Result<SpecFile> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = unique(std::env::temp_dir(), "spec.bson");
+        let encoded = bson::serialize_to_vec(spec)
+            .map_err(|e| anyhow::anyhow!("encoding the namespace: {e}"))?;
+
+        // 0600 at creation and not afterwards: a `set_permissions` later leaves a window in
+        // which the file exists and is readable, which is the whole thing being avoided.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| anyhow::anyhow!("creating {}: {e}", path.display()))?;
+        file.write_all(&encoded)
+            .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+
+        Ok(SpecFile { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for SpecFile {
+    fn drop(&mut self) {
+        // Gone already is the expected case, not a failure: the boot child unlinks it the
+        // moment it has read it.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// The directory libkrun serves as the guest's virtio-fs root, holding the guest binary
 /// and nothing else.
 ///
@@ -243,8 +295,20 @@ pub fn unique(dir: PathBuf, what: &str) -> PathBuf {
 ///
 /// Every value in this module removes its own file when it drops, which covers a session
 /// ending any way that runs a destructor — a `stop`, a `quit`, a process exiting on its own.
-/// What it cannot cover is `SIGKILL`, and the cost of that case here is not a stray
-/// directory: it is a sparse image that may hold everything a session wrote.
+/// What it cannot cover is `SIGKILL`, and two things are lost by it, not one: a sparse image
+/// that may hold everything a session wrote, and a [`SpecFile`] that may hold credentials.
+///
+/// The second is the sharper one, and this sweep is the only thing that ever removes it in
+/// that case. The boot child normally unlinks the spec the moment it has read it, so the
+/// exposure needs the child to have not got that far — a machine that lost power between the
+/// write and the read, a child that never started. Then the file stays until some later
+/// `cortex-uvm-console` starts on the same host and runs this. If none ever does, it stays.
+///
+/// Making that window disappear rather than sweeping it means never giving the file a name
+/// the filesystem keeps: create it, unlink it, and hand the child the descriptor. That is
+/// the fix to reach for before a spec on this backend is ever allowed to carry a real
+/// secret — which it cannot today, since this crate pins `cortex` to `krun` and has no way
+/// to forward `s3` or `notion`.
 ///
 /// So the pid in the name is what a later run reads. `kill(pid, 0)` sends no signal and only
 /// reports whether the pid can be signalled: `ESRCH` — no such process — is the one answer
@@ -416,4 +480,58 @@ async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
 
     std::fs::rename(&tmp, image)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cortex::volume::{VolumeSpec, WorkspaceSpec};
+
+    /// The file a boot child reads: readable by nobody else, and gone when the session is.
+    #[test]
+    fn a_spec_file_is_private_and_owns_its_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let spec = WorkspaceSpec::default().mount(
+            "work",
+            VolumeSpec::Local {
+                host: "/tmp/somewhere".into(),
+            },
+        );
+
+        let path = {
+            let file = SpecFile::create(&spec).expect("writes");
+            let path = file.path().to_path_buf();
+
+            // 0600, because the whole reason this is a file and not an environment
+            // variable is that a file's reach can be stated.
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "mode was {:o}", mode & 0o777);
+
+            // And it round-trips: what the boot child will read is what was declared.
+            let read: WorkspaceSpec =
+                bson::deserialize_from_slice(&std::fs::read(&path).unwrap()).expect("parses");
+            assert_eq!(read, spec);
+
+            // Named so `sweep_abandoned` can tell whose it is.
+            let name = path.file_name().unwrap().to_str().unwrap();
+            assert!(
+                name.starts_with(&format!("{PREFIX}{}-", std::process::id())),
+                "{name} carries no pid a later run could read"
+            );
+
+            path
+        };
+
+        assert!(!path.exists(), "dropping the guard left the spec on disk");
+    }
+
+    /// A boot child that read the file may unlink it, and the guard must survive that —
+    /// two removals of one path is the normal case, not an error.
+    #[test]
+    fn a_spec_file_already_unlinked_drops_quietly() {
+        let file = SpecFile::create(&WorkspaceSpec::default()).expect("writes");
+        std::fs::remove_file(file.path()).expect("the child's unlink");
+        drop(file);
+    }
 }

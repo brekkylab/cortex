@@ -92,9 +92,12 @@ pub async fn run() -> anyhow::Result<()> {
             // Booting early rather than under whichever call would have paid for it.
             // Nothing answers this, so a failure is only said here — the next call that
             // needs a guest tries again and tells whoever asked for it.
+            //
+            // Which is why this logs the message and not the `Outcome`: the code is for
+            // whoever gets answered, and that is nobody here.
             Message::Notification(Notification::Start) => {
-                if let Err(e) = session.booted().await {
-                    eprintln!("{}: booting: {e}", env!("CARGO_BIN_NAME"));
+                if let Err(Outcome::Error(e)) = session.booted().await {
+                    eprintln!("{}: booting: {}", env!("CARGO_BIN_NAME"), e.message);
                 }
             }
 
@@ -129,7 +132,9 @@ pub async fn run() -> anyhow::Result<()> {
                             )
                         }
                     },
-                    Err(e) => refused(Error::BOOT_FAILED, format!("booting a guest: {e}")),
+                    // Already an answer, and already the right one — `booted` chose the
+                    // code because only it knows which of its failures happened.
+                    Err(outcome) => outcome,
                 };
                 server.respond(id, outcome).await?;
             }
@@ -183,19 +188,67 @@ impl Session {
     /// heard one has no delegated names, so a guest that is handed back from here is one
     /// the session has already been announced to. A replay the agent refuses is a boot that
     /// failed, for the same reason — there is nothing useful to hand back.
-    async fn booted(&mut self) -> anyhow::Result<&mut Guest> {
+    ///
+    /// Returns an [`Outcome`] rather than an error, because two of the ways this fails are
+    /// things the protocol has codes for and a client can act on. See below for why they
+    /// would otherwise be lost.
+    async fn booted(&mut self) -> Result<&mut Guest, Outcome> {
         if self.guest.is_none() {
-            let mut guest = Guest::boot().await?;
+            // Realized here and thrown away, so that a bad spec is answered where an answer
+            // can still be given. The boot child realizes it again for real, and a failure
+            // there has nowhere to go — it writes to its own stderr and exits, and this end
+            // sees only a closed channel, which is `BOOT_FAILED`. That would collapse every
+            // distinction `UNSUPPORTED_VOLUME` exists to draw.
+            //
+            // The cost is a `Mountable` built and dropped: no network, and an unused HTTP
+            // client at worst. Asking more cheaply would mean a second copy of
+            // `build_mountable`'s `#[cfg]` arms.
+            drop(
+                cortex::volume::Workspace::from_spec(&self.config.volumes)
+                    .map_err(unsupported_volume)?,
+            );
+
+            let mut guest = Guest::boot(&self.config.volumes)
+                .await
+                .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
+
+            // The namespace does **not** go in the replay. The boot child realized it and the
+            // guest sees a mounted filesystem, so the agent never reads `volumes` — and a
+            // field nobody reads is not free when it carries an S3 secret or a Notion key,
+            // in the one environment this design treats as untrusted.
+            let announced = Init {
+                volumes: cortex::volume::WorkspaceSpec::default(),
+                ..self.config.clone()
+            };
             let outcome = guest
-                .relay(REPLAYED_INIT, Call::Init(self.config.clone()))
-                .await?;
+                .relay(REPLAYED_INIT, Call::Init(announced))
+                .await
+                .map_err(|e| refused(Error::BOOT_FAILED, format!("announcing the session: {e}")))?;
             if let Some(error) = outcome.error() {
-                anyhow::bail!("the guest agent refused the session: {error}");
+                return Err(refused(
+                    Error::BOOT_FAILED,
+                    format!("the guest agent refused the session: {error}"),
+                ));
             }
             self.guest = Some(guest);
         }
         Ok(self.guest.as_mut().expect("just booted"))
     }
+}
+
+/// A namespace this build cannot realize, as the answer to whatever needed a session.
+///
+/// The same mapping `cortex-local-console` applies, and deliberately the same: a client
+/// cannot tell which backend answered it, so the two must not disagree about what a spec
+/// they both refuse is called.
+fn unsupported_volume(e: cortex::CortexError) -> Outcome {
+    let code = match e {
+        cortex::CortexError::UnsupportedVolume(_) => Error::UNSUPPORTED_VOLUME,
+        // Anything else from `from_spec` is a spec this server cannot make sense of — a
+        // mount path that escapes the root, or two at one path.
+        _ => Error::INVALID_PARAMS,
+    };
+    refused(code, format!("realizing the namespace: {e}"))
 }
 
 fn refused(code: i64, message: impl Into<String>) -> Outcome {

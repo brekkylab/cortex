@@ -29,7 +29,9 @@ use std::{
 use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::volume::{Dirent, DirentKind, FileExt, FileHandle, Mountable, OpenOptions, Stat};
+use crate::volume::{
+    Dirent, DirentKind, FileExt, FileHandle, Mountable, NotionConfig, OpenOptions, Stat,
+};
 use crate::{CortexError, Result};
 
 const API: &str = "https://api.notion.com/v1";
@@ -43,19 +45,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3);
 /// How long a rendered `page.json` stays cached (a `stat`+`open` reuse it).
 const RENDER_TTL: Duration = Duration::from_secs(15);
 
-/// Connection settings for [`NotionVolume`].
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub struct NotionConfig {
-    pub api_key: String,
-}
-
-impl std::fmt::Debug for NotionConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NotionConfig")
-            .field("api_key", &"[redacted]")
-            .finish()
-    }
-}
+// `NotionConfig` lives in `volume/spec.rs`, for the reason `S3Config` does: a build
+// without this feature still parses a spec that names a Notion volume.
 
 /// A rendered `page.json`: its bytes plus the page's timestamps.
 #[derive(Clone)]
