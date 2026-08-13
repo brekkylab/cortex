@@ -119,9 +119,9 @@ impl Fixture {
             .client(client)
             .executables(
                 ExecutableSet::new()
-                    .register("report", Report)
-                    .register("rawbytes", RawBytes)
-                    .register("where", Where),
+                    .register("report", "report the call it was made with", Report)
+                    .register("rawbytes", "answer bytes that are not text", RawBytes)
+                    .register("where", "resolve an argument where the command ran", Where),
             )
             .build()
             .await
@@ -146,9 +146,9 @@ impl Fixture {
             .volumes(volumes)
             .executables(
                 ExecutableSet::new()
-                    .register("report", Report)
-                    .register("rawbytes", RawBytes)
-                    .register("where", Where),
+                    .register("report", "report the call it was made with", Report)
+                    .register("rawbytes", "answer bytes that are not text", RawBytes)
+                    .register("where", "resolve an argument where the command ran", Where),
             )
             .build()
             .await

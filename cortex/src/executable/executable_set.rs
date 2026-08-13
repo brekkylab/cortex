@@ -7,16 +7,20 @@ use crate::{
 
 /// A named set of [`Executable`]s — the allowlist one console server offers.
 ///
-/// Name -> behaviour, and nothing about how the name is reached. Surfacing the
-/// set is the server's business: the host-local one links each name into a
-/// directory it puts on `PATH`, a micro-VM one projects them into the guest.
-/// Either way the behaviour stays here, in-process, and [`invoke`] is where a
-/// call lands once the server has worked out which name was asked for.
+/// Name -> behaviour and the line describing it, and nothing about how the name
+/// is reached. Surfacing the set is the server's business: the host-local one
+/// links each name into a directory it puts on `PATH`, a micro-VM one projects
+/// them into the guest. Either way the behaviour stays here, in-process, and
+/// [`invoke`] is where a call lands once the server has worked out which name
+/// was asked for.
+///
+/// [`names`](Self::names) is what a server exposes; [`entries`](Self::entries) is
+/// what assembles an agent's list.
 ///
 /// [`invoke`]: Self::invoke
 #[derive(Default)]
 pub struct ExecutableSet {
-    execs: BTreeMap<String, Box<dyn Executable>>,
+    execs: BTreeMap<String, (String, Box<dyn Executable>)>,
 }
 
 impl ExecutableSet {
@@ -26,14 +30,36 @@ impl ExecutableSet {
     }
 
     /// Add `exec` under `name` (builder-style; last write wins).
-    pub fn register(mut self, name: &str, exec: impl Executable + 'static) -> Self {
-        self.execs.insert(name.to_string(), Box::new(exec));
+    ///
+    /// `summary` is one line for a list, not usage — usage is `<name> --help`, which the
+    /// executable answers itself. Required and undefaulted, so `""` is a decision rather
+    /// than an oversight; here rather than on [`Executable`], so one executable under two
+    /// names can describe each.
+    pub fn register(
+        mut self,
+        name: &str,
+        summary: impl Into<String>,
+        exec: impl Executable + 'static,
+    ) -> Self {
+        self.execs
+            .insert(name.to_string(), (summary.into(), Box::new(exec)));
         self
     }
 
     /// The registered names, sorted — the exact set a server should expose.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.execs.keys().map(String::as_str)
+    }
+
+    /// Every name with its summary, sorted by name — what a consumer renders into whatever
+    /// its agent reads.
+    ///
+    /// Nothing is rendered here: the shape that suits depends on the agent, and a renderer
+    /// pointing at `--help` would promise what only the implementor can keep.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.execs
+            .iter()
+            .map(|(name, (summary, _))| (name.as_str(), summary.as_str()))
     }
 
     /// Run the executable `call` names against `workspace`, or `None` if nothing is
@@ -52,7 +78,11 @@ impl ExecutableSet {
     /// lookup itself is a map read — so a caller that only wants to know whether a name
     /// is one of ours pays nothing for the waiting it did not ask for.
     pub async fn invoke(&self, call: &ExecCall, workspace: &Workspace) -> Option<ExecResult> {
-        let exec = self.execs.get(&call.name)?;
+        let (_, exec) = self.execs.get(&call.name)?;
         Some(exec.exec(call, workspace).await)
     }
 }
+
+#[cfg(test)]
+#[path = "executable_set_tests.rs"]
+mod tests;
