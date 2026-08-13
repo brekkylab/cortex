@@ -833,7 +833,7 @@ mod tests {
         let (client, log) = recorder(vec![null(), ran(b"hi\n")]);
         let mut console = Console::builder()
             .client(client)
-            .executables(ExecutableSet::new().register("foo", Greeter))
+            .executables(ExecutableSet::new().register("foo", "greet the arguments", Greeter))
             .build()
             .await
             .unwrap();
@@ -949,7 +949,7 @@ mod tests {
         ]);
         let mut console = Console::builder()
             .client(client)
-            .executables(ExecutableSet::new().register("foo", Greeter))
+            .executables(ExecutableSet::new().register("foo", "greet the arguments", Greeter))
             .build()
             .await
             .unwrap();
@@ -1035,7 +1035,11 @@ mod tests {
         ]);
         let mut console = Console::builder()
             .client(client)
-            .executables(ExecutableSet::new().register("cat", Cat))
+            .executables(ExecutableSet::new().register(
+                "cat",
+                "read a file out of the workspace it was handed",
+                Cat,
+            ))
             .workspace(Workspace::new().try_with_mount("", volume).unwrap())
             .build()
             .await
@@ -1070,7 +1074,11 @@ mod tests {
         ]);
         let mut console = Console::builder()
             .client(client)
-            .executables(ExecutableSet::new().register("where", Where))
+            .executables(ExecutableSet::new().register(
+                "where",
+                "resolve an argument where the command ran",
+                Where,
+            ))
             .build()
             .await
             .unwrap();
@@ -1101,7 +1109,11 @@ mod tests {
         ]);
         let mut console = Console::builder()
             .client(client)
-            .executables(ExecutableSet::new().register("where", Where))
+            .executables(ExecutableSet::new().register(
+                "where",
+                "resolve an argument where the command ran",
+                Where,
+            ))
             .build()
             .await
             .unwrap();

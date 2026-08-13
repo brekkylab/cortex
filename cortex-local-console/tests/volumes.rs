@@ -412,7 +412,11 @@ async fn a_delegated_call_resolves_the_file_the_command_would_have() {
     let mut console = Console::builder()
         .client(server())
         .volumes(spec)
-        .executables(ExecutableSet::new().register("where", Where))
+        .executables(ExecutableSet::new().register(
+            "where",
+            "resolve an argument where the command ran",
+            Where,
+        ))
         .build()
         .await
         .unwrap();
@@ -499,7 +503,11 @@ async fn one_name_is_one_file_to_a_command_a_read_and_a_delegated_call() {
         .client(server())
         .volumes(spec)
         .workspace(mine)
-        .executables(ExecutableSet::new().register("readit", Reader))
+        .executables(ExecutableSet::new().register(
+            "readit",
+            "read a file through the client's own tree",
+            Reader,
+        ))
         .build()
         .await
         .unwrap();

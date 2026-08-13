@@ -90,6 +90,7 @@ impl Fixture {
         let execs = ExecutableSet::new()
             .register(
                 "foo",
+                "answer `bar`",
                 Fixed {
                     stdout: b"bar\n",
                     stderr: b"",
@@ -98,6 +99,7 @@ impl Fixture {
             )
             .register(
                 "boom",
+                "run and fail with 3",
                 Fixed {
                     stdout: b"",
                     stderr: b"boom failed\n",
@@ -106,6 +108,7 @@ impl Fixture {
             )
             .register(
                 "rawbytes",
+                "answer bytes that are not text",
                 Fixed {
                     // Not utf-8, and contains a NUL: nothing may touch it.
                     stdout: &[0xff, 0xfe, 0x00, b'\n'],
@@ -113,8 +116,8 @@ impl Fixture {
                     code: 0,
                 },
             )
-            .register("report", Report)
-            .register("slow", Slow);
+            .register("report", "report the call it was made with", Report)
+            .register("slow", "wait, then answer", Slow);
 
         // A `Command` and not `stdio_client`'s argv, because this test wants the server's
         // stderr on ours to read when something fails. Only that is ours to place — the
