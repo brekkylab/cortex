@@ -214,10 +214,7 @@ fn a_host_path_bson_cannot_carry_is_refused_before_it_is_written() {
     let host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe"));
     let spec = WorkspaceSpec::default().mount("work", VolumeSpec::Local { host });
 
-    assert!(matches!(
-        spec.check(),
-        Err(crate::CortexError::InvalidName)
-    ));
+    assert!(matches!(spec.check(), Err(crate::CortexError::InvalidName)));
     // And this is what it is standing in for.
     assert!(bson::serialize_to_vec(&spec).is_err());
 }

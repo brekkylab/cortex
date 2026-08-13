@@ -525,6 +525,9 @@ async fn one_name_is_one_file_to_a_command_a_read_and_a_delegated_call() {
 
     assert_eq!(by_command.stdout, b"the same bytes\n", "the command");
     assert_eq!(by_read.data, b"the same bytes\n", "the protocol's own read");
-    assert_eq!(resolved, "work/report.md", "what the executable resolved to");
+    assert_eq!(
+        resolved, "work/report.md",
+        "what the executable resolved to"
+    );
     assert_eq!(content, "the same bytes\n", "what the executable read");
 }
