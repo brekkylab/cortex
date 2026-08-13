@@ -61,29 +61,38 @@ impl Workspace {
         }
     }
 
-    /// Build a live [`Workspace`] from a serialized [`WorkspaceSpec`]: each mount
-    /// realized via [`VolumeSpec::build_mountable`](crate::volume::VolumeSpec::build_mountable),
-    /// in the spec's order. This is how a spec carried across a process boundary
-    /// (see [`WorkspaceSpec`]) becomes an identical *namespace* on the far side.
+    /// Build a live [`Workspace`] from a serialized
+    /// [`WorkspaceSpec`](crate::volume::WorkspaceSpec), each mount realized via
+    /// [`VolumeSpec::build_mountable`](crate::volume::VolumeSpec::build_mountable).
     ///
-    /// Restores the namespace only — the instance-local `born` is not in the spec,
-    /// by design: its job is to stay fixed across *one* instance's lifetime (so a
-    /// guest's `AUTO_INVAL_DATA` cache does not churn), which a per-build timestamp
-    /// already satisfies; only the synthesized-directory timestamps differ between
-    /// two builds of the same spec, and each build is self-consistent.
+    /// The namespace only — `born` is instance-local, and it has to stay fixed across *one*
+    /// instance's lifetime so a guest's `AUTO_INVAL_DATA` cache does not churn, which a
+    /// per-build timestamp already satisfies.
     ///
-    /// A duplicate mount path is rejected with [`AlreadyExists`](CortexError::AlreadyExists),
-    /// the same as [`mount`](Self::mount) — and the check comes *before*
-    /// `build_mountable`, so a spec with a repeated path never opens a client only
-    /// to drop it.
+    /// **Every path is checked before any volume is realized.** One mount at a time, the first
+    /// failure picks the error for the whole spec, so the same set of mounts would answer
+    /// differently depending on the order it was written in — and a build without a provider
+    /// would answer [`UnsupportedVolume`](CortexError::UnsupportedVolume) where a build with
+    /// one answers [`InvalidName`](CortexError::InvalidName) for the same document. Telling
+    /// those apart is why the wire tags do not depend on the build, so the answer must not.
     pub fn from_spec(spec: &crate::volume::WorkspaceSpec) -> Result<Self> {
+        let mut keys: Vec<PathBuf> = Vec::with_capacity(spec.mounts.len());
+        for mount in &spec.mounts {
+            keys.push(mount_key(Path::new(&mount.path))?);
+        }
+
+        // Sorted rather than scanning what came before, because how many mounts there are is a
+        // peer's choice and a scan is quadratic in it: 32k mounts took 8.4s measured, where one
+        // frame under `MAX_PAYLOAD` holds about a million of them.
+        let mut sorted: Vec<&PathBuf> = keys.iter().collect();
+        sorted.sort_unstable();
+        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CortexError::AlreadyExists);
+        }
+
         let mut ws = Workspace::new();
-        for (path, volume) in &spec.mounts {
-            let key = mount_key(Path::new(path))?;
-            if ws.mounts.contains_key(&key) {
-                return Err(CortexError::AlreadyExists);
-            }
-            ws.mounts.insert(key, volume.build_mountable()?);
+        for (key, mount) in keys.into_iter().zip(&spec.mounts) {
+            ws.mounts.insert(key, mount.volume.build_mountable()?);
         }
         Ok(ws)
     }
@@ -492,32 +501,9 @@ impl Mountable for Workspace {
     }
 }
 
-/// A serializable description of a whole [`Workspace`]'s *namespace*: the ordered
-/// set of `(mount_path, volume)` pairs.
-///
-/// This is the artifact a caller reuses across a process boundary. A live
-/// `Workspace` holds open clients and runtimes that cannot cross to another
-/// process, so the thing shared between (say) a WebDAV server and a sandbox's VM
-/// helper is this spec — each side calls [`Workspace::from_spec`] to build its
-/// own live tree with an identical namespace.
-///
-/// The namespace is all that crosses. A live `Workspace`'s instance-local `born`
-/// timestamp stays behind; each [`from_spec`](Workspace::from_spec) build sets its
-/// own (see that method for why it need not cross).
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-pub struct WorkspaceSpec {
-    /// `(mount_path, volume)` in insertion order. A mount at the empty path is
-    /// the root; deeper mounts shadow it (longest-prefix, see [`Workspace`]).
-    pub mounts: Vec<(String, crate::volume::VolumeSpec)>,
-}
-
-impl WorkspaceSpec {
-    /// Builder-style: append a mount of `volume` at `path`.
-    pub fn mount(mut self, path: impl Into<String>, volume: crate::volume::VolumeSpec) -> Self {
-        self.mounts.push((path.into(), volume));
-        self
-    }
-}
+// [`WorkspaceSpec`](crate::volume::WorkspaceSpec) lives in `spec.rs`, beside the
+// [`VolumeSpec`](crate::volume::VolumeSpec) it is a list of. Both are wire types and their
+// encoding is one decision; this file is about the live tree they build.
 
 // Tests live beside this file rather than inside it: they had grown longer than
 // the implementation, so a reader opening it had to scroll past them to find the

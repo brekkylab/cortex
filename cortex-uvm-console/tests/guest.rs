@@ -49,6 +49,28 @@ impl Executable for Report {
     }
 }
 
+/// Resolves its argument against the namespace, from wherever the caller stood.
+///
+/// Byte-for-byte the executable `cortex-local-console`'s own suite uses, and that is the
+/// claim: the client's half of a delegated call is the same on both backends, because the
+/// `cwd` it resolves against arrives already relative to the workspace either way.
+struct Where;
+
+impl Executable for Where {
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        _workspace: &'a Workspace,
+    ) -> BoxFuture<'a, ExecOutput> {
+        Box::pin(async move {
+            match call.resolve(&call.args[0]) {
+                Ok(p) => ExecOutput::ok(p.to_string_lossy().into_owned()),
+                Err(e) => ExecOutput::failed(1, format!("{e}")),
+            }
+        })
+    }
+}
+
 /// A delegated name whose output is not text and not something a shell would survive
 /// re-encoding.
 struct RawBytes;
@@ -98,7 +120,35 @@ impl Fixture {
             .executables(
                 ExecutableSet::new()
                     .register("report", Report)
-                    .register("rawbytes", RawBytes),
+                    .register("rawbytes", RawBytes)
+                    .register("where", Where),
+            )
+            .build()
+            .await
+            .expect("building the console");
+
+        Fixture { console }
+    }
+
+    /// A fixture whose client declares a namespace, which is what a client actually does.
+    ///
+    /// Distinct from [`with_env`](Self::with_env) because it goes over the channel and not
+    /// through the server's environment — the two were the same thing when a workspace was
+    /// a host path pair, and are not now.
+    async fn with_volumes(volumes: cortex::volume::WorkspaceSpec) -> Fixture {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client =
+            cortex::console::stdio::StdioClient::new(server).expect("starting the console server");
+
+        let console = Console::builder()
+            .client(client)
+            .volumes(volumes)
+            .executables(
+                ExecutableSet::new()
+                    .register("report", Report)
+                    .register("rawbytes", RawBytes)
+                    .register("where", Where),
             )
             .build()
             .await
@@ -125,6 +175,40 @@ impl Fixture {
     async fn read(&mut self, path: &str) -> ReadResult {
         self.console.read(path, None, None).await.expect("reading")
     }
+}
+
+/// A volume kind this build cannot realize is refused with the code that says so — and
+/// without booting a VM.
+///
+/// The same claim `cortex-local-console`'s suite makes, and it has to be: a client cannot
+/// tell which backend answered it, so `-32008` has to mean the same thing on both. It did
+/// not. Realization happens in the boot child, which writes its failure to its own stderr
+/// and exits, so every distinction `Workspace::from_spec` draws reached a client as one
+/// undifferentiated "the guest closed the channel" answered `BOOT_FAILED`.
+///
+/// **Not** `#[ignore]`d, because nothing here boots: the point is that the spec is refused
+/// before a VM is worth starting. If this ever needs libkrunfw, the check moved.
+#[tokio::test]
+async fn a_volume_kind_this_build_cannot_realize_is_refused_before_a_vm_is_started() {
+    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+        "docs",
+        cortex::volume::VolumeSpec::Notion(cortex::volume::NotionConfig {
+            api_key: "a".into(),
+        }),
+    ))
+    .await;
+
+    let err = fx
+        .console
+        .exec(["true"], None)
+        .await
+        .expect_err("no session can be built from a kind this build lacks");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::UNSUPPORTED_VOLUME),
+        "answered {err:?} — a spec this build cannot realize is not a backend that would \
+         not come up"
+    );
 }
 
 /// A session, from the outside: commands run somewhere that is not this host, on a
@@ -225,10 +309,14 @@ async fn a_workspace_is_the_same_tree_on_both_sides() {
     std::fs::write(dir.path().join("from-the-host"), b"hello from the host\n")
         .expect("writing a file for the guest to read");
 
-    let mut fx = Fixture::with_env(&[(
-        "CORTEX_UVM_WORKSPACE",
-        &format!("{}:/workspace", dir.path().display()),
-    )])
+    // Declared by the client, over the channel. The server has no environment saying
+    // anything about a workspace, which is the change this asserts.
+    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+        "",
+        cortex::volume::VolumeSpec::Local {
+            host: dir.path().to_path_buf(),
+        },
+    ))
     .await;
 
     // The guest reads what the host wrote.
@@ -252,6 +340,65 @@ async fn a_workspace_is_the_same_tree_on_both_sides() {
     assert_eq!(
         std::fs::read(dir.path().join("from-the-guest")).expect("the guest's file, on the host"),
         b"hello from the guest\n"
+    );
+}
+
+/// A namespace with a named mount lands where the spec said, inside the guest.
+///
+/// The root-mounted case above is what the retired `CORTEX_UVM_WORKSPACE` could express;
+/// this is what it could not, and it is the reason the spec crosses the channel at all.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
+async fn a_named_mount_lands_where_the_spec_said() {
+    let docs = tempfile::tempdir().expect("a temp directory");
+    std::fs::write(docs.path().join("note.md"), b"# note\n").expect("writing a file");
+
+    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+        "docs",
+        cortex::volume::VolumeSpec::Local {
+            host: docs.path().to_path_buf(),
+        },
+    ))
+    .await;
+
+    // The spec said `docs`, so the guest has `docs` — under the workspace root, which is
+    // this backend's constant and not the client's to name.
+    assert_eq!(fx.output("cat docs/note.md").await.stdout, b"# note\n");
+    assert_eq!(
+        fx.output("cat /workspace/docs/note.md").await.stdout,
+        b"# note\n"
+    );
+
+    // And the file plane names what a command names: the same relative path, answered by
+    // the guest agent rather than by a shell in the guest.
+    assert_eq!(fx.read("docs/note.md").await.data, b"# note\n");
+}
+
+/// The whole point, end to end, across the VM boundary: a delegated executable running on
+/// the *host* resolves the same file the guest command would have.
+///
+/// The guest reports an absolute guest path; the agent turns it into a workspace-relative
+/// one; the host's executable resolves against the namespace it declared. Three processes
+/// and a hypervisor, and one name meaning one thing throughout.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
+async fn a_delegated_call_resolves_what_the_guest_command_would_have() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    std::fs::create_dir(dir.path().join("sub")).expect("a subdirectory");
+
+    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+        "work",
+        cortex::volume::VolumeSpec::Local {
+            host: dir.path().to_path_buf(),
+        },
+    ))
+    .await;
+
+    let out = fx.output("cd work/sub && where report.md").await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "work/sub/report.md",
+        "the host executable resolved against the namespace, from where the guest stood"
     );
 }
 

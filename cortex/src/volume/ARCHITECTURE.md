@@ -213,19 +213,34 @@ let ws = Workspace::new()
 WebDAV로, 에이전트는 격리된 게스트 안에서 봐야 하고, 그 둘은 서로 다른 프로세스입니다.
 건너가는 것은 라이브 트리가 아니라 **namespace를 기술한 값**입니다.
 
-- **[`VolumeSpec`](src/volume.rs)** — 마운트 하나를 무엇으로 채울지 적은 serde 값:
+- **[`VolumeSpec`](spec.rs)** — 마운트 하나를 무엇으로 채울지 적은 serde 값:
   `Local { host }` / `S3(S3Config)` / `Notion(NotionConfig)`. 벤더 설정과 크리덴셜만
   담을 뿐 라이브 상태는 없습니다.
-- **[`WorkspaceSpec`](src/workspace.rs)** — 순서 있는 `(mount_path, VolumeSpec)` 목록,
-  즉 workspace의 namespace 그 자체. 프로세스 경계를 넘겨받은 쪽이
-  `Workspace::from_spec`으로 자기 쪽 라이브 트리를 세우면 양쪽 namespace가 동일해집니다.
 
-`VolumeSpec`은 두 갈래로 실체화됩니다 — 소비자가 어느 문으로 들어오는지에 따라:
+  **variant에는 `#[cfg]`가 없습니다.** `s3` 없이 빌드한 바이너리도 `{"type": "s3", …}`를
+  파싱하고, 실체화 단계에서 `UnsupportedVolume("s3")`으로 거절합니다 — variant를 feature
+  뒤에 두면 같은 문서가 어느 빌드에서는 스펙이고 어느 빌드에서는 파싱 실패가 되어, 클라이언트가
+  "이 서버엔 s3 provider가 없다"와 "요청이 잘못됐다"를 구별할 수 없습니다. 같은 이유로
+  `S3Config`/`NotionConfig`도 provider 모듈이 아니라 [`spec.rs`](spec.rs)에 있습니다 —
+  와이어 타입은 provider가 없는 빌드에도 있어야 합니다.
+- **[`WorkspaceSpec`](spec.rs)** — 순서 있는 `Mount { path, volume }` 목록, 즉 workspace의
+  namespace 그 자체. 튜플이 아니라 **이름 붙은 구조체**인 것은 이것이 와이어 타입이기
+  때문입니다: 튜플은 BSON에서 `{"0": …, "1": …}`가 되어 사람이 읽을 수 없고, 필드를 하나
+  늘리는 것이 모든 리더를 깨는 변경이 됩니다.
+
+  프로세스 경계를 넘겨받은 쪽이 `Workspace::from_spec`으로 자기 쪽 라이브 트리를 세우면 양쪽
+  namespace가 동일해집니다.
+
+`VolumeSpec`을 실체화하는 문은 **하나**입니다:
 
 | 빌더 | 반환 | 쓰는 곳 |
 | --- | --- | --- |
 | `build_mountable()` | `Box<dyn DynMountable>` | `Workspace`(`from_spec`)가 마운트 테이블에 담음 |
-| `build()` | `Box<dyn msb_krun::DynFileSystem>` (`PosixFs`로 감쌈) | krun 바인딩이 `VolumeSpec` 하나를 게스트 fs로 바로 붙임 |
+
+VM에 붙일 파일시스템이 필요하면 `Workspace::from_spec(...)` → `PosixFs::new(ws)`입니다.
+`Workspace` 자체가 `Mountable`이므로 볼륨이 하나든 여럿이든 경로가 같습니다. 볼륨 하나를
+곧장 `DynFileSystem`으로 바꾸던 `VolumeSpec::build()`는 그래서 제거됐습니다 — 더 좁은
+일을 하는 두 번째 방법이었고, feature가 관여하는 자리를 둘로 만들었습니다.
 
 namespace만 건너갑니다. 라이브 인스턴스의 `born` 타임스탬프는 넘어가지 않고 각
 `from_spec` 빌드가 자기 것을 새로 잡습니다(합성 디렉터리 mtime이 한 인스턴스 수명 동안만
@@ -351,22 +366,26 @@ cortex 탓이 아님도 확인했습니다 — 하드코딩된 `fuser` 파일시
 
 ## Feature
 
-| feature | 내용 | 딸려 오는 크레이트 |
+| feature | 내용 | 딸려 오는 것 |
 | --- | --- | --- |
-| `default = []` | 자체 계층 + 항상 필요한 `serde_json`(wire)·`async-trait`(async trait) | **12** |
-| `fuse-t` | `dep:libc`, `dep:tokio` | **17** |
-| `fuse` | `dep:fuser`, `dep:libc`, `dep:tokio` | **45** |
-| `krun` | `dep:msb_krun`, `dep:libc`, `dep:tempfile`, `dep:tokio` | **74** (VMM 트리 전체) |
-| `s3` | `dep:object_store`, `dep:tokio` | **131** (HTTP·TLS 스택) |
-| `notion` | `dep:reqwest`, `dep:uuid`, `dep:chrono`, `dep:tokio` | **95** |
-| `fuse-no-mount` | `fuse` + `fuser/macos-no-mount` — 마운트 제공자 없이 컴파일·테스트 | 45 |
+| `default = []` | 자체 계층 + `tokio`·`bson`(console wire)·`serde`·`async-trait`·`anyhow`·`futures-core` | 인터페이스 없음 |
+| `fuse-t` | `dep:libc` | libc 하나 |
+| `fuse` | `dep:fuser`, `dep:libc` | `fuser`와 그 의존 트리 |
+| `krun` | `dep:msb_krun`, `dep:libc`, `dep:tempfile` | **VMM 트리 전체** (vmm, devices, hvf, kernel, arch) |
+| `s3` | `dep:object_store` | **HTTP·TLS 스택 전체** (`object_store` 밑) |
+| `notion` | `dep:reqwest`, `dep:uuid`, `dep:chrono`, `dep:serde_json` | 또 하나의 HTTP 스택 |
+| `fuse-no-mount` | `fuse` + `fuser/macos-no-mount` — 마운트 제공자 없이 컴파일·테스트 | `fuse`와 동일 |
 
-실측한 크레이트 수가 **기본값이 인터페이스 바인딩을 하나도 켜지 않는** 근거입니다. HTTP로
-파일만 서빙하려는 소비자가 하이퍼바이저(krun 74)나 객체 스토어 스택(s3 131)을 컴파일할
-이유가 없습니다. `default`의 12개는 인터페이스가 아니라 wire/`Executable`용 `serde_json`과
-async trait용 `async-trait`이며, 모든 바인딩이 async 실행을 위해 `tokio`를 더 얹습니다.
-(측정 명령은 `Cargo.toml`의 `[features]` 주석에 있습니다. normal 엣지만 세므로 무조건
-딸려 오는 build-dep `cc`/`pkg-config`는 제외됩니다.)
+바인딩은 크레이트를 더 얹는 것 말고도 `tokio/net`과 `tokio/rt-multi-thread`를 켭니다.
+바인딩이 async 백엔드 위의 **동기** 콜백이라 프로세스 하나짜리 런타임에서 `block_on` 하기
+때문이고, 이유는 [`Cargo.toml`](../../Cargo.toml)의 `[features]` 주석에 있습니다.
+
+이 표가 **기본값이 인터페이스 바인딩을 하나도 켜지 않는** 근거입니다. HTTP로 파일만
+서빙하려는 소비자가 하이퍼바이저나 객체 스토어 스택을 컴파일할 이유가 없습니다.
+
+크레이트 수를 적지 않는 것은 의도적입니다. 의존성이 바뀔 때마다 썩고, 정확한 개수가 몇이든
+결론은 바뀌지 않습니다. 세는 명령은 [`Cargo.toml`](../../Cargo.toml)의 `[features]` 주석에
+있습니다.
 
 `fuse`와 `fuse-t`가 **서로 독립**이라 어떤 기본 조합으로도 모든 바인딩을 한 번에 덮을 수
 없습니다. 그래서 전체 커버리지는 처음부터 스윕이고, 명령은
@@ -408,7 +427,7 @@ WebDAV는 agent-k가 의존성으로 직접 들고 씁니다.
 
 | 층 | 방법 |
 | --- | --- |
-| 단위 | `cargo test -p cortex --lib` — 기본 131개, `--features fuse-no-mount,krun,s3,notion` 184개. 두 숫자 모두 `console` 쪽 테스트를 포함합니다. 테스트는 `#[path]`로 `*_tests.rs` 형제 파일에 두면서 private 항목 접근을 유지합니다 |
+| 단위 | `cargo test -p cortex --lib`. 바인딩의 테스트는 그 feature가 켜져야 존재하므로 feature 없이 돌리면 일부만 돕니다 — `--features fuse-no-mount,krun,s3,notion`이 가장 많이 돕니다. 어느 쪽이든 `console` 테스트는 포함됩니다. 테스트는 `#[path]`로 `*_tests.rs` 형제 파일에 두면서 private 항목 접근을 유지합니다 |
 | 조합 | feature 조합 9개 스윕 — 명령은 `Cargo.toml`의 `[features]` 주석에 |
 | 실제 마운트 | [`cortex/tests/host_mount.rs`](../../tests/host_mount.rs) — `#[ignore]`, `--test-threads=1` **필수**. FUSE-T의 `go-nfsv4` 헬퍼가 동시 마운트 3개에서 멈춥니다 |
 | 실제 게스트 | [`cortex/src/bin/apply_krun.rs`](../bin/apply_krun.rs) — microVM을 띄워 게스트 안에서 읽고 씁니다. macOS는 `com.apple.security.hypervisor` 엔타이틀먼트로 재서명 필요 |

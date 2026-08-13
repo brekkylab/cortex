@@ -357,6 +357,7 @@ mod tests {
         client
             .init(Init {
                 delegated: vec!["foo".into()],
+                volumes: Default::default(),
             })
             .await
             .unwrap();

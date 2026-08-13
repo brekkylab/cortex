@@ -27,6 +27,15 @@ pub enum CortexError {
     /// needs a ceiling — otherwise the guest picks how much host memory to ask
     /// for.
     FileTooLarge,
+    /// A volume kind this build has no provider for.
+    ///
+    /// Not a malformed spec and not a missing file: the description is fine and this binary is
+    /// the wrong one to realize it, so a caller needs a different build or one fewer volume.
+    ///
+    /// The one variant that never comes from a filesystem operation, which is why the kernel
+    /// bindings map it to `EIO` — a mounted workspace is one whose volumes all realized, so no
+    /// request reaching a binding can produce it.
+    UnsupportedVolume(&'static str),
     /// The file handle is not one this filesystem issued, or has been released.
     ///
     /// Distinct from [`NotFound`](Self::NotFound), which is about a *name*: a
@@ -98,6 +107,7 @@ impl std::fmt::Display for CortexError {
             CortexError::NotEmpty => write!(f, "directory not empty"),
             CortexError::InvalidName => write!(f, "invalid name"),
             CortexError::InvalidArgument => write!(f, "invalid argument"),
+            CortexError::UnsupportedVolume(kind) => write!(f, "unsupported volume kind: {kind}"),
             CortexError::FileTooLarge => write!(f, "file too large"),
             CortexError::BadHandle => write!(f, "bad file handle"),
             CortexError::PermissionDenied => write!(f, "permission denied"),

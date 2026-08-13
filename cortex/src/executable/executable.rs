@@ -11,6 +11,27 @@ pub struct ExecCall {
 
     /// Everything after the name.
     pub args: Vec<String>,
+
+    /// Where the command that invoked this stood, **relative to the workspace root** — or
+    /// `None` when there was no workspace, when it stood outside one, or when the
+    /// directory's name has no `String` form.
+    ///
+    /// An executable that names no paths can ignore it. One that does should reach for
+    /// [`resolve`](Self::resolve) rather than joining by hand: `None` there is a refusal,
+    /// which is the honest answer, where a substituted root would read a different file and
+    /// say nothing about it.
+    pub cwd: Option<String>,
+}
+
+impl ExecCall {
+    /// `arg` as a workspace path, resolved against [`cwd`](Self::cwd).
+    ///
+    /// A leading `/` makes `arg` workspace-absolute and `cwd` irrelevant. Anything that
+    /// would leave the root is refused, as is a relative `arg` with no `cwd` — see
+    /// [`resolve_under`](crate::executable::resolve_under).
+    pub fn resolve(&self, arg: &str) -> crate::Result<std::path::PathBuf> {
+        crate::executable::resolve_under(self.cwd.as_deref(), arg)
+    }
 }
 
 /// What a delegated executable produced.
@@ -89,3 +110,7 @@ pub trait Executable: Send + Sync {
         workspace: &'a Workspace,
     ) -> BoxFuture<'a, ExecResult>;
 }
+
+#[cfg(test)]
+#[path = "executable_tests.rs"]
+mod tests;

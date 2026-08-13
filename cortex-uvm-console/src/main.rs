@@ -43,9 +43,11 @@
 //! the guest is up; they are gone when it is released, because the image is deleted with
 //! it. The base image is shared, never written, and provisioned once — see [`assets`].
 //!
-//! A workspace is optional and named by [`WORKSPACE_ENV`](contract::WORKSPACE_ENV). It is
-//! the one thing in the guest that is not a file on the host: cortex answers every request
-//! the guest kernel makes for it, out of the boot child's own address space.
+//! A workspace is optional and comes from the client, not the environment: an `init`
+//! carries a `WorkspaceSpec`, and the server writes it where the boot child can read it
+//! (see [`SPEC_ENV`](contract::SPEC_ENV)). It is the one thing in the guest that is not a
+//! file on the host: cortex answers every request the guest kernel makes for it, out of the
+//! boot child's own address space.
 //!
 //! # What this backend deliberately does not do
 //!

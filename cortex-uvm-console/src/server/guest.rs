@@ -6,7 +6,7 @@
 //! and removes the boot root and the socket — and the next call that needs a guest gets a
 //! new one of each, because none of it was ever shared.
 //!
-//! Each of those four is a field whose type has a destructor, and they are declared in the
+//! Each of those is a field whose type has a destructor, and they are declared in the
 //! order they have to happen: the VMM is reaped before the files it had open are deleted.
 //! So there is no `Drop` for [`Guest`] itself, and nothing to keep in step with a list of
 //! things a boot happened to acquire — a piece added here cleans itself up by being the
@@ -47,9 +47,9 @@ use tokio::io::{AsyncReadExt as _, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-use crate::assets::{self, BootRoot, SessionImage};
+use crate::assets::{self, BootRoot, SessionImage, SpecFile};
 use crate::contract::{
-    BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV,
+    BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV, SPEC_ENV,
 };
 use crate::helper::boot_helper;
 
@@ -83,6 +83,13 @@ pub struct Guest {
     _socket: Socket,
     _session: SessionImage,
     _boot_root: BootRoot,
+
+    /// Removed by the boot child as soon as it has read it; this is the backstop for a
+    /// child that never got that far.
+    ///
+    /// `None` for a session that declared no namespace — which is also how the boot child
+    /// is told there is none, by [`SPEC_ENV`] being unset.
+    _spec: Option<SpecFile>,
 }
 
 impl Guest {
@@ -91,10 +98,19 @@ impl Guest {
     /// Everything expensive happens before the child is spawned — provisioning the base
     /// image, formatting the session's — so a failure in any of it is reported as itself
     /// rather than as a boot that timed out.
-    pub async fn boot() -> anyhow::Result<Guest> {
+    pub async fn boot(volumes: &cortex::volume::WorkspaceSpec) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image().await?;
         let helper = boot_helper()?;
+
+        // Written before the child is spawned, like everything else expensive here, so a
+        // namespace that will not encode is reported as itself rather than as a guest that
+        // came up without one.
+        let spec = if volumes.is_empty() {
+            None
+        } else {
+            Some(SpecFile::create(volumes)?)
+        };
 
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
         // still not something to do on the runtime's own thread.
@@ -105,7 +121,8 @@ impl Guest {
 
         let socket = Socket::bind()?;
 
-        let vmm = Vmm(Command::new(&helper)
+        let mut command = Command::new(&helper);
+        command
             .arg(BOOT_ARG)
             .env(KERNEL_ENV, &kernel)
             .env(BASE_IMAGE_ENV, &base)
@@ -117,7 +134,15 @@ impl Guest {
             // escapes onto — goes where this process's diagnostics go. Not stdout:
             // that is the protocol's, and a boot message on it corrupts a frame.
             .stdout(Stdio::from(stderr()?))
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::inherit());
+
+        // Unset when there is no namespace, which is how the boot child is told so — it
+        // reads the variable's absence, not an empty spec.
+        if let Some(spec) = &spec {
+            command.env(SPEC_ENV, spec.path());
+        }
+
+        let vmm = Vmm(command
             .spawn()
             .map_err(|e| anyhow::anyhow!("starting the boot helper {}: {e}", helper.display()))?);
 
@@ -146,6 +171,7 @@ impl Guest {
             _socket: socket,
             _session: session,
             _boot_root: boot_root,
+            _spec: spec,
         })
     }
 
