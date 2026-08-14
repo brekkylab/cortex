@@ -21,9 +21,10 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
-# `Mountable`/`DynMountable`/`FileHandle`/`FileExt` are async *and* object-safe
-# (`Box<dyn DynMountable>`), which native `async fn` in traits cannot be — so
-# their futures are boxed here.
+# Declared for a consumer that wants the macro, not used by any member: `FileSystem`,
+# `Client`, `Server` and `Executable` are async *and* object-safe (`dyn FileSystem`,
+# `Box<dyn Client>`), which native `async fn` in traits cannot be — and they box their
+# futures by hand, so the lifetimes are visible where the borrows are.
 async-trait = "0.1"
 # The console wire. Declared here rather than per crate because `Outcome::Result`
 # carries a `Bson` in public API: two versions of it in one build would be a type

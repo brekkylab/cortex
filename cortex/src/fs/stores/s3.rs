@@ -1,4 +1,4 @@
-//! A read-only [`Mountable`] store over an object store (S3 and compatibles).
+//! A read-only [`FileSystem`] store over an object store (S3 and compatibles).
 //!
 //! Object keys map to paths and a directory is a key prefix — that is the whole of the
 //! mapping. There is no directory object to create or remove; two keys sharing a prefix *are*
@@ -7,14 +7,14 @@
 //!
 //! # Read-only, and why that is a design rather than an omission
 //!
-//! [`Mountable::write_at`] addresses a byte offset. Answering that over S3 means reading the
+//! [`FileSystem::write_at`] addresses a byte offset. Answering that over S3 means reading the
 //! whole object, patching it, and putting it back — `object_store` does not expose a byte-range
 //! patch, and its multipart API requires parts of at least 5 MiB where a guest's writes are at
 //! most 1 MiB. So a write needs staging, with a ceiling on it (a guest picks the offset, so an
 //! allocation sized from one is a guest-chosen allocation).
 //!
 //! And staging needs somewhere to end: a multipart upload has to be *completed*, and this trait
-//! has no signal for when a writer is done (see *Durability* on [`Mountable`]). That is a
+//! has no signal for when a writer is done (see *Durability* on [`FileSystem`]). That is a
 //! separate piece of work, waiting on a design that has one. Every write here keeps the trait's
 //! `ReadOnlyFilesystem` default.
 //!
@@ -23,7 +23,7 @@
 //!
 //! # Async
 //!
-//! `object_store` is async and so is [`Mountable`], so each operation `.await`s the client
+//! `object_store` is async and so is [`FileSystem`], so each operation `.await`s the client
 //! directly — no runtime lives here. An async-native consumer drives it with its own runtime; a
 //! sync interface binding (fuse/fuse-t) `block_on`s at its callback boundary.
 
@@ -40,7 +40,7 @@ use object_store::{
 };
 
 use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, Mountable, Stat};
+use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
 use crate::lock::lock;
 
 // `S3Config` lives in `volume/spec.rs`, not here. It is a wire type: a build without
@@ -259,7 +259,7 @@ struct ReadCache {
     ///
     /// Being per *key* rather than per open, two consumers reading one object interleave
     /// here, and each costs the other a read-ahead. The store cannot tell them apart — a
-    /// path is not an open (see [`Mountable`]) — and the answer stays correct either way:
+    /// path is not an open (see [`FileSystem`]) — and the answer stays correct either way:
     /// what a wrong guess costs is one round trip, never a wrong byte.
     last_end: Option<u64>,
 }
@@ -459,7 +459,7 @@ impl S3Fs {
 /// Three methods, which is all a read-only store implements: everything that would change
 /// something keeps the trait's `ReadOnlyFilesystem` default. A caller that meant to write
 /// hears it on the write rather than on an open, there being no open to hear it on.
-impl Mountable for S3Fs {
+impl FileSystem for S3Fs {
     /// Metadata for one key, or for the prefix of that name — see `classify`.
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
@@ -519,7 +519,7 @@ impl Mountable for S3Fs {
     /// — so the end is decided here, from the remembered size, and a read beyond it answers
     /// `Ok(0)` without a round trip.
     ///
-    /// **A short return means EOF and nothing else.** That is the contract [`Mountable`]
+    /// **A short return means EOF and nothing else.** That is the contract [`FileSystem`]
     /// states, and `Posix` believes it — it calls this once and passes the length on. So a
     /// request the cached window only partly covers must not stop there: the loop fills the
     /// remainder, or a file would appear to end at a window boundary.
@@ -629,7 +629,7 @@ impl S3Fs {
     }
 
     /// One ranged GET. No lock is held here — see the loop in
-    /// [`read_at`](Mountable::read_at).
+    /// [`read_at`](FileSystem::read_at).
     async fn fetch(&self, location: &OsPath, at: u64, end: u64) -> io::Result<Vec<u8>> {
         let options = GetOptions {
             range: Some(GetRange::Bounded(at..end)),

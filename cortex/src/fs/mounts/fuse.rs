@@ -35,7 +35,7 @@ use crate::fs::posix::{
     BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
     decode_open_flags, host_errno,
 };
-use crate::fs::{DirentKind, Mountable, Posix, SetAttr, Stat};
+use crate::fs::{DirentKind, FileSystem, Mount, Posix, SetAttr, Stat};
 
 /// Open flags in the host's numbering: this reply goes to this host's kernel.
 const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
@@ -78,7 +78,7 @@ impl FuseMount {
     /// completed by a helper it has not answered yet.)
     ///
     /// `'static`, because the store is served from that thread for as long as the mount lives.
-    pub fn try_new<T: Mountable + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
+    pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
         Self::try_new_with(fs, mountpoint, vec![MountOption::FSName(FSNAME.into())])
     }
 
@@ -90,7 +90,7 @@ impl FuseMount {
     ///
     /// The options are `fuser`'s own, and this is the only binding that has any: FUSE-T takes a
     /// different set entirely, which is why its `try_new_with` chooses a transport instead.
-    pub fn try_new_with<T: Mountable + 'static>(
+    pub fn try_new_with<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
         options: Vec<MountOption>,
@@ -104,10 +104,6 @@ impl FuseMount {
             session: Some(session),
             mountpoint: mountpoint.to_path_buf(),
         })
-    }
-
-    pub fn mountpoint(&self) -> &Path {
-        &self.mountpoint
     }
 
     /// Serve until the mount goes away, then take it down.
@@ -125,6 +121,13 @@ impl FuseMount {
             Some(session) => session.join(),
             None => Ok(()),
         }
+    }
+}
+
+/// Nothing to arrange: the guard already is the mount, and already knows where it is.
+impl Mount for FuseMount {
+    fn mountpoint(&self) -> &Path {
+        &self.mountpoint
     }
 }
 
@@ -186,7 +189,7 @@ fn to_file_type(kind: DirentKind) -> FileType {
 
 /// The `'static` bound is `fuser`'s: a mounted session outlives the mount call, so the
 /// filesystem may not borrow.
-impl<T: Mountable + 'static> Filesystem for Posix<T> {
+impl<T: FileSystem + 'static> Filesystem for Posix<T> {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match super::block_on(self.lookup_child(parent.0, name)) {
             Ok((inode, stat)) => reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0)),

@@ -47,12 +47,12 @@
 //! 0% contiguous, Linux switching its own read-ahead off once access stops looking sequential.)
 //!
 //! **FSKit never asked for a flush.** A store that treated `flush` as its durability point
-//! would simply never be asked on this transport — which is why [`Mountable`]'s contract is
+//! would simply never be asked on this transport — which is why [`FileSystem`]'s contract is
 //! that a write is durable when it returns, and `flush` is an `fsync` on a name rather than a
 //! promise the store may wait for.
 //!
 //! **`O_TRUNC` decomposes identically.** Both send it as a separate truncation, so
-//! [`Posix`](cortex::fs::Posix) handing it to [`Mountable::truncate`] is right for both, and
+//! [`Posix`](cortex::fs::Posix) handing it to [`FileSystem::truncate`] is right for both, and
 //! the store never sees an open at all.
 //!
 //! **Unlink-while-open is already solved on one of them, and by the same trick.** The macOS NFS
@@ -62,7 +62,7 @@
 //! doing the identical thing under its own prefix. Two transports, one behaviour, and the
 //! measurement is how you can tell which half is doing it.
 //!
-//! [`Mountable`]: cortex::fs::Mountable
+//! [`FileSystem`]: cortex::fs::FileSystem
 
 use std::{
     fs,
@@ -75,7 +75,7 @@ use std::{
 };
 
 use cortex::BoxFuture;
-use cortex::fs::{Dirent, FuseTBackend, FuseTMount, InMemFs, Mountable, Stat, WorkFs};
+use cortex::fs::{Dirent, FileSystem, FuseTBackend, FuseTMount, InMemFs, Mount, Stat, WorkFs};
 
 /// Set once the mount is up, so the traffic the mount itself makes while coming up does not
 /// land in the sample.
@@ -92,11 +92,11 @@ fn note(line: String) {
 
 /// Forwards every call to the store inside and writes down what it was asked.
 ///
-/// A `Mountable` in its own right, which is the point: this is what any store would have
+/// A `FileSystem` in its own right, which is the point: this is what any store would have
 /// seen, so what it records is the kernel's behaviour and not this example's.
 struct Recorder<T>(T);
 
-impl<T: Mountable> Mountable for Recorder<T> {
+impl<T: FileSystem> FileSystem for Recorder<T> {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, std::io::Result<Stat>> {
         note(format!("stat     {}", path.display()));
         self.0.stat(path)

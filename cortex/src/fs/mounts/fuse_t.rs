@@ -38,7 +38,7 @@ use crate::fs::posix::{
     BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, attr_for, decode_open_flags,
     host_errno, mode_for, unix_time,
 };
-use crate::fs::{Mountable, Posix, SetAttr, Stat};
+use crate::fs::{FileSystem, Mount, Posix, SetAttr, Stat};
 
 /// Open flags in the host's numbering: this reply goes to this host's kernel.
 const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
@@ -148,7 +148,7 @@ unsafe extern "C" {
 /// # Safety
 /// `fs` must be the pointer given to `cortex_fuse_t_mount`, and the `Posix<T>` behind it must
 /// outlive the session — [`FuseTMount`] boxes it and keeps it until after the loop returns.
-unsafe fn recover<'a, T: Mountable>(fs: *mut c_void) -> &'a Posix<T> {
+unsafe fn recover<'a, T: FileSystem>(fs: *mut c_void) -> &'a Posix<T> {
     unsafe { &*(fs as *const Posix<T>) }
 }
 
@@ -163,7 +163,7 @@ fn code(result: io::Result<()>) -> c_int {
 // Each callback is generic in `T` and monomorphised per store by `ops_for`, so the
 // filesystem type stays static — no trait object, no downcast.
 
-unsafe extern "C" fn lookup<T: Mountable>(
+unsafe extern "C" fn lookup<T: FileSystem>(
     fs: *mut c_void,
     parent: u64,
     name: *const c_char,
@@ -180,7 +180,7 @@ unsafe extern "C" fn lookup<T: Mountable>(
     )
 }
 
-unsafe extern "C" fn getattr<T: Mountable>(
+unsafe extern "C" fn getattr<T: FileSystem>(
     fs: *mut c_void,
     inode: u64,
     out: *mut CortexStat,
@@ -194,7 +194,7 @@ unsafe extern "C" fn getattr<T: Mountable>(
 /// The `fh` the shim passes is dropped. A resize names a path either way, and the inode
 /// arriving beside it is already that path — there is no per-handle state a store keeps
 /// that a file handle could reach instead.
-unsafe extern "C" fn setattr<T: Mountable>(
+unsafe extern "C" fn setattr<T: FileSystem>(
     fs: *mut c_void,
     inode: u64,
     _fh: u64,
@@ -216,7 +216,7 @@ unsafe extern "C" fn setattr<T: Mountable>(
     )
 }
 
-unsafe extern "C" fn open<T: Mountable>(
+unsafe extern "C" fn open<T: FileSystem>(
     fs: *mut c_void,
     inode: u64,
     flags: c_int,
@@ -234,7 +234,7 @@ unsafe extern "C" fn open<T: Mountable>(
     )
 }
 
-unsafe extern "C" fn create<T: Mountable>(
+unsafe extern "C" fn create<T: FileSystem>(
     fs: *mut c_void,
     parent: u64,
     name: *const c_char,
@@ -260,7 +260,7 @@ unsafe extern "C" fn create<T: Mountable>(
     )
 }
 
-unsafe extern "C" fn read<T: Mountable>(
+unsafe extern "C" fn read<T: FileSystem>(
     fs: *mut c_void,
     fh: u64,
     offset: u64,
@@ -279,7 +279,7 @@ unsafe extern "C" fn read<T: Mountable>(
     }
 }
 
-unsafe extern "C" fn write<T: Mountable>(
+unsafe extern "C" fn write<T: FileSystem>(
     fs: *mut c_void,
     fh: u64,
     offset: u64,
@@ -294,17 +294,17 @@ unsafe extern "C" fn write<T: Mountable>(
     }
 }
 
-unsafe extern "C" fn flush<T: Mountable>(fs: *mut c_void, fh: u64) -> c_int {
+unsafe extern "C" fn flush<T: FileSystem>(fs: *mut c_void, fh: u64) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     code(super::block_on(fs.flush_handle(fh)))
 }
 
-unsafe extern "C" fn release<T: Mountable>(fs: *mut c_void, fh: u64) -> c_int {
+unsafe extern "C" fn release<T: FileSystem>(fs: *mut c_void, fh: u64) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     code(super::block_on(fs.release_handle(fh)))
 }
 
-unsafe extern "C" fn mkdir<T: Mountable>(
+unsafe extern "C" fn mkdir<T: FileSystem>(
     fs: *mut c_void,
     parent: u64,
     name: *const c_char,
@@ -321,7 +321,7 @@ unsafe extern "C" fn mkdir<T: Mountable>(
     )
 }
 
-unsafe extern "C" fn unlink<T: Mountable>(
+unsafe extern "C" fn unlink<T: FileSystem>(
     fs: *mut c_void,
     parent: u64,
     name: *const c_char,
@@ -331,7 +331,7 @@ unsafe extern "C" fn unlink<T: Mountable>(
     code(super::block_on(fs.unlink_child(parent, name)))
 }
 
-unsafe extern "C" fn rmdir<T: Mountable>(
+unsafe extern "C" fn rmdir<T: FileSystem>(
     fs: *mut c_void,
     parent: u64,
     name: *const c_char,
@@ -344,7 +344,7 @@ unsafe extern "C" fn rmdir<T: Mountable>(
 /// No flags parameter, because libfuse-t's `rename` has none — so
 /// `RENAME_NOREPLACE`/`RENAME_EXCHANGE` never reach this binding and there is nothing here
 /// to refuse.
-unsafe extern "C" fn rename<T: Mountable>(
+unsafe extern "C" fn rename<T: FileSystem>(
     fs: *mut c_void,
     parent: u64,
     name: *const c_char,
@@ -359,7 +359,7 @@ unsafe extern "C" fn rename<T: Mountable>(
     ))
 }
 
-unsafe extern "C" fn readdir<T: Mountable>(
+unsafe extern "C" fn readdir<T: FileSystem>(
     fs: *mut c_void,
     inode: u64,
     offset: u64,
@@ -389,13 +389,13 @@ unsafe extern "C" fn readdir<T: Mountable>(
     )))
 }
 
-unsafe extern "C" fn forget<T: Mountable>(fs: *mut c_void, inode: u64, nlookup: u64) {
+unsafe extern "C" fn forget<T: FileSystem>(fs: *mut c_void, inode: u64, nlookup: u64) {
     let fs = unsafe { recover::<T>(fs) };
     fs.forget_inode(inode, nlookup);
 }
 
 /// The vtable for one concrete store, with every callback monomorphised for it.
-fn ops_for<T: Mountable>() -> Ops {
+fn ops_for<T: FileSystem>() -> Ops {
     Ops {
         lookup: lookup::<T>,
         getattr: getattr::<T>,
@@ -538,14 +538,14 @@ impl FuseTMount {
     ///
     /// `'static`, because the store is served from that thread for as long as the mount
     /// lives.
-    pub fn try_new<T: Mountable + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
+    pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
         Self::mount(fs, mountpoint, std::ptr::null())
     }
 
     /// [`try_new`](Self::try_new), with the transport named rather than configured.
     ///
     /// The only thing this changes is what the kernel is talking to — see [`FuseTBackend`].
-    pub fn try_new_with<T: Mountable + 'static>(
+    pub fn try_new_with<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
         backend: FuseTBackend,
@@ -555,7 +555,7 @@ impl FuseTMount {
 
     /// The two above, differing only in whether they name a backend. `backend` is a C string
     /// or null, which is what the shim reads as "leave it to FUSE-T".
-    fn mount<T: Mountable + 'static>(
+    fn mount<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
         backend: *const c_char,
@@ -615,10 +615,6 @@ impl FuseTMount {
             ));
         }
         Ok(mount)
-    }
-
-    pub fn mountpoint(&self) -> &Path {
-        &self.mountpoint
     }
 
     /// Serve until the mount goes away, then take it down.
@@ -683,6 +679,33 @@ impl FuseTMount {
         }
     }
 }
+
+/// Nothing to arrange: the guard already is the mount, and already knows where it is.
+impl Mount for FuseTMount {
+    fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+}
+
+/// The session pointer is what keeps these from being derived, and it is not what makes the
+/// guard shareable or movable.
+///
+/// # Safety
+/// Nothing reachable through `&FuseTMount` touches the pointer: the trait above reads
+/// `mountpoint` and there is no other method on a shared borrow, so no amount of sharing can
+/// produce a second caller into libfuse-t. The pointer is used by exactly two things — the
+/// serving thread, which was handed it at `mount` and holds it alone, and `Drop`, which has
+/// `&mut self` and so runs after every borrow is gone and joins that thread before releasing
+/// the session.
+///
+/// Which thread that `Drop` runs on does not matter, and already does not: the loop is spawned
+/// onto a thread of its own while the caller keeps the guard, so unmount and destroy were
+/// never called from the thread doing the serving.
+///
+/// [`Mount`] requires both, and a mount that could not be shared or sent would be one a task
+/// could not hold — which is what a mount is *for* here.
+unsafe impl Send for FuseTMount {}
+unsafe impl Sync for FuseTMount {}
 
 impl Drop for FuseTMount {
     /// Unmount → join → destroy, in that order and at most once. Unmounting is what makes the

@@ -1,15 +1,18 @@
 //! Two halves, sharing a crate and nothing else.
 //!
 //! * [`fs`] — expose any path-addressed store as a real filesystem. A store implements
-//!   [`Mountable`](fs::Mountable) and a binding puts it in front of a concrete interface: a
+//!   [`FileSystem`](fs::FileSystem) and a binding puts it in front of a concrete interface: a
 //!   host FUSE mount, an NFS or FSKit one, whatever else addresses files by path.
 //!   `fs/ARCHITECTURE.md` has the long form.
 //! * [`console`] — run commands somewhere else, over one JSON-RPC channel, with the
 //!   executables only *this* side knows how to run reachable from inside that somewhere
 //!   else. `console/ARCHITECTURE.md` has the long form.
 //!
-//! Nothing in [`console`] builds a tree, calls [`Mountable`](fs::Mountable) or touches a
-//! binding, and nothing in [`fs`] knows a console exists. There is not even an error type
+//! Nothing in [`console`] builds a tree, calls [`FileSystem`](fs::FileSystem) or touches a
+//! binding. What it does take is a [`Mount`](fs::Mount) — a tree somebody else already
+//! mounted, which is how a delegated executable comes to open the same file the command that
+//! called it did — and that is the whole of the seam. Nothing in [`fs`] knows a console
+//! exists. There is not even an error type
 //! between them: both halves answer in [`std::io::Error`], classified by kind, so neither has a
 //! vocabulary the other has to learn.
 //!

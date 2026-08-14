@@ -1,7 +1,7 @@
-//! An in-memory [`Mountable`] store.
+//! An in-memory [`FileSystem`] store.
 //!
 //! The whole tree lives behind `Arc<Mutex<..>>` links so that every operation shares one
-//! store through `&self`, and so the store is `Send + Sync` as [`Mountable`] requires —
+//! store through `&self`, and so the store is `Send + Sync` as [`FileSystem`] requires —
 //! enough for tests, scratch space, and prototyping.
 //!
 //! Every path is walked from the root on every call, which is what a store addressed by path
@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, Mountable, Stat};
+use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
 use crate::lock::lock;
 
 /// The largest file this store will represent — a safety ceiling, not a capacity plan.
@@ -223,7 +223,7 @@ impl Default for InMemFs {
     }
 }
 
-impl Mountable for InMemFs {
+impl FileSystem for InMemFs {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let link = self.navigate(&components(path)?)?;

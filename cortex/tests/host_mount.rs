@@ -56,7 +56,7 @@ use cortex::fs::FuseMount as HostMount;
 /// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
 #[cfg(feature = "fuse-t")]
 use cortex::fs::FuseTMount as HostMount;
-use cortex::fs::{InMemFs, Mountable, WorkFs};
+use cortex::fs::{FileSystem, InMemFs, WorkFs};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {

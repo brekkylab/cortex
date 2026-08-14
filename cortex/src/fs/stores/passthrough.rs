@@ -1,4 +1,4 @@
-//! A [`Mountable`] store that passes every operation straight through to the real local
+//! A [`FileSystem`] store that passes every operation straight through to the real local
 //! filesystem via `std::fs`.
 //!
 //! A [`PassthroughFs`] is anchored at a `root` directory on disk. Request paths are
@@ -32,7 +32,7 @@
 //! # A descriptor per call
 //!
 //! Every read and write opens the file, acts, and closes it. There is no open to hang one on:
-//! a store is addressed by path (see *No opens, only paths* on [`Mountable`]), so the
+//! a store is addressed by path (see *No opens, only paths* on [`FileSystem`]), so the
 //! descriptor cannot outlive the call that made it.
 //!
 //! Three syscalls where a held descriptor would need one, and the path walked again each time.
@@ -50,7 +50,7 @@ use std::{
 };
 
 use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, Mountable, Stat};
+use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
 
 /// The links one request may resolve through before the walk calls it a cycle. Reading links
 /// rather than having the kernel follow them moves its ceiling here: `MAXSYMLINKS` is 32 on
@@ -227,7 +227,7 @@ impl PassthroughFs {
 
     /// Open the file at `path` for the data plane, in the mode `writable` asks for.
     ///
-    /// Never creates: [`create`](Mountable::create) is the one thing that makes a name, so a
+    /// Never creates: [`create`](FileSystem::create) is the one thing that makes a name, so a
     /// write to a name that went away is an error rather than a resurrection.
     fn open(&self, path: &Path, writable: bool) -> io::Result<fs::File> {
         let real = self.real_path(path)?;
@@ -260,7 +260,7 @@ struct Folded {
     through_a_link: bool,
 }
 
-impl Mountable for PassthroughFs {
+impl FileSystem for PassthroughFs {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let real = self.real_path(path)?;

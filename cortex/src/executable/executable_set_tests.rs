@@ -5,7 +5,11 @@ use super::*;
 struct Echo;
 
 impl Executable for Echo {
-    fn exec<'a>(&'a self, call: &'a ExecCall, _ws: &'a WorkFs) -> BoxFuture<'a, ExecResult> {
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        _mount: Option<&'a dyn Mount>,
+    ) -> BoxFuture<'a, ExecResult> {
         Box::pin(async move { ExecResult::ok(call.args.join(" ")) })
     }
 }
@@ -14,7 +18,11 @@ impl Executable for Echo {
 struct Shout;
 
 impl Executable for Shout {
-    fn exec<'a>(&'a self, call: &'a ExecCall, _ws: &'a WorkFs) -> BoxFuture<'a, ExecResult> {
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        _mount: Option<&'a dyn Mount>,
+    ) -> BoxFuture<'a, ExecResult> {
         Box::pin(async move { ExecResult::ok(call.args.join(" ").to_uppercase()) })
     }
 }
@@ -80,7 +88,7 @@ async fn re_registering_a_name_replaces_the_summary_and_the_behaviour() {
     );
 
     let result = set
-        .invoke(&call("say", &["hi", "there"]), &WorkFs::new())
+        .invoke(&call("say", &["hi", "there"]), None)
         .await
         .expect("registered");
     assert_eq!(result.stdout, b"HI THERE");
@@ -93,18 +101,17 @@ async fn a_name_reaches_the_executable_it_was_registered_with() {
     let set = ExecutableSet::new()
         .register("echo", "say it back", Echo)
         .register("shout", "say it back, louder", Shout);
-    let ws = WorkFs::new();
 
-    assert!(set.invoke(&call("nope", &[]), &ws).await.is_none());
+    assert!(set.invoke(&call("nope", &[]), None).await.is_none());
 
     let quiet = set
-        .invoke(&call("echo", &["hi"]), &ws)
+        .invoke(&call("echo", &["hi"]), None)
         .await
         .expect("registered");
     assert_eq!(quiet.stdout, b"hi");
 
     let loud = set
-        .invoke(&call("shout", &["hi"]), &ws)
+        .invoke(&call("shout", &["hi"]), None)
         .await
         .expect("registered");
     assert_eq!(loud.stdout, b"HI");

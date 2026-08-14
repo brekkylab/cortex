@@ -1,4 +1,4 @@
-//! A read-oriented [`Mountable`] store over a Notion workspace.
+//! A read-oriented [`FileSystem`] store over a Notion workspace.
 //!
 //! Notion pages/blocks are projected onto a filesystem tree:
 //! ```text
@@ -14,7 +14,7 @@
 //! between them — which is what lets a guest kernel see the real size (no `direct_io` here).
 //!
 //! Read-only: page/block writes and the domain command channel are not exposed. Every
-//! mutating method keeps [`Mountable`]'s `ReadOnlyFilesystem` default rather than answering
+//! mutating method keeps [`FileSystem`]'s `ReadOnlyFilesystem` default rather than answering
 //! `Unsupported`, so one read-only source does not disable writes for a whole mount.
 
 use std::{
@@ -28,7 +28,7 @@ use std::{
 use serde_json::{Value, json};
 
 use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, Mountable, Stat};
+use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
 
 const API: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2022-06-28";
@@ -312,7 +312,7 @@ impl NotionFs {
 /// Three methods, which is all a read-only store implements: everything that would change
 /// something keeps the trait's `ReadOnlyFilesystem` default, and a caller hears that on the
 /// write rather than on the open — there being no open to hear it on.
-impl Mountable for NotionFs {
+impl FileSystem for NotionFs {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let segs = segments(path);

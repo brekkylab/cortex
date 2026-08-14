@@ -1,6 +1,6 @@
 use futures_core::future::BoxFuture;
 
-use crate::fs::WorkFs;
+use crate::fs::Mount;
 
 /// What a delegated executable was asked to do.
 #[derive(Clone, Debug)]
@@ -29,6 +29,10 @@ impl ExecCall {
     /// A leading `/` makes `arg` workspace-absolute and `cwd` irrelevant. Anything that
     /// would leave the root is refused, as is a relative `arg` with no `cwd` — see
     /// [`resolve_under`](crate::executable::resolve_under).
+    ///
+    /// Relative to the workspace root and never to this host, because the two ends of a
+    /// delegated call agree on the first and not the second. What turns it into a file to
+    /// open is the mount the call was handed: [`Mount::host_path`].
     pub fn resolve(&self, arg: &str) -> std::io::Result<std::path::PathBuf> {
         crate::executable::resolve_under(self.cwd.as_deref(), arg)
     }
@@ -88,23 +92,38 @@ impl ExecResult {
 /// anyone's signature. The allocation is one per delegated call, next to a round trip
 /// out to the server and back.
 ///
-/// # Why the workspace is an argument
+/// # Why the mount is an argument
 ///
-/// A delegated name is called from inside an execution, and the files it is asked
-/// about are the ones that execution can see. That namespace is the console's — it
-/// is what the console projects into the server, one per session — so an
-/// implementation cannot have captured the right one: the same `Executable` may be
-/// registered on several consoles, and each call belongs to whichever one is asking.
+/// A delegated name is called from inside an execution, and the files it is asked about are
+/// the ones that execution can see. Those are reachable because the session's tree is
+/// *mounted*: the command that invoked this name opened them by path, and a delegated name
+/// that is asked about the same file has to be able to open the same path.
 ///
-/// A shared borrow, because mounting is not a delegated name's to do. Everything a
-/// name does *to files* — stat, list, open, read, write, rename — is a
-/// [`Mountable`](crate::fs::Mountable) operation on `&self`, while
-/// [`mount`](WorkFs::mount) needs `&mut self` and would rewrite the namespace an
-/// execution is already running against.
+/// So what arrives is a [`Mount`] and not a store. A store would describe the same tree and
+/// name it differently — no host path, nothing a `std::fs` call or a spawned program could
+/// use — where a mount is the arrangement both ends of the call already share:
+/// [`ExecCall::resolve`] gives the workspace-relative path, [`Mount::host_path`] turns it
+/// into the file, and it is the same file the command meant.
+///
+/// It cannot be captured instead, either. The mount belongs to the console — one per session
+/// — and the same `Executable` may be registered on several, so each call belongs to
+/// whichever console is asking.
+///
+/// A shared borrow, because taking the mount down is not a delegated name's to do: dropping
+/// it unmounts (see [`Mount`]), which would take the tree out from under the execution still
+/// running against it.
+///
+/// `None` is a console with nothing mounted. A name that touches no files ignores it; one
+/// that needs a file has no way to reach one and should say so, which is honest where a
+/// substituted path would read something nobody asked about.
 ///
 /// [`ExecutableSet`]: super::ExecutableSet
 pub trait Executable: Send + Sync {
-    fn exec<'a>(&'a self, call: &'a ExecCall, workspace: &'a WorkFs) -> BoxFuture<'a, ExecResult>;
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        mount: Option<&'a dyn Mount>,
+    ) -> BoxFuture<'a, ExecResult>;
 }
 
 #[cfg(test)]

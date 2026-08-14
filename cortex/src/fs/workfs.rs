@@ -4,11 +4,17 @@
 //! path and serves every request that falls under it, with the path re-based onto the store's
 //! own root.
 //!
-//! It is itself a [`Mountable`], so it can be driven by the same bindings as any single
+//! It is itself a [`FileSystem`], so it can be driven by the same bindings as any single
 //! store — and even mounted inside another one. That costs nothing to arrange now that the
-//! trait is object-safe: the table holds `Box<dyn Mountable>` and forwards, where a trait
+//! trait is object-safe: the table holds `Box<dyn FileSystem>` and forwards, where a trait
 //! with an associated handle type would need the whole call erased and re-typed on the way
 //! through.
+//!
+//! **The `mount` here is the table's, not the operating system's.**
+//! [`mount`](WorkFs::mount) grafts a store onto a path in *this* tree and nothing outside the
+//! process learns of it. Putting the result where a kernel can see it is
+//! [`Mount`](crate::fs::Mount), which is what a binding hands back — so a `WorkFs` with ten
+//! mounts in it may still be mounted nowhere at all.
 
 use std::{
     collections::BTreeMap,
@@ -19,7 +25,7 @@ use std::{
 };
 
 use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, Mountable, Stat};
+use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
 
 /// A public API for using cortex's filesystem.
 ///
@@ -32,7 +38,7 @@ pub struct WorkFs {
     /// is a reverse range scan (see [`WorkFs::route`]), and all keys sharing a prefix form one
     /// contiguous run (see [`WorkFs::descendant_mounts`]). A store mounted at the empty path is
     /// the root and serves anything no deeper mount claims.
-    mounts: BTreeMap<PathBuf, Box<dyn Mountable>>,
+    mounts: BTreeMap<PathBuf, Box<dyn FileSystem>>,
 
     /// The timestamp every synthesized directory reports.
     ///
@@ -61,7 +67,7 @@ impl WorkFs {
     /// Builder-style mount that overwrites any store already at `path`.
     ///
     /// Fails only if `path` escapes the workspace root.
-    pub fn try_with_mount<M: Mountable + 'static>(
+    pub fn try_with_mount<M: FileSystem + 'static>(
         mut self,
         path: impl AsRef<Path>,
         store: M,
@@ -73,7 +79,7 @@ impl WorkFs {
 
     /// Mount `store` at `path` (root-relative). Fails if the path escapes the workspace root or
     /// another store is already mounted there.
-    pub fn mount<M: Mountable + 'static>(
+    pub fn mount<M: FileSystem + 'static>(
         &mut self,
         path: impl AsRef<Path>,
         store: M,
@@ -87,7 +93,7 @@ impl WorkFs {
     }
 
     /// Remove the mount registered at `path`, returning the detached store.
-    pub fn unmount(&mut self, path: impl AsRef<Path>) -> io::Result<Box<dyn Mountable>> {
+    pub fn unmount(&mut self, path: impl AsRef<Path>) -> io::Result<Box<dyn FileSystem>> {
         let key = mount_key(path.as_ref())?;
         self.mounts.remove(&key).ok_or_else(not_found)
     }
@@ -104,7 +110,7 @@ impl WorkFs {
     /// this" apart from "a mount claimed it and answered `NotFound`", because only the first is
     /// a candidate for a directory synthesized from the mount table. A `Result` here invites
     /// `?`, which would propagate `NotFound` before that decision is made.
-    fn route(&self, key: &Path) -> Option<(&dyn Mountable, PathBuf)> {
+    fn route(&self, key: &Path) -> Option<(&dyn FileSystem, PathBuf)> {
         // Walk every key <= `key` from the greatest downward; the first that is a prefix of
         // `key` is the longest match.
         let (mount, store) = self
@@ -121,7 +127,7 @@ impl WorkFs {
     /// [`route`](Self::route) for the data plane, where both refusals are settled the same way
     /// every time: a directory the mount table synthesized is a directory, and a path no mount
     /// claims is missing.
-    fn route_file(&self, key: &Path) -> io::Result<(&dyn Mountable, PathBuf)> {
+    fn route_file(&self, key: &Path) -> io::Result<(&dyn FileSystem, PathBuf)> {
         self.guard_synthesized(key, io::ErrorKind::IsADirectory)?;
         self.route(key).ok_or_else(not_found)
     }
@@ -140,7 +146,7 @@ impl WorkFs {
     fn descendant_mounts<'a>(
         &'a self,
         prefix: &'a Path,
-    ) -> impl Iterator<Item = (&'a PathBuf, &'a Box<dyn Mountable>)> {
+    ) -> impl Iterator<Item = (&'a PathBuf, &'a Box<dyn FileSystem>)> {
         self.mounts
             .range((Excluded(prefix.to_path_buf()), Unbounded))
             .take_while(move |(k, _)| k.starts_with(prefix))
@@ -311,7 +317,7 @@ fn normalize(path: &Path) -> io::Result<PathBuf> {
     Ok(out)
 }
 
-impl Mountable for WorkFs {
+impl FileSystem for WorkFs {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let key = normalize(path)?;

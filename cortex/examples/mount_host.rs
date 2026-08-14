@@ -39,7 +39,9 @@ use cortex::fs::FuseTMount as HostMount;
 fn main() {
     use std::path::Path;
 
-    use cortex::fs::{InMemFs, Mountable, WorkFs};
+    // `Mount` for `mountpoint` below: what a guard *is* comes from the trait, not from the
+    // binding that made it.
+    use cortex::fs::{FileSystem, InMemFs, Mount, WorkFs};
 
     let mountpoint = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: mount_host <mountpoint>   (the directory must already exist)");

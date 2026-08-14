@@ -1,5 +1,9 @@
-//! What a store must provide to be exposed as a filesystem: [`Mountable`], and the vocabulary
+//! What a store must provide to be exposed as a filesystem: [`FileSystem`], and the vocabulary
 //! it answers in — [`Stat`], [`DirentKind`], [`Dirent`].
+//!
+//! Describing a tree is all of it. Whether one is *mounted* anywhere is
+//! [`Mount`](crate::fs::Mount)'s, in [`mounts`](crate::fs) — see the module docs there for
+//! why the two are not the same thing.
 //!
 //! Nothing a *caller's* open speaks is here: `OpenOptions` and `SetAttr` describe what a kernel
 //! asked for, which no store ever sees, so they live with [`Posix`](crate::fs::Posix).
@@ -131,7 +135,7 @@ impl Dirent {
     /// The metadata the listing came with, if it came with any.
     ///
     /// `None` is not "unknown to the backend" — it is "not free from the listing".
-    /// A consumer that needs it anyway asks [`Mountable::stat`](crate::fs::Mountable::stat),
+    /// A consumer that needs it anyway asks [`FileSystem::stat`](crate::fs::FileSystem::stat),
     /// and pays for it.
     pub fn stat(&self) -> Option<&Stat> {
         self.stat.as_ref()
@@ -140,12 +144,17 @@ impl Dirent {
 
 /// A logical, path-addressed store that can be exposed as a filesystem.
 ///
+/// A *description* of a tree and not a mounted one: implementing this makes something
+/// answerable about names and bytes, and nothing about it is visible outside this process
+/// until a binding puts it behind a real filesystem interface. That step is
+/// [`Mount`](crate::fs::Mount), which is the mounted state itself.
+///
 /// Every operation names its target by path, and there are only two kinds of them:
 /// the namespace (`stat`/`list`/`create`/`mkdir`/`unlink`/`rmdir`/`rename`) and the
 /// bytes (`read_at`/`write_at`/`truncate`/`flush`). Nothing stands between a caller
 /// and either one:
 ///
-/// * The trait stays object-safe, so `dyn Mountable` is the whole of erasure. A
+/// * The trait stays object-safe, so `dyn FileSystem` is the whole of erasure. A
 ///   trait handing out an associated handle type needs a hand-written object-safe
 ///   twin and a blanket impl bridging the two before a heterogeneous mount table can
 ///   hold two backends at once — and then a third impl to make the erased handle
@@ -257,7 +266,7 @@ impl Dirent {
 /// the syscall. An async-native frontend over such a backend should wrap the calls in
 /// `tokio::task::block_in_place` (gated on a multi-thread runtime), which costs
 /// nothing when the call is already quick, rather than `spawn_blocking`.
-pub trait Mountable: Send + Sync {
+pub trait FileSystem: Send + Sync {
     /// Metadata for one entry (works on files *and* directories).
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>>;
 
@@ -404,7 +413,7 @@ pub trait Mountable: Send + Sync {
 
 /// A shared backend is itself a backend: every call forwards to the one inside.
 ///
-/// `?Sized`, so one impl covers `Arc<dyn Mountable>` as well as `Arc<T>` — the
+/// `?Sized`, so one impl covers `Arc<dyn FileSystem>` as well as `Arc<T>` — the
 /// erased case needs it as much as the concrete one, and a trait object cannot get it
 /// from a second, overlapping impl.
 ///
@@ -416,7 +425,7 @@ pub trait Mountable: Send + Sync {
 ///
 /// Each method hands the inner future back untouched rather than awaiting it inside
 /// one of its own, so sharing a backend costs no allocation on top of the call.
-impl<T: Mountable + ?Sized> Mountable for Arc<T> {
+impl<T: FileSystem + ?Sized> FileSystem for Arc<T> {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         (**self).stat(path)
     }

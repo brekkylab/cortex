@@ -75,7 +75,7 @@ use crate::{
         stdio::StdioClient,
     },
     executable::{ExecCall, ExecutableSet},
-    fs::WorkFs,
+    fs::Mount,
 };
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
@@ -89,8 +89,8 @@ type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>
 /// Assembles a [`Console`] from the parts it needs.
 ///
 /// A builder rather than arguments because a console is going to acquire more of them —
-/// volumes to project, limits, a backend of its own choosing — and each should be
-/// something a caller can leave out.
+/// limits, a backend of its own choosing — and each should be something a caller can leave
+/// out, as [`mount`](Self::mount) already is.
 ///
 /// Nothing here starts anything. The channel is described, not driven, until something
 /// is asked over it.
@@ -105,12 +105,11 @@ pub struct ConsoleBuilder {
 
     execs: ExecutableSet,
 
-    /// `None` is a console whose delegated names have nothing to read, which is
-    /// [`WorkFs::new`] — an empty namespace rather than an absent one, so
-    /// [`Executable::exec`](crate::executable::Executable::exec) always has a tree to
-    /// be handed and a name that touches no files never had to say so. Left unfilled
-    /// here so the default is the console's and not the setter's.
-    workspace: Option<Arc<WorkFs>>,
+    /// `None` is a console with nothing mounted, and stays `None`: a mount is something a
+    /// caller *has* or has not, and there is no empty one to substitute — an unmounted tree
+    /// has no path for a delegated name to open. What that means for the names is
+    /// [`Executable::exec`](crate::executable::Executable::exec)'s to say.
+    mount: Option<Arc<dyn Mount>>,
 }
 
 impl ConsoleBuilder {
@@ -170,18 +169,25 @@ impl ConsoleBuilder {
         self
     }
 
-    /// The namespace this console's delegated executables are handed.
+    /// Where this console's tree is mounted, which is what its delegated executables are
+    /// handed.
     ///
     /// One per console and fixed for the session, because it is what an execution's
-    /// delegated calls are resolved *against*: a name that reads a file is asked about
-    /// the tree the command that called it can see.
+    /// delegated calls are resolved *against*: a name that reads a file is asked about the
+    /// tree the command that called it can see, and it can see it because it is mounted.
     ///
-    /// [`Arc`], so the same `WorkFs` can also be served somewhere else — mounted on
-    /// the host, or projected into the server the commands themselves run in — which is
-    /// the arrangement that makes a delegated name and its caller talk about the same
-    /// files. Takes a plain [`WorkFs`] too, for a caller that shares it with nobody.
-    pub fn workspace(mut self, workspace: impl Into<Arc<WorkFs>>) -> Self {
-        self.workspace = Some(workspace.into());
+    /// Mounting is the caller's, not the console's. Which binding puts a tree in front of a
+    /// kernel is a build's business — and the same mount is usually what the server the
+    /// commands run in was given too, which is the arrangement that makes a delegated name
+    /// and its caller talk about the same files.
+    ///
+    /// Takes the mount by value, so a console holds it and the mount lives at least as long
+    /// as the session does — dropping a mount unmounts it (see [`Mount`]). A caller that
+    /// needs it elsewhere as well hands over an `Arc<..>` of it, which is a [`Mount`] too.
+    ///
+    /// Leaving it out is a console with nothing mounted; see the field this fills.
+    pub fn mount(mut self, mount: impl Mount + 'static) -> Self {
+        self.mount = Some(Arc::new(mount));
         self
     }
 
@@ -247,11 +253,13 @@ pub struct Console {
     /// resolves to when one comes back as a [`Delegated`](Progress::Delegated).
     execs: ExecutableSet,
 
-    /// The namespace those names are resolved against, handed to each one as it runs.
-    /// Shared rather than owned: whoever also serves this tree to the commands
-    /// themselves is holding the same `WorkFs`, which is what makes the two ends
-    /// agree about a file.
-    workspace: Arc<WorkFs>,
+    /// The mount those names are resolved against, handed to each one as it runs — `None`
+    /// when this console has nothing mounted.
+    ///
+    /// Held for the session, which is also what keeps the mount up: an [`Arc`] rather than
+    /// the guard itself because whoever also serves this tree to the commands themselves is
+    /// holding the same mount, and it comes down when the last of them goes.
+    mount: Option<Arc<dyn Mount>>,
 }
 
 impl Console {
@@ -279,7 +287,7 @@ impl Console {
         let ConsoleBuilder {
             client_factory,
             execs,
-            workspace,
+            mount,
         } = builder;
 
         let client_factory =
@@ -295,7 +303,7 @@ impl Console {
         Ok(Console {
             client,
             execs,
-            workspace: workspace.unwrap_or_else(|| Arc::new(WorkFs::new())),
+            mount,
         })
     }
 
@@ -378,12 +386,12 @@ impl Console {
         };
 
         // Split rather than borrowed through `self`, because the chain holds the client
-        // across every step and consults the set — and the tree it resolves against —
+        // across every step and consults the set — and the mount it resolves against —
         // in between.
         let Console {
             client,
             execs,
-            workspace,
+            mount,
         } = self;
 
         // The id of the request the *next* answer will be to, which is what carrying on
@@ -403,7 +411,7 @@ impl Console {
                     let carry_on = Exec {
                         cmd: ExecCmd::Resume {
                             id,
-                            outcome: answer(execs, workspace, delegated).await,
+                            outcome: answer(execs, mount.as_deref(), delegated).await,
                         },
                         // The execution this belongs to is already running under its own,
                         // and this is not a second execution to bound.
@@ -525,7 +533,7 @@ impl Drop for Console {
 
 /// What one delegated call comes to: the outcome of the [`ExecCmd::Resume`] that carries
 /// it back.
-async fn answer(execs: &ExecutableSet, workspace: &WorkFs, exec: Exec) -> Outcome {
+async fn answer(execs: &ExecutableSet, mount: Option<&dyn Mount>, exec: Exec) -> Outcome {
     let Some((name, args)) = exec.cmd.split() else {
         return refused(Error::INVALID_PARAMS, "an empty command");
     };
@@ -541,7 +549,7 @@ async fn answer(execs: &ExecutableSet, workspace: &WorkFs, exec: Exec) -> Outcom
     // `None` is the allowlist boundary. Nothing honest reaches it — the only names the
     // server was given are the ones in this set — so this is a server asking for
     // something it was never told about.
-    let Some(result) = execs.invoke(&call, workspace).await else {
+    let Some(result) = execs.invoke(&call, mount).await else {
         return refused(
             Error::NOT_EXECUTABLE,
             format!("{}: not a delegated executable", call.name),
@@ -578,7 +586,6 @@ mod tests {
     use crate::{
         console::message::{Call, Method, Notification},
         executable::{ExecResult as ExecOutput, Executable},
-        fs::{InMemFs, Mountable},
     };
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.
@@ -692,7 +699,7 @@ mod tests {
         fn exec<'a>(
             &'a self,
             call: &'a ExecCall,
-            _workspace: &'a WorkFs,
+            _mount: Option<&'a dyn Mount>,
         ) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move { ExecOutput::ok(format!("hello {}\n", call.args.join(" "))) })
         }
@@ -706,7 +713,7 @@ mod tests {
         fn exec<'a>(
             &'a self,
             call: &'a ExecCall,
-            _workspace: &'a WorkFs,
+            _mount: Option<&'a dyn Mount>,
         ) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move {
                 match call.resolve(&call.args[0]) {
@@ -907,58 +914,74 @@ mod tests {
         assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
     }
 
-    /// A delegated name is handed the console's own workspace, so what it reads is what
-    /// the session projects rather than whatever the host process happens to have.
+    /// A delegated name is handed the console's own mount, so the file it opens is the one
+    /// the session's tree has under that name rather than whatever this process's own
+    /// directory holds.
+    ///
+    /// The whole chain is here, because it is the chain that makes the two ends agree: the
+    /// name the server reported, resolved against where the command stood, then joined onto
+    /// the mount point — and a real file at the end of it.
     #[tokio::test]
-    async fn a_delegated_call_reads_the_consoles_workspace() {
-        /// Answers with the contents of the file it was asked for.
+    async fn a_delegated_call_reads_the_consoles_mount() {
+        /// A directory that is already part of a filesystem, standing in for a mounted one.
+        ///
+        /// Not a mount this test made: putting one up needs a binding, a libfuse provider
+        /// and a kernel, which is what `tests/host_mount.rs` is for. What is under test here
+        /// is what a *console* does with a mount — hand it to the name it delegates to — and
+        /// a plain directory answers a path the same way a mount point does.
+        struct Mounted(std::path::PathBuf);
+
+        impl Mount for Mounted {
+            fn mountpoint(&self) -> &std::path::Path {
+                &self.0
+            }
+        }
+
+        /// Answers with the contents of the file it was asked for, opened where the mount
+        /// says it is.
         struct Cat;
 
         impl Executable for Cat {
             fn exec<'a>(
                 &'a self,
                 call: &'a ExecCall,
-                workspace: &'a WorkFs,
+                mount: Option<&'a dyn Mount>,
             ) -> BoxFuture<'a, ExecOutput> {
                 Box::pin(async move {
-                    let path = std::path::Path::new(&call.args[0]);
-                    let stat = match workspace.stat(path).await {
-                        Ok(stat) => stat,
+                    let Some(mount) = mount else {
+                        return ExecOutput::failed(1, "nothing is mounted");
+                    };
+                    let path = match call.resolve(&call.args[0]) {
+                        Ok(path) => mount.host_path(&path),
                         Err(e) => return ExecOutput::failed(1, e.to_string()),
                     };
-                    let mut bytes = vec![0; stat.size as usize];
-                    match workspace.read_at(path, &mut bytes, 0).await {
-                        Ok(n) => {
-                            bytes.truncate(n);
-                            ExecOutput::ok(bytes)
-                        }
+                    match std::fs::read(&path) {
+                        Ok(bytes) => ExecOutput::ok(bytes),
                         Err(e) => ExecOutput::failed(1, e.to_string()),
                     }
                 })
             }
         }
 
-        let volume = InMemFs::new();
-        let note = std::path::Path::new("note.txt");
-        volume.create(note).await.unwrap();
-        volume
-            .write_at(note, b"from the workspace\n", 0)
-            .await
-            .unwrap();
+        let mnt = std::env::temp_dir().join(format!("cortex-console-{}", std::process::id()));
+        std::fs::create_dir_all(&mnt).expect("temp dir is writable");
+        std::fs::write(mnt.join("note.txt"), b"from the mounted tree\n").unwrap();
 
         let (client, log) = recorder(vec![
             null(),
-            delegated(&["cat", "note.txt"]),
+            // At the root of the tree, which is what lets a relative argument resolve at
+            // all — the same rule a command's own directory is reported under.
+            delegated_in(&["cat", "note.txt"], ""),
             ran(b"done\n"),
         ]);
         let mut console = Console::builder()
             .client(client)
             .executables(ExecutableSet::new().register(
                 "cat",
-                "read a file out of the workspace it was handed",
+                "read a file out of the tree it was handed",
                 Cat,
             ))
-            .workspace(WorkFs::new().try_with_mount("", volume).unwrap())
+            .mount(Mounted(mnt.clone()))
             .build()
             .await
             .unwrap();
@@ -967,6 +990,7 @@ mod tests {
             .exec(["sh", "-c", "cat note.txt"], None)
             .await
             .unwrap();
+        std::fs::remove_dir_all(&mnt).ok();
 
         let Call::Exec(Exec {
             cmd: ExecCmd::Resume { outcome, .. },
@@ -976,7 +1000,7 @@ mod tests {
             panic!("{:?} is not an exec carrying on from anything", log.call(2));
         };
         let result: ExecResult = outcome.take().unwrap();
-        assert_eq!(result.stdout, b"from the workspace\n");
+        assert_eq!(result.stdout, b"from the mounted tree\n");
     }
 
     /// The one line that copies `exec.cwd` onto the `ExecCall` has no other coverage: every

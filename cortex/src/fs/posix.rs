@@ -1,4 +1,4 @@
-//! POSIX bookkeeping over a path-addressed [`Mountable`] store.
+//! POSIX bookkeeping over a path-addressed [`FileSystem`] store.
 //!
 //! [`Posix`] maps the store's paths onto stable inode numbers, tracks the kernel's
 //! per-inode reference counts, and keeps the open-file table a file handle is an index
@@ -7,20 +7,20 @@
 //!
 //! This layer exists *because* a kernel addresses files by number, and by descriptor.
 //! A path-addressed consumer — an HTTP binding whose verbs all carry paths — reaches
-//! [`Mountable`] directly and never comes through here.
+//! [`FileSystem`] directly and never comes through here.
 //!
 //! # What it holds that the store does not
 //!
 //! The store answers about names and bytes only (see *No opens, only paths* on
-//! [`Mountable`]), so everything an open means lives here:
+//! [`FileSystem`]), so everything an open means lives here:
 //!
 //! * **The numbers.** inode ↔ path, and the reference counts that say when a number
 //!   may be reclaimed.
 //! * **The descriptors.** A file handle resolves to an inode and the options it was
 //!   opened with — never to a path directly, so an open follows its file through a
 //!   rename the way a descriptor does.
-//! * **The decomposition.** `O_CREAT|O_EXCL` becomes [`create`](Mountable::create),
-//!   `O_TRUNC` becomes [`truncate`](Mountable::truncate), and the access mode becomes a check
+//! * **The decomposition.** `O_CREAT|O_EXCL` becomes [`create`](FileSystem::create),
+//!   `O_TRUNC` becomes [`truncate`](FileSystem::truncate), and the access mode becomes a check
 //!   made here rather than in every store. [`OpenOptions`] and [`SetAttr`] are what a caller's
 //!   open and a kernel's `setattr` say, and they stop here — a store sees neither.
 //!
@@ -46,7 +46,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::fs::{Dirent, DirentKind, Mountable, Stat};
+use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
 use crate::lock::lock;
 
 /// How a file should be opened.
@@ -58,7 +58,7 @@ use crate::lock::lock;
 ///   is a race, not a contract — and for a local backend (`O_CREAT|O_EXCL`) or an
 ///   object store (`If-None-Match: *`) the atomic form is the only one there is.
 /// * `truncate` must take effect *before* anything can observe the file, so the metadata the
-///   caller gets back already reflects it as empty. [`Mountable::truncate`](crate::fs::Mountable::truncate) is the other,
+///   caller gets back already reflects it as empty. [`FileSystem::truncate`](crate::fs::FileSystem::truncate) is the other,
 ///   non-atomic resize; a store must not treat one as the other.
 ///
 /// The only meaningless combination — neither `read` nor `write` — is rejected by
@@ -186,7 +186,7 @@ impl OpenOptions {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SetAttr {
     /// Resize the file. The only field this crate can actually act on, via
-    /// [`Mountable::truncate`](crate::fs::Mountable::truncate).
+    /// [`FileSystem::truncate`](crate::fs::FileSystem::truncate).
     pub size: Option<u64>,
     pub mtime: Option<std::time::SystemTime>,
     pub atime: Option<std::time::SystemTime>,
@@ -223,7 +223,7 @@ fn bad_handle() -> io::Error {
 /// The fields are **private**, and that is the enforcement mechanism for "a binding only
 /// translates": a binding cannot reach the tables, so it cannot re-derive an operation that
 /// belongs here.
-pub struct Posix<T: Mountable> {
+pub struct Posix<T: FileSystem> {
     store: T,
 
     inodes: Mutex<InodeTable>,
@@ -235,7 +235,7 @@ pub struct Posix<T: Mountable> {
     held: Mutex<HashMap<u64, PathBuf>>,
 }
 
-impl<T: Mountable> Posix<T> {
+impl<T: FileSystem> Posix<T> {
     pub fn new(store: T) -> Self {
         Posix {
             store,
@@ -438,7 +438,7 @@ pub(super) fn decode_open_flags(flags: i32, bits: &OpenFlagBits) -> io::Result<O
 ///
 /// Every method takes the inode/handle numbers the kernel speaks in and drops each table
 /// lock before touching the (possibly slow) store.
-impl<T: Mountable> Posix<T> {
+impl<T: FileSystem> Posix<T> {
     /// Resolve `name` under `parent`, returning the child's inode and metadata.
     ///
     /// Takes a kernel reference on the inode, so it must be balanced by
@@ -514,7 +514,7 @@ impl<T: Mountable> Posix<T> {
     /// The two steps are ordered, and both orderings matter:
     ///
     /// * Creation first, because `O_EXCL` is decided against what is on the store and
-    ///   nothing else. [`create`](Mountable::create) is exclusive, so a non-exclusive
+    ///   nothing else. [`create`](FileSystem::create) is exclusive, so a non-exclusive
     ///   open reads its `AlreadyExists` as the answer it wanted.
     /// * Truncation second, and only for a name that was already there: a file this call
     ///   just made is empty already, and asking a store to resize what it has just

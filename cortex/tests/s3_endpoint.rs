@@ -23,7 +23,7 @@
 
 use std::{path::Path, process::Command};
 
-use cortex::fs::{DirentKind, Mountable, S3Config, S3Fs};
+use cortex::fs::{DirentKind, FileSystem, S3Config, S3Fs};
 
 /// The mock this drives — a stand-in for the read APIs of a dozen enterprise
 /// services, S3 among them, over a corpus rather than a live account.
@@ -35,7 +35,7 @@ const S3_PATH: &str = "/s3";
 /// A bucket in the mock's corpus, chosen for having several levels of prefix.
 ///
 /// Named here because bucket names are not discoverable through [`S3Fs`]:
-/// `ListBuckets` is not a `Mountable` operation, and would not be — a volume is
+/// `ListBuckets` is not a `FileSystem` operation, and would not be — a volume is
 /// mounted *at* a bucket. If the corpus is rebuilt and this name goes away, the
 /// first assertion says so; the current list comes from a signed `GET /s3/`.
 const BUCKET: &str = "redwood-redwood";

@@ -1,4 +1,4 @@
-//! Concrete [`Mountable`](super::Mountable) stores.
+//! Concrete [`FileSystem`](super::FileSystem) stores.
 //!
 //! The two that need nothing outside `std` are always here. A store that reaches the network is
 //! behind its own feature, for the reason the crate has no default features at all: `s3` costs
