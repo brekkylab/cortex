@@ -3,19 +3,15 @@ name = "cortex"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "apply_krun"
-required-features = ["krun"]
-
 # Serves both host bindings from one file, so no `required-features`: the key is
 # AND, so it cannot say "fuse or fuse-t", and naming either would lock the other
 # out. The example carries a no-feature `main` instead.
 [[example]]
 name = "mount_host"
 
-# Measures the read sizes a kernel asks for, for the S3 read-ahead window.
+# What each of FUSE-T's three transports asks a store for, side by side.
 [[example]]
-name = "measure_read_sizes"
+name = "compare_fuse_t_backends"
 required-features = ["fuse-t"]
 
 [build-dependencies]
@@ -24,10 +20,6 @@ pkg-config = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
-# The volume traits are async and object-safe at once, which native `async fn` in
-# traits is not — so their futures are boxed. Unconditional: those traits are the
-# volume half's spine, not something a feature turns on.
-async-trait = { workspace = true }
 # The console wire. The protocol's shape needs a *self-describing* codec — `params`
 # and `result` are typed by a method that may arrive after them, and `result` xor
 # `error` is decided by which member is present — and BSON is the self-describing
@@ -38,24 +30,22 @@ bson = { workspace = true }
 futures-core = { workspace = true }
 fuser = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
-msb_krun = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "process", "rt", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-# No *binding* by default. The crate's own layers — `Mountable`, `Workspace`, the
+# No *binding* by default. The crate's own layers — `Mountable`, `WorkFs`, the
 # inode bookkeeping, the console — need nothing, and each interface binding brings
-# a heavy dependency: enabling any by default charges every consumer for it. A
-# consumer that mounts over HTTP has no reason to compile a hypervisor.
+# a libfuse provider with it: enabling one by default charges every consumer for
+# it. A consumer that mounts over HTTP has no reason to link libfuse.
 #
 # Count them with
 #
@@ -89,20 +79,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Editors default to no features too, so a binding shows as inactive code until
 # its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
 default = []
-# Every binding below also asks for `tokio/rt-multi-thread` and `tokio/net`: a
-# binding is a *synchronous* callback over async backends, so it blocks on one
-# process-wide runtime (`volume::adapter::block_on`), and `Builder::enable_all` is
+# Both bindings below also ask for `tokio/rt-multi-thread` and `tokio/net`: a
+# binding is a *synchronous* callback over async stores, so it blocks on one
+# process-wide runtime (`fs::mounts::block_on`), and `Builder::enable_all` is
 # cfg'd on `net` and `time` — built without them the runtime silently has no I/O
 # driver. `time` is already in the base set the console asks for.
-#
-# Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
-krun = [
-    "dep:msb_krun",
-    "dep:libc",
-    "dep:tempfile",
-    "tokio/net",
-    "tokio/rt-multi-thread",
-]
 # Mount a cortex filesystem on the host through FUSE.
 #
 # Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
@@ -121,7 +102,7 @@ fuse = ["dep:fuser", "dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # who drives the session: `fuser` reads the FUSE protocol off the mount fd
 # itself, while FUSE-T hands back a socket to its own helper and expects to drive
 # the filesystem through libfuse-t's loop. Enabling both at once is fine — they
-# are independent call surfaces over the same `PosixFs`.
+# are independent call surfaces over the same `Posix`.
 fuse-t = ["dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # Compile and unit-test the FUSE adapter with no libfuse provider installed:
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.

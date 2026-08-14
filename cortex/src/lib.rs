@@ -1,23 +1,20 @@
 //! Two halves. They share a vocabulary for describing a namespace, and no behaviour.
 //!
-//! * [`volume`] — expose any path-addressed store as a real filesystem. A store
-//!   implements [`Mountable`](volume::Mountable) and a binding puts it in front of a
-//!   concrete interface: a host FUSE mount, a guest microVM's virtio-fs, whatever else
-//!   addresses files by path. `volume/ARCHITECTURE.md` has the long form.
+//! * [`fs`] — expose any path-addressed store as a real filesystem. A store implements
+//!   [`Mountable`](fs::Mountable) and a binding puts it in front of a concrete
+//!   interface: a host FUSE mount, a guest microVM's virtio-fs, whatever else addresses
+//!   files by path. `fs/ARCHITECTURE.md` has the long form.
 //! * [`console`] — run commands somewhere else, over one JSON-RPC channel, with the
 //!   executables only *this* side knows how to run reachable from inside that somewhere
 //!   else. `console/ARCHITECTURE.md` has the long form.
 //!
-//! What they share is a crate, an error type, and one vocabulary:
-//! [`Init`](console::Init) carries a [`WorkspaceSpec`](volume::WorkspaceSpec), and both ends
-//! call [`Workspace::from_spec`](volume::Workspace::from_spec) to build their own live tree —
-//! which is what makes a path mean the same thing to a command and to the delegated executable
-//! it invoked.
-//!
-//! That is data, not behaviour, and the distinction is the arrangement: nothing in [`console`]
-//! builds a workspace, calls [`Mountable`](volume::Mountable) or touches an adapter. **A
-//! backend that projects a volume into its sandbox is built on top of both**, which is what
-//! `cortex-local-console` and `cortex-uvm-console` are.
+//! What they share is a crate and an error vocabulary, and nothing else: nothing in [`console`]
+//! builds a tree, calls [`Mountable`](fs::Mountable) or touches a binding, and nothing in
+//! [`fs`] knows a console exists. **A backend that projects a filesystem into its sandbox is
+//! built on top of both** — which is what `cortex-local-console` and `cortex-uvm-console` are,
+//! and why both are out of the workspace while each decides its own way through the current
+//! `fs`: a tree is mounted by whoever wants one, not described on the wire and realized at the
+//! far end.
 //!
 //! # The file layout
 //!
@@ -36,10 +33,8 @@
 pub mod console;
 mod error;
 pub mod executable;
+pub mod fs;
 mod lock;
-#[cfg(test)]
-mod test_support;
-pub mod volume;
 
 pub use error::*;
 

@@ -1,7 +1,7 @@
 //! Mount a cortex filesystem on the host and leave it up until interrupted.
 //!
-//! The host counterpart of `src/bin/apply_krun.rs`: same `Workspace`, same
-//! `PosixFs`, a different interface in front of it.
+//! The host counterpart of `src/bin/apply_krun.rs`: same `WorkFs`, same `Posix`, a different
+//! interface in front of it.
 //!
 //! One example for both host bindings, because the only difference between them
 //! here is which guard type is constructed, and two copies of the same program
@@ -25,37 +25,44 @@
 //! cannot say "fuse or fuse-t" and naming either would lock the other out. The
 //! no-feature build gets the `main` at the bottom instead.
 
+#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
+use cortex::fs::FuseMount as HostMount;
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
-use cortex::volume::HostMount;
+/// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
+///
+/// A consumer cannot express this itself: features are a crate-level concept, so "whichever of
+/// the two is enabled" has no spelling outside the crate that declares them.
+#[cfg(feature = "fuse-t")]
+use cortex::fs::FuseTMount as HostMount;
 
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
 fn main() {
     use std::path::Path;
 
-    use cortex::volume::{FileExt, InMemVolume, Mountable, OpenOptions, Workspace};
+    use cortex::fs::{InMemFs, Mountable, WorkFs};
 
     let mountpoint = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: mount_host <mountpoint>   (the directory must already exist)");
         std::process::exit(2);
     });
 
-    let vol = InMemVolume::new();
-    // The `Mountable` data plane is async; drive this one-off setup on a
-    // throwaway runtime before mounting.
+    let vol = InMemFs::new();
+    // The store's data plane is async; drive this one-off setup on a throwaway runtime before
+    // mounting.
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let (file, _) = vol
-            .open(Path::new("hello.txt"), OpenOptions::create_new())
+        let hello = Path::new("hello.txt");
+        vol.create(hello).await.expect("fresh store");
+        vol.write_at(hello, b"Hello from cortex!\n", 0)
             .await
-            .expect("fresh volume");
-        file.write_all_at(b"Hello from cortex!\n", 0).await.unwrap();
+            .unwrap();
         vol.mkdir(Path::new("sub")).await.unwrap();
     });
 
-    let workspace = Workspace::new()
+    let workspace = WorkFs::new()
         .try_with_mount("", vol)
         .expect("the empty mount path never escapes the workspace root");
 
-    let mount = HostMount::spawn(workspace, &mountpoint).expect("mount");
+    let mount = HostMount::try_new(workspace, Path::new(&mountpoint)).expect("mount");
     println!("mounted at {}", mount.mountpoint().display());
     println!("  ls {mountpoint}");
     println!("  cat {mountpoint}/hello.txt");

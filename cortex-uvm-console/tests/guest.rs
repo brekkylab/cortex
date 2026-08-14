@@ -33,18 +33,14 @@ use std::process::Stdio;
 use cortex::BoxFuture;
 use cortex::console::{Console, ExecResult, ReadResult};
 use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
-use cortex::volume::Workspace;
+use cortex::fs::WorkFs;
 use tokio::process::Command;
 
 /// Reports everything it was told, so a round trip can be told from a coincidence.
 struct Report;
 
 impl Executable for Report {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        _workspace: &'a Workspace,
-    ) -> BoxFuture<'a, ExecOutput> {
+    fn exec<'a>(&'a self, call: &'a ExecCall, _workspace: &'a WorkFs) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move { ExecOutput::ok(format!("{}|{}\n", call.name, call.args.join(","))) })
     }
 }
@@ -57,11 +53,7 @@ impl Executable for Report {
 struct Where;
 
 impl Executable for Where {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        _workspace: &'a Workspace,
-    ) -> BoxFuture<'a, ExecOutput> {
+    fn exec<'a>(&'a self, call: &'a ExecCall, _workspace: &'a WorkFs) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move {
             match call.resolve(&call.args[0]) {
                 Ok(p) => ExecOutput::ok(p.to_string_lossy().into_owned()),
@@ -79,7 +71,7 @@ impl Executable for RawBytes {
     fn exec<'a>(
         &'a self,
         _call: &'a ExecCall,
-        _workspace: &'a Workspace,
+        _workspace: &'a WorkFs,
     ) -> BoxFuture<'a, ExecOutput> {
         Box::pin(async move { ExecOutput::ok([0xff, 0xfe, 0x00, b'\n'].as_slice()) })
     }
@@ -135,7 +127,7 @@ impl Fixture {
     /// Distinct from [`with_env`](Self::with_env) because it goes over the channel and not
     /// through the server's environment — the two were the same thing when a workspace was
     /// a host path pair, and are not now.
-    async fn with_volumes(volumes: cortex::volume::WorkspaceSpec) -> Fixture {
+    async fn with_volumes(volumes: cortex::fs::WorkspaceSpec) -> Fixture {
         let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
         server.stderr(Stdio::inherit());
         let client =
@@ -183,16 +175,16 @@ impl Fixture {
 /// The same claim `cortex-local-console`'s suite makes, and it has to be: a client cannot
 /// tell which backend answered it, so `-32008` has to mean the same thing on both. It did
 /// not. Realization happens in the boot child, which writes its failure to its own stderr
-/// and exits, so every distinction `Workspace::from_spec` draws reached a client as one
+/// and exits, so every distinction `WorkFs::from_spec` draws reached a client as one
 /// undifferentiated "the guest closed the channel" answered `BOOT_FAILED`.
 ///
 /// **Not** `#[ignore]`d, because nothing here boots: the point is that the spec is refused
 /// before a VM is worth starting. If this ever needs libkrunfw, the check moved.
 #[tokio::test]
 async fn a_volume_kind_this_build_cannot_realize_is_refused_before_a_vm_is_started() {
-    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+    let mut fx = Fixture::with_volumes(cortex::fs::WorkspaceSpec::default().mount(
         "docs",
-        cortex::volume::VolumeSpec::Notion(cortex::volume::NotionConfig {
+        cortex::fs::VolumeSpec::Notion(cortex::fs::NotionConfig {
             api_key: "a".into(),
         }),
     ))
@@ -311,9 +303,9 @@ async fn a_workspace_is_the_same_tree_on_both_sides() {
 
     // Declared by the client, over the channel. The server has no environment saying
     // anything about a workspace, which is the change this asserts.
-    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+    let mut fx = Fixture::with_volumes(cortex::fs::WorkspaceSpec::default().mount(
         "",
-        cortex::volume::VolumeSpec::Local {
+        cortex::fs::VolumeSpec::Local {
             host: dir.path().to_path_buf(),
         },
     ))
@@ -353,9 +345,9 @@ async fn a_named_mount_lands_where_the_spec_said() {
     let docs = tempfile::tempdir().expect("a temp directory");
     std::fs::write(docs.path().join("note.md"), b"# note\n").expect("writing a file");
 
-    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+    let mut fx = Fixture::with_volumes(cortex::fs::WorkspaceSpec::default().mount(
         "docs",
-        cortex::volume::VolumeSpec::Local {
+        cortex::fs::VolumeSpec::Local {
             host: docs.path().to_path_buf(),
         },
     ))
@@ -386,9 +378,9 @@ async fn a_delegated_call_resolves_what_the_guest_command_would_have() {
     let dir = tempfile::tempdir().expect("a temp directory");
     std::fs::create_dir(dir.path().join("sub")).expect("a subdirectory");
 
-    let mut fx = Fixture::with_volumes(cortex::volume::WorkspaceSpec::default().mount(
+    let mut fx = Fixture::with_volumes(cortex::fs::WorkspaceSpec::default().mount(
         "work",
-        cortex::volume::VolumeSpec::Local {
+        cortex::fs::VolumeSpec::Local {
             host: dir.path().to_path_buf(),
         },
     ))

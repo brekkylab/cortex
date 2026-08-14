@@ -3,13 +3,10 @@ name = "cortex-local-console"
 version.workspace = true
 edition.workspace = true
 
-[features]
-default = []
-# Mount a declared namespace where commands can see it. Without either, a session that
-# declares volumes is answered MOUNT_FAILED — a console that only delegates needs neither,
-# and neither is cheap (see cortex's own [features] for what each binding costs).
-fuse = ["cortex/fuse"]
-fuse-t = ["cortex/fuse-t"]
+# No features. There were two — `fuse` and `fuse-t`, to mount a namespace a client declared on
+# `init` where commands could see it — and both went with the declaration: `cortex::fs` no longer
+# carries a tree over the wire, so this backend has nothing to mount and needs no binding to
+# mount it with. Wiring the two halves back together is its own piece of work.
 
 [dependencies]
 anyhow = { workspace = true }

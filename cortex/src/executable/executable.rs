@@ -1,6 +1,6 @@
 use futures_core::future::BoxFuture;
 
-use crate::volume::Workspace;
+use crate::fs::WorkFs;
 
 /// What a delegated executable was asked to do.
 #[derive(Clone, Debug)]
@@ -98,17 +98,13 @@ impl ExecResult {
 ///
 /// A shared borrow, because mounting is not a delegated name's to do. Everything a
 /// name does *to files* — stat, list, open, read, write, rename — is a
-/// [`Mountable`](crate::volume::Mountable) operation on `&self`, while
-/// [`mount`](Workspace::mount) needs `&mut self` and would rewrite the namespace an
+/// [`Mountable`](crate::fs::Mountable) operation on `&self`, while
+/// [`mount`](WorkFs::mount) needs `&mut self` and would rewrite the namespace an
 /// execution is already running against.
 ///
 /// [`ExecutableSet`]: super::ExecutableSet
 pub trait Executable: Send + Sync {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        workspace: &'a Workspace,
-    ) -> BoxFuture<'a, ExecResult>;
+    fn exec<'a>(&'a self, call: &'a ExecCall, workspace: &'a WorkFs) -> BoxFuture<'a, ExecResult>;
 }
 
 #[cfg(test)]

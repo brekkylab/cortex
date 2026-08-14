@@ -1,4 +1,4 @@
-//! A read-oriented [`Mountable`] backend over a Notion workspace.
+//! A read-oriented [`Mountable`] store over a Notion workspace.
 //!
 //! Notion pages/blocks are projected onto a filesystem tree:
 //! ```text
@@ -8,15 +8,14 @@
 //! `/pages` lists only top-level (workspace) pages; the `<page-id>` is the part
 //! after the last `__`. `page.json` is rendered on read.
 //!
-//! The Notion API is async (reqwest) and so is this backend — each `Mountable`
-//! op `.await`s the client directly; no runtime lives here. A `page.json`'s
-//! bytes are rendered once and cached briefly so a `stat` + `open` pair costs
-//! one render, and both can report the real size a guest kernel needs (no
-//! `direct_io` here).
+//! The Notion API is async (reqwest) and so is this store — each operation `.await`s the
+//! client directly; no runtime lives here. A `page.json`'s bytes are rendered once and cached
+//! briefly, so the `stat` that reports a size and the reads that follow it cost one render
+//! between them — which is what lets a guest kernel see the real size (no `direct_io` here).
 //!
-//! Read-only: page/block writes and the domain command channel are not exposed.
-//! Writes surface as [`CortexError::ReadOnly`] (not `Unsupported`) so one
-//! read-only source does not disable writes for a whole workspace mount.
+//! Read-only: page/block writes and the domain command channel are not exposed. Every
+//! mutating method keeps [`Mountable`]'s `ReadOnlyFilesystem` default rather than answering
+//! `Unsupported`, so one read-only source does not disable writes for a whole mount.
 
 use std::{
     collections::HashMap,
@@ -26,13 +25,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use async_trait::async_trait;
 use serde_json::{Value, json};
 
-use crate::volume::{
-    Dirent, DirentKind, FileExt, FileHandle, Mountable, NotionConfig, OpenOptions, Stat,
-};
-use crate::{CortexError, Result};
+use crate::BoxFuture;
+use crate::fs::{Dirent, DirentKind, Mountable, Stat};
 
 const API: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2022-06-28";
@@ -47,6 +43,22 @@ const RENDER_TTL: Duration = Duration::from_secs(15);
 
 // `NotionConfig` lives in `volume/spec.rs`, for the reason `S3Config` does: a build
 // without this feature still parses a spec that names a Notion volume.
+
+/// Connection settings for a [`NotionFs`].
+///
+/// Redacted in `Debug` for the reason [`S3Config`](crate::fs::S3Config) is.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NotionConfig {
+    pub api_key: String,
+}
+
+impl std::fmt::Debug for NotionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NotionConfig")
+            .field("api_key", &"[redacted]")
+            .finish()
+    }
+}
 
 /// A rendered `page.json`: its bytes plus the page's timestamps.
 #[derive(Clone)]
@@ -65,16 +77,18 @@ impl Rendered {
     }
 }
 
-/// A Notion-backed volume.
-pub struct NotionVolume {
+/// A Notion workspace's pages, served as a tree.
+///
+/// Read-only. Each `page.json` is rendered on read; the module doc has the layout.
+pub struct NotionFs {
     client: reqwest::Client,
     api_key: String,
-    /// `page-id -> (fetched-at, rendered)`, evicted after [`RENDER_TTL`].
+    /// `page-id -> (fetched-at, rendered)`, evicted after `RENDER_TTL`.
     cache: Mutex<HashMap<String, (Instant, Rendered)>>,
 }
 
-impl NotionVolume {
-    pub fn new(cfg: &NotionConfig) -> Result<Self> {
+impl NotionFs {
+    pub fn new(cfg: &NotionConfig) -> io::Result<Self> {
         // Bound every request: a hung upstream call would otherwise wedge the FUSE
         // op (and any process touching the mount) indefinitely. The client builds
         // synchronously; requests run later on whatever runtime drives the async
@@ -83,7 +97,7 @@ impl NotionVolume {
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
             .build()
-            .map_err(|e| CortexError::Io(io::Error::other(e)))?;
+            .map_err(io::Error::other)?;
         Ok(Self {
             client,
             api_key: cfg.api_key.clone(),
@@ -98,7 +112,7 @@ impl NotionVolume {
             .header("Notion-Version", NOTION_VERSION)
     }
 
-    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Value> {
+    async fn send(&self, req: reqwest::RequestBuilder) -> io::Result<Value> {
         // `attempt` indexes `RETRY_BACKOFF`, but the range is `0..=len` (one past,
         // the final no-backoff try) and the index also gates that last attempt, so
         // an `.iter()` rewrite would not capture the loop — keep the range.
@@ -124,7 +138,7 @@ impl NotionVolume {
     }
 
     /// Pages shared with the integration (search filtered to pages), all pages.
-    async fn search_pages(&self) -> Result<Vec<Value>> {
+    async fn search_pages(&self) -> io::Result<Vec<Value>> {
         let mut results = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
@@ -152,18 +166,18 @@ impl NotionVolume {
         Ok(results)
     }
 
-    async fn get_page(&self, id: &str) -> Result<Value> {
+    async fn get_page(&self, id: &str) -> io::Result<Value> {
         if !valid_notion_id(id) {
-            return Err(CortexError::NotFound);
+            return Err(io::ErrorKind::NotFound.into());
         }
         self.send(self.client.get(format!("{API}/pages/{id}")))
             .await
     }
 
     /// All immediate block children of `id`, paging through every result.
-    async fn list_children(&self, id: &str) -> Result<Vec<Value>> {
+    async fn list_children(&self, id: &str) -> io::Result<Vec<Value>> {
         if !valid_notion_id(id) {
-            return Err(CortexError::NotFound);
+            return Err(io::ErrorKind::NotFound.into());
         }
         let mut results = Vec::new();
         let mut cursor: Option<String> = None;
@@ -202,7 +216,8 @@ impl NotionVolume {
         &'a self,
         id: String,
         depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<Value>>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = io::Result<Vec<Value>>> + Send + 'a>>
+    {
         Box::pin(async move {
             let mut blocks = self.list_children(&id).await?;
             if depth >= MAX_BLOCK_DEPTH {
@@ -234,7 +249,7 @@ impl NotionVolume {
     // ---- Render + cache ------------------------------------------------------
 
     /// The rendered `page.json` for `page_id`, served from cache when fresh.
-    async fn render_cached(&self, page_id: &str) -> Result<Rendered> {
+    async fn render_cached(&self, page_id: &str) -> io::Result<Rendered> {
         if let Some((at, r)) = self.cache.lock().unwrap().get(page_id)
             && at.elapsed() < RENDER_TTL
         {
@@ -257,7 +272,7 @@ impl NotionVolume {
     }
 
     /// Top-level (workspace) pages as `<title>__<id>` dir entries.
-    async fn top_level_page_dirs(&self) -> Result<Vec<Dirent>> {
+    async fn top_level_page_dirs(&self) -> io::Result<Vec<Dirent>> {
         let pages = self.search_pages().await?;
         Ok(pages
             .iter()
@@ -272,7 +287,7 @@ impl NotionVolume {
     }
 
     /// Contents of a page dir: `page.json` plus a subdir per `child_page` block.
-    async fn page_dir_entries(&self, page_id: &str) -> Result<Vec<Dirent>> {
+    async fn page_dir_entries(&self, page_id: &str) -> io::Result<Vec<Dirent>> {
         let blocks = self.list_children(page_id).await?;
         let mut out = vec![Dirent::new("page.json", DirentKind::File)];
         for b in &blocks {
@@ -294,135 +309,112 @@ impl NotionVolume {
     }
 }
 
-#[async_trait]
-impl Mountable for NotionVolume {
-    type Handle = NotionHandle;
-
-    async fn stat(&self, path: &Path) -> Result<Stat> {
-        let segs = segments(path);
-        match segs.as_slice() {
-            [] => Ok(Stat::new(DirentKind::Dir, 0)),
-            [p] if p == "pages" => Ok(Stat::new(DirentKind::Dir, 0)),
-            [p, rest @ ..] if p == "pages" && !rest.is_empty() => {
-                let is_json = rest.last().map(String::as_str) == Some("page.json");
-                let dir = if is_json {
-                    // `/pages/page.json` has no enclosing page dir.
-                    let Some(dir) = rest.iter().nth_back(1) else {
-                        return Err(CortexError::NotFound);
+/// Three methods, which is all a read-only store implements: everything that would change
+/// something keeps the trait's `ReadOnlyFilesystem` default, and a caller hears that on the
+/// write rather than on the open — there being no open to hear it on.
+impl Mountable for NotionFs {
+    fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
+        Box::pin(async move {
+            let segs = segments(path);
+            match segs.as_slice() {
+                [] => Ok(Stat::new(DirentKind::Dir, 0)),
+                [p] if p == "pages" => Ok(Stat::new(DirentKind::Dir, 0)),
+                [p, rest @ ..] if p == "pages" && !rest.is_empty() => {
+                    let is_json = rest.last().map(String::as_str) == Some("page.json");
+                    let dir = if is_json {
+                        // `/pages/page.json` has no enclosing page dir.
+                        let Some(dir) = rest.iter().nth_back(1) else {
+                            return Err(io::ErrorKind::NotFound.into());
+                        };
+                        dir.as_str()
+                    } else {
+                        rest.last().unwrap().as_str()
                     };
-                    dir.as_str()
-                } else {
-                    rest.last().unwrap().as_str()
-                };
-                let id = page_id(dir);
-                if is_json {
-                    // Render so the guest kernel sees the real size (no direct_io).
-                    Ok(self.render_cached(&id).await?.stat())
-                } else {
-                    // Confirm the page dir exists (and pick up its times) cheaply.
-                    let page = self.get_page(&id).await?;
-                    let mut st = Stat::new(DirentKind::Dir, 0);
-                    st.mtime = page_time(&page, "last_edited_time");
-                    st.ctime = page_time(&page, "created_time");
-                    Ok(st)
+                    let id = page_id(dir);
+                    if is_json {
+                        // Render so the guest kernel sees the real size (no direct_io).
+                        Ok(self.render_cached(&id).await?.stat())
+                    } else {
+                        // Confirm the page dir exists (and pick up its times) cheaply.
+                        let page = self.get_page(&id).await?;
+                        let mut st = Stat::new(DirentKind::Dir, 0);
+                        st.mtime = page_time(&page, "last_edited_time");
+                        st.ctime = page_time(&page, "created_time");
+                        Ok(st)
+                    }
                 }
+                _ => Err(io::ErrorKind::NotFound.into()),
             }
-            _ => Err(CortexError::NotFound),
-        }
+        })
     }
 
-    async fn list(&self, path: &Path) -> Result<Vec<Dirent>> {
-        let segs = segments(path);
-        match segs.as_slice() {
-            [] => Ok(vec![Dirent::new("pages", DirentKind::Dir)]),
-            [p] if p == "pages" => self.top_level_page_dirs().await,
-            [p, rest @ ..] if p == "pages" && !rest.is_empty() => {
-                let last = rest.last().unwrap();
-                if last == "page.json" {
-                    return Err(CortexError::NotADirectory);
+    fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
+        Box::pin(async move {
+            let segs = segments(path);
+            match segs.as_slice() {
+                [] => Ok(vec![Dirent::new("pages", DirentKind::Dir)]),
+                [p] if p == "pages" => self.top_level_page_dirs().await,
+                [p, rest @ ..] if p == "pages" && !rest.is_empty() => {
+                    let last = rest.last().unwrap();
+                    if last == "page.json" {
+                        return Err(io::ErrorKind::NotADirectory.into());
+                    }
+                    self.page_dir_entries(&page_id(last)).await
                 }
-                self.page_dir_entries(&page_id(last)).await
+                _ => Err(io::ErrorKind::NotFound.into()),
             }
-            _ => Err(CortexError::NotFound),
-        }
+        })
     }
 
-    async fn mkdir(&self, _path: &Path) -> Result<()> {
-        Err(CortexError::ReadOnly)
-    }
-
-    async fn unlink(&self, _path: &Path) -> Result<()> {
-        Err(CortexError::ReadOnly)
-    }
-
-    async fn rmdir(&self, _path: &Path) -> Result<()> {
-        Err(CortexError::ReadOnly)
-    }
-
-    async fn open(&self, path: &Path, options: OpenOptions) -> Result<(Self::Handle, Stat)> {
-        options.validate()?;
-        if options.write || options.create || options.create_new || options.truncate {
-            return Err(CortexError::ReadOnly);
-        }
-        let segs = segments(path);
-        if segs.len() >= 3
-            && segs[0] == "pages"
-            && segs.last().map(String::as_str) == Some("page.json")
-        {
-            let id = page_id(&segs[segs.len() - 2]);
-            let r = self.render_cached(&id).await?;
-            let stat = r.stat();
-            return Ok((NotionHandle { data: r.bytes }, stat));
-        }
-        // Directories (and everything else) aren't openable as files.
-        Err(CortexError::IsADirectory)
-    }
-}
-
-/// An open `page.json`: its rendered bytes. Reads are served from memory; there
-/// is no network on the read path (render happened at `open`/`stat`).
-pub struct NotionHandle {
-    data: Arc<Vec<u8>>,
-}
-
-#[async_trait]
-impl FileExt for NotionHandle {
-    async fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
-        let data = &self.data;
-        if offset >= data.len() as u64 {
-            return Ok(0);
-        }
-        let from = offset as usize;
-        let n = (data.len() - from).min(buf.len());
-        buf[..n].copy_from_slice(&data[from..from + n]);
-        Ok(n)
-    }
-
-    async fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
-        Err(io::Error::from(io::ErrorKind::Unsupported))
-    }
-}
-
-#[async_trait]
-impl FileHandle for NotionHandle {
-    async fn truncate(&self, _size: u64) -> Result<()> {
-        Err(CortexError::ReadOnly)
+    /// Served from the render cache, which is what makes a path plane cheap here: the bytes
+    /// were produced by the [`stat`](Self::stat) that told the kernel how big the file is, and
+    /// they are still under `RENDER_TTL` when the reads arrive. A read that outlives the TTL
+    /// renders again — which is the same work the old open-and-hold did, just triggered by age
+    /// rather than by a descriptor going away.
+    fn read_at<'a>(
+        &'a self,
+        path: &'a Path,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        Box::pin(async move {
+            let segs = segments(path);
+            // `page.json` is the only file in this tree; everything else that resolves is a
+            // directory, which is what a read of one has to say.
+            if segs.len() < 3
+                || segs[0] != "pages"
+                || segs.last().map(String::as_str) != Some("page.json")
+            {
+                return Err(io::ErrorKind::IsADirectory.into());
+            }
+            let data = self
+                .render_cached(&page_id(&segs[segs.len() - 2]))
+                .await?
+                .bytes;
+            if offset >= data.len() as u64 {
+                return Ok(0);
+            }
+            let from = offset as usize;
+            let n = (data.len() - from).min(buf.len());
+            buf[..n].copy_from_slice(&data[from..from + n]);
+            Ok(n)
+        })
     }
 }
 
 // ---- helpers ----------------------------------------------------------------
 
-fn io_other<E: std::fmt::Display>(e: E) -> CortexError {
-    CortexError::Io(io::Error::other(e.to_string()))
+fn io_other<E: std::fmt::Display>(e: E) -> io::Error {
+    io::Error::other(e.to_string())
 }
 
 /// Turn a finished response into JSON, or map a non-2xx status.
-async fn finish(resp: reqwest::Response) -> Result<Value> {
+async fn finish(resp: reqwest::Response) -> io::Result<Value> {
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
     if !status.is_success() {
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(CortexError::NotFound);
+            return Err(io::ErrorKind::NotFound.into());
         }
         return Err(io_other(format!("notion API {status}: {body}")));
     }
@@ -725,77 +717,5 @@ fn blocks_to_markdown(blocks: &[Value]) -> String {
         String::new()
     } else {
         format!("{}\n", lines.join("\n\n"))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn notion_id_validation_rejects_url_escapes() {
-        assert!(valid_notion_id("22222222222222222222222222222222"));
-        assert!(valid_notion_id("22222222-2222-2222-2222-222222222222"));
-        for bad in ["../pages/2222?", "..%2Fpages", "abc/def", "x?y", "x#y", ""] {
-            assert!(!valid_notion_id(bad), "should reject {bad:?}");
-        }
-    }
-
-    #[test]
-    fn page_id_is_after_last_dunder() {
-        assert_eq!(page_id("My_Title__abc123"), "abc123");
-        assert_eq!(page_id("a__b__c"), "c");
-        assert_eq!(page_id("no-dunder"), "no-dunder");
-    }
-
-    /// Live smoke check: reads real pages through the Notion API. Ignored by
-    /// default; run explicitly with a token shared with the target pages:
-    ///
-    ///   NOTION_API_KEY=ntn_… cargo test -p cortex --features notion \
-    ///     notion_live_read -- --ignored --nocapture
-    #[tokio::test]
-    #[ignore = "requires NOTION_API_KEY + network"]
-    async fn notion_live_read() {
-        let api_key =
-            std::env::var("NOTION_API_KEY").expect("set NOTION_API_KEY to run this live check");
-        let vol = NotionVolume::new(&NotionConfig { api_key }).expect("build NotionVolume");
-
-        let root = vol.list(Path::new("/")).await.expect("list /");
-        let root_names: Vec<_> = root.iter().map(|e| e.name.clone()).collect();
-        println!("root: {root_names:?}");
-        assert!(root_names.iter().any(|n| n == "pages"));
-
-        let pages = vol.list(Path::new("/pages")).await.expect("list /pages");
-        println!("{} top-level page dir(s):", pages.len());
-        for p in &pages {
-            println!("  - {}", p.name);
-        }
-        let Some(first) = pages.first() else {
-            println!("no pages shared with this integration — share a page and retry");
-            return;
-        };
-        let dir = &first.name;
-
-        let json_path = format!("/pages/{dir}/page.json");
-        let st = vol
-            .stat(Path::new(&json_path))
-            .await
-            .expect("stat page.json");
-        assert_eq!(st.kind, DirentKind::File);
-        assert!(st.size > 0, "page.json size should be non-zero");
-
-        let (h, ost) = vol
-            .open(Path::new(&json_path), OpenOptions::read_only())
-            .await
-            .expect("open page.json");
-        assert_eq!(ost.size, st.size, "open stat size == stat size");
-        let mut buf = vec![0u8; ost.size as usize];
-        h.read_exact_at(&mut buf, 0).await.expect("read page.json");
-        let text = String::from_utf8_lossy(&buf);
-        println!("--- {json_path} ({} bytes) ---", buf.len());
-        println!("{}", &text[..text.len().min(1500)]);
-        for key in ["page_id", "title", "markdown", "blocks"] {
-            assert!(text.contains(key), "page.json should contain {key:?}");
-        }
     }
 }

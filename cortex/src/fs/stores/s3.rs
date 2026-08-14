@@ -1,0 +1,663 @@
+//! A read-only [`Mountable`] store over an object store (S3 and compatibles).
+//!
+//! Object keys map to paths and a directory is a key prefix — that is the whole of the
+//! mapping. There is no directory object to create or remove; two keys sharing a prefix *are*
+//! a directory. Metadata comes from `head`, listings from `list_with_delimiter`, and file data
+//! from ranged GETs.
+//!
+//! # Read-only, and why that is a design rather than an omission
+//!
+//! [`Mountable::write_at`] addresses a byte offset. Answering that over S3 means reading the
+//! whole object, patching it, and putting it back — `object_store` does not expose a byte-range
+//! patch, and its multipart API requires parts of at least 5 MiB where a guest's writes are at
+//! most 1 MiB. So a write needs staging, with a ceiling on it (a guest picks the offset, so an
+//! allocation sized from one is a guest-chosen allocation).
+//!
+//! And staging needs somewhere to end: a multipart upload has to be *completed*, and this trait
+//! has no signal for when a writer is done (see *Durability* on [`Mountable`]). That is a
+//! separate piece of work, waiting on a design that has one. Every write here keeps the trait's
+//! `ReadOnlyFilesystem` default.
+//!
+//! `ReadOnlyFilesystem` and not [`Unsupported`](io::ErrorKind::Unsupported): the store *could*
+//! write, it is this implementation that will not, and userspace acts on the difference.
+//!
+//! # Async
+//!
+//! `object_store` is async and so is [`Mountable`], so each operation `.await`s the client
+//! directly — no runtime lives here. An async-native consumer drives it with its own runtime; a
+//! sync interface binding (fuse/fuse-t) `block_on`s at its callback boundary.
+
+use std::{
+    collections::{BTreeSet, HashMap, VecDeque},
+    io,
+    path::{Component, Path},
+    sync::{Arc, Mutex},
+};
+
+use object_store::{
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt, aws::AmazonS3Builder,
+    path::Path as OsPath,
+};
+
+use crate::BoxFuture;
+use crate::fs::{Dirent, DirentKind, Mountable, Stat};
+use crate::lock::lock;
+
+// `S3Config` lives in `volume/spec.rs`, not here. It is a wire type: a build without
+// this feature still has to parse a spec that names an S3 volume, so the settings
+// cannot be behind the feature the *provider* is behind. Its hand-written `Debug`,
+// which redacts the secret, went with it.
+
+/// Connection settings for an [`S3Fs`].
+///
+/// `Serialize` because a caller may well keep its configuration in a file. The hand-written
+/// `Debug` below redacts the secret, because a log is not that file.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    /// Custom endpoint (MinIO / R2 / localstack); `None` for real AWS.
+    pub endpoint: Option<String>,
+    /// Key prefix every path is rooted under. Composes with whatever mount path a
+    /// [`WorkFs`](crate::fs::WorkFs) puts this store at: the mount table strips its own path
+    /// first, then this prefix is prepended.
+    pub key_prefix: Option<String>,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[redacted]")
+            .field("endpoint", &self.endpoint)
+            .field("key_prefix", &self.key_prefix)
+            .finish()
+    }
+}
+
+/// An object store's keys, served as a tree.
+///
+/// Read-only, and the module doc says why that is a design rather than an omission.
+pub struct S3Fs {
+    store: Arc<dyn ObjectStore>,
+    /// Normalised to carry no leading or trailing `/`, so [`Self::key`] can join
+    /// with `/` unconditionally.
+    prefix: String,
+    /// What reads have learned about keys, and what they read ahead into.
+    ///
+    /// Taken through [`lock`], which ignores poisoning: a panic anywhere else must not turn
+    /// every later read into a panic of its own. Under krun there is one worker thread, so
+    /// that would take the whole virtio-fs device down.
+    windows: Mutex<Windows>,
+}
+
+impl S3Fs {
+    /// Build an S3 client from `cfg`.
+    pub fn new(cfg: &S3Config) -> io::Result<Self> {
+        let mut builder = AmazonS3Builder::new()
+            .with_bucket_name(&cfg.bucket)
+            .with_region(&cfg.region)
+            .with_access_key_id(&cfg.access_key_id)
+            .with_secret_access_key(&cfg.secret_access_key);
+        if let Some(endpoint) = &cfg.endpoint {
+            builder = builder.with_endpoint(endpoint).with_allow_http(true);
+        }
+        // Synchronous — the builder just assembles config; requests run later on
+        // whatever runtime drives the async ops.
+        let store = builder.build().map_err(to_io_error)?;
+        Ok(Self::with_store(
+            Arc::new(store),
+            cfg.key_prefix.clone().unwrap_or_default(),
+        ))
+    }
+
+    /// Wrap an already-built store.
+    ///
+    /// Deliberately not `pub`. Widening it would let this type be assembled over
+    /// any `ObjectStore` — GCS, Azure, even `LocalFileSystem` — which may well be
+    /// worth doing, but not under the name `S3Fs` and not without its own
+    /// design pass. Tests reach it as a sibling module.
+    fn with_store(store: Arc<dyn ObjectStore>, prefix: String) -> Self {
+        S3Fs {
+            prefix: prefix.trim_matches('/').to_string(),
+            store,
+            windows: Mutex::default(),
+        }
+    }
+
+    /// Confirm the bucket answers, for a caller that wants to fail at mount time.
+    ///
+    /// One listing. A misconfigured bucket, region, endpoint or key is otherwise
+    /// invisible until something reads the mount, and it arrives there as `EIO` on
+    /// every `stat` — an object store reports a failed listing without a status code,
+    /// so there is nothing finer to say later either.
+    ///
+    /// Deliberately not folded into [`Self::new`]. Building the client is offline and
+    /// stays that way: a caller choosing among credentials — or probing what a
+    /// principal may read — needs to construct a volume without a request going out,
+    /// and folding this in would make "cannot build a client" and "cannot read the
+    /// bucket" the same `Err`.
+    ///
+    /// It does not cover credentials that expire mid-session; nothing at mount time
+    /// can.
+    pub async fn check_reachable(&self) -> io::Result<()> {
+        self.list(Path::new("")).await?;
+        Ok(())
+    }
+
+    /// Map a request path to an object key, rooted under [`S3Config::key_prefix`].
+    ///
+    /// `..` and OS prefixes are rejected rather than resolved, so a request can
+    /// never address a key outside the configured prefix — the same rule
+    /// [`PassthroughFs`] applies to its root.
+    fn key(&self, path: &Path) -> io::Result<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        if !self.prefix.is_empty() {
+            parts.extend(self.prefix.split('/').filter(|s| !s.is_empty()));
+        }
+        for comp in path.components() {
+            match comp {
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(name) => parts.push(
+                    name.to_str()
+                        .ok_or(io::Error::from(io::ErrorKind::InvalidFilename))?,
+                ),
+                Component::ParentDir | Component::Prefix(_) => {
+                    return Err(io::ErrorKind::InvalidFilename.into());
+                }
+            }
+        }
+        Ok(parts.join("/"))
+    }
+}
+
+/// Parse a key into the store's own path type.
+///
+/// `Path::parse` preserves bytes that are special in a URL (`%`, `#`, …), so a key
+/// surfaced by a listing round-trips to the same object on read.
+fn os_path(key: &str) -> io::Result<OsPath> {
+    OsPath::parse(key).map_err(|_| io::ErrorKind::InvalidFilename.into())
+}
+
+/// Translate an object-store error into the kind this crate answers with.
+///
+/// Every variant that exists today is named, the way the errno tables in the bindings are.
+/// Unlike those, the wildcard is **required**: `object_store::Error` is `#[non_exhaustive]`,
+/// so an external crate cannot match it exhaustively — a variant added upstream falls to the
+/// catch-all and reaches userspace as `EIO`.
+///
+/// Anything not classified is wrapped with `io::Error::other`, never with a raw OS error:
+/// `host_errno` forwards `raw_os_error()` when there is one, so a preserved transport errno
+/// would reach userspace as itself rather than as `EIO`. Wrapping also keeps the upstream
+/// error as the `source`, which a classified kind on its own would drop.
+fn to_io_error(err: object_store::Error) -> io::Error {
+    use object_store::Error;
+    let kind = match &err {
+        Error::NotFound { .. } => io::ErrorKind::NotFound,
+        Error::AlreadyExists { .. } => io::ErrorKind::AlreadyExists,
+        Error::InvalidPath { .. } => io::ErrorKind::InvalidFilename,
+        Error::PermissionDenied { .. } => io::ErrorKind::PermissionDenied,
+        // Credentials missing or expired. A claim about the caller, not about the filesystem,
+        // so not `Unsupported`; `EACCES` is what userspace can act on.
+        Error::Unauthenticated { .. } => io::ErrorKind::PermissionDenied,
+        Error::UnknownConfigurationKey { .. } => io::ErrorKind::InvalidInput,
+        // These two *are* claims about the filesystem — the store cannot do the operation at
+        // all — which is what `Unsupported` means.
+        Error::NotSupported { .. } => io::ErrorKind::Unsupported,
+        Error::NotImplemented { .. } => io::ErrorKind::Unsupported,
+        // `Precondition`/`NotModified` are only reachable once this store sends conditional
+        // requests, which it does not. Left unclassified with the rest: the right answer
+        // would be `ESTALE`, which `io::ErrorKind` has no name for.
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, err)
+}
+
+/// Read-ahead window size. One miss fetches this much and serves subsequent reads
+/// inside it from memory, which is the difference between one round trip and one
+/// per request — a guest asks in 128 KiB pieces at most (32 KiB through FUSE-T).
+const READAHEAD_CHUNK: u64 = 8 << 20;
+
+/// How many keys may hold a read-ahead window at once, which is what bounds this store's
+/// memory: at most this many times [`READAHEAD_CHUNK`], so 64 MiB.
+///
+/// A cap is needed *because* the windows are keyed by path rather than by an open. A
+/// per-open window is bounded by however many files a consumer has open at once — which is
+/// to say, not bounded at all, only invisible. This one is a number.
+const MAX_CACHED_KEYS: usize = 8;
+
+/// What the store remembers about one key between reads.
+struct ReadCache {
+    /// Size as of the `head` that filled this entry.
+    ///
+    /// Held so a read past the end answers without a round trip, and so ranges can be
+    /// clamped rather than sent and rejected — an out-of-range GET comes back as the
+    /// generic error variant, indistinguishable from a transport failure.
+    ///
+    /// It goes stale if the object is replaced while a consumer is reading, which a
+    /// read-only mount already tolerates in its cache.
+    size: u64,
+
+    /// The last fetched window as `(start, bytes)`.
+    window: Option<(u64, Vec<u8>)>,
+
+    /// Where the previous read of this key ended, or `None` before the first one.
+    ///
+    /// This is how sequential access is recognised — a read that starts where the last one
+    /// ended earns read-ahead, anything else is served at exactly the size asked for.
+    /// Request size cannot serve as the signal: one consumer path sends a uniform size
+    /// whether access is sequential or random.
+    ///
+    /// Assigned, not folded with `max`. A monotonic value would pin itself to the highest
+    /// offset ever read, and then nothing below that can ever equal it — so a reader that
+    /// peeks at the tail once and then streams from the front (a zip's central directory, an
+    /// ELF's section headers) loses read-ahead for the whole file.
+    ///
+    /// Being per *key* rather than per open, two consumers reading one object interleave
+    /// here, and each costs the other a read-ahead. The store cannot tell them apart — a
+    /// path is not an open (see [`Mountable`]) — and the answer stays correct either way:
+    /// what a wrong guess costs is one round trip, never a wrong byte.
+    last_end: Option<u64>,
+}
+
+/// The windows, and the order to give them up in.
+#[derive(Default)]
+struct Windows {
+    by_key: HashMap<String, ReadCache>,
+
+    /// Keys in the order they were first cached, so the oldest goes first. Insertion order
+    /// rather than true LRU: the eviction it gets wrong is one round trip, and a
+    /// use-ordered queue would have to be touched on every read — under the mutex that
+    /// every read already contends for.
+    order: VecDeque<String>,
+}
+
+impl Windows {
+    /// Make room for `key` and record it, evicting the oldest entry once the cap is passed.
+    fn admit(&mut self, key: String, entry: ReadCache) {
+        self.by_key.insert(key.clone(), entry);
+        self.order.push_back(key);
+        if self.order.len() > MAX_CACHED_KEYS
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.by_key.remove(&oldest);
+        }
+    }
+}
+
+/// Everything an object's metadata says, not just its length.
+///
+/// `etag` and `version` are here because a consumer that caches needs them to
+/// revalidate, and `mtime` because a guest negotiating `AUTO_INVAL_DATA` watches it
+/// to decide when to drop cached pages — a timestamp stuck at the epoch is never
+/// invalidated.
+fn file_stat(meta: &ObjectMeta) -> Stat {
+    let mut stat = Stat::new(DirentKind::File, meta.size);
+    stat.mtime = Some(meta.last_modified.into());
+    stat.etag = meta.e_tag.clone();
+    stat.version = meta.version.clone();
+    stat
+}
+
+/// A directory, which an object store never stores. Nothing to report but the kind:
+/// a prefix has no size, and no timestamp of its own to take one from.
+fn dir_stat() -> Stat {
+    Stat::new(DirentKind::Dir, 0)
+}
+
+/// What a key turned out to be. Carries the metadata when it is a file, so a caller
+/// that needs both the verdict and the size pays for one `head`, not two.
+enum Entry {
+    File(ObjectMeta),
+    Dir,
+}
+
+/// Read a listing as an answer about children — and refuse to read a failure as one.
+///
+/// Separated from the request so the decision can be tested without a store: what
+/// matters here is not the listing but the rule that **an error is not an answer**.
+///
+/// A failed listing cannot tell a missing prefix from an unreachable store, and the
+/// two want opposite things from userspace: `ENOENT` is a durable claim it acts on
+/// permanently, `EIO` a transient one it retries. Swallowing the error and reporting
+/// "no children" would turn a store that is briefly unreachable into a file that does
+/// not exist — the same mistake the read path avoids by clamping a range rather than
+/// catching what comes back.
+fn children_from(listed: object_store::Result<object_store::ListResult>) -> io::Result<bool> {
+    let listed = listed.map_err(to_io_error)?;
+    Ok(!listed.common_prefixes.is_empty() || !listed.objects.is_empty())
+}
+
+impl S3Fs {
+    /// What a path is, in as few requests as the answer allows.
+    ///
+    /// Three answers from up to two requests:
+    ///
+    /// * an object with a body — a file, from `head` alone;
+    /// * a key that also names a prefix with children — a directory, whether or not
+    ///   an object of that exact name exists;
+    /// * neither — absent.
+    ///
+    /// The second case is why a successful `head` is not the end of it. An object
+    /// store console writes a 0-byte object to stand for a folder, and `head`
+    /// succeeds on that, so reporting what `head` said would call a directory an
+    /// empty file and leave the guest unable to descend into it. A body of any
+    /// length settles the question, which keeps the extra request to keys that are
+    /// genuinely ambiguous.
+    ///
+    /// Shared by `stat` and `open` so the two cannot disagree about a name — the
+    /// same reason `list` decides collisions from the object's size rather than by
+    /// consulting `stat`.
+    async fn classify(&self, path: &Path) -> io::Result<Entry> {
+        let key = self.key(path)?;
+        // The volume's own root is a directory by construction — there need not be
+        // any object or prefix of that name, and every mount opens by asking for it.
+        if key.is_empty() {
+            return Ok(Entry::Dir);
+        }
+        let os = os_path(&key)?;
+        match self.store.head(&os).await {
+            Ok(meta) if meta.size > 0 => Ok(Entry::File(meta)),
+            // Ambiguous: empty body, so it may be standing in for a prefix.
+            Ok(meta) => {
+                if self.has_children(&os).await? {
+                    Ok(Entry::Dir)
+                } else {
+                    Ok(Entry::File(meta))
+                }
+            }
+            // No object with that exact key. Still a directory if keys live
+            // under it — a prefix is not an object.
+            Err(object_store::Error::NotFound { .. }) => {
+                if self.has_children(&os).await? {
+                    Ok(Entry::Dir)
+                } else {
+                    Err(io::ErrorKind::NotFound.into())
+                }
+            }
+            Err(err) => Err(to_io_error(err)),
+        }
+    }
+
+    /// Whether any key lives under `prefix`.
+    ///
+    /// A listing is how this is asked, and an absent prefix answers with an empty
+    /// result rather than an error — so emptiness, not failure, is what says "no".
+    /// Without that distinction every path would look like a directory.
+    ///
+    /// An error is not read as "no children" — [`children_from`] carries that rule.
+    /// What follows from it reaches callers: a bad credential or a missing bucket
+    /// surfaces as `EIO` on any `stat` that gets here, because an object store reports
+    /// a failed listing generically whatever status came back. `head` and `get` do
+    /// carry the status, so a name that exists still answers `EACCES`.
+    async fn has_children(&self, prefix: &OsPath) -> io::Result<bool> {
+        children_from(self.store.list_with_delimiter(Some(prefix)).await)
+    }
+
+    /// Turn one listing into entries, emitting every name exactly once.
+    ///
+    /// Where a prefix and an object share a name, **the object's size decides**:
+    ///
+    /// * empty — the object is standing in for the directory, so the object goes;
+    /// * non-empty — the object is real content that cannot be hidden, so the
+    ///   *prefix* goes, and its subtree becomes unreachable.
+    ///
+    /// That asymmetry is the price of a flat namespace, and it is paid this way round
+    /// because a hidden empty file costs less than an unreachable subtree. The
+    /// alternative — always preferring the directory — would leave `stat` disagreeing
+    /// with the listing unless it re-checked for children on *every* successful
+    /// `head`, which is a second round trip on every ordinary file.
+    ///
+    /// `stat` reaches the same verdict from the same fact without consulting this
+    /// code: an empty body sends it to the children check, a non-empty one does not.
+    ///
+    /// Entries come out sorted. The kernel resumes a `readdir` by quoting a position
+    /// in this list, so the order has to be the same on the next call.
+    fn resolve_collision(listed: object_store::ListResult, marker: &str) -> Vec<Dirent> {
+        let mut dirs: BTreeSet<String> = listed
+            .common_prefixes
+            .iter()
+            .filter_map(|prefix| prefix.filename().map(str::to_owned))
+            .collect();
+
+        let mut files: Vec<(String, ObjectMeta)> = Vec::new();
+        for meta in listed.objects {
+            // The listed prefix itself, arriving as a marker object.
+            if meta.location.as_ref() == marker {
+                continue;
+            }
+            let Some(name) = meta.location.filename().map(str::to_owned) else {
+                continue;
+            };
+            if dirs.contains(&name) {
+                if meta.size == 0 {
+                    continue;
+                }
+                dirs.remove(&name);
+            }
+            files.push((name, meta));
+        }
+
+        let mut out: Vec<Dirent> = dirs
+            .into_iter()
+            .map(|name| Dirent::new(name, DirentKind::Dir))
+            .chain(
+                files
+                    .into_iter()
+                    .map(|(name, meta)| Dirent::with_stat(name, file_stat(&meta))),
+            )
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+}
+
+/// Three methods, which is all a read-only store implements: everything that would change
+/// something keeps the trait's `ReadOnlyFilesystem` default. A caller that meant to write
+/// hears it on the write rather than on an open, there being no open to hear it on.
+impl Mountable for S3Fs {
+    /// Metadata for one key, or for the prefix of that name — see `classify`.
+    fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
+        Box::pin(async move {
+            Ok(match self.classify(path).await? {
+                Entry::File(meta) => file_stat(&meta),
+                Entry::Dir => dir_stat(),
+            })
+        })
+    }
+
+    /// The entries directly under `path`.
+    ///
+    /// One request. `list_with_delimiter` rolls deeper keys into the prefix they sit in and
+    /// hands back the objects at this level with their metadata already attached, which is
+    /// what lets [`Dirent::with_stat`] answer a `readdirplus` without a `stat` per name.
+    ///
+    /// Two things have to be untangled first, both consequences of a flat key space
+    /// pretending to be a tree:
+    ///
+    /// * The listed prefix can come back as an object of its own — a folder marker. That is
+    ///   *this* directory, not something in it, so it is dropped.
+    /// * A name can arrive from both sides at once: as a prefix (because keys live under it)
+    ///   and as an object (because a key of exactly that name exists). A `readdir` may not
+    ///   repeat a name, so one side has to go — see `resolve_collision`.
+    fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
+        Box::pin(async move {
+            let key = self.key(path)?;
+            let prefix = if key.is_empty() {
+                None
+            } else {
+                Some(os_path(&key)?)
+            };
+            let listed = self
+                .store
+                .list_with_delimiter(prefix.as_ref())
+                .await
+                .map_err(to_io_error)?;
+            Ok(Self::resolve_collision(
+                listed,
+                prefix.as_ref().map(|p| p.as_ref()).unwrap_or(""),
+            ))
+        })
+    }
+
+    /// Fill `buf` from `offset`, fetching only what the cache cannot answer.
+    ///
+    /// Four things are load-bearing:
+    ///
+    /// **The first read of a key costs a `head`.** The size has to be known before a range
+    /// can be clamped, and a path plane has no open to have learned it at — so the first
+    /// read classifies the key and remembers what it found. A directory is refused here, and
+    /// so is the marker case (a 0-byte object standing for a prefix), or a guest would read a
+    /// directory as an empty file.
+    ///
+    /// **The range is clamped, never rejected.** A GET that starts at or past the end comes
+    /// back as the store's generic error, which is indistinguishable from a transport failure
+    /// — so the end is decided here, from the remembered size, and a read beyond it answers
+    /// `Ok(0)` without a round trip.
+    ///
+    /// **A short return means EOF and nothing else.** That is the contract [`Mountable`]
+    /// states, and `Posix` believes it — it calls this once and passes the length on. So a
+    /// request the cached window only partly covers must not stop there: the loop fills the
+    /// remainder, or a file would appear to end at a window boundary.
+    ///
+    /// **Read-ahead is earned by continuity, not by request size.** A read that starts where
+    /// the last one ended fetches a whole window; anything else fetches exactly what was
+    /// asked.
+    ///
+    /// The lock is never held across a fetch, and never across the `head` either.
+    fn read_at<'a>(
+        &'a self,
+        path: &'a Path,
+        buf: &'a mut [u8],
+        offset: u64,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        Box::pin(async move {
+            let key = self.key(path)?;
+            let (location, size) = self.located(path, &key).await?;
+            // `Bounded(0..0)` is an error rather than an empty answer, so an empty request is
+            // settled here — and without disturbing `last_end`, which a zero-length read in
+            // the middle of a stream would otherwise push off the sequence.
+            if buf.is_empty() || offset >= size {
+                return Ok(0);
+            }
+            let want = (buf.len() as u64).min(size - offset) as usize;
+            let buf = &mut buf[..want];
+
+            let mut filled = 0usize;
+            while filled < want {
+                let at = offset + filled as u64;
+
+                // One acquisition for both questions: nothing waits on the network between
+                // them, so splitting it would only widen the chance of an answer from one
+                // state and a decision from another.
+                let (from_cache, sequential) = {
+                    let windows = lock(&self.windows);
+                    match windows.by_key.get(&key) {
+                        Some(cache) => (
+                            from_window(&cache.window, at, &mut buf[filled..]),
+                            cache.last_end == Some(at),
+                        ),
+                        None => (0, false),
+                    }
+                };
+                if from_cache > 0 {
+                    filled += from_cache;
+                    continue;
+                }
+
+                let span = if sequential {
+                    READAHEAD_CHUNK
+                } else {
+                    (want - filled) as u64
+                };
+                let data = self.fetch(&location, at, (at + span).min(size)).await?;
+                if data.is_empty() {
+                    // Defensive. A store answering a non-empty range with no bytes has no
+                    // defined meaning here, and looping on it would not terminate.
+                    //
+                    // Not the stale-size path: an object that shrank makes the range invalid,
+                    // so the store errors and `?` carries that out of `fetch` — which is
+                    // right, because shortening the return instead would say this was EOF.
+                    break;
+                }
+                let n = data.len().min(want - filled);
+                buf[filled..filled + n].copy_from_slice(&data[..n]);
+                filled += n;
+                if let Some(cache) = lock(&self.windows).by_key.get_mut(&key) {
+                    cache.window = Some((at, data));
+                }
+            }
+
+            if filled > 0 {
+                // Assigned, not folded — see `ReadCache::last_end`.
+                if let Some(cache) = lock(&self.windows).by_key.get_mut(&key) {
+                    cache.last_end = Some(offset + filled as u64);
+                }
+            }
+            Ok(filled)
+        })
+    }
+}
+
+impl S3Fs {
+    /// Where `key` lives in the store and how big it is, from the cache if it is there and
+    /// from a `head` if it is not.
+    ///
+    /// The location comes from the `head` that classified it rather than being mapped again,
+    /// so a read cannot end up pointed at a different key than the one that was inspected.
+    async fn located(&self, path: &Path, key: &str) -> io::Result<(OsPath, u64)> {
+        if let Some(cache) = lock(&self.windows).by_key.get(key) {
+            return Ok((os_path(key)?, cache.size));
+        }
+        let meta = match self.classify(path).await? {
+            Entry::Dir => return Err(io::ErrorKind::IsADirectory.into()),
+            Entry::File(meta) => meta,
+        };
+        lock(&self.windows).admit(
+            key.to_string(),
+            ReadCache {
+                size: meta.size,
+                window: None,
+                last_end: None,
+            },
+        );
+        Ok((meta.location, meta.size))
+    }
+
+    /// One ranged GET. No lock is held here — see the loop in
+    /// [`read_at`](Mountable::read_at).
+    async fn fetch(&self, location: &OsPath, at: u64, end: u64) -> io::Result<Vec<u8>> {
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(at..end)),
+            ..Default::default()
+        };
+        let got = self
+            .store
+            .get_opts(location, options)
+            .await
+            .map_err(to_io_error)?;
+        let bytes = got.bytes().await.map_err(to_io_error)?;
+        Ok(bytes.to_vec())
+    }
+}
+
+/// Copy out of a cached window, returning how much of `out` it could fill.
+///
+/// Zero means the window does not cover `at` — it may still cover *part* of what was asked
+/// for, which is why the caller loops rather than treating a partial answer as the end.
+fn from_window(window: &Option<(u64, Vec<u8>)>, at: u64, out: &mut [u8]) -> usize {
+    let Some((start, data)) = window else {
+        return 0;
+    };
+    if at < *start || at >= *start + data.len() as u64 {
+        return 0;
+    }
+    let from = (at - *start) as usize;
+    let n = (data.len() - from).min(out.len());
+    out[..n].copy_from_slice(&data[from..from + n]);
+    n
+}

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::{
     executable::{ExecCall, ExecResult, Executable},
-    volume::Workspace,
+    fs::WorkFs,
 };
 
 /// A named set of [`Executable`]s — the allowlist one console server offers.
@@ -77,7 +77,7 @@ impl ExecutableSet {
     /// Whether the name was registered is settled before anything is awaited, and the
     /// lookup itself is a map read — so a caller that only wants to know whether a name
     /// is one of ours pays nothing for the waiting it did not ask for.
-    pub async fn invoke(&self, call: &ExecCall, workspace: &Workspace) -> Option<ExecResult> {
+    pub async fn invoke(&self, call: &ExecCall, workspace: &WorkFs) -> Option<ExecResult> {
         let (_, exec) = self.execs.get(&call.name)?;
         Some(exec.exec(call, workspace).await)
     }

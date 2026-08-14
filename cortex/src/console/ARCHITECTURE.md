@@ -225,7 +225,7 @@ That is what turns "this server cannot do `s3`" into [`UNSUPPORTED_VOLUME`](#err
 The server builds the tree a command runs against; the client builds one of its own from the same description, because a delegated executable runs on the *client* and has to see the files the command was working on.
 Neither end sends the other a tree — they send this, and each realizes it. That is what makes one file name mean the same thing to a command, to a `read`, and to a delegated executable, and [`cwd`](#exec--run-this) on an `exec` is what completes it.
 
-What the kinds are and how a workspace routes between them is [`volume/ARCHITECTURE.md`](../volume/ARCHITECTURE.md); this protocol only carries the description.
+What the kinds are and how a workspace routes between them is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol only carries the description.
 
 **Nothing is realized by sending it**, any more than anything is booted by it.
 The first call that needs a session builds the tree, so a kind the server cannot realize is *that* call's failure and not this one's.

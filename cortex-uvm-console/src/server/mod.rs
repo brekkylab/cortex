@@ -203,10 +203,7 @@ impl Session {
             // The cost is a `Mountable` built and dropped: no network, and an unused HTTP
             // client at worst. Asking more cheaply would mean a second copy of
             // `build_mountable`'s `#[cfg]` arms.
-            drop(
-                cortex::volume::Workspace::from_spec(&self.config.volumes)
-                    .map_err(unsupported_volume)?,
-            );
+            drop(cortex::fs::WorkFs::from_spec(&self.config.volumes).map_err(unsupported_volume)?);
 
             let mut guest = Guest::boot(&self.config.volumes)
                 .await
@@ -217,7 +214,7 @@ impl Session {
             // field nobody reads is not free when it carries an S3 secret or a Notion key,
             // in the one environment this design treats as untrusted.
             let announced = Init {
-                volumes: cortex::volume::WorkspaceSpec::default(),
+                volumes: cortex::fs::WorkspaceSpec::default(),
                 ..self.config.clone()
             };
             let outcome = guest
@@ -241,9 +238,10 @@ impl Session {
 /// The same mapping `cortex-local-console` applies, and deliberately the same: a client
 /// cannot tell which backend answered it, so the two must not disagree about what a spec
 /// they both refuse is called.
-fn unsupported_volume(e: cortex::CortexError) -> Outcome {
-    let code = match e {
-        cortex::CortexError::UnsupportedVolume(_) => Error::UNSUPPORTED_VOLUME,
+fn unsupported_volume(e: std::io::Error) -> Outcome {
+    let code = match e.kind() {
+        // What `build_store` answers for a kind this build has no provider for.
+        std::io::ErrorKind::Unsupported => Error::UNSUPPORTED_VOLUME,
         // Anything else from `from_spec` is a spec this server cannot make sense of — a
         // mount path that escapes the root, or two at one path.
         _ => Error::INVALID_PARAMS,

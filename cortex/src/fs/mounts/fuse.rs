@@ -1,25 +1,27 @@
-//! Binds a [`PosixFs`] to `fuser`'s host-side [`Filesystem`].
+//! Binds a [`Posix`] to `fuser`'s host-side [`Filesystem`]. [`FuseMount`] is the whole of
+//! what it exports.
 //!
-//! Sibling of [`super::krun`]: the same [`PosixFs`] operations through a different
-//! interface, so everything here is translation. What differs from the krun side
-//! is the errno numbering (host, not guest-Linux) and the attribute type
-//! ([`FileAttr`], not `stat64`). Data transfer is simpler too — `fuser` passes
-//! byte slices where `msb_krun` passes file descriptors, so nothing is staged
-//! through a temp file.
+//! Sibling of [`super::fuse_t`]: the same [`Posix`] operations through a different interface,
+//! so everything here is translation. What differs from that side is who drives the session —
+//! `fuser` speaks the kernel FUSE protocol over the mount fd itself, which is exactly what
+//! FUSE-T's helper will not tolerate — and the attribute type ([`FileAttr`] rather than a
+//! `stat` this crate lays out by hand). The errno numbering is shared: both answer this
+//! host's kernel.
 //!
-//! What stays on `fuser`'s `ENOSYS` defaults is what the backend contract has no
-//! notion of — symlinks, hard links — matching the krun stubs.
+//! On Linux `fuser` opens `/dev/fuse` itself, so nothing has to be installed. On macOS this
+//! is **macFUSE**, a kernel extension needing reduced-security boot on Apple Silicon — which
+//! is why [`super::fuse_t`] exists beside it.
 //!
-//! **No unit tests, unlike its two siblings**, and the reason is structural: a
-//! callback here answers by consuming a `Reply*` object that only `fuser` can
-//! construct, so there is nothing a test can hand it and nothing it hands back.
-//! The krun binding returns `io::Result`, and the FUSE-T one fills caller-owned
-//! out-params, so both are driven directly in their `*_tests.rs`. This one is
-//! covered only by `tests/host_mount.rs`, which is `#[ignore]`d because it needs a
-//! real mount — so a plain `cargo test` exercises none of it.
+//! What stays on `fuser`'s `ENOSYS` defaults is what the store contract has no notion of:
+//! symlinks, hard links, extended attributes.
+//!
+//! **Hard to test in isolation, and structurally so**: a callback here answers by consuming a
+//! `Reply*` object only `fuser` can construct, so there is nothing to hand it and nothing it
+//! hands back. Exercising it means a real mount.
 
 use std::{
     ffi::OsStr,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -29,15 +31,13 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
-use crate::volume::posix::{
+use crate::fs::posix::{
     BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
     decode_open_flags, host_errno,
 };
-use crate::volume::{DirentKind, Mountable, PosixFs, SetAttr, Stat};
-use crate::{CortexError, Result};
+use crate::fs::{DirentKind, Mountable, Posix, SetAttr, Stat};
 
-/// Host numbering, where the krun binding's is Linux's — `O_TRUNC` is not the
-/// same number on the two.
+/// Open flags in the host's numbering: this reply goes to this host's kernel.
 const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
     append: libc::O_APPEND,
     truncate: libc::O_TRUNC,
@@ -45,55 +45,64 @@ const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
     create_new: libc::O_EXCL,
 };
 
-/// A live host mount, unmounted when this guard is dropped.
+/// What the mount reports as its source — the name `df` and Finder show.
 ///
-/// This binding's *call surface* — the counterpart of `.fs(..).custom(..)` on a
-/// `msb_krun` VM. The [`Filesystem`] impl below is what the kernel talks to.
-pub struct CortexMount {
-    /// `Option` so [`Drop`] can take ownership: `umount_and_join` consumes the
-    /// session, and `Drop` only has `&mut self`.
+/// Fixed, because nothing has wanted another one.
+const FSNAME: &str = "cortex";
+
+/// A live mount on the kernel's own FUSE: constructing one mounts, dropping it unmounts.
+///
+/// The whole call surface of this binding, and the counterpart of
+/// [`FuseTMount`](super::FuseTMount) — same shape, different interface underneath.
+///
+/// Not generic in the store, and needs no erasure to manage it: `fuser`'s session owns the
+/// filesystem it was handed, so unlike the FUSE-T binding there is no raw pointer here whose
+/// target something else has to keep alive.
+pub struct FuseMount {
+    /// `Option` so `Drop` can take ownership: both of `fuser`'s exits consume the session, and
+    /// `Drop` has only `&mut self`. `None` once [`join`](Self::join) or `Drop` has taken it.
     session: Option<fuser::BackgroundSession>,
+
     mountpoint: PathBuf,
 }
 
-impl CortexMount {
-    /// Mount `volume` at `mountpoint` and serve it from a background thread.
+impl FuseMount {
+    /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
-    /// `mountpoint` must already exist. On Linux `fuser` opens `/dev/fuse` itself;
-    /// on macOS this needs **macFUSE** — see `adapter/fuse_t.rs` for why FUSE-T
-    /// needs its own binding.
-    pub fn spawn<T>(volume: T, mountpoint: impl AsRef<Path>) -> Result<Self>
-    where
-        T: Mountable + 'static,
-    {
-        Self::spawn_with(
-            volume,
-            mountpoint,
-            vec![MountOption::FSName("cortex".into())],
-        )
+    /// `mountpoint` must already exist. On Linux this needs nothing installed; on macOS it
+    /// needs macFUSE.
+    ///
+    /// Returns as soon as the mount is real, and needs no waiting to say so: the mount syscall
+    /// happens before this returns, so the path is a mount point by the time a caller has the
+    /// guard. (The FUSE-T binding has to poll for that, because its kernel-side mount is
+    /// completed by a helper it has not answered yet.)
+    ///
+    /// `'static`, because the store is served from that thread for as long as the mount lives.
+    pub fn try_new<T: Mountable + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
+        Self::try_new_with(fs, mountpoint, vec![MountOption::FSName(FSNAME.into())])
     }
 
-    /// [`spawn`](Self::spawn) with the mount options spelled out.
+    /// [`try_new`](Self::try_new) with the mount options spelled out.
     ///
-    /// [`MountOption::RO`] makes the *kernel* reject writes before they reach a
-    /// backend — stronger than each backend answering `ReadOnly` by hand.
-    pub fn spawn_with<T>(
-        volume: T,
-        mountpoint: impl AsRef<Path>,
-        mount_options: Vec<MountOption>,
-    ) -> Result<Self>
-    where
-        T: Mountable + 'static,
-    {
-        let mountpoint = mountpoint.as_ref().to_path_buf();
-        // `Config` is `#[non_exhaustive]`, so it cannot be built with a struct
-        // literal from outside `fuser` — start from the default and assign.
+    /// [`MountOption::RO`] is the one worth reaching for: it makes the *kernel* reject writes
+    /// before they reach a store, which is stronger than every store answering
+    /// `ReadOnlyFilesystem` by hand — and it covers the ones that would have answered `Ok`.
+    ///
+    /// The options are `fuser`'s own, and this is the only binding that has any: FUSE-T takes a
+    /// different set entirely, which is why its `try_new_with` chooses a transport instead.
+    pub fn try_new_with<T: Mountable + 'static>(
+        fs: T,
+        mountpoint: &Path,
+        options: Vec<MountOption>,
+    ) -> io::Result<Self> {
+        // `Config` is `#[non_exhaustive]`, so it cannot be built with a struct literal from
+        // outside `fuser` — start from the default and assign.
         let mut config = Config::default();
-        config.mount_options = mount_options;
-        let session = fuser::spawn_mount2(PosixFs::new(volume), &mountpoint, &config)?;
-        Ok(CortexMount {
+        config.mount_options = options;
+        let session = fuser::spawn_mount2(Posix::new(fs), mountpoint, &config)?;
+        Ok(FuseMount {
             session: Some(session),
-            mountpoint,
+            mountpoint: mountpoint.to_path_buf(),
         })
     }
 
@@ -101,21 +110,32 @@ impl CortexMount {
         &self.mountpoint
     }
 
-    /// Unmount and join the serving thread. [`Drop`] does the same but cannot
-    /// report failure.
-    pub fn unmount(mut self) -> Result<()> {
+    /// Serve until the mount goes away, then take it down.
+    ///
+    /// For a program whose whole job is the mount: `try_new` puts it up without blocking, and
+    /// this waits for something else to end it — `umount`, `fusermount -u`, or the kernel
+    /// tearing the connection down. **It does not unmount**, so a caller with other work to do
+    /// drops the guard instead of joining it.
+    ///
+    /// The session is taken out here, so the `Drop` that follows has nothing left to do.
+    ///
+    /// `Err` is the serving thread having failed or panicked.
+    pub fn join(mut self) -> io::Result<()> {
         match self.session.take() {
-            Some(session) => Ok(session.umount_and_join()?),
+            Some(session) => session.join(),
             None => Ok(()),
         }
     }
 }
 
-impl Drop for CortexMount {
+impl Drop for FuseMount {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
-            // Swallowed: a `Drop` that panics mid-unwind aborts the process,
-            // replacing a failing test's real assertion with a bare abort.
+            // Reported rather than propagated, and never a panic: a `Drop` that panics
+            // mid-unwind aborts the process, which in a failing test replaces the real
+            // assertion with a bare abort. Not silent either — a mount that would not come
+            // down is left behind for someone to clear by hand, so saying so is the least this
+            // can do.
             if let Err(err) = session.umount_and_join() {
                 eprintln!(
                     "cortex: unmounting {} failed: {err}",
@@ -126,15 +146,15 @@ impl Drop for CortexMount {
     }
 }
 
-/// Wrap the shared host-errno table in `fuser`'s newtype. The table is shared with
-/// the FUSE-T binding: both answer this host's kernel.
-fn to_errno(err: CortexError) -> Errno {
+/// Wrap the shared host-errno table in `fuser`'s newtype. The table is shared with the FUSE-T
+/// binding: both answer this host's kernel.
+fn to_errno(err: io::Error) -> Errno {
     Errno::from_i32(host_errno(&err))
 }
 
-/// Lay the shared attribute policy into `fuser`'s struct, which splits what
-/// `st_mode` packs into a separate `kind` and `perm`. Ownership is the *mounting
-/// user's*: a mount whose files belong to someone else cannot be traversed.
+/// Lay the shared attribute policy into `fuser`'s struct, which splits what `st_mode` packs
+/// into a separate `kind` and `perm`. Ownership is the *mounting user's*: a mount whose files
+/// belong to someone else cannot be traversed.
 fn to_file_attr(inode: u64, stat: &Stat) -> FileAttr {
     let attr = attr_for(stat);
     FileAttr {
@@ -145,10 +165,7 @@ fn to_file_attr(inode: u64, stat: &Stat) -> FileAttr {
         mtime: attr.mtime,
         ctime: attr.ctime,
         crtime: attr.crtime,
-        kind: match stat.kind {
-            DirentKind::Dir => FileType::Directory,
-            DirentKind::File => FileType::RegularFile,
-        },
+        kind: to_file_type(stat.kind),
         perm: (attr.mode & 0o7777) as u16,
         nlink: attr.nlink,
         // SAFETY: `getuid`/`getgid` read process-global ids and cannot fail.
@@ -160,10 +177,16 @@ fn to_file_attr(inode: u64, stat: &Stat) -> FileAttr {
     }
 }
 
-/// The `'static` bound is `fuser`'s: a mounted session outlives the mount call, so
-/// the filesystem may not borrow. The krun binding's device owns its backend and
-/// needs no such bound.
-impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
+fn to_file_type(kind: DirentKind) -> FileType {
+    match kind {
+        DirentKind::Dir => FileType::Directory,
+        DirentKind::File => FileType::RegularFile,
+    }
+}
+
+/// The `'static` bound is `fuser`'s: a mounted session outlives the mount call, so the
+/// filesystem may not borrow.
+impl<T: Mountable + 'static> Filesystem for Posix<T> {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         match super::block_on(self.lookup_child(parent.0, name)) {
             Ok((inode, stat)) => reply.entry(&TTL, &to_file_attr(inode, &stat), Generation(0)),
@@ -188,7 +211,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
             Err(err) => return reply.error(to_errno(err)),
         };
         match super::block_on(self.open_inode(ino.0, options)) {
-            Ok((fh, _stat)) => reply.opened(FileHandle(fh), FopenFlags::empty()),
+            Ok(fh) => reply.opened(FileHandle(fh), FopenFlags::empty()),
             Err(err) => reply.error(to_errno(err)),
         }
     }
@@ -235,16 +258,17 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        // The cursor protocol is the shared operation's; this closure only
-        // encodes. `add` returning true is the `stop` flag.
+        // The cursor protocol is the shared operation's; this closure only encodes. `add`
+        // returning true is the `stop` flag.
         let streamed =
             super::block_on(
                 self.for_each_dirent(ino.0, offset, |child_inode, child, cursor| {
-                    let kind = match child.kind {
-                        DirentKind::Dir => FileType::Directory,
-                        DirentKind::File => FileType::RegularFile,
-                    };
-                    Ok(reply.add(INodeNo(child_inode), cursor, kind, &child.name))
+                    Ok(reply.add(
+                        INodeNo(child_inode),
+                        cursor,
+                        to_file_type(child.kind),
+                        &child.name,
+                    ))
                 }),
             );
         match streamed {
@@ -294,7 +318,6 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         _lock_owner: Option<LockOwner>,
         reply: fuser::ReplyWrite,
     ) {
-        // No staging temp file, unlike krun: `fuser` hands over a plain slice.
         match super::block_on(self.write_handle(fh.0, offset, data)) {
             Ok(written) => reply.written(written as u32),
             Err(err) => reply.error(to_errno(err)),
@@ -370,11 +393,10 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` cannot be served: libfuse-t's
-        // `rename` takes no flags at all, so a contract carrying them would be
-        // unhonourable in one of the three bindings. EINVAL is Linux's own answer
-        // for a rename flag it does not implement, and unlike ENOSYS it does not
-        // make the kernel stop sending renames for the whole mount.
+        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` cannot be served: libfuse-t's `rename` takes no
+        // flags at all, so a contract carrying them would be unhonourable in one of the
+        // bindings. EINVAL is Linux's own answer for a rename flag it does not implement, and
+        // unlike ENOSYS it does not make the kernel stop sending renames for the whole mount.
         if !flags.is_empty() {
             reply.error(Errno::from_i32(libc::EINVAL));
             return;
@@ -397,15 +419,16 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
-        fh: Option<FileHandle>,
+        _fh: Option<FileHandle>,
         _crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // `fuser` already decoded the validity mask into these `Option`s, where
-        // krun consults a bitflag set. Same information, same shared `SetAttr`.
+        // `fuser` has already decoded the validity mask into these `Option`s. The file handle
+        // it may also carry is dropped: a resize names a path either way, and the inode
+        // arriving beside it is already that path.
         let want = SetAttr {
             size,
             mode,
@@ -414,7 +437,7 @@ impl<T: Mountable + 'static> Filesystem for PosixFs<T> {
             atime: None,
             mtime: None,
         };
-        match super::block_on(self.setattr_inode(ino.0, fh.map(|fh| fh.0), want)) {
+        match super::block_on(self.setattr_inode(ino.0, want)) {
             Ok(stat) => reply.attr(&TTL, &to_file_attr(ino.0, &stat)),
             Err(err) => reply.error(to_errno(err)),
         }

@@ -73,9 +73,9 @@ pub enum CortexError {
     /// *succeed*. A vaguer error turns the same request into a hard failure the
     /// user has to work around by hand.
     ///
-    /// Reached only from inside one mount: a kernel answers a move between two
-    /// real mounts itself, but it cannot see a [`Workspace`](crate::Workspace)'s
-    /// own mount table, so it asks and this layer has to say so.
+    /// Reached only from inside one mount: a kernel answers a move between two real mounts
+    /// itself, but it cannot see a [`WorkFs`](crate::fs::WorkFs)'s own mount table, so it asks
+    /// and this layer has to say so.
     ///
     /// Not [`Unsupported`](Self::Unsupported), for the reason spelled out on
     /// [`ReadOnly`](Self::ReadOnly), and here the mistranslation is sharper still:

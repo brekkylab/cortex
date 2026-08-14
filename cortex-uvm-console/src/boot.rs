@@ -14,7 +14,7 @@
 //!
 //! ```text
 //! virtio-fs  root         the boot root, holding the guest binary and nothing else
-//! virtio-fs  cortexws     a cortex Workspace, served straight out of this process
+//! virtio-fs  cortexws     a cortex WorkFs, served straight out of this process
 //! virtio-blk /dev/vda     the session's ext4 image — the overlay's upper
 //! virtio-blk /dev/vdb     the base EROFS image, read-only — the overlay's lower
 //! virtio-con cortex-…     the console session, the other end of it a socket on the host
@@ -25,7 +25,7 @@
 //! [`GUEST_UPPER_DEV`](crate::contract::GUEST_UPPER_DEV).
 //!
 //! The workspace is the one device that is not a file. cortex realizes it as a
-//! [`PosixFs`] over a [`Workspace`], which `msb_krun` drives as a `DynFileSystem`, so
+//! [`Posix`] over a [`WorkFs`], which `msb_krun` drives as a `DynFileSystem`, so
 //! every request the guest kernel makes is answered by this process — no daemon and no host
 //! mount.
 //!
@@ -48,7 +48,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-use cortex::volume::{PosixFs, Workspace};
+use cortex::fs::{Posix, WorkFs};
 use msb_krun::{DiskImageFormat, DynFileSystem, VmBuilder};
 
 use crate::contract::{
@@ -125,21 +125,21 @@ pub fn run() -> anyhow::Result<Infallible> {
 /// Split out from [`workspace`] because it is the part with an answer a test can check.
 /// The unlink is not cleanup: the file is credentials, this is the last reader, and the
 /// sooner it stops existing the smaller the window in which anything else could read it.
-fn read_spec(path: &Path) -> anyhow::Result<Workspace> {
+fn read_spec(path: &Path) -> anyhow::Result<WorkFs> {
     let encoded = std::fs::read(path)
         .map_err(|e| anyhow::anyhow!("reading the namespace from {}: {e}", path.display()))?;
     // Before parsing, not after: a spec this build cannot make sense of is still a spec that
     // should not be sitting on disk.
     let _ = std::fs::remove_file(path);
 
-    let spec: cortex::volume::WorkspaceSpec = bson::deserialize_from_slice(&encoded)
+    let spec: cortex::fs::WorkspaceSpec = bson::deserialize_from_slice(&encoded)
         .map_err(|e| anyhow::anyhow!("parsing the namespace: {e}"))?;
-    Workspace::from_spec(&spec).map_err(|e| anyhow::anyhow!("realizing the namespace: {e}"))
+    WorkFs::from_spec(&spec).map_err(|e| anyhow::anyhow!("realizing the namespace: {e}"))
 }
 
 /// The cortex workspace to project into the guest, and where it lands.
 ///
-/// One virtio-fs device for the whole tree. What is under it is a [`Workspace`]'s
+/// One virtio-fs device for the whole tree. What is under it is a [`WorkFs`]'s
 /// business — however many volumes, of whatever kind, mounted wherever the spec says — and
 /// the guest sees whatever that tree is, which is the same tree a host FUSE mount built from
 /// the same spec would show. That sameness is the point of the spec existing.
@@ -149,7 +149,7 @@ fn workspace() -> anyhow::Result<Option<(Box<dyn DynFileSystem + Send + Sync>, S
     };
     let ws = read_spec(Path::new(&path))?;
     Ok(Some((
-        Box::new(PosixFs::new(ws)),
+        Box::new(Posix::new(ws)),
         GUEST_WORKSPACE_ROOT.to_string(),
     )))
 }
@@ -177,7 +177,7 @@ mod tests {
     /// that awaits.
     #[tokio::test]
     async fn a_spec_file_becomes_a_workspace_and_is_unlinked() {
-        use cortex::volume::{Mountable as _, VolumeSpec, WorkspaceSpec};
+        use cortex::fs::{Mountable as _, VolumeSpec, WorkspaceSpec};
 
         let host = tempfile::tempdir().unwrap();
         std::fs::write(host.path().join("hello.txt"), b"hi").unwrap();

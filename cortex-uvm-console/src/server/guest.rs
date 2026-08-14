@@ -98,7 +98,7 @@ impl Guest {
     /// Everything expensive happens before the child is spawned — provisioning the base
     /// image, formatting the session's — so a failure in any of it is reported as itself
     /// rather than as a boot that timed out.
-    pub async fn boot(volumes: &cortex::volume::WorkspaceSpec) -> anyhow::Result<Guest> {
+    pub async fn boot(volumes: &cortex::fs::WorkspaceSpec) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image().await?;
         let helper = boot_helper()?;

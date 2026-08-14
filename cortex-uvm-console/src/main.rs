@@ -36,7 +36,7 @@
 //!
 //! ```text
 //! /                a read-only base image, overlaid with this session's ext4 upper
-//! <workspace>      a cortex Workspace, served over virtio-fs out of the boot child
+//! <workspace>      a cortex WorkFs, served over virtio-fs out of the boot child
 //! ```
 //!
 //! Writes anywhere in the guest land on the session's upper and stay there for as long as

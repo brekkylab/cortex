@@ -109,13 +109,11 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 
 use bson::Bson;
-use cortex::CortexError;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
     Call, Error, Exec, ExecCmd, ExecResult, Init, MAX_PAYLOAD, Message, Notification, Outcome,
     Progress, Read, ReadResult, RequestId, Server, Write, WriteResult,
 };
-use cortex::volume::Workspace;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
@@ -249,28 +247,19 @@ struct Session {
 
 /// What a boot produced. Built together, released together.
 struct Booted {
-    /// Released before `scratch`, whose removal would otherwise block on a live mount.
-    ///
-    /// Field order is the backstop — `Drop` runs fields in declaration order — but
-    /// [`Session::release`] does it explicitly, being the only path that *can* report a
-    /// failure. `FuseTMount::unmount` has no fallible step, so the log below fires on a `fuse`
-    /// build and never on a `fuse-t` one.
-    #[cfg(any(feature = "fuse", feature = "fuse-t"))]
-    mount: Option<cortex::volume::HostMount>,
-
     scratch: SessionScratch,
 }
 
 impl Booted {
     /// Where an execution runs, and where a file call resolves its path.
     ///
-    /// The mount point when there is one, and otherwise whatever this process inherited —
-    /// which is what a session with no declared namespace gets, exactly as before.
+    /// `None`: whatever this process inherited. A session used to be able to declare a
+    /// namespace on `init` and have it mounted here, which made the answer the mount point —
+    /// wiring that back onto `cortex::fs` is its own piece of work, and until then the two
+    /// halves of the protocol agree by inheriting the same cwd, as they did before there were
+    /// namespaces at all.
     fn cwd(&self) -> Option<&Path> {
-        #[cfg(any(feature = "fuse", feature = "fuse-t"))]
-        return self.mount.as_ref().map(|m| m.mountpoint());
-        #[cfg(not(any(feature = "fuse", feature = "fuse-t")))]
-        return None;
+        None
     }
 }
 
@@ -289,100 +278,24 @@ impl Session {
         self.config = config;
     }
 
-    /// Give back what booting took, mount first.
-    ///
-    /// Not left to field drop order: removing the scratch directory **blocks** on a live
-    /// mount, and [`HostMount::unmount`](cortex::volume::HostMount) is the one path that
-    /// can report a failure — `Drop` swallows it, because a `Drop` that panics mid-unwind
-    /// aborts the process.
-    ///
-    /// # This can hang, and one of its callers is a call somebody is waiting on
-    ///
-    /// `unmount` joins the serving thread and that join has no timeout. Measured on a mac:
-    /// five `FuseTMount`s torn down at once left one in uninterruptible sleep for 145
-    /// seconds, out of reach of `kill`, until it was unmounted from outside by hand.
-    ///
-    /// Not reachable as things stand — one session per process, one mount per session — and
-    /// whether the race exists *between* processes was never measured. What makes it worth
-    /// writing down is that [`configure`](Self::configure) calls this, so a re-`init` over a
-    /// wedged mount leaves a **request** unanswered where a `stop` could only cost silence.
-    ///
-    /// So: if a bounded teardown is ever needed, it belongs in `cortex`'s FUSE adapters
-    /// rather than here, and both callers would need a way to give up.
+    /// Give back what booting took.
     fn release(&mut self) {
-        let Some(booted) = self.booted.take() else {
-            return;
-        };
-        #[cfg(any(feature = "fuse", feature = "fuse-t"))]
-        if let Some(mount) = booted.mount {
-            // Nothing is waiting on this — `stop` is a notification and `init` answers
-            // `null` — so a failure is said here and nowhere else, as a failed boot is.
-            if let Err(e) = mount.unmount() {
-                eprintln!("{}: unmounting the namespace: {e}", env!("CARGO_BIN_NAME"));
-            }
-        }
-
-        // Without a mount binding there is nothing to give back in order, so releasing is
-        // just letting go — said outright, because a binding this build does not have is
-        // not a step it skips.
-        #[cfg(not(any(feature = "fuse", feature = "fuse-t")))]
-        drop(booted);
-
-        // `scratch` drops here, with nothing mounted over it.
+        // `scratch` drops with it, which is the whole of it: nothing is mounted over it.
+        self.booted = None;
     }
 
-    /// The session, booting if nothing has: the namespace realized, and the delegated
-    /// names somewhere `execvp` will find them.
+    /// The session, booting if nothing has: the delegated names somewhere `execvp` will find
+    /// them.
     ///
     /// The directory of symlinks is not put on `PATH`: every execution is given its own
-    /// environment (see [`environment`]), which is what an inherited `PATH` and a
-    /// `set_var` would otherwise be for — and doing it per command rather than per
-    /// process is what lets this program have more than one thread.
+    /// environment (see [`environment`]), which is what an inherited `PATH` and a `set_var`
+    /// would otherwise be for — and doing it per command rather than per process is what lets
+    /// this program have more than one thread.
     fn booted(&mut self) -> Result<&Booted, Outcome> {
         if self.booted.is_none() {
-            // Cheapest first, and nothing is installed until all of it succeeded: a
-            // failure here leaves the session unbooted, and the next call tries again —
-            // which is the shape a client already has to handle.
-            //
-            // The workspace is not kept. Mounting moves it into the mount, which is the
-            // only thing that reads it — nothing here asks a `Workspace` a question, and a
-            // second handle would be state nobody looks at. What survives realization is
-            // the mount, and where a build has none, what survives is the knowledge that
-            // the spec was one this build could make sense of.
-            let ws = Workspace::from_spec(&self.config.volumes).map_err(unsupported_volume)?;
             let scratch = SessionScratch::create(self.config.delegated.iter().map(String::as_str))
                 .map_err(boot_failed)?;
-
-            #[cfg(any(feature = "fuse", feature = "fuse-t"))]
-            let mount = if self.config.volumes.is_empty() {
-                // Nothing to make visible, and a mount is not free. A session that
-                // declares no namespace pays for none.
-                drop(ws);
-                None
-            } else {
-                Some(cortex::volume::HostMount::spawn(ws, scratch.mnt()).map_err(mount_failed)?)
-            };
-
-            #[cfg(not(any(feature = "fuse", feature = "fuse-t")))]
-            {
-                drop(ws);
-                // A namespace was declared and there is nothing here that could show it to
-                // a command. The kinds were all fine, so this is about the build and not
-                // the spec — see `MOUNT_FAILED`.
-                if !self.config.volumes.is_empty() {
-                    return Err(refused(
-                        Error::MOUNT_FAILED,
-                        "no mount binding compiled in: this build cannot make a namespace \
-                         visible to a command",
-                    ));
-                }
-            }
-
-            self.booted = Some(Booted {
-                #[cfg(any(feature = "fuse", feature = "fuse-t"))]
-                mount,
-                scratch,
-            });
+            self.booted = Some(Booted { scratch });
         }
         Ok(self.booted.as_ref().expect("just booted"))
     }
@@ -408,23 +321,6 @@ fn at(root: Option<&Path>, path: &str) -> PathBuf {
         Some(root) => root.join(path),
         None => PathBuf::from(path),
     }
-}
-
-/// A namespace that could not be bound to a filesystem interface. The kinds were fine.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
-fn mount_failed(e: CortexError) -> Outcome {
-    refused(Error::MOUNT_FAILED, format!("mounting the namespace: {e}"))
-}
-
-/// A volume kind this build cannot realize, as the answer to whatever needed a session.
-fn unsupported_volume(e: CortexError) -> Outcome {
-    let code = match e {
-        CortexError::UnsupportedVolume(_) => Error::UNSUPPORTED_VOLUME,
-        // Anything else from `from_spec` is a spec this server cannot make sense of — a
-        // mount path that escapes the root, or two at one path.
-        _ => Error::INVALID_PARAMS,
-    };
-    refused(code, format!("realizing the namespace: {e}"))
 }
 
 /// Run one command, answering the console channel as many times as it takes.
@@ -552,7 +448,7 @@ async fn delegate(
         }
     };
 
-    // Workspace-relative, or `None`. The rule is `cortex`'s and not this backend's — see
+    // WorkFs-relative, or `None`. The rule is `cortex`'s and not this backend's — see
     // `reported_cwd`, which the uvm guest agent calls for the same reason.
     let exec = Exec {
         cwd: cortex::executable::reported_cwd(exec.cwd.as_deref(), root),

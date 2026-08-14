@@ -75,7 +75,7 @@ use crate::{
         stdio::StdioClient,
     },
     executable::{ExecCall, ExecutableSet},
-    volume::Workspace,
+    fs::WorkFs,
 };
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
@@ -106,13 +106,11 @@ pub struct ConsoleBuilder {
     execs: ExecutableSet,
 
     /// `None` is a console whose delegated names have nothing to read, which is
-    /// [`Workspace::new`] — an empty namespace rather than an absent one, so
+    /// [`WorkFs::new`] — an empty namespace rather than an absent one, so
     /// [`Executable::exec`](crate::executable::Executable::exec) always has a tree to
     /// be handed and a name that touches no files never had to say so. Left unfilled
     /// here so the default is the console's and not the setter's.
-    workspace: Option<Arc<Workspace>>,
-
-    volumes: crate::volume::WorkspaceSpec,
+    workspace: Option<Arc<WorkFs>>,
 }
 
 impl ConsoleBuilder {
@@ -178,31 +176,12 @@ impl ConsoleBuilder {
     /// delegated calls are resolved *against*: a name that reads a file is asked about
     /// the tree the command that called it can see.
     ///
-    /// [`Arc`], so the same `Workspace` can also be served somewhere else — mounted on
+    /// [`Arc`], so the same `WorkFs` can also be served somewhere else — mounted on
     /// the host, or projected into the server the commands themselves run in — which is
     /// the arrangement that makes a delegated name and its caller talk about the same
-    /// files. Takes a plain [`Workspace`] too, for a caller that shares it with nobody.
-    pub fn workspace(mut self, workspace: impl Into<Arc<Workspace>>) -> Self {
+    /// files. Takes a plain [`WorkFs`] too, for a caller that shares it with nobody.
+    pub fn workspace(mut self, workspace: impl Into<Arc<WorkFs>>) -> Self {
         self.workspace = Some(workspace.into());
-        self
-    }
-
-    /// The namespace to announce, which the server realizes and this side does not.
-    ///
-    /// Separate from [`workspace`](Self::workspace), and deliberately not the thing this
-    /// builder realizes into one: what the far end must project and what *this* side can
-    /// read are not the same tree. A spec naming a volume kind this build has no provider
-    /// for is still a legitimate thing to announce — the server may well have it — so a
-    /// builder that realized the spec for itself would refuse sessions that work.
-    ///
-    /// Which is why a caller who wants both ends to agree about a file says so twice: the
-    /// spec here, and a tree from the same description — its own
-    /// [`Workspace::from_spec`](crate::volume::Workspace::from_spec), or the very volumes
-    /// the spec describes — to `workspace`.
-    ///
-    /// Leaving it out is a session with no namespace, which is still a session.
-    pub fn volumes(mut self, volumes: crate::volume::WorkspaceSpec) -> Self {
-        self.volumes = volumes;
         self
     }
 
@@ -270,9 +249,9 @@ pub struct Console {
 
     /// The namespace those names are resolved against, handed to each one as it runs.
     /// Shared rather than owned: whoever also serves this tree to the commands
-    /// themselves is holding the same `Workspace`, which is what makes the two ends
+    /// themselves is holding the same `WorkFs`, which is what makes the two ends
     /// agree about a file.
-    workspace: Arc<Workspace>,
+    workspace: Arc<WorkFs>,
 }
 
 impl Console {
@@ -301,15 +280,7 @@ impl Console {
             client_factory,
             execs,
             workspace,
-            volumes,
         } = builder;
-
-        // Before a server is started, not after: a spec that cannot be written down is the
-        // caller's to fix, and starting a process to tell them so costs a process and buries
-        // the reason under whatever the channel says when it is dropped.
-        volumes
-            .check()
-            .context("the declared namespace cannot be put on the wire")?;
 
         let client_factory =
             client_factory.context("a console needs a client to drive its server")?;
@@ -318,14 +289,13 @@ impl Console {
         client
             .init(Init {
                 delegated: execs.names().map(str::to_string).collect(),
-                volumes,
             })
             .await?;
 
         Ok(Console {
             client,
             execs,
-            workspace: workspace.unwrap_or_else(|| Arc::new(Workspace::new())),
+            workspace: workspace.unwrap_or_else(|| Arc::new(WorkFs::new())),
         })
     }
 
@@ -555,7 +525,7 @@ impl Drop for Console {
 
 /// What one delegated call comes to: the outcome of the [`ExecCmd::Resume`] that carries
 /// it back.
-async fn answer(execs: &ExecutableSet, workspace: &Workspace, exec: Exec) -> Outcome {
+async fn answer(execs: &ExecutableSet, workspace: &WorkFs, exec: Exec) -> Outcome {
     let Some((name, args)) = exec.cmd.split() else {
         return refused(Error::INVALID_PARAMS, "an empty command");
     };
@@ -608,7 +578,7 @@ mod tests {
     use crate::{
         console::message::{Call, Method, Notification},
         executable::{ExecResult as ExecOutput, Executable},
-        volume::{FileExt, InMemVolume, Mountable, OpenOptions},
+        fs::{InMemFs, Mountable},
     };
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.
@@ -722,7 +692,7 @@ mod tests {
         fn exec<'a>(
             &'a self,
             call: &'a ExecCall,
-            _workspace: &'a Workspace,
+            _workspace: &'a WorkFs,
         ) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move { ExecOutput::ok(format!("hello {}\n", call.args.join(" "))) })
         }
@@ -736,7 +706,7 @@ mod tests {
         fn exec<'a>(
             &'a self,
             call: &'a ExecCall,
-            _workspace: &'a Workspace,
+            _workspace: &'a WorkFs,
         ) -> BoxFuture<'a, ExecOutput> {
             Box::pin(async move {
                 match call.resolve(&call.args[0]) {
@@ -754,36 +724,6 @@ mod tests {
             panic!("a console with nothing to ask should not build");
         };
         assert!(failure.to_string().contains("needs a client"), "{failure}");
-    }
-
-    /// A namespace that cannot be written down is refused before a server is started, so the
-    /// reason reaches the caller rather than a dropped channel's.
-    ///
-    /// The client here would answer an `init`; it is never asked, which is the assertion —
-    /// `recorder`'s log stays empty and the caller is told what is wrong with its own spec.
-    #[tokio::test]
-    async fn a_namespace_the_wire_cannot_carry_is_refused_before_anything_starts() {
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let host = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe"));
-        let (client, log) = recorder(vec![null()]);
-        let Err(failure) = Console::builder()
-            .client(client)
-            .volumes(
-                crate::volume::WorkspaceSpec::default()
-                    .mount("work", crate::volume::VolumeSpec::Local { host }),
-            )
-            .build()
-            .await
-        else {
-            panic!("a namespace BSON cannot carry should not build");
-        };
-
-        assert!(
-            failure.to_string().contains("cannot be put on the wire"),
-            "{failure}"
-        );
-        assert_eq!(log.methods(), [], "nothing should have been asked");
     }
 
     /// Every way building can fail says which one it was, and all of them are here rather
@@ -892,32 +832,6 @@ mod tests {
         assert_eq!(log.methods(), [Method::Init]);
     }
 
-    /// The namespace a caller declared is what the server hears, on the one call that
-    /// describes a session. The caller keeps the spec and realizes it for itself too —
-    /// that second tree is what a delegated executable works against.
-    #[tokio::test]
-    async fn the_builder_announces_the_namespace_it_was_given() {
-        let spec = crate::volume::WorkspaceSpec::default().mount(
-            "work",
-            crate::volume::VolumeSpec::Local {
-                host: "/tmp/p".into(),
-            },
-        );
-
-        let (client, log) = recorder(vec![null()]);
-        let _console = Console::builder()
-            .client(client)
-            .volumes(spec.clone())
-            .build()
-            .await
-            .unwrap();
-
-        match log.call(0) {
-            Call::Init(init) => assert_eq!(init.volumes, spec),
-            other => panic!("call 0 should be the init, got {other:?}"),
-        }
-    }
-
     /// A console that was never started is ended the same way, because what `quit` is for
     /// is the server going away and a server exists whether or not it was ever booted.
     #[tokio::test]
@@ -1004,29 +918,33 @@ mod tests {
             fn exec<'a>(
                 &'a self,
                 call: &'a ExecCall,
-                workspace: &'a Workspace,
+                workspace: &'a WorkFs,
             ) -> BoxFuture<'a, ExecOutput> {
                 Box::pin(async move {
                     let path = std::path::Path::new(&call.args[0]);
-                    let (file, stat) = match workspace.open(path, OpenOptions::read_only()).await {
-                        Ok(opened) => opened,
+                    let stat = match workspace.stat(path).await {
+                        Ok(stat) => stat,
                         Err(e) => return ExecOutput::failed(1, e.to_string()),
                     };
                     let mut bytes = vec![0; stat.size as usize];
-                    match file.read_exact_at(&mut bytes, 0).await {
-                        Ok(()) => ExecOutput::ok(bytes),
+                    match workspace.read_at(path, &mut bytes, 0).await {
+                        Ok(n) => {
+                            bytes.truncate(n);
+                            ExecOutput::ok(bytes)
+                        }
                         Err(e) => ExecOutput::failed(1, e.to_string()),
                     }
                 })
             }
         }
 
-        let volume = InMemVolume::new();
-        let (file, _) = volume
-            .open(std::path::Path::new("note.txt"), OpenOptions::create_new())
+        let volume = InMemFs::new();
+        let note = std::path::Path::new("note.txt");
+        volume.create(note).await.unwrap();
+        volume
+            .write_at(note, b"from the workspace\n", 0)
             .await
             .unwrap();
-        file.write_all_at(b"from the workspace\n", 0).await.unwrap();
 
         let (client, log) = recorder(vec![
             null(),
@@ -1040,7 +958,7 @@ mod tests {
                 "read a file out of the workspace it was handed",
                 Cat,
             ))
-            .workspace(Workspace::new().try_with_mount("", volume).unwrap())
+            .workspace(WorkFs::new().try_with_mount("", volume).unwrap())
             .build()
             .await
             .unwrap();

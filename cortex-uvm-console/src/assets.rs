@@ -203,7 +203,7 @@ pub struct SpecFile {
 }
 
 impl SpecFile {
-    pub fn create(spec: &cortex::volume::WorkspaceSpec) -> anyhow::Result<SpecFile> {
+    pub fn create(spec: &cortex::fs::WorkspaceSpec) -> anyhow::Result<SpecFile> {
         use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt;
 
@@ -485,7 +485,7 @@ async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cortex::volume::{VolumeSpec, WorkspaceSpec};
+    use cortex::fs::{VolumeSpec, WorkspaceSpec};
 
     /// The file a boot child reads: readable by nobody else, and gone when the session is.
     #[test]

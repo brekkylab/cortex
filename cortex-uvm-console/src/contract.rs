@@ -51,7 +51,7 @@ pub const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
 /// Guest memory in MiB, if the caller overrode it.
 pub const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
 
-/// The file holding this session's [`WorkspaceSpec`](cortex::volume::WorkspaceSpec), as BSON.
+/// The file holding this session's [`WorkspaceSpec`](cortex::fs::WorkspaceSpec), as BSON.
 ///
 /// A file and not an environment value because a spec carries credentials: `environ` is
 /// readable by any same-uid process for the life of the process, where a `0600` file stops
