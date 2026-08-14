@@ -29,7 +29,7 @@ impl ExecCall {
     /// A leading `/` makes `arg` workspace-absolute and `cwd` irrelevant. Anything that
     /// would leave the root is refused, as is a relative `arg` with no `cwd` — see
     /// [`resolve_under`](crate::executable::resolve_under).
-    pub fn resolve(&self, arg: &str) -> crate::Result<std::path::PathBuf> {
+    pub fn resolve(&self, arg: &str) -> std::io::Result<std::path::PathBuf> {
         crate::executable::resolve_under(self.cwd.as_deref(), arg)
     }
 }

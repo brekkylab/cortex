@@ -87,7 +87,7 @@ pub struct OpenOptions {
     /// decides *whether* to create from `create`, and reads this only inside that
     /// branch, to decide whether the creation has to be exclusive.
     ///
-    /// [`AlreadyExists`]: crate::CortexError::AlreadyExists
+    /// [`AlreadyExists`]: io::ErrorKind::AlreadyExists
     pub create_new: bool,
 }
 

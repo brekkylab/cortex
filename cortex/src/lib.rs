@@ -1,20 +1,22 @@
-//! Two halves. They share a vocabulary for describing a namespace, and no behaviour.
+//! Two halves, sharing a crate and nothing else.
 //!
 //! * [`fs`] — expose any path-addressed store as a real filesystem. A store implements
-//!   [`Mountable`](fs::Mountable) and a binding puts it in front of a concrete
-//!   interface: a host FUSE mount, a guest microVM's virtio-fs, whatever else addresses
-//!   files by path. `fs/ARCHITECTURE.md` has the long form.
+//!   [`Mountable`](fs::Mountable) and a binding puts it in front of a concrete interface: a
+//!   host FUSE mount, an NFS or FSKit one, whatever else addresses files by path.
+//!   `fs/ARCHITECTURE.md` has the long form.
 //! * [`console`] — run commands somewhere else, over one JSON-RPC channel, with the
 //!   executables only *this* side knows how to run reachable from inside that somewhere
 //!   else. `console/ARCHITECTURE.md` has the long form.
 //!
-//! What they share is a crate and an error vocabulary, and nothing else: nothing in [`console`]
-//! builds a tree, calls [`Mountable`](fs::Mountable) or touches a binding, and nothing in
-//! [`fs`] knows a console exists. **A backend that projects a filesystem into its sandbox is
-//! built on top of both** — which is what `cortex-local-console` and `cortex-uvm-console` are,
-//! and why both are out of the workspace while each decides its own way through the current
-//! `fs`: a tree is mounted by whoever wants one, not described on the wire and realized at the
-//! far end.
+//! Nothing in [`console`] builds a tree, calls [`Mountable`](fs::Mountable) or touches a
+//! binding, and nothing in [`fs`] knows a console exists. There is not even an error type
+//! between them: both halves answer in [`std::io::Error`], classified by kind, so neither has a
+//! vocabulary the other has to learn.
+//!
+//! **A backend that projects a filesystem into a sandbox is built on top of both** — which is
+//! what `cortex-local-console` and `cortex-uvm-console` are, and why both are out of the
+//! workspace while each decides its own way through the current `fs`: a tree is mounted by
+//! whoever wants one, not described on the wire and realized at the far end.
 //!
 //! # The file layout
 //!
@@ -31,12 +33,9 @@
 #![allow(clippy::module_inception)]
 
 pub mod console;
-mod error;
 pub mod executable;
 pub mod fs;
 mod lock;
-
-pub use error::*;
 
 /// What every method that waits hands back — a [`Client`], a [`Server`], an
 /// [`Executable`].

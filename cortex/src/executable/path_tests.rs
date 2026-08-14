@@ -89,10 +89,12 @@ fn a_shim_that_reported_nothing_stays_nothing() {
 /// caller is wrong. Before this was refused, `("/etc", "passwd")` answered `etc/passwd`.
 #[test]
 fn an_absolute_cwd_is_refused_rather_than_reinterpreted() {
-    assert!(matches!(
-        resolve_under(Some("/etc"), "passwd"),
-        Err(CortexError::InvalidArgument)
-    ));
+    assert_eq!(
+        resolve_under(Some("/etc"), "passwd")
+            .expect_err("an absolute cwd is not a workspace path")
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
 }
 
 #[test]

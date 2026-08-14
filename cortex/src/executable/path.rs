@@ -8,9 +8,8 @@
 //! Here rather than in each backend because a backend's `delegate` is written twice, and the
 //! `Some`-vs-`None` rule is what must not drift between the copies.
 
+use std::io;
 use std::path::{Component, Path, PathBuf};
-
-use crate::{CortexError, Result};
 
 /// `cwd` expressed relative to `root`, or `None` if it cannot be — because it lies outside
 /// `root`, or because its name is not UTF-8. `to_string_lossy` there would hand back a path
@@ -41,9 +40,9 @@ pub fn reported_cwd(shim: Option<&str>, root: Option<&Path>) -> Option<String> {
 /// A leading `/` makes `arg` workspace-absolute, so `cwd` does not apply — which is how a
 /// caller names a file without depending on where it stood.
 ///
-/// Errors when a relative `arg` has no `cwd`
-/// ([`InvalidArgument`](CortexError::InvalidArgument)), and when the result would leave the
-/// root ([`InvalidName`](CortexError::InvalidName)).
+/// Errors when a relative `arg` has no `cwd` ([`InvalidInput`](io::ErrorKind::InvalidInput)),
+/// and when the result would leave the root
+/// ([`InvalidFilename`](io::ErrorKind::InvalidFilename)).
 ///
 /// # `..` is resolved only where that is not a guess
 ///
@@ -56,7 +55,7 @@ pub fn reported_cwd(shim: Option<&str>, root: Option<&Path>) -> Option<String> {
 /// nothing has looked up. `("work/sub", "../x.txt")` is `work/x.txt`;
 /// `("work/sub", "nope/../x.txt")` is `InvalidName`. The two ends still disagree there, by
 /// refusing rather than by answering.
-pub fn resolve_under(cwd: Option<&str>, arg: &str) -> Result<PathBuf> {
+pub fn resolve_under(cwd: Option<&str>, arg: &str) -> io::Result<PathBuf> {
     let mut out: Vec<&std::ffi::OsStr> = Vec::new();
 
     // Entries in `out` that `cwd` put there, and so the pops that are looking at a directory
@@ -64,7 +63,7 @@ pub fn resolve_under(cwd: Option<&str>, arg: &str) -> Result<PathBuf> {
     let mut standing = 0;
 
     if !arg.starts_with('/') {
-        let cwd = Path::new(cwd.ok_or(CortexError::InvalidArgument)?);
+        let cwd = Path::new(cwd.ok_or(io::Error::from(io::ErrorKind::InvalidInput))?);
         for component in cwd.components() {
             match component {
                 Component::Normal(name) => out.push(name),
@@ -74,7 +73,7 @@ pub fn resolve_under(cwd: Option<&str>, arg: &str) -> Result<PathBuf> {
                 // absolute `cwd` as relative: `("/etc", "passwd")` would answer `etc/passwd`,
                 // a real place nobody asked for.
                 Component::RootDir | Component::Prefix(_) | Component::ParentDir => {
-                    return Err(CortexError::InvalidArgument);
+                    return Err(io::ErrorKind::InvalidInput.into());
                 }
             }
         }
@@ -86,12 +85,12 @@ pub fn resolve_under(cwd: Option<&str>, arg: &str) -> Result<PathBuf> {
             // A root is where a workspace-absolute `arg` starts, not a name in it.
             Component::RootDir | Component::CurDir => {}
             // A drive letter or UNC share names a volume no workspace contains, and
-            // `Workspace::normalize` refuses one too.
-            Component::Prefix(_) => return Err(CortexError::InvalidName),
+            // `WorkFs`'s own normalization refuses one too.
+            Component::Prefix(_) => return Err(io::ErrorKind::InvalidFilename.into()),
             Component::ParentDir => {
                 // Above `standing` is a name `arg` pushed; at zero the path has left the root.
                 if out.len() > standing || out.is_empty() {
-                    return Err(CortexError::InvalidName);
+                    return Err(io::ErrorKind::InvalidFilename.into());
                 }
                 out.pop();
                 standing -= 1;
