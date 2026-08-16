@@ -3,11 +3,11 @@
 `cortex::fs`는 작고 합성 가능한 가상 파일시스템입니다.
 
 한 문장으로 요약하면 **"경로로 주소를 매기는 아무 저장소든 진짜 파일시스템으로 노출한다"**
-입니다. 저장소 쪽은 [`FileSystem`](filesystem.rs) trait 하나로 표현하고, 노출 쪽은
+입니다. 저장소 쪽은 [`FileSystem`](filesystem/filesystem.rs) trait 하나로 표현하고, 노출 쪽은
 인터페이스마다 얇은 바인딩을 하나씩 얹습니다.
 
 이름이 비슷한 두 trait을 먼저 갈라 두는 편이 좋습니다. **`FileSystem`은 트리를 *기술*하고,
-[`Mount`](mounts/mod.rs)는 OS가 실제로 마운트해 둔 *상태*입니다.** 앞쪽은 이 프로세스 안의
+[`Mount`](mount/mount.rs)는 OS가 실제로 마운트해 둔 *상태*입니다.** 앞쪽은 이 프로세스 안의
 계약이라 밖에서는 보이지 않고, 뒤쪽은 아무 프로세스나 `open`할 수 있는 경로 하나입니다 —
 바인딩이 마운트하며 돌려주는 가드가 그것이고, 가드가 drop되면 마운트도 내려갑니다.
 
@@ -20,14 +20,14 @@
 ```mermaid
 flowchart TB
     subgraph surface["바인딩 — 인터페이스별. 가드는 모두 <b>Mount</b>"]
-        fuse["mounts/fuse.rs<br/><i>fuser Filesystem</i><br/>커널 FUSE → FuseMount"]
-        fuset["mounts/fuse_t.rs<br/><i>libfuse-t + C shim</i><br/>nfs · fskit · smb → FuseTMount"]
+        fuse["mount/impl/fuse.rs<br/><i>fuser Filesystem</i><br/>커널 FUSE → FuseMount"]
+        fuset["mount/impl/fuse_t.rs<br/><i>libfuse-t + C shim</i><br/>nfs · fskit · smb → FuseTMount"]
         dav["webdav <i>(예정)</i><br/>HTTP"]
     end
 
-    posix["<b>Posix&lt;T&gt;</b> — posix.rs<br/>inode 번호 · 커널 참조 카운트 · 열린 파일 테이블<br/>open 분해 · 접근 모드 · readdir 커서 · errno 표"]
+    posix["<b>Posix&lt;T&gt;</b> — filesystem/posix.rs<br/>inode 번호 · 커널 참조 카운트 · 열린 파일 테이블<br/>open 분해 · 접근 모드 · readdir 커서 · errno 표"]
 
-    mountable["<b>FileSystem</b> — filesystem.rs<br/>stat · list · read_at<br/>create · mkdir · unlink · rmdir · rename · write_at · truncate · flush"]
+    mountable["<b>FileSystem</b> — filesystem/filesystem.rs<br/>stat · list · read_at<br/>create · mkdir · unlink · rmdir · rename · write_at · truncate · flush"]
 
     subgraph stores["구현체"]
         ws["<b>WorkFs</b> — workfs.rs<br/>최장 접두사 마운트 테이블"]
@@ -67,10 +67,11 @@ delegated executable이 그 예입니다 — 명령이 열었던 파일을 같�
 
 | 파일 | 담고 있는 것 |
 | --- | --- |
-| [`filesystem.rs`](filesystem.rs) | `FileSystem` — 저장소가 구현하는 유일한 계약. `Stat`·`DirentKind`·`Dirent`가 그것이 답하는 어휘로 함께 있습니다 |
-| [`posix.rs`](posix.rs) | `Posix<T>` — inode·파일 핸들·open 분해·errno 표. `OpenOptions`·`SetAttr`은 *호출자의* open과 커널 `setattr`의 어휘이고 여기서 멈춥니다 — 저장소는 보지 않습니다 |
-| [`mounts/`](mounts/) | 바인딩과 `Mount`. 각각 가드 하나를 내보내고, `mod.rs`가 그 가드들의 공통 계약(`Mount`)과 동기 콜백에서 async 저장소로 건너가는 유일한 지점(`block_on`)을 갖습니다 |
-| [`stores/`](stores/) | 구체 저장소들 |
+| [`filesystem/filesystem.rs`](filesystem/filesystem.rs) | `FileSystem` — 저장소가 구현하는 유일한 계약. `Stat`·`DirentKind`·`Dirent`가 그것이 답하는 어휘로 함께 있습니다 |
+| [`filesystem/posix.rs`](filesystem/posix.rs) | `Posix<T>` — inode·파일 핸들·open 분해·errno 표. `OpenOptions`·`SetAttr`은 *호출자의* open과 커널 `setattr`의 어휘이고 여기서 멈춥니다 — 저장소는 보지 않습니다 |
+| [`filesystem/impl/`](filesystem/impl/) | 구체 저장소들 |
+| [`mount/mount.rs`](mount/mount.rs) | `Mount` — 가드들의 공통 계약. 바인딩이 무엇이든 마운트된 상태가 답하는 것은 이것 하나입니다 |
+| [`mount/impl/`](mount/impl/) | 바인딩. 각각 가드 하나를 내보내고, `mod.rs`가 동기 콜백에서 async 저장소로 건너가는 유일한 지점(`block_on`)을 갖습니다 |
 | [`workfs.rs`](workfs.rs) | `WorkFs` — 여러 저장소를 한 트리로 접합하며 그 자체로 저장소 |
 
 ## 설계 판단은 코드 옆에 있습니다
@@ -88,5 +89,5 @@ delegated executable이 그 예입니다 — 명령이 열었던 파일을 같�
   아니라 이 층의 몫인지.
 - **`Posix::host_errno`** — raw errno를 넘겨도 되는 이유(같은 호스트의 번호 체계). 게스트를 읽는
   바인딩이 생기면 반대로 kind로만 분류해야 합니다 — `ENOTEMPTY`가 macOS 66, Linux 39입니다.
-- **`mounts/fuse_t.rs`의 `FuseTBackend`** — 같은 vtable 위에서 전송만 바뀐다는 것.
+- **`mount/impl/fuse_t.rs`의 `FuseTBackend`** — 같은 vtable 위에서 전송만 바뀐다는 것.
 - **`examples/compare_fuse_t_backends.rs`** — 그 전송들이 실제로 무엇을 요청하는지 측정한 표.

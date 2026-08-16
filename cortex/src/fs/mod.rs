@@ -1,21 +1,20 @@
-//! A path-addressed store ([`FileSystem`]), the POSIX layer that gives it inode identity
-//! ([`Posix`]), and the bindings that put one in front of a real filesystem ([`Mount`]).
+//! Two traits and one type. [`FileSystem`] is what a store must provide, [`Mount`] is what the
+//! host has once one of those trees is attached to it, and [`WorkFs`] is the public API — the
+//! tree a caller actually assembles and hands to a binding.
 //!
-//! The three form a stack, and the module tree mirrors it:
-//!
-//! * [`filesystem`] — what a store must provide, and the vocabulary it answers in: a namespace
-//!   plane and a data plane, both addressed by path, and nothing that stands for an open.
-//!   Descriptor identity belongs to the layer that has descriptors, which is why a store never
-//!   sees one.
-//! * [`posix`] — [`Posix`], which turns those paths into the inode numbers, file handles
-//!   and open decomposition a kernel speaks in, and owns everything the bindings share.
-//! * [`mounts`] — the bindings, one per concrete filesystem interface, each doing nothing but
-//!   translating that interface's calls onto [`Posix`], plus [`Mount`]: what a live one is.
-//! * [`stores`] — the concrete stores, from an in-memory tree to an object store.
-//!
-//! Beside the stack sits [`workfs`] — [`WorkFs`], which grafts several stores under one tree
-//! and is itself a [`FileSystem`], so it is both a consumer of the trait and something the
-//! bindings can drive like any single store.
+//! * [`FileSystem`] — the one contract a store implements, and the vocabulary it answers in: a
+//!   namespace plane and a data plane, both addressed by path, and nothing that stands for an
+//!   open. Descriptor identity belongs to the layer that has descriptors, which is [`Posix`]:
+//!   it turns those paths into the inode numbers, file handles and open decomposition a kernel
+//!   speaks in, and owns everything the bindings share, so a store never sees one. The concrete
+//!   stores sit under the trait, from an in-memory tree to an object store.
+//! * [`Mount`] — the state of having been mounted, which is a path on this host where a kernel
+//!   will answer. What implements it is the guard a binding hands back, and the bindings are
+//!   one per concrete filesystem interface, each doing nothing but translating that interface's
+//!   calls onto [`Posix`].
+//! * [`WorkFs`] — several stores grafted under one tree, and itself a [`FileSystem`], so it is
+//!   both a consumer of the trait and something the bindings can drive like any single store.
+//!   A caller that has one store still has a tree; a caller that has five has this.
 //!
 //! **A [`FileSystem`] describes a tree; a [`Mount`] is one the operating system has.** The
 //! first is a contract some type implements and nothing outside this process can see; the
@@ -28,25 +27,25 @@
 //! anything else does — mounted on the host, then passed in as a directory — so there is no
 //! second, VM-shaped path through [`Posix`] to keep in step with this one.
 //!
+//! Which of the two a consumer names is therefore a statement, and worth reading as one. A
+//! parameter typed [`FileSystem`] asks only to be *given a tree*: the callee will address it by
+//! path, inside this process, and does not care whether anything outside can see it. A
+//! parameter typed [`Mount`] asks for a tree the host already has — the caller must have
+//! mounted it, and what arrives is a directory that `std::fs`, a spawned program or a guest can
+//! open by name. [`Executable`] takes the second: a delegated name runs inside an execution and
+//! has to open the file the command meant, by the path the command used, so its signature says
+//! "a tree plugged into this host" rather than "a tree".
+//!
 //! Errors are [`std::io::Error`], classified by kind. There is no error type here to
 //! learn: a store's own `std::fs` calls travel up unchanged, and `FileSystem`'s docs say
 //! which kind answers what.
+//!
+//! [`Executable`]: crate::executable::Executable
 
 mod filesystem;
-mod mounts;
-mod posix;
-mod stores;
+mod mount;
 mod workfs;
 
 pub use filesystem::*;
-// `Mount` is here whatever this build can mount: a consumer takes one to be told where a tree
-// is, and which binding made it is the mounting caller's business. The guards themselves are
-// each gated on the binding that exports them.
-pub use mounts::Mount;
-#[cfg(feature = "fuse")]
-pub use mounts::{FuseMount, MountOption};
-#[cfg(feature = "fuse-t")]
-pub use mounts::{FuseTBackend, FuseTMount};
-pub use posix::*;
-pub use stores::*;
+pub use mount::*;
 pub use workfs::*;

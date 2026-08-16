@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "cortex",
+    "cortex-execs/mem",
     "cortex-local-console",
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
@@ -80,6 +81,17 @@ chrono = "0.4"
 # Notion answers in JSON and `page.json` is rendered back to it, so the backend
 # holds pages as `Value` rather than a mirror of a schema it does not own.
 serde_json = "1"
+
+# A memory store that is one file in a cortex tree. `bundled` on purpose: the store
+# is a file a delegated executable opens on a mount, and which SQLite answers for it
+# must not be whichever one the host happens to ship — the schema below uses an
+# extension that is compiled against these headers.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Nearest-neighbour search inside that same file: a `vec0` virtual table, statically
+# registered as an auto-extension rather than loaded from a `.dylib` nobody would
+# have. Pinned off the 0.1.10 alphas, whose published crate is missing a `#include`d
+# source file and does not compile.
+sqlite-vec = "0.1.9"
 
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.

@@ -3,7 +3,7 @@
 //!
 //! Everything it needs — inode identity, handle lifetime, the readdir cursor, the open
 //! decomposition, the attribute policy, the host errno table — already lives in
-//! [`super::super::posix`], so what is left here is marshalling.
+//! [`posix`](crate::fs::filesystem::posix), so what is left here is marshalling.
 //!
 //! **Why a binding of its own, beside the `fuser` one?** They differ in who drives the
 //! session. `fuser` takes the fd from `fuse_mount` and speaks the kernel FUSE protocol over
@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::fs::posix::{
+use crate::fs::filesystem::posix::{
     BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, attr_for, decode_open_flags,
     host_errno, mode_for, unix_time,
 };

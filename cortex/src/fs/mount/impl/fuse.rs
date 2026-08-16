@@ -31,7 +31,7 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
-use crate::fs::posix::{
+use crate::fs::filesystem::posix::{
     BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
     decode_open_flags, host_errno,
 };

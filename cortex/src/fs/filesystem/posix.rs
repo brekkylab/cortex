@@ -256,25 +256,25 @@ const HELD_PREFIX: &str = ".cortex-unlinked-";
 
 /// How long a kernel may cache a lookup or attribute reply — also the window in which a
 /// write stays invisible, hence short.
-pub(super) const TTL: Duration = Duration::from_secs(1);
+pub(in crate::fs) const TTL: Duration = Duration::from_secs(1);
 
 /// Reported block size. Shapes only `st_blocks`/`st_blksize` and `statfs`; no store has
 /// a block notion of its own.
-pub(super) const BLOCK_SIZE: u64 = 512;
+pub(in crate::fs) const BLOCK_SIZE: u64 = 512;
 
 /// Longest single path component reported by `statfs`.
-pub(super) const NAME_MAX: u32 = 255;
+pub(in crate::fs) const NAME_MAX: u32 = 255;
 
 /// Synthetic `statfs` capacity, in [`BLOCK_SIZE`] blocks (1 TiB).
 ///
 /// No store has a capacity to report, but "unknown" cannot be spelled as zero: zero
 /// total blocks reads as *full*, so `df` shows 100% used and installers refuse to run.
 /// Reported entirely free.
-pub(super) const TOTAL_BLOCKS: u64 = (1 << 40) / BLOCK_SIZE;
+pub(in crate::fs) const TOTAL_BLOCKS: u64 = (1 << 40) / BLOCK_SIZE;
 
 /// Synthetic inode budget. Zero free inodes would mean every `create` fails before it
 /// is attempted.
-pub(super) const TOTAL_INODES: u64 = 1 << 32;
+pub(in crate::fs) const TOTAL_INODES: u64 = 1 << 32;
 
 // Identical on every POSIX system, and `libc` is only an optional dependency.
 const S_IFDIR: u32 = 0o040000;
@@ -289,7 +289,7 @@ const S_IFREG: u32 = 0o100000;
 /// `uid`/`gid` are absent on purpose: a guest sees the ids inside the VM, while a host
 /// mount must report the mounting user's or that user cannot traverse their own mount.
 /// Each binding decides those, as it decides its errno numbering.
-pub(super) struct Attr {
+pub(in crate::fs) struct Attr {
     pub size: u64,
     pub blocks: u64,
     pub blksize: u32,
@@ -306,7 +306,7 @@ pub(super) struct Attr {
 }
 
 /// `st_mode` for an entry of this kind: type bits plus fixed permission bits.
-pub(super) fn mode_for(kind: DirentKind) -> u32 {
+pub(in crate::fs) fn mode_for(kind: DirentKind) -> u32 {
     match kind {
         DirentKind::Dir => S_IFDIR | 0o755,
         DirentKind::File => S_IFREG | 0o644,
@@ -331,7 +331,7 @@ pub(super) fn mode_for(kind: DirentKind) -> u32 {
 /// the `_` arm and reaches userspace as `EIO`, which is a valid number and therefore a
 /// silent wrong answer. A store that answers with a kind not named below has to add it.
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
-pub(super) fn host_errno(err: &io::Error) -> i32 {
+pub(in crate::fs) fn host_errno(err: &io::Error) -> i32 {
     if let Some(errno) = err.raw_os_error() {
         return errno;
     }
@@ -359,7 +359,7 @@ pub(super) fn host_errno(err: &io::Error) -> i32 {
 /// missing one falls back to `mtime` then the epoch. Reporting a real `mtime` is
 /// functional, not cosmetic: a guest negotiating `AUTO_INVAL_DATA` watches it to decide
 /// when to drop cached pages, so one stuck at 0 never has its cache invalidated.
-pub(super) fn attr_for(stat: &Stat) -> Attr {
+pub(in crate::fs) fn attr_for(stat: &Stat) -> Attr {
     // A directory's real link count is `2 + subdirs`, and `find`/`du` read `nlink - 2`
     // as that count and stop descending at zero. `1` is the conventional "unreliable",
     // which turns that optimisation off.
@@ -381,7 +381,7 @@ pub(super) fn attr_for(stat: &Stat) -> Attr {
 
 /// Split a [`SystemTime`] into the `(seconds, nanoseconds)` a `stat` carries. Pre-epoch
 /// times clamp rather than wrap into the future.
-pub(super) fn unix_time(time: SystemTime) -> (i64, i64) {
+pub(in crate::fs) fn unix_time(time: SystemTime) -> (i64, i64) {
     match time.duration_since(UNIX_EPOCH) {
         Ok(since) => (since.as_secs() as i64, since.subsec_nanos() as i64),
         Err(_) => (0, 0),
@@ -392,7 +392,7 @@ pub(super) fn unix_time(time: SystemTime) -> (i64, i64) {
 /// `O_TRUNC` alone is `0o1000` on Linux and `0o2000` on macOS, so each binding supplies
 /// its own — same split as the errno tables. The access mode is portable and decoded
 /// once below.
-pub(super) struct OpenFlagBits {
+pub(in crate::fs) struct OpenFlagBits {
     pub append: i32,
     pub truncate: i32,
     pub create: i32,
@@ -403,7 +403,7 @@ pub(super) struct OpenFlagBits {
 ///
 /// The one self-contradictory combination — neither read nor write — is rejected here,
 /// which is the last place it can be: no store sees these options at all.
-pub(super) fn decode_open_flags(flags: i32, bits: &OpenFlagBits) -> io::Result<OpenOptions> {
+pub(in crate::fs) fn decode_open_flags(flags: i32, bits: &OpenFlagBits) -> io::Result<OpenOptions> {
     // `O_ACCMODE` is a two-bit *field*, not a bitmask, and `O_RDONLY` is 0, so
     // `flags & O_WRONLY != 0` would misread `O_RDWR` as write-only. Match it as a
     // value. Getting this wrong silently opens files with the wrong access.
@@ -443,7 +443,7 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// Takes a kernel reference on the inode, so it must be balanced by
     /// [`forget`](InodeTable::forget) — that is the `lookup` contract.
-    pub(super) async fn lookup_child(&self, parent: u64, name: &OsStr) -> io::Result<(u64, Stat)> {
+    pub(in crate::fs) async fn lookup_child(&self, parent: u64, name: &OsStr) -> io::Result<(u64, Stat)> {
         let parent_path = self.path_of(parent)?;
         let child = parent_path.join(name);
         let stat = self.store.stat(&child).await?;
@@ -453,7 +453,7 @@ impl<T: FileSystem> Posix<T> {
     }
 
     /// Metadata for an inode already known to the kernel.
-    pub(super) async fn stat_inode(&self, inode: u64) -> io::Result<Stat> {
+    pub(in crate::fs) async fn stat_inode(&self, inode: u64) -> io::Result<Stat> {
         let path = self.path_of(inode)?;
         self.store.stat(&path).await
     }
@@ -473,7 +473,7 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// The options are the caller's: a binding decodes them from whatever flags word its
     /// kernel speaks (see [`decode_open_flags`]).
-    pub(super) async fn open_inode(&self, inode: u64, options: OpenOptions) -> io::Result<u64> {
+    pub(in crate::fs) async fn open_inode(&self, inode: u64, options: OpenOptions) -> io::Result<u64> {
         let path = self.path_of(inode)?;
         self.realize_open(&path, options).await?;
         Ok(lock(&self.opens).insert(Open { inode, options }))
@@ -481,7 +481,7 @@ impl<T: FileSystem> Posix<T> {
 
     /// Create — or open, if `options` allows — a child of `parent`, returning everything
     /// a `create` reply needs at once.
-    pub(super) async fn create_child(
+    pub(in crate::fs) async fn create_child(
         &self,
         parent: u64,
         name: &OsStr,
@@ -539,7 +539,7 @@ impl<T: FileSystem> Posix<T> {
 
     /// Read the `(offset, size)` window the kernel asked for. A short read is EOF, so
     /// the returned buffer is only as long as what actually arrived.
-    pub(super) async fn read_handle(&self, fh: u64, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+    pub(in crate::fs) async fn read_handle(&self, fh: u64, offset: u64, size: u32) -> io::Result<Vec<u8>> {
         let (path, options) = self.open_of(fh)?;
         if !options.read {
             return Err(bad_handle());
@@ -560,7 +560,7 @@ impl<T: FileSystem> Posix<T> {
     /// `O_APPEND` is not resolved here. A kernel resolves it before the request arrives,
     /// sending the absolute offset it decided on; the flag is kept only because it is
     /// permission to write, which the check below reads.
-    pub(super) async fn write_handle(
+    pub(in crate::fs) async fn write_handle(
         &self,
         fh: u64,
         offset: u64,
@@ -587,7 +587,7 @@ impl<T: FileSystem> Posix<T> {
     }
 
     /// Create a subdirectory of `parent`, returning its inode and metadata.
-    pub(super) async fn mkdir_child(&self, parent: u64, name: &OsStr) -> io::Result<(u64, Stat)> {
+    pub(in crate::fs) async fn mkdir_child(&self, parent: u64, name: &OsStr) -> io::Result<(u64, Stat)> {
         let path = self.path_of(parent)?.join(name);
         // One call, not a `mkdir` followed by a `stat`: the store reports what it just
         // made, which it knows for free and a second request would have to ask for.
@@ -632,7 +632,7 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// A store that cannot rename cannot hold anything aside either, so it gets the plain
     /// removal and the old behaviour with it.
-    pub(super) async fn unlink_child(&self, parent: u64, name: &OsStr) -> io::Result<()> {
+    pub(in crate::fs) async fn unlink_child(&self, parent: u64, name: &OsStr) -> io::Result<()> {
         let dir = self.path_of(parent)?;
         let path = dir.join(name);
 
@@ -670,7 +670,7 @@ impl<T: FileSystem> Posix<T> {
     }
 
     /// Remove the empty directory named `name` under `parent`.
-    pub(super) async fn rmdir_child(&self, parent: u64, name: &OsStr) -> io::Result<()> {
+    pub(in crate::fs) async fn rmdir_child(&self, parent: u64, name: &OsStr) -> io::Result<()> {
         let path = self.path_of(parent)?.join(name);
         self.store.rmdir(&path).await?;
         lock(&self.inodes).evict_subtree(&path);
@@ -687,7 +687,7 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// Open handles follow, and get that for free: a handle resolves to an inode, and
     /// the inode's path is what moves.
-    pub(super) async fn rename_child(
+    pub(in crate::fs) async fn rename_child(
         &self,
         from_parent: u64,
         name: &OsStr,
@@ -711,7 +711,7 @@ impl<T: FileSystem> Posix<T> {
     /// No file handle argument, unlike the calls above. A `setattr` may carry one, but a
     /// resize names a path either way, and the inode the kernel quotes alongside it is
     /// already that path.
-    pub(super) async fn setattr_inode(&self, inode: u64, attr: SetAttr) -> io::Result<Stat> {
+    pub(in crate::fs) async fn setattr_inode(&self, inode: u64, attr: SetAttr) -> io::Result<Stat> {
         if let Some(size) = attr.size {
             let path = self.path_of(inode)?;
             self.store.truncate(&path, size).await?;
@@ -723,7 +723,7 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// Serves both FLUSH and FSYNC, which arrive on every `close()` and mid-stream
     /// respectively, so it must be repeatable and must leave the handle usable.
-    pub(super) async fn flush_handle(&self, fh: u64) -> io::Result<()> {
+    pub(in crate::fs) async fn flush_handle(&self, fh: u64) -> io::Result<()> {
         let (path, _) = self.open_of(fh)?;
         self.store.flush(&path).await
     }
@@ -736,7 +736,7 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// A release for a handle we never issued is the kernel tidying up; there is nothing
     /// to drop and nothing to complain about.
-    pub(super) async fn release_handle(&self, fh: u64) -> io::Result<()> {
+    pub(in crate::fs) async fn release_handle(&self, fh: u64) -> io::Result<()> {
         let Some(open) = lock(&self.opens).remove(fh) else {
             return Ok(());
         };
@@ -761,7 +761,7 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// `..` reuses this directory's inode: resolving the real parent buys nothing for
     /// traversal, which goes through `lookup`.
-    pub(super) async fn dir_entries(&self, inode: u64) -> io::Result<Vec<(u64, Dirent)>> {
+    pub(in crate::fs) async fn dir_entries(&self, inode: u64) -> io::Result<Vec<(u64, Dirent)>> {
         let dir = self.path_of(inode)?;
         let children = self.store.list(&dir).await?;
 
@@ -791,7 +791,7 @@ impl<T: FileSystem> Posix<T> {
     /// The cursor protocol is here because every binding must agree on it exactly:
     /// offsets are 1-based positions in the listing, and the kernel resumes by quoting
     /// the last one it consumed.
-    pub(super) async fn for_each_dirent<E>(
+    pub(in crate::fs) async fn for_each_dirent<E>(
         &self,
         inode: u64,
         offset: u64,
@@ -813,7 +813,7 @@ impl<T: FileSystem> Posix<T> {
     }
 
     /// Release the inode's kernel references, evicting it once none remain.
-    pub(super) fn forget_inode(&self, inode: u64, count: u64) {
+    pub(in crate::fs) fn forget_inode(&self, inode: u64, count: u64) {
         lock(&self.inodes).forget(inode, count);
     }
 
@@ -850,7 +850,7 @@ struct InodeData {
 /// `next` only ever increases, so a number is never reused even after its entry is
 /// forgotten. That keeps every *live* inode unique within the mount and sidesteps
 /// generation churn — u64 won't wrap in any realistic lifetime.
-pub(super) struct InodeTable {
+pub(in crate::fs) struct InodeTable {
     /// inode -> path + reference count. The authority for "what does this inode mean";
     /// every FUSE call that receives only an inode resolves through it.
     fwd: HashMap<u64, InodeData>,
@@ -898,12 +898,12 @@ impl InodeTable {
     ///
     /// [`number_for`](Self::number_for) is the other spelling and mints; this one answers "does
     /// the kernel know this name" and has to be able to say no.
-    pub(super) fn number_of(&self, path: &Path) -> Option<u64> {
+    pub(in crate::fs) fn number_of(&self, path: &Path) -> Option<u64> {
         self.rev.get(path).copied()
     }
 
     /// The path an inode maps to, or `None` if we've forgotten it (or never issued it).
-    pub(super) fn path_of(&self, inode: u64) -> Option<PathBuf> {
+    pub(in crate::fs) fn path_of(&self, inode: u64) -> Option<PathBuf> {
         self.fwd.get(&inode).map(|data| data.path.clone())
     }
 
@@ -919,7 +919,7 @@ impl InodeTable {
     ///
     /// This is the path for a file nothing had open. One that was open is *moved* rather than
     /// removed and so keeps both mappings — see [`Posix::unlink_child`].
-    pub(super) fn evict_path(&mut self, path: &Path) {
+    pub(in crate::fs) fn evict_path(&mut self, path: &Path) {
         self.rev.remove(path);
     }
 
@@ -928,7 +928,7 @@ impl InodeTable {
     /// `rmdir` succeeding means the *store* sees an empty directory; this table can still
     /// hold descendants interned by an earlier listing, and leaving them would let a
     /// rebuilt subtree resolve to the old numbers.
-    pub(super) fn evict_subtree(&mut self, prefix: &Path) {
+    pub(in crate::fs) fn evict_subtree(&mut self, prefix: &Path) {
         self.rev.retain(|path, _| !path.starts_with(prefix));
     }
 
@@ -950,7 +950,7 @@ impl InodeTable {
     /// `to` first *also* wipes the source whenever the paths overlap, leaving `fwd`
     /// populated and `rev` empty — after which the next `lookup` mints a second number
     /// for a path the table already knew, which is exactly what `rev` exists to prevent.
-    pub(super) fn rekey_subtree(&mut self, from: &Path, to: &Path) {
+    pub(in crate::fs) fn rekey_subtree(&mut self, from: &Path, to: &Path) {
         // Overlapping moves do nothing. A store refuses them all (`EINVAL` for a
         // directory into its own descendant, `ENOTEMPTY` for the reverse, a no-op for a
         // self-rename), so this is a backstop, not the rule — and leaving the table
@@ -993,7 +993,7 @@ impl InodeTable {
 
     /// Return the inode for `path`, allocating a fresh number the first time, and record
     /// one more kernel reference. Pairs with [`forget`](Self::forget).
-    pub(super) fn intern(&mut self, path: PathBuf) -> u64 {
+    pub(in crate::fs) fn intern(&mut self, path: PathBuf) -> u64 {
         if let Some(&inode) = self.rev.get(&path) {
             if let Some(data) = self.fwd.get_mut(&inode) {
                 data.lookup_count += 1;
@@ -1031,7 +1031,7 @@ impl InodeTable {
     /// A recycled number means a later `lookup` of that path answers with a different
     /// one than `readdir` advertised. Numbers themselves are still never reused, which is
     /// what lets each binding report `generation: 0`.
-    pub(super) fn number_for(&mut self, path: PathBuf) -> u64 {
+    pub(in crate::fs) fn number_for(&mut self, path: PathBuf) -> u64 {
         if let Some(&inode) = self.rev.get(&path) {
             return inode;
         }
@@ -1060,7 +1060,7 @@ impl InodeTable {
     ///
     /// The root is exempt: the kernel holds it for the life of the mount, and evicting it
     /// would strand every path that resolves through it.
-    pub(super) fn forget(&mut self, inode: u64, count: u64) {
+    pub(in crate::fs) fn forget(&mut self, inode: u64, count: u64) {
         if inode == ROOT_INODE {
             return;
         }
@@ -1106,7 +1106,7 @@ struct Open {
 ///
 /// Entries are `Copy` and tiny, so a caller takes one out, drops the lock, and then does
 /// the (possibly slow) store I/O without blocking other opens.
-pub(super) struct OpenTable {
+pub(in crate::fs) struct OpenTable {
     open: HashMap<u64, Open>,
     next: u64,
 }
