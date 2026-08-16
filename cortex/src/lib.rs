@@ -1,27 +1,94 @@
-//! Two halves, sharing a crate and nothing else.
+//! # Cortex
+//!
+//! The environment an agent works in: what it can see, and what it can do.
+//!
+//! Both are ordinary to whatever runs inside them, and that is the point. An agent handed a
+//! filesystem and a shell has two interfaces it already knows, and every capability added to
+//! them arrives as a file to read or a command to run rather than as something else to learn.
+//!
+//! * **What it sees is a filesystem.** Whatever it should know about — a project directory,
+//!   an object store, a Notion workspace, a tree assembled in memory — implements
+//!   [`FileSystem`](fs::FileSystem) and is grafted into a [`WorkFs`](fs::WorkFs) at a path
+//!   the caller chooses. A binding mounts that tree on the host, so what reads it is `cat`,
+//!   `grep`, and whatever else the agent thought to run.
+//! * **What it does is run commands.** A [`Console`](console::Console) runs them somewhere —
+//!   this host, a micro-VM — over one channel, and the `PATH` they run against carries more
+//!   than the programs that happen to be installed there. A caller registers
+//!   [`Executable`](exec::Executable)s: names that resolve back into *this* process, so
+//!   `summarize report.md` in a shell the agent wrote reaches Rust that can call a model,
+//!   and the shell cannot tell it from `wc`.
+//!
+//! ## Quickstart
+//!
+//! Needs the `fuse` feature, which is where `FuseMount` comes from — under `fuse-t` the same
+//! two lines say `FuseTMount`, and nothing else about this changes.
+//!
+//! ```ignore
+//! use std::path::Path;
+//!
+//! use cortex::console::Console;
+//! use cortex::fs::{FuseMount, InMemFs, WorkFs};
+//!
+//! #[tokio::main]
+//! async fn main() -> anyhow::Result<()> {
+//!     // What the agent can see. Each store is a `FileSystem`; a `WorkFs` is several of
+//!     // them under one root, and is itself a `FileSystem`, so a binding drives it like
+//!     // any single store.
+//!     let workfs = WorkFs::new().try_with_mount("notes", InMemFs::new())?;
+//!
+//!     // Where the host can see it. Constructing the guard mounts, dropping it unmounts,
+//!     // and the console below holds it for the length of the session.
+//!     let mount = FuseMount::try_new(workfs, Path::new("/tmp/session"))?;
+//!
+//!     // What the agent can do: a server that runs its commands, against that tree. A
+//!     // session's shape is said once, when the console is built.
+//!     let mut console = Console::builder()
+//!         .stdio_client(&["cortex-local-console"])
+//!         .mount(mount)
+//!         .build()
+//!         .await?;
+//!
+//!     // A shell the agent wrote, run wherever that server runs things.
+//!     let result = console.exec(["sh", "-c", "wc -w notes/today.md"], None).await?;
+//!     println!("{}", String::from_utf8_lossy(&result.stdout));
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Structure
+//!
+//! Three modules. Two are halves that share a crate and nothing else; the third is where
+//! both are spoken of at once.
 //!
 //! * [`fs`] — expose any path-addressed store as a real filesystem. A store implements
 //!   [`FileSystem`](fs::FileSystem) and a binding puts it in front of a concrete interface: a
 //!   host FUSE mount, an NFS or FSKit one, whatever else addresses files by path.
 //!   `fs/ARCHITECTURE.md` has the long form.
-//! * [`console`] — run commands somewhere else, over one JSON-RPC channel, with the
-//!   executables only *this* side knows how to run reachable from inside that somewhere
-//!   else. `console/ARCHITECTURE.md` has the long form.
+//! * [`exec`] — the names a console offers that are not programs on disk.
+//!   [`Executable`](exec::Executable) is what one of them runs and
+//!   [`ExecutableSet`](exec::ExecutableSet) is the allowlist announced for a session; how a
+//!   name is *reached* is the server's business and is not decided here. This is the module
+//!   that names both halves: an `Executable` is handed an [`ExecCall`](exec::ExecCall) by the
+//!   console and the [`Mount`](fs::Mount) the session runs against by `fs`, and resolving an
+//!   argument against a tree is the only operation in the crate that needs both.
+//! * [`console`] — run the commands, wherever the environment is: this host, a micro-VM.
+//!   One JSON-RPC channel carries them and the delegated names back the other way.
+//!   `console/ARCHITECTURE.md` has the long form.
 //!
-//! Nothing in [`console`] builds a tree, calls [`FileSystem`](fs::FileSystem) or touches a
-//! binding. What it does take is a [`Mount`](fs::Mount) — a tree somebody else already
-//! mounted, which is how a delegated executable comes to open the same file the command that
-//! called it did — and that is the whole of the seam. Nothing in [`fs`] knows a console
-//! exists. There is not even an error type
-//! between them: both halves answer in [`std::io::Error`], classified by kind, so neither has a
-//! vocabulary the other has to learn.
+//! Nothing in [`console`] builds a tree, calls [`FileSystem`](fs::FileSystem) or
+//! touches a binding. What it does take is a [`Mount`](fs::Mount) — a tree somebody else
+//! already mounted, which is how a delegated executable comes to open the same file the
+//! command that called it did — and that is the whole of the seam. Nothing in [`fs`] knows a
+//! console exists. There is not even an error type between them: both halves answer in
+//! [`std::io::Error`], classified by kind, so neither has a vocabulary the other has to learn.
 //!
-//! **A backend that projects a filesystem into a sandbox is built on top of both** — which is
-//! what `cortex-local-console` and `cortex-uvm-console` are, and why both are out of the
-//! workspace while each decides its own way through the current `fs`: a tree is mounted by
-//! whoever wants one, not described on the wire and realized at the far end.
+//! **A console server is built on top of both**, and the crates under
+//! `cortex-console-servers/` are what that looks like: `local` runs commands on this host,
+//! `uvm/console` runs them in a micro-VM with `uvm/guest` as its far half. Each finds its own
+//! way through `fs`, because a tree is mounted by whoever wants one rather than described on
+//! the wire and realized at the far end.
 //!
-//! # The file layout
+//! ## The file layout
 //!
 //! A module here is a directory whose `mod.rs` holds the module's own documentation and
 //! its re-exports, and whose siblings hold the code — including one named after the
