@@ -17,7 +17,7 @@
 //! mounts in it may still be mounted nowhere at all.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io,
     ops::Bound::{Excluded, Unbounded},
     path::{Component, Path, PathBuf},
@@ -40,6 +40,16 @@ pub struct WorkFs {
     /// the root and serves anything no deeper mount claims.
     mounts: BTreeMap<PathBuf, Box<dyn FileSystem>>,
 
+    /// The paths in this tree that something has declared to be skills, keyed the same way the
+    /// mount table is.
+    ///
+    /// Paths and nothing else, which is the whole of what this layer knows about them. What a
+    /// skill *is* — a directory with a `skill.md` in it, and the type that builds one — belongs
+    /// to [`skill`](crate::skill), and the methods that put entries in here are that module's.
+    /// A set of paths, though, is a fact about this tree: it has to be pruned when a mount goes
+    /// away, and nothing outside the mount table can see that happen.
+    pub(crate) skills: BTreeSet<PathBuf>,
+
     /// The timestamp every synthesized directory reports.
     ///
     /// Fixed at construction rather than read per call. A directory that advertises
@@ -60,6 +70,7 @@ impl WorkFs {
     pub fn new() -> Self {
         WorkFs {
             mounts: BTreeMap::new(),
+            skills: BTreeSet::new(),
             born: SystemTime::now(),
         }
     }
@@ -93,9 +104,43 @@ impl WorkFs {
     }
 
     /// Remove the mount registered at `path`, returning the detached store.
+    ///
+    /// Any skill mark the removal orphaned goes with it. Not the marks *below* `path`, which is
+    /// a different set: a skill under a mount of its own is still served after the mount above
+    /// it goes, and only the ones nothing serves any more are dropped.
     pub fn unmount(&mut self, path: impl AsRef<Path>) -> io::Result<Box<dyn FileSystem>> {
         let key = mount_key(path.as_ref())?;
-        self.mounts.remove(&key).ok_or_else(not_found)
+        let store = self.mounts.remove(&key).ok_or_else(not_found)?;
+        // Collected first: the test borrows the whole table, which `retain` would not allow.
+        let orphaned: Vec<PathBuf> = self
+            .skills
+            .iter()
+            .filter(|skill| !self.is_claimed(skill))
+            .cloned()
+            .collect();
+        for skill in orphaned {
+            self.skills.remove(&skill);
+        }
+        Ok(store)
+    }
+
+    /// Normalize `path` into the form both the mount table and the skill registry are keyed by.
+    ///
+    /// The one way in for [`skill`](crate::skill), which keys its marks by the same paths this
+    /// table routes on and must not do its own normalizing — two spellings of one directory
+    /// would be two skills.
+    pub(crate) fn key(&self, path: &Path) -> io::Result<PathBuf> {
+        mount_key(path)
+    }
+
+    /// Whether anything in this workspace serves `key`: a store routes there, or the mount
+    /// table synthesizes a directory at it.
+    ///
+    /// Not "something exists there" — that is a store's answer and costs a call. This is the
+    /// weaker question the mount table can settle alone, which is enough to reject a path the
+    /// workspace has no tree at.
+    pub(crate) fn is_claimed(&self, key: &Path) -> bool {
+        self.route(key).is_some() || self.is_synthesized_dir(key)
     }
 
     /// The store that owns `key` (longest-prefix match), with `key` re-based onto that store's

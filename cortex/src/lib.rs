@@ -75,6 +75,15 @@
 //!   One JSON-RPC channel carries them and the delegated names back the other way.
 //!   `console/ARCHITECTURE.md` has the long form.
 //!
+//! One module is built on [`fs`] rather than beside it:
+//!
+//! * [`skill`] — instructions the agent finds by looking. A [`Skill`](skill::Skill) is a
+//!   directory with a `skill.md` in it, so a capability added to a workspace arrives as files
+//!   to read rather than as an interface to learn — the bargain [`fs`] makes, one level up.
+//!   [`SkillDir`](skill::SkillDir) is such a directory as a [`FileSystem`](fs::FileSystem), and
+//!   a [`WorkFs`](fs::WorkFs) keeps the register of where its skills are. The dependency runs
+//!   one way: nothing in [`fs`] knows what a skill is.
+//!
 //! Nothing in [`console`] builds a tree, calls [`FileSystem`](fs::FileSystem) or
 //! touches a binding. What it does take is a [`Mount`](fs::Mount) — a tree somebody else
 //! already mounted, which is how a delegated executable comes to open the same file the
@@ -106,6 +115,7 @@ pub mod console;
 pub mod exec;
 pub mod fs;
 mod lock;
+pub mod skill;
 
 /// What every method that waits hands back — a [`Client`], a [`Server`], an
 /// [`Executable`].
