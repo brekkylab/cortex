@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "cortex",
+    "cortex-execs/index",
     "cortex-execs/mem",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
@@ -38,6 +39,16 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
+
+# The full-text index behind `cortex-exec-index`, and the parser its `--help` comes out of.
+# Only that crate takes either, which is what keeps a search engine and an argument parser out
+# of `cortex` — the same rule `rusqlite` follows for `cortex-exec-mem`.
+#
+# clap's `string` feature is load-bearing rather than a convenience: one executable can be
+# registered under several names, so the usage line has to carry the name it was invoked by,
+# and without `string` a command's name can only be a `&'static str`.
+clap = { version = "4", features = ["derive", "string"] }
+tantivy = "0.26"
 
 # The in-process, Rust-native libkrun fork. `VmBuilder` is what lets a boot be
 # assembled out of parts this workspace already holds: tagged virtio-fs shares, two
