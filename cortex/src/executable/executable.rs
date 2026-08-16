@@ -21,6 +21,21 @@ pub struct ExecCall {
     /// which is the honest answer, where a substituted root would read a different file and
     /// say nothing about it.
     pub cwd: Option<String>,
+
+    /// The environment the invoking command had — all of it, as the executor reported it.
+    ///
+    /// What makes a delegated name behave like a program on `PATH` rather than almost like
+    /// one: `FOO=bar summarize x` reaches here as `FOO`, and so does anything exported
+    /// earlier in the same shell.
+    ///
+    /// **Read, never applied.** This is what the *command* had, not what this process has,
+    /// and the two are different machines' worth of facts — `PATH` names a directory of
+    /// symlinks on the executor, `PWD` and `HOME` are its own. An executable that wants a
+    /// variable looks it up here; one that sets it anywhere has changed the wrong process.
+    ///
+    /// Empty when there was nothing to report and when the command genuinely had no
+    /// environment, which are the same thing to a lookup.
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 impl ExecCall {
@@ -137,6 +152,7 @@ mod tests {
             name: "summarize".into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             cwd: cwd.map(str::to_owned),
+            env: Default::default(),
         }
     }
 

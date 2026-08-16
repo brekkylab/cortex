@@ -444,10 +444,11 @@ impl Console {
             // A command a caller asked for, so it carries on from nothing.
             cmd: ExecCmd::New(cmd.into_iter().map(|s| s.as_ref().to_string()).collect()),
             timeout_ms,
-            // A caller asking for a command names no directory: where an execution runs is
-            // the server's, decided by the namespace it mounted. The field reports where
-            // one *did* run, which only the end that ran it can say.
+            // A caller asking for a command names neither of these: where an execution
+            // runs and what it runs with are the session's, kept by the far end. Both
+            // fields report what *did* happen, which only the end that ran it can say.
             cwd: None,
+            env: Default::default(),
         };
 
         // Split rather than borrowed through `self`, because the chain holds the client
@@ -494,6 +495,7 @@ impl Console {
                         timeout_ms: None,
                         // Nor a command to be run anywhere: this carries an answer back.
                         cwd: None,
+                        env: Default::default(),
                     };
 
                     let (next, answered) = client.exec(carry_on).await;
@@ -618,6 +620,9 @@ async fn answer(execs: &ExecutableSet, mount: Option<&dyn Mount>, exec: Exec) ->
     let call = ExecCall {
         name: name.clone(),
         args: args.to_vec(),
+        // Whatever the command had, as the server reported it. Handed on rather than read:
+        // what a name does with its caller's environment is the name's business.
+        env: exec.env.clone(),
         // Where the command that invoked this stood, as the server reported it —
         // workspace-relative, so it means the same thing against this side's own tree.
         cwd: exec.cwd.clone(),
@@ -803,6 +808,18 @@ mod tests {
         }))
     }
 
+    /// An execution pausing on a delegated name, with the environment the command had.
+    fn delegated_with_env(cmd: &[&str], env: &[(&str, &str)]) -> Outcome {
+        progress(Progress::Delegated(Exec {
+            cmd: ExecCmd::New(cmd.iter().map(|s| s.to_string()).collect()),
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            ..Exec::default()
+        }))
+    }
+
     /// A directory that is already part of a filesystem, standing in for a mounted one.
     ///
     /// Not a mount these tests made: putting one up needs a binding, a libfuse provider and
@@ -843,6 +860,24 @@ mod tests {
                 match call.resolve(&call.args[0]) {
                     Ok(path) => ExecOutput::ok(path.to_string_lossy().into_owned()),
                     Err(e) => ExecOutput::failed(1, format!("{e}")),
+                }
+            })
+        }
+    }
+
+    /// Answers with a variable out of the environment the command had.
+    struct Getenv;
+
+    impl Executable for Getenv {
+        fn exec<'a>(
+            &'a self,
+            call: &'a ExecCall,
+            _mount: Option<&'a dyn Mount>,
+        ) -> BoxFuture<'a, ExecOutput> {
+            Box::pin(async move {
+                match call.env.get(&call.args[0]) {
+                    Some(value) => ExecOutput::ok(value.clone()),
+                    None => ExecOutput::failed(1, format!("{}: unset", call.args[0])),
                 }
             })
         }
@@ -1252,5 +1287,41 @@ mod tests {
             panic!("a console whose workfs went to a relative path should not build");
         };
         assert!(e.to_string().contains("not an absolute path"), "{e}");
+    }
+
+    /// The environment on a delegated call crosses onto the [`ExecCall`], which is what
+    /// makes a delegated name usable the way a program on `PATH` is — and it crosses whole,
+    /// so a variable the reporting end never mentioned is one the executable finds unset.
+    #[tokio::test]
+    async fn a_delegated_call_is_handed_the_environment_the_command_had() {
+        for (arg, code, out) in [("FOO", 0, &b"bar"[..]), ("NOPE", 1, &b""[..])] {
+            let (client, log) = recorder(vec![
+                initialized(),
+                delegated_with_env(&["getenv", arg], &[("FOO", "bar")]),
+                ran(b"done\n"),
+            ]);
+            let mut console = Console::builder()
+                .client(client)
+                .executables(ExecutableSet::new().register(
+                    "getenv",
+                    "answer a variable the command had",
+                    Getenv,
+                ))
+                .build()
+                .await
+                .unwrap();
+
+            console.exec(["sh"], None).await.unwrap();
+
+            let Call::Exec(Exec {
+                cmd: ExecCmd::Resume { outcome, .. },
+                ..
+            }) = log.call(2)
+            else {
+                panic!("{:?} is not an exec carrying on from anything", log.call(2));
+            };
+            let result: ExecResult = outcome.take().unwrap();
+            assert_eq!((result.code, result.stdout.as_slice()), (code, out));
+        }
     }
 }

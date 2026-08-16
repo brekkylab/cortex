@@ -56,6 +56,25 @@ impl Executable for Report {
     }
 }
 
+/// Answers with a variable out of the environment the *command* had, which is the only way
+/// to see that the environment crossed four processes to get here.
+struct Getenv;
+
+impl Executable for Getenv {
+    fn exec<'a>(
+        &'a self,
+        call: &'a ExecCall,
+        _mount: Option<&'a dyn Mount>,
+    ) -> BoxFuture<'a, ExecOutput> {
+        Box::pin(async move {
+            match call.env.get(&call.args[0]) {
+                Some(value) => ExecOutput::ok(format!("{value}\n")),
+                None => ExecOutput::failed(1, format!("{}: unset\n", call.args[0])),
+            }
+        })
+    }
+}
+
 /// How long [`Slow`] takes. Long enough to tell waiting apart from not waiting, short
 /// enough that a test suite does not notice.
 const SLEEP: std::time::Duration = std::time::Duration::from_millis(50);
@@ -117,6 +136,7 @@ impl Fixture {
                 },
             )
             .register("report", "report the call it was made with", Report)
+            .register("getenv", "answer a variable the command had", Getenv)
             .register("slow", "wait, then answer", Slow);
 
         // A `Command` and not `stdio_client`'s argv, because this test wants the server's
@@ -271,7 +291,10 @@ async fn a_stopped_session_boots_again_for_the_next_command() {
     let listed = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut names: Vec<&str> = listed.split_whitespace().collect();
     names.sort_unstable();
-    assert_eq!(names, ["boom", "foo", "rawbytes", "report", "slow"]);
+    assert_eq!(
+        names,
+        ["boom", "foo", "getenv", "rawbytes", "report", "slow"]
+    );
 }
 
 /// A client with nothing to delegate is still a client: no `start`, no executables, just
@@ -367,4 +390,40 @@ async fn two_consoles_run_at_the_same_time() {
 
     let took = began.elapsed();
     assert!(took < SLEEP * 3, "the two consoles took {took:?}, in turn");
+}
+
+/// The environment a delegated name is handed is the one the *command* had, which is what
+/// makes it usable the way a program on `PATH` is: `FOO=bar getenv FOO` answers `bar`.
+///
+/// Four processes deep — the shell set it, the shim read its own `environ`, the server
+/// passed it up as a `delegated`, and the executable looked it up here.
+#[tokio::test]
+async fn a_delegated_name_is_handed_the_environment_the_command_had() {
+    let out = output("FOO=bar getenv FOO").await;
+    assert_eq!(out.stdout, b"bar\n");
+    assert_eq!(out.code, 0);
+
+    // An `export` earlier in the same shell reaches it too, since it is the same environ by
+    // the time the shim is spawned.
+    let out = output("export GREETING=hi; getenv GREETING").await;
+    assert_eq!(out.stdout, b"hi\n");
+
+    // And the whole environment, not a chosen part of it: `PATH` is the executor's, with
+    // the directory of delegated symlinks appended to it by the server.
+    let out = output("getenv PATH").await;
+    assert_eq!(out.code, 0, "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("/bin"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+/// A variable nobody set is absent rather than empty, which is the difference an executable
+/// branches on.
+#[tokio::test]
+async fn a_variable_the_command_did_not_have_is_absent() {
+    let out = output("getenv CORTEX_NO_SUCH_VARIABLE").await;
+    assert_eq!(out.code, 1);
+    assert_eq!(out.stderr, b"CORTEX_NO_SUCH_VARIABLE: unset\n");
 }

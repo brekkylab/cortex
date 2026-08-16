@@ -260,6 +260,7 @@ mod tests {
             ]),
             timeout_ms: Some(1_000),
             cwd: None,
+            env: Default::default(),
         }
     }
 

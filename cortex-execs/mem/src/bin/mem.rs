@@ -63,6 +63,9 @@ async fn run() -> ExitCode {
         // The root of the tree, because that is where this was invoked: names resolve against
         // the directory `mem` is standing in, which is the one `Cwd` is rooted at.
         cwd: Some(String::new()),
+        // Run as a program rather than delegated to, so the caller's environment is this
+        // process's own and there is nothing to carry across.
+        env: std::env::vars().collect(),
     };
 
     let mem = Mem::new(Arc::new(HashEmbedder::default()), Arc::new(Verbatim));

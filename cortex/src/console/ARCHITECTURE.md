@@ -143,7 +143,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 | method | `params` | `result` |
 |---|---|---|
 | `init` | `{delegated, workfs?}` | `{workfs?, cwd?}` |
-| `exec` | `{cmd, timeout_ms?, cwd?}` | `{done: {...}}` or `{delegated: {...}}` |
+| `exec` | `{cmd, timeout_ms?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
 | `start` | — | *(notification)* |
@@ -293,6 +293,7 @@ Minimal form — no timeout of its own:
 | `cmd` | an **array** is a command, already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`. An **object** is not a command at all but the answer to a delegated call — see below. |
 | `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. |
 | `cwd` | on a `delegated`: where the command was invoked, as a path **in the server's filesystem** — `"/mnt/workfs/work/sub"`. Reported, never instructed, and a caller's own `exec` leaves it out — there is nothing it could usefully say. See below. |
+| `env` | on a `delegated`: the whole environment the invoking command had. Reported the same way, and absent everywhere else. See [`env`](#env--what-the-command-was-running-with). |
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
 | `stdout`/`stderr` | `Binary`, byte-exact, kept apart. |
 | `truncated` | the command wrote more than the executor would hold, and this is the beginning of it. |
@@ -308,7 +309,7 @@ A delegated executable runs on the **client**, in a process of its own, against 
 So `fetch report.md` arrives as an argv and nothing else, and `report.md` names a file relative to nothing.
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"delegated":{"cmd":["fetch","report.md"],"cwd":"/mnt/workfs/work/sub"}}}
+{"jsonrpc":"2.0","id":1,"result":{"delegated":{"cmd":["fetch","report.md"],"cwd":"/mnt/workfs/work/sub","env":{"PATH":"…","FOO":"bar"}}}}
 ```
 
 `cwd` is what closes that.
@@ -331,6 +332,25 @@ The two ends still disagree about the second case, by refusing rather than by an
 
 Like `timeout_ms` it belongs to a `cmd` that is an argv and means nothing on one carrying a delegated call's outcome, and like `timeout_ms` nothing enforces that.
 It is a different field from the `cwd` on a `done`, which is not about a command at all — see below.
+
+#### `env` — what the command was running with
+
+`FOO=bar fetch x` is how a shell hands a program a value, and a delegated name that could not see it would be *almost* a program on `PATH`.
+So the shim reports its own environment and the whole of it crosses on the `delegated`, beside the `cwd`.
+
+**All of it, and no policy.**
+A chosen subset means an end deciding what matters, and the two ends would be deciding it differently within a week — a name that works from the shell and not through delegation is exactly the failure this protocol exists to avoid.
+What arrives is therefore `PATH` with the server's `bin/` directory on it, whatever the backend set, whatever the session exported, and `FOO`.
+
+What it costs is real and worth stating: the executor's environment crosses the channel on **every delegated call**, which is a few kilobytes and whatever the server was started with.
+Both ends are in one workspace and the client is usually the process that started the server, so this is largely its own environment coming back to it — a transport where that is not true is one that has to say what makes it safe before this member is.
+
+**Data, not something to apply.**
+A delegated name runs as a closure in the client and not as a process, so nothing here is set on anything: the executable reads what it wants.
+Which is as well, since half of it describes the far end — `PATH` names a directory of symlinks that does not exist here, and `PWD`, `HOME` and `TMPDIR` are the executor's facts.
+
+A name or value with no string form is left out rather than made lossy, the rule `cwd` follows.
+Empty therefore covers both a backend that reports nothing and a command run with `env -i`, and unlike `cwd` that costs nothing to conflate: a variable nobody reported and one nobody set are the same lookup miss, where an unknown directory decides whether a relative path may be resolved at all.
 
 #### Where the session stands
 
@@ -555,7 +575,7 @@ sequenceDiagram
     activate shim
     shim->>server: dials the shim socket
     Note over sh,shim: both blocked until this is answered
-    server-->>client: id:1 result {delegated:{cmd:["fetch","x"]}}
+    server-->>client: id:1 result {delegated:{cmd:["fetch","x"], cwd:"…", env:{…}}}
     Note over client,server: client runs ExecutableSet::invoke("fetch", ["x"])
     client->>server: id:2 exec {cmd:{id:1, outcome:{result:{code:0, stdout:"…"}}}}
     server-->>shim: {code:0, stdout:"…"}
@@ -576,6 +596,7 @@ The shim's dial is the only arrow that is not this protocol: it is server-local,
 
 And note what the delegated call carries: an ordinary `exec`'s `params`, verbatim.
 An execution request is an execution request no matter who is asking whom — a command, output, a code at the end — so there is one shape and one codec in the system rather than two.
+The two members only a `delegated` fills in, [`cwd`](#cwd--where-the-command-stood) and [`env`](#env--what-the-command-was-running-with), are what the shim knew and the caller of a command could not: where it stood and what it was running with.
 
 ### Consequences
 

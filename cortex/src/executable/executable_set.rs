@@ -119,6 +119,7 @@ mod tests {
             name: name.into(),
             args: args.iter().map(|a| a.to_string()).collect(),
             cwd: None,
+            env: Default::default(),
         }
     }
 

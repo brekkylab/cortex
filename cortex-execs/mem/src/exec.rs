@@ -526,6 +526,7 @@ mod tests {
             args: args.iter().map(|a| a.to_string()).collect(),
             // At the root of the tree, which is where a relative store name resolves from.
             cwd: Some(String::new()),
+            env: Default::default(),
         }
     }
 
@@ -574,6 +575,7 @@ mod tests {
                 .map(|a| a.to_string())
                 .collect(),
             cwd: Some("notes".into()),
+            env: Default::default(),
         };
 
         let result = mem().exec(&call, Some(&mount)).await;

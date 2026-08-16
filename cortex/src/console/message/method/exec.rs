@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
@@ -75,6 +76,37 @@ pub struct Exec {
     /// thing telling the two apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+
+    /// The environment the invoking command had, as the shim saw it — on a
+    /// [`Delegated`](Progress::Delegated) alone, like [`cwd`](Self::cwd), and reported the
+    /// same way.
+    ///
+    /// **All of it, not a chosen part of it.** A delegated name is meant to be usable as a
+    /// program on `PATH`, and a program on `PATH` is handed the whole environment; a client
+    /// that could only see what somebody remembered to forward would have names that behave
+    /// almost like programs. So there is no policy here for either end to get wrong —
+    /// `FOO=bar fetch x`, an `export` earlier in the same shell, and the backend's own
+    /// variables all arrive as themselves.
+    ///
+    /// What that costs is that the executor's environment crosses the channel on every
+    /// delegated call, which is a few kilobytes and whatever the server was started with.
+    /// Both ends of a console are in one workspace and the client is usually what started
+    /// the server, so this is its own environment coming back to it; a transport where that
+    /// is not true is one that has to say what makes it safe.
+    ///
+    /// **Data, not something to apply.** A delegated name runs as a closure in the client
+    /// and not as a process, so nothing here is set anywhere — the executable reads what it
+    /// wants. Which is as well: `PATH` names the server's directory of symlinks, and `PWD`,
+    /// `TMPDIR` and `HOME` are facts about the far end.
+    ///
+    /// A name or value with no `String` form is left out rather than made lossy, the same
+    /// rule `cwd` follows. Empty is therefore two things at once — a backend that reports
+    /// nothing, and a command run with `env -i` — and unlike `cwd` that costs nothing to
+    /// conflate: a variable nobody reported and one nobody set are the same lookup miss,
+    /// where an unknown directory and a known one decide whether a relative path may be
+    /// resolved at all.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 /// A command to run, or the answer a paused execution is waiting for.
@@ -491,6 +523,7 @@ mod tests {
             cmd: ExecCmd::New(vec!["ls".into()]),
             timeout_ms: Some(5_000),
             cwd: Some("/mnt/workfs/work/sub".into()),
+            env: BTreeMap::from([("FOO".to_string(), "bar".to_string())]),
         };
         let doc = bson::serialize_to_document(&exec).expect("serializes");
         assert!(
