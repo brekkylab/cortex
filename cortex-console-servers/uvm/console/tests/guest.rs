@@ -33,7 +33,7 @@ use std::process::Stdio;
 
 use cortex::BoxFuture;
 use cortex::console::{Console, ExecResult, ReadResult};
-use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
+use cortex::exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
 use cortex::fs::Mount;
 use tokio::process::Command;
 

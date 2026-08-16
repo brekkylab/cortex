@@ -22,7 +22,7 @@ use futures_core::future::BoxFuture;
 /// # Why it waits, and why it batches
 ///
 /// The implementation worth having reaches a service. That is the same reason
-/// [`Executable`](cortex::executable::Executable) is async, and the future is boxed here for
+/// [`Executable`](cortex::exec::Executable) is async, and the future is boxed here for
 /// the same reason too: a store holds one behind a `dyn`, so the type is not in anyone's
 /// signature.
 ///

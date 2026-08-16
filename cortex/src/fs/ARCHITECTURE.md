@@ -90,4 +90,3 @@ delegated executable이 그 예입니다 — 명령이 열었던 파일을 같�
 - **`Posix::host_errno`** — raw errno를 넘겨도 되는 이유(같은 호스트의 번호 체계). 게스트를 읽는
   바인딩이 생기면 반대로 kind로만 분류해야 합니다 — `ENOTEMPTY`가 macOS 66, Linux 39입니다.
 - **`mount/impl/fuse_t.rs`의 `FuseTBackend`** — 같은 vtable 위에서 전송만 바뀐다는 것.
-- **`examples/compare_fuse_t_backends.rs`** — 그 전송들이 실제로 무엇을 요청하는지 측정한 표.

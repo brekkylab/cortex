@@ -3,14 +3,14 @@ resolver = "3"
 members = [
     "cortex",
     "cortex-execs/mem",
-    "cortex-local-console",
-    "cortex-uvm-console",
+    "cortex-console-servers/local",
+    "cortex-console-servers/uvm/console",
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
 # bare `cargo build` — for a target that has no host to run on.
 #
-exclude = ["cortex-uvm-guest"]
+exclude = ["cortex-console-servers/uvm/guest"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,7 +28,6 @@ async-trait = "0.1"
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
-cortex-fs = { path = "cortex-fs", default-features = false }
 futures-core = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -40,10 +39,12 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
 
-# The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
-# `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
-# backend to the guest — the one thing the upstream libkrun C API and the
-# high-level microsandbox SDK do not offer.
+# The in-process, Rust-native libkrun fork. `VmBuilder` is what lets a boot be
+# assembled out of parts this workspace already holds: tagged virtio-fs shares, two
+# virtio-blk disks, and — the one that decides the design — a console port bound to a
+# file descriptor the caller opened, which is how a session's socket reaches the guest
+# with no pty and no file in between. The high-level microsandbox SDK boots images, not
+# descriptors, and offers nowhere to hand one over.
 msb_krun = "0.1"
 
 # Two image formats, in pure Rust, with no `mkfs` to shell out to: `ext4` formats
@@ -54,8 +55,9 @@ msb_krun = "0.1"
 # a guest at all.
 microsandbox-image = "0.6.7"
 
-# Host-side FUSE. A sync trait whose methods take `&self`, so it drives the same
-# `PosixFs` (interior mutability) that the krun binding does.
+# Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl`
+# on `Posix` itself rather than a wrapper holding one — the same shape `fuse-t` takes,
+# over the same `Mutex`-held inode and open tables.
 fuser = "0.17"
 # A read-only S3 backend. `default-features = false` on purpose: the default set
 # is `["fs"]`, which is object_store's *own* local-filesystem store and drags in

@@ -20,7 +20,7 @@ use std::{
 };
 
 use cortex::{
-    executable::{ExecCall, Executable},
+    exec::{ExecCall, Executable},
     fs::Mount,
 };
 use cortex_exec_mem::{HashEmbedder, Mem, Verbatim};

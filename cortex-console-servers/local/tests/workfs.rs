@@ -10,7 +10,7 @@ use std::process::Stdio;
 use cortex::BoxFuture;
 use cortex::console::stdio::StdioClient;
 use cortex::console::{Console, Error, ExecResult};
-use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
+use cortex::exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
 use cortex::fs::Mount;
 use tempfile::TempDir;
 use tokio::process::Command;

@@ -31,7 +31,7 @@ const NEIGHBOURS: usize = 5;
 /// SQLite and the vector scan run in the calling thread and can take as long as the file is
 /// big. Every call into the store therefore goes through [`spawn_blocking`], because the
 /// thread this is awaited on is the one answering a console's channel — see
-/// [`Executable`](cortex::executable::Executable), which is the same argument for the same
+/// [`Executable`](cortex::exec::Executable), which is the same argument for the same
 /// reason.
 ///
 /// [`spawn_blocking`]: tokio::task::spawn_blocking

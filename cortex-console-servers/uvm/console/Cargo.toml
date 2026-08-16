@@ -16,9 +16,10 @@ cortex = { workspace = true }
 # `dup(2)`, to hand a boot child a copy of this process's stderr as its stdout. A guest's
 # kernel log is not the protocol and must not reach stdout, which is.
 libc = { workspace = true }
-# `blk`, for the two disks the guest overlays into a root. cortex's own `krun` feature
-# does not ask for it — nothing in cortex attaches a block device — and cargo unifies the
-# two into one build of `msb_krun`.
+# `blk`, for the two disks the guest overlays into a root: the session's writable ext4
+# upper and the read-only EROFS base. This crate is the only consumer of `msb_krun` in
+# the workspace — cortex itself links no VMM — so the feature is charged to the one
+# build that boots anything.
 msb_krun = { workspace = true, features = ["blk"] }
 # The image tooling: `ext4` formats the session's writable upper, `tar` and `tree` turn a
 # rootfs tarball into a file tree, and `erofs` writes that tree as the read-only base.

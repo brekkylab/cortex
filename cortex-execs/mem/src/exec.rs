@@ -3,7 +3,7 @@
 use std::{io, sync::Arc};
 
 use cortex::{
-    executable::{ExecCall, ExecResult, Executable},
+    exec::{ExecCall, ExecResult, Executable},
     fs::Mount,
 };
 use futures_core::future::BoxFuture;
@@ -80,7 +80,7 @@ impl Mem {
         }
     }
 
-    /// One line for [`ExecutableSet::register`](cortex::executable::ExecutableSet::register).
+    /// One line for [`ExecutableSet::register`](cortex::exec::ExecutableSet::register).
     pub fn summary() -> &'static str {
         "remember and recall facts, in a store that is one file of this tree"
     }

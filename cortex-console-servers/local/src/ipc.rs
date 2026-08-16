@@ -7,7 +7,7 @@
 //! # The server binds it, and passes the call along
 //!
 //! A delegated name's behaviour lives in the client's
-//! [`ExecutableSet`](cortex::executable::ExecutableSet), so the client is what has to
+//! [`ExecutableSet`](cortex::exec::ExecutableSet), so the client is what has to
 //! answer. But the shim does not reach it directly. It reaches *us*, and we hand the call
 //! to the client as a [`Delegated`](cortex::console::Progress::Delegated) — a response on
 //! the console channel, on the request the client is already waiting on — then hand back

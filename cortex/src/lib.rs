@@ -36,7 +36,7 @@
 #![allow(clippy::module_inception)]
 
 pub mod console;
-pub mod executable;
+pub mod exec;
 pub mod fs;
 mod lock;
 
@@ -50,5 +50,5 @@ mod lock;
 ///
 /// [`Client`]: console::Client
 /// [`Server`]: console::Server
-/// [`Executable`]: executable::Executable
+/// [`Executable`]: exec::Executable
 pub use futures_core::future::BoxFuture;

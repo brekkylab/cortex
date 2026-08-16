@@ -43,13 +43,13 @@ impl ExecCall {
     ///
     /// A leading `/` makes `arg` workspace-absolute and `cwd` irrelevant. Anything that
     /// would leave the root is refused, as is a relative `arg` with no `cwd` — see
-    /// [`resolve_under`](crate::executable::resolve_under).
+    /// [`resolve_under`](crate::exec::resolve_under).
     ///
     /// Relative to the workspace root and never to this host, because the two ends of a
     /// delegated call agree on the first and not the second. What turns it into a file to
     /// open is the mount the call was handed: [`Mount::host_path`].
     pub fn resolve(&self, arg: &str) -> std::io::Result<std::path::PathBuf> {
-        crate::executable::resolve_under(self.cwd.as_deref(), arg)
+        crate::exec::resolve_under(self.cwd.as_deref(), arg)
     }
 }
 

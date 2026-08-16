@@ -90,8 +90,8 @@ pub struct S3Fs {
     /// What reads have learned about keys, and what they read ahead into.
     ///
     /// Taken through [`lock`], which ignores poisoning: a panic anywhere else must not turn
-    /// every later read into a panic of its own. Under krun there is one worker thread, so
-    /// that would take the whole virtio-fs device down.
+    /// every later read into a panic of its own — a binding that serves its device from a
+    /// single worker thread would lose the whole mount to one poisoned lock.
     windows: Mutex<Windows>,
 }
 

@@ -15,7 +15,7 @@ use std::process::Stdio;
 use cortex::BoxFuture;
 use cortex::console::stdio::StdioClient;
 use cortex::console::{Console, ExecResult};
-use cortex::executable::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
+use cortex::exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
 use cortex::fs::Mount;
 use tokio::process::Command;
 

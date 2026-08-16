@@ -27,7 +27,7 @@ bson = { version = "3", features = ["serde"] }
 # frames the client wrote, so there is one definition of them or there are two
 # that drift. Default features, so no binding comes with it — a guest agent
 # mounts nothing and boots nothing.
-cortex = { path = "../cortex", default-features = false }
+cortex = { path = "../../../cortex", default-features = false }
 # `mount(2)`, `pivot_root`, `dup`. Every one of them is a syscall with no std
 # spelling, which is the whole reason the guest side is its own binary.
 libc = "0.2"

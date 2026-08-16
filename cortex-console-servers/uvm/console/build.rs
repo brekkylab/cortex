@@ -48,7 +48,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?)
-        .join("../cortex-uvm-guest")
+        .join("../guest")
         .canonicalize()?;
     for source in ["src", "Cargo.toml", ".cargo/config.toml"] {
         println!(
@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
     // The guest links cortex, so a change to the protocol is a change to the guest.
-    println!("cargo::rerun-if-changed=../cortex/src");
+    println!("cargo::rerun-if-changed=../../../cortex/src");
 
     let built = build(&crate_dir)?;
     std::fs::copy(&built, &out)

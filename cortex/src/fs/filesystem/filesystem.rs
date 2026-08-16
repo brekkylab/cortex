@@ -257,7 +257,7 @@ impl Dirent {
 ///
 /// The namespace and data planes are naturally async (an object store, a document
 /// API), so the trait is too. An async-native consumer (a WebDAV/HTTP frontend)
-/// `.await`s these directly; a sync interface binding (krun/fuse/fuse-t) `block_on`s
+/// `.await`s these directly; a sync interface binding (fuse/fuse-t) `block_on`s
 /// them at its callback boundary.
 ///
 /// Awaiting directly is only truly non-blocking for backends whose I/O is actually

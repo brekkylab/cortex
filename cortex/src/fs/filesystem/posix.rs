@@ -2,7 +2,7 @@
 //!
 //! [`Posix`] maps the store's paths onto stable inode numbers, tracks the kernel's
 //! per-inode reference counts, and keeps the open-file table a file handle is an index
-//! into. It carries no FUSE/`msb_krun` coupling of its own — a concrete filesystem
+//! into. It carries no coupling to any one interface of its own — a concrete filesystem
 //! binding drives it.
 //!
 //! This layer exists *because* a kernel addresses files by number, and by descriptor.
@@ -217,7 +217,8 @@ fn bad_handle() -> io::Error {
 
 /// A store, in the terms a kernel speaks: inode numbers and file handles.
 ///
-/// The name is the vocabulary, not an interface — nothing here is FUSE- or `msb_krun`-shaped.
+/// The name is the vocabulary, not an interface — nothing here is shaped by the binding
+/// that drives it.
 /// What a binding does with one is translate; see the module doc.
 ///
 /// The fields are **private**, and that is the enforcement mechanism for "a binding only
@@ -321,9 +322,9 @@ pub(in crate::fs) fn mode_for(kind: DirentKind) -> u32 {
 /// more precise than the kind it was classified into: `EBADF` and `ENOTBLK` have no
 /// `ErrorKind` at all, and would otherwise collapse onto `EIO`.
 ///
-/// The krun binding must do the opposite, and keeps its own hardcoded Linux table: its
-/// reader is a Linux guest whatever this host is, and `ENOTEMPTY` is 66 here against 39
-/// there.
+/// A binding whose reader is a *guest* must do the opposite and carry a table of its own:
+/// the numbering that matters is the guest's, whatever this host is, and `ENOTEMPTY` is 66
+/// on macOS against 39 on Linux.
 ///
 /// **No exhaustive match is possible**, so the arms are a standing obligation rather
 /// than a checked one. `io::ErrorKind` is `#[non_exhaustive]`: a kind this crate starts

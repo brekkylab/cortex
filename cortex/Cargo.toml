@@ -3,17 +3,6 @@ name = "cortex"
 version.workspace = true
 edition.workspace = true
 
-# Serves both host bindings from one file, so no `required-features`: the key is
-# AND, so it cannot say "fuse or fuse-t", and naming either would lock the other
-# out. The example carries a no-feature `main` instead.
-[[example]]
-name = "mount_host"
-
-# What each of FUSE-T's three transports asks a store for, side by side.
-[[example]]
-name = "compare_fuse_t_backends"
-required-features = ["fuse-t"]
-
 [build-dependencies]
 cc = { workspace = true }
 pkg-config = { workspace = true }
@@ -58,9 +47,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # unconditional build-deps `cc`/`pkg-config` are not counted.
 #
 # The numbers themselves are deliberately not written down: they go stale on every
-# dependency bump, and the conclusion does not depend on what they are — `krun`
-# brings the whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP
-# and TLS stack under `object_store`, whatever this month's count is.
+# dependency bump, and the conclusion does not depend on what they are — `fuse`
+# brings a libfuse provider and `s3` the whole HTTP and TLS stack under
+# `object_store`, whatever this month's count is.
 #
 # Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
 # because a binding's tests only exist when its feature is on. No default set fixes
@@ -68,10 +57,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # every binding. Full coverage is a sweep:
 #
 #   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
-#   for f in "" "--features krun" "--features fuse" "--features fuse-t" \
+#   for f in "" "--features fuse" "--features fuse-t" \
 #            "--features fuse-no-mount" "--features s3" "--features notion" \
 #            "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,krun,s3,notion"; do cargo test -p cortex $f --all-targets; done
+#            "--features fuse,fuse-t,s3,notion"; do cargo test -p cortex $f --all-targets; done
 #
 # Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
 # unquoted expansion — under zsh pass the flags as separate arguments.

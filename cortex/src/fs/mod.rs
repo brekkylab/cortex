@@ -40,7 +40,7 @@
 //! learn: a store's own `std::fs` calls travel up unchanged, and `FileSystem`'s docs say
 //! which kind answers what.
 //!
-//! [`Executable`]: crate::executable::Executable
+//! [`Executable`]: crate::exec::Executable
 
 mod filesystem;
 mod mount;

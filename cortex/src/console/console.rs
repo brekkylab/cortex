@@ -74,7 +74,7 @@ use crate::{
         },
         stdio::StdioClient,
     },
-    executable::{ExecCall, ExecutableSet, relativize},
+    exec::{ExecCall, ExecutableSet, relativize},
     fs::Mount,
 };
 
@@ -108,7 +108,7 @@ pub struct ConsoleBuilder {
     /// `None` is a console with nothing mounted, and stays `None`: a mount is something a
     /// caller *has* or has not, and there is no empty one to substitute — an unmounted tree
     /// has no path for a delegated name to open. What that means for the names is
-    /// [`Executable::exec`](crate::executable::Executable::exec)'s to say.
+    /// [`Executable::exec`](crate::exec::Executable::exec)'s to say.
     mount: Option<Box<dyn Mount>>,
 }
 
@@ -222,7 +222,7 @@ impl ConsoleBuilder {
 ///
 /// ```no_run
 /// use cortex::console::Console;
-/// use cortex::executable::ExecutableSet;
+/// use cortex::exec::ExecutableSet;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
@@ -685,7 +685,7 @@ mod tests {
     use super::*;
     use crate::{
         console::message::{Call, InitResult, Method, Notification, WorkFsMount},
-        executable::{ExecResult as ExecOutput, Executable},
+        exec::{ExecResult as ExecOutput, Executable},
     };
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.

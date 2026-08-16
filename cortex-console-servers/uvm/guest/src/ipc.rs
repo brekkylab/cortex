@@ -7,7 +7,7 @@
 //! # The hop is guest-local, and that is the point
 //!
 //! A delegated name's behaviour lives in the client's
-//! [`ExecutableSet`](cortex::executable::ExecutableSet), which is on the host, on the far
+//! [`ExecutableSet`](cortex::exec::ExecutableSet), which is on the host, on the far
 //! side of a hypervisor. A shim cannot reach it: a unix socket does not cross that
 //! boundary, and giving the guest a way to dial the host would mean a second channel with
 //! its own addressing, its own lifetime and its own failure modes.

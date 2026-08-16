@@ -20,7 +20,7 @@ pub struct Init {
     /// backend that wants to say something useful about it should check before it builds.
     ///
     /// What running one *means* is not here and cannot be: the behaviour lives in
-    /// the client's [`ExecutableSet`](crate::executable::ExecutableSet), so a
+    /// the client's [`ExecutableSet`](crate::exec::ExecutableSet), so a
     /// server only arranges for something that runs the name to reach the client —
     /// on a channel of its own, as an `exec` like any other.
     pub delegated: Vec<String>,

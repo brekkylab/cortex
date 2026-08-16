@@ -34,7 +34,7 @@
 //! A store is a *file*, opened by SQLite through the host's own filesystem calls, and the name
 //! it is called by — `notes.sqlite` — is a name in the workspace. Only a
 //! [`Mount`](cortex::fs::Mount) turns one into the other, which is why
-//! [`Executable::exec`](cortex::executable::Executable::exec) is handed one and why `mem`
+//! [`Executable::exec`](cortex::exec::Executable::exec) is handed one and why `mem`
 //! refuses when there is none: with nothing mounted there is no file to open, and any path
 //! substituted for it would be a different store that nobody asked about.
 
