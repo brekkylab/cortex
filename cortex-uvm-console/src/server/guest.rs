@@ -37,7 +37,7 @@
 
 use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -47,9 +47,10 @@ use tokio::io::{AsyncReadExt as _, BufReader};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-use crate::assets::{self, BootRoot, SessionImage, SpecFile};
+use crate::assets::{self, BootRoot, SessionImage};
 use crate::contract::{
-    BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV, SPEC_ENV,
+    BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV,
+    WORKFS_ENV,
 };
 use crate::helper::boot_helper;
 
@@ -83,13 +84,6 @@ pub struct Guest {
     _socket: Socket,
     _session: SessionImage,
     _boot_root: BootRoot,
-
-    /// Removed by the boot child as soon as it has read it; this is the backstop for a
-    /// child that never got that far.
-    ///
-    /// `None` for a session that declared no namespace — which is also how the boot child
-    /// is told there is none, by [`SPEC_ENV`] being unset.
-    _spec: Option<SpecFile>,
 }
 
 impl Guest {
@@ -98,19 +92,13 @@ impl Guest {
     /// Everything expensive happens before the child is spawned — provisioning the base
     /// image, formatting the session's — so a failure in any of it is reported as itself
     /// rather than as a boot that timed out.
-    pub async fn boot(volumes: &cortex::fs::WorkspaceSpec) -> anyhow::Result<Guest> {
+    /// `workfs` is a directory on this host, or `None` for a session with no tree. It is
+    /// shared into the guest **at its own path** — see [`boot`](crate::boot), which is where
+    /// that decision is argued.
+    pub async fn boot(workfs: Option<&Path>) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image().await?;
         let helper = boot_helper()?;
-
-        // Written before the child is spawned, like everything else expensive here, so a
-        // namespace that will not encode is reported as itself rather than as a guest that
-        // came up without one.
-        let spec = if volumes.is_empty() {
-            None
-        } else {
-            Some(SpecFile::create(volumes)?)
-        };
 
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
         // still not something to do on the runtime's own thread.
@@ -136,10 +124,10 @@ impl Guest {
             .stdout(Stdio::from(stderr()?))
             .stderr(Stdio::inherit());
 
-        // Unset when there is no namespace, which is how the boot child is told so — it
-        // reads the variable's absence, not an empty spec.
-        if let Some(spec) = &spec {
-            command.env(SPEC_ENV, spec.path());
+        // Unset when there is no tree, which is how the boot child is told so — it reads
+        // the variable's absence rather than an empty value.
+        if let Some(workfs) = workfs {
+            command.env(WORKFS_ENV, workfs);
         }
 
         let vmm = Vmm(command
@@ -171,7 +159,6 @@ impl Guest {
             _socket: socket,
             _session: session,
             _boot_root: boot_root,
-            _spec: spec,
         })
     }
 

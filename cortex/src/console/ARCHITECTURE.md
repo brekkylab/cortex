@@ -245,7 +245,13 @@ A `read` names a file under it, a `write` does, and so does the [`cwd`](#exec--r
 Nothing is workspace-relative and nothing is rewritten in flight.
 
 That is the trade this member exists to make. Two ends realizing one description separately is the other way to have a name mean one file, and it costs a tree on each side and a translation on every path that crosses — to reconstruct something one end already has.
-So the server realizes it once and says where, and what it costs instead is that the client has to be able to open what the server opened. A backend whose commands run somewhere else — a guest, a container — answers the path on *this* side of that boundary and does its own translation behind it.
+So the server realizes it once and says where, and what it costs instead is that the client has to be able to open what the server opened.
+A backend whose commands run somewhere else — a guest, a container — answers a path on *this* side of that boundary, and then either translates behind it or arranges that there is nothing to translate. `cortex-uvm-console` does the second: it shares the host's directory into the guest at the host's own path, so a `cwd` the guest reports is already a name the client can open.
+
+**One spelling, and it is this one.**
+Every path a server reports afterwards — a `done`'s [`cwd`](#where-the-session-stands), a `delegated`'s — has to be spelled the way this answer is, because the client's only way to relate one to the other is the characters.
+That is not automatic and it is where a backend will get it wrong: `getcwd(2)` answers the *physical* path, so a tree mounted at `/var/x` is reported from inside as `/private/var/x`, and a `cd` that canonicalized would answer the same. Both are the same directory and neither is one the client was told about.
+So a server that answers a path holds that spelling and puts what it observes back into it. `cortex-local-console` does this in two places, and both were bugs before they were code.
 
 **Nothing is mounted by sending it**, any more than anything is booted by it.
 The path is where the tree *will be*: the mount happens when the session boots, so a client holding this answer holds a name before it holds a directory.

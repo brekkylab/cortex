@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 /// What a session is. The `params` of `init`.
@@ -75,6 +77,30 @@ impl WorkFsSource {
     pub fn new(url: impl Into<String>) -> Self {
         WorkFsSource { url: url.into() }
     }
+
+    /// The scheme, which is the kind — `"file"`, `"https"`, or the whole URL when it has
+    /// no `://` in it and so names no kind at all.
+    ///
+    /// What a server branches on to decide whether it has a provider, and what it names in
+    /// an [`UNSUPPORTED_WORKFS`](crate::console::Error::UNSUPPORTED_WORKFS) when it has not.
+    pub fn scheme(&self) -> &str {
+        self.url.split_once("://").map_or(&self.url, |(s, _)| s)
+    }
+
+    /// The directory a `file://` URL names, or `None` for any other scheme.
+    ///
+    /// The path is what follows the scheme, **as it stands** — see the type's docs on why
+    /// nothing is percent-decoded. Whether it is absolute is the caller's to check and
+    /// refuse, because that refusal is a different one: a relative path is a malformed
+    /// request where an unknown scheme is a build without a provider.
+    ///
+    /// Here rather than in each backend because every server that realizes `file://` has to
+    /// read it the same way. Two that disagree would be two servers a client cannot tell
+    /// apart answering the same URL differently, which is the failure a shared protocol
+    /// type exists to prevent.
+    pub fn file_path(&self) -> Option<&Path> {
+        self.url.strip_prefix("file://").map(Path::new)
+    }
 }
 
 /// What the server made of the session. The `result` of `init`.
@@ -125,7 +151,10 @@ pub struct InitResult {
 /// and neither end rewrites anything. What it costs is that the client has to be able to
 /// open what the server opened — the two share a filesystem, which is what the path being
 /// *the server's* means. A backend whose commands run somewhere else, a guest included,
-/// answers the path on this side of that boundary and does its own translation behind it.
+/// answers a path on this side of that boundary and either translates behind it or arranges
+/// that there is nothing to translate: `cortex-uvm-console` shares the host's directory into
+/// its guest **at the host's own path**, so the two spellings are one string and a `cwd` the
+/// guest reports needs no rewriting to be a name the client can open.
 ///
 /// # It is a name before it is a directory
 ///
@@ -220,6 +249,31 @@ mod tests {
                 }),
                 cwd: None,
             },
+        );
+    }
+
+    /// The two things a server reads off a URL, and the one it can act on.
+    #[test]
+    fn a_url_names_a_kind_and_sometimes_a_directory() {
+        let file = WorkFsSource::new("file:///srv/project");
+        assert_eq!(file.scheme(), "file");
+        assert_eq!(file.file_path(), Some(Path::new("/srv/project")));
+
+        let http = WorkFsSource::new("https://example.com/share");
+        assert_eq!(http.scheme(), "https");
+        assert_eq!(http.file_path(), None);
+
+        // No scheme at all names no kind, and the whole of it is what a server has to put
+        // in the message — there is nothing shorter that would say what arrived.
+        let bare = WorkFsSource::new("/srv/project");
+        assert_eq!(bare.scheme(), "/srv/project");
+        assert_eq!(bare.file_path(), None);
+
+        // An authority is not decoded away: what follows the scheme is the path, so this
+        // one is relative and the caller is the end that refuses it.
+        assert_eq!(
+            WorkFsSource::new("file://srv/project").file_path(),
+            Some(Path::new("srv/project"))
         );
     }
 }

@@ -1,12 +1,17 @@
 //! `cortex-local-console` — entry point for the host-local backend.
 //!
 //! Answers a console session on stdin and stdout: `init` to say which names the session
-//! delegates, an `exec` per command, `quit` to end. See [`cortex::console`] for the
-//! shape of what those descriptors carry.
+//! delegates and which tree it works in, an `exec` per command, `quit` to end. See
+//! [`cortex::console`] for the shape of what those descriptors carry.
 //!
-//! Putting those names on `PATH` is booting, and nothing has to ask for it: the first
-//! `exec`, `read` or `write` to find a session without one is served by a session that
-//! has just booted. `start` and `stop` are resource management on top of that and
+//! The tree is a `file://` URL and so a directory this host already has — the answer to
+//! `init` is where it is, and every path afterwards is under it. Where the session
+//! *stands* starts there and moves only through `cd`, which [`server`] answers itself
+//! because it is a builtin rather than a program.
+//!
+//! Putting the delegated names on `PATH` is booting, and nothing has to ask for it: the
+//! first `exec`, `read` or `write` to find a session without one is served by a session
+//! that has just booted. `start` and `stop` are resource management on top of that and
 //! nothing more — boot early so no command pays the cold start, release while idle so
 //! the directory is not sitting there — which is why neither is answered and neither is
 //! required. On this backend what they hand back and forth is a directory of symlinks,

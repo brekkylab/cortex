@@ -36,18 +36,21 @@
 //!
 //! ```text
 //! /                a read-only base image, overlaid with this session's ext4 upper
-//! <workspace>      a cortex WorkFs, served over virtio-fs out of the boot child
+//! /the/host/path   the session's tree, shared over virtio-fs from the host directory
+//!                  of that same name
 //! ```
 //!
 //! Writes anywhere in the guest land on the session's upper and stay there for as long as
 //! the guest is up; they are gone when it is released, because the image is deleted with
 //! it. The base image is shared, never written, and provisioned once — see [`assets`].
 //!
-//! A workspace is optional and comes from the client, not the environment: an `init`
-//! carries a `WorkspaceSpec`, and the server writes it where the boot child can read it
-//! (see [`SPEC_ENV`](contract::SPEC_ENV)). It is the one thing in the guest that is not a
-//! file on the host: cortex answers every request the guest kernel makes for it, out of the
-//! boot child's own address space.
+//! The tree is optional and comes from the client, not the environment: an `init` names it
+//! as a `file://` URL, and what that names is a directory on this host — mounted there by
+//! whoever built it, which is not this crate's business. The boot shares it (see
+//! [`WORKFS_ENV`](contract::WORKFS_ENV)) **at the path the host spells it with**, so a
+//! command's working directory inside the guest is a path the client can open. That is
+//! what makes this backend answer the same protocol as the host-local one rather than a
+//! translated dialect of it.
 //!
 //! # What this backend deliberately does not do
 //!

@@ -1,8 +1,13 @@
 # Cross-linking a Linux/musl static binary from a macOS host: the system `cc`
 # targets Mach-O and cannot produce an ELF, so link with the `rust-lld` that
 # ships with the toolchain instead of looking for a musl-gcc that is not there.
+#
+# `-C linker=rust-lld` and not `-C linker-flavor=ld.lld`: the second one names a
+# flavour and leaves rustc looking for an `lld` on `PATH`, which is a linker
+# nobody installed. This names the one in the toolchain's own sysroot, which is
+# there for anyone who ran `rustup target add`.
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "linker-flavor=ld.lld"]
+rustflags = ["-C", "linker=rust-lld"]
 
 [target.x86_64-unknown-linux-musl]
-rustflags = ["-C", "linker-flavor=ld.lld"]
+rustflags = ["-C", "linker=rust-lld"]

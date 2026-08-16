@@ -52,24 +52,34 @@
 //! Delegated calls are therefore served in turn. See [`Progress`] for why that is
 //! latency rather than a deadlock.
 //!
+//! # The tree, and where the session stands in it
+//!
+//! A `file://` workfs is a directory this host already has, so **realizing one is checking
+//! a claim rather than mounting anything**: `init` reads the URL and answers with the path
+//! it names, and the boot is what has to find a directory there. Any other scheme is
+//! [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) at `init`, because whether this build
+//! can realize a kind is knowable the moment the frame is read — see [`directory_url`].
+//!
+//! Where the session *stands* starts there and moves only through [`cd`](Session::change_dir),
+//! which this server answers itself: it is a shell builtin rather than a program, so an
+//! `exec` carrying an argv has no other way to offer it, and the shell a person would be
+//! talking to is the session. A `cd` inside a command moves that command's own process and
+//! nothing else, exactly as a subshell does in a terminal — so `sh -c 'cd x'` reports
+//! nothing and the session is where it was.
+//!
 //! # Files
 //!
-//! `read` and `write` reach this host's filesystem directly, at the path resolved against
-//! the session's namespace — the same directory a command runs in, so the two halves of
-//! the protocol name the same file.
+//! `read` and `write` reach this host's filesystem directly, at the path resolved where the
+//! session stands — the same directory a command runs in, so the two halves of the protocol
+//! name the same file. See [`at`], which is the whole of that agreement.
 //!
-//! That used to hold for free: with no per-command directory set, a spawned command and a
-//! file call both inherited this process's cwd. Running commands *in* a mount removes that
-//! reason, so the agreement is now something this module does — see [`at`] and
-//! [`Booted::cwd`]. A session with no namespace still uses the path as it arrives.
-//!
-//! It is a namespace and not a confinement: an absolute path, or one with enough `..`,
-//! still leaves the mount.
+//! It is a place to stand and not a confinement: an absolute path, or one with enough `..`,
+//! still leaves the tree.
 //!
 //! Both are answered on the spot, outside any execution: nothing is spawned, nothing can
 //! delegate, and one response ends it. They boot the session first because that rule is
-//! the protocol's rather than this backend's — and here it is also what produces the
-//! directory they resolve in.
+//! the protocol's rather than this backend's — and here it is also what checks that the
+//! directory they resolve in is there at all.
 //!
 //! # One session at a time, on one task
 //!
@@ -93,11 +103,11 @@
 //! A `read` or a `write` is not confined to anywhere either. The path is used as it
 //! arrives, so a client can name any file this process can reach.
 //!
-//! **No workfs is realized.** An `init` that names one is refused with
-//! [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS), because answering it means saying
-//! where the tree is and this server puts one nowhere. What that takes is a `file://` URL
-//! turned into the directory an execution runs in and a file call resolves against — which
-//! is [`Booted::cwd`], the same piece of work its stub describes.
+//! **Only `cd` moves the session.** A command that changes its own directory some other way
+//! — a program that `chdir`s, a shell script that ends somewhere else — is not followed,
+//! because a child's working directory dies with the child and nothing here reads it back.
+//! What that would take is a shell kept alive across executions, which is a different
+//! backend rather than a line of code.
 //!
 //! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
 //! the `default_timeout_ms` to fall back on, and this server reads both and
@@ -111,14 +121,15 @@ mod bin_dir;
 use std::ffi::OsString;
 use std::io::{self, SeekFrom};
 use std::os::unix::process::ExitStatusExt as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 
 use bson::Bson;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
     Call, Error, Exec, ExecCmd, ExecResult, Init, InitResult, MAX_PAYLOAD, Message, Notification,
-    Outcome, Progress, Read, ReadResult, RequestId, Server, Write, WriteResult,
+    Outcome, Progress, Read, ReadResult, RequestId, Server, WorkFsMount, WorkFsSource, Write,
+    WriteResult,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
@@ -166,7 +177,7 @@ pub async fn run() -> anyhow::Result<()> {
             // The message rather than the `Outcome`: the code belongs to whoever gets
             // answered, and nobody is being answered here. This line is for a person.
             Message::Notification(Notification::Start) => {
-                if let Err(Outcome::Error(e)) = session.booted() {
+                if let Err(Outcome::Error(e)) = session.boot() {
                     eprintln!(
                         "{}: booting a session: {}",
                         env!("CARGO_BIN_NAME"),
@@ -179,23 +190,13 @@ pub async fn run() -> anyhow::Result<()> {
 
             Message::Request { id, call } => match call {
                 // A session is taken or it is not: a workfs this server cannot put
-                // anywhere is refused here rather than answered with a path, since a path
-                // is what every later call the client makes would be spelled in.
+                // anywhere is refused rather than answered with a path, since a path is
+                // what every later call the client makes would be spelled in.
                 Call::Init(init) => {
-                    let outcome = match &init.workfs {
-                        Some(workfs) => refused(
-                            Error::UNSUPPORTED_WORKFS,
-                            format!(
-                                "{}: this server realizes no workfs at all yet, so it can put \
-                                 one nowhere",
-                                workfs.url
-                            ),
-                        ),
-                        None => encoded(bson::serialize_to_bson(&InitResult::default())),
+                    let outcome = match session.configure(init) {
+                        Ok(answer) => encoded(bson::serialize_to_bson(&answer)),
+                        Err(outcome) => outcome,
                     };
-                    if outcome.error().is_none() {
-                        session.configure(init);
-                    }
                     server.respond(id, outcome).await?;
                 }
 
@@ -216,24 +217,34 @@ pub async fn run() -> anyhow::Result<()> {
                         .await?
                 }
 
-                Call::Exec(exec) => match session.booted() {
-                    Ok(booted) => execute(&mut server, id, &exec, booted, &shims).await?,
+                Call::Exec(exec) => match session.boot() {
                     Err(outcome) => server.respond(id, outcome).await?,
+                    // `cd` is the session's own and not a program: see
+                    // [`Session::change_dir`]. It is answered here rather than spawned,
+                    // and it is the one thing that moves where the session stands.
+                    Ok(()) => match cd_target(&exec) {
+                        Some(argv) => {
+                            let outcome = session.change_dir(argv);
+                            server.respond(id, outcome).await?;
+                        }
+                        None => execute(&mut server, id, &exec, &session, &shims).await?,
+                    },
                 },
 
                 // Booting first is the protocol's rule, and here it also decides *where*: a
-                // file call resolves in the namespace booting produced.
+                // relative path lands where the session stands, which is where a command
+                // would have looked for it.
                 Call::Read(read) => {
-                    let outcome = match session.booted() {
-                        Ok(booted) => read_file(booted.cwd(), &read).await,
+                    let outcome = match session.boot() {
+                        Ok(()) => read_file(session.cwd(), &read).await,
                         Err(outcome) => outcome,
                     };
                     server.respond(id, outcome).await?;
                 }
 
                 Call::Write(write) => {
-                    let outcome = match session.booted() {
-                        Ok(booted) => write_file(booted.cwd(), &write).await,
+                    let outcome = match session.boot() {
+                        Ok(()) => write_file(session.cwd(), &write).await,
                         Err(outcome) => outcome,
                     };
                     server.respond(id, outcome).await?;
@@ -250,18 +261,39 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What a session is on this host: what the client announced, and whatever booting it
-/// took.
+/// What a session is on this host: what the client announced, where it stands, and
+/// whatever booting it took.
 ///
-/// The two are apart because they are wanted at different moments. What [`Init`] carries
-/// is the session's shape and costs nothing to hold; the directory of symlinks is a real
-/// thing on disk, and the point of `start` and `stop` being optional is that it may come
-/// and go underneath a session that does not change.
+/// The three are apart because they are wanted at different moments. What [`Init`] carries
+/// is the session's shape and costs nothing to hold; where it stands is a path and costs no
+/// more; the directory of symlinks is a real thing on disk, and the point of `start` and
+/// `stop` being optional is that it may come and go underneath a session that does not
+/// change.
 #[derive(Default)]
 struct Session {
     /// What `init` said, or the defaults for a client that never sent one — which is a
     /// session with nothing delegated, and that is a session.
     config: Init,
+
+    /// The directory a `file://` workfs named, or `None` for a session that has none.
+    ///
+    /// Kept apart from [`cwd`](Self::cwd) because they answer different questions and stop
+    /// being the same path the first time a command runs `cd`: this one is the tree, and it
+    /// is what `cd` with no argument goes back to.
+    workfs: Option<PathBuf>,
+
+    /// Where the session stands, which is what an execution runs in and what a relative
+    /// path in a file call is resolved against.
+    ///
+    /// The workfs when there is one, this process's own directory when there is not, and
+    /// `None` when even that could not be read — a session that then names nothing and
+    /// leaves every path as it arrives, which is what this backend did before it had a tree
+    /// to stand in.
+    ///
+    /// **Not part of what booting produced**, so a `stop` does not disturb it: a `PathBuf`
+    /// is not occupancy, and a client that ran a `cd`, went idle and came back should not
+    /// find itself somewhere it never asked to be.
+    cwd: Option<PathBuf>,
 
     /// `None` until something boots it: a `start`, or the first call that needs one.
     booted: Option<Booted>,
@@ -270,57 +302,293 @@ struct Session {
 /// What a boot produced. Built together, released together.
 struct Booted {
     scratch: SessionScratch,
-}
 
-impl Booted {
-    /// Where an execution runs, and where a file call resolves its path.
+    /// The tree as `getcwd(2)` will spell it — symlinks resolved — or `None` for a session
+    /// with no tree.
     ///
-    /// `None`: whatever this process inherited. A session used to be able to declare a
-    /// namespace on `init` and have it mounted here, which made the answer the mount point —
-    /// wiring that back onto `cortex::fs` is its own piece of work, and until then the two
-    /// halves of the protocol agree by inheriting the same cwd, as they did before there were
-    /// namespaces at all.
-    fn cwd(&self) -> Option<&Path> {
-        None
-    }
+    /// Taken at boot because that is where the directory is looked at anyway, and it cannot
+    /// be taken any earlier: `init` answers a path before anything has been asked to find
+    /// one there. What it is for is [`respelled`], which is the only reader.
+    physical: Option<PathBuf>,
 }
 
 impl Session {
-    /// Take a new shape, and let go of anything booted under the old one.
+    /// Take a new shape, answering what the client has to know about it.
     ///
-    /// The delegated names are built into the directory, so a boot from before this is a
-    /// boot that no longer matches the session. Releasing it is enough — the next call
-    /// that needs one builds it again, from what has just arrived.
+    /// The URL is read **before** anything is let go of, so a session this server cannot
+    /// take is one it has not taken: a client whose second `init` is refused still has the
+    /// one it had.
     ///
-    /// Through [`release`](Self::release) rather than nulling the field: what a boot has
-    /// to give back grows, and a re-`init` while a session is live has exactly as much
-    /// reason to go through the one ordered teardown as a `stop` does.
-    fn configure(&mut self, config: Init) {
+    /// Otherwise the old boot goes, because the delegated names are built into the
+    /// directory and a boot from before this is a boot that no longer matches the session.
+    /// Releasing it is enough — the next call that needs one builds it again, from what has
+    /// just arrived.
+    fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
+        let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+
+        // Through `release` rather than nulling the field: what a boot has to give back
+        // grows, and a re-`init` while a session is live has exactly as much reason to go
+        // through the one ordered teardown as a `stop` does.
         self.release();
+
+        // A session with no tree still stands somewhere — this process's own directory,
+        // which is where a spawned command would have run anyway. Saying so is better than
+        // leaving the client to guess what a relative path would mean.
+        self.cwd = workfs.clone().or_else(|| std::env::current_dir().ok());
+        self.workfs = workfs;
         self.config = config;
+
+        Ok(InitResult {
+            workfs: self.workfs.as_deref().map(|path| WorkFsMount {
+                // The URL it came from was a `String`, so this one round-trips.
+                path: path.to_string_lossy().into_owned(),
+            }),
+            // A directory with no `String` form is one the client could not have used, so
+            // it is left unsaid rather than sent lossily — the rule a `cwd` follows
+            // everywhere in this protocol.
+            cwd: self.named_cwd(),
+        })
+    }
+
+    /// Where the session stands.
+    fn cwd(&self) -> Option<&Path> {
+        self.cwd.as_deref()
+    }
+
+    /// The same, as the protocol can carry it: `None` for a directory with no `String`
+    /// form, which is a name the client could not have joined onto anyway.
+    fn named_cwd(&self) -> Option<String> {
+        self.cwd().and_then(|cwd| cwd.to_str().map(str::to_owned))
+    }
+
+    /// The tree under both its spellings — what `init` answered, and what `getcwd(2)` will
+    /// say — for [`respelled`]. `None` before a boot and for a session with no tree.
+    fn tree(&self) -> Option<(&Path, &Path)> {
+        let physical = self.booted.as_ref()?.physical.as_deref()?;
+        Some((self.workfs.as_deref()?, physical))
+    }
+
+    /// What booting produced, for the one thing outside this type that needs it.
+    ///
+    /// Reached separately from [`boot`](Self::boot) rather than returned by it, because a
+    /// `cd` between two commands needs the session back — and a borrow handed out by the
+    /// call that booted would still be held while it asked for that.
+    fn scratch(&self) -> Option<&SessionScratch> {
+        self.booted.as_ref().map(|booted| &booted.scratch)
     }
 
     /// Give back what booting took.
     fn release(&mut self) {
-        // `scratch` drops with it, which is the whole of it: nothing is mounted over it.
+        // `scratch` drops with it, which is the whole of it: nothing is mounted over the
+        // tree, because a `file://` one is a directory this host already had.
         self.booted = None;
     }
 
-    /// The session, booting if nothing has: the delegated names somewhere `execvp` will find
-    /// them.
+    /// Bring the session up if nothing has: the tree where `init` said it would be, and the
+    /// delegated names somewhere `execvp` will find them.
+    ///
+    /// Realizing a `file://` workfs is **checking a claim rather than mounting anything** —
+    /// the directory is one this host already has — and it happens here rather than at
+    /// `init` because that is where the protocol puts it: `init` says where the tree will
+    /// be, and a boot is what has to find it there. A directory that is not there is the
+    /// environment being wrong for a session that is described correctly, which is what
+    /// [`MOUNT_FAILED`](Error::MOUNT_FAILED) says.
     ///
     /// The directory of symlinks is not put on `PATH`: every execution is given its own
     /// environment (see [`environment`]), which is what an inherited `PATH` and a `set_var`
     /// would otherwise be for — and doing it per command rather than per process is what lets
     /// this program have more than one thread.
-    fn booted(&mut self) -> Result<&Booted, Outcome> {
-        if self.booted.is_none() {
-            let scratch = SessionScratch::create(self.config.delegated.iter().map(String::as_str))
-                .map_err(boot_failed)?;
-            self.booted = Some(Booted { scratch });
+    fn boot(&mut self) -> Result<(), Outcome> {
+        if self.booted.is_some() {
+            return Ok(());
         }
-        Ok(self.booted.as_ref().expect("just booted"))
+
+        // Canonicalizing is the check: it fails for a directory that is not there, and what
+        // it produces is the spelling a shim will report from inside the tree.
+        let physical = match &self.workfs {
+            None => None,
+            Some(workfs) => match workfs.canonicalize() {
+                Ok(physical) if physical.is_dir() => Some(physical),
+                Ok(_) => {
+                    return Err(refused(
+                        Error::MOUNT_FAILED,
+                        format!("{}: not a directory", workfs.display()),
+                    ));
+                }
+                Err(e) => {
+                    return Err(refused(
+                        Error::MOUNT_FAILED,
+                        format!("{}: {e}", workfs.display()),
+                    ));
+                }
+            },
+        };
+
+        let scratch = SessionScratch::create(self.config.delegated.iter().map(String::as_str))
+            .map_err(boot_failed)?;
+        self.booted = Some(Booted { scratch, physical });
+        Ok(())
     }
+
+    /// Move where the session stands, and say where to.
+    ///
+    /// **`cd` is the session's own because it is nobody else's.** It is a shell builtin and
+    /// not a program, so an `exec` carrying an argv has no other way to offer it — and the
+    /// shell a person would be talking to is, here, the session itself. A `cd` inside a
+    /// command (`sh -c 'cd x'`) moves that command's own process and nothing else, which is
+    /// what a subshell does in a terminal too.
+    ///
+    /// The answer is a `done` and not an error, including when it fails: `cd` behaves like
+    /// the builtin it stands in for, so a directory that is not there is a non-zero code and
+    /// a line on stderr rather than the session refusing the call.
+    ///
+    /// **Logical, like a shell's own `cd`.** The path is normalized on paper — `.` dropped,
+    /// `..` popped — and symlinks are left alone, so what goes back is still spelled under
+    /// the path `init` answered with. Canonicalizing instead would be `cd -P`, and it breaks
+    /// the one thing these paths are for: a mount point reached through a symlink is
+    /// answered as `/var/…` at `init` and would come back as `/private/var/…` here, which
+    /// the client cannot relate to what it was told. See [`respelled`].
+    ///
+    /// The directory still has to be there — the normalization is about spelling, and this
+    /// stats what it produced.
+    fn change_dir(&mut self, argv: &[String]) -> Outcome {
+        let target = match argv {
+            // `cd` with nothing is the tree it started in, which is this session's spelling
+            // of what `$HOME` is to a shell.
+            [] => match self.workfs.clone().or_else(|| self.cwd.clone()) {
+                Some(home) => home,
+                None => return builtin_failed("cd: this session stands nowhere to return to"),
+            },
+            [dir] => at(self.cwd(), dir),
+            _ => return builtin_failed("cd: too many arguments"),
+        };
+
+        let moved = lexical(&target);
+        match std::fs::metadata(&moved) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => return builtin_failed(format!("cd: {}: not a directory", moved.display())),
+            Err(e) => return builtin_failed(format!("cd: {}: {e}", moved.display())),
+        }
+        // A directory the client cannot be told about is one it must not be moved into: the
+        // paths it built afterwards would name files nobody meant.
+        if moved.to_str().is_none() {
+            return builtin_failed(format!(
+                "cd: {}: has no name this protocol can carry",
+                moved.display()
+            ));
+        }
+
+        self.cwd = Some(moved);
+        result(Progress::Done(ExecResult {
+            code: 0,
+            cwd: self.named_cwd(),
+            ..ExecResult::default()
+        }))
+    }
+}
+
+/// `path` with `.` dropped and `..` popped, on paper and without touching the filesystem.
+///
+/// What a shell does to keep a working directory readable, and here it also keeps it
+/// *comparable*: every path this server reports has to be spelled under the one `init`
+/// answered with, and resolving symlinks would produce a second spelling of the same
+/// directory that the client has no way to relate to the first.
+///
+/// A `..` popped on paper can name a different directory than a kernel would reach through
+/// a symlinked component. That is the same trade a shell's logical `cd` makes, and the
+/// alternative here is worse: a path the other end cannot use at all.
+///
+/// `..` at the root stays at the root, the way `cd /..` does.
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            component => out.push(component),
+        }
+    }
+    out
+}
+
+/// A directory a shim reported, spelled the way this session spells things.
+///
+/// `getcwd(2)` answers the *physical* path — symlinks resolved, always — so a shim standing
+/// in a tree mounted at `/var/…` reports `/private/var/…`, which is not a path the client
+/// was ever told about. Only this end can put that right: it knows both spellings, and the
+/// one the client can use is the one `init` answered with.
+///
+/// So a directory inside the tree comes back re-rooted onto that answer, and one outside it
+/// is passed through as it stands — a path this session never described, which the client
+/// will decline to resolve anything against rather than guess at.
+///
+/// `None` in and `None` out: a shim that reported nothing leaves the client refusing
+/// relative arguments, which is the honest end of it.
+fn respelled(reported: Option<String>, tree: Option<(&Path, &Path)>) -> Option<String> {
+    let reported = reported?;
+    let Some((answered, physical)) = tree else {
+        return Some(reported);
+    };
+    match Path::new(&reported).strip_prefix(physical) {
+        Ok(rest) => answered.join(rest).to_str().map(str::to_owned),
+        Err(_) => Some(reported),
+    }
+}
+
+/// The argv of an `exec` that is a `cd`, without the name — or `None` for anything else.
+///
+/// The whole of what makes it a builtin: matched on the first word, before a process is
+/// spawned. Nothing else about an `exec` is read differently.
+fn cd_target(exec: &Exec) -> Option<&[String]> {
+    match exec.cmd.split() {
+        Some((program, args)) if program == "cd" => Some(args),
+        _ => None,
+    }
+}
+
+/// The directory a workfs URL names, or why it names none this server can use.
+///
+/// `file://` and nothing else, which is the whole of what this build realizes — and the
+/// scheme is where that is decided, not the path, so anything else is
+/// [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) naming what was asked for.
+///
+/// Reading the URL is [`WorkFsSource`]'s, so that this server and any other realize the same
+/// string the same way. What is left here is the two refusals, which are this build's: a
+/// scheme it has no provider for, and a path that is not absolute — `file://srv/x`, whose
+/// authority is not something this can honour and whose path two ends would resolve
+/// differently.
+fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Outcome> {
+    let Some(path) = workfs.file_path() else {
+        return Err(refused(
+            Error::UNSUPPORTED_WORKFS,
+            format!(
+                "{}: this server realizes file:// and nothing else",
+                workfs.scheme()
+            ),
+        ));
+    };
+
+    if !path.is_absolute() {
+        return Err(refused(
+            Error::INVALID_PARAMS,
+            format!("{}: a file:// workfs needs an absolute path", workfs.url),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// A builtin that ran and failed, the way the shell builtin it stands in for would: a code
+/// and a line, and not a refusal of the call.
+fn builtin_failed(message: impl Into<String>) -> Outcome {
+    let mut stderr: Vec<u8> = message.into().into_bytes();
+    stderr.push(b'\n');
+    result(Progress::Done(ExecResult {
+        code: 1,
+        stderr,
+        ..ExecResult::default()
+    }))
 }
 
 /// A boot that did not happen, as the answer to whatever needed one.
@@ -328,16 +596,17 @@ fn boot_failed(e: io::Error) -> Outcome {
     refused(Error::BOOT_FAILED, format!("linking delegated names: {e}"))
 }
 
-/// The path a file call names, in the namespace an execution would resolve it in.
+/// The file a path names, resolved where the session stands.
 ///
-/// A workspace path is relative and a mount point is where it starts, so this is a join —
-/// the same one a spawned command's `current_dir` performs for it. With no mount there is
-/// no directory to join, and the path is used as it arrives, which is what this backend did
-/// before there were namespaces at all.
+/// The protocol's paths are this host's, so an absolute one is already the answer and
+/// `Path::join` says so by dropping the root it was given. A relative one lands where a
+/// command would have looked for it, which is the join a spawned command's `current_dir`
+/// performs for itself. With nowhere to stand there is nothing to join, and the path is
+/// used as it arrives.
 ///
 /// **A join, not containment.** An absolute path, or one with enough `..`, still leaves the
-/// mount. What this buys is that the two halves of the protocol name the same file, not
-/// that either half is confined.
+/// tree. What this buys is that the two halves of the protocol name the same file, not that
+/// either half is confined.
 fn at(root: Option<&Path>, path: &str) -> PathBuf {
     match root {
         Some(root) => root.join(path),
@@ -355,7 +624,7 @@ async fn execute(
     server: &mut StdioServer,
     id: RequestId,
     exec: &Exec,
-    booted: &Booted,
+    session: &Session,
     shims: &Shims,
 ) -> io::Result<()> {
     let Some((program, args)) = exec.cmd.split() else {
@@ -366,16 +635,16 @@ async fn execute(
 
     let mut cmd = Command::new(program);
     cmd.args(args)
-        .envs(environment(booted, shims))
+        .envs(environment(session, shims))
         // Piped and then read by `wait_with_output`, which is what carries the output
         // back. Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // In the namespace, when there is one — which is what makes a relative path in a
-    // command mean the same thing as one in a `read`.
-    if let Some(dir) = booted.cwd() {
+    // Where the session stands, which is what makes a relative path in a command mean the
+    // same thing as one in a `read` — and what a `cd` before this one moved.
+    if let Some(dir) = session.cwd() {
         cmd.current_dir(dir);
     }
 
@@ -416,7 +685,7 @@ async fn execute(
             biased;
 
             accepted = shims.accept() => match accepted {
-                Some(stream) => match delegate(server, owed, stream, booted.cwd()).await? {
+                Some(stream) => match delegate(server, owed, stream, session.tree()).await? {
                     Some(next) => owed = next,
                     // The client stopped saying anything that could carry the execution on,
                     // so there is nobody left to answer. The command is left to the
@@ -446,7 +715,7 @@ async fn delegate(
     server: &mut StdioServer,
     owed: RequestId,
     stream: UnixStream,
-    root: Option<&Path>,
+    tree: Option<(&Path, &Path)>,
 ) -> io::Result<Option<RequestId>> {
     // Owned halves, because the two directions are separate fields of a `StdioServer` and
     // have to outlive the borrow the stream came in on.
@@ -470,10 +739,12 @@ async fn delegate(
         }
     };
 
-    // WorkFs-relative, or `None`. The rule is `cortex`'s and not this backend's — see
-    // `reported_cwd`, which the uvm guest agent calls for the same reason.
+    // The environment goes verbatim — it is the command's own, and nothing about it is
+    // this end's to interpret. The directory is re-spelled, because `getcwd(2)` answers a
+    // physical path and the client was told about a possibly different spelling of the same
+    // tree. See [`respelled`].
     let exec = Exec {
-        cwd: cortex::executable::reported_cwd(exec.cwd.as_deref(), root),
+        cwd: respelled(exec.cwd, tree),
         ..exec
     };
 
@@ -519,17 +790,28 @@ async fn delegate(
 /// Per command rather than per process. `std::env::set_var` is unsound with any other
 /// thread running and this program has one, so a `PATH` this process mutates once is a
 /// `PATH` each [`Command`] is handed instead.
-fn environment(booted: &Booted, shims: &Shims) -> Vec<(OsString, OsString)> {
+fn environment(session: &Session, shims: &Shims) -> Vec<(OsString, OsString)> {
     // Appended, not prepended: these names are meant to add commands, not to quietly
     // shadow a real `git` or `python` a caller meant to run.
     let mut path = std::env::var_os("PATH").unwrap_or_default();
-    path.push(":");
-    path.push(booted.scratch.bin());
+    if let Some(scratch) = session.scratch() {
+        path.push(":");
+        path.push(scratch.bin());
+    }
 
-    vec![
+    let mut env = vec![
         (SOCK_ENV.into(), shims.sock.clone().into_os_string()),
         ("PATH".into(), path),
-    ]
+    ];
+
+    // `PWD` is what a shell reads to answer `pwd`, and it is inherited from this process
+    // unless something says otherwise — so a command spawned in the session's directory
+    // would be told it was standing somewhere else. Set to match, which is what a shell
+    // does for itself when it moves.
+    if let Some(cwd) = session.cwd() {
+        env.push(("PWD".into(), cwd.into()));
+    }
+    env
 }
 
 /// The socket every shim dials.
@@ -633,9 +915,9 @@ fn finished(output: io::Result<Output>) -> Outcome {
         stdout: out.stdout,
         stderr: out.stderr,
         truncated: false,
-        // Nowhere to have moved from: this backend spawns each command in the directory it
-        // inherited and keeps no session directory of its own — see [`Booted::cwd`]. A
-        // command that ran `cd` moved its own process and nothing that outlives it.
+        // A spawned command cannot have moved the session: `cd` in a child dies with the
+        // child, and the one `cd` that moves anything here is the builtin, which never
+        // reaches this function. See [`Session::change_dir`].
         cwd: None,
     }))
 }
@@ -782,4 +1064,74 @@ fn exit_code(status: &ExitStatus) -> i32 {
 
 fn refused(code: i64, message: impl Into<String>) -> Outcome {
     Outcome::Error(Error::new(code, message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A URL is refused for the reason it actually has, and the two reasons are different
+    /// answers: a scheme this build has no provider for is the *build* being wrong for a
+    /// well-formed request, where a path that is not absolute is the request.
+    ///
+    /// Neither is reachable through a `Console`, which names a mount point it holds and so
+    /// can only ever write `file://` and an absolute path — which is exactly why they are
+    /// asserted here.
+    #[test]
+    fn a_workfs_url_is_a_file_url_or_it_is_refused() {
+        assert_eq!(
+            directory_url(&WorkFsSource::new("file:///srv/project")).unwrap(),
+            PathBuf::from("/srv/project")
+        );
+
+        for (url, code, because) in [
+            (
+                "https://example.com/share",
+                Error::UNSUPPORTED_WORKFS,
+                "https",
+            ),
+            ("s3://bucket/prefix", Error::UNSUPPORTED_WORKFS, "s3"),
+            // No scheme at all is not a path this server may fall back to reading: it is a
+            // URL that names no kind, and the message says the whole of what arrived.
+            ("/srv/project", Error::UNSUPPORTED_WORKFS, "/srv/project"),
+            // An authority is not something this can honour, so what follows `file://` has
+            // to be the path itself.
+            ("file://srv/project", Error::INVALID_PARAMS, "absolute"),
+        ] {
+            let Err(Outcome::Error(e)) = directory_url(&WorkFsSource::new(url)) else {
+                panic!("{url} was accepted");
+            };
+            assert_eq!(e.code, code, "{url}: {}", e.message);
+            assert!(e.message.contains(because), "{url}: {}", e.message);
+        }
+    }
+
+    /// `cd` is the first word and nothing else about an `exec` is read differently — not a
+    /// command that merely mentions it, and not an answer to a delegated call.
+    #[test]
+    fn cd_is_the_first_word_of_a_command_and_nothing_else() {
+        let argv = |words: &[&str]| Exec {
+            cmd: ExecCmd::New(words.iter().map(|w| w.to_string()).collect()),
+            ..Exec::default()
+        };
+
+        assert_eq!(cd_target(&argv(&["cd"])), Some(&[][..]));
+        assert_eq!(
+            cd_target(&argv(&["cd", "work"])),
+            Some(&["work".to_string()][..])
+        );
+        assert!(cd_target(&argv(&["sh", "-c", "cd work"])).is_none());
+        assert!(cd_target(&argv(&["cdx"])).is_none());
+        assert!(cd_target(&argv(&[])).is_none());
+        assert!(
+            cd_target(&Exec {
+                cmd: ExecCmd::Resume {
+                    id: 0,
+                    outcome: Outcome::Result(Bson::Null),
+                },
+                ..Exec::default()
+            })
+            .is_none()
+        );
+    }
 }

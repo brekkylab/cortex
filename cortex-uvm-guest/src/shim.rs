@@ -67,8 +67,9 @@ async fn forward(tool: &str) -> anyhow::Result<i32> {
             id: CALL_ID,
             call: Call::Exec(Exec {
                 cmd: ExecCmd::New(cmd),
-                // Absolute, in the *guest's* filesystem; the agent strips the workspace root,
-                // since only the agent knows where it was mounted.
+                // Absolute, in the guest's filesystem — which is the host's spelling too,
+                // since the tree is mounted at the path the host names it by. So nothing
+                // downstream translates this; it is already a path the client can use.
                 //
                 // `to_str` and not `to_string_lossy`, and this is the last place the bytes
                 // exist: lossy would substitute U+FFFD and hand on a `String` that looks
@@ -76,6 +77,15 @@ async fn forward(tool: &str) -> anyhow::Result<i32> {
                 cwd: std::env::current_dir()
                     .ok()
                     .and_then(|p| p.to_str().map(str::to_owned)),
+                // All of it, so a delegated name sees what a program on `PATH` would.
+                // `vars_os` and not `vars`: the latter panics on an entry that is not
+                // UTF-8, and one variable nothing can spell is no reason to fail a call —
+                // it is left out, the way a `cwd` with no `String` form is.
+                env: std::env::vars_os()
+                    .filter_map(|(name, value)| {
+                        Some((name.into_string().ok()?, value.into_string().ok()?))
+                    })
+                    .collect(),
                 ..Exec::default()
             }),
         },

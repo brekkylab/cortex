@@ -24,17 +24,17 @@
 //! names, and the guest is told which is which by name — see
 //! [`GUEST_UPPER_DEV`](crate::contract::GUEST_UPPER_DEV).
 //!
-//! The workspace is the one device that is not a file. cortex realizes it as a
-//! [`Posix`] over a [`WorkFs`], which `msb_krun` drives as a `DynFileSystem`, so
-//! every request the guest kernel makes is answered by this process — no daemon and no host
-//! mount.
+//! The tree is a **host directory**, shared over virtio-fs like any other. Whatever it is
+//! made of — a cortex `WorkFs` of several stores, a plain project directory — was realized
+//! and mounted on the host before this process started, so nothing in here knows or asks:
+//! it attaches a path.
 //!
-//! What is behind it is whatever the client declared: a `WorkspaceSpec` arrives on a file
-//! this process reads once and unlinks, and every volume kind cortex can realize is a
-//! volume kind a guest can see. Where the tree lands is not negotiable — it is
-//! [`GUEST_WORKSPACE_ROOT`](crate::contract::GUEST_WORKSPACE_ROOT), a constant, because a
-//! spec's own mount paths are relative to the workspace root and one spec has to mean one
-//! namespace on either backend.
+//! Where it lands in the guest is **that same path**, and that is the one decision worth
+//! reading here. A constant of our own (`/workspace`, say) would mean a directory has two
+//! names, one per side of the hypervisor, and every path crossing between them would have
+//! to be rewritten — a `cwd` on the way out, a `read` on the way in, an argv nobody could
+//! rewrite safely. Mounting it where the host already has it makes the two spellings one
+//! string, and the translation problem does not exist.
 //!
 //! # Networking
 //!
@@ -48,13 +48,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
-use cortex::fs::{Posix, WorkFs};
-use msb_krun::{DiskImageFormat, DynFileSystem, VmBuilder};
+use msb_krun::{DiskImageFormat, VmBuilder};
 
 use crate::contract::{
     BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV,
-    GUEST_WORKSPACE_ROOT, KERNEL_ENV, LOWER_ENV, MEMORY_ENV, PORT_NAME, SESSION_IMAGE_ENV,
-    SHARE_ENV, SPEC_ENV, UPPER_ENV, VCPUS_ENV, WORKSPACE_TAG,
+    KERNEL_ENV, LOWER_ENV, MEMORY_ENV, PORT_NAME, SESSION_IMAGE_ENV, SHARE_ENV, UPPER_ENV,
+    VCPUS_ENV, WORKFS_ENV, WORKFS_TAG,
 };
 
 /// Guest vCPUs when nothing says otherwise. Two rather than one because a command that
@@ -95,11 +94,13 @@ pub fn run() -> anyhow::Result<Infallible> {
         .console(|c| c.port(PORT_NAME, port, port));
 
     // Attached here and named to the guest below, because the tag is one agreement in two
-    // places: a device configuration and a `mount -t virtiofs`.
-    let share = match workspace()? {
-        Some((backend, guest_root)) => {
-            builder = builder.fs(move |fs| fs.tag(WORKSPACE_TAG).custom(backend));
-            Some(format!("{WORKSPACE_TAG}:{guest_root}"))
+    // places: a device configuration and a `mount -t virtiofs`. The path is the second
+    // agreement, and it is the host's own — see the module docs on why the guest mounts it
+    // where this host has it.
+    let share = match workfs()? {
+        Some(path) => {
+            builder = builder.fs(|fs| fs.tag(WORKFS_TAG).path(&path));
+            Some(format!("{WORKFS_TAG}:{path}"))
         }
         None => None,
     };
@@ -120,38 +121,23 @@ pub fn run() -> anyhow::Result<Infallible> {
     Ok(vm.enter()?)
 }
 
-/// Read a namespace off disk and unlink it.
+/// The host directory to share, and `None` for a session that declared no tree.
 ///
-/// Split out from [`workspace`] because it is the part with an answer a test can check.
-/// The unlink is not cleanup: the file is credentials, this is the last reader, and the
-/// sooner it stops existing the smaller the window in which anything else could read it.
-fn read_spec(path: &Path) -> anyhow::Result<WorkFs> {
-    let encoded = std::fs::read(path)
-        .map_err(|e| anyhow::anyhow!("reading the namespace from {}: {e}", path.display()))?;
-    // Before parsing, not after: a spec this build cannot make sense of is still a spec that
-    // should not be sitting on disk.
-    let _ = std::fs::remove_file(path);
-
-    let spec: cortex::fs::WorkspaceSpec = bson::deserialize_from_slice(&encoded)
-        .map_err(|e| anyhow::anyhow!("parsing the namespace: {e}"))?;
-    WorkFs::from_spec(&spec).map_err(|e| anyhow::anyhow!("realizing the namespace: {e}"))
-}
-
-/// The cortex workspace to project into the guest, and where it lands.
-///
-/// One virtio-fs device for the whole tree. What is under it is a [`WorkFs`]'s
-/// business — however many volumes, of whatever kind, mounted wherever the spec says — and
-/// the guest sees whatever that tree is, which is the same tree a host FUSE mount built from
-/// the same spec would show. That sameness is the point of the spec existing.
-fn workspace() -> anyhow::Result<Option<(Box<dyn DynFileSystem + Send + Sync>, String)>> {
-    let Some(path) = std::env::var_os(SPEC_ENV) else {
+/// UTF-8 because it has to be written into [`SHARE_ENV`] as `tag:path` and read back by the
+/// guest — a directory with no string form is one the two ends could not agree on, and this
+/// is the last place that can say so.
+fn workfs() -> anyhow::Result<Option<String>> {
+    let Some(path) = std::env::var_os(WORKFS_ENV) else {
         return Ok(None);
     };
-    let ws = read_spec(Path::new(&path))?;
-    Ok(Some((
-        Box::new(Posix::new(ws)),
-        GUEST_WORKSPACE_ROOT.to_string(),
-    )))
+    let path = path.into_string().map_err(|path| {
+        anyhow::anyhow!("{WORKFS_ENV} is not utf-8: {}", Path::new(&path).display())
+    })?;
+    anyhow::ensure!(
+        Path::new(&path).is_absolute(),
+        "{WORKFS_ENV} has to be an absolute path, and is {path}"
+    );
+    Ok(Some(path))
 }
 
 fn required(key: &str) -> anyhow::Result<PathBuf> {
@@ -164,55 +150,4 @@ fn required(key: &str) -> anyhow::Result<PathBuf> {
 /// caller who typed nonsense gets the default and a guest that boots.
 fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.parse().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A spec on disk becomes the tree it describes, and the file is gone afterwards.
-    ///
-    /// `async` only because `Mountable` is: `read_spec` itself is not, and neither is
-    /// anything else this file does with a spec. Asking the tree a question is the one step
-    /// that awaits.
-    #[tokio::test]
-    async fn a_spec_file_becomes_a_workspace_and_is_unlinked() {
-        use cortex::fs::{Mountable as _, VolumeSpec, WorkspaceSpec};
-
-        let host = tempfile::tempdir().unwrap();
-        std::fs::write(host.path().join("hello.txt"), b"hi").unwrap();
-
-        let spec = WorkspaceSpec::default().mount(
-            "work",
-            VolumeSpec::Local {
-                host: host.path().to_path_buf(),
-            },
-        );
-        let path = std::env::temp_dir().join(format!("spec-test-{}.bson", std::process::id()));
-        std::fs::write(&path, bson::serialize_to_vec(&spec).unwrap()).unwrap();
-
-        let ws = read_spec(&path).expect("builds the workspace the spec describes");
-
-        // The tree is the spec's, asked through the `Mountable` surface rather than through
-        // a mount — no VM, no virtio-fs, just the object the boot child hands libkrun.
-        assert!(ws.stat(Path::new("work/hello.txt")).await.is_ok());
-
-        assert!(
-            !path.exists(),
-            "the spec is credentials, and a reader that leaves it on disk is the leak this \
-             file's whole shape exists to avoid"
-        );
-    }
-
-    /// A spec file that is not there at all is a hard failure, not an empty namespace.
-    ///
-    /// Silence would mean a session whose client declared volumes gets a guest with none,
-    /// and no way to tell. Declaring nothing is spelled by `SPEC_ENV` being unset, which
-    /// never reaches here.
-    #[test]
-    fn a_missing_spec_file_is_an_error() {
-        let missing = std::env::temp_dir().join("cortex-uvm-no-such-spec.bson");
-        let _ = std::fs::remove_file(&missing);
-        assert!(read_spec(&missing).is_err());
-    }
 }

@@ -60,16 +60,18 @@ const PORT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// Build the root, mount what the session was given, and open the channel the host is
 /// waiting on.
 ///
-/// Returns the port and the workspace root, when there is one. The root is also this
-/// process's working directory, and it is returned as well as applied because the agent
-/// needs it as a *value*: a delegated call reports an absolute guest path, and turning that
-/// back into a workspace-relative one means having the prefix to remove. Reading the cwd
-/// back later would work today and would be a different thing tomorrow.
+/// Returns the port, which is the only thing the agent needs from here.
+///
+/// Where the tree landed is **not** returned, and that is the point: the agent hears it in
+/// the `init` the host replays, as a `file://` URL naming the same absolute path the host
+/// spells it with — one fact from one place. This function only has to put the tree where
+/// that URL says, which the boot arranged by naming the share after the host's own
+/// directory.
 ///
 /// The order is the only one that works: pseudo-filesystems first because `/proc` is how
 /// this binary finds itself and `/dev` is where the block devices are, the overlay next
 /// because it replaces everything mounted so far, then the share, then the port.
-pub fn prepare() -> anyhow::Result<(File, Option<PathBuf>)> {
+pub fn prepare() -> anyhow::Result<File> {
     mount_pseudo();
 
     if let (Ok(lower), Ok(upper)) = (std::env::var(LOWER_ENV), std::env::var(UPPER_ENV)) {
@@ -80,16 +82,15 @@ pub fn prepare() -> anyhow::Result<(File, Option<PathBuf>)> {
         copy_self()?;
     }
 
-    // A workspace is where a command's relative paths should resolve, so it is also the
-    // working directory. Without one, `/` — a session with nothing projected into it
-    // still has a root.
-    let root = share()?;
-    match &root {
-        Some(root) => set_cwd(root)?,
+    // Where a command runs is the session's, and the agent sets it per command — but this
+    // process has to stand somewhere, and a session with no tree stands here. The tree
+    // when there is one, `/` when there is not.
+    match share()? {
+        Some(root) => set_cwd(&root)?,
         None => set_cwd(Path::new("/"))?,
     }
 
-    Ok((open_port()?, root))
+    open_port()
 }
 
 /// `mount(2)`, creating the target first.

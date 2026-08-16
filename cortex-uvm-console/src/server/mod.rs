@@ -42,6 +42,12 @@
 //!   [replayed](Session::booted) into whichever guest comes up next. A second `init`
 //!   therefore releases the guest booted under the first, which is exactly what the
 //!   protocol says it does.
+//! - **The tree.** A `file://` workfs is a directory on *this* host, and it is shared into
+//!   the guest at that same path — see [`boot`](crate::boot). So the path this end answers
+//!   is the path the guest stands in, and everything after `init` relays untouched: a `cwd`
+//!   the agent reports is already a name the client can open, and a `read`'s path is
+//!   already one the guest can. **Nothing here translates a path**, and that is the whole
+//!   reason the share lands where it does.
 //! - **Releasing.** `stop` drops the guest, which kills the VMM and deletes the image it
 //!   was writing. `quit` ends the process, and the guest goes with it.
 //!
@@ -55,9 +61,13 @@
 
 mod guest;
 
-use bson::Bson;
+use std::path::PathBuf;
+
 use cortex::console::stdio::StdioServer;
-use cortex::console::{Call, Error, Init, Message, Notification, Outcome, RequestId, Server};
+use cortex::console::{
+    Call, Error, Init, InitResult, Message, Notification, Outcome, RequestId, Server, WorkFsMount,
+    WorkFsSource,
+};
 
 pub use guest::BOOT_ARG;
 use guest::Guest;
@@ -110,8 +120,14 @@ pub async fn run() -> anyhow::Result<()> {
                 id,
                 call: Call::Init(init),
             } => {
-                session.configure(init);
-                server.respond(id, Outcome::Result(Bson::Null)).await?;
+                let outcome = match session.configure(init) {
+                    Ok(answer) => match bson::serialize_to_bson(&answer) {
+                        Ok(value) => Outcome::Result(value),
+                        Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
+                    },
+                    Err(outcome) => outcome,
+                };
+                server.respond(id, outcome).await?;
             }
 
             // Everything else is the guest's to answer, including an `exec` that carries
@@ -162,20 +178,45 @@ struct Session {
     /// session with nothing delegated, and that is a session.
     config: Init,
 
+    /// The host directory a `file://` workfs named, or `None` for a session with no tree.
+    ///
+    /// Held apart from `config` because it is the one thing in it this end acts on: the
+    /// boot shares it, and the answer to `init` was spelled from it.
+    workfs: Option<PathBuf>,
+
     /// `None` until something boots one: a `start`, or the first call that needs it.
     guest: Option<Guest>,
 }
 
 impl Session {
-    /// Take a new shape, and let go of any guest running under the old one.
+    /// Take a new shape, answering what the client has to know about it.
     ///
-    /// The delegated names are built into what the agent linked when it booted, so a guest
-    /// from before this is a guest that no longer matches the session. Dropping it is
-    /// enough — the next call that needs one boots it again, and hears the `init` that has
-    /// just arrived.
-    fn configure(&mut self, config: Init) {
+    /// The URL is read before anything is let go of, so a session this backend cannot take
+    /// is one it has not taken. Otherwise the guest goes: the delegated names are built into
+    /// what the agent linked when it booted, so a guest from before this is a guest that no
+    /// longer matches the session. Dropping it is enough — the next call that needs one
+    /// boots it again, and hears the `init` that has just arrived.
+    ///
+    /// **The path answered here is a host path**, and the guest will stand at the same one.
+    /// Nothing is mounted or booted by saying so: the share happens when a guest does.
+    fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
+        let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+
         self.guest = None;
+        self.workfs = workfs;
         self.config = config;
+
+        let path = self
+            .workfs
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned());
+        Ok(InitResult {
+            workfs: path.clone().map(|path| WorkFsMount { path }),
+            // Where a session starts is its tree, and a guest with no tree stands at `/` —
+            // which is what `init::prepare` puts the agent in. Either way this is the same
+            // answer the agent will give when the session is replayed into it.
+            cwd: Some(path.unwrap_or_else(|| "/".to_string())),
+        })
     }
 
     fn release(&mut self) {
@@ -194,31 +235,40 @@ impl Session {
     /// would otherwise be lost.
     async fn booted(&mut self) -> Result<&mut Guest, Outcome> {
         if self.guest.is_none() {
-            // Realized here and thrown away, so that a bad spec is answered where an answer
-            // can still be given. The boot child realizes it again for real, and a failure
-            // there has nowhere to go — it writes to its own stderr and exits, and this end
-            // sees only a closed channel, which is `BOOT_FAILED`. That would collapse every
-            // distinction `UNSUPPORTED_VOLUME` exists to draw.
-            //
-            // The cost is a `Mountable` built and dropped: no network, and an unused HTTP
-            // client at worst. Asking more cheaply would mean a second copy of
-            // `build_mountable`'s `#[cfg]` arms.
-            drop(cortex::fs::WorkFs::from_spec(&self.config.volumes).map_err(unsupported_volume)?);
+            // The tree has to be there before a guest is told to mount it: a directory that
+            // is not on this host is the environment being wrong for a session that is
+            // described correctly, which is what `MOUNT_FAILED` says — and saying it here is
+            // the difference between that and a guest that comes up without a filesystem and
+            // fails at the first command.
+            if let Some(workfs) = &self.workfs {
+                match std::fs::metadata(workfs) {
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => {
+                        return Err(refused(
+                            Error::MOUNT_FAILED,
+                            format!("{}: not a directory", workfs.display()),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(refused(
+                            Error::MOUNT_FAILED,
+                            format!("{}: {e}", workfs.display()),
+                        ));
+                    }
+                }
+            }
 
-            let mut guest = Guest::boot(&self.config.volumes)
+            let mut guest = Guest::boot(self.workfs.as_deref())
                 .await
                 .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
 
-            // The namespace does **not** go in the replay. The boot child realized it and the
-            // guest sees a mounted filesystem, so the agent never reads `volumes` — and a
-            // field nobody reads is not free when it carries an S3 secret or a Notion key,
-            // in the one environment this design treats as untrusted.
-            let announced = Init {
-                volumes: cortex::fs::WorkspaceSpec::default(),
-                ..self.config.clone()
-            };
+            // The tree **does** go in the replay, and it is the same URL the client sent:
+            // the guest mounted that host directory at that host path, so what the agent is
+            // told is true on its side too. Nothing secret is in it — a `file://` URL is a
+            // directory this host already has, and whatever it took to build that tree
+            // stayed on this side of the boundary.
             let outcome = guest
-                .relay(REPLAYED_INIT, Call::Init(announced))
+                .relay(REPLAYED_INIT, Call::Init(self.config.clone()))
                 .await
                 .map_err(|e| refused(Error::BOOT_FAILED, format!("announcing the session: {e}")))?;
             if let Some(error) = outcome.error() {
@@ -233,20 +283,35 @@ impl Session {
     }
 }
 
-/// A namespace this build cannot realize, as the answer to whatever needed a session.
+/// The host directory a workfs URL names, or why it names none this backend can use.
 ///
-/// The same mapping `cortex-local-console` applies, and deliberately the same: a client
-/// cannot tell which backend answered it, so the two must not disagree about what a spec
-/// they both refuse is called.
-fn unsupported_volume(e: std::io::Error) -> Outcome {
-    let code = match e.kind() {
-        // What `build_store` answers for a kind this build has no provider for.
-        std::io::ErrorKind::Unsupported => Error::UNSUPPORTED_VOLUME,
-        // Anything else from `from_spec` is a spec this server cannot make sense of — a
-        // mount path that escapes the root, or two at one path.
-        _ => Error::INVALID_PARAMS,
+/// The same two refusals `cortex-local-console` makes, and deliberately the same: a client
+/// cannot tell which backend answered it, so the two must not disagree about a URL they both
+/// decline. Reading the URL itself is [`WorkFsSource`]'s, which is what keeps them from
+/// drifting apart.
+///
+/// `file://` and nothing else, for a reason this backend has and the local one does not: the
+/// tree is shared into a guest as a directory, so a kind that is not one on this host is a
+/// kind there is nothing to share. What realizes an object store as a directory is a mount,
+/// and mounting is the caller's.
+fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Outcome> {
+    let Some(path) = workfs.file_path() else {
+        return Err(refused(
+            Error::UNSUPPORTED_WORKFS,
+            format!(
+                "{}: a guest is handed a directory, so this server realizes file:// and \
+                 nothing else",
+                workfs.scheme()
+            ),
+        ));
     };
-    refused(code, format!("realizing the namespace: {e}"))
+    if !path.is_absolute() {
+        return Err(refused(
+            Error::INVALID_PARAMS,
+            format!("{}: a file:// workfs needs an absolute path", workfs.url),
+        ));
+    }
+    Ok(path.to_path_buf())
 }
 
 fn refused(code: i64, message: impl Into<String>) -> Outcome {

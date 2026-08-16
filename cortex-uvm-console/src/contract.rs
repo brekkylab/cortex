@@ -12,6 +12,11 @@
 //!   two crates are built for different targets, so neither can depend on the other and
 //!   the compiler will not notice a mismatch.
 //!
+//! Where the tree lands inside the guest is **the host's own path for it**, carried in
+//! [`SHARE_ENV`] like any other share. Not a constant of this crate's choosing: one spelling
+//! on both sides of the hypervisor is what lets a `cwd` the guest reports be a path the
+//! client can open, with nothing in the middle translating and nothing to disagree about.
+//!
 //! The environment is the channel because it is the only one libkrun's `exec` has that
 //! survives: an argument becomes part of the guest's kernel command line, which is
 //! size-limited and rejects a newline. Nothing that could grow is here — the session
@@ -51,14 +56,14 @@ pub const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
 /// Guest memory in MiB, if the caller overrode it.
 pub const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
 
-/// The file holding this session's [`WorkspaceSpec`](cortex::fs::WorkspaceSpec), as BSON.
+/// The host directory to put in front of the guest — the tree the session works in.
 ///
-/// A file and not an environment value because a spec carries credentials: `environ` is
-/// readable by any same-uid process for the life of the process, where a `0600` file stops
-/// being readable once the boot child has unlinked it. It also has no size limit.
+/// A path and nothing else, because that is all a tree is now: whatever it is made of was
+/// realized on the host before this, and what a guest gets is the directory it was mounted
+/// at. Nothing secret travels here, which is what lets it be an environment value at all.
 ///
-/// Unset means a session that declared no namespace, which is a session.
-pub const SPEC_ENV: &str = "CORTEX_UVM_SPEC";
+/// Unset means a session that declared no tree, which is a session.
+pub const WORKFS_ENV: &str = "CORTEX_UVM_WORKFS";
 
 /// The read-only base image, as a host path (the child) — and as a guest block device
 /// (the guest). Both ends of the overlay are named twice for that reason: one side has a
@@ -84,13 +89,6 @@ pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 /// Told to the guest as `CORTEX_UVM_SHARE`, spelled `tag:/guest/path`.
 pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
 
-/// The virtio-fs tag the workspace is attached under. Never seen by a caller: it is an
+/// The virtio-fs tag the tree is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
-pub const WORKSPACE_TAG: &str = "cortexws";
-
-/// Where the workspace is mounted inside the guest.
-///
-/// A constant and not a caller's choice: a spec's mount paths are relative to the workspace's
-/// own root, so where that root lands is this backend's business. Fixing it is also what gives
-/// the guest agent a prefix to strip when it reports a `cwd`.
-pub const GUEST_WORKSPACE_ROOT: &str = "/workspace";
+pub const WORKFS_TAG: &str = "cortexws";

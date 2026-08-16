@@ -4,17 +4,13 @@ members = [
     "cortex",
     "cortex-execs/mem",
     "cortex-local-console",
+    "cortex-uvm-console",
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
 # bare `cargo build` — for a target that has no host to run on.
 #
-# `cortex-uvm-console` is out of the workspace mid-redesign, not because of how it is built. It
-# served a `Posix<WorkFs>` into the guest as a **custom virtio-fs backend** and shipped the tree
-# as a serialized spec; `cortex::fs` has neither now — a guest gets one of these trees the way
-# anything else does, mounted on the host and passed in as a directory. It comes back once its
-# boot path is that. Its source stays in the tree meanwhile.
-exclude = ["cortex-uvm-guest", "cortex-uvm-console"]
+exclude = ["cortex-uvm-guest"]
 
 [workspace.package]
 version = "0.1.0"
