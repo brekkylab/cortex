@@ -274,6 +274,12 @@ pub struct Console {
     /// the tree, because that is the form that means the same thing through the mount above
     /// — usually the very same directory, and nothing requires the two ends to have it at
     /// one path.
+    ///
+    /// Where the session *stands* is not here and is not kept anywhere on this side: the
+    /// current directory is the far end's state machine, `init` says where it starts and
+    /// [`ExecResult::cwd`] says when an execution moved it, so a copy here would be a
+    /// second answer to a question that already has one — wrong from the first `cd`
+    /// somebody else's execution ran.
     server_path: Option<PathBuf>,
 }
 
@@ -636,6 +642,9 @@ async fn answer(execs: &ExecutableSet, mount: Option<&dyn Mount>, exec: Exec) ->
         stdout: result.stdout,
         stderr: result.stderr,
         truncated: false,
+        // A name that ran out here did not move the session, and where that session stands
+        // is not something this end knows in the first place.
+        cwd: None,
     };
     match bson::serialize_to_bson(&result) {
         Ok(value) => Outcome::Result(value),
@@ -758,6 +767,7 @@ mod tests {
                 workfs: Some(WorkFsMount {
                     path: path.to_str().expect("a test path is UTF-8").to_string(),
                 }),
+                ..InitResult::default()
             })
             .unwrap(),
         )

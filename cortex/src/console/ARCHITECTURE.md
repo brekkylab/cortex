@@ -142,7 +142,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{delegated, workfs?}` | `{workfs?}` |
+| `init` | `{delegated, workfs?}` | `{workfs?, cwd?}` |
 | `exec` | `{cmd, timeout_ms?, cwd?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -181,13 +181,15 @@ A boot that fails is reported to whoever asked for the call that needed it, as `
 
 ```json
 {"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":["fetch","ask"],"workfs":{"url":"file:///srv/project"}}}
-{"jsonrpc":"2.0","id":0,"result":{"workfs":{"path":"/mnt/workfs"}}}
+{"jsonrpc":"2.0","id":0,"result":{"workfs":{"path":"/mnt/workfs"},"cwd":"/mnt/workfs"}}
 ```
 
 Two things a session is: **what can be run**, and **what can be reached**.
 Both outlive any one execution, which is why they are here and not on an `exec` — each has to be in place before the first command that uses it, so each is said once instead of on every command.
 
-It is also the only method whose answer carries something, and the workfs is why: a client that has not been told where the tree is cannot name a file in it.
+A third thing a session *has* is where it stands, and that is the server's to keep rather than the client's to say — so it is not in the request at all, and the answer is the first reading of it.
+
+It is also the only method whose answer carries anything, and both members are why: a client that has not been told where the tree is cannot name a file in it, and one that has not been told where the session stands cannot say where a command would look.
 
 #### `delegated` — what can be run
 
@@ -290,10 +292,11 @@ Minimal form — no timeout of its own:
 |---|---|
 | `cmd` | an **array** is a command, already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`. An **object** is not a command at all but the answer to a delegated call — see below. |
 | `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. |
-| `cwd` | where the command was invoked, as a path **in the server's filesystem** — `"/mnt/workfs/work/sub"`. Reported, never instructed: a caller's own `exec` leaves it out, and it appears on a `delegated` because that is the end that knows. See below. |
+| `cwd` | on a `delegated`: where the command was invoked, as a path **in the server's filesystem** — `"/mnt/workfs/work/sub"`. Reported, never instructed, and a caller's own `exec` leaves it out — there is nothing it could usefully say. See below. |
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
 | `stdout`/`stderr` | `Binary`, byte-exact, kept apart. |
 | `truncated` | the command wrote more than the executor would hold, and this is the beginning of it. |
+| `cwd` on a `done` | where the session stands **now**, if this execution moved it. Absent is unmoved. See [Where the session stands](#where-the-session-stands). |
 
 The `result` is not the execution's output but **how far it got**: `done` is the whole of it, `delegated` is the execution pausing on something only the client can run.
 A client with nothing delegated never sees the second.
@@ -313,7 +316,7 @@ It is **the executor's own path**, under the [`path`](#workfs--what-can-be-reach
 
 **Reported, never instructed.**
 A shim fills it in because it knows where it stood, and the client reads it off the `delegated`.
-A client's own `exec` leaves it out — where a command runs is decided by the tree, and a caller-chosen directory would be a second thing deciding it.
+A client's own `exec` leaves it out and has nothing it could usefully put there: where a command runs is [where the session stands](#where-the-session-stands), which the server keeps.
 
 It is absent rather than guessed when nothing reported one, or when the directory's name has no string form — a path inside a passthrough store may legitimately not be UTF-8.
 Substituting the root would name a different file and say nothing about having done so, which is the failure this field exists to prevent.
@@ -326,7 +329,36 @@ Resolving it regardless is how one name comes to mean two files: the command tha
 So a `..` that pops a component of `cwd` is resolved — the command *stood* there, so it existed — and one that pops a name the argument itself introduced is refused.
 The two ends still disagree about the second case, by refusing rather than by answering, which is the difference between a caller that finds out and one that reads the wrong file.
 
-Like `timeout_ms` it belongs to a command and means nothing on an answer, and like `timeout_ms` nothing enforces that.
+Like `timeout_ms` it belongs to a `cmd` that is an argv and means nothing on one carrying a delegated call's outcome, and like `timeout_ms` nothing enforces that.
+It is a different field from the `cwd` on a `done`, which is not about a command at all — see below.
+
+#### Where the session stands
+
+A session has a current directory, and **the far end is what keeps it**.
+
+```json
+{"jsonrpc":"2.0","id":0,"result":{"workfs":{"path":"/mnt/workfs"},"cwd":"/mnt/workfs"}}
+{"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","cd work"]}}
+{"jsonrpc":"2.0","id":2,"result":{"done":{"code":0,"cwd":"/mnt/workfs/work","stdout":…,"stderr":…,"truncated":false}}}
+{"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":["ls"]}}
+```
+
+The `ls` lists `/mnt/workfs/work`, and nothing in its frame said so.
+`init` answered where the session started, the `cd` moved it and its `done` said where to, and the next command inherited that — which is the whole of the mechanism: **a server is a state machine, and these two members are the only readings of it a client gets.**
+
+`cwd` on a `done` is **absent when the execution did not move anything**, which is nearly every execution.
+Present, it is the executor's own path, and it is the state *after* the command rather than a directory the command used.
+
+**A command's effect on it is the server's to work out, not the protocol's to define.**
+`cd` in a child process dies with that process, so a backend that spawns each command and reads nothing back has nothing to report and says nothing — which is a legal server and simply one whose sessions never move.
+A backend that keeps a shell, or interprets `cd` itself, reports what it did.
+
+**Why the request carries no directory.**
+A per-`exec` `cwd` would be a second answer to a question that already has one, and the two would disagree the moment a command ran `cd`: the client would be instructing where to run while the server was tracking where it *is*.
+One of them has to be authoritative, and it can only be the end that watches the commands.
+
+What that costs is that a client cannot run one command somewhere else without moving the session to get there — `sh -c 'cd elsewhere && …'`, and back again if it cares.
+That is the trade, and it is worth taking: a shell has the same one, and an agent driving this reads its own transcript the way a person reads a terminal.
 
 ### `exec` with an object `cmd` — the delegated call ended like this
 
@@ -386,6 +418,7 @@ Asking would therefore re-encode base64 at exactly the point the byte type was t
 ```
 
 The path is one in the executor's own filesystem, built by joining onto what `init` answered with, so it names the file a command would open by the same name.
+A relative one lands [where the session stands](#where-the-session-stands), which is the same rule a command's relative path follows — and the reason to send an absolute one anyway is that the session moves and a client that built the path is the end that knows what it meant.
 
 | field | |
 |---|---|
@@ -429,6 +462,8 @@ Those are memory, descriptors and disk held on the far end for as long as the se
 
 Afterwards the session is where it was before it booted, and **the next call that needs a boot gets one** — under the same `init`, with nothing having to ask, and with the tree back at the path that `init` answered with.
 So a client that sent a `stop` keeps every path it had built; what changed is only whether anything answers at them in the meantime.
+
+[Where the session stands](#where-the-session-stands) survives it too. A current directory is a `PathBuf`, not occupancy — there is nothing to hand back by forgetting it — and a client that ran a `cd`, went idle and came back would otherwise find itself somewhere it never asked to be.
 So a server process outlives the resources it booted, which is what makes handing them back cheap: it costs one cold start later and nothing else.
 
 `Console::stop` is therefore not the end of anything and not owed; dropping the `Console` is what sends `quit`, and a server on its way out releases what a `stop` would have released.
@@ -637,6 +672,8 @@ stateDiagram-v2
 `Idle` is therefore not a session that cannot work — it is a session that is not occupying anything, and the two edges a client controls by hand are there to keep it in that state while it is idle and out of it before it is busy.
 A boot that fails leaves `Idle`, so nothing thinks it is up, and the call that needed one hears `BOOT_FAILED`.
 
+What a session carries across all of this is small and worth naming: the delegated names and the tree from `init`, and **where it stands** — which the states above do not show because it is not one. It is seeded by `init`'s answer, moved by an execution that says so, and untouched by `start` and `stop`.
+
 `init` is not an edge at all. It is legal in either state, it boots and mounts nothing, and what it changes is the shape a future boot will take — its names and its tree — which is why it drops back to `Idle` when it arrives in `Up`.
 The path it answers with is a fact about every state after it: in `Idle` nothing is mounted there, in `Up` something is, and it is the same path throughout.
 
@@ -673,5 +710,6 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | cancel one execution | `stop` hands back the whole session's resources, not a command, and nothing answers it. Let the timeout expire. |
 | output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. A *file* larger than that is readable, because `read` is bounded on purpose and `size` says where to ask next. |
 | run two delegated calls at once | a response carries one `delegated`. Needs delegated calls to stop being independent before it is worth a shape that carries several — see [Consequences](#consequences). |
+| run one command somewhere else | there is no `cwd` on a request, because the session's own is the only authority on where a command runs — see [Where the session stands](#where-the-session-stands). `sh -c 'cd there && …'` is how, and moving back is the caller's. |
 | put two trees in one session | `workfs` is one URL and one path. A session that needs several trees gets them the way a session gets one tree of many stores: composed behind a single URL, where the composing is [`fs`](../fs/ARCHITECTURE.md)'s and not this protocol's. |
 | delegate a name that touches files the client cannot open | a delegated executable is handed a path and opens it, so the two ends have to share a filesystem for that much. Commands, `read` and `write` do not care — they run on the far end — so this bounds delegation and not the session. |

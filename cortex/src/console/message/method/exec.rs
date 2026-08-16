@@ -53,10 +53,16 @@ pub struct Exec {
     /// a spelling that had to be rewritten on the way past would be a second thing for the
     /// two ends to disagree about.
     ///
-    /// **Reported, never instructed.** A shim fills it because it knows where it stood, and
-    /// a client reads it off a [`Delegated`](Progress::Delegated). A client's own
-    /// [`New`](ExecCmd::New) leaves it `None`, because a caller-chosen directory would be a
-    /// second way to decide where a command runs beside the tree that already decides it.
+    /// **Reported, never instructed**, and on a [`Delegated`](Progress::Delegated) alone.
+    /// A shim fills it because it knows where it stood, and a client reads it off the
+    /// `Delegated` to resolve the executable's arguments — which is the whole of what the
+    /// field is for, and why it is on this type rather than only on a result.
+    ///
+    /// A client's own [`New`](ExecCmd::New) leaves it `None` and there is nothing it could
+    /// usefully put there. Where a command runs is the *session's* current directory, which
+    /// the server keeps and an execution moves ([`InitResult::cwd`](super::InitResult::cwd),
+    /// [`ExecResult::cwd`]); a directory named on the request would be a second thing
+    /// deciding it, and the two would disagree the moment a command ran `cd`.
     ///
     /// `None` when nothing reported one, or when the directory's name has no `String` form
     /// — a path inside a passthrough store may legitimately not be UTF-8. It is never
@@ -255,6 +261,29 @@ pub struct ExecResult {
     /// short one.
     #[serde(default)]
     pub truncated: bool,
+
+    /// Where the session stands now, if the execution moved it. Absent is unmoved.
+    ///
+    /// A session has a current directory and the server keeps it — see
+    /// [`InitResult::cwd`](super::InitResult::cwd), which is where it starts. `cd foo` is
+    /// therefore not a command whose effect dies with it: the far end is a state machine,
+    /// the next execution runs where this one left off, and this field is the only thing
+    /// that tells the near end so.
+    ///
+    /// The path is the executor's own, absolute, like every other path here.
+    ///
+    /// Absent rather than always-present, because "unmoved" is the ordinary case and a
+    /// field repeated on every result is one a reader stops looking at. A client that
+    /// wants to know where it stands and has never been told simply has not been told;
+    /// nothing here is guessed from the command.
+    ///
+    /// It means nothing on the result of a *delegated* call, which is an
+    /// [`ExecResult`] travelling the other way in an
+    /// [`ExecCmd::Resume`](ExecCmd::Resume): a name that ran in the client did not move
+    /// the far end's session, and a client that fills this in is telling the server
+    /// something only the server could know. Left absent, as `truncated` is left false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// How far an execution got: finished, or waiting for the client. The `result` of
@@ -486,6 +515,34 @@ mod tests {
         assert_eq!(
             bson::serialize_to_document(&exec).unwrap(),
             doc! {"cmd": ["ls"]}
+        );
+    }
+
+    /// Where an execution left the session — the other half of the far end keeping one, and
+    /// on the result rather than on the request because only that end knows. Absent is
+    /// unmoved, and absent from the frame rather than null.
+    #[test]
+    fn a_result_says_where_the_session_stands_only_when_it_moved() {
+        let unmoved = ExecResult {
+            code: 0,
+            ..ExecResult::default()
+        };
+        let doc = bson::serialize_to_document(&unmoved).unwrap();
+        assert!(!doc.contains_key("cwd"), "{doc:?}");
+        assert_eq!(
+            bson::deserialize_from_document::<ExecResult>(doc).unwrap(),
+            unmoved
+        );
+
+        let moved = ExecResult {
+            cwd: Some("/mnt/workfs/work".into()),
+            ..unmoved
+        };
+        let doc = bson::serialize_to_document(&moved).unwrap();
+        assert_eq!(doc.get_str("cwd").unwrap(), "/mnt/workfs/work");
+        assert_eq!(
+            bson::deserialize_from_document::<ExecResult>(doc).unwrap(),
+            moved
         );
     }
 

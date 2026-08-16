@@ -93,6 +93,21 @@ pub struct InitResult {
     /// session rather than an empty one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workfs: Option<WorkFsMount>,
+
+    /// Where the session stands to begin with — conventionally the
+    /// [`workfs`](Self::workfs) mount point, and never required to be.
+    ///
+    /// **A session has a current directory, and the server is what keeps it.** That is why
+    /// an [`Exec`](super::Exec) asking for a command says nothing about where to run it:
+    /// there is one answer at any moment, the far end holds it, and an execution that moves
+    /// it says so in its [`ExecResult::cwd`](super::ExecResult::cwd). This is where that
+    /// state starts, and the only reading of it a client gets before running anything.
+    ///
+    /// Absent is a server that will not say. A client is then no worse off than it was
+    /// before the field existed — every path it sends is one it built itself, and it simply
+    /// cannot show where a relative one would land.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Where a workfs is, in the server's filesystem.
@@ -172,24 +187,39 @@ mod tests {
         );
         assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
 
+        // The answer is where the tree went and where the session stands in it — the second
+        // conventionally the first, which is what the two members being apart allows to not
+        // be the case.
         let answered = InitResult {
             workfs: Some(WorkFsMount {
                 path: "/mnt/workfs".into(),
             }),
+            cwd: Some("/mnt/workfs/work".into()),
         };
+        let doc = bson::serialize_to_document(&answered).unwrap();
         assert_eq!(
-            bson::serialize_to_document(&answered).unwrap(),
-            doc! {"workfs": {"path": "/mnt/workfs"}},
+            doc,
+            doc! {"workfs": {"path": "/mnt/workfs"}, "cwd": "/mnt/workfs/work"},
+        );
+        assert_eq!(
+            bson::deserialize_from_document::<InitResult>(doc).unwrap(),
+            answered,
         );
 
         // Unknown members are ignored here as everywhere else, so a server may report more
-        // about what it mounted than this reads.
+        // about what it mounted than this reads — and a server that will not say where the
+        // session stands is answered without that member rather than with a guess.
         assert_eq!(
             bson::deserialize_from_document::<InitResult>(
                 doc! {"workfs": {"path": "/mnt/workfs", "kind": "local"}}
             )
             .unwrap(),
-            answered,
+            InitResult {
+                workfs: Some(WorkFsMount {
+                    path: "/mnt/workfs".into(),
+                }),
+                cwd: None,
+            },
         );
     }
 }

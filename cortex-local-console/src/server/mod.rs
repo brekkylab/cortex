@@ -633,6 +633,10 @@ fn finished(output: io::Result<Output>) -> Outcome {
         stdout: out.stdout,
         stderr: out.stderr,
         truncated: false,
+        // Nowhere to have moved from: this backend spawns each command in the directory it
+        // inherited and keeps no session directory of its own — see [`Booted::cwd`]. A
+        // command that ran `cd` moved its own process and nothing that outlives it.
+        cwd: None,
     }))
 }
 

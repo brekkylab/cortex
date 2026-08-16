@@ -367,6 +367,9 @@ mod tests {
                         stdout: vec![0, 1, 2, 255, b'\n'],
                         stderr: vec![],
                         truncated: false,
+                        // The command moved the session, which is a whole session's worth of
+                        // frames only if something survives the round trip.
+                        cwd: Some("/mnt/workfs/work".into()),
                     }))
                     .unwrap(),
                 ),
