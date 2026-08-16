@@ -9,8 +9,8 @@ Two things make it more than a remote `exec`:
    The semantics are the spec's and read as it; the bytes are not, so a peer needs a BSON codec. See [Codec](#codec) for what that trade bought.
 2. Execution runs both ways.
    A tool that only the client knows how to run ends up runnable inside a sandbox — the server asks for it by *answering*, and the client runs it.
-3. The session declares a **volume**, and the server says where it put it.
-   The client names a tree by URL, the server answers with a path in its own filesystem, and every path in the protocol after that is spelled under that one — so a file name means the same thing to a command, to a `read`, and to a delegated executable. See [`volumes`](#volumes--what-can-be-reached).
+3. The session declares a **workfs**, and the server says where it put it.
+   The client names a tree by URL, the server answers with a path in its own filesystem, and every path in the protocol after that is spelled under that one — so a file name means the same thing to a command, to a `read`, and to a delegated executable. See [`workfs`](#workfs--what-can-be-reached).
 
 **Each end of the channel does one job.** The client only asks; the server only answers.
 Execution running both ways does *not* mean requests going both ways: a server that needs a delegated executable run says so in a `result`, on the request the client is already waiting on — see [Delegation](#delegation-and-execution-both-ways) for what that buys and what it costs.
@@ -142,7 +142,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{delegated, volumes?}` | `{volumes?}` |
+| `init` | `{delegated, workfs?}` | `{workfs?}` |
 | `exec` | `{cmd, timeout_ms?, cwd?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -180,14 +180,14 @@ A boot that fails is reported to whoever asked for the call that needed it, as `
 ### `init` — this is the session
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":["fetch","ask"],"volumes":{"url":"file:///srv/project"}}}
-{"jsonrpc":"2.0","id":0,"result":{"volumes":{"path":"/mnt/workfs"}}}
+{"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":["fetch","ask"],"workfs":{"url":"file:///srv/project"}}}
+{"jsonrpc":"2.0","id":0,"result":{"workfs":{"path":"/mnt/workfs"}}}
 ```
 
 Two things a session is: **what can be run**, and **what can be reached**.
 Both outlive any one execution, which is why they are here and not on an `exec` — each has to be in place before the first command that uses it, so each is said once instead of on every command.
 
-It is also the only method whose answer carries something, and the volume is why: a client that has not been told where the tree is cannot name a file in it.
+It is also the only method whose answer carries something, and the workfs is why: a client that has not been told where the tree is cannot name a file in it.
 
 #### `delegated` — what can be run
 
@@ -205,9 +205,11 @@ A client with nothing to delegate is still a client:
 {"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":[]}}
 ```
 
-#### `volumes` — what can be reached, and where it ends up
+#### `workfs` — what can be reached, and where it ends up
 
 One tree, named by URL going out and by a path coming back.
+
+The name is [`fs`](../fs/ARCHITECTURE.md)'s — a *workfs* is a workspace, as against a rootfs — and it is the same thing meant on both sides of this exchange, which is why the protocol borrows the word rather than inventing one for the wire.
 
 ```json
 → {"url":"file:///srv/project"}
@@ -230,7 +232,7 @@ That is why the two paths in this exchange are so often the same one — and why
 A URL and not a tagged object, because there is one thing this protocol does with it: hand it to whatever realizes that kind.
 A tagged object would grow the wire schema with every provider anyone adds; a string leaves the schema alone and leaves each kind's spelling to the kind — so a peer that has never heard of a scheme still parses the frame, and refuses it for the reason it actually has.
 
-That reason is [`UNSUPPORTED_VOLUME`](#errors), and unlike the failures below it is **`init`'s own**.
+That reason is [`UNSUPPORTED_WORKFS`](#errors), and unlike the failures below it is **`init`'s own**.
 Which kinds a server can realize is a fact about the build, knowable the moment the frame is read — and answering a path for a tree that can never be there would make every later path in the session a lie.
 
 A URL is a name, so a kind that has to be authorized rather than opened will need a member beside it to carry that; `file://` needs none, which is why there is none yet.
@@ -256,10 +258,10 @@ What the kinds are and how one tree is assembled from several stores is [`fs/ARC
 A notification could say none of that, which is the whole reason this one method is answered.
 
 Which is also why the asking side sends it when a console is *constructed* rather than leaving it to a caller to remember: a `Console` that exists is one that got this answer back. See [Session](#session).
-A volume answered without a path is a server that took a tree and left the client no way to name a file in it, so that is a console that does not exist rather than one that guesses.
+A workfs answered without a path is a server that took a tree and left the client no way to name a file in it, so that is a console that does not exist rather than one that guesses.
 
 A second `init` replaces the first and takes whatever was booted under it with it.
-Both halves are built into what booting produced — the names as entries in a `bin/` directory, the volume as a mounted tree — so a session that changes either has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived. Its answer may name a different path, and that path is the session's from then on.
+Both halves are built into what booting produced — the names as entries in a `bin/` directory, the workfs as a mounted tree — so a session that changes either has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived. Its answer may name a different path, and that path is the session's from then on.
 
 ### `start` — boot now, to hide the cold start
 
@@ -307,7 +309,7 @@ So `fetch report.md` arrives as an argv and nothing else, and `report.md` names 
 ```
 
 `cwd` is what closes that.
-It is **the executor's own path**, under the [`path`](#volumes--what-can-be-reached) `init` answered with — the same terms as every other path here, and for the same reason: there is one tree, the server already said where it is, and a spelling that had to be rewritten on the way past would be a second thing for the two ends to disagree about.
+It is **the executor's own path**, under the [`path`](#workfs--what-can-be-reached) `init` answered with — the same terms as every other path here, and for the same reason: there is one tree, the server already said where it is, and a spelling that had to be rewritten on the way past would be a second thing for the two ends to disagree about.
 
 **Reported, never instructed.**
 A shim fills it in because it knows where it stood, and the client reads it off the `delegated`.
@@ -507,8 +509,8 @@ sequenceDiagram
         participant shim as fetch
     end
 
-    client->>server: id:0 init {delegated:["fetch"], volumes:{url:"file:///srv/project"}}
-    server-->>client: id:0 result {volumes:{path:"/mnt/workfs"}}
+    client->>server: id:0 init {delegated:["fetch"], workfs:{url:"file:///srv/project"}}
+    server-->>client: id:0 result {workfs:{path:"/mnt/workfs"}}
 
     client->>server: id:1 exec {cmd:["sh","-c","fetch x"]}
     Note over server: nothing is booted yet, so this boots it:<br/>`fetch` is symlinked into a bin/ dir
@@ -588,11 +590,11 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
 | `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
-| `-32008` | `init` | **unsupported volume** — a URL whose scheme this server has no provider for, named in the message. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and a path answered for a tree that can never be there would make every later path a lie. Distinct from `BOOT_FAILED` because the fix is different: the volume is well formed and the *build* is wrong for it — a different binary, or a different URL. |
-| `-32009` | `exec`, `read`, `write` | **mount failed** — the volume could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
+| `-32008` | `init` | **unsupported workfs** — a URL whose scheme this server has no provider for, named in the message. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and a path answered for a tree that can never be there would make every later path a lie. Distinct from `BOOT_FAILED` because the fix is different: the workfs is well formed and the *build* is wrong for it — a different binary, or a different URL. |
+| `-32009` | `exec`, `read`, `write` | **mount failed** — the workfs could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
 | `-32600` | any | invalid request — including an `exec` answering a delegated call when nothing is paused on one. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty argv `cmd`, or a `volumes` URL that is not one. Apart from `UNSUPPORTED_VOLUME` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. A delegated name that is not a plain path component *should* be this and is not checked; see [`init`](#init--this-is-the-session). |
+| `-32602` | any | invalid params — an empty argv `cmd`, or a `workfs` URL that is not one. Apart from `UNSUPPORTED_WORKFS` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. A delegated name that is not a plain path component *should* be this and is not checked; see [`init`](#init--this-is-the-session). |
 | `-32603` | any | internal error |
 
 `-32003` and `-32004` are unassigned and stay that way.
@@ -671,5 +673,5 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | cancel one execution | `stop` hands back the whole session's resources, not a command, and nothing answers it. Let the timeout expire. |
 | output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. A *file* larger than that is readable, because `read` is bounded on purpose and `size` says where to ask next. |
 | run two delegated calls at once | a response carries one `delegated`. Needs delegated calls to stop being independent before it is worth a shape that carries several — see [Consequences](#consequences). |
-| put two volumes in one session | `volumes` is one URL and one path. A session that needs several trees gets them the way a session gets one tree of many stores: composed behind a single URL, where the composing is [`fs`](../fs/ARCHITECTURE.md)'s and not this protocol's. |
+| put two trees in one session | `workfs` is one URL and one path. A session that needs several trees gets them the way a session gets one tree of many stores: composed behind a single URL, where the composing is [`fs`](../fs/ARCHITECTURE.md)'s and not this protocol's. |
 | delegate a name that touches files the client cannot open | a delegated executable is handed a path and opens it, so the two ends have to share a filesystem for that much. Commands, `read` and `write` do not care — they run on the far end — so this bounds delegation and not the session. |

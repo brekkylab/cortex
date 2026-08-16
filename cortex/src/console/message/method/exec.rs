@@ -42,7 +42,7 @@ pub struct Exec {
     pub timeout_ms: Option<u64>,
 
     /// Where the command was invoked — a path **in the server's filesystem**, under the
-    /// [`path`](super::VolumeMount::path) `init` answered with.
+    /// [`path`](super::WorkFsMount::path) `init` answered with.
     ///
     /// It is what makes a delegated call's relative paths resolvable. The client runs the
     /// executable in a process of its own, so an argv alone would name a file relative to

@@ -50,7 +50,7 @@
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
-//! | `init` | [`Init`] | [`InitResult`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_VOLUME`](Error::UNSUPPORTED_VOLUME) |
+//! | `init` | [`Init`] | [`InitResult`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) |
 //! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `read` | [`Read`] | [`ReadResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `write` | [`Write`] | [`WriteResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |

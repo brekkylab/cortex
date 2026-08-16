@@ -342,7 +342,7 @@ mod tests {
         }
     }
 
-    /// A session taken as it was described, with nothing said about a volume — which is
+    /// A session taken as it was described, with nothing said about a workfs — which is
     /// what an `init` that named none is answered with.
     fn initialized(id: RequestId) -> Message {
         Message::Response {

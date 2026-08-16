@@ -95,7 +95,7 @@ pub enum Call {
     /// act on before it has asked for anything. A channel that answers this has a
     /// server on the far end that read the frame, speaks this protocol, and has taken
     /// what it was told; a notification could say none of that. The answer also carries
-    /// where the volume went, which is what every later path in the session is spelled
+    /// where the workfs went, which is what every later path in the session is spelled
     /// in — see [`InitResult`].
     ///
     /// It carries no booting, and no mounting either. Bringing a backend up costs a kernel

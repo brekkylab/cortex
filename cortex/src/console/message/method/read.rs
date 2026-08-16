@@ -5,7 +5,7 @@ use super::bytes;
 /// Part of a file to hand back. The `params` of `read`.
 ///
 /// A path is one in the executor's own filesystem, under the
-/// [`path`](super::VolumeMount::path) `init` answered with — so the file this names is the
+/// [`path`](super::WorkFsMount::path) `init` answered with — so the file this names is the
 /// one a command would open by the same name, and reading it is how a requester sees what
 /// an execution left behind.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

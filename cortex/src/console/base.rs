@@ -141,14 +141,13 @@ pub trait Client: Send {
     /// Send something nothing answers, so there is nothing to wait for.
     fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>>;
 
-    /// Say what this session is: the names it may call back into, and the volume it works
-    /// in.
+    /// Say what this session is: the names it may call back into, and the tree it works in.
     ///
     /// Nothing is booted or mounted by it. What returning means is that there is a server
     /// on the far end, that it speaks this protocol, and that it has what it was told —
     /// which is the only thing about a session a client can hear before it asks for work.
     ///
-    /// What comes back is where that volume will be: an [`InitResult`], carrying the path
+    /// What comes back is where that tree will be: an [`InitResult`], carrying the path
     /// every later `read`, `write` and reported [`cwd`](Exec::cwd) is spelled in. Whether
     /// it is the path that was asked for is the server's to decide, which is why it is
     /// answered rather than assumed.

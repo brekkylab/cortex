@@ -103,7 +103,7 @@ impl Error {
     /// file is whatever it is, and a requester that needs to know asks with a `read`.
     pub const IO_FAILED: i64 = -32007;
 
-    /// `init`: a volume URL whose scheme this server has no provider for, named in the
+    /// `init`: a workfs URL whose scheme this server has no provider for, named in the
     /// message.
     ///
     /// `init`'s own, and not deferred to the call that needs a session, because it is
@@ -111,12 +111,12 @@ impl Error {
     /// about the *build*, and answering a path for a tree that can never be there would be
     /// a session in which every later path is a lie.
     ///
-    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the volume
+    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the workfs
     /// is well formed and the server is the wrong build for it — a different binary, or a
     /// different URL.
-    pub const UNSUPPORTED_VOLUME: i64 = -32008;
+    pub const UNSUPPORTED_WORKFS: i64 = -32008;
 
-    /// `exec`, `read`, `write`: the volume could not be put where `init` said it would be —
+    /// `exec`, `read`, `write`: the workfs could not be put where `init` said it would be —
     /// no mount binding compiled in, no FUSE provider installed, the mount point busy, the
     /// store itself unreachable.
     ///

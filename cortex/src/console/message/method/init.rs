@@ -27,13 +27,17 @@ pub struct Init {
     /// mounted, which is still a session — a command then sees whatever the executor's own
     /// filesystem holds and nothing this protocol described.
     ///
-    /// Answered by a [`VolumeMount`] saying where the server put it, which is what makes
+    /// Answered by a [`WorkFsMount`] saying where the server put it, which is what makes
     /// every later path in this protocol a path both ends can spell. See [`InitResult`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volumes: Option<Volume>,
+    pub workfs: Option<WorkFsSource>,
 }
 
-/// A store to put in front of a session, named by URL.
+/// The tree a session works in, named by URL.
+///
+/// A *workfs* is `fs`'s word for it — a workspace, as against a rootfs — and this is the
+/// protocol's way of naming one: not the tree itself, which is a thing in some process, but
+/// where to get it.
 ///
 /// # The scheme is the kind
 ///
@@ -43,8 +47,8 @@ pub struct Init {
 /// | `http://…`, `https://…` | a tree reached over HTTP — **on the wire, implemented nowhere** |
 ///
 /// A scheme this build has no provider for is refused at `init` with
-/// [`UNSUPPORTED_VOLUME`](crate::console::Error::UNSUPPORTED_VOLUME) naming it, which is what `http`
-/// and `https` get everywhere today.
+/// [`UNSUPPORTED_WORKFS`](crate::console::Error::UNSUPPORTED_WORKFS) naming it, which is
+/// what `http` and `https` get everywhere today.
 ///
 /// **A URL and not a tagged object**, because there is exactly one thing this protocol does
 /// with it: hand it to whatever realizes that kind. A tagged object would put every kind's
@@ -58,18 +62,18 @@ pub struct Init {
 /// A kind that has to be *reached* rather than opened needs more than a name for it — an
 /// HTTP tree needs whatever authorizes the request, and a secret does not belong in a URL
 /// that gets logged, quoted in an error and written into a config file. So the URL is a
-/// member rather than the whole of a volume, and what carries a credential is a member
+/// member rather than the whole of a workfs, and what carries a credential is a member
 /// beside it, added when there is a provider that reads one. `file://` needs none, which is
 /// why there is none here yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Volume {
+pub struct WorkFsSource {
     /// `file:///srv/project`, `https://example.com/share`.
     pub url: String,
 }
 
-impl Volume {
+impl WorkFsSource {
     pub fn new(url: impl Into<String>) -> Self {
-        Volume { url: url.into() }
+        WorkFsSource { url: url.into() }
     }
 }
 
@@ -78,20 +82,20 @@ impl Volume {
 /// Answered rather than left to a notification because this is the one thing about a
 /// session a client can hear before it asks for work — that there is a server on the far
 /// end, that it read the frame, that it speaks this protocol, and that it has taken what it
-/// was told. It is also *where*: a session with a volume has a path in it, and that path is
+/// was told. It is also *where*: a session with a workfs has a path in it, and that path is
 /// what every later `read`, `write` and reported [`cwd`](super::Exec::cwd) is spelled in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitResult {
-    /// Where the volume [`Init::volumes`] named went, or `None` when none was named.
+    /// Where the workfs [`Init::workfs`] named went, or `None` when none was named.
     ///
     /// A client that asked for one and is answered without this has been told nothing it
     /// can use: every path it would send afterwards would be a guess. That is a broken
     /// session rather than an empty one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volumes: Option<VolumeMount>,
+    pub workfs: Option<WorkFsMount>,
 }
 
-/// Where a volume is, in the server's filesystem.
+/// Where a workfs is, in the server's filesystem.
 ///
 /// # Why the server says the path instead of both ends agreeing on a namespace
 ///
@@ -117,7 +121,7 @@ pub struct InitResult {
 /// anyway: `read`, `write` and `exec` each boot a session first, and a delegated executable
 /// runs inside one.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VolumeMount {
+pub struct WorkFsMount {
     /// Absolute, and in the server's filesystem — `"/mnt/workfs"`.
     ///
     /// A relative one would be relative to a working directory nobody named, and the client
@@ -135,7 +139,7 @@ mod tests {
     /// the member is absent rather than null, which is what leaves room for it to mean
     /// exactly one thing when it is there.
     #[test]
-    fn a_session_with_no_volume_carries_no_volume() {
+    fn a_session_with_no_workfs_carries_no_workfs() {
         let init = Init {
             delegated: vec!["fetch".into()],
             ..Init::default()
@@ -153,36 +157,36 @@ mod tests {
         );
     }
 
-    /// The volume is the URL and the answer is the path, which is the whole of what the two
+    /// The workfs is the URL and the answer is the path, which is the whole of what the two
     /// ends have to agree on about files.
     #[test]
-    fn a_volume_is_a_url_and_the_answer_is_where_it_went() {
+    fn a_workfs_is_a_url_and_the_answer_is_where_it_went() {
         let init = Init {
             delegated: Vec::new(),
-            volumes: Some(Volume::new("file:///srv/project")),
+            workfs: Some(WorkFsSource::new("file:///srv/project")),
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
             doc,
-            doc! {"delegated": [], "volumes": {"url": "file:///srv/project"}},
+            doc! {"delegated": [], "workfs": {"url": "file:///srv/project"}},
         );
         assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
 
         let answered = InitResult {
-            volumes: Some(VolumeMount {
+            workfs: Some(WorkFsMount {
                 path: "/mnt/workfs".into(),
             }),
         };
         assert_eq!(
             bson::serialize_to_document(&answered).unwrap(),
-            doc! {"volumes": {"path": "/mnt/workfs"}},
+            doc! {"workfs": {"path": "/mnt/workfs"}},
         );
 
         // Unknown members are ignored here as everywhere else, so a server may report more
         // about what it mounted than this reads.
         assert_eq!(
             bson::deserialize_from_document::<InitResult>(
-                doc! {"volumes": {"path": "/mnt/workfs", "kind": "local"}}
+                doc! {"workfs": {"path": "/mnt/workfs", "kind": "local"}}
             )
             .unwrap(),
             answered,

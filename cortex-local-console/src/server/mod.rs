@@ -93,8 +93,8 @@
 //! A `read` or a `write` is not confined to anywhere either. The path is used as it
 //! arrives, so a client can name any file this process can reach.
 //!
-//! **No volume is realized.** An `init` that names one is refused with
-//! [`UNSUPPORTED_VOLUME`](Error::UNSUPPORTED_VOLUME), because answering it means saying
+//! **No workfs is realized.** An `init` that names one is refused with
+//! [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS), because answering it means saying
 //! where the tree is and this server puts one nowhere. What that takes is a `file://` URL
 //! turned into the directory an execution runs in and a file call resolves against — which
 //! is [`Booted::cwd`], the same piece of work its stub describes.
@@ -178,17 +178,17 @@ pub async fn run() -> anyhow::Result<()> {
             Message::Notification(Notification::Stop) => session.release(),
 
             Message::Request { id, call } => match call {
-                // A session is taken or it is not: a volume this server cannot put
+                // A session is taken or it is not: a workfs this server cannot put
                 // anywhere is refused here rather than answered with a path, since a path
                 // is what every later call the client makes would be spelled in.
                 Call::Init(init) => {
-                    let outcome = match &init.volumes {
-                        Some(volume) => refused(
-                            Error::UNSUPPORTED_VOLUME,
+                    let outcome = match &init.workfs {
+                        Some(workfs) => refused(
+                            Error::UNSUPPORTED_WORKFS,
                             format!(
-                                "{}: this server realizes no volumes yet, so it can put none \
-                                 anywhere",
-                                volume.url
+                                "{}: this server realizes no workfs at all yet, so it can put \
+                                 one nowhere",
+                                workfs.url
                             ),
                         ),
                         None => encoded(bson::serialize_to_bson(&InitResult::default())),

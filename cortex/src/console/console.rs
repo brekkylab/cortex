@@ -70,7 +70,7 @@ use crate::{
         base::{Client, Failure},
         message::{
             Call, Error, Exec, ExecCmd, ExecResult, Init, Notification, Outcome, Progress, Read,
-            ReadResult, RequestId, Volume, Write, WriteResult,
+            ReadResult, RequestId, WorkFsSource, Write, WriteResult,
         },
         stdio::StdioClient,
     },
@@ -170,7 +170,7 @@ impl ConsoleBuilder {
     }
 
     /// Where this console's tree is mounted, which is what its delegated executables are
-    /// handed — and what the session's volume is.
+    /// handed — and what the session's workfs is.
     ///
     /// One per console and fixed for the session, because it is what an execution's
     /// delegated calls are resolved *against*: a name that reads a file is asked about the
@@ -178,10 +178,10 @@ impl ConsoleBuilder {
     ///
     /// Mounting is the caller's, not the console's. Which binding puts a tree in front of a
     /// kernel is a build's business, and this is the whole of what the server is then told
-    /// about it: [`build`](Self::build) names this mount point as the session's volume —
+    /// about it: [`build`](Self::build) names this mount point as the session's workfs —
     /// `file://` and the path — and the server answers where *it* plugged that in. The two
     /// are usually the same path and nothing requires them to be, which is why the answer
-    /// is read rather than assumed; see [`VolumeMount`](crate::console::VolumeMount).
+    /// is read rather than assumed; see [`WorkFsMount`](crate::console::WorkFsMount).
     ///
     /// Takes the mount by value, so a console holds it and the mount lives at least as long
     /// as the session does — dropping a mount unmounts it (see [`Mount`]). A caller that
@@ -266,7 +266,7 @@ pub struct Console {
     mount: Option<Box<dyn Mount>>,
 
     /// Where the server put that same tree, as it answered at `init` — `None` alongside a
-    /// `mount` that is `None`, since there was no volume to put anywhere.
+    /// `mount` that is `None`, since there was no workfs to put anywhere.
     ///
     /// **The paths this protocol speaks are these.** A [`read`](Self::read) names a file
     /// under this, and a reported [`cwd`](Exec::cwd) is a directory under it. What a
@@ -291,9 +291,9 @@ impl Console {
     /// that exists is one the server has heard from and answered — which is the one thing
     /// about a session a caller can act on before asking for work.
     ///
-    /// The answer is not only an acknowledgement: it says where the server put the volume,
+    /// The answer is not only an acknowledgement: it says where the server put the workfs,
     /// and that path is what every later `read`, `write` and reported `cwd` is spelled in.
-    /// A server that takes a volume and says nothing about where it went has left this end
+    /// A server that takes a workfs and says nothing about where it went has left this end
     /// with no way to name a file, so that is a console that does not exist rather than one
     /// that guesses.
     ///
@@ -318,11 +318,11 @@ impl Console {
         // What the server is told about the tree is where this end has it. A mount point
         // with no URL to it is refused here rather than sent, by the rule the client factory
         // above follows: a console either exists or says what it lacked.
-        let volumes = match mount.as_deref() {
-            Some(mount) => Some(Volume::new(mount.url().with_context(|| {
+        let workfs = match mount.as_deref() {
+            Some(mount) => Some(WorkFsSource::new(mount.url().with_context(|| {
                 format!(
                     "a mount point that is not an absolute UTF-8 path cannot be named as a \
-                     volume: {:?}",
+                     workfs: {:?}",
                     mount.mountpoint()
                 )
             })?)),
@@ -332,14 +332,14 @@ impl Console {
         let answered = client
             .init(Init {
                 delegated: execs.names().map(str::to_string).collect(),
-                volumes,
+                workfs,
             })
             .await?;
 
-        let server_path = match (&mount, answered.volumes) {
+        let server_path = match (&mount, answered.workfs) {
             (Some(_), Some(at)) => Some(absolute(at.path)?),
             (Some(mount), None) => anyhow::bail!(
-                "the console server took the volume at {} and did not say where it put it",
+                "the console server took the workfs at {} and did not say where it put it",
                 mount.mountpoint().display()
             ),
             // Nothing was asked for, so a path that came back anyway is about a session
@@ -362,7 +362,7 @@ impl Console {
     /// onto this. It is the server's answer and not the mount point this end passed in: the
     /// two are usually the same directory, and which one the protocol speaks in is settled
     /// rather than assumed.
-    pub fn volume_path(&self) -> Option<&Path> {
+    pub fn workfs_path(&self) -> Option<&Path> {
         self.server_path.as_deref()
     }
 
@@ -499,7 +499,7 @@ impl Console {
 
     /// Read part of a file where commands run.
     ///
-    /// The path is the server's — under [`volume_path`](Self::volume_path), which is what a
+    /// The path is the server's — under [`workfs_path`](Self::workfs_path), which is what a
     /// caller joins onto — so this names the file a command would open by the same name, and
     /// is how a caller sees what an execution wrote to a file rather than to its output.
     ///
@@ -656,7 +656,7 @@ fn absolute(path: String) -> anyhow::Result<PathBuf> {
     let path = PathBuf::from(path);
     anyhow::ensure!(
         path.is_absolute(),
-        "the console server put the volume somewhere that is not an absolute path: {}",
+        "the console server put the workfs somewhere that is not an absolute path: {}",
         path.display()
     );
     Ok(path)
@@ -670,7 +670,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        console::message::{Call, InitResult, Method, Notification, VolumeMount},
+        console::message::{Call, InitResult, Method, Notification, WorkFsMount},
         executable::{ExecResult as ExecOutput, Executable},
     };
 
@@ -745,17 +745,17 @@ mod tests {
         )
     }
 
-    /// A session taken with nothing mounted, which is what a server answers a volume-less
+    /// A session taken with nothing mounted, which is what a server answers a workfs-less
     /// `init` with.
     fn initialized() -> Outcome {
         Outcome::Result(bson::serialize_to_bson(&InitResult::default()).unwrap())
     }
 
-    /// A session taken, with the volume put at `path`.
+    /// A session taken, with the workfs put at `path`.
     fn initialized_at(path: &Path) -> Outcome {
         Outcome::Result(
             bson::serialize_to_bson(&InitResult {
-                volumes: Some(VolumeMount {
+                workfs: Some(WorkFsMount {
                     path: path.to_str().expect("a test path is UTF-8").to_string(),
                 }),
             })
@@ -1037,7 +1037,7 @@ mod tests {
     /// in the tree, the argument resolved against that, then joined onto the mount point,
     /// and a real file at the end of it.
     ///
-    /// The server puts the volume somewhere of its own here, which is why the strip is
+    /// The server puts the workfs somewhere of its own here, which is why the strip is
     /// visible: `/srv/served` and the mount point are the same tree, and only the second is
     /// a directory this end can open.
     #[tokio::test]
@@ -1091,15 +1091,15 @@ mod tests {
             .await
             .unwrap();
 
-        // The volume is this end's mount point, and where it ended up is the server's answer.
+        // The workfs is this end's mount point, and where it ended up is the server's answer.
         let Call::Init(init) = log.call(0) else {
             panic!("{:?} is not an init", log.call(0));
         };
         assert_eq!(
-            init.volumes,
-            Some(Volume::new(format!("file://{}", mnt.display())))
+            init.workfs,
+            Some(WorkFsSource::new(format!("file://{}", mnt.display())))
         );
-        assert_eq!(console.volume_path(), Some(Path::new("/srv/served")));
+        assert_eq!(console.workfs_path(), Some(Path::new("/srv/served")));
 
         console
             .exec(["sh", "-c", "cat note.txt"], None)
@@ -1215,11 +1215,11 @@ mod tests {
         }
     }
 
-    /// A session with a volume needs somewhere to have put it: a path is what every later
+    /// A session with a workfs needs somewhere to have put it: a path is what every later
     /// call is spelled in, so a server that answers without one has left this end with
     /// nothing it could name, and that is not a console.
     #[tokio::test]
-    async fn a_volume_the_server_did_not_place_is_not_a_session() {
+    async fn a_workfs_the_server_did_not_place_is_not_a_session() {
         let (client, _) = recorder(vec![initialized()]);
         let Err(e) = Console::builder()
             .client(client)
@@ -1227,7 +1227,7 @@ mod tests {
             .build()
             .await
         else {
-            panic!("a console whose volume went nowhere should not build");
+            panic!("a console whose workfs went nowhere should not build");
         };
         assert!(e.to_string().contains("did not say where"), "{e}");
 
@@ -1239,7 +1239,7 @@ mod tests {
             .build()
             .await
         else {
-            panic!("a console whose volume went to a relative path should not build");
+            panic!("a console whose workfs went to a relative path should not build");
         };
         assert!(e.to_string().contains("not an absolute path"), "{e}");
     }
