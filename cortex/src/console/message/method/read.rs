@@ -4,12 +4,14 @@ use super::bytes;
 
 /// Part of a file to hand back. The `params` of `read`.
 ///
-/// A path is where the executor says it is, resolved the way a relative path in
-/// [`cmd`](super::Exec::cmd) is — so the file this names is the one a command would open
-/// by the same name, and reading it is how a requester sees what an execution left
-/// behind.
+/// A path is one in the executor's own filesystem, under the
+/// [`path`](super::VolumeMount::path) `init` answered with — so the file this names is the
+/// one a command would open by the same name, and reading it is how a requester sees what
+/// an execution left behind.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Read {
+    /// UTF-8, and the executor's own: a requester builds it by joining onto the path the
+    /// session was answered with, which is the one both ends have a name for.
     pub path: String,
 
     /// Where in the file to start. `None` is the beginning.

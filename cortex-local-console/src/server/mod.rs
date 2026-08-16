@@ -93,6 +93,12 @@
 //! A `read` or a `write` is not confined to anywhere either. The path is used as it
 //! arrives, so a client can name any file this process can reach.
 //!
+//! **No volume is realized.** An `init` that names one is refused with
+//! [`UNSUPPORTED_VOLUME`](Error::UNSUPPORTED_VOLUME), because answering it means saying
+//! where the tree is and this server puts one nowhere. What that takes is a `file://` URL
+//! turned into the directory an execution runs in and a file call resolves against — which
+//! is [`Booted::cwd`], the same piece of work its stub describes.
+//!
 //! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
 //! the `default_timeout_ms` to fall back on, and this server reads both and
 //! applies neither — so a command that never ends is a command this server waits on
@@ -111,8 +117,8 @@ use std::process::{ExitStatus, Output, Stdio};
 use bson::Bson;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, Exec, ExecCmd, ExecResult, Init, MAX_PAYLOAD, Message, Notification, Outcome,
-    Progress, Read, ReadResult, RequestId, Server, Write, WriteResult,
+    Call, Error, Exec, ExecCmd, ExecResult, Init, InitResult, MAX_PAYLOAD, Message, Notification,
+    Outcome, Progress, Read, ReadResult, RequestId, Server, Write, WriteResult,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
@@ -172,9 +178,25 @@ pub async fn run() -> anyhow::Result<()> {
             Message::Notification(Notification::Stop) => session.release(),
 
             Message::Request { id, call } => match call {
+                // A session is taken or it is not: a volume this server cannot put
+                // anywhere is refused here rather than answered with a path, since a path
+                // is what every later call the client makes would be spelled in.
                 Call::Init(init) => {
-                    session.configure(init);
-                    server.respond(id, Outcome::Result(Bson::Null)).await?;
+                    let outcome = match &init.volumes {
+                        Some(volume) => refused(
+                            Error::UNSUPPORTED_VOLUME,
+                            format!(
+                                "{}: this server realizes no volumes yet, so it can put none \
+                                 anywhere",
+                                volume.url
+                            ),
+                        ),
+                        None => encoded(bson::serialize_to_bson(&InitResult::default())),
+                    };
+                    if outcome.error().is_none() {
+                        session.configure(init);
+                    }
+                    server.respond(id, outcome).await?;
                 }
 
                 // An `exec` whose `cmd` is an answer rather than a command is read

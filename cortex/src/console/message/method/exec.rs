@@ -41,28 +41,27 @@ pub struct Exec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
 
-    /// Where the command was invoked, **relative to the workspace root** — `"work/sub"`,
-    /// or `""` for the root itself.
+    /// Where the command was invoked — a path **in the server's filesystem**, under the
+    /// [`path`](super::VolumeMount::path) `init` answered with.
     ///
     /// It is what makes a delegated call's relative paths resolvable. The client runs the
-    /// executable in a process of its own, against its own tree built from the same
-    /// namespace, so an argv alone would name a file relative to nothing.
+    /// executable in a process of its own, so an argv alone would name a file relative to
+    /// nothing.
     ///
-    /// Workspace-relative and not the executor's own path, because the two ends share a
-    /// namespace and not a filesystem: a server strips whatever prefix it mounted the tree
-    /// at before answering.
+    /// The server's own path and not a name in some namespace both ends agree on, for the
+    /// reason every other path here is: there is one tree, the server said where it is, and
+    /// a spelling that had to be rewritten on the way past would be a second thing for the
+    /// two ends to disagree about.
     ///
-    /// **Reported, never instructed.** A shim fills it because it knows where it stood; a
-    /// server rewrites it; a client reads it off a [`Delegated`](Progress::Delegated). A
-    /// client's own [`New`](ExecCmd::New) leaves it `None`, because a caller-chosen
-    /// directory would be a second way to decide where a command runs beside the mount
-    /// point that already decides it.
+    /// **Reported, never instructed.** A shim fills it because it knows where it stood, and
+    /// a client reads it off a [`Delegated`](Progress::Delegated). A client's own
+    /// [`New`](ExecCmd::New) leaves it `None`, because a caller-chosen directory would be a
+    /// second way to decide where a command runs beside the tree that already decides it.
     ///
-    /// `None` when there is no workspace, when the command stood outside it, or when the
-    /// directory's name has no `String` form — a path inside a passthrough volume may
-    /// legitimately not be UTF-8. It is never *guessed*: substituting the root would name
-    /// a different file and say nothing about having done so, which is the failure this
-    /// field exists to prevent.
+    /// `None` when nothing reported one, or when the directory's name has no `String` form
+    /// — a path inside a passthrough store may legitimately not be UTF-8. It is never
+    /// *guessed*: substituting the root would name a different file and say nothing about
+    /// having done so, which is the failure this field exists to prevent.
     ///
     /// Like [`timeout_ms`](Self::timeout_ms) it belongs to a `New` and means nothing on a
     /// [`Resume`](ExecCmd::Resume) — and, like it, nothing enforces that. Putting it inside
@@ -462,7 +461,7 @@ mod tests {
         let exec = Exec {
             cmd: ExecCmd::New(vec!["ls".into()]),
             timeout_ms: Some(5_000),
-            cwd: Some("work/sub".into()),
+            cwd: Some("/mnt/workfs/work/sub".into()),
         };
         let doc = bson::serialize_to_document(&exec).expect("serializes");
         assert!(
@@ -475,7 +474,7 @@ mod tests {
             matches!(back.cmd, ExecCmd::New(_)),
             "still reads back as New"
         );
-        assert_eq!(back.cwd.as_deref(), Some("work/sub"));
+        assert_eq!(back.cwd.as_deref(), Some("/mnt/workfs/work/sub"));
     }
 
     #[test]

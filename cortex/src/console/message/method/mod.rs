@@ -88,22 +88,24 @@ impl fmt::Display for Method {
 /// asks for it while remaining the answering end.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Call {
-    /// This is the session: the names it may call back into, and
-    /// how long an execution may run.
+    /// This is the session: the names it may call back into, and the tree it works in.
     ///
     /// The one exchange that is about the session rather than about work, and the one
     /// thing worth answering about it — because the answer is something a client can
     /// act on before it has asked for anything. A channel that answers this has a
     /// server on the far end that read the frame, speaks this protocol, and has taken
-    /// what it was told; a notification could say none of that.
+    /// what it was told; a notification could say none of that. The answer also carries
+    /// where the volume went, which is what every later path in the session is spelled
+    /// in — see [`InitResult`].
     ///
-    /// It carries no booting. Bringing a backend up costs a kernel on one and nothing
-    /// at all on another, and a session's shape is the same either way, so *when* to pay
-    /// for it is [`Start`](super::Notification::Start)'s and not this method's.
+    /// It carries no booting, and no mounting either. Bringing a backend up costs a kernel
+    /// on one and nothing at all on another, and a session's shape is the same either way,
+    /// so *when* to pay for it is [`Start`](super::Notification::Start)'s and not this
+    /// method's. The tree is put where this said it would be at the same moment.
     ///
     /// A second one replaces the first, and takes whatever was booted under it with it:
-    /// the delegated names are built into what booting produced, so a session that
-    /// changes them has a boot that no longer matches it.
+    /// the delegated names and the tree are both built into what booting produced, so a
+    /// session that changes either has a boot that no longer matches it.
     Init(Init),
 
     /// Run this command.

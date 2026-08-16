@@ -305,6 +305,7 @@ mod tests {
                 id: 0,
                 call: Call::Init(Init {
                     delegated: vec!["bar".into(), "foo".into()],
+                    ..Init::default()
                 }),
             },
             Message::Response {
@@ -607,6 +608,7 @@ mod tests {
                 id: 0,
                 call: Call::Init(Init {
                     delegated: vec!["fetch".into()],
+                    ..Init::default()
                 }),
             }),
             doc! {

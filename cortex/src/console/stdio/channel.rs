@@ -199,6 +199,7 @@ mod tests {
                 id: 0,
                 call: Call::Init(Init {
                     delegated: vec!["foo".into()],
+                    ..Init::default()
                 }),
             },
             Message::Response {

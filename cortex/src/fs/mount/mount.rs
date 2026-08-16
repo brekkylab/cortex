@@ -44,6 +44,27 @@ pub trait Mount: Send + Sync {
     /// Where this is mounted — the directory a kernel now answers for.
     fn mountpoint(&self) -> &Path;
 
+    /// This mount, named as a URL — `file:///srv/project`.
+    ///
+    /// The spelling of a mount point that travels. A path is a fact about this host, where a
+    /// URL is a name for a *tree* and says which kind of thing it is by its scheme — so
+    /// anything being told about this mount from outside the process is told this, and a
+    /// tree that is not a directory on this host can be named alongside one that is.
+    ///
+    /// The path goes in as it stands and is not percent-encoded: a reader would have to
+    /// decode it before it was a path again, which is a second thing to get right about one
+    /// directory.
+    ///
+    /// `None` when the mount point is not an absolute UTF-8 path. Both halves of that are
+    /// what a URL cannot do without rather than a restriction added here — a relative path
+    /// after `file://` reads as a host, and a lossy name is a directory that looks valid and
+    /// is not this one.
+    fn url(&self) -> Option<String> {
+        let mountpoint = self.mountpoint();
+        let path = mountpoint.to_str().filter(|_| mountpoint.is_absolute())?;
+        Some(format!("file://{path}"))
+    }
+
     /// Where `path`, named relative to the root of the mounted tree, is on this host.
     ///
     /// The translation every consumer of a mount performs, provided once because the join is

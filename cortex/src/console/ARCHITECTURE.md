@@ -9,8 +9,8 @@ Two things make it more than a remote `exec`:
    The semantics are the spec's and read as it; the bytes are not, so a peer needs a BSON codec. See [Codec](#codec) for what that trade bought.
 2. Execution runs both ways.
    A tool that only the client knows how to run ends up runnable inside a sandbox — the server asks for it by *answering*, and the client runs it.
-3. The session declares a **namespace**, and both ends realize it.
-   The client says what tree it wants; each end builds its own from that one description, so a file name means the same thing to a command, to a `read`, and to a delegated executable. See [`volumes`](#volumes--what-can-be-reached).
+3. The session declares a **volume**, and the server says where it put it.
+   The client names a tree by URL, the server answers with a path in its own filesystem, and every path in the protocol after that is spelled under that one — so a file name means the same thing to a command, to a `read`, and to a delegated executable. See [`volumes`](#volumes--what-can-be-reached).
 
 **Each end of the channel does one job.** The client only asks; the server only answers.
 Execution running both ways does *not* mean requests going both ways: a server that needs a delegated executable run says so in a `result`, on the request the client is already waiting on — see [Delegation](#delegation-and-execution-both-ways) for what that buys and what it costs.
@@ -142,7 +142,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{delegated, volumes?}` | `null` |
+| `init` | `{delegated, volumes?}` | `{volumes?}` |
 | `exec` | `{cmd, timeout_ms?, cwd?}` | `{done: {...}}` or `{delegated: {...}}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -180,12 +180,14 @@ A boot that fails is reported to whoever asked for the call that needed it, as `
 ### `init` — this is the session
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":["fetch","ask"],"volumes":{"mounts":[{"path":"work","volume":{"type":"local","host":"/srv/project"}}]}}}
-{"jsonrpc":"2.0","id":0,"result":null}
+{"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":["fetch","ask"],"volumes":{"url":"file:///srv/project"}}}
+{"jsonrpc":"2.0","id":0,"result":{"volumes":{"path":"/mnt/workfs"}}}
 ```
 
 Two things a session is: **what can be run**, and **what can be reached**.
 Both outlive any one execution, which is why they are here and not on an `exec` — each has to be in place before the first command that uses it, so each is said once instead of on every command.
+
+It is also the only method whose answer carries something, and the volume is why: a client that has not been told where the tree is cannot name a file in it.
 
 #### `delegated` — what can be run
 
@@ -203,40 +205,61 @@ A client with nothing to delegate is still a client:
 {"jsonrpc":"2.0","id":0,"method":"init","params":{"delegated":[]}}
 ```
 
-#### `volumes` — what can be reached
+#### `volumes` — what can be reached, and where it ends up
 
-The namespace the server is to realize: a list of mounts, each a path in the workspace and the volume to put there.
+One tree, named by URL going out and by a path coming back.
 
 ```json
-{"mounts":[{"path":"work","volume":{"type":"local","host":"/srv/project"}},
-           {"path":"data","volume":{"type":"s3","bucket":"b","region":"r","access_key_id":"…","secret_access_key":"…"}}]}
+→ {"url":"file:///srv/project"}
+← {"path":"/mnt/workfs"}
 ```
 
-Absent is empty, and empty is not an error — a client with nothing to mount is still a client, and then the member is left off the frame rather than sent empty.
+Absent is nothing mounted, in both directions, and that is not an error — a client with no tree is still a client, and then the member is left off the frame rather than sent empty.
+Such a session's commands see whatever the executor's own filesystem holds, and this protocol has described none of it.
 
-A `local` volume's `host` is a path on the declaring side, and BSON strings are UTF-8, so one with no UTF-8 form cannot be sent.
-The declaring end refuses it — `INVALID_PARAMS`, the same as a mount path a server cannot make sense of — rather than letting a codec complain about a frame it was halfway through building.
+**The scheme is the kind.**
 
-**The schema does not depend on the build.**
-Every volume kind is on the wire whatever features the peer reading it was compiled with, and a build without a provider for one refuses it when asked to *realize* it rather than when asked to parse it.
-That is what turns "this server cannot do `s3`" into [`UNSUPPORTED_VOLUME`](#errors) naming the kind, instead of a decode error a client cannot tell from its own bug.
+| scheme | is |
+|---|---|
+| `file:///srv/project` | a directory in a filesystem the server can already open |
+| `http://…`, `https://…` | a tree reached over HTTP — on the wire, implemented nowhere |
 
-**Both ends realize it, separately.**
-The server builds the tree a command runs against; the client builds one of its own from the same description, because a delegated executable runs on the *client* and has to see the files the command was working on.
-Neither end sends the other a tree — they send this, and each realizes it. That is what makes one file name mean the same thing to a command, to a `read`, and to a delegated executable, and [`cwd`](#exec--run-this) on an `exec` is what completes it.
+A `file://` URL is usually a directory the *client* put there: a cortex tree mounted in front of a kernel on this host, whose path is then the whole of what the server has to be told about it.
+That is why the two paths in this exchange are so often the same one — and why they are exchanged anyway rather than assumed equal.
 
-What the kinds are and how a workspace routes between them is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol only carries the description.
+A URL and not a tagged object, because there is one thing this protocol does with it: hand it to whatever realizes that kind.
+A tagged object would grow the wire schema with every provider anyone adds; a string leaves the schema alone and leaves each kind's spelling to the kind — so a peer that has never heard of a scheme still parses the frame, and refuses it for the reason it actually has.
 
-**Nothing is realized by sending it**, any more than anything is booted by it.
-The first call that needs a session builds the tree, so a kind the server cannot realize is *that* call's failure and not this one's.
+That reason is [`UNSUPPORTED_VOLUME`](#errors), and unlike the failures below it is **`init`'s own**.
+Which kinds a server can realize is a fact about the build, knowable the moment the frame is read — and answering a path for a tree that can never be there would make every later path in the session a lie.
 
-**Nothing is booted by it**, and the response is not a readiness signal — it is the one thing about a session a client can hear before it asks for work: that there is a server on the far end, that it read the frame, that it speaks this protocol, and that it has taken what it was told.
+A URL is a name, so a kind that has to be authorized rather than opened will need a member beside it to carry that; `file://` needs none, which is why there is none yet.
+Whatever it becomes will cross in the clear, and what protects it is the transport: over stdio, a pipe to a child on this host.
+
+**The path is the server's, and it is what the rest of the protocol speaks.**
+A `read` names a file under it, a `write` does, and so does the [`cwd`](#exec--run-this) reported on a delegated call.
+Nothing is workspace-relative and nothing is rewritten in flight.
+
+That is the trade this member exists to make. Two ends realizing one description separately is the other way to have a name mean one file, and it costs a tree on each side and a translation on every path that crosses — to reconstruct something one end already has.
+So the server realizes it once and says where, and what it costs instead is that the client has to be able to open what the server opened. A backend whose commands run somewhere else — a guest, a container — answers the path on *this* side of that boundary and does its own translation behind it.
+
+**Nothing is mounted by sending it**, any more than anything is booted by it.
+The path is where the tree *will be*: the mount happens when the session boots, so a client holding this answer holds a name before it holds a directory.
+Nothing needs it any sooner — a `read`, a `write` and an `exec` each boot a session first, and a delegated executable runs inside one.
+A mount that then fails is [`MOUNT_FAILED`](#errors) to whoever asked for the call that needed it, exactly as a boot that fails is `BOOT_FAILED`.
+
+The path is fixed for the session either way, which is what makes it usable as a name: a `stop` takes the mount down and the next call puts it back at the same place.
+
+What the kinds are and how one tree is assembled from several stores is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol carries a URL and a path.
+
+**Nothing is booted by it**, and the response is not a readiness signal — it is the one thing about a session a client can hear before it asks for work: that there is a server on the far end, that it read the frame, that it speaks this protocol, that it has taken what it was told, and where the tree will be.
 A notification could say none of that, which is the whole reason this one method is answered.
 
 Which is also why the asking side sends it when a console is *constructed* rather than leaving it to a caller to remember: a `Console` that exists is one that got this answer back. See [Session](#session).
+A volume answered without a path is a server that took a tree and left the client no way to name a file in it, so that is a console that does not exist rather than one that guesses.
 
 A second `init` replaces the first and takes whatever was booted under it with it.
-Both halves are built into what booting produced — the names as entries in a `bin/` directory, the volumes as a mounted tree — so a session that changes either has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived.
+Both halves are built into what booting produced — the names as entries in a `bin/` directory, the volume as a mounted tree — so a session that changes either has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived. Its answer may name a different path, and that path is the session's from then on.
 
 ### `start` — boot now, to hide the cold start
 
@@ -265,7 +288,7 @@ Minimal form — no timeout of its own:
 |---|---|
 | `cmd` | an **array** is a command, already split into argv. Nothing consults a shell, so quoting and word rules stay wherever the command was composed; a caller that wants shell semantics asks outright — `["sh","-c","…"]`. Empty is `INVALID_PARAMS`. An **object** is not a command at all but the answer to a delegated call — see below. |
 | `timeout_ms` | a **kill** on expiry: no grace period, no second signal, no negotiation. |
-| `cwd` | where the command was invoked, **relative to the workspace root** — `"work/sub"`, or `""` for the root itself. Reported, never instructed: a caller's own `exec` leaves it out, and it appears on a `delegated` because that is the end that knows. See below. |
+| `cwd` | where the command was invoked, as a path **in the server's filesystem** — `"/mnt/workfs/work/sub"`. Reported, never instructed: a caller's own `exec` leaves it out, and it appears on a `delegated` because that is the end that knows. See below. |
 | `code` | the command's exit status; `128 + signal` when a signal killed it. |
 | `stdout`/`stderr` | `Binary`, byte-exact, kept apart. |
 | `truncated` | the command wrote more than the executor would hold, and this is the beginning of it. |
@@ -280,18 +303,20 @@ A delegated executable runs on the **client**, in a process of its own, against 
 So `fetch report.md` arrives as an argv and nothing else, and `report.md` names a file relative to nothing.
 
 ```json
-{"jsonrpc":"2.0","id":1,"result":{"delegated":{"cmd":["fetch","report.md"],"cwd":"work/sub"}}}
+{"jsonrpc":"2.0","id":1,"result":{"delegated":{"cmd":["fetch","report.md"],"cwd":"/mnt/workfs/work/sub"}}}
 ```
 
 `cwd` is what closes that.
-It is **workspace-relative and not the executor's own path**, because the two ends share a namespace and not a filesystem: the server mounted the tree somewhere of its own choosing and strips that prefix before answering, so `"work/sub"` means the same directory against whatever the client mounted.
+It is **the executor's own path**, under the [`path`](#volumes--what-can-be-reached) `init` answered with — the same terms as every other path here, and for the same reason: there is one tree, the server already said where it is, and a spelling that had to be rewritten on the way past would be a second thing for the two ends to disagree about.
 
 **Reported, never instructed.**
-A shim fills it in because it knows where it stood, the server rewrites it, and the client reads it off the `delegated`.
-A client's own `exec` leaves it out — where a command runs is decided by the namespace, and a caller-chosen directory would be a second thing deciding it.
+A shim fills it in because it knows where it stood, and the client reads it off the `delegated`.
+A client's own `exec` leaves it out — where a command runs is decided by the tree, and a caller-chosen directory would be a second thing deciding it.
 
-It is absent rather than guessed when there is no workspace, when the command stood outside it, or when the directory's name has no string form — a path inside a passthrough volume may legitimately not be UTF-8.
+It is absent rather than guessed when nothing reported one, or when the directory's name has no string form — a path inside a passthrough store may legitimately not be UTF-8.
 Substituting the root would name a different file and say nothing about having done so, which is the failure this field exists to prevent.
+
+What a client does with it before running the name is its own business, and there is one thing worth doing: a directory *under* the session's path names a file that this end can also open, and one outside it names nothing this session described. The Rust client answers the second the way the server answers a missing `cwd` — by refusing a relative argument rather than resolving it somewhere else.
 
 **`..` is resolved only where doing so is not a guess.**
 A client resolves an argument on paper, and a kernel looks each component up as it goes — so `nope/../notes.txt` cancels out here and fails at `nope` there.
@@ -354,15 +379,15 @@ Asking would therefore re-encode base64 at exactly the point the byte type was t
 ### `read` — hand back part of a file
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"read","params":{"path":"out/log.txt","offset":4096,"len":1024}}
+{"jsonrpc":"2.0","id":5,"method":"read","params":{"path":"/mnt/workfs/out/log.txt","offset":4096,"len":1024}}
 {"jsonrpc":"2.0","id":5,"result":{"data":{"$binary":{"base64":"aGkK","subType":"00"}},"size":10000}}
 ```
 
-The path is resolved wherever the executor runs things, exactly as a relative path in `cmd` is, so it names the file a command would open by the same name.
+The path is one in the executor's own filesystem, built by joining onto what `init` answered with, so it names the file a command would open by the same name.
 
 | field | |
 |---|---|
-| `path` | UTF-8, resolved executor-side. |
+| `path` | UTF-8, and the executor's own. |
 | `offset` | where to start; omitted is the beginning. Past the end is not an error — the answer is empty `data` and the `size` that says so. |
 | `len` | how many bytes at most; omitted is as many as there are. |
 | `data` | `Binary`, byte-exact. |
@@ -375,7 +400,7 @@ Comparing what arrived against `size` is the only thing that says there is more,
 ### `write` — put these bytes in a file
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"write","params":{"path":"in/data","data":{"$binary":{"base64":"aGkK","subType":"00"}}}}
+{"jsonrpc":"2.0","id":6,"method":"write","params":{"path":"/mnt/workfs/in/data","data":{"$binary":{"base64":"aGkK","subType":"00"}}}}
 {"jsonrpc":"2.0","id":6,"result":{"size":3}}
 ```
 
@@ -397,10 +422,11 @@ The file is whatever it is, and a requester that needs to know asks with a `read
 {"jsonrpc":"2.0","method":"stop"}
 ```
 
-Much what stopping a VM is: the guest goes away, the socket and the symlinks go with it, and a scratch directory is cleaned up by whoever made it rather than left for someone to find later.
+Much what stopping a VM is: the guest goes away, the socket and the symlinks go with it, the tree is unmounted, and a scratch directory is cleaned up by whoever made it rather than left for someone to find later.
 Those are memory, descriptors and disk held on the far end for as long as the session is booted, and worth holding only while something is running — which is the whole reason a client is given a way to say it is going idle.
 
-Afterwards the session is where it was before it booted, and **the next call that needs a boot gets one** — under the same `init`, with nothing having to ask.
+Afterwards the session is where it was before it booted, and **the next call that needs a boot gets one** — under the same `init`, with nothing having to ask, and with the tree back at the path that `init` answered with.
+So a client that sent a `stop` keeps every path it had built; what changed is only whether anything answers at them in the meantime.
 So a server process outlives the resources it booted, which is what makes handing them back cheap: it costs one cold start later and nothing else.
 
 `Console::stop` is therefore not the end of anything and not owed; dropping the `Console` is what sends `quit`, and a server on its way out releases what a `stop` would have released.
@@ -481,8 +507,8 @@ sequenceDiagram
         participant shim as fetch
     end
 
-    client->>server: id:0 init {delegated:["fetch"]}
-    server-->>client: id:0 result null
+    client->>server: id:0 init {delegated:["fetch"], volumes:{url:"file:///srv/project"}}
+    server-->>client: id:0 result {volumes:{path:"/mnt/workfs"}}
 
     client->>server: id:1 exec {cmd:["sh","-c","fetch x"]}
     Note over server: nothing is booted yet, so this boots it:<br/>`fetch` is symlinked into a bin/ dir
@@ -562,11 +588,11 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
 | `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
-| `-32008` | `exec`, `read`, `write` | **unsupported volume** — a kind in `volumes` this server has no provider for, named in the message. Like `BOOT_FAILED` it reaches whoever asked for the call that needed a session, because `init` realizes nothing. Distinct from it because the fix is different: the spec is well formed and the *build* is wrong for it — a different binary, or one fewer volume. |
-| `-32009` | `exec`, `read`, `write` | **mount failed** — every volume realized and binding the tree to a filesystem interface did not: no mount binding compiled in, no FUSE provider installed, the mount point busy. The kinds were all fine; the environment is what has to change. |
+| `-32008` | `init` | **unsupported volume** — a URL whose scheme this server has no provider for, named in the message. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and a path answered for a tree that can never be there would make every later path a lie. Distinct from `BOOT_FAILED` because the fix is different: the volume is well formed and the *build* is wrong for it — a different binary, or a different URL. |
+| `-32009` | `exec`, `read`, `write` | **mount failed** — the volume could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
 | `-32600` | any | invalid request — including an `exec` answering a delegated call when nothing is paused on one. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty argv `cmd`. A delegated name that is not a plain path component *should* be this and is not checked; see [`init`](#init--this-is-the-session). |
+| `-32602` | any | invalid params — an empty argv `cmd`, or a `volumes` URL that is not one. Apart from `UNSUPPORTED_VOLUME` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. A delegated name that is not a plain path component *should* be this and is not checked; see [`init`](#init--this-is-the-session). |
 | `-32603` | any | internal error |
 
 `-32003` and `-32004` are unassigned and stay that way.
@@ -609,7 +635,8 @@ stateDiagram-v2
 `Idle` is therefore not a session that cannot work — it is a session that is not occupying anything, and the two edges a client controls by hand are there to keep it in that state while it is idle and out of it before it is busy.
 A boot that fails leaves `Idle`, so nothing thinks it is up, and the call that needed one hears `BOOT_FAILED`.
 
-`init` is not an edge at all. It is legal in either state, it boots nothing, and what it changes is the shape a future boot will take — its names and its tree — which is why it drops back to `Idle` when it arrives in `Up`.
+`init` is not an edge at all. It is legal in either state, it boots and mounts nothing, and what it changes is the shape a future boot will take — its names and its tree — which is why it drops back to `Idle` when it arrives in `Up`.
+The path it answers with is a fact about every state after it: in `Idle` nothing is mounted there, in `Up` something is, and it is the same path throughout.
 
 An `exec` answering a delegated call outside `Paused` is `INVALID_REQUEST`: nothing is waiting on one.
 
@@ -644,3 +671,5 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | cancel one execution | `stop` hands back the whole session's resources, not a command, and nothing answers it. Let the timeout expire. |
 | output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. A *file* larger than that is readable, because `read` is bounded on purpose and `size` says where to ask next. |
 | run two delegated calls at once | a response carries one `delegated`. Needs delegated calls to stop being independent before it is worth a shape that carries several — see [Consequences](#consequences). |
+| put two volumes in one session | `volumes` is one URL and one path. A session that needs several trees gets them the way a session gets one tree of many stores: composed behind a single URL, where the composing is [`fs`](../fs/ARCHITECTURE.md)'s and not this protocol's. |
+| delegate a name that touches files the client cannot open | a delegated executable is handed a path and opens it, so the two ends have to share a filesystem for that much. Commands, `read` and `write` do not care — they run on the far end — so this bounds delegation and not the session. |

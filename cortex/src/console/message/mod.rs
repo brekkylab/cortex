@@ -50,10 +50,10 @@
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
-//! | `init` | [`Init`] | `null` | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
-//! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED) |
-//! | `read` | [`Read`] | [`ReadResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED) |
-//! | `write` | [`Write`] | [`WriteResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED) |
+//! | `init` | [`Init`] | [`InitResult`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_VOLUME`](Error::UNSUPPORTED_VOLUME) |
+//! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `read` | [`Read`] | [`ReadResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `write` | [`Write`] | [`WriteResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `start` | — | *(notification — no response)* | — |
 //! | `stop` | — | *(notification — no response)* | — |
 //! | `quit` | — | *(notification — no response)* | — |
@@ -86,11 +86,12 @@
 //! booted yet, since the next call that needs one tries again. A failure reaches whoever
 //! asked for that call, as [`BOOT_FAILED`](Error::BOOT_FAILED).
 //!
-//! `init` is the exception and is a call, because it is not about resources. It
-//! says what the session *is* — the delegated names, the fallback timeout — and its
-//! response is the one thing a client can act on before it has asked for any work: that
-//! there is a server on the far end, that it speaks this protocol, and that it has taken
-//! what it was told.
+//! `init` is the exception and is a call, because it is not about resources. It says what
+//! the session *is* — the delegated names, and the tree it works in — and its response is
+//! the one thing a client can act on before it has asked for any work: that there is a
+//! server on the far end, that it speaks this protocol, that it has taken what it was told,
+//! and where it will put the tree. That last part is why the answer is read rather than
+//! merely awaited: every path in the session afterwards is spelled under it.
 //!
 //! # Why the codec is BSON
 //!
