@@ -107,3 +107,15 @@ notion = [
     "tokio/net",
     "tokio/rt-multi-thread",
 ]
+# A Slack workspace as a read-only store, through the messenger lane.
+#
+# `chrono` because a messenger tree is addressed by date: turning a `2026-08-10/` directory into
+# a time window and a message's instant back into the day that holds it is calendar arithmetic,
+# and leap years are not a thing to hand-roll.
+slack = [
+    "dep:reqwest",
+    "dep:chrono",
+    "dep:serde_json",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+]

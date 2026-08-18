@@ -1,0 +1,296 @@
+//! [`MessengerSource`] — what a messenger has to answer for its conversations to become a
+//! tree, and the normalized shapes it answers in.
+//!
+//! # What is normalized, and what deliberately is not
+//!
+//! Normalized: a timestamp is a [`SystemTime`] whichever way the platform spells one (a
+//! Slack float-seconds string, a Discord snowflake, an RFC 3339 instant), an author is an
+//! [`Author`], a thread is [`Thread`]. That is what makes one `jq` filter work across every
+//! source — the point of the lane, and the reason the tree-building code
+//! ([`MessengerVolume`](super::MessengerVolume)) is written once rather than per platform.
+//!
+//! Not normalized: [`Message::raw`] keeps the platform's own object. A normalization that
+//! cannot be escaped is one that decides in advance what nobody will need, and the
+//! alternative has a name — every unified messenger project that flattened its sources to a
+//! common struct lost the platform-specific half with it.
+//!
+//! # Why `scan` and `history` are separate questions
+//!
+//! `history` answers "what is in this window". `scan` answers "which windows are there at
+//! all", and no messenger API has an endpoint for it: the tree learns a conversation's days
+//! by walking its newest messages backwards for a bounded number of pages and listing what
+//! it saw. Generating the calendar instead — every day between the conversation's creation
+//! and now — invents a directory for every silent day, and the reader is an agent, which
+//! cannot tell a quiet day from a failed request and pays a request to find out.
+//!
+//! The two are one call on some platforms and two on others, which is exactly why the
+//! *tree* asks them separately and the source decides how to serve each.
+
+use std::ops::Range;
+use std::time::SystemTime;
+
+use serde_json::Value;
+
+use crate::BoxFuture;
+
+use super::error::SourceResult;
+
+/// A conversation's platform id, opaque to the tree.
+///
+/// A newtype and not a `String`, because a conversation id and a message id are both strings
+/// and the tree passes them next to each other — see [`MsgId`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ConvId(pub String);
+
+/// A message's platform id. Also the name of its thread directory, when it has one.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MsgId(pub String);
+
+/// Which section of the tree a conversation belongs under.
+///
+/// Only two, because only two survive on every platform in the lane. A finer split (private
+/// vs public channels, group vs one-to-one DMs) is a property of one platform's model, and
+/// the tree would then have sections some sources always leave empty — which is the empty
+/// directory this lane refuses to synthesize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvKind {
+    /// A named, many-participant conversation. `channels/`.
+    Channel,
+    /// A direct or small-group conversation, named by its participants. `dms/`.
+    Dm,
+}
+
+/// One conversation the tree will give a directory to.
+#[derive(Clone, Debug)]
+pub struct Conversation {
+    pub id: ConvId,
+    /// Display name, used as the human half of the `<name>__<id>` directory. Empty is
+    /// allowed — the id half still identifies it.
+    pub name: String,
+    pub kind: ConvKind,
+}
+
+/// Who sent a message.
+///
+/// The two names are separate fields on purpose. `name` is what the platform's own directory
+/// says the account is called; `claimed` is a name the *message* asserted for itself — a
+/// webhook's `username`, a bot posting under a display name. Merging them lets anything that
+/// can post choose to look like a colleague, and the tree is read by an agent that cannot
+/// tell the difference unless the file does.
+#[derive(Clone, Debug, Default)]
+pub struct Author {
+    /// The platform's id for the account. The only field the platform vouches for.
+    pub id: String,
+    /// The name that id resolves to in the source's own user directory, when it does.
+    pub name: Option<String>,
+    /// A name this one message asserted for itself, if any. Never merged into `name`.
+    pub claimed: Option<String>,
+}
+
+/// A message's place in a thread, when it is in one.
+#[derive(Clone, Debug)]
+pub struct Thread {
+    /// The thread's root, or `None` when this message *is* the root.
+    ///
+    /// A reply keyed by its root's id and not by the root message itself, because a root can
+    /// be deleted while its replies live on: hanging a thread off the root object loses the
+    /// whole thread when that happens.
+    pub root: Option<MsgId>,
+    /// Replies below the root. Zero on a reply itself — only a root counts them.
+    pub replies: usize,
+}
+
+/// An attachment, as a listing knows it.
+#[derive(Clone, Debug)]
+pub struct FileRef {
+    pub id: String,
+    /// Name as posted. The tree makes a filename out of it and its id.
+    pub name: String,
+    /// Exact length, which the tree reports as the file's size and a download is checked
+    /// against — a body that is not this long is a login page or a truncation, not the file.
+    pub size: u64,
+    /// Where the bytes are, in whatever form the source will hand back to itself.
+    pub url: String,
+}
+
+/// One message, normalized.
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub id: MsgId,
+    /// When it was created — not when it was last edited. The tree buckets by this, so a
+    /// reaction arriving a year later must not move a message to another day.
+    pub ts: SystemTime,
+    pub from: Author,
+    /// The body as text. May be empty (an attachment-only post, a system event).
+    pub text: String,
+    pub thread: Option<Thread>,
+    pub files: Vec<FileRef>,
+    /// The platform's own object for this message, kept whole. See the module docs.
+    pub raw: Value,
+}
+
+/// A half-open span of time — one day of the tree, as the source should ask for it.
+///
+/// `SystemTime` and not a date, so the trait needs no calendar: turning `2026-08-10/` into
+/// this pair is the tree's arithmetic, and turning this pair into `oldest`/`latest` params is
+/// the source's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub start: SystemTime,
+    /// Exclusive, so consecutive days neither overlap nor leave a gap.
+    pub end: SystemTime,
+}
+
+/// One member of the workspace, for resolving ids to names.
+#[derive(Clone, Debug)]
+pub struct User {
+    pub id: String,
+    pub name: String,
+    /// The platform's own record, for the `users/<name>__<id>.json` the tree serves.
+    pub record: Value,
+}
+
+/// What a source can and cannot do, where the difference changes the tree's *shape*.
+///
+/// Deliberately tiny: a field earns its place only when a directory exists or does not
+/// because of it. Anything else is an error the caller reads.
+///
+/// Both ask about **enumeration**, which an empty answer cannot settle — "none today" and
+/// "never, by this credential" are the same empty list and opposite claims, and only one of
+/// them may be served as an empty directory. The source knows which it is; nothing else can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Capabilities {
+    /// Whether [`MessengerSource::conversations`] can return [`ConvKind::Channel`] entries.
+    /// False for a source whose platform keeps its channels in another shape.
+    pub channels: bool,
+    /// Whether it can return [`ConvKind::Dm`] entries *and read them*. False where either
+    /// half is missing: a listing whose conversations all serve empty is worse than an absent
+    /// `dms/`, because it looks like it works.
+    pub dms: bool,
+}
+
+/// A messenger the tree can be built over.
+///
+/// Read-only by construction: there is no method here that writes. A conversation this
+/// credential cannot read is the source's own business to absorb — it returns what it could
+/// see, because one channel a bot was never invited to must not fail the whole tree — while a
+/// failure that applies to *every* conversation (a dead token, a scope never granted)
+/// propagates, because serving that as an empty workspace presents it as a complete one.
+/// # Why the futures are boxed
+///
+/// The same reason [`FileSystem`](crate::fs::FileSystem)'s are: a native `async fn` in a trait
+/// is not object-safe, and one boxed future per call sits next to a round trip to a messenger.
+/// Writing it out rather than reaching for a macro keeps this crate's one convention.
+pub trait MessengerSource: Send + Sync {
+    /// Conversations this credential can see. The flag is true when the listing stopped at
+    /// the source's own page ceiling, so the tree can say it is partial rather than pass it
+    /// off as the whole.
+    fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<Conversation>, bool)>>;
+
+    /// Messages created within `window`, oldest-first, thread roots and standalone messages
+    /// only — a root's replies come from [`thread`](Self::thread).
+    fn history<'a>(
+        &'a self,
+        conv: &'a ConvId,
+        window: Window,
+    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>>;
+
+    /// The conversation's newest messages backwards, at most `max_pages` pages, returned
+    /// oldest-first. True means the walk stopped at that ceiling and older messages exist
+    /// that it did not reach. See the module docs for why this is not `history`.
+    fn scan<'a>(
+        &'a self,
+        conv: &'a ConvId,
+        max_pages: usize,
+    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>>;
+
+    /// A thread: its root followed by every reply, oldest-first.
+    fn thread<'a>(
+        &'a self,
+        conv: &'a ConvId,
+        root: &'a MsgId,
+    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>>;
+
+    /// Workspace members, for resolving author ids to names.
+    fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<User>, bool)>>;
+
+    /// An attachment's bytes. `range` is a request, not a promise: the second return value
+    /// is false when the source served the whole thing and the caller must slice it itself.
+    fn fetch_file<'a>(
+        &'a self,
+        file: &'a FileRef,
+        range: Option<Range<u64>>,
+    ) -> BoxFuture<'a, SourceResult<(Vec<u8>, bool)>>;
+
+    /// See [`Capabilities`].
+    fn capabilities(&self) -> Capabilities;
+}
+
+/// The one line format, shared by every source.
+///
+/// This function is the lane's actual product. A layout is a convention two implementations
+/// can agree to by accident and drift from by accident; a single renderer cannot drift,
+/// which is what makes "the same `jq` filter works on all of them" a property of the code
+/// rather than a claim in a document.
+///
+/// One message is always one line: `serde_json` escapes a newline in the body as `\n`, so a
+/// `grep` hit is a whole message and the name attached to it is the right one. Nothing here
+/// may switch to a pretty writer without breaking that.
+pub fn render_line(msg: &Message) -> Vec<u8> {
+    let mut from = serde_json::Map::new();
+    from.insert("id".into(), Value::String(msg.from.id.clone()));
+    if let Some(n) = &msg.from.name {
+        from.insert("name".into(), Value::String(n.clone()));
+    }
+    // Kept apart from `name` for the reason `Author::claimed` exists.
+    if let Some(c) = &msg.from.claimed {
+        from.insert("claimed".into(), Value::String(c.clone()));
+    }
+
+    let mut out = serde_json::Map::new();
+    out.insert("ts".into(), Value::String(rfc3339(msg.ts)));
+    out.insert("id".into(), Value::String(msg.id.0.clone()));
+    out.insert("from".into(), Value::Object(from));
+    out.insert("text".into(), Value::String(msg.text.clone()));
+    if let Some(t) = &msg.thread {
+        out.insert(
+            "thread".into(),
+            serde_json::json!({
+                "root": t.root.as_ref().map(|r| r.0.clone()),
+                "replies": t.replies,
+            }),
+        );
+    }
+    if !msg.files.is_empty() {
+        out.insert(
+            "files".into(),
+            Value::Array(
+                msg.files
+                    .iter()
+                    .map(|f| serde_json::json!({"name": f.name, "size": f.size, "id": f.id}))
+                    .collect(),
+            ),
+        );
+    }
+
+    let mut bytes = serde_json::to_vec(&Value::Object(out)).unwrap_or_else(|_| b"{}".to_vec());
+    bytes.push(b'\n');
+    bytes
+}
+
+/// A `SystemTime` as the fixed-width UTC instant the line format uses.
+///
+/// Second resolution, deliberately: the sub-second part of a messenger timestamp is a
+/// platform's own ordering key (Slack's `ts` carries microseconds and *is* the message's id),
+/// and a line that printed it would invite sorting on a field that means something different
+/// on each source. Ordering within a day comes from the file's order, which the source
+/// guarantees.
+fn rfc3339(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t)
+        .format("%Y-%m-%dT%H:%M:%SZ")
+        .to_string()
+}
+
+#[cfg(test)]
+#[path = "source_tests.rs"]
+mod source_tests;

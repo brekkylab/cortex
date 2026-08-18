@@ -6,6 +6,10 @@
 //! do it.
 
 mod inmem;
+// A directory, and one *family* of stores rather than one: a messenger has no hierarchy to
+// mirror, so its tree is synthesized — once, shared by every platform in the lane.
+#[cfg(feature = "slack")]
+mod messenger;
 #[cfg(feature = "notion")]
 mod notion;
 mod passthrough;
@@ -13,6 +17,8 @@ mod passthrough;
 mod s3;
 
 pub use inmem::*;
+#[cfg(feature = "slack")]
+pub use messenger::*;
 #[cfg(feature = "notion")]
 pub use notion::*;
 pub use passthrough::*;

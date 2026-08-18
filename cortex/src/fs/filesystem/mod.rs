@@ -25,6 +25,12 @@ pub use filesystem::*;
 // default features at all: `s3` costs 131 crates, and a build that serves local files should
 // not compile an HTTP and TLS stack to do it.
 pub use r#impl::{InMemFs, PassthroughFs};
+#[cfg(feature = "slack")]
+pub use r#impl::{
+    Author, Capabilities, ConvId, ConvKind, Conversation, ErrorClass, FileRef, MessengerSource,
+    Message, MsgId, MessengerFs, SlackAccessor, SlackConfig, SlackSource, SourceError, SourceResult, Thread, User,
+    Window, render_line,
+};
 #[cfg(feature = "notion")]
 pub use r#impl::{NotionConfig, NotionFs};
 #[cfg(feature = "s3")]

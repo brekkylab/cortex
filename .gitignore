@@ -25,3 +25,6 @@ rustc-ice-*.txt
 
 # Generated docs write-ups (not versioned)
 docs/
+
+# Endpoint test credentials
+.env
