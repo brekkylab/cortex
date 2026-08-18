@@ -38,7 +38,8 @@ use std::io;
 /// Credentials for a Slack filesystem.
 ///
 /// Beside the client that uses them, as `NotionConfig` is: there is no declarative spec to
-/// carry them any more, so a consumer builds this and hands it to [`SlackFs::new`].
+/// carry them any more, so a consumer builds this and hands it to `SlackSource::new`, then mounts the
+/// `MessengerFs` around it.
 ///
 /// Both tokens are optional and at least one is required, which [`SlackAccessor::new`] checks
 /// — either alone is a usable mount, for the reason [`user_token`](Self::user_token) gives.

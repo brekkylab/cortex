@@ -557,8 +557,8 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
     ///
     /// Two shapes behind one method, decided by what the path names rather than by how it is
     /// read — [`FileRef::size`] is in the listing, so there is nothing to learn by watching.
-    /// Assembled bytes are already in hand; an attachment is fetched whole when it fits under
-    /// [`WINDOW`] and a window at a time when it does not.
+    /// Assembled bytes are already in hand; an attachment is fetched whole when it fits within
+    /// the store's memory ceiling for one file, and a window at a time when it does not.
     fn read_at<'a>(
         &'a self,
         path: &'a Path,
