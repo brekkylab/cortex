@@ -799,3 +799,56 @@ async fn a_server_that_ignores_the_range_is_not_served_as_the_wrong_offset() {
         "the whole file was already held; reading elsewhere in it must not refetch"
     );
 }
+
+/// A file under the ceiling is fetched once, not once per read.
+///
+/// A kernel reads a file in chunks of its own choosing — 32 KiB through FUSE-T, 128 KiB through
+/// virtio-fs — and each chunk is a separate `read_at`. Fetching the whole file on each of them
+/// turns a 1 MiB attachment into megabytes per read and an 8 MiB one into hundreds, which is the
+/// cost `windowed` exists to bound and which the files small enough to skip it were paying in
+/// full. Counting requests rather than timing them, because the defect is invisible against a
+/// fixture that answers instantly.
+#[tokio::test]
+async fn a_small_file_is_fetched_once_however_the_kernel_chunks_it() {
+    const SIZE: u64 = 1 << 20;
+    let vol = with_attachment(SIZE);
+
+    let mut buf = vec![0u8; 128 * 1024];
+    let mut at = 0u64;
+    loop {
+        let n = vol.read_at(Path::new(ATTACHMENT), &mut buf, at).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        // The bytes have to stay right across the seams, not merely be cheap.
+        for (i, b) in buf[..n].iter().enumerate() {
+            assert_eq!(*b, (at + i as u64) as u8, "byte {}", at + i as u64);
+        }
+        at += n as u64;
+    }
+    assert_eq!(at, SIZE, "the whole file is read");
+    assert_eq!(
+        vol.source.calls.files.lock().unwrap().len(),
+        1,
+        "one fetch for the file, and none for the read that finds EOF"
+    );
+}
+
+/// Holding a small file must not out-live the file it belongs to: the slot is one, so the next
+/// path served replaces it rather than answering with the wrong file's bytes.
+#[tokio::test]
+async fn a_held_small_file_never_answers_for_another_path() {
+    let vol = with_attachment(4096);
+    let mut buf = vec![0u8; 4096];
+    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut buf, 0).await.unwrap(), 4096);
+
+    // `chat.jsonl` is assembled, not fetched, so a held window that ignored the path would show
+    // up here as attachment bytes.
+    let mut chat = vec![0u8; 64];
+    let n = vol
+        .read_at(Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl"), &mut chat, 0)
+        .await
+        .unwrap();
+    assert!(n > 0);
+    assert_eq!(chat[0], b'{', "the day's own bytes, not the held file's");
+}

@@ -570,12 +570,30 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
                 Node::Dir => Err(io_err(io::ErrorKind::IsADirectory)),
                 Node::Bytes(data) => Ok(copy_out(&data, buf, offset)),
 
-                // Unranged, which is what lets the source check the body against the length the
-                // listing promised — the check that catches a refused token answering 200 with a
-                // login page. It is also no more requests: a window is larger than the file.
                 Node::File(f) if f.size <= WINDOW => {
+                    // The listing named the size, so the end is known without asking. Without
+                    // this the last read of every file — the one the kernel makes to see EOF —
+                    // would fetch the whole thing to be told nothing.
+                    if buf.is_empty() || offset >= f.size {
+                        return Ok(0);
+                    }
+                    let held = self.serve_held(path, offset, buf);
+                    if held > 0 {
+                        return Ok(held);
+                    }
+                    // Unranged, which is what lets the source check the body against the length
+                    // the listing promised — the check that catches a refused token answering
+                    // 200 with a login page. It is also no more requests than a range: a window
+                    // is larger than the file.
                     let (bytes, _) = self.source.fetch_file(&f, None).await?;
-                    Ok(copy_out(&bytes, buf, offset))
+                    let n = copy_out(&bytes, buf, offset);
+                    // Held like a window, because that is what it is: a file at or under the
+                    // ceiling is one window that happens to cover the whole file. A kernel reads
+                    // this in chunks of its own choosing, so without holding it the file is
+                    // fetched once per chunk — the cost `windowed` exists to bound, paid in full
+                    // by the files small enough to skip it.
+                    self.cache.lock().unwrap().window = Some((path.to_path_buf(), 0, bytes));
+                    Ok(n)
                 }
 
                 Node::File(f) => self.windowed(path, &f, buf, offset).await,
