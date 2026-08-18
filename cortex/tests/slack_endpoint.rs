@@ -297,7 +297,9 @@ async fn a_real_workspace_answers_the_read_surface() {
 #[ignore = "needs a real Slack token; see this file's docs"]
 async fn the_workspace_opens_as_a_tree() {
     let Some(config) = config() else { return };
-    let vol = MessengerFs::new(SlackSource::new(&config).expect("a source"));
+    let vol = MessengerFs::new(
+        SlackSource::new(&config).expect("a config with a token builds"),
+    );
 
     let sections: Vec<String> = vol
         .list(Path::new("/"))

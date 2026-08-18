@@ -174,6 +174,9 @@ fn a_user_is_named_the_way_slack_names_them() {
 
 /// A bot-token install has no DMs to enumerate, so the section must be absent rather than
 /// empty — an empty one would say this person has no DMs.
+///
+/// Decided by the config alone — no workspace to ask, which is the point of `capabilities`
+/// being sync.
 #[test]
 fn a_bot_only_install_declares_no_dms() {
     let bot = SlackSource::new(&SlackConfig {

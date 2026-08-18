@@ -28,14 +28,14 @@ use super::super::source::{
     MsgId, Thread, User, Window,
 };
 
-/// Conversation kinds behind each section, widest first.
+/// Both kinds of a section, asked for in one call.
 ///
-/// Slack lists both kinds of a section in one call, but wants a scope per *type* and fails
-/// the whole call when one is missing — `types=public_channel,private_channel` on a token
-/// without `groups:read` answers `missing_scope` and no channels at all. So a section that
-/// cannot have both drops the second kind and asks again, which is the one place a missing
-/// scope is absorbed rather than propagated: the request can be narrowed, so narrowing it is
-/// an answer rather than a guess.
+/// Slack wants a scope per conversation *type* and fails the whole call when one is missing, so
+/// `types=public_channel,private_channel` on a token without `groups:read` answers
+/// `missing_scope` and no channels at all. Asking again for fewer types would turn that into a
+/// tree of public channels only — which is worse, because nothing in the result says a kind is
+/// missing: an agent reads a workspace with no private channels and concludes there are none.
+/// So the failure propagates, and `ls /channels` says `missing_scope` with the grant to fix it.
 const CHANNEL_TYPES: &[&str] = &["public_channel", "private_channel"];
 const DM_TYPES: &[&str] = &["im", "mpim"];
 
@@ -47,6 +47,17 @@ pub struct SlackSource {
 }
 
 impl SlackSource {
+    /// Build a source over an already-obtained token.
+    ///
+    /// No scope check here, deliberately. Slack answers `missing_scope` on the first call a
+    /// missing grant governs, with the `needed`/`provided` pair the accessor turns into the
+    /// message — so a misconfigured install already fails loudly, early, and naming what to
+    /// grant, at `ls` instead of at mount. Checking up front would mean keeping a second copy of
+    /// which scope each of Slack's methods wants, and a copy that drifts refuses a mount Slack
+    /// would have served — a failure the API itself cannot produce.
+    ///
+    /// The scope table in [this module's docs](super) is for whoever grants the token, not for
+    /// code to enforce.
     pub fn new(config: &SlackConfig) -> std::io::Result<Self> {
         Ok(SlackSource {
             api: SlackAccessor::new(config)?,
@@ -54,17 +65,14 @@ impl SlackSource {
         })
     }
 
-    /// List one section, narrowing the request when a scope is missing.
+    /// List one section.
+    ///
+    /// No narrowing on a missing scope, unlike an earlier shape of this: [`new`](Self::new) has
+    /// already refused a token that cannot read a kind, so a `missing_scope` here means one was
+    /// revoked mid-session — and answering that with a quietly smaller tree is the silent
+    /// failure the mount check exists to remove.
     async fn section(&self, types: &[&str]) -> SourceResult<(Vec<Value>, bool)> {
-        match self.api.list_conversations(&types.join(",")).await {
-            Ok(v) => Ok(v),
-            // Ask for less rather than answer with nothing: a token with `channels:read` and
-            // no `groups:read` still has public channels to show.
-            Err(e) if e.is_scope_missing() && types.len() > 1 => {
-                self.api.list_conversations(types[0]).await
-            }
-            Err(e) => Err(e),
-        }
+        self.api.list_conversations(&types.join(",")).await
     }
 }
 
@@ -81,8 +89,12 @@ impl MessengerSource for SlackSource {
             // A one-to-one DM has a partner where a channel has a name, so naming those needs
             // the member list. Fetched only when there is a DM to name — a workspace whose
             // token sees none must not pay for a roster nothing will use.
+            // Propagated, not defaulted away: a roster this cannot fetch is a missing
+            // `users:read`, and swallowing it serves every DM under a fallback name with no
+            // error anywhere — the one place in this source where a missing grant would be
+            // quiet.
             let members = if dms.iter().any(|d| d.get("user").is_some()) {
-                self.api.list_users().await.map(|(m, _)| m).unwrap_or_default()
+                self.api.list_users().await?.0
             } else {
                 Vec::new()
             };
@@ -320,5 +332,5 @@ fn to_ts(t: SystemTime) -> String {
 
 
 #[cfg(test)]
-#[path = "source_tests.rs"]
-mod source_tests;
+#[path = "slack_tests.rs"]
+mod slack_tests;

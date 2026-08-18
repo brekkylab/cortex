@@ -5,7 +5,7 @@
 //! * [`accessor`] — the Web API client. One gate on every call, because Slack reports
 //!   application errors *inside* a 200; cursor pagination; the one host check an attachment
 //!   download is allowed to send the token to.
-//! * [`source`] — which of those calls answers which of the lane's questions, and how a Slack
+//! * [`slack`] — which of those calls answers which of the lane's questions, and how a Slack
 //!   message becomes a [`Message`](super::Message).
 //!
 //! # Where the credentials come from
@@ -31,32 +31,35 @@
 //! | attachment download | `files:read` |
 //! | `search.messages` | `search:read` — **user token only** |
 //!
-//! Two of those rows are softer than they look, and one is harder.
+//! Nothing in this crate checks that list before mounting, and the table is here for whoever
+//! grants the token rather than for code to enforce — see [`SlackSource::new`](slack). What
+//! enforces it is Slack: `missing_scope` comes back on the first call the absent grant governs,
+//! carrying `needed` and `provided`, which is what the accessor puts in the error a reader sees.
 //!
-//! **`groups:*` is optional.** Slack wants a scope per conversation *type* and fails the whole
-//! `conversations.list` call when one is missing, so a token with `channels:read` and no
-//! `groups:read` would see no channels at all — which is why
-//! [`SlackSource::section`](source) asks again for fewer types. Without the `groups:*` pair the
-//! tree simply has no private channels in it.
+//! Three of the rows are worth a note.
+//!
+//! **`groups:*` is not optional.** Slack wants a scope per conversation *type* and fails the
+//! whole `conversations.list` call when one is missing, so a token with `channels:read` and no
+//! `groups:read` sees no channels **at all** — not "public ones only". `channels/` asks for both
+//! types in one call and does not retry with fewer, so a public-channels-only install does not
+//! get a narrower tree; it gets `EACCES` on that listing.
+//!
+//! **`users:read` reaches further than the roster.** `dms/` names a one-to-one conversation
+//! after its partner, which needs the member list, so a token without it fails that listing too
+//! — rather than serving DMs under a fallback name, which would be the one grant whose absence
+//! this source could be quiet about.
 //!
 //! **`search:read` is unused by the tree.** There is no search in
 //! [`MessengerSource`](super::MessengerSource) — the point of the layout is that `grep` runs
 //! locally — so this is only reachable through [`SlackAccessor::search_messages`] by a caller
-//! holding the client directly.
-//!
-//! **The DM scopes are not optional on a user token.** `dms/` exists whenever there is one (see
-//! [`SlackSource::capabilities`](source)), so the tree *will* ask, and a token missing
-//! `im:read` fails that listing rather than serving a tree without the section. Narrowing
-//! cannot save it the way it saves `groups:read`, because dropping `mpim` still leaves `im`.
-//! Granting the four DM scopes with a user token, or using a bot token — which has no DMs and
-//! is reported as such — are the two arrangements that work.
+//! holding the client directly. An install that never granted it still mounts and reads.
 //!
 //! Only `files:read` is inferred rather than quoted: Slack documents it for `files.info`, and an
 //! attachment here is fetched from the `url_private_download` in a message rather than through
 //! that method, which the reference does not separately state a scope for.
 
 mod accessor;
-mod source;
+mod slack;
 
 pub use accessor::*;
-pub use source::*;
+pub use slack::*;
