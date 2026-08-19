@@ -27,7 +27,7 @@
 
 use std::path::Path;
 
-use cortex::fs::{FileSystem, MessengerFs, SlackAccessor, SlackConfig, SlackSource};
+use cortex::fs::{FileSystem, MessengerFs, SlackAccessor, SlackConfig, SlackSource, WorkFs};
 
 /// The workspace these read, or `None` when there is no credential to name one with.
 fn config() -> Option<SlackConfig> {
@@ -420,5 +420,133 @@ async fn a_bad_token_is_refused_rather_than_read_as_empty() {
     assert!(
         !err.is_conversation_denied(),
         "a token failure must propagate, not be served as an empty conversation: {err}"
+    );
+}
+
+/// The first conversation under `root` that has a day, as `(conversation path, day)`.
+///
+/// Discovered rather than named, like everything else here: a conversation this token cannot
+/// read is listed and empty, which is the soft-fail path and not a failure, so this looks for
+/// one with content instead of assuming the first has any.
+async fn first_day(fs: &WorkFs, root: &str) -> Option<(String, String)> {
+    let convs = fs
+        .list(Path::new(&format!("{root}/channels")))
+        .await
+        .expect("a mounted store lists its channels");
+    for c in &convs {
+        let at = format!("{root}/channels/{}", c.name);
+        let days = fs
+            .list(Path::new(&at))
+            .await
+            .expect("a conversation lists its days");
+        if let Some(d) = days.last() {
+            return Some((at, d.name.clone()));
+        }
+    }
+    None
+}
+
+/// Names directly under `path`, sorted — the shape of a listing, without depending on order.
+async fn names(fs: &WorkFs, path: &str) -> Vec<String> {
+    let mut out: Vec<String> = fs
+        .list(Path::new(path))
+        .await
+        .unwrap_or_else(|e| panic!("{path} lists: {e:?}"))
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    out.sort();
+    out
+}
+
+/// Two workspaces are two mounts, and neither store knows it is not the root.
+///
+/// This is the shape a second credential turns into — another Slack workspace, and later a
+/// Discord guild or a Grid workspace, which one token spans several of. What it pins is the
+/// *pair*: [`WorkFs`] re-bases a request onto the store's own root, and a messenger store
+/// resolves paths without assuming where it was grafted. Both halves are tested apart from
+/// each other; the failure this catches is the one that only appears together — a store that
+/// resolved against the mount path would serve nothing under a nested mount, and a table that
+/// re-based wrongly would serve the wrong workspace's bytes without erring.
+///
+/// Both stores here are the same workspace, because the subject is the composition and one
+/// credential is all it takes to have two of them. That also makes the strongest assertion
+/// available: the same relative path under either mount must read back the same bytes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs a real Slack token; see this file's docs"]
+async fn a_second_workspace_is_a_second_mount() {
+    let Some(config) = config() else { return };
+
+    // Independent stores, deliberately: each keeps its own cache and its own attachment
+    // window, which is what a second workspace costs and what sharing one would hide.
+    let mut fs = WorkFs::new();
+    fs.mount(
+        "chat/one",
+        MessengerFs::new(SlackSource::new(&config).expect("a config with a token builds")),
+    )
+    .expect("a store mounts");
+    fs.mount(
+        "chat/two/nested",
+        MessengerFs::new(SlackSource::new(&config).expect("a config with a token builds")),
+    )
+    .expect("a store mounts at a nested path");
+
+    // The table answers for the directories nobody mounted, or the mounts below them are
+    // unreachable by a walk.
+    assert_eq!(names(&fs, "/").await, ["chat"], "the root names the branch");
+    assert_eq!(
+        names(&fs, "/chat").await,
+        ["one", "two"],
+        "an intermediate directory is synthesized from the mount paths"
+    );
+    assert_eq!(
+        names(&fs, "/chat/two").await,
+        ["nested"],
+        "and so is one that only exists because a mount sits below it"
+    );
+
+    // Each mount serves a whole messenger tree, not a fragment of one.
+    for at in ["/chat/one", "/chat/two/nested"] {
+        let sections = names(&fs, at).await;
+        assert!(
+            sections.contains(&"channels".to_string()) && sections.contains(&"users".to_string()),
+            "{at} must serve its own sections, got {sections:?}"
+        );
+    }
+
+    // The read path, which is where a mistake would be quiet rather than loud.
+    let Some((conv, day)) = first_day(&fs, "/chat/one").await else {
+        eprintln!("no conversation had any days; nothing further to exercise");
+        return;
+    };
+    let relative = conv
+        .strip_prefix("/chat/one/")
+        .expect("the discovered path is under the mount it came from");
+    eprintln!("reading {relative}/{day} through both mounts");
+
+    let mut bytes = Vec::new();
+    for at in ["/chat/one", "/chat/two/nested"] {
+        let p = format!("{at}/{relative}/{day}/chat.jsonl");
+        let stat = fs.stat(Path::new(&p)).await.expect("chat.jsonl stats");
+        let mut buf = vec![0u8; stat.size as usize];
+        let n = fs.read_at(Path::new(&p), &mut buf, 0).await.expect("reads");
+        buf.truncate(n);
+        assert!(!buf.is_empty(), "a listed day is never empty: {p}");
+        bytes.push(buf);
+    }
+    assert_eq!(
+        bytes[0], bytes[1],
+        "the same relative path under either mount is the same file, or the table re-based it \
+         onto the wrong root"
+    );
+    eprintln!("  {} bytes, identical through both", bytes[0].len());
+
+    // A path inside the branch but under no mount is not a directory the walk may enter.
+    assert!(
+        matches!(
+            fs.stat(Path::new("/chat/two/nested/channels/nothing__X0")).await,
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+        ),
+        "a conversation the workspace does not have must not resolve under a nested mount"
     );
 }
