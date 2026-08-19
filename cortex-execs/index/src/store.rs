@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tantivy::schema::{Field, STORED, STRING, Schema, TEXT};
+use tantivy::schema::{FAST, Field, STORED, STRING, Schema, TEXT};
 use tantivy::{Index, IndexReader, IndexWriter, ReloadPolicy};
 
 /// The writer's heap. tantivy's floor is 15 MB; this is a few segments' worth of buffering
@@ -16,11 +16,23 @@ const WRITER_HEAP: usize = 50_000_000;
 pub(crate) struct Fields {
     /// The workspace path, which is also the document's identity — `STRING`, so it is one
     /// term and `delete_term` can name exactly one document.
+    ///
+    /// `FAST` as well, so that walking what the index holds reads a column rather than a
+    /// stored document. A stored document carries the body, and decompressing every one of
+    /// them to learn a path is a pass over the whole corpus to answer a question about names.
     pub path: Field,
     /// The file name, indexed separately so a query matching a name outranks one matching a
     /// mention in someone else's body.
     pub title: Field,
     pub body: Field,
+
+    /// When the file was last modified and how long it was, as of the ingest that wrote this.
+    ///
+    /// What makes a `sync` incremental: a file whose pair still matches is one whose bytes
+    /// this index already has, so it is not read again. `FAST` for the reason `path` is —
+    /// deciding what to re-read must not cost a read of everything.
+    pub mtime: Field,
+    pub len: Field,
 }
 
 /// One tantivy index, opened once and shared by every executable over it.
@@ -73,6 +85,8 @@ impl Store {
             path: field(&schema, "path")?,
             title: field(&schema, "title")?,
             body: field(&schema, "body")?,
+            mtime: field(&schema, "mtime")?,
+            len: field(&schema, "len")?,
         };
 
         Ok(Arc::new(Store {
@@ -117,14 +131,16 @@ impl Store {
 
 fn build_schema() -> Schema {
     let mut schema = Schema::builder();
-    schema.add_text_field("path", STRING | STORED);
+    schema.add_text_field("path", STRING | STORED | FAST);
     schema.add_text_field("title", TEXT | STORED);
     schema.add_text_field("body", TEXT | STORED);
+    schema.add_u64_field("mtime", STORED | FAST);
+    schema.add_u64_field("len", STORED | FAST);
     schema.build()
 }
 
 fn has_our_fields(existing: &Schema) -> bool {
-    ["path", "title", "body"]
+    ["path", "title", "body", "mtime", "len"]
         .iter()
         .all(|name| existing.get_field(name).is_ok())
 }

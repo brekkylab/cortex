@@ -8,11 +8,39 @@ use cortex::fs::Mount;
 
 use crate::exec::host_path;
 use crate::store::{Store, other};
-use tantivy::schema::Value as _;
 
 /// What a directory argument picks up. An allowlist and not a "skip what looks binary"
 /// guess, because a wrong guess here is a document that silently is not searchable.
 const INDEXED: &[&str] = &["md", "markdown", "txt", "rst"];
+
+/// What a file was, cheaply: when it changed and how big it was.
+///
+/// Enough to decide whether the index already has its bytes, and no more. mtime alone would
+/// miss an edit made within one timestamp tick, which some filesystems round to a second, so
+/// the length rides along.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Stamp {
+    pub mtime: u64,
+    pub len: u64,
+}
+
+impl Stamp {
+    /// Nanoseconds since the epoch, saturating. A clock before 1970 is a machine this has
+    /// nothing useful to say about, and `0` makes every such file look changed, which is the
+    /// safe direction.
+    fn of(meta: &std::fs::Metadata) -> Stamp {
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        Stamp {
+            mtime,
+            len: meta.len(),
+        }
+    }
+}
 
 /// Index the files named by `args`; a directory means everything under it.
 ///
@@ -64,15 +92,15 @@ fn index_all(store: &Store, targets: Vec<(PathBuf, PathBuf)>) -> std::io::Result
     let mut skipped = Vec::new();
     {
         let mut writer = store.writer();
-        for (workspace, host) in &files {
-            match std::fs::read_to_string(host) {
+        for file in &files {
+            match std::fs::read_to_string(&file.host) {
                 Ok(body) => {
-                    write_one(store, &mut writer, workspace, &body)?;
+                    write_one(store, &mut writer, &file.workspace, &body, file.stamp)?;
                     written += 1;
                 }
                 // A file that is not UTF-8 is not a failure of the call: the allowlist said
                 // what to look at, and this one turned out not to be text.
-                Err(e) => skipped.push(format!("{}: {e}", workspace.display())),
+                Err(e) => skipped.push(format!("{}: {e}", file.workspace.display())),
             }
         }
         writer.commit().map_err(other)?;
@@ -96,6 +124,7 @@ fn write_one(
     writer: &mut tantivy::IndexWriter,
     workspace: &Path,
     body: &str,
+    stamp: Stamp,
 ) -> std::io::Result<()> {
     let fields = store.fields();
     let id = workspace.to_string_lossy().into_owned();
@@ -110,8 +139,17 @@ fn write_one(
     doc.add_text(fields.path, &id);
     doc.add_text(fields.title, &title);
     doc.add_text(fields.body, body);
+    doc.add_u64(fields.mtime, stamp.mtime);
+    doc.add_u64(fields.len, stamp.len);
     writer.add_document(doc).map_err(other)?;
     Ok(())
+}
+
+/// One file the walk found: both its names, and what it was when it was looked at.
+pub(crate) struct Walked {
+    pub workspace: PathBuf,
+    pub host: PathBuf,
+    pub stamp: Stamp,
 }
 
 /// Every indexable file under `host`, paired with the workspace path it is known by.
@@ -119,14 +157,14 @@ fn write_one(
 /// Both paths are carried down together because only one of them can be walked and only the
 /// other can be stored: the walk needs the host's directory entries, and a result has to
 /// name a file the caller can open.
-fn collect(
-    workspace: &Path,
-    host: &Path,
-    out: &mut Vec<(PathBuf, PathBuf)>,
-) -> std::io::Result<()> {
+fn collect(workspace: &Path, host: &Path, out: &mut Vec<Walked>) -> std::io::Result<()> {
     let meta = std::fs::metadata(host)?;
     if meta.is_file() {
-        out.push((workspace.to_path_buf(), host.to_path_buf()));
+        out.push(Walked {
+            workspace: workspace.to_path_buf(),
+            host: host.to_path_buf(),
+            stamp: Stamp::of(&meta),
+        });
         return Ok(());
     }
     if !meta.is_dir() {
@@ -147,7 +185,19 @@ fn collect(
         if entry.file_type()?.is_dir() {
             collect(&child_workspace, &child_host, out)?;
         } else if indexable(&child_host) {
-            out.push((child_workspace, child_host));
+            // `metadata` and not `entry.metadata()`: a symlink should be measured by what it
+            // points at, which is also what will be read. One that points nowhere fails here
+            // and is left out of the walk entirely, so `sync` treats it as the absent file it
+            // is rather than as a file it merely could not read.
+            match std::fs::metadata(&child_host) {
+                Ok(meta) => out.push(Walked {
+                    workspace: child_workspace,
+                    host: child_host,
+                    stamp: Stamp::of(&meta),
+                }),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(())
@@ -194,25 +244,10 @@ pub(crate) async fn purge(store: &Arc<Store>, call: &ExecCall, paths: &[String])
 /// what a purge is worth: it is rare, and it is the operation whose job is to be exact.
 fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
     let fields = store.fields();
-    let searcher = store.searcher()?;
-
-    let held = searcher
-        .search(
-            &tantivy::query::AllQuery,
-            &tantivy::collector::DocSetCollector,
-        )
-        .map_err(other)?;
-
-    let mut doomed = Vec::new();
-    for address in held {
-        let doc: tantivy::TantivyDocument = searcher.doc(address).map_err(other)?;
-        let Some(path) = doc.get_first(fields.path).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if prefixes.iter().any(|prefix| under(path, prefix)) {
-            doomed.push(path.to_owned());
-        }
-    }
+    let doomed: Vec<String> = held_under(store, prefixes)?
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
 
     if doomed.is_empty() {
         return Ok("purged 0 document(s)\n".into());
@@ -260,6 +295,7 @@ pub(crate) async fn sync(
     call: &ExecCall,
     mount: Option<&dyn Mount>,
     paths: &[String],
+    force: bool,
 ) -> ExecResult {
     let mut targets = Vec::new();
     for arg in paths {
@@ -275,7 +311,7 @@ pub(crate) async fn sync(
     }
 
     let store = store.clone();
-    match tokio::task::spawn_blocking(move || sync_all(&store, targets)).await {
+    match tokio::task::spawn_blocking(move || sync_all(&store, targets, force)).await {
         Ok(Ok(report)) => ExecResult::ok(report),
         Ok(Err(e)) => ExecResult::failed(1, format!("sync: {e}\n")),
         Err(e) => ExecResult::failed(1, format!("sync: {e}\n")),
@@ -283,27 +319,44 @@ pub(crate) async fn sync(
 }
 
 /// One commit for both halves, so the index is never a tree that half-existed.
-fn sync_all(store: &Store, targets: Vec<(PathBuf, PathBuf)>) -> std::io::Result<String> {
+fn sync_all(
+    store: &Store,
+    targets: Vec<(PathBuf, PathBuf)>,
+    force: bool,
+) -> std::io::Result<String> {
     // What the tree has under each path. A path that is gone contributes nothing rather than
     // failing the call — that is the case this exists for.
     let mut files = Vec::new();
     let mut prefixes = Vec::new();
     for (workspace, host) in &targets {
         prefixes.push(workspace.to_string_lossy().into_owned());
-        match collect(workspace, host, &mut files) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+        // Only *this* path being absent means an empty tree under it. A `NotFound` from
+        // somewhere inside the walk is a file that went while it was being read, and taking
+        // that for "the whole path is gone" would delete everything the walk had not reached
+        // yet.
+        if !host.exists() {
+            continue;
         }
+        collect(workspace, host, &mut files)?;
     }
-    let walked: std::collections::BTreeSet<String> = files
-        .iter()
-        .map(|(workspace, _)| workspace.to_string_lossy().into_owned())
-        .collect();
+    // What the index holds under the same paths, and what it held it under.
+    let held: std::collections::BTreeMap<String, Stamp> =
+        held_under(store, &prefixes)?.into_iter().collect();
 
-    // What the index holds under the same paths, and is no longer there to hold.
-    let held = held_under(store, &prefixes)?;
-    let doomed: Vec<&String> = held.iter().filter(|path| !walked.contains(*path)).collect();
+    // Three groups, decided without opening a single file: what the index has never seen,
+    // what it has under a different stamp, and what it already holds the bytes of.
+    let mut doomed: std::collections::BTreeSet<&String> = held.keys().collect();
+    let mut to_read = Vec::new();
+    let mut unchanged = 0usize;
+    for file in &files {
+        let path = file.workspace.to_string_lossy().into_owned();
+        match held.get(&path) {
+            Some(stamp) if *stamp == file.stamp && !force => unchanged += 1,
+            _ => to_read.push(file),
+        }
+        doomed.remove(&path);
+    }
+    let doomed: Vec<String> = doomed.into_iter().cloned().collect();
 
     let fields = store.fields();
     let mut written = 0usize;
@@ -311,50 +364,70 @@ fn sync_all(store: &Store, targets: Vec<(PathBuf, PathBuf)>) -> std::io::Result<
     let removed = doomed.len();
     {
         let mut writer = store.writer();
-        for path in doomed {
+        for path in &doomed {
             writer.delete_term(tantivy::Term::from_field_text(fields.path, path));
         }
-        for (workspace, host) in &files {
-            match std::fs::read_to_string(host) {
+        for file in to_read {
+            match std::fs::read_to_string(&file.host) {
                 Ok(body) => {
-                    write_one(store, &mut writer, workspace, &body)?;
+                    write_one(store, &mut writer, &file.workspace, &body, file.stamp)?;
                     written += 1;
                 }
-                Err(e) => skipped.push(format!("{}: {e}", workspace.display())),
+                Err(e) => skipped.push(format!("{}: {e}", file.workspace.display())),
             }
         }
         writer.commit().map_err(other)?;
     }
 
-    let mut report = format!("synced {written} file(s), removed {removed} document(s)\n");
+    let mut report =
+        format!("synced {written} file(s), {unchanged} unchanged, removed {removed} document(s)\n");
     for line in &skipped {
         report.push_str(&format!("skipped {line}\n"));
     }
     Ok(report)
 }
 
-/// Every indexed path lying under one of `prefixes`.
+/// Every indexed path lying under one of `prefixes`, with the stamp it was written under.
 ///
-/// Shared by [`sync`] and [`purge`], which ask the same question of the index and differ only
-/// in what they do with the answer.
-fn held_under(store: &Store, prefixes: &[String]) -> std::io::Result<Vec<String>> {
-    let fields = store.fields();
+/// Read from the fast fields rather than from stored documents. A stored document carries the
+/// body, so asking every one of them for its path would decompress the whole corpus to answer
+/// a question about names; the columns hold exactly the three values this needs.
+///
+/// Shared by [`sync`] and [`purge`], which ask the index the same question and differ only in
+/// what they do with the answer.
+fn held_under(store: &Store, prefixes: &[String]) -> std::io::Result<Vec<(String, Stamp)>> {
     let searcher = store.searcher()?;
-    let held = searcher
-        .search(
-            &tantivy::query::AllQuery,
-            &tantivy::collector::DocSetCollector,
-        )
-        .map_err(other)?;
-
     let mut found = Vec::new();
-    for address in held {
-        let doc: tantivy::TantivyDocument = searcher.doc(address).map_err(other)?;
-        let Some(path) = doc.get_first(fields.path).and_then(|v| v.as_str()) else {
-            continue;
-        };
-        if prefixes.iter().any(|prefix| under(path, prefix)) {
-            found.push(path.to_owned());
+    let mut path = String::new();
+
+    for reader in searcher.segment_readers() {
+        let columns = reader.fast_fields();
+        let paths = columns
+            .str("path")
+            .map_err(other)?
+            .ok_or_else(|| std::io::Error::other("the index has no `path` column"))?;
+        let mtimes = columns.u64("mtime").map_err(other)?;
+        let lens = columns.u64("len").map_err(other)?;
+
+        // Alive only: a document replaced by a later ingest is still in the segment until a
+        // merge, and counting it would resurrect a path nothing holds any more.
+        for doc in reader.doc_ids_alive() {
+            let Some(ord) = paths.term_ords(doc).next() else {
+                continue;
+            };
+            path.clear();
+            if !paths.ord_to_str(ord, &mut path).map_err(other)? {
+                continue;
+            }
+            if prefixes.iter().any(|prefix| under(&path, prefix)) {
+                found.push((
+                    path.clone(),
+                    Stamp {
+                        mtime: mtimes.first(doc).unwrap_or(0),
+                        len: lens.first(doc).unwrap_or(0),
+                    },
+                ));
+            }
         }
     }
     Ok(found)

@@ -572,7 +572,8 @@ async fn sync_closes_the_gap_a_reingest_leaves() {
     assert_eq!(out.exit_code, 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "synced 2 file(s), removed 1 document(s)\n"
+        // The re-ingest above already wrote both, so an incremental sync reads neither.
+        "synced 0 file(s), 2 unchanged, removed 1 document(s)\n"
     );
 
     // Gone.
@@ -625,7 +626,7 @@ async fn syncing_a_path_that_is_gone_empties_it() {
     assert_eq!(out.exit_code, 0, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "synced 0 file(s), removed 2 document(s)\n"
+        "synced 0 file(s), 0 unchanged, removed 2 document(s)\n"
     );
 }
 
@@ -726,5 +727,100 @@ async fn the_top_level_help_lists_the_stores() {
         String::from_utf8_lossy(&after.stdout).contains("stores: notes"),
         "{:?}",
         String::from_utf8_lossy(&after.stdout)
+    );
+}
+
+/// The point of an incremental sync: a tree that did not move is not read again.
+#[tokio::test]
+async fn sync_reads_only_what_moved() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+
+    let still = execs
+        .invoke(&call(&["sync", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&still.stdout),
+        "synced 0 file(s), 2 unchanged, removed 0 document(s)\n"
+    );
+
+    std::fs::write(tree.path().join("notes/mounts.md"), "rewritten entirely\n").unwrap();
+    let moved = execs
+        .invoke(&call(&["sync", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&moved.stdout),
+        "synced 1 file(s), 1 unchanged, removed 0 document(s)\n",
+        "only the file that moved is read"
+    );
+}
+
+/// `--force` is the way out when a stamp cannot tell: an edit inside one timestamp tick that
+/// kept the file's length.
+#[tokio::test]
+async fn force_reads_everything() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    let out = execs
+        .invoke(&call(&["sync", "notes", "/notes", "--force"]), Some(&mount))
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "synced 2 file(s), 0 unchanged, removed 0 document(s)\n"
+    );
+}
+
+/// A file that cannot be read is an absent file, not a file to leave the old document for.
+///
+/// A dangling symlink is the case: it has an indexable name, so a walk that judged by name
+/// alone would keep the document it once had, and a search would answer with the body of a
+/// file nothing can open.
+#[tokio::test]
+async fn sync_removes_a_document_whose_file_became_unreadable() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+
+    let gone = tree.path().join("notes/ownership.md");
+    std::fs::remove_file(&gone).unwrap();
+    std::os::unix::fs::symlink("/nonexistent/target", &gone).unwrap();
+
+    let out = execs
+        .invoke(&call(&["sync", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "synced 0 file(s), 1 unchanged, removed 1 document(s)\n"
+    );
+
+    let found = execs
+        .invoke(&call(&["search", "notes", "ownership"]), None)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&found.stdout).contains("no matches"),
+        "the body of an unopenable file is still searchable: {:?}",
+        String::from_utf8_lossy(&found.stdout)
     );
 }

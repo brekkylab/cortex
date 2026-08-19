@@ -211,6 +211,8 @@ enum Command {
     /// What a second `ingest` cannot do: it picks up what was added and replaces what
     /// changed, but leaves a document behind for a file that is gone. This removes those
     /// too, so the index says what the tree says.
+    ///
+    /// Only files whose size or modification time moved are read again.
     Sync {
         /// Which index to bring up to date.
         #[arg(value_name = "STORE")]
@@ -220,6 +222,13 @@ enum Command {
         /// means everything the index held under it goes.
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<String>,
+
+        /// Re-read every file, not only the ones whose size or modification time moved.
+        ///
+        /// What to reach for when a file was edited within one timestamp tick and kept its
+        /// length, which some filesystems round to a second.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Take documents back out of a store, by the paths they were ingested under.
@@ -275,8 +284,12 @@ impl Executable for Index {
                     Ok(store) => search::run(&store, limit, &query.join(" ")).await,
                     Err(e) => ExecResult::failed(1, format!("{e}\n")),
                 },
-                Command::Sync { store, paths } => match self.existing(&store) {
-                    Ok(store) => ingest::sync(&store, call, mount, &paths).await,
+                Command::Sync {
+                    store,
+                    paths,
+                    force,
+                } => match self.existing(&store) {
+                    Ok(store) => ingest::sync(&store, call, mount, &paths, force).await,
                     Err(e) => ExecResult::failed(1, format!("{e}\n")),
                 },
                 Command::Purge { store, paths } => match self.existing(&store) {
