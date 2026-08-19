@@ -58,8 +58,8 @@ use tokio::{
 use crate::{
     assets::{self, BootRoot, SessionImage},
     contract::{
-        BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV,
-        WORKFS_ENV,
+        BASE_FORMAT_ENV, BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV,
+        SESSION_IMAGE_ENV, WORKFS_ENV,
     },
     helper::boot_helper,
 };
@@ -115,7 +115,7 @@ impl Guest {
         let session = tokio::task::spawn_blocking(SessionImage::create)
             .await
             .map_err(|e| anyhow::anyhow!("formatting the session image: {e}"))??;
-        let boot_root = BootRoot::create()?;
+        let boot_root = BootRoot::create(&base.spec)?;
 
         let socket = Socket::bind()?;
 
@@ -123,7 +123,8 @@ impl Guest {
         command
             .arg(BOOT_ARG)
             .env(KERNEL_ENV, &kernel)
-            .env(BASE_IMAGE_ENV, &base)
+            .env(BASE_IMAGE_ENV, &base.path)
+            .env(BASE_FORMAT_ENV, base.format.as_str())
             .env(SESSION_IMAGE_ENV, session.path())
             .env(BOOT_ROOT_ENV, boot_root.path())
             .env(CHANNEL_ENV, &socket.path)

@@ -44,6 +44,12 @@
 //! the guest is up; they are gone when it is released, because the image is deleted with
 //! it. The base image is shared, never written, and provisioned once — see [`assets`].
 //!
+//! What that base *is* comes from the environment: an OCI reference
+//! ([`IMAGE_ENV`](assets::IMAGE_ENV)) is pulled from a registry, and a caller who names none
+//! gets the pinned rootfs the crate falls back to. Either way it reaches the guest as one
+//! read-only disk, and what the image says about running a process in it reaches the commands
+//! — see [`ImageSpec`](contract::ImageSpec).
+//!
 //! The tree is optional and comes from the client, not the environment: an `init` names it
 //! as a `file://` URL, and what that names is a directory on this host — mounted there by
 //! whoever built it, which is not this crate's business. The boot shares it (see

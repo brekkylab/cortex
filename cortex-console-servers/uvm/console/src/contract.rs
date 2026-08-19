@@ -22,6 +22,8 @@
 //! size-limited and rejects a newline. Nothing that could grow is here — the session
 //! itself arrives on [`PORT_NAME`] as protocol frames.
 
+use serde::{Deserialize, Serialize};
+
 /// Where a boot writes the guest binary in the boot root, and therefore the path libkrun
 /// execs. Also where the guest puts a copy of itself after its pivot, which is what the
 /// delegated names end up symlinked to.
@@ -70,6 +72,15 @@ pub const WORKFS_ENV: &str = "CORTEX_UVM_WORKFS";
 /// file, the other has a device.
 pub const BASE_IMAGE_ENV: &str = "CORTEX_UVM_BASE_IMAGE";
 
+/// How the base image is laid out on the host, spelled as one of [`BaseFormat`]'s names.
+///
+/// A boot is told rather than left to guess from a path: a registry pull's base is a VMDK
+/// descriptor stitching per-layer EROFS blobs, where a tarball's is a single raw EROFS, and
+/// the guest mounts both as `erofs` — the difference is only what the VMM has to read.
+///
+/// Also the caller's knob for an image built elsewhere, alongside [`BASE_IMAGE_ENV`].
+pub const BASE_FORMAT_ENV: &str = "CORTEX_UVM_BASE_FORMAT";
+
 /// The session's writable image, as a host path.
 pub const SESSION_IMAGE_ENV: &str = "CORTEX_UVM_SESSION_IMAGE";
 
@@ -92,3 +103,92 @@ pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
 /// The virtio-fs tag the tree is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
 pub const WORKFS_TAG: &str = "cortexws";
+
+/// How the read-only base image is laid out on the host — the value of [`BASE_FORMAT_ENV`],
+/// and what a boot turns into a disk format.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BaseFormat {
+    /// A single raw image: what a rootfs tarball is encoded to.
+    #[default]
+    Raw,
+    /// A VMDK descriptor stitching per-layer blobs into one disk: what a registry pull's
+    /// layered materialization produces.
+    Vmdk,
+}
+
+impl BaseFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BaseFormat::Raw => "raw",
+            BaseFormat::Vmdk => "vmdk",
+        }
+    }
+
+    /// Parse the environment's spelling. An unrecognised one is an error rather than the
+    /// default, which would fail at the guest's mount instead — several seconds and a kernel
+    /// log away from the mistake.
+    pub fn parse(spelling: &str) -> anyhow::Result<BaseFormat> {
+        match spelling {
+            "raw" => Ok(BaseFormat::Raw),
+            "vmdk" => Ok(BaseFormat::Vmdk),
+            other => anyhow::bail!("{BASE_FORMAT_ENV}: {other} is not `raw` or `vmdk`"),
+        }
+    }
+}
+
+/// Where a boot writes [`ImageSpec`] in the boot root, and the path the guest reads it from.
+///
+/// A file rather than another environment value, because the environment here *is* the
+/// kernel command line: libkrun passes it as `KRUN_ENV=…`, which is size-limited and cannot
+/// carry a space, and an image's `ENV` is neither short nor free of them. The boot root is
+/// already shared over virtio-fs, so a file in it costs nothing — and the guest reads it
+/// before the pivot detaches that root.
+pub const IMAGE_SPEC_PATH: &str = "/.cortex-image";
+
+/// What the base image says about running a process in it, as BSON at [`IMAGE_SPEC_PATH`].
+///
+/// The far end is `cortex-uvm-guest`'s `contract::ImageSpec`, which **has to change with
+/// this one** — the two crates are built for different targets, so the compiler cannot see a
+/// mismatch. BSON because it is the codec both ends already carry for the console wire.
+///
+/// Two fields of an OCI config, and deliberately not the rest. `Entrypoint` and `Cmd` have
+/// nobody to instruct: a command's argv comes from the client. `ExposedPorts` and `Volumes`
+/// describe things this backend does not have. `User` is the one left out on purpose rather
+/// than for want of a use — running as the image's user changes who owns writes to a tree
+/// shared over virtio-fs, and that is a decision with a failure mode too quiet to make as a
+/// side effect of reading a config.
+///
+/// A base with no config — the rootfs tarball — gets the default, which says nothing and
+/// leaves every fallback in place.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ImageSpec {
+    /// `KEY=VALUE`, as the image spelled them.
+    pub env: Vec<String>,
+
+    /// Where the image expects a process to stand, if it said so.
+    pub working_dir: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every spelling this writes is one it reads. The two halves are a boot apart — a server
+    /// writes the name and a child in another process parses it — so a variant added with one
+    /// of them updated fails at a mount, in a kernel log, seconds later.
+    #[test]
+    fn a_base_format_round_trips_through_its_name() {
+        for format in [BaseFormat::Raw, BaseFormat::Vmdk] {
+            assert_eq!(
+                BaseFormat::parse(format.as_str()).expect("its own name"),
+                format
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_base_format_is_refused() {
+        assert!(BaseFormat::parse("qcow2").is_err());
+        assert!(BaseFormat::parse("").is_err());
+    }
+}

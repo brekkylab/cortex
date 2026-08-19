@@ -16,13 +16,18 @@
 //! virtio-fs  root         the boot root, holding the guest binary and nothing else
 //! virtio-fs  cortexws     a cortex WorkFs, served straight out of this process
 //! virtio-blk /dev/vda     the session's ext4 image — the overlay's upper
-//! virtio-blk /dev/vdb     the base EROFS image, read-only — the overlay's lower
+//! virtio-blk /dev/vdb     the base image, read-only — the overlay's lower
 //! virtio-con cortex-…     the console session, the other end of it a socket on the host
 //! ```
 //!
 //! The two disks are attached in that order because attach order is what fixes the guest
 //! names, and the guest is told which is which by name — see
 //! [`GUEST_UPPER_DEV`](crate::contract::GUEST_UPPER_DEV).
+//!
+//! The base is attached in the format the server said ([`base_format`]): raw for an image
+//! encoded from a tarball, VMDK for a registry pull's, whose descriptor stitches one disk out
+//! of a layer per file. The guest mounts either as `erofs` — the stitching is a host-side
+//! detail that stops at the block layer.
 //!
 //! The tree is a **host directory**, shared over virtio-fs like any other. Whatever it is
 //! made of — a cortex `WorkFs` of several stores, a plain project directory — was realized
@@ -52,9 +57,9 @@ use std::{
 use msb_krun::{DiskImageFormat, VmBuilder};
 
 use crate::contract::{
-    BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV,
-    KERNEL_ENV, LOWER_ENV, MEMORY_ENV, PORT_NAME, SESSION_IMAGE_ENV, SHARE_ENV, UPPER_ENV,
-    VCPUS_ENV, WORKFS_ENV, WORKFS_TAG,
+    BASE_FORMAT_ENV, BASE_IMAGE_ENV, BOOT_ROOT_ENV, BaseFormat, CHANNEL_ENV, GUEST_BIN_PATH,
+    GUEST_LOWER_DEV, GUEST_UPPER_DEV, KERNEL_ENV, LOWER_ENV, MEMORY_ENV, PORT_NAME,
+    SESSION_IMAGE_ENV, SHARE_ENV, UPPER_ENV, VCPUS_ENV, WORKFS_ENV, WORKFS_TAG,
 };
 
 /// Guest vCPUs when nothing says otherwise. Two rather than one because a command that
@@ -72,6 +77,7 @@ pub fn run() -> anyhow::Result<Infallible> {
     let boot_root = required(BOOT_ROOT_ENV)?;
     let upper = required(SESSION_IMAGE_ENV)?;
     let lower = required(BASE_IMAGE_ENV)?;
+    let lower_format = base_format()?;
     let channel = required(CHANNEL_ENV)?;
 
     // The console port is a descriptor, and this is where it comes from: one connection
@@ -89,7 +95,7 @@ pub fn run() -> anyhow::Result<Infallible> {
         .kernel(|k| k.krunfw_path(&kernel))
         .fs(|fs| fs.root(&boot_root))
         .disk(|d| d.path(&upper).format(DiskImageFormat::Raw))
-        .disk(|d| d.path(&lower).read_only(true).format(DiskImageFormat::Raw))
+        .disk(|d| d.path(&lower).read_only(true).format(lower_format))
         // The same descriptor both ways: a socket is bidirectional, and the port the
         // guest opens is one thing rather than a pair.
         .console(|c| c.port(PORT_NAME, port, port));
@@ -139,6 +145,23 @@ fn workfs() -> anyhow::Result<Option<String>> {
         "{WORKFS_ENV} has to be an absolute path, and is {path}"
     );
     Ok(Some(path))
+}
+
+/// How to attach the base image, which the server resolved and named here.
+///
+/// Unset means `raw`: a boot that predates the variable, or a caller driving this role
+/// directly with a tarball-built image. Unlike [`number`] a bad value is refused rather than
+/// defaulted — a VMDK read as raw bytes is not a filesystem, and the guest's mount is a worse
+/// place to find that out.
+fn base_format() -> anyhow::Result<DiskImageFormat> {
+    let format = match std::env::var(BASE_FORMAT_ENV) {
+        Ok(spelling) if !spelling.is_empty() => BaseFormat::parse(&spelling)?,
+        _ => BaseFormat::default(),
+    };
+    Ok(match format {
+        BaseFormat::Raw => DiskImageFormat::Raw,
+        BaseFormat::Vmdk => DiskImageFormat::Vmdk,
+    })
 }
 
 fn required(key: &str) -> anyhow::Result<PathBuf> {

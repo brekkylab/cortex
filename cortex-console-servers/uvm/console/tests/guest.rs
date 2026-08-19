@@ -285,6 +285,68 @@ async fn commands_run_in_a_guest_of_their_own() {
     assert_eq!(out.size, 16);
 }
 
+/// An OCI image off a registry is a base like any other, and what it says about running a
+/// process in it reaches the process.
+///
+/// Two claims, and the second is the one worth the boot. That `python3` exists proves the
+/// image really is the root — no rootfs tarball has it. That `PYTHON_VERSION` is set proves
+/// the image's `ENV` was replayed: it is declared nowhere but the image config, so a shell
+/// that can read it read what the config said.
+///
+/// The values asserted are the ones this image's config actually carries, which is four
+/// variables and no more — an image that states a `LANG` or a `WORKDIR` is common enough to
+/// assume and this one does neither.
+///
+/// Debian-based on purpose. `mount(2)` is called directly precisely so a base whose `mount`
+/// binary is util-linux's works, and this is the test that would fail if that ever became a
+/// spawned command again. The guest binary being musl-static is the other half — it runs on a
+/// glibc image without sharing a libc with it.
+///
+/// `-slim` for the download, not for the coverage: it is the same Debian userland as the full
+/// tag with a few hundred megabytes less to pull the first time.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and a registry pull"]
+async fn an_oci_image_is_a_base_and_its_environment_is_the_command_s() {
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_IMAGE", "python:3.13-slim")]).await;
+
+    let out = fx.output("python3 -c 'print(1 + 1)'").await;
+    assert_eq!(
+        out.stdout,
+        b"2\n",
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = fx.output(r#"printf '%s' "$PYTHON_VERSION""#).await;
+    assert!(
+        out.stdout.starts_with(b"3.13."),
+        "PYTHON_VERSION came out as {:?} — the image's ENV did not reach the command",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The delegated names went on the end of whatever `PATH` was in force, rather than in place
+    // of it.
+    let path = fx.output(r#"printf '%s' "$PATH""#).await.stdout;
+    let path = String::from_utf8(path).expect("a PATH that is text");
+    assert!(
+        path.contains("/cortex-console-"),
+        "PATH is {path:?} — the delegated names are not on it"
+    );
+
+    // Which is what being on it is for: a name this process answers is callable from inside an
+    // image that knows nothing about it.
+    assert_eq!(
+        fx.output("report one two").await.stdout,
+        b"report|one,two\n"
+    );
+
+    // And `python3` is still the image's, not something the appended directory shadowed.
+    assert_eq!(
+        fx.output("command -v python3").await.stdout,
+        b"/usr/local/bin/python3\n"
+    );
+}
+
 /// The part that is not a remote `exec`: a name whose behaviour lives in *this* process is
 /// runnable by a command inside the guest, and composes with the shell like a program.
 ///
