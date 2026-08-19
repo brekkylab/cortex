@@ -1058,3 +1058,40 @@ async fn a_file_that_stopped_being_text_loses_its_document() {
         .unwrap();
     assert!(String::from_utf8_lossy(&found.stdout).contains("no matches"));
 }
+
+/// A limit of zero is a usage error, not a panic.
+///
+/// `TopDocs::with_limit` asserts on `0`, and the limit comes straight from a caller: typed as
+/// `NonZeroUsize` it never reaches the collector, and clap says so in the shape it says
+/// everything else. What this pins is that a delegated call cannot be made to panic inside
+/// tantivy by an argument.
+#[tokio::test]
+async fn a_limit_of_zero_is_a_usage_error() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+
+    let out = execs
+        .invoke(&call(&["search", "notes", "-n", "0", "kernel"]), None)
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 2, "{}", String::from_utf8_lossy(&out.stderr));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("0"), "{said}");
+    assert!(
+        !said.contains("panicked") && !said.contains("tantivy"),
+        "an argument reached a collector: {said}"
+    );
+
+    // And the search still works either side of it.
+    let ok = execs
+        .invoke(&call(&["search", "notes", "-n", "1", "kernel"]), None)
+        .await
+        .unwrap();
+    assert_eq!(ok.exit_code, 0, "{}", String::from_utf8_lossy(&ok.stderr));
+}

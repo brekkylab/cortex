@@ -1,6 +1,7 @@
 //! `<name> search [-n N] <query>...` — ask the index.
 
 use std::fmt::Write as _;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use cortex::exec::ExecResult;
@@ -10,7 +11,12 @@ use tantivy::schema::Value as _;
 
 use crate::store::{Store, other};
 
-pub(crate) const DEFAULT_LIMIT: usize = 10;
+/// How many hits a search answers with when nothing says otherwise.
+///
+/// `NonZeroUsize` because tantivy's `TopDocs::with_limit` asserts on `0`, and the limit comes
+/// from a caller: parsed as this, `-n 0` is a usage error clap renders rather than a panic
+/// from inside a collector.
+pub(crate) const DEFAULT_LIMIT: NonZeroUsize = NonZeroUsize::new(10).expect("10 is not zero");
 /// How much of a body a hit shows. Enough to judge a result by, short enough that ten of
 /// them still fit in something an agent will read.
 const SNIPPET: usize = 240;
@@ -28,7 +34,7 @@ pub struct Hit {
 /// Takes no mount: the corpus was read at ingest time, and a query is answered from the
 /// index alone. `query` arrives already joined — a shell has split the words, and
 /// `<name> search rust ownership` is what a caller writes when they mean the phrase.
-pub(crate) async fn run(store: &Arc<Store>, limit: usize, query: &str) -> ExecResult {
+pub(crate) async fn run(store: &Arc<Store>, limit: NonZeroUsize, query: &str) -> ExecResult {
     let store = store.clone();
     let query = query.to_owned();
     match tokio::task::spawn_blocking(move || query_for(&store, &query, limit)).await {
@@ -38,7 +44,7 @@ pub(crate) async fn run(store: &Arc<Store>, limit: usize, query: &str) -> ExecRe
     }
 }
 
-fn query_for(store: &Store, query: &str, limit: usize) -> std::io::Result<Vec<Hit>> {
+fn query_for(store: &Store, query: &str, limit: NonZeroUsize) -> std::io::Result<Vec<Hit>> {
     let fields = store.fields();
     let searcher = store.searcher()?;
 
@@ -50,7 +56,7 @@ fn query_for(store: &Store, query: &str, limit: usize) -> std::io::Result<Vec<Hi
     // `order_by_score` and not the bare `TopDocs`: in tantivy 0.26 `TopDocs` is the *builder*
     // and the terminal method is what implements `Collector`.
     let found: Vec<(tantivy::Score, tantivy::DocAddress)> = searcher
-        .search(&query, &TopDocs::with_limit(limit).order_by_score())
+        .search(&query, &TopDocs::with_limit(limit.get()).order_by_score())
         .map_err(other)?;
 
     let mut hits = Vec::with_capacity(found.len());

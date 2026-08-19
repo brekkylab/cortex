@@ -10,6 +10,8 @@ use cortex::exec::{ExecCall, ExecResult, Executable};
 use cortex::fs::Mount;
 use futures_core::future::BoxFuture;
 
+use std::num::NonZeroUsize;
+
 use crate::search::DEFAULT_LIMIT;
 use crate::store::Store;
 use crate::{ingest, search};
@@ -219,7 +221,7 @@ enum Command {
 
         /// How many hits to answer with.
         #[arg(short = 'n', long = "limit", value_name = "N", default_value_t = DEFAULT_LIMIT)]
-        limit: usize,
+        limit: NonZeroUsize,
 
         /// The words to look for, joined — a shell has already split them.
         #[arg(required = true, value_name = "QUERY")]
