@@ -51,6 +51,24 @@ pub struct Store {
     ///
     /// Kept once made, because two overlapping ingests of one store must queue on this lock
     /// rather than race for tantivy's.
+    ///
+    /// # Kept for the process, and what that costs
+    ///
+    /// Nothing puts it back, so the first *write* takes this store's lock for as long as the
+    /// process lives: a console that ingests once is a console no other process can write
+    /// that store under, though any number may read it.
+    ///
+    /// Releasing it is `*held = None` after the commit in [`writer`](Self::writer)'s callers,
+    /// and costs about 20ms a write call (a writer is an arena and a merge thread; measured
+    /// against a `list`, which builds none). What it buys is smaller than it looks: tantivy
+    /// allows one writer at a time whatever this does, so releasing turns a *permanent*
+    /// exclusion into a *transient* one. A second writer still has to find the gap, which
+    /// means retry and backoff on its side.
+    ///
+    /// So the question is not the 20ms, it is whether anything else writes the same store. A
+    /// console that owns its indexes wants this as it is; a person running the standalone
+    /// binary against a store a session is holding wants it released. There is no consumer
+    /// yet to say which, and it is one line either way when there is.
     writer: Mutex<Option<IndexWriter>>,
     reader: IndexReader,
     fields: Fields,

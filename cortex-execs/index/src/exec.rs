@@ -38,8 +38,11 @@ pub struct Index {
     /// Stores opened so far, by name.
     ///
     /// Cached because tantivy allows exactly one `IndexWriter` per index: opening per call
-    /// would make two overlapping ingests of one store collide on its lock file, and would
-    /// re-pay the writer heap every time.
+    /// would make two overlapping ingests of one store collide on its lock file.
+    ///
+    /// Nothing evicts, so a session that touches many stores keeps a reader (and its mapped
+    /// segments) for each. That is the same question [`Store::writer`] answers about the
+    /// writer, and has the same answer for now: no consumer has said it matters.
     open: Mutex<BTreeMap<String, Arc<Store>>>,
 }
 

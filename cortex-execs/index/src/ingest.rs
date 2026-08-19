@@ -33,6 +33,15 @@ pub(crate) struct Stamp {
 }
 
 impl Stamp {
+    /// Whether the index already holds this file's bytes.
+    ///
+    /// `0` is "no mtime", which some filesystems and some errors give, and it must never read
+    /// as a match: two files that both failed to report one would otherwise look identical
+    /// forever. Equality alone would say they do.
+    fn unchanged_from(&self, current: &Stamp) -> bool {
+        self.mtime != 0 && current.mtime != 0 && self == current
+    }
+
     /// Nanoseconds since the epoch, saturating. A clock before 1970 is a machine this has
     /// nothing useful to say about, and `0` makes every such file look changed, which is the
     /// safe direction.
@@ -91,24 +100,17 @@ pub(crate) async fn run(
 /// One commit for the call and not one per file — a commit is an fsync and a segment, so
 /// per-file would be both slow and a pile of tiny segments for the merge policy to clean up.
 fn index_all(store: &Store, targets: Vec<(PathBuf, PathBuf)>) -> std::io::Result<String> {
-    let mut files = Vec::new();
+    let mut walk = Walk::default();
     for (workspace, host) in targets {
-        collect(&workspace, &host, &mut files)?;
+        collect(&workspace, &host, &mut walk)?;
     }
+    walk.dedup();
 
     let mut written = 0usize;
-    let mut skipped = Vec::new();
+    let mut skipped = walk.declined;
     {
         let mut writer = store.writer()?;
-        for file in &files {
-            if file.stamp.len > MAX_BODY {
-                skipped.push(format!(
-                    "{}: {} bytes, over the {MAX_BODY} this reads",
-                    file.workspace.display(),
-                    file.stamp.len
-                ));
-                continue;
-            }
+        for file in &walk.files {
             match std::fs::read_to_string(&file.host) {
                 Ok(body) => {
                     write_one(store, &mut writer, &file.workspace, &body, file.stamp)?;
@@ -168,19 +170,74 @@ pub(crate) struct Walked {
     pub stamp: Stamp,
 }
 
+/// What a walk came back with.
+///
+/// **A file this declines to read is an absent file**, and that is one rule rather than a case
+/// per reason. A dangling symlink, a file too large to hold, one whose bytes turn out not to
+/// be text: each ends with no document written, so each must end with no document *held* —
+/// otherwise the index goes on asserting the contents of a file nothing will open again.
+/// `declined` is what says so out loud, since silence and success read the same to a caller.
+#[derive(Default)]
+pub(crate) struct Walk {
+    pub files: Vec<Walked>,
+    pub declined: Vec<String>,
+}
+
+impl Walk {
+    /// Admit a file, or decline it for a reason a caller can act on.
+    ///
+    /// The size cap lives here and not at the read, so that "too large" and "not there" leave
+    /// the walk by the same door: both are files this will not have a document for.
+    fn take(&mut self, workspace: &Path, host: &Path, meta: &std::fs::Metadata) {
+        if meta.len() > MAX_BODY {
+            self.declined.push(format!(
+                "{}: {} bytes, over the {MAX_BODY} this reads",
+                workspace.display(),
+                meta.len()
+            ));
+            return;
+        }
+        self.files.push(Walked {
+            workspace: workspace.to_path_buf(),
+            host: host.to_path_buf(),
+            stamp: Stamp::of(meta),
+        });
+    }
+
+    /// Every path the walk found a readable file at.
+    ///
+    /// What `sync` measures the index against: a declined path is not here, so what the index
+    /// holds for it falls out as something to remove, which is the point.
+    fn seen(&self) -> std::collections::BTreeSet<String> {
+        self.files
+            .iter()
+            .map(|f| f.workspace.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Drop what two overlapping arguments found twice.
+    ///
+    /// `ingest notes /a /a/b` walks `/a/b` under both, and without this the same file is
+    /// written twice in one batch and counted twice in the report. The documents come out
+    /// right either way, because a write is a delete and an add; the count does not.
+    fn dedup(&mut self) {
+        let mut seen = std::collections::BTreeSet::new();
+        self.files
+            .retain(|f| seen.insert(f.workspace.to_string_lossy().into_owned()));
+        self.declined.sort();
+        self.declined.dedup();
+    }
+}
+
 /// Every indexable file under `host`, paired with the workspace path it is known by.
 ///
 /// Both paths are carried down together because only one of them can be walked and only the
 /// other can be stored: the walk needs the host's directory entries, and a result has to
 /// name a file the caller can open.
-fn collect(workspace: &Path, host: &Path, out: &mut Vec<Walked>) -> std::io::Result<()> {
+fn collect(workspace: &Path, host: &Path, out: &mut Walk) -> std::io::Result<()> {
     let meta = std::fs::metadata(host)?;
     if meta.is_file() {
-        out.push(Walked {
-            workspace: workspace.to_path_buf(),
-            host: host.to_path_buf(),
-            stamp: Stamp::of(&meta),
-        });
+        out.take(workspace, host, &meta);
         return Ok(());
     }
     if !meta.is_dir() {
@@ -206,13 +263,15 @@ fn collect(workspace: &Path, host: &Path, out: &mut Vec<Walked>) -> std::io::Res
             // and is left out of the walk entirely, so `sync` treats it as the absent file it
             // is rather than as a file it merely could not read.
             match std::fs::metadata(&child_host) {
-                Ok(meta) => out.push(Walked {
-                    workspace: child_workspace,
-                    host: child_host,
-                    stamp: Stamp::of(&meta),
-                }),
+                Ok(meta) => out.take(&child_workspace, &child_host, &meta),
+                // Not there at all: a dangling symlink, or a file that went while this was
+                // walking. Absent, and so not among what the tree has.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+                // There but not readable. Declined rather than fatal: one file nobody can
+                // open should not end a walk over everything beside it.
+                Err(e) => out
+                    .declined
+                    .push(format!("{}: {e}", child_workspace.display())),
             }
         }
     }
@@ -260,6 +319,9 @@ pub(crate) async fn purge(store: &Arc<Store>, call: &ExecCall, paths: &[String])
 /// what a purge is worth: it is rare, and it is the operation whose job is to be exact.
 fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
     let fields = store.fields();
+    // The writer before the read, for the reason `sync_all` gives: deciding what to remove
+    // and removing it must not have another writer's commit between them.
+    let mut writer = store.writer()?;
     let doomed: Vec<String> = held_under(store, prefixes)?
         .into_iter()
         .map(|(path, _)| path)
@@ -271,7 +333,6 @@ fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
 
     let removed = doomed.len();
     {
-        let mut writer = store.writer()?;
         for path in &doomed {
             writer.delete_term(tantivy::Term::from_field_text(fields.path, path));
         }
@@ -340,9 +401,7 @@ fn sync_all(
     targets: Vec<(PathBuf, PathBuf)>,
     force: bool,
 ) -> std::io::Result<String> {
-    // What the tree has under each path. A path that is gone contributes nothing rather than
-    // failing the call — that is the case this exists for.
-    let mut files = Vec::new();
+    let mut walk = Walk::default();
     let mut prefixes = Vec::new();
     for (workspace, host) in &targets {
         prefixes.push(workspace.to_string_lossy().into_owned());
@@ -353,8 +412,17 @@ fn sync_all(
         if !host.exists() {
             continue;
         }
-        collect(workspace, host, &mut files)?;
+        collect(workspace, host, &mut walk)?;
     }
+    walk.dedup();
+    let seen = walk.seen();
+
+    // The writer first, and the index read under it. The other order leaves a window in which
+    // another writer commits between deciding what to remove and removing it, so a document
+    // that arrived in between is deleted on the strength of a state it was never in.
+    let fields = store.fields();
+    let mut writer = store.writer()?;
+
     // What the index holds under the same paths, and what it held it under.
     let held: std::collections::BTreeMap<String, Stamp> =
         held_under(store, &prefixes)?.into_iter().collect();
@@ -364,44 +432,49 @@ fn sync_all(
     let mut doomed: std::collections::BTreeSet<&String> = held.keys().collect();
     let mut to_read = Vec::new();
     let mut unchanged = 0usize;
-    for file in &files {
+    for file in &walk.files {
         let path = file.workspace.to_string_lossy().into_owned();
         match held.get(&path) {
-            Some(stamp) if *stamp == file.stamp && !force => unchanged += 1,
+            Some(stamp) if stamp.unchanged_from(&file.stamp) && !force => unchanged += 1,
             _ => to_read.push(file),
         }
         doomed.remove(&path);
     }
-    let doomed: Vec<String> = doomed.into_iter().cloned().collect();
+    let mut doomed: Vec<String> = doomed.into_iter().cloned().collect();
 
-    let fields = store.fields();
     let mut written = 0usize;
-    let mut skipped = Vec::new();
-    let removed = doomed.len();
-    {
-        let mut writer = store.writer()?;
-        for path in &doomed {
-            writer.delete_term(tantivy::Term::from_field_text(fields.path, path));
-        }
-        for file in to_read {
-            if file.stamp.len > MAX_BODY {
-                skipped.push(format!(
-                    "{}: {} bytes, over the {MAX_BODY} this reads",
-                    file.workspace.display(),
-                    file.stamp.len
-                ));
-                continue;
+    let mut skipped = walk.declined;
+    for file in to_read {
+        let path = file.workspace.to_string_lossy().into_owned();
+        match std::fs::read_to_string(&file.host) {
+            Ok(body) => {
+                write_one(store, &mut writer, &file.workspace, &body, file.stamp)?;
+                written += 1;
             }
-            match std::fs::read_to_string(&file.host) {
-                Ok(body) => {
-                    write_one(store, &mut writer, &file.workspace, &body, file.stamp)?;
-                    written += 1;
+            // Read at the walk, not readable at the read: the same rule as everything else
+            // this declines. A document the index holds for it would be the contents of a
+            // file that cannot be opened.
+            Err(e) => {
+                skipped.push(format!("{path}: {e}"));
+                if held.contains_key(&path) {
+                    doomed.push(path);
                 }
-                Err(e) => skipped.push(format!("{}: {e}", file.workspace.display())),
             }
         }
-        writer.commit().map_err(other)?;
     }
+
+    // Anything declined by the walk is absent, so what the index still holds for it goes.
+    for path in seen_removals(&held, &seen, &doomed) {
+        doomed.push(path);
+    }
+    doomed.sort();
+    doomed.dedup();
+
+    let removed = doomed.len();
+    for path in &doomed {
+        writer.delete_term(tantivy::Term::from_field_text(fields.path, path));
+    }
+    writer.commit().map_err(other)?;
 
     let mut report =
         format!("synced {written} file(s), {unchanged} unchanged, removed {removed} document(s)\n");
@@ -409,6 +482,21 @@ fn sync_all(
         report.push_str(&format!("skipped {line}\n"));
     }
     Ok(report)
+}
+
+/// Documents held for a path the walk found nothing readable at.
+///
+/// `doomed` already has everything the walk did not reach at all; this is the other half —
+/// a path that *was* reached and declined, which is not in `seen` either.
+fn seen_removals(
+    held: &std::collections::BTreeMap<String, Stamp>,
+    seen: &std::collections::BTreeSet<String>,
+    doomed: &[String],
+) -> Vec<String> {
+    held.keys()
+        .filter(|path| !seen.contains(*path) && !doomed.contains(path))
+        .cloned()
+        .collect()
 }
 
 /// Every indexed path lying under one of `prefixes`, with the stamp it was written under.

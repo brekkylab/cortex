@@ -955,3 +955,106 @@ async fn a_file_past_the_size_cap_is_reported() {
         "the one left out is named: {said}"
     );
 }
+
+/// Two arguments that overlap walk the same file twice. The documents come out right either
+/// way, because a write is a delete and an add; the count is what lies.
+#[tokio::test]
+async fn overlapping_paths_are_counted_once() {
+    let (tree, root) = fixture();
+    std::fs::create_dir(tree.path().join("notes/sub")).unwrap();
+    std::fs::write(tree.path().join("notes/sub/deep.md"), "under both\n").unwrap();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    let out = execs
+        .invoke(
+            &call(&["ingest", "notes", "/notes", "/notes/sub"]),
+            Some(&mount),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "indexed 3 file(s)\n",
+        "three files, one of them reachable two ways"
+    );
+
+    let listed = execs.invoke(&call(&["list"]), None).await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("notes\t3 document(s)"),
+        "the report and the store agree: {:?}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+}
+
+/// One rule for every file this declines to read: it is an absent file.
+///
+/// A file that grows past the cap is the case a size limit introduces, and it has to end the
+/// same way a dangling symlink does. Otherwise the index asserts the contents of a file it
+/// has decided never to open.
+#[tokio::test]
+async fn a_file_that_grew_past_the_cap_loses_its_document() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    std::fs::write(
+        tree.path().join("notes/ownership.md"),
+        vec![b'x'; 9 * 1024 * 1024],
+    )
+    .unwrap();
+
+    let out = execs
+        .invoke(&call(&["sync", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("removed 1 document(s)"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let found = execs
+        .invoke(&call(&["search", "notes", "ownership"]), None)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&found.stdout).contains("no matches"),
+        "the body of a file past the cap is still searchable: {:?}",
+        String::from_utf8_lossy(&found.stdout)
+    );
+}
+
+/// A file that was readable at the walk and is not at the read ends the same way.
+#[tokio::test]
+async fn a_file_that_stopped_being_text_loses_its_document() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    // Same name, same extension, bytes that are not UTF-8.
+    std::fs::write(tree.path().join("notes/ownership.md"), [0xff, 0xfe, 0x00]).unwrap();
+
+    let out = execs
+        .invoke(&call(&["sync", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("removed 1 document(s)"),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let found = execs
+        .invoke(&call(&["search", "notes", "ownership"]), None)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&found.stdout).contains("no matches"));
+}
