@@ -70,9 +70,13 @@ impl Index {
     /// path would reach outside the root, and the root is the whole of what bounds this — a
     /// delegated name gets to say *which* index, never *where*.
     fn dir_of(&self, name: &str) -> io::Result<PathBuf> {
+        // A separator anywhere, before the components are even looked at: `notes/` parses as
+        // one component, so a walk of them alone would accept a spelling that is a path.
         let mut components = Path::new(name).components();
         match (components.next(), components.next()) {
-            (Some(Component::Normal(one)), None) if !name.starts_with('.') => {
+            (Some(Component::Normal(one)), None)
+                if !name.starts_with('.') && !name.contains('/') =>
+            {
                 Ok(self.root.join(one))
             }
             _ => Err(io::Error::new(
@@ -85,13 +89,26 @@ impl Index {
     /// The store called `name`, opened or created.
     fn store(&self, name: &str) -> io::Result<Arc<Store>> {
         let dir = self.dir_of(name)?;
-        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(store) = open.get(name) {
-            return Ok(store.clone());
+        if let Some(store) = self.cached(name) {
+            return Ok(store);
         }
-        let store = Store::open(&dir)?;
-        open.insert(name.to_owned(), store.clone());
-        Ok(store)
+
+        // Opened without the map held: `Store::open` reads a directory and may build an
+        // index, and holding the table through that would make opening one store block a
+        // lookup of every other. The cost is that two calls can open the same store at once,
+        // which the check below settles by keeping whichever landed first, so that one name
+        // still means one writer.
+        let opened = Store::open(&dir)?;
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(open.entry(name.to_owned()).or_insert(opened).clone())
+    }
+
+    fn cached(&self, name: &str) -> Option<Arc<Store>> {
+        self.open
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
     /// The store called `name`, which must already be there.
@@ -313,15 +330,29 @@ async fn list(index: &Index) -> ExecResult {
         return ExecResult::ok("no stores yet — `ingest <STORE> <PATH>...` makes one\n");
     }
     let mut out = String::new();
+    let mut refused = Vec::new();
     for name in names {
         match index.existing(&name).and_then(|store| store.num_docs()) {
             Ok(docs) => out.push_str(&format!("{name}\t{docs} document(s)\n")),
-            // A store that will not open is still a store, and saying so beside the others is
-            // more use than failing the whole listing over one of them.
-            Err(e) => out.push_str(&format!("{name}\t{e}\n")),
+            // A store that will not open is still a store, and naming it beside the others is
+            // more use than failing the whole listing over one of them. The exit code still
+            // says something went wrong, because a caller asking what it has should not read
+            // a broken store as an answer.
+            Err(e) => {
+                out.push_str(&format!("{name}\t(unreadable)\n"));
+                refused.push(format!("{name}: {e}"));
+            }
         }
     }
-    ExecResult::ok(out)
+    if refused.is_empty() {
+        return ExecResult::ok(out);
+    }
+    ExecResult {
+        stdout: out.into_bytes(),
+        stderr: format!("{}\n", refused.join("\n")).into_bytes(),
+        exit_code: 1,
+        timed_out: false,
+    }
 }
 
 /// Parse `call.args`, or the answer clap already wrote.

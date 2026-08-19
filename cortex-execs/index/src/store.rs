@@ -42,11 +42,38 @@ pub(crate) struct Fields {
 /// over one directory would be the second one failing on the lock file.
 pub struct Store {
     index: Index,
-    /// One writer for the process's lifetime, behind a lock. Building one per call is what
-    /// makes two overlapping ingests collide, and it re-pays the heap allocation each time.
-    writer: Mutex<IndexWriter>,
+    /// The writer, made when something first writes and kept afterwards.
+    ///
+    /// **Lazy, and that is the whole point.** tantivy's writer takes an exclusive lock file
+    /// over the directory, so building one eagerly would make every read hold a write lock:
+    /// a `search` would fail with `LockBusy` while anything was ingesting, and a store that a
+    /// long-lived process had ever read would be one no other process could write to.
+    ///
+    /// Kept once made, because two overlapping ingests of one store must queue on this lock
+    /// rather than race for tantivy's.
+    writer: Mutex<Option<IndexWriter>>,
     reader: IndexReader,
     fields: Fields,
+}
+
+/// A held writer. Exists so that making one lazily is still a `&mut IndexWriter` to a caller.
+pub(crate) struct Writing<'a>(MutexGuard<'a, Option<IndexWriter>>);
+
+impl std::ops::Deref for Writing<'_> {
+    type Target = IndexWriter;
+    fn deref(&self) -> &IndexWriter {
+        self.0
+            .as_ref()
+            .expect("a writer, put there by `Store::writer`")
+    }
+}
+
+impl std::ops::DerefMut for Writing<'_> {
+    fn deref_mut(&mut self) -> &mut IndexWriter {
+        self.0
+            .as_mut()
+            .expect("a writer, put there by `Store::writer`")
+    }
 }
 
 impl Store {
@@ -71,7 +98,8 @@ impl Store {
             }
         };
 
-        let writer = index.writer(WRITER_HEAP).map_err(other)?;
+        // No writer here: see the field. Opening a store is what a `search` does too.
+        //
         // `OnCommitWithDelay` rather than `Manual`: a search that runs right after an ingest
         // should see it, and the searcher is what a reload swaps.
         let reader = index
@@ -91,7 +119,7 @@ impl Store {
 
         Ok(Arc::new(Store {
             index,
-            writer: Mutex::new(writer),
+            writer: Mutex::new(None),
             reader,
             fields,
         }))
@@ -119,13 +147,21 @@ impl Store {
         Ok(self.reader.searcher())
     }
 
-    /// The writer, waiting for whoever holds it.
+    /// The writer, waiting for whoever holds it, and made on the first call that asks.
+    ///
+    /// Fails when another process holds the directory's lock, which is the honest answer:
+    /// two writers on one index is what tantivy forbids, and this is where a caller hears it
+    /// rather than at some later commit.
     ///
     /// A poisoned lock is taken anyway: the data behind it is tantivy's, a panic in one
     /// ingest says nothing about the index's state, and refusing every later ingest over it
     /// would turn one failed call into a dead name.
-    pub(crate) fn writer(&self) -> MutexGuard<'_, IndexWriter> {
-        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    pub(crate) fn writer(&self) -> io::Result<Writing<'_>> {
+        let mut held = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        if held.is_none() {
+            *held = Some(self.index.writer(WRITER_HEAP).map_err(other)?);
+        }
+        Ok(Writing(held))
     }
 }
 

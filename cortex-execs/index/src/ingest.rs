@@ -13,6 +13,14 @@ use crate::store::{Store, other};
 /// guess, because a wrong guess here is a document that silently is not searchable.
 const INDEXED: &[&str] = &["md", "markdown", "txt", "rst"];
 
+/// The largest file this will read into an index.
+///
+/// A body is held in memory whole, tokenized and then stored, so one file can cost several
+/// times its own size. 8 MiB is far past any prose and well short of what a stray database
+/// dump or minified bundle would be, and a file over it is named in the report rather than
+/// skipped in silence.
+const MAX_BODY: u64 = 8 * 1024 * 1024;
+
 /// What a file was, cheaply: when it changed and how big it was.
 ///
 /// Enough to decide whether the index already has its bytes, and no more. mtime alone would
@@ -91,8 +99,16 @@ fn index_all(store: &Store, targets: Vec<(PathBuf, PathBuf)>) -> std::io::Result
     let mut written = 0usize;
     let mut skipped = Vec::new();
     {
-        let mut writer = store.writer();
+        let mut writer = store.writer()?;
         for file in &files {
+            if file.stamp.len > MAX_BODY {
+                skipped.push(format!(
+                    "{}: {} bytes, over the {MAX_BODY} this reads",
+                    file.workspace.display(),
+                    file.stamp.len
+                ));
+                continue;
+            }
             match std::fs::read_to_string(&file.host) {
                 Ok(body) => {
                     write_one(store, &mut writer, &file.workspace, &body, file.stamp)?;
@@ -255,7 +271,7 @@ fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
 
     let removed = doomed.len();
     {
-        let mut writer = store.writer();
+        let mut writer = store.writer()?;
         for path in &doomed {
             writer.delete_term(tantivy::Term::from_field_text(fields.path, path));
         }
@@ -363,11 +379,19 @@ fn sync_all(
     let mut skipped = Vec::new();
     let removed = doomed.len();
     {
-        let mut writer = store.writer();
+        let mut writer = store.writer()?;
         for path in &doomed {
             writer.delete_term(tantivy::Term::from_field_text(fields.path, path));
         }
         for file in to_read {
+            if file.stamp.len > MAX_BODY {
+                skipped.push(format!(
+                    "{}: {} bytes, over the {MAX_BODY} this reads",
+                    file.workspace.display(),
+                    file.stamp.len
+                ));
+                continue;
+            }
             match std::fs::read_to_string(&file.host) {
                 Ok(body) => {
                     write_one(store, &mut writer, &file.workspace, &body, file.stamp)?;

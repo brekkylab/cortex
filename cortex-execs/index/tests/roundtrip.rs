@@ -824,3 +824,134 @@ async fn sync_removes_a_document_whose_file_became_unreadable() {
         String::from_utf8_lossy(&found.stdout)
     );
 }
+
+/// Reading must not take a write lock. tantivy allows one `IndexWriter` per directory, so a
+/// store built eagerly with one would make every `search` fail while anything was ingesting,
+/// and would lock out any other process for as long as a console lived.
+///
+/// Two `Index` values over one root stand in for two processes: they share no cache, so the
+/// only thing that could couple them is the lock on the directory itself.
+#[tokio::test]
+async fn reading_does_not_take_the_write_lock() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let writing = registered(root.path()).unwrap();
+    let reading = registered(root.path()).unwrap();
+
+    writing
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+
+    // The writer is now held by `writing`, for the life of that `Index`.
+    let found = reading
+        .invoke(&call(&["search", "notes", "kernel"]), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        found.exit_code,
+        0,
+        "search while another holds the writer: {}",
+        String::from_utf8_lossy(&found.stderr)
+    );
+    assert!(String::from_utf8_lossy(&found.stdout).contains("notes/mounts.md"));
+
+    let listed = reading.invoke(&call(&["list"]), None).await.unwrap();
+    assert_eq!(
+        listed.exit_code,
+        0,
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("notes\t2 document(s)"));
+}
+
+/// A second writer is still refused, which is tantivy's rule and not something to paper over.
+#[tokio::test]
+async fn a_second_writer_is_refused_rather_than_silently_second() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let first = registered(root.path()).unwrap();
+    let second = registered(root.path()).unwrap();
+
+    first
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    let out = second
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert_ne!(out.exit_code, 0, "two writers on one index");
+}
+
+/// A listing that could not read a store says so in its exit code, so a caller asking what it
+/// has does not read a broken store as an answer.
+#[tokio::test]
+async fn list_reports_an_unreadable_store_in_its_exit_code() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    // A directory that is not an index, wearing a store's name.
+    std::fs::create_dir(root.path().join("broken")).unwrap();
+    std::fs::write(root.path().join("broken/meta.json"), "not an index").unwrap();
+
+    let out = execs.invoke(&call(&["list"]), None).await.unwrap();
+    assert_eq!(out.exit_code, 1, "a broken store is not a clean listing");
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(listed.contains("notes\t2 document(s)"), "{listed}");
+    assert!(
+        listed.contains("broken"),
+        "the broken one is still named: {listed}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("broken"),
+        "and the reason is on stderr"
+    );
+}
+
+/// `notes/` parses as one component, so a check that only walks components would take a
+/// spelling that is a path.
+#[tokio::test]
+async fn a_store_name_with_a_separator_is_refused() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    let out = execs
+        .invoke(&call(&["ingest", "notes/", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert_ne!(out.exit_code, 0, "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(!root.path().join("notes").exists());
+}
+
+/// A file too large to hold in memory is named rather than skipped in silence.
+#[tokio::test]
+async fn a_file_past_the_size_cap_is_reported() {
+    let (tree, root) = fixture();
+    std::fs::write(
+        tree.path().join("notes/huge.md"),
+        vec![b'a'; 9 * 1024 * 1024],
+    )
+    .unwrap();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    let out = execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0, "the other files still went in");
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.starts_with("indexed 2 file(s)"), "{said}");
+    assert!(
+        said.contains("notes/huge.md"),
+        "the one left out is named: {said}"
+    );
+}
