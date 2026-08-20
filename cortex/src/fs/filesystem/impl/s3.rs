@@ -32,6 +32,7 @@ use std::{
     io,
     path::{Component, Path},
     sync::{Arc, Mutex},
+    time::SystemTime,
 };
 
 use object_store::{
@@ -231,6 +232,11 @@ const READAHEAD_CHUNK: u64 = 8 << 20;
 const MAX_CACHED_KEYS: usize = 8;
 
 /// What the store remembers about one key between reads.
+///
+/// Keyed by path, so an entry outlives every open of it — there is no open to end its life
+/// (see [`FileSystem`]), and nothing but eviction would ever drop it. Two things bound how
+/// long what it says can stay wrong: [`MAX_CACHED_KEYS`] on how many are kept at all, and
+/// [`S3Fs::revalidate`] on whether a kept one still describes the object.
 struct ReadCache {
     /// Size as of the `head` that filled this entry.
     ///
@@ -238,9 +244,19 @@ struct ReadCache {
     /// clamped rather than sent and rejected — an out-of-range GET comes back as the
     /// generic error variant, indistinguishable from a transport failure.
     ///
-    /// It goes stale if the object is replaced while a consumer is reading, which a
-    /// read-only mount already tolerates in its cache.
+    /// Being a clamp and not just a number is why staleness here is not a small matter: a
+    /// grown object read against a remembered smaller size answers `Ok(0)` at the old end,
+    /// which the contract says is EOF. Hence [`Self::describes`].
     size: u64,
+
+    /// What the object was when this entry was filled, as the store names it — the pair
+    /// [`Self::describes`] compares a later `head` against.
+    ///
+    /// `etag` is a content fingerprint and settles it alone. `mtime` is kept for the stores
+    /// that report no tag, where size and timestamp together are all there is to compare.
+    etag: Option<String>,
+
+    mtime: SystemTime,
 
     /// The last fetched window as `(start, bytes)`.
     window: Option<(u64, Vec<u8>)>,
@@ -264,6 +280,32 @@ struct ReadCache {
     last_end: Option<u64>,
 }
 
+impl ReadCache {
+    /// A new entry for what a `head` just reported, with nothing read ahead yet.
+    fn fresh(meta: &ObjectMeta) -> Self {
+        ReadCache {
+            size: meta.size,
+            etag: meta.e_tag.clone(),
+            mtime: meta.last_modified.into(),
+            window: None,
+            last_end: None,
+        }
+    }
+
+    /// Whether `meta` still describes the object this entry was filled from.
+    ///
+    /// A tag on both sides settles it by itself: that is what an etag is for, and it catches
+    /// the replacement that keeps the length. With a tag missing from either side there is
+    /// only size and timestamp, which agree for an object rewritten to the same length within
+    /// the store's timestamp resolution — a weaker answer, and the strongest one available.
+    fn describes(&self, meta: &ObjectMeta) -> bool {
+        match (&self.etag, &meta.e_tag) {
+            (Some(held), Some(fresh)) => held == fresh,
+            _ => self.size == meta.size && self.mtime == SystemTime::from(meta.last_modified),
+        }
+    }
+}
+
 /// The windows, and the order to give them up in.
 #[derive(Default)]
 struct Windows {
@@ -273,18 +315,34 @@ struct Windows {
     /// rather than true LRU: the eviction it gets wrong is one round trip, and a
     /// use-ordered queue would have to be touched on every read — under the mutex that
     /// every read already contends for.
+    ///
+    /// Holds exactly the keys `by_key` holds, which is what makes its length the cap. A key
+    /// left here after its entry went would spend a slot on nothing and then evict a live
+    /// entry when it came up.
     order: VecDeque<String>,
 }
 
 impl Windows {
     /// Make room for `key` and record it, evicting the oldest entry once the cap is passed.
+    ///
+    /// Only a key the map did not already hold joins the queue. Two reads can race to admit
+    /// the same key — each one saw a miss — and a second copy in the queue would come up for
+    /// eviction while the entry is still in use.
     fn admit(&mut self, key: String, entry: ReadCache) {
-        self.by_key.insert(key.clone(), entry);
-        self.order.push_back(key);
+        if self.by_key.insert(key.clone(), entry).is_none() {
+            self.order.push_back(key);
+        }
         if self.order.len() > MAX_CACHED_KEYS
             && let Some(oldest) = self.order.pop_front()
         {
             self.by_key.remove(&oldest);
+        }
+    }
+
+    /// Forget `key` entirely, so the next read of it starts from a `head`.
+    fn forget(&mut self, key: &str) {
+        if self.by_key.remove(key).is_some() {
+            self.order.retain(|held| held != key);
         }
     }
 }
@@ -349,9 +407,13 @@ impl S3Fs {
     /// length settles the question, which keeps the extra request to keys that are
     /// genuinely ambiguous.
     ///
-    /// Shared by `stat` and `open` so the two cannot disagree about a name — the
-    /// same reason `list` decides collisions from the object's size rather than by
-    /// consulting `stat`.
+    /// Shared by `stat` and the first read of a key, so the two cannot disagree about
+    /// a name — the same reason `list` decides collisions from the object's size rather
+    /// than by consulting `stat`.
+    ///
+    /// It is also where the read cache is revalidated, because this is where a fresh `head`
+    /// already is: every `stat` spends one, and what it reports is exactly what says whether
+    /// a cached entry still describes the object. See [`Self::revalidate`].
     async fn classify(&self, path: &Path) -> io::Result<Entry> {
         let key = self.key(path)?;
         // The volume's own root is a directory by construction — there need not be
@@ -359,7 +421,16 @@ impl S3Fs {
         if key.is_empty() {
             return Ok(Entry::Dir);
         }
-        let os = os_path(&key)?;
+        let found = self.classify_key(&key).await;
+        if let Ok(found) = &found {
+            self.revalidate(&key, found);
+        }
+        found
+    }
+
+    /// [`Self::classify`] without the revalidation, for a key already known to be non-empty.
+    async fn classify_key(&self, key: &str) -> io::Result<Entry> {
+        let os = os_path(key)?;
         match self.store.head(&os).await {
             Ok(meta) if meta.size > 0 => Ok(Entry::File(meta)),
             // Ambiguous: empty body, so it may be standing in for a prefix.
@@ -617,15 +688,46 @@ impl S3Fs {
             Entry::Dir => return Err(io::ErrorKind::IsADirectory.into()),
             Entry::File(meta) => meta,
         };
-        lock(&self.windows).admit(
-            key.to_string(),
-            ReadCache {
-                size: meta.size,
-                window: None,
-                last_end: None,
-            },
-        );
+        lock(&self.windows).admit(key.to_string(), ReadCache::fresh(&meta));
         Ok((meta.location, meta.size))
+    }
+
+    /// Drop what reads remember about `key` unless `fresh` — what a `head` just said — still
+    /// describes the object the entry was filled from.
+    ///
+    /// Without this, an entry survives every open of its key and is bounded only by eviction,
+    /// so an object replaced under a mount is served from the old window and clamped to the
+    /// old size until seven other keys push it out. Meanwhile `stat` answers from a `head`
+    /// every time: the two would disagree, and the one a guest acts on — the size it was told
+    /// — is the one the read path would refuse to honour. Worse, this store reports `mtime`
+    /// precisely so a guest negotiating `AUTO_INVAL_DATA` drops its own pages when the object
+    /// moves; a cache that ignored the same signal would hand the same stale bytes straight
+    /// back.
+    ///
+    /// A `Dir` verdict drops the entry too: the key does not name a file any more, so nothing
+    /// remembered about reading it is true.
+    ///
+    /// Two limits, both deliberate:
+    ///
+    /// * **Freshness is only as frequent as the `stat`s.** A replacement between one `stat`
+    ///   and the reads that follow is not caught here, and how often a kernel revalidates is
+    ///   the kernel's business. Catching it *within* a read means conditional GETs — see the
+    ///   note on `Precondition` in [`to_io_error`] — which is a separate change: it turns a
+    ///   replacement into an error mid-stream, and that needs an errno this crate can express.
+    /// * **A failed `head` changes nothing.** Only a positive answer is acted on. A transient
+    ///   failure must not cost a re-`head` on the next read, and a key deleted from under an
+    ///   open is a case POSIX says keeps reading — the entry expiring by eviction is closer to
+    ///   right than dropping it the moment a `stat` says `ENOENT`.
+    fn revalidate(&self, key: &str, fresh: &Entry) {
+        let mut windows = lock(&self.windows);
+        let stale = match (windows.by_key.get(key), fresh) {
+            (None, _) => false,
+            (Some(cache), Entry::File(meta)) => !cache.describes(meta),
+            (Some(_), Entry::Dir) => true,
+        };
+        if stale {
+            windows.forget(key);
+        }
     }
 
     /// One ranged GET. No lock is held here — see the loop in
@@ -660,4 +762,123 @@ fn from_window(window: &Option<(u64, Vec<u8>)>, at: u64, out: &mut [u8]) -> usiz
     let n = (data.len() - from).min(out.len());
     out[..n].copy_from_slice(&data[from..from + n]);
     n
+}
+
+/// What the read cache does when the object underneath it changes.
+///
+/// Over `InMemory` rather than a real bucket: what is under test is this file's bookkeeping,
+/// and a store that answers locally still answers with `head`, ranged GETs and an etag per
+/// version — which is the whole of what the cache reads. The live-endpoint tests
+/// (`tests/s3_endpoint.rs`) cover the parts only a real S3 can disagree about.
+#[cfg(test)]
+mod tests {
+    use object_store::{PutPayload, memory::InMemory};
+
+    use super::*;
+
+    /// The store and a filesystem over it, so a test can change an object behind the mount the
+    /// way something outside it would.
+    fn store() -> (Arc<InMemory>, S3Fs) {
+        let store = Arc::new(InMemory::new());
+        (store.clone(), S3Fs::with_store(store, String::new()))
+    }
+
+    async fn put(store: &InMemory, key: &str, body: &[u8]) {
+        store
+            .put(&os_path(key).unwrap(), PutPayload::from(body.to_vec()))
+            .await
+            .unwrap();
+    }
+
+    async fn read(fs: &S3Fs, key: &str, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        let n = fs.read_at(Path::new(key), &mut buf, 0).await.unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    /// The case the revalidation exists for: a longer object under a filled entry. The
+    /// remembered size is a clamp, so without the drop the read stops at the old length and
+    /// reports it as EOF — while `stat` is already answering with the new one.
+    #[tokio::test]
+    async fn a_grown_object_is_read_whole_once_a_stat_has_seen_it() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"aaaa").await;
+        assert_eq!(read(&fs, "a.txt", 8).await, b"aaaa");
+
+        put(&store, "a.txt", b"bbbbbbbb").await;
+        // Nothing has asked about the name yet, so the entry still stands — this is the
+        // documented limit, not an accident: reads alone spend no `head`.
+        assert_eq!(read(&fs, "a.txt", 8).await, b"aaaa");
+
+        assert_eq!(fs.stat(Path::new("a.txt")).await.unwrap().size, 8);
+        assert_eq!(read(&fs, "a.txt", 8).await, b"bbbbbbbb");
+    }
+
+    /// Same length, different bytes — invisible to size and to a timestamp of coarse enough
+    /// resolution. The etag is what catches it.
+    #[tokio::test]
+    async fn a_replacement_of_the_same_length_is_caught_by_the_etag() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"aaaa").await;
+        assert_eq!(read(&fs, "a.txt", 4).await, b"aaaa");
+
+        put(&store, "a.txt", b"cccc").await;
+        fs.stat(Path::new("a.txt")).await.unwrap();
+        assert_eq!(read(&fs, "a.txt", 4).await, b"cccc");
+    }
+
+    /// A key that stops naming a file at all: an object store console turning it into a folder
+    /// leaves a 0-byte marker with keys under it. Nothing remembered about reading it survives
+    /// that, and the read has to refuse rather than serve the old window.
+    #[tokio::test]
+    async fn a_key_that_becomes_a_prefix_is_no_longer_readable() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"aaaa").await;
+        assert_eq!(read(&fs, "a.txt", 4).await, b"aaaa");
+
+        put(&store, "a.txt/inner", b"x").await;
+        put(&store, "a.txt", b"").await;
+        assert_eq!(
+            fs.stat(Path::new("a.txt")).await.unwrap().kind,
+            DirentKind::Dir
+        );
+
+        let err = fs
+            .read_at(Path::new("a.txt"), &mut [0u8; 4], 0)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
+    }
+
+    /// A `head` that fails says nothing about what a reader holds. The entry stays, which is
+    /// what keeps an object deleted from under a reader readable — and keeps a transient
+    /// failure from charging the next read a round trip.
+    #[tokio::test]
+    async fn a_failed_head_leaves_the_entry_alone() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"aaaa").await;
+        assert_eq!(read(&fs, "a.txt", 4).await, b"aaaa");
+
+        store.delete(&os_path("a.txt").unwrap()).await.unwrap();
+        assert_eq!(
+            fs.stat(Path::new("a.txt")).await.unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert!(lock(&fs.windows).by_key.contains_key("a.txt"));
+    }
+
+    /// Re-admitting a key must not queue it twice, or the duplicate comes up for eviction
+    /// while the entry is live — and every eviction after it is one entry early.
+    #[tokio::test]
+    async fn a_re_read_key_holds_one_slot() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"aaaa").await;
+        read(&fs, "a.txt", 4).await;
+        lock(&fs.windows).forget("a.txt");
+        read(&fs, "a.txt", 4).await;
+
+        let windows = lock(&fs.windows);
+        assert_eq!(windows.order.len(), windows.by_key.len());
+    }
 }
