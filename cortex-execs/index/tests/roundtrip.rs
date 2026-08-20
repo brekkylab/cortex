@@ -183,6 +183,82 @@ async fn search_answers_without_a_mount() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("notes/mounts.md"));
 }
 
+/// The line under a hit is cut around what was queried, not off the top of the file — and
+/// the match sits in the *middle* of the cut.
+///
+/// The filler is 1600 characters on each side, so a head-of-body snippet could not reach the
+/// match however it was trimmed. Asserting the whole sentence and both ellipses is what
+/// separates a centred excerpt from tantivy's own window, whose edge can land on the term and
+/// take the rest of its sentence with it.
+#[tokio::test]
+async fn a_snippet_is_cut_around_the_query() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    let filler = "a paragraph about nothing in particular. ".repeat(40);
+    let body = format!("{filler}\nlifetimes are what the borrow checker counts.\n{filler}");
+    std::fs::write(tree.path().join("notes/deep.md"), &body).unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    let out = execs
+        .invoke(&call(&["search", "notes", "lifetimes"]), None)
+        .await
+        .unwrap();
+
+    let said = String::from_utf8_lossy(&out.stdout);
+    let snippet = said
+        .lines()
+        .skip_while(|line| !line.contains("notes/deep.md"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("a snippet under the hit: {said}"));
+    assert!(
+        snippet.contains("lifetimes are what the borrow checker counts"),
+        "the match itself is in it: {snippet:?}"
+    );
+    assert!(
+        snippet.starts_with("\t…") && snippet.ends_with('…'),
+        "with the file going on above and below it: {snippet:?}"
+    );
+}
+
+/// A hit whose *name* matched has no body term to cut around, and shows the opening instead.
+#[tokio::test]
+async fn a_name_only_match_shows_the_head_of_the_body() {
+    let (tree, root) = fixture();
+    let mount = Mounted(tree.path().to_path_buf());
+    let execs = registered(root.path()).unwrap();
+
+    std::fs::write(
+        tree.path().join("notes/lifetimes.md"),
+        "Every value has exactly one owner.\n",
+    )
+    .unwrap();
+
+    execs
+        .invoke(&call(&["ingest", "notes", "/notes"]), Some(&mount))
+        .await
+        .unwrap();
+    let out = execs
+        .invoke(&call(&["search", "notes", "lifetimes"]), None)
+        .await
+        .unwrap();
+
+    let said = String::from_utf8_lossy(&out.stdout);
+    let snippet = said
+        .lines()
+        .skip_while(|line| !line.contains("notes/lifetimes.md"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("a snippet under the hit: {said}"));
+    assert_eq!(
+        snippet, "\tEvery value has exactly one owner.",
+        "the whole body, with no ellipsis: nothing was cut"
+    );
+}
+
 /// Today's limit, written down as a test so it fails when `cwd` starts arriving.
 #[tokio::test]
 async fn a_relative_path_is_refused_while_there_is_no_cwd() {
