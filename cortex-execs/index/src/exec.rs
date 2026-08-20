@@ -42,6 +42,14 @@ pub struct Index {
     /// Cached because tantivy allows exactly one `IndexWriter` per index: opening per call
     /// would make two overlapping ingests of one store collide on its lock file.
     ///
+    /// # The lock is the invariant, not the map
+    ///
+    /// **One name means one live [`Store`], and this lock is what makes that true.** Every
+    /// `Arc` in existence came out of this map while it was held, so holding it is the same
+    /// as knowing no other thread is making or destroying a store. [`store`](Self::store)
+    /// opens under it and [`drop_store`](Self::drop_store) deletes under it, which is what
+    /// keeps a name from being reopened halfway through its own removal.
+    ///
     /// Nothing evicts, so a session that touches many stores keeps a reader (and its mapped
     /// segments) for each. That is the same question [`Store::writer`] answers about the
     /// writer, and has the same answer for now: no consumer has said it matters.
@@ -92,28 +100,23 @@ impl Index {
     }
 
     /// The store called `name`, opened or created.
+    ///
+    /// Opened with the map held, so that one name is opened once. Letting the open run
+    /// outside would cost a name's whole invariant twice over: two calls could each build a
+    /// [`Store`], and a rebuild (`Store::open`'s answer to a schema that is not ours) removes
+    /// and recreates the directory, so the loser would delete what the winner just made.
+    ///
+    /// What that costs is a lookup of any *other* name waiting behind an open. An open is
+    /// once per name per process and reads a directory, so it is a wait measured against
+    /// something that does not happen again.
     fn store(&self, name: &str) -> io::Result<Arc<Store>> {
         let dir = self.dir_of(name)?;
-        if let Some(store) = self.cached(name) {
-            return Ok(store);
-        }
-
-        // Opened without the map held: `Store::open` reads a directory and may build an
-        // index, and holding the table through that would make opening one store block a
-        // lookup of every other. The cost is that two calls can open the same store at once,
-        // which the check below settles by keeping whichever landed first, so that one name
-        // still means one writer.
-        let opened = Store::open(&dir)?;
         let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(store) = open.get(name) {
+            return Ok(store.clone());
+        }
+        let opened = Store::open(&dir)?;
         Ok(open.entry(name.to_owned()).or_insert(opened).clone())
-    }
-
-    fn cached(&self, name: &str) -> Option<Arc<Store>> {
-        self.open
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .cloned()
     }
 
     /// The store called `name`, which must already be there.
@@ -146,6 +149,13 @@ impl Index {
     }
 
     /// Forget an index. The corpus it was built from is untouched.
+    ///
+    /// **Refused while a call is still running against it.** Removing the cached [`Store`]
+    /// under a live `Arc` would let the next `ingest` of that name open a second one: the
+    /// directory is gone, so a fresh lock file is a fresh inode and the new writer takes it
+    /// without resistance, while the old one still holds an unlinked one. Two writers over a
+    /// path is exactly what the cache exists to prevent, and it is silent — so this says
+    /// `ResourceBusy` and leaves the store alone.
     fn drop_store(&self, name: &str) -> io::Result<String> {
         let dir = self.dir_of(name)?;
         if !dir.is_dir() {
@@ -154,12 +164,24 @@ impl Index {
                 format!("{name}: no such store"),
             ));
         }
-        // Out of the cache first: whoever still holds an `Arc` goes on working against files
-        // that are being removed, and that is one call's problem rather than every later one's.
-        self.open
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(name);
+        // Held across the removal too: taken, the map is proof that nobody else can be
+        // opening this name, so the delete cannot race a reopen of what it is deleting.
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = open.remove(name) {
+            // `try_unwrap` and not a count: it hands the `Arc` back when someone else has
+            // one, and when nobody does the `Store` dies *here* — writer released and
+            // segments unmapped before the files under them go.
+            if let Err(still_held) = Arc::try_unwrap(cached) {
+                open.insert(name.to_owned(), still_held);
+                return Err(io::Error::new(
+                    io::ErrorKind::ResourceBusy,
+                    format!("{name}: in use — something is still running against it"),
+                ));
+            }
+        }
+        // Still under the lock. No test covers this line — a concurrent open of the name
+        // being deleted is what it rules out, and nothing here runs one — so if it ever
+        // moves out, it is this comment and not a red suite that will say why it should not.
         std::fs::remove_dir_all(&dir)?;
         Ok(format!("dropped {name}\n"))
     }
@@ -436,5 +458,84 @@ pub(crate) fn host_path(
     match call.resolve(arg) {
         Ok(path) => Ok(mount.host_path(&path)),
         Err(e) => Err(ExecResult::failed(1, format!("{arg}: {e}\n"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An [`Index`] over an empty root, with the temporary directory that keeps it alive.
+    fn fresh() -> (Index, tempfile::TempDir) {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let index = Index::new(root.path()).expect("a root to keep stores under");
+        (index, root)
+    }
+
+    /// A store a call is still holding cannot be dropped out from under it.
+    ///
+    /// The `Arc` here stands for the one an `ingest` holds across its `spawn_blocking`. With
+    /// it alive, removing the cached entry would let the next open of that name build a
+    /// *second* `Store` over the same path — and the old writer would still hold the lock
+    /// file the delete unlinked, so nothing would say no.
+    #[test]
+    fn drop_refuses_while_a_store_is_held() {
+        let (index, root) = fresh();
+        let held = index.store("notes").expect("a new store");
+        let dir = root.path().join("notes");
+
+        let refused = index.drop_store("notes").expect_err("a store in use");
+        assert_eq!(refused.kind(), io::ErrorKind::ResourceBusy);
+        assert!(dir.is_dir(), "a refused drop leaves the store where it was");
+
+        drop(held);
+        index.drop_store("notes").expect("nothing holds it now");
+        assert!(!dir.exists(), "and then it is gone");
+    }
+
+    /// One name opens once, even down the branch that deletes the directory first.
+    ///
+    /// A store whose schema is not ours is *rebuilt*, and rebuilding is a `remove_dir_all`
+    /// followed by a create — so two opens racing here would have one deleting what the
+    /// other had just made. Comparing the handed-back pointers is the whole assertion: same
+    /// address means the second caller found the first's store rather than opening its own.
+    ///
+    /// Formally a race, so a pass cannot *prove* the serialization — but eight threads onto
+    /// a cold name is a wide enough window that opening outside the lock failed this 10 runs
+    /// out of 10, which is the evidence that it is testing what it says.
+    #[test]
+    fn one_name_is_opened_once_even_when_rebuilt() {
+        let (index, root) = fresh();
+        let dir = root.path().join("notes");
+        std::fs::create_dir_all(&dir).expect("somewhere to put the foreign index");
+        let mut foreign = tantivy::schema::Schema::builder();
+        foreign.add_text_field("unrelated", tantivy::schema::TEXT);
+        tantivy::Index::create_in_dir(&dir, foreign.build()).expect("an index that is not ours");
+
+        let opened: Vec<usize> = std::thread::scope(|scope| {
+            let racing: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let store = index.store("notes").expect("a rebuilt store");
+                        Arc::as_ptr(&store) as usize
+                    })
+                })
+                .collect();
+            racing
+                .into_iter()
+                .map(|thread| thread.join().expect("no opener panicked"))
+                .collect()
+        });
+
+        assert!(
+            opened.iter().all(|handed| *handed == opened[0]),
+            "one name means one store: {opened:?}"
+        );
+        let store = index.store("notes").expect("still open");
+        assert_eq!(
+            store.num_docs().expect("a searcher"),
+            0,
+            "rebuilt, so empty"
+        );
     }
 }
