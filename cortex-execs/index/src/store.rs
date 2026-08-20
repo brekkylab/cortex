@@ -105,14 +105,18 @@ impl Store {
 
         let index = match Index::open_in_dir(dir) {
             Ok(index) if has_our_fields(&index.schema()) => index,
-            Ok(_) => {
-                std::fs::remove_dir_all(dir)?;
-                std::fs::create_dir_all(dir)?;
-                Index::create_in_dir(dir, schema.clone()).map_err(other)?
-            }
+            Ok(_) => rebuild(dir, schema.clone())?,
             Err(_) => {
                 std::fs::create_dir_all(dir)?;
-                Index::create_in_dir(dir, schema.clone()).map_err(other)?
+                match Index::create_in_dir(dir, schema.clone()) {
+                    Ok(index) => index,
+                    // Somebody created it between our open and our create. Theirs is as
+                    // good as ours would have been: same schema, and both are empty.
+                    Err(tantivy::TantivyError::IndexAlreadyExists) => {
+                        Index::open_in_dir(dir).map_err(other)?
+                    }
+                    Err(e) => return Err(other(e)),
+                }
             }
         };
 
@@ -181,6 +185,95 @@ impl Store {
         }
         Ok(Writing(held))
     }
+}
+
+/// Replace whatever is at `dir` with an index of our schema, **building it beside the store
+/// rather than in place**.
+///
+/// The straight way round is to remove the directory and create in it, and it has two holes.
+/// A failure anywhere after the remove leaves no store at all, when what was there a moment
+/// ago was at least openable. And the process next door has no idea any of this is happening:
+/// the map lock that orders this within one [`Index`] is a field of that struct, and
+/// `Index::open_in_dir` takes no lock of its own, so a console and the standalone binary
+/// meeting a foreign schema together would each remove what the other had just made.
+///
+/// So the new index is finished first, under a name of its own, and only then moved in. The
+/// destructive step no longer comes before the constructive one, and the moment `dir` is
+/// unusable shrinks from a directory's worth of file creation to two adjacent `rename`s.
+///
+/// **It is not zero.** POSIX has no portable atomic swap of two directories (`rename` onto a
+/// non-empty one is `ENOTEMPTY`), so the old one is moved aside and the new one moved in as
+/// two steps, and between them the name does not exist. What survived that window changed
+/// rather than disappeared: 8 processes opening one foreign-schema store, 40 times over, gave
+/// one `FileDoesNotExist("meta.json")` out of 320 opens, from a reader reloading across a
+/// swap. A transient error on a read, where before the window could take an index out from
+/// under a live handle.
+///
+/// Closing it needs a lock somewhere neither directory is, since the one place that cannot
+/// hold it is inside what gets moved. That is a different change from this one.
+fn rebuild(dir: &Path, schema: Schema) -> io::Result<Index> {
+    let staging = beside(dir, "building")?;
+    let stale = beside(dir, "stale")?;
+    // Whatever a run that died mid-rebuild left under our own names. Another process's are
+    // its business, and the leading dot keeps them out of `list` either way.
+    let _ = std::fs::remove_dir_all(&staging);
+    let _ = std::fs::remove_dir_all(&stale);
+
+    std::fs::create_dir_all(&staging)?;
+    // Built and dropped: `create_in_dir` writes the metadata as it goes, and what is wanted
+    // here is the files, not a handle bound to a path about to stop existing.
+    Index::create_in_dir(&staging, schema).map_err(other)?;
+
+    // Asked again, now that the replacement exists: somebody else may have rebuilt this while
+    // we were building ours, and moving *their* finished index aside is the one thing here
+    // that would lose an index somebody is using.
+    if Index::open_in_dir(dir).is_ok_and(|found| has_our_fields(&found.schema())) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Index::open_in_dir(dir).map_err(other);
+    }
+
+    // Moved, not removed. If the second rename fails the old store is still whole, one name
+    // over, rather than gone.
+    if let Err(e) = std::fs::rename(dir, &stale)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&staging, dir) {
+        // Somebody finished their own rebuild in the moment between our two renames. Theirs
+        // is this schema and empty, which is exactly what ours is, so it is the one to use.
+        let _ = std::fs::remove_dir_all(&staging);
+        if !dir.is_dir() {
+            return Err(e);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&stale);
+
+    Index::open_in_dir(dir).map_err(other)
+}
+
+/// Rebuilds started by this process, only ever used to tell their working names apart.
+static REBUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A working name next to the store, on the same filesystem so a `rename` between them is a
+/// move and not a copy.
+///
+/// Dotted, which is what keeps it out of [`names`](crate::Index) and out of a walk; and
+/// stamped so that no two rebuilds share it. The pid separates processes and the counter
+/// separates rebuilds within one, which a pid alone does not: two [`Index`](crate::Index)es
+/// over one root are in the same process and are exactly the case this has to survive.
+fn beside(dir: &Path, what: &str) -> io::Result<std::path::PathBuf> {
+    let name = dir.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidFilename,
+            format!("{}: a store is a directory under a root", dir.display()),
+        )
+    })?;
+    let mut sibling = std::ffi::OsString::from(".");
+    sibling.push(name);
+    let attempt = REBUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    sibling.push(format!(".{}-{attempt}.{what}", std::process::id()));
+    Ok(dir.with_file_name(sibling))
 }
 
 fn build_schema() -> Schema {

@@ -472,6 +472,25 @@ mod tests {
         (index, root)
     }
 
+    /// A tantivy index at `dir` whose schema is not ours, so opening it takes the rebuild.
+    fn foreign_index(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("somewhere to put the foreign index");
+        let mut foreign = tantivy::schema::Schema::builder();
+        foreign.add_text_field("unrelated", tantivy::schema::TEXT);
+        tantivy::Index::create_in_dir(dir, foreign.build()).expect("an index that is not ours");
+    }
+
+    /// What a root holds, sorted, dotted working names included.
+    fn entries(root: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .expect("a readable root")
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// A store a call is still holding cannot be dropped out from under it.
     ///
     /// The `Arc` here stands for the one an `ingest` holds across its `spawn_blocking`. With
@@ -507,10 +526,7 @@ mod tests {
     fn one_name_is_opened_once_even_when_rebuilt() {
         let (index, root) = fresh();
         let dir = root.path().join("notes");
-        std::fs::create_dir_all(&dir).expect("somewhere to put the foreign index");
-        let mut foreign = tantivy::schema::Schema::builder();
-        foreign.add_text_field("unrelated", tantivy::schema::TEXT);
-        tantivy::Index::create_in_dir(&dir, foreign.build()).expect("an index that is not ours");
+        foreign_index(&dir);
 
         let opened: Vec<usize> = std::thread::scope(|scope| {
             let racing: Vec<_> = (0..8)
@@ -537,5 +553,73 @@ mod tests {
             0,
             "rebuilt, so empty"
         );
+    }
+
+    /// A rebuild leaves the root holding the store and nothing else.
+    ///
+    /// The replacement is built under a dotted working name beside the store and moved in, so
+    /// a leaked one would be invisible to `list` (which skips dotted names) while still
+    /// sitting on disk. This looks past that filter on purpose.
+    #[test]
+    fn a_rebuild_leaves_no_working_directories() {
+        let (index, root) = fresh();
+        foreign_index(&root.path().join("notes"));
+
+        index.store("notes").expect("a rebuilt store");
+        assert_eq!(entries(root.path()), vec!["notes".to_string()]);
+    }
+
+    /// Two `Index`es over one root are two processes minus the process boundary: the map lock
+    /// that orders opens is a field of each, so nothing about it spans them.
+    ///
+    /// Creating is the common case of that race, and it used to be the loud one — whichever
+    /// call lost got `IndexAlreadyExists` from tantivy for having asked at the same moment as
+    /// somebody else.
+    #[test]
+    fn two_indexes_over_one_root_can_create_one_store() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let (first, second) = (
+            Index::new(root.path()).expect("a root"),
+            Index::new(root.path()).expect("the same root, other instance"),
+        );
+
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| first.store("notes").map(|_| ()));
+            let b = scope.spawn(|| second.store("notes").map(|_| ()));
+            a.join()
+                .expect("no panic")
+                .expect("one of the two creating");
+            b.join()
+                .expect("no panic")
+                .expect("and the other finding it");
+        });
+        assert_eq!(entries(root.path()), vec!["notes".to_string()]);
+    }
+
+    /// The same two, meeting a schema that is not ours and both deciding to replace it.
+    ///
+    /// Neither may end up holding an index whose files another one removed, so the assertion
+    /// is that both are usable *afterwards* rather than merely that both returned.
+    #[test]
+    fn two_indexes_over_one_root_can_rebuild_one_store() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        foreign_index(&root.path().join("notes"));
+        let (first, second) = (
+            Index::new(root.path()).expect("a root"),
+            Index::new(root.path()).expect("the same root, other instance"),
+        );
+
+        let (a, b) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| first.store("notes"));
+            let b = scope.spawn(|| second.store("notes"));
+            (
+                a.join().expect("no panic").expect("a rebuilt store"),
+                b.join().expect("no panic").expect("a rebuilt store"),
+            )
+        });
+
+        assert_eq!(a.num_docs().expect("a searcher"), 0);
+        assert_eq!(b.num_docs().expect("a searcher"), 0);
+        assert_eq!(entries(root.path()), vec!["notes".to_string()]);
     }
 }
