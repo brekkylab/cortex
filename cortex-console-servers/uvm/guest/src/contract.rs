@@ -84,3 +84,27 @@ pub struct ImageSpec {
     /// that has a tree stands in it, which is the whole reason it named one.
     pub working_dir: Option<String>,
 }
+
+/// The interface the boot attached, as `iface=<name>,mac=<addr>,mtu=<n>`. Absent for a guest
+/// with no network, which is the default.
+///
+/// **Not this project's spelling.** These are `microsandbox-network`'s own variable names, and
+/// they arrive from the stack that assigned the values — passed through by the boot rather than
+/// translated, so there is one description of the network and not two. Its guest agent reads
+/// the same names to do the same job, which is what makes this the shape to match rather than
+/// invent.
+///
+/// The `mac=` field is the one that is not description: it is how [`net`](crate::net) tells the
+/// attached interface from the others the kernel brought up on its own.
+pub const NET_ENV: &str = "MSB_NET";
+
+/// The addresses on that interface, as `addr=<ip>/<prefix>,gw=<ip>,dns=<ip>`.
+///
+/// A separate variable from [`NET_ENV`] because a stack with no IPv4 route to offer sends no
+/// IPv4 — and one that has both sends `MSB_NET_IPV6` beside it, which this end does not read
+/// yet.
+pub const NET_IPV4_ENV: &str = "MSB_NET_IPV4";
+
+/// Where a resolver is named on any system a base image was built for.
+pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+

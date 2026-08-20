@@ -435,6 +435,112 @@ async fn a_reference_that_is_not_one_is_refused_before_a_vm_is_started() {
     );
 }
 
+/// A session that asked for nothing has no interface to configure, which is the default and the
+/// thing most worth keeping true.
+///
+/// Not "the interface is down" — there is no device, so there is nothing to bring up. What the
+/// guest does have is a loopback and the `dummy0` its kernel makes on its own, and neither goes
+/// anywhere: what this looks for is a default route, which is what a configured device would
+/// have left behind.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
+async fn a_session_is_air_gapped_unless_a_network_was_asked_for() {
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "none")]).await;
+
+    let routes = fx.output("cat /proc/net/route").await.stdout;
+    let routes = String::from_utf8(routes).expect("a route table that is text");
+    assert!(
+        !routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "a session that asked for no network has a default route:\n{routes}"
+    );
+
+    // And nothing wrote a resolver, so a name has nowhere to be looked up either.
+    assert_eq!(fx.output("cat /etc/resolv.conf").await.code, 1);
+}
+
+/// The default posture: names resolve, and nothing else leaves.
+///
+/// Which is two claims about one device. The interface came up and a lookup was answered — by
+/// the stack in the console server process, since there is nothing else on that network to
+/// answer it. And a connection to the address that lookup returned is *refused*, because the
+/// policy allows the resolver and nothing more.
+///
+/// `getent hosts` rather than a ping: ICMP is a different permission from a name, and what is
+/// under test here is the resolver.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn the_default_posture_resolves_names_and_refuses_the_rest() {
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "host")]).await;
+
+    // The interface the stack assigned, configured by the guest with no `ip` binary in sight.
+    let routes = fx.output("cat /proc/net/route").await.stdout;
+    let routes = String::from_utf8(routes).expect("a route table that is text");
+    assert!(
+        routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "no default route, so the interface was never configured:\n{routes}"
+    );
+    assert!(
+        fx.output("cat /etc/resolv.conf")
+            .await
+            .stdout
+            .starts_with(b"nameserver "),
+        "no resolver was written"
+    );
+
+    let out = fx.output("getent hosts example.com").await;
+    assert_eq!(
+        out.code,
+        0,
+        "a name did not resolve: {:?} {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // …and that is all it gets. `wget` is busybox's here and exits non-zero on a refusal; what
+    // matters is that it does not succeed.
+    let out = fx
+        .output("wget -q -T 5 -O /dev/null http://example.com/")
+        .await;
+    assert_ne!(
+        out.code, 0,
+        "the default posture reached the internet, which is what it exists not to do"
+    );
+}
+
+/// `public` reaches the internet, where the default posture does not.
+///
+/// The same command, on a session that asked for egress: what separates the two is the policy
+/// and nothing else. Both directions are asserted because either alone is half a claim — a
+/// posture that refuses everything and one that allows everything each pass one of them.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_public_session_reaches_the_internet() {
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "public")]).await;
+
+    let out = fx.output("wget -q -T 10 -O /dev/null http://example.com/").await;
+    assert_eq!(
+        out.code,
+        0,
+        "a session that asked for the internet could not reach it: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And over TLS, which is a different path through the stack: a stream it does not read.
+    let out = fx.output("wget -q -T 10 -O /dev/null https://example.com/").await;
+    assert_eq!(
+        out.code,
+        0,
+        "plain HTTP reached the internet and HTTPS did not: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The part that is not a remote `exec`: a name whose behaviour lives in *this* process is
 /// runnable by a command inside the guest, and composes with the shell like a program.
 ///

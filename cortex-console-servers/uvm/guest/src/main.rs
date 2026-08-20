@@ -38,6 +38,7 @@ mod agent;
 mod contract;
 mod init;
 mod ipc;
+mod net;
 mod shim;
 
 use std::path::Path;

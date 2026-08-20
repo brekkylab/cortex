@@ -70,6 +70,14 @@ msb_krun = "0.1"
 # a guest at all.
 microsandbox-image = "0.6.7"
 
+# The userspace network stack a session with a network gets: smoltcp behind a policy engine,
+# in this process rather than in a helper anyone has to install. Only `cortex-uvm-boot`'s `vm`
+# feature takes it — the stack lives with the VM it serves.
+#
+# **The pin matters.** It requires an exact `msb_krun`, so the two versions here have to agree
+# or a build ends up with two `NetBackend` traits and no way to hand one to the other.
+microsandbox-network = "=0.6.12"
+
 # Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl`
 # on `Posix` itself rather than a wrapper holding one — the same shape `fuse-t` takes,
 # over the same `Mutex`-held inode and open tables.

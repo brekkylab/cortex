@@ -57,7 +57,7 @@ use tokio::{
 
 use crate::{
     assets::{self, BootRoot, SessionImage},
-    contract::{BootArgs, HANDSHAKE},
+    contract::{BootArgs, HANDSHAKE, Network},
     helper::boot_helper,
 };
 
@@ -65,6 +65,11 @@ use crate::{
 ///
 /// Read here and passed on, rather than left for the child to find in the environment it
 /// inherits: a value the boot is given is a value the server can be asked what it sent.
+/// How much of a network a session gets when its client did not say. Read from this server's
+/// own environment, like the two below and like `CORTEX_UVM_IMAGE`, and passed on as an
+/// argument: what a boot is told is a thing the server can be asked what it sent.
+const NETWORK: &str = "CORTEX_UVM_NETWORK";
+
 const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
 const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
 
@@ -114,6 +119,12 @@ impl Guest {
         let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
 
+        // Read here rather than only in the boot process, so a value nobody recognises is a
+        // failed call and not a guest that quietly reaches nothing. Passed on as the name it
+        // parsed to, which is the same spelling — the round trip is what keeps the two ends
+        // from disagreeing about a default.
+        let network = Network::parse(std::env::var(NETWORK).ok().as_deref())?;
+
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
         // still not something to do on the runtime's own thread.
         let session = tokio::task::spawn_blocking(SessionImage::create)
@@ -130,6 +141,7 @@ impl Guest {
             base: base.path,
             base_format: base.format,
             session: session.path().to_path_buf(),
+            network,
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),

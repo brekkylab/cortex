@@ -111,6 +111,10 @@ pub struct BootArgs {
     /// no tree. Mounted in the guest at **this same path** — see [`SHARE_ENV`].
     pub workfs: Option<PathBuf>,
 
+    /// How much of a network the session gets. Decided by the server, because it decides a
+    /// *device*, which is attached before a kernel comes up.
+    pub network: Network,
+
     /// Guest vCPUs and memory, when the server was told to override them.
     pub vcpus: Option<u8>,
     pub memory_mib: Option<u32>,
@@ -135,6 +139,7 @@ impl BootArgs {
         put("--base", self.base.as_os_str());
         put("--base-format", OsStr::new(self.base_format.as_str()));
         put("--session", self.session.as_os_str());
+        put("--network", OsStr::new(self.network.as_str()));
         if let Some(workfs) = &self.workfs {
             put("--workfs", workfs.as_os_str());
         }
@@ -159,6 +164,7 @@ impl BootArgs {
         let mut base = None;
         let mut base_format = None;
         let mut session = None;
+        let mut network = None;
         let mut workfs = None;
         let mut vcpus = None;
         let mut memory_mib = None;
@@ -179,6 +185,7 @@ impl BootArgs {
                 "--base" => base = Some(PathBuf::from(value()?)),
                 "--base-format" => base_format = Some(text(&flag, value()?)?),
                 "--session" => session = Some(PathBuf::from(value()?)),
+                "--network" => network = Some(text(&flag, value()?)?),
                 "--workfs" => workfs = Some(PathBuf::from(value()?)),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
@@ -200,6 +207,10 @@ impl BootArgs {
                 None => anyhow::bail!("--base-format is missing — a boot is started by a server"),
             },
             session: required("--session", session)?,
+            network: match network {
+                Some(name) => Network::parse(Some(&name))?,
+                None => anyhow::bail!("--network is missing — a boot is started by a server"),
+            },
             workfs,
             vcpus,
             memory_mib,
@@ -287,6 +298,66 @@ pub struct ImageSpec {
     pub working_dir: Option<String>,
 }
 
+/// How much of the network a session may reach: the value of [`BootArgs::network`].
+///
+/// The addresses are deliberately absent. A boot's network is a userspace stack running in the
+/// boot process, which assigns them itself and tells the guest what they are directly — as the
+/// `MSB_NET*` variables it puts in the guest's exec environment. So there is nothing here for
+/// the two ends to agree on: this crate carries the *decision*, and the stack carries the
+/// numbers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Network {
+    /// No device at all. A guest with nothing attached reaches nothing, which is a stronger
+    /// statement than any policy over a device that is there.
+    Disabled,
+
+    /// A device, and a policy that allows the gateway's resolver and nothing else.
+    ///
+    /// The default, and the reason there is a default at all: names resolve, so a command that
+    /// tries to reach the internet fails at a refused connection rather than at a lookup that
+    /// hangs — and nothing leaves the host. A caller who wants egress asks for it.
+    #[default]
+    HostOnly,
+
+    /// [`HostOnly`](Self::HostOnly) plus the public internet. Private ranges and the host's own
+    /// loopback stay refused: a sandbox that can reach a LAN is reaching things nobody
+    /// published to it.
+    Public,
+
+    /// Everything, with no policy. For a caller who has decided the sandbox boundary is
+    /// somewhere else.
+    Full,
+}
+
+impl Network {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Network::Disabled => "none",
+            Network::HostOnly => "host",
+            Network::Public => "public",
+            Network::Full => "full",
+        }
+    }
+
+    /// Parse the name a server wrote, where absent and empty both mean the default.
+    ///
+    /// An unrecognised value is refused. `on`, `true` and `1` are all things a caller might
+    /// reasonably type and none of them says how much reach is wanted, so guessing at one would
+    /// be deciding a sandbox's egress on their behalf.
+    pub fn parse(value: Option<&str>) -> anyhow::Result<Network> {
+        match value {
+            None | Some("") => Ok(Network::default()),
+            Some("none") => Ok(Network::Disabled),
+            Some("host") => Ok(Network::HostOnly),
+            Some("public") => Ok(Network::Public),
+            Some("full") => Ok(Network::Full),
+            Some(other) => {
+                anyhow::bail!("--network: {other} is not `none`, `host`, `public` or `full`")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +370,7 @@ mod tests {
             base: "/cache/oci/vmdk/sha256_7e6269.vmdk".into(),
             base_format: BaseFormat::Vmdk,
             session: "/tmp/session.ext4".into(),
+            network: Network::Public,
             workfs: Some("/Users/someone/project".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
@@ -392,5 +464,34 @@ mod tests {
     fn an_unknown_base_format_is_refused() {
         assert!(BaseFormat::parse("qcow2").is_err());
         assert!(BaseFormat::parse("").is_err());
+    }
+
+    /// The same promise for a reach: a server writes the name and a binary in another process
+    /// parses it, so a variant added with only one of them updated is a session that quietly
+    /// gets a reach nobody asked for.
+    #[test]
+    fn a_reach_round_trips_through_its_name() {
+        for reach in [
+            Network::Disabled,
+            Network::HostOnly,
+            Network::Public,
+            Network::Full,
+        ] {
+            assert_eq!(
+                Network::parse(Some(reach.as_str())).expect("its own name"),
+                reach
+            );
+        }
+    }
+
+    /// Silence is the default, and a misspelling is neither answer. `on`, `true` and `1` are all
+    /// things a caller might type and none of them says how much reach is wanted.
+    #[test]
+    fn a_reach_that_is_not_one_is_refused() {
+        assert_eq!(Network::parse(None).expect("unset"), Network::default());
+        assert_eq!(Network::parse(Some("")).expect("empty"), Network::default());
+        for typo in ["hsot", "on", "true", "1", "HOST"] {
+            assert!(Network::parse(Some(typo)).is_err(), "{typo} was accepted");
+        }
     }
 }

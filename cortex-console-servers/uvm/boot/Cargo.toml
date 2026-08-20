@@ -35,7 +35,7 @@ required-features = ["vm"]
 
 [features]
 # Everything the binary needs and the library must not have.
-vm = ["dep:msb_krun", "dep:libc"]
+vm = ["dep:msb_krun", "dep:microsandbox-network", "dep:libc", "dep:tokio"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -45,3 +45,10 @@ libc = { workspace = true, optional = true }
 # `blk` for the two disks the guest overlays into a root; `net` for the virtio-net device a
 # session with a network gets.
 msb_krun = { workspace = true, features = ["blk", "net"], optional = true }
+# The network a session with one gets. Its stack runs here rather than in the server, because
+# what `VmBuilder` takes is an in-process backend object and not a socket — so whatever owns
+# the VM is what has to own the stack.
+microsandbox-network = { workspace = true, optional = true }
+# The stack's poll loop is async and wants a runtime of its own, held for as long as the VM is
+# up. Nothing else in this binary waits for anything, which is why it is behind the feature.
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
