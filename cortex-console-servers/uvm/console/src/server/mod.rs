@@ -70,7 +70,6 @@ use cortex::console::{
 use microsandbox_image::Reference;
 
 use crate::assets;
-pub use guest::BOOT_ARG;
 use guest::Guest;
 
 /// The id the replayed `init` goes out under.

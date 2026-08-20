@@ -83,12 +83,6 @@ fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// with nothing to report.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// The role argument the boot child is started under.
-///
-/// Not a subcommand anybody types. The child is a copy of this binary at a path in a cache
-/// directory, so `argv[0]` cannot say what it is and `argv[1]` does.
-pub const BOOT_ARG: &str = "--boot";
-
 /// A guest that is up, and everything whose lifetime is that guest's.
 pub struct Guest {
     /// The VMM. First, so it is gone before anything it had open is deleted.
@@ -145,7 +139,6 @@ impl Guest {
 
         let mut command = Command::new(&helper);
         command
-            .arg(BOOT_ARG)
             .args(args.to_args())
             .stdin(Stdio::null())
             // The guest's console — kernel messages, and anything a command's output

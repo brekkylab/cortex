@@ -1,4 +1,4 @@
-//! The boot role: assemble the micro-VM and enter it.
+//! `cortex-uvm-boot` — assemble the micro-VM a console server described, and enter it.
 //!
 //! This never returns. `Vm::enter` hands the process to the VMM, and when the guest shuts
 //! down the VMM calls `_exit` — so whatever runs a VM *becomes* a VM and stops being able
@@ -6,8 +6,8 @@
 //! server has a session to keep answering, and it cannot be the thing that disappears
 //! when the guest does.
 //!
-//! Everything below comes out of the environment, which [`contract`](crate::contract)
-//! spells out. Nothing is decided here that the server did not already decide — this role
+//! Everything below comes out of the environment, which this crate's own library half
+//! spells out. Nothing is decided here that the server did not already decide — this binary
 //! exists to hold a hypervisor, not to have opinions.
 //!
 //! # The devices, and what each one is for
@@ -22,7 +22,7 @@
 //!
 //! The two disks are attached in that order because attach order is what fixes the guest
 //! names, and the guest is told which is which by name — see
-//! [`GUEST_UPPER_DEV`](crate::contract::GUEST_UPPER_DEV).
+//! [`GUEST_UPPER_DEV`](cortex_uvm_boot::GUEST_UPPER_DEV).
 //!
 //! The base is attached in the format the server said ([`base_format`]): raw for an image
 //! encoded from a tarball, VMDK for a registry pull's, whose descriptor stitches one disk out
@@ -56,7 +56,7 @@ use std::{
 
 use msb_krun::{DiskImageFormat, VmBuilder};
 
-use crate::contract::{
+use cortex_uvm_boot::{
     BaseFormat, BootArgs, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, PORT_NAME,
     SHARE_ENV, UPPER_ENV, WORKFS_TAG,
 };
@@ -70,12 +70,12 @@ const DEFAULT_VCPUS: u8 = 2;
 /// is the first thing anyone does in a sandbox.
 const DEFAULT_MEMORY_MIB: u32 = 2048;
 
-/// Build the VM this process was started to be, and enter it.
+/// Build the VM, and enter it.
 ///
-/// Everything comes off the command line, which this crate's own [`BootArgs`] spells. Nothing
-/// is decided here that the server did not already decide — this role exists to hold a
-/// hypervisor, not to have opinions.
-pub fn run(args: BootArgs) -> anyhow::Result<Infallible> {
+/// Everything comes off the command line, which this crate's library half spells as
+/// [`BootArgs`]. Nothing is decided here that the server did not already decide: this binary
+/// exists to hold a hypervisor, not to have opinions.
+fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // The console port is a descriptor, and this is where it comes from: one connection
     // back to the server that spawned us. Held for the length of this function, which is
     // the length of the process — `enter` below does not return.
@@ -126,6 +126,22 @@ pub fn run(args: BootArgs) -> anyhow::Result<Infallible> {
         .build()?;
 
     Ok(vm.enter()?)
+}
+
+/// Not async, and not multi-threaded. This process assembles a VM and hands itself to the
+/// VMM; everything it waits for after that it waits for by not existing.
+fn main() -> std::process::ExitCode {
+    match BootArgs::parse(std::env::args_os().skip(1)).and_then(run) {
+        // `enter` only returns on success by not returning at all: the `Ok` holds an
+        // `Infallible`, and the empty match is what says so.
+        Ok(never) => match never {},
+        Err(e) => {
+            eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));
+            // The shell's code for "found it, could not run it", which is what a boot that
+            // could not become a VM is.
+            std::process::ExitCode::from(126)
+        }
+    }
 }
 
 /// The host directory to share, and `None` for a session that declared no tree.

@@ -1,16 +1,18 @@
-//! What a boot tells the guest, and what a boot child is told.
+//! What a console server tells a boot, and what a boot tells the guest.
 //!
-//! Two cross-process contracts live together here, and they are not the same kind of thing:
+//! Two cross-process contracts live together here, in a crate of their own because the two
+//! ends of the first one are two binaries. They are not the same kind of thing:
 //!
-//! - **this process to the boot child** ([`BootArgs`]). A `Command::spawn`, so it is the
-//!   child's command line. The child is a copy of this binary in the
-//!   [`Boot`](crate::Role::Boot) role, and both ends are this one type, so nothing there
-//!   can drift.
-//! - **this process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`SHARE_ENV`],
-//!   [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]). The other end of that one is
-//!   `cortex-uvm-guest`'s `contract` module, which **has to change with this file** — the
-//!   two crates are built for different targets, so neither can depend on the other and
-//!   the compiler will not notice a mismatch.
+//! - **the server to the boot process** ([`BootArgs`]). An ordinary `Command::spawn`, so it
+//!   is the boot's command line. Both ends take this crate, and both are this one type, so
+//!   nothing there can drift. It is also the whole of what they say to each other: a boot is
+//!   started, told, and never asked anything, which is what made `cortex-uvm-boot` a separate
+//!   binary rather than a rewrite.
+//! - **the boot process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`SHARE_ENV`],
+//!   [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`], [`IMAGE_SPEC_PATH`]). The other end of
+//!   that one is `cortex-uvm-guest`'s `contract` module, which **has to change with this
+//!   file** — that crate is built for a different target and takes nothing it does not need,
+//!   so the compiler will not notice a mismatch.
 //!
 //! Where the tree lands inside the guest is **the host's own path for it**, carried in
 //! [`SHARE_ENV`] like any other share. Not a constant of this crate's choosing: one spelling
@@ -20,8 +22,8 @@
 //! The **guest** half is environment because that is the only channel libkrun's `exec` has:
 //! an argv and an env value alike become part of the guest's kernel command line, which is
 //! size-limited and rejects a newline. Nothing that could grow is there — the session itself
-//! arrives on [`PORT_NAME`] as protocol frames, and an image's own `ENV` goes as a file (see
-//! [`IMAGE_SPEC_PATH`]). None of that constrains [`BootArgs`], which is an ordinary spawn.
+//! arrives on [`PORT_NAME`] as protocol frames, and what the base image said arrives as a file
+//! ([`IMAGE_SPEC_PATH`]). None of that constrains [`BootArgs`], which is an ordinary spawn.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -48,7 +50,7 @@ pub const PORT_NAME: &str = "cortex-console";
 pub const HANDSHAKE: &[u8; 8] = b"CORTEXUV";
 
 /// The overlay's lower, as the guest sees it. Attach order is what fixes the names, so
-/// this is a promise [`crate::boot`] keeps rather than something either end computes.
+/// this is a promise `cortex-uvm-boot` keeps rather than something either end computes.
 pub const GUEST_LOWER_DEV: &str = "/dev/vdb";
 
 /// The overlay's upper, as the guest sees it.
