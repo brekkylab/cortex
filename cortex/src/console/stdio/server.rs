@@ -23,14 +23,18 @@
 //! # }
 //! ```
 
-use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    io,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use futures_core::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 
-use crate::console::stdio::{read, write};
-use crate::console::{Message, Outcome, RequestId, Server};
+use crate::console::{
+    Message, Outcome, RequestId, Server,
+    stdio::{read, write},
+};
 
 /// Whether this process has already taken its standard descriptors.
 ///
@@ -107,10 +111,12 @@ impl Server for StdioServer {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context as TaskContext, Poll};
+    use std::{
+        io::Cursor,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context as TaskContext, Poll},
+    };
 
     use super::*;
     use crate::console::{Call, Error, Exec, ExecCmd, Init, Notification};

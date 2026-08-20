@@ -25,9 +25,11 @@
 use std::fmt;
 
 use bson::Bson;
-use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, DeserializeOwned, MapAccess, Visitor},
+    ser::SerializeMap,
+};
 
 /// A `result` or an `error` — never both, never neither.
 ///
@@ -262,8 +264,7 @@ impl<'de> Visitor<'de> for OutcomeVisitor {
 mod tests {
     use bson::{Document, doc};
 
-    use super::super::ExecResult;
-    use super::*;
+    use super::{super::ExecResult, *};
 
     /// Read an outcome off the bytes a document makes, which is what a peer would
     /// actually have sent — the whole point of going through the wire rather than

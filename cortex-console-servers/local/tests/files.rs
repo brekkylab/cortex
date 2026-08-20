@@ -8,8 +8,7 @@
 
 use std::process::Stdio;
 
-use cortex::console::stdio::StdioClient;
-use cortex::console::{Console, Error, ExecResult, Failure, ReadResult};
+use cortex::console::{Console, Error, ExecResult, Failure, ReadResult, stdio::StdioClient};
 use tempfile::TempDir;
 use tokio::process::Command;
 

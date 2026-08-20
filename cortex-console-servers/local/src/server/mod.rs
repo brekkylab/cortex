@@ -118,25 +118,28 @@
 
 mod bin_dir;
 
-use std::ffi::OsString;
-use std::io::{self, SeekFrom};
-use std::os::unix::process::ExitStatusExt as _;
-use std::path::{Component, Path, PathBuf};
-use std::process::{ExitStatus, Output, Stdio};
+use std::{
+    ffi::OsString,
+    io::{self, SeekFrom},
+    os::unix::process::ExitStatusExt as _,
+    path::{Component, Path, PathBuf},
+    process::{ExitStatus, Output, Stdio},
+};
 
+use bin_dir::SessionScratch;
 use bson::Bson;
-use cortex::console::stdio::StdioServer;
 use cortex::console::{
     Call, Error, Exec, ExecCmd, ExecResult, Init, InitResult, MAX_PAYLOAD, Message, Notification,
     Outcome, Progress, Read, ReadResult, RequestId, Server, WorkFsMount, WorkFsSource, Write,
-    WriteResult,
+    WriteResult, stdio::StdioServer,
 };
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
+    net::{UnixListener, UnixStream},
+    process::Command,
+};
 
 use crate::ipc::SOCK_ENV;
-use bin_dir::SessionScratch;
 
 /// A command we found but could not start, and one we could not find at all.
 ///

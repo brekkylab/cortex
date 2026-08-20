@@ -49,8 +49,10 @@ use std::{
     sync::OnceLock,
 };
 
-use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
+use crate::{
+    BoxFuture,
+    fs::{Dirent, DirentKind, FileSystem, Stat},
+};
 
 /// The links one request may resolve through before the walk calls it a cycle. Reading links
 /// rather than having the kernel follow them moves its ceiling here: `MAXSYMLINKS` is 32 on

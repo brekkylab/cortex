@@ -9,14 +9,14 @@
 //! come back out of the shim's own stdout — four processes and one channel. Nothing
 //! smaller than the whole thing exercises it.
 
-use std::path::PathBuf;
-use std::process::Stdio;
+use std::{path::PathBuf, process::Stdio};
 
-use cortex::BoxFuture;
-use cortex::console::stdio::StdioClient;
-use cortex::console::{Console, ExecResult};
-use cortex::exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
-use cortex::fs::Mount;
+use cortex::{
+    BoxFuture,
+    console::{Console, ExecResult, stdio::StdioClient},
+    exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
+    fs::Mount,
+};
 use tokio::process::Command;
 
 /// An executable with a canned answer — enough to tell a round trip from a coincidence.

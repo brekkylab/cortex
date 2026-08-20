@@ -32,8 +32,10 @@
 //! guest that will not start. `CORTEX_UVM_GUEST_BIN` short-circuits the whole thing and
 //! embeds the file it names, for a caller who builds the guest some other way.
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 fn main() -> anyhow::Result<()> {
     let out = PathBuf::from(std::env::var("OUT_DIR")?).join("cortex-uvm-guest");

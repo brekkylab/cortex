@@ -37,15 +37,18 @@
 //! [`Console`]: crate::console::Console
 //! [`kill_on_drop`]: tokio::process::Command::kill_on_drop
 
-use std::io;
-use std::process::Stdio;
+use std::{io, process::Stdio};
 
 use futures_core::future::BoxFuture;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::process::{Child, Command};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, BufReader},
+    process::{Child, Command},
+};
 
-use crate::console::stdio::{read, write};
-use crate::console::{Call, Client, Failure, Message, Notification, Outcome, RequestId};
+use crate::console::{
+    Call, Client, Failure, Message, Notification, Outcome, RequestId,
+    stdio::{read, write},
+};
 
 /// A [`Client`] over a server process's pipes, and the process itself.
 ///
@@ -256,10 +259,12 @@ fn broke(doing: &'static str) -> impl FnOnce(io::Error) -> Failure {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
+    use std::{
+        io::Cursor,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
 
     use super::*;
     use crate::console::{

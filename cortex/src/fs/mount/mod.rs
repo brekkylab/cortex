@@ -13,10 +13,10 @@
 mod r#impl;
 mod mount;
 
-pub use mount::*;
 // The guards themselves are each gated on the binding that exports them, so a build without
 // that feature has no name for one — which is the point: it cannot mount that way either.
 #[cfg(feature = "fuse")]
 pub use r#impl::{FuseMount, MountOption};
 #[cfg(feature = "fuse-t")]
 pub use r#impl::{FuseTBackend, FuseTMount};
+pub use mount::*;

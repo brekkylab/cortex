@@ -13,9 +13,11 @@
 use std::fmt;
 
 use bson::Bson;
-use serde::de::{self, MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, MapAccess, Visitor},
+    ser::SerializeMap,
+};
 
 use crate::console::{Call, Error, Method, Notification, Outcome};
 
@@ -230,10 +232,10 @@ impl<'de> Visitor<'de> for MessageVisitor {
 mod tests {
     use bson::{Document, doc};
 
-    use super::super::{
-        Exec, ExecCmd, ExecResult, Init, Progress, Read, ReadResult, Write, WriteResult,
+    use super::{
+        super::{Exec, ExecCmd, ExecResult, Init, Progress, Read, ReadResult, Write, WriteResult},
+        *,
     };
-    use super::*;
 
     /// What a peer would have sent, and what it reads back as.
     ///

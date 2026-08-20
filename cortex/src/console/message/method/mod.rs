@@ -23,14 +23,15 @@ mod write;
 use std::fmt;
 
 use bson::Bson;
-use serde::de::{self, DeserializeOwned};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Serialize};
-
 pub use exec::*;
 pub use init::*;
 pub use notifications::*;
 pub use read::*;
+use serde::{
+    Deserialize, Serialize,
+    de::{self, DeserializeOwned},
+    ser::SerializeMap,
+};
 pub use write::*;
 
 /// Which method a request called, and its response answers.
@@ -255,8 +256,10 @@ impl Notification {
 /// BSON's own projection is the thing to reach for — `Bson::into_relaxed_extjson` spells
 /// `Binary` as `{"$binary": ..}` — rather than a second spelling in here.
 pub(super) mod bytes {
-    use serde::de::{SeqAccess, Visitor};
-    use serde::{Deserializer, Serializer};
+    use serde::{
+        Deserializer, Serializer,
+        de::{SeqAccess, Visitor},
+    };
 
     pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_bytes(bytes)

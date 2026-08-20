@@ -11,8 +11,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::fs::{FileSystem, WorkFs};
-use crate::skill::{Skill, SkillDir};
+use crate::{
+    fs::{FileSystem, WorkFs},
+    skill::{Skill, SkillDir},
+};
 
 /// A skill found in a workspace: where it is mounted, and what its manifest says.
 ///

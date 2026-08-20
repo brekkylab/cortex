@@ -4,14 +4,17 @@
 //! spawns the commands and holds the directory between them — so the only way to see what
 //! this backend does with them is to drive it over the channel and ask.
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
-use cortex::BoxFuture;
-use cortex::console::stdio::StdioClient;
-use cortex::console::{Console, Error, ExecResult};
-use cortex::exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
-use cortex::fs::Mount;
+use cortex::{
+    BoxFuture,
+    console::{Console, Error, ExecResult, stdio::StdioClient},
+    exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
+    fs::Mount,
+};
 use tempfile::TempDir;
 use tokio::process::Command;
 

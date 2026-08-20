@@ -40,9 +40,11 @@ use object_store::{
     path::Path as OsPath,
 };
 
-use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
-use crate::lock::lock;
+use crate::{
+    BoxFuture,
+    fs::{Dirent, DirentKind, FileSystem, Stat},
+    lock::lock,
+};
 
 // `S3Config` lives in `volume/spec.rs`, not here. It is a wire type: a build without
 // this feature still has to parse a spec that names an S3 volume, so the settings

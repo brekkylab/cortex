@@ -27,8 +27,10 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
+use crate::{
+    BoxFuture,
+    fs::{Dirent, DirentKind, FileSystem, Stat},
+};
 
 const API: &str = "https://api.notion.com/v1";
 const NOTION_VERSION: &str = "2022-06-28";

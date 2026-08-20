@@ -35,24 +35,34 @@
 //! [`Guest::boot`] waits for the agent to say it is reading before it treats the channel as
 //! usable — and that wait doubles as the only signal there is that the guest booted at all.
 
-use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
-
-use cortex::console::stdio::{read, write};
-use cortex::console::{Call, Message, Outcome, RequestId};
-use tokio::io::{AsyncReadExt as _, BufReader};
-use tokio::net::UnixListener;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-
-use crate::assets::{self, BootRoot, SessionImage};
-use crate::contract::{
-    BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV,
-    WORKFS_ENV,
+use std::{
+    io,
+    os::fd::{FromRawFd, OwnedFd},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    time::Duration,
 };
-use crate::helper::boot_helper;
+
+use cortex::console::{
+    Call, Message, Outcome, RequestId,
+    stdio::{read, write},
+};
+use tokio::{
+    io::{AsyncReadExt as _, BufReader},
+    net::{
+        UnixListener,
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+    },
+};
+
+use crate::{
+    assets::{self, BootRoot, SessionImage},
+    contract::{
+        BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV,
+        WORKFS_ENV,
+    },
+    helper::boot_helper,
+};
 
 /// How long a boot may take before it is called a failure.
 ///

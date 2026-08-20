@@ -8,8 +8,10 @@
 //! Here rather than in each backend because a backend's `delegate` is written twice, and the
 //! `Some`-vs-`None` rule is what must not drift between the copies.
 
-use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::{
+    io,
+    path::{Component, Path, PathBuf},
+};
 
 /// `cwd` expressed relative to `root`, or `None` if it cannot be — because it lies outside
 /// `root`, or because its name is not UTF-8. `to_string_lossy` there would hand back a path
@@ -140,8 +142,7 @@ mod tests {
     /// which is the failure `cwd` exists to prevent.
     #[test]
     fn a_non_utf8_directory_is_none_rather_than_lossy() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
 
         let mut bytes = b"/mnt/".to_vec();
         bytes.push(0xff);

@@ -21,7 +21,6 @@ mod r#impl;
 pub(super) mod posix;
 
 pub use filesystem::*;
-pub use posix::*;
 // A store that reaches the network is behind its own feature, for the reason the crate has no
 // default features at all: `s3` costs 131 crates, and a build that serves local files should
 // not compile an HTTP and TLS stack to do it.
@@ -30,3 +29,4 @@ pub use r#impl::{InMemFs, PassthroughFs};
 pub use r#impl::{NotionConfig, NotionFs};
 #[cfg(feature = "s3")]
 pub use r#impl::{S3Config, S3Fs};
+pub use posix::*;

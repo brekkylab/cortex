@@ -63,12 +63,10 @@ mod guest;
 
 use std::path::PathBuf;
 
-use cortex::console::stdio::StdioServer;
 use cortex::console::{
     Call, Error, Init, InitResult, Message, Notification, Outcome, RequestId, Server, WorkFsMount,
-    WorkFsSource,
+    WorkFsSource, stdio::StdioServer,
 };
-
 pub use guest::BOOT_ARG;
 use guest::Guest;
 

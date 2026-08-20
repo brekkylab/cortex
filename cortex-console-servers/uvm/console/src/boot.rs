@@ -43,10 +43,11 @@
 //! internet. A session that needs egress needs a network device and a policy to go with
 //! it, and neither is something to add without a way for a caller to say what it wants.
 
-use std::convert::Infallible;
-use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::{
+    convert::Infallible,
+    os::{fd::AsRawFd, unix::net::UnixStream},
+    path::{Path, PathBuf},
+};
 
 use msb_krun::{DiskImageFormat, VmBuilder};
 

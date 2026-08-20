@@ -16,9 +16,11 @@ use std::{
     time::SystemTime,
 };
 
-use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
-use crate::lock::lock;
+use crate::{
+    BoxFuture,
+    fs::{Dirent, DirentKind, FileSystem, Stat},
+    lock::lock,
+};
 
 /// The largest file this store will represent — a safety ceiling, not a capacity plan.
 ///

@@ -46,8 +46,10 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
-use crate::lock::lock;
+use crate::{
+    fs::{Dirent, DirentKind, FileSystem, Stat},
+    lock::lock,
+};
 
 /// How a file should be opened.
 ///
@@ -444,7 +446,11 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// Takes a kernel reference on the inode, so it must be balanced by
     /// [`forget`](InodeTable::forget) — that is the `lookup` contract.
-    pub(in crate::fs) async fn lookup_child(&self, parent: u64, name: &OsStr) -> io::Result<(u64, Stat)> {
+    pub(in crate::fs) async fn lookup_child(
+        &self,
+        parent: u64,
+        name: &OsStr,
+    ) -> io::Result<(u64, Stat)> {
         let parent_path = self.path_of(parent)?;
         let child = parent_path.join(name);
         let stat = self.store.stat(&child).await?;
@@ -474,7 +480,11 @@ impl<T: FileSystem> Posix<T> {
     ///
     /// The options are the caller's: a binding decodes them from whatever flags word its
     /// kernel speaks (see [`decode_open_flags`]).
-    pub(in crate::fs) async fn open_inode(&self, inode: u64, options: OpenOptions) -> io::Result<u64> {
+    pub(in crate::fs) async fn open_inode(
+        &self,
+        inode: u64,
+        options: OpenOptions,
+    ) -> io::Result<u64> {
         let path = self.path_of(inode)?;
         self.realize_open(&path, options).await?;
         Ok(lock(&self.opens).insert(Open { inode, options }))
@@ -540,7 +550,12 @@ impl<T: FileSystem> Posix<T> {
 
     /// Read the `(offset, size)` window the kernel asked for. A short read is EOF, so
     /// the returned buffer is only as long as what actually arrived.
-    pub(in crate::fs) async fn read_handle(&self, fh: u64, offset: u64, size: u32) -> io::Result<Vec<u8>> {
+    pub(in crate::fs) async fn read_handle(
+        &self,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> io::Result<Vec<u8>> {
         let (path, options) = self.open_of(fh)?;
         if !options.read {
             return Err(bad_handle());
@@ -588,7 +603,11 @@ impl<T: FileSystem> Posix<T> {
     }
 
     /// Create a subdirectory of `parent`, returning its inode and metadata.
-    pub(in crate::fs) async fn mkdir_child(&self, parent: u64, name: &OsStr) -> io::Result<(u64, Stat)> {
+    pub(in crate::fs) async fn mkdir_child(
+        &self,
+        parent: u64,
+        name: &OsStr,
+    ) -> io::Result<(u64, Stat)> {
         let path = self.path_of(parent)?.join(name);
         // One call, not a `mkdir` followed by a `stat`: the store reports what it just
         // made, which it knows for free and a second request would have to ask for.

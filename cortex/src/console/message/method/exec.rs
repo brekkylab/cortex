@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, MapAccess, SeqAccess, Visitor},
+    ser::SerializeMap,
+};
 
 use super::bytes;
 use crate::console::{Outcome, RequestId};

@@ -11,10 +11,11 @@
 use std::process::ExitCode;
 
 use anyhow::bail;
-use cortex::console::stdio::{read, write};
-use cortex::console::{Call, Exec, ExecCmd, ExecResult, Message};
-use tokio::io::AsyncWriteExt as _;
-use tokio::net::UnixStream;
+use cortex::console::{
+    Call, Exec, ExecCmd, ExecResult, Message,
+    stdio::{read, write},
+};
+use tokio::{io::AsyncWriteExt as _, net::UnixStream};
 
 use crate::ipc::SOCK_ENV;
 

@@ -5,9 +5,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::BoxFuture;
-use crate::fs::{Dirent, FileSystem, InMemFs, PassthroughFs, Stat};
-use crate::skill::Skill;
+use crate::{
+    BoxFuture,
+    fs::{Dirent, FileSystem, InMemFs, PassthroughFs, Stat},
+    skill::Skill,
+};
 
 /// A [`FileSystem`] whose root *is* a skill: `skill.md` at the top, and whatever the
 /// instructions bring with them beside it.

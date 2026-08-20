@@ -28,13 +28,17 @@
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
-use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+};
 
-use cortex::BoxFuture;
-use cortex::console::{Console, ExecResult, ReadResult};
-use cortex::exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet};
-use cortex::fs::Mount;
+use cortex::{
+    BoxFuture,
+    console::{Console, ExecResult, ReadResult},
+    exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
+    fs::Mount,
+};
 use tokio::process::Command;
 
 /// A directory standing in for a mounted tree.

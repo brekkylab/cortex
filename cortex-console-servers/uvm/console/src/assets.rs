@@ -29,13 +29,17 @@
 //!
 //! [`BASE_IMAGE_ENV`]: crate::contract::BASE_IMAGE_ENV
 
-use std::io;
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
-use microsandbox_image::erofs::write_erofs;
-use microsandbox_image::ext4::{Ext4FormatOptions, format_ext4};
-use microsandbox_image::tar::{Compression, ingest_compressed_tar};
-use microsandbox_image::tree::ResourceLimits;
+use microsandbox_image::{
+    erofs::write_erofs,
+    ext4::{Ext4FormatOptions, format_ext4},
+    tar::{Compression, ingest_compressed_tar},
+    tree::ResourceLimits,
+};
 
 use crate::contract::{BASE_IMAGE_ENV, GUEST_BIN_PATH, SESSION_IMAGE_ENV};
 

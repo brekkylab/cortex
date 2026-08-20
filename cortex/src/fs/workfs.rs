@@ -24,8 +24,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
+use crate::{
+    BoxFuture,
+    fs::{Dirent, DirentKind, FileSystem, Stat},
+};
 
 /// A public API for using cortex's filesystem.
 ///

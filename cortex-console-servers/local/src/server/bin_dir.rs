@@ -20,11 +20,13 @@
 //! what earlier runs left behind: the pid in the name says whose it was, and a
 //! signal-0 probe says whether that process is still around.
 
-use std::fs::{self, DirBuilder};
-use std::io;
-use std::os::unix::fs::{DirBuilderExt, symlink};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    fs::{self, DirBuilder},
+    io,
+    os::unix::fs::{DirBuilderExt, symlink},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 /// Marks a directory as ours and carries the owning pid, so a later run can
 /// tell an abandoned directory from one still in use.

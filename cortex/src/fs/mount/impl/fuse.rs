@@ -31,11 +31,13 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
-use crate::fs::filesystem::posix::{
-    BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
-    decode_open_flags, host_errno,
+use crate::fs::{
+    DirentKind, FileSystem, Mount, Posix, SetAttr, Stat,
+    filesystem::posix::{
+        BLOCK_SIZE, NAME_MAX, OpenFlagBits, TOTAL_BLOCKS, TOTAL_INODES, TTL, attr_for,
+        decode_open_flags, host_errno,
+    },
 };
-use crate::fs::{DirentKind, FileSystem, Mount, Posix, SetAttr, Stat};
 
 /// Open flags in the host's numbering: this reply goes to this host's kernel.
 const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {

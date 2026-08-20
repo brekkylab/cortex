@@ -41,9 +41,7 @@ mod ipc;
 mod server;
 mod shim;
 
-use std::ffi::OsStr;
-use std::path::Path;
-use std::process::ExitCode;
+use std::{ffi::OsStr, path::Path, process::ExitCode};
 
 /// A failure of ours, not the command's — the shell's code for "found it, could
 /// not run it".
