@@ -746,10 +746,14 @@ impl<T: FileSystem> Posix<T> {
         if lock(&self.opens).any_on(open.inode) {
             return Ok(());
         }
-        let Some(aside) = lock(&self.held).remove(&open.inode) else {
+        let Some(aside) = lock(&self.held).get(&open.inode).cloned() else {
             return Ok(());
         };
-        self.store.unlink(&aside).await
+        self.store.unlink(&aside).await?;
+        // Only after the store agreed, as everywhere else here: forgetting the hidden name
+        // first would leave a failed removal with nothing left that knows what to remove.
+        lock(&self.held).remove(&open.inode);
+        Ok(())
     }
 
     /// The entries a `readdir` of `inode` should stream, in order: `.`, `..`, then the
