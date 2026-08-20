@@ -65,11 +65,6 @@ use crate::{
 ///
 /// Read here and passed on, rather than left for the child to find in the environment it
 /// inherits: a value the boot is given is a value the server can be asked what it sent.
-/// How much of a network a session gets when its client did not say. Read from this server's
-/// own environment, like the two below and like `CORTEX_UVM_IMAGE`, and passed on as an
-/// argument: what a boot is told is a thing the server can be asked what it sent.
-const NETWORK: &str = "CORTEX_UVM_NETWORK";
-
 const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
 const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
 
@@ -114,16 +109,14 @@ impl Guest {
     /// `workfs` is a directory on this host, or `None` for a session with no tree. It is
     /// shared into the guest **at its own path** — see [`boot`](crate::boot), which is where
     /// that decision is argued.
-    pub async fn boot(workfs: Option<&Path>, image: Option<&str>) -> anyhow::Result<Guest> {
+    pub async fn boot(
+        workfs: Option<&Path>,
+        image: Option<&str>,
+        network: Network,
+    ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
-
-        // Read here rather than only in the boot process, so a value nobody recognises is a
-        // failed call and not a guest that quietly reaches nothing. Passed on as the name it
-        // parsed to, which is the same spelling — the round trip is what keeps the two ends
-        // from disagreeing about a default.
-        let network = Network::parse(std::env::var(NETWORK).ok().as_deref())?;
 
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
         // still not something to do on the runtime's own thread.

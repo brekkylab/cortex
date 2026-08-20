@@ -69,8 +69,8 @@ use crate::{
     console::{
         base::{Client, Failure},
         message::{
-            Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, Notification, Outcome,
-            Progress, Read, ReadResult, RequestId, WorkFsSource, Write, WriteResult,
+            Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, NetworkAccess, Notification,
+            Outcome, Progress, Read, ReadResult, RequestId, WorkFsSource, Write, WriteResult,
         },
         stdio::StdioClient,
     },
@@ -113,6 +113,10 @@ pub struct ConsoleBuilder {
 
     /// The base the session's commands run in, and `None` to leave it to the server.
     image: Option<ImageSource>,
+
+    /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
+    /// and what every caller wanted before this existed.
+    network: Option<NetworkAccess>,
 }
 
 impl ConsoleBuilder {
@@ -229,6 +233,34 @@ impl ConsoleBuilder {
         self
     }
 
+    /// How much of a network the session's commands get.
+    ///
+    /// ```no_run
+    /// # use cortex::console::{Console, NetworkAccess};
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .network(NetworkAccess::public())
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// **A server gives what is named here or refuses to open the session**, which is what
+    /// makes this worth saying rather than checking afterwards: a console that exists is one
+    /// whose commands reach what was asked for and no more. A reach the far end cannot provide
+    /// arrives as [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) from
+    /// [`build`](Self::build) — including from a server whose commands run on this host, which
+    /// cannot take the network away from them and so answers only
+    /// [`full`](NetworkAccess::full).
+    ///
+    /// Leaving it out leaves the choice to the server, and [`Console::network`] is then how to
+    /// find out what it chose.
+    pub fn network(mut self, network: NetworkAccess) -> Self {
+        self.network = Some(network);
+        self
+    }
+
     /// Fails for the one part that has no default — something to ask — for whatever having
     /// a channel took (over stdio, a server process that would not start), and for the
     /// `init` this then sends.
@@ -318,6 +350,10 @@ pub struct Console {
 
     /// The base in force, as the server answered at `init`.
     image: Option<ImageSource>,
+
+    /// What the session's commands can reach, as the server answered at `init` — `None` from a
+    /// server that would not say.
+    network: Option<NetworkAccess>,
 }
 
 impl Console {
@@ -353,6 +389,7 @@ impl Console {
             execs,
             mount,
             image,
+            network,
         } = builder;
 
         let client_factory =
@@ -378,6 +415,7 @@ impl Console {
                 delegated: execs.names().map(str::to_string).collect(),
                 workfs,
                 image,
+                network,
             })
             .await?;
 
@@ -398,6 +436,7 @@ impl Console {
             mount,
             server_path,
             image: answered.image,
+            network: answered.network,
         })
     }
 
@@ -422,6 +461,17 @@ impl Console {
     /// commands do not run in an image at all.
     pub fn image(&self) -> Option<&ImageSource> {
         self.image.as_ref()
+    }
+
+    /// What this session's commands can reach, as the server answered.
+    ///
+    /// The reach [`ConsoleBuilder::network`] asked for, when it asked — a server gives that or
+    /// refuses, so a console that exists is one that got it. Worth reading when nothing was
+    /// asked: the reach is then the server's own choice, and this is where it says which.
+    ///
+    /// `None` is a server that would not say, which is every server built before it could.
+    pub fn network(&self) -> Option<&NetworkAccess> {
+        self.network.as_ref()
     }
 
     /// Boot the far end now, to hide the cold start.
@@ -512,6 +562,7 @@ impl Console {
             mount,
             server_path,
             image: _,
+            network: _,
         } = self;
 
         // The id of the request the *next* answer will be to, which is what carrying on

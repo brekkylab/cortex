@@ -35,7 +35,7 @@ use std::{
 
 use cortex::{
     BoxFuture,
-    console::{Console, ExecResult, ImageSource, ReadResult},
+    console::{Console, ExecResult, ImageSource, NetworkAccess, ReadResult},
     exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
     fs::Mount,
 };
@@ -174,6 +174,26 @@ impl Fixture {
                     .register("rawbytes", "answer bytes that are not text", RawBytes)
                     .register("cat-here", "read a file where the command stood", CatHere),
             )
+            .build()
+            .await?;
+
+        Ok(Fixture { console })
+    }
+
+    /// A fixture whose session asks for `reach` over the channel, the way a client does.
+    ///
+    /// The same shape as [`asking_for`](Self::asking_for) and for the same reason: what a
+    /// client declares in its `init` is what the session gets, and the server's own setting is
+    /// only the answer when nothing was declared.
+    async fn asking_for_reach(reach: NetworkAccess) -> anyhow::Result<Fixture> {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client = cortex::console::stdio::StdioClient::new(server)?;
+
+        let console = Console::builder()
+            .client(client)
+            .network(reach)
+            .executables(ExecutableSet::new())
             .build()
             .await?;
 
@@ -537,6 +557,83 @@ async fn a_public_session_reaches_the_internet() {
         out.code,
         0,
         "plain HTTP reached the internet and HTTPS did not: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A reach nobody defined is refused at `init`, before a VM is worth starting.
+///
+/// **Not** `#[ignore]`d, because nothing here boots — which is the property being asserted. A
+/// name the server cannot answer is knowable from the frame, so a client hears about it while
+/// it can still ask for something else.
+#[tokio::test]
+async fn a_reach_that_is_not_a_reach_is_refused_before_a_vm_is_started() {
+    let err = match Fixture::asking_for_reach(NetworkAccess::new("sort-of")).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened with a reach nobody defined"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::UNSUPPORTED_NETWORK),
+        "answered {err:?} — a name nobody defined is not a backend that would not come up"
+    );
+}
+
+/// What the client asks for is what the session gets, and the server says so.
+///
+/// The `init` declaration is the whole subject here: nothing sets `CORTEX_UVM_NETWORK`, so a
+/// guest that reaches the internet reached it because the client asked over the channel.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_client_asks_for_its_reach_over_the_channel() {
+    // Asked for nothing, so the answer is the server's own — which is `host` by default, and
+    // the only way a client could have learnt that.
+    let quiet = Fixture::new().await;
+    assert_eq!(
+        quiet.console.network().map(|n| n.reach.as_str()),
+        Some("host"),
+        "a server that chose the reach did not say which"
+    );
+    drop(quiet);
+
+    // Asked for none: no device, so no default route for the guest to have.
+    let mut off = Fixture::asking_for_reach(NetworkAccess::none())
+        .await
+        .expect("a session with no network");
+    assert_eq!(
+        off.console.network().map(|n| n.reach.as_str()),
+        Some("none")
+    );
+    let routes = String::from_utf8(off.output("cat /proc/net/route").await.stdout)
+        .expect("a route table that is text");
+    assert!(
+        !routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "a session that asked for no network has a default route:\n{routes}"
+    );
+    drop(off);
+
+    // And asked for the internet: reached, with nothing in the server's environment saying so.
+    let mut open = Fixture::asking_for_reach(NetworkAccess::public())
+        .await
+        .expect("a session with the internet");
+    assert_eq!(
+        open.console.network().map(|n| n.reach.as_str()),
+        Some("public")
+    );
+    let out = open
+        .output("wget -q -T 10 -O /dev/null http://example.com/")
+        .await;
+    assert_eq!(
+        out.code,
+        0,
+        "a session that asked for the internet could not reach it: {:?}",
         String::from_utf8_lossy(&out.stderr)
     );
 }

@@ -64,12 +64,12 @@ mod guest;
 use std::path::PathBuf;
 
 use cortex::console::{
-    Call, Error, ImageSource, Init, InitResult, Message, Notification, Outcome, RequestId, Server,
-    WorkFsMount, WorkFsSource, stdio::StdioServer,
+    Call, Error, ImageSource, Init, InitResult, Message, NetworkAccess, Notification, Outcome,
+    RequestId, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
 };
 use microsandbox_image::Reference;
 
-use crate::assets;
+use crate::{assets, contract::Network};
 use guest::Guest;
 
 /// The id the replayed `init` goes out under.
@@ -192,6 +192,11 @@ struct Session {
     /// and this is only the name of one.
     image: Option<Reference>,
 
+    /// How much of a network this session's guest gets. From the client's `init` when it said,
+    /// and from this server's own environment when it did not — decided at `init` because it
+    /// decides a *device*, which is attached before a kernel comes up.
+    network: Network,
+
     /// `None` until something boots one: a `start`, or the first call that needs it.
     guest: Option<Guest>,
 }
@@ -210,10 +215,12 @@ impl Session {
     fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
         let image = base(config.image.as_ref())?;
+        let network = reach(config.network.as_ref())?;
 
         self.guest = None;
         self.workfs = workfs;
         self.image = image;
+        self.network = network;
         self.config = config;
 
         let path = self
@@ -234,6 +241,9 @@ impl Session {
                 .image
                 .as_ref()
                 .map(|reference| ImageSource::new(reference.to_string())),
+            // What the session got, whether it asked or not — the one place a client that
+            // asked for nothing can learn what this server's own setting turned out to be.
+            network: Some(NetworkAccess::new(network.as_str())),
         })
     }
 
@@ -277,7 +287,7 @@ impl Session {
             }
 
             let image = self.image.as_ref().map(Reference::to_string);
-            let mut guest = Guest::boot(self.workfs.as_deref(), image.as_deref())
+            let mut guest = Guest::boot(self.workfs.as_deref(), image.as_deref(), self.network)
                 .await
                 .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
 
@@ -328,6 +338,36 @@ fn base(asked: Option<&ImageSource>) -> Result<Option<Reference>, Outcome> {
         .parse()
         .map(Some)
         .map_err(|e| refused(Error::INVALID_PARAMS, format!("{reference}: {e}")))
+}
+
+/// How much of a network a session gets when its client did not say. This server's own setting,
+/// read from its own environment like `CORTEX_UVM_IMAGE` and answered back at `init`.
+const NETWORK: &str = "CORTEX_UVM_NETWORK";
+
+/// The reach a session asked for, or this server's own when it asked for nothing.
+///
+/// Every name the protocol defines is one this backend can answer, so the only refusal here is
+/// a name nobody defined. That is the whole of the check — and it is worth making at `init`
+/// anyway, because a reach decides whether a virtio-net device is attached and a device is
+/// attached before a kernel comes up. A client told now can ask for something else; one told at
+/// its first command has already paid for a boot it cannot use.
+fn reach(asked: Option<&NetworkAccess>) -> Result<Network, Outcome> {
+    let Some(asked) = asked else {
+        // Nothing asked, so this server's own setting stands — and is answered back, which is
+        // how the client finds out what that was.
+        return Network::parse(std::env::var(NETWORK).ok().as_deref())
+            .map_err(|e| refused(Error::INVALID_PARAMS, e.to_string()));
+    };
+
+    Network::parse(Some(&asked.reach)).map_err(|_| {
+        refused(
+            Error::UNSUPPORTED_NETWORK,
+            format!(
+                "{}: no such reach — this server answers none, host, public and full",
+                asked.reach
+            ),
+        )
+    })
 }
 
 /// The host directory a workfs URL names, or why it names none this backend can use.

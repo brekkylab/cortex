@@ -128,6 +128,23 @@ impl Error {
     /// correctly and the environment is what has to change.
     pub const MOUNT_FAILED: i64 = -32009;
 
+    /// `init`: a network reach this server cannot provide, named in the message.
+    ///
+    /// `init`'s own, for the reason [`UNSUPPORTED_WORKFS`](Self::UNSUPPORTED_WORKFS) is:
+    /// which reaches a server can answer is a fact about the build and the machine, knowable
+    /// the moment the frame is read.
+    ///
+    /// Two things arrive as this. A name nobody has heard of — a client asking for something
+    /// no backend implements. And a name that is understood and cannot be honoured: a server
+    /// whose commands run on this host cannot take the network away from them, so it refuses
+    /// every reach but `full` rather than pretending. Both are the same fix — ask for
+    /// something else, or run against a different backend — which is why they are one code.
+    ///
+    /// Never used to *narrow* a session. A server that could give less than was asked for
+    /// refuses instead: quietly granting a different reach than the one named is the failure
+    /// [`Init::network`](crate::console::Init::network) exists to prevent.
+    pub const UNSUPPORTED_NETWORK: i64 = -32010;
+
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
     /// error) belongs to whoever reads the frame, not here.
     /// The base image a session asked for is one this backend cannot give it.
