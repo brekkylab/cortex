@@ -162,7 +162,15 @@ pub(super) const NAME_MAX: usize = 255;
 /// gives way is the half that is only for reading. Two long names can therefore shorten to the
 /// same text; their components still differ, because the id follows.
 pub(super) fn entry(name: &str, id: &str, suffix: &str) -> String {
-    let tail = format!("__{id}{suffix}");
+    // The id is sanitized too. It is the platform's, not this tree's — `ConvId` is documented
+    // as opaque — and a `/` or a tab in one would produce an entry a listing names and nothing
+    // can open, which is the disagreement between `resolve` and `listing` that this tree may
+    // not have. Slack's alphabet cannot carry either; the next platform's is not this tree's
+    // to assume.
+    let tail = format!("__{}{suffix}", sanitize(id));
+    // An id long enough to fill the budget on its own leaves nothing to cut. Truncating the id
+    // would break addressing, so the component goes out over the limit and the filesystem
+    // refuses it — a loud failure on an unserveable name, rather than a quiet unaddressable one.
     let budget = NAME_MAX.saturating_sub(tail.len());
     let mut head = sanitize(name);
     if head.len() > budget {
@@ -176,12 +184,33 @@ pub(super) fn entry(name: &str, id: &str, suffix: &str) -> String {
         head.truncate(cut);
         // A cut lands wherever the budget ran out, which can be mid-word and after a space.
         // Trailing blanks in a directory name are legal and invisible, which is worse than
-        // either having them or not.
-        while head.ends_with(' ') {
+        // either having them or not. `sanitize`'s own `trim` only reaches the ends of the
+        // *input*, so a cut can expose one it never saw — and the blank exposed is whatever
+        // the name held, not necessarily an ASCII space.
+        while head.ends_with(char::is_whitespace) {
             head.pop();
         }
     }
     format!("{head}{tail}")
+}
+
+/// The file a thread is served as: its root's id and nothing else.
+///
+/// Not [`entry`], which would put `unnamed__` in front of it — a thread has no name of its own,
+/// only the message that started it. Sanitized all the same, because the id is the platform's:
+/// one carrying a `/` would otherwise be a listing entry that names two path components and
+/// opens none.
+pub(super) fn thread_file(root: &str) -> String {
+    let mut name = sanitize(root);
+    let budget = NAME_MAX.saturating_sub(JSONL.len());
+    if name.len() > budget {
+        let mut cut = budget;
+        while cut > 0 && !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        name.truncate(cut);
+    }
+    format!("{name}{JSONL}")
 }
 
 /// A display name made safe to be one path component.
@@ -192,12 +221,14 @@ pub(super) fn entry(name: &str, id: &str, suffix: &str) -> String {
 pub(super) fn sanitize(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        // A control character is legal in a POSIX name and hostile in every other way. A
-        // newline breaks anything that reads a listing a line at a time, a tab breaks the
-        // `<path>\t<record>` a search hit is printed as, and an escape sequence rewrites
-        // whatever a terminal already drew. Slack's own channel names cannot carry one, but a
+        // Anything that rewrites a rendered line. A newline breaks whatever reads a listing a
+        // line at a time, a tab breaks the `<path>\t<record>` a search hit is printed as, and
+        // an escape sequence rewrites what a terminal already drew — but `char::is_control` is
+        // category Cc only, and a bidi override does that last one without being one:
+        // `invoice<U+202E>fdp.txt` renders as `invoicetxt.pdf`. So the format characters and
+        // the line separators go too. Slack's own channel names cannot carry any of this; a
         // display name and an uploaded filename are whoever typed them.
-        .map(|c| if c == '/' || c.is_control() { '-' } else { c })
+        .map(|c| if c == '/' || rewrites_a_line(c) { '-' } else { c })
         .collect();
     let cleaned = cleaned.trim().trim_start_matches('.').to_string();
     if cleaned.is_empty() {
@@ -205,6 +236,22 @@ pub(super) fn sanitize(name: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Whether `c` would change how a name renders rather than what it says.
+///
+/// Cc controls, Cf format characters (bidi overrides, zero-width joiners, the BOM), and the
+/// Zl/Zp separators. Not a general "is this printable" test — an emoji in a channel name is
+/// fine, and so is every script.
+fn rewrites_a_line(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{200B}'..='\u{200F}'   // zero width, LRM/RLM
+            | '\u{202A}'..='\u{202E}' // bidi embedding and override
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{2028}' | '\u{2029}' // line and paragraph separator
+            | '\u{FEFF}')              // BOM
 }
 
 /// The UTC day a timestamp falls in — the tree's bucketing rule, in one place.

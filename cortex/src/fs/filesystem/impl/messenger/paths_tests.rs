@@ -286,3 +286,59 @@ fn the_month_span_covers_both_ends_and_rolls_the_year() {
     // `created` from inventing an axis.
     assert!(months(d(2027, 1, 1), d(2026, 8, 21)).is_empty());
 }
+
+
+/// A character that rewrites how a line renders, rather than what it says.
+///
+/// `char::is_control` is category Cc only, so a bidi override slips past it — and a bidi
+/// override is exactly the thing the rule exists to stop: `invoice<RLO>fdp.txt` renders as
+/// `invoicetxt.pdf` in anything that honours it.
+#[test]
+fn a_name_cannot_rewrite_how_it_renders() {
+    for raw in [
+        "invoice\u{202E}fdp.txt",  // RIGHT-TO-LEFT OVERRIDE
+        "two\u{2028}lines",        // LINE SEPARATOR
+        "a\u{200B}b",              // ZERO WIDTH SPACE
+        "\u{FEFF}name",            // BOM
+        "iso\u{2066}late",         // LEFT-TO-RIGHT ISOLATE
+    ] {
+        let got = conv_dir(&conv(raw, "C1", ConvKind::Channel));
+        assert!(
+            !got.chars().any(|c| c.is_control()
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}'
+                    | '\u{2028}' | '\u{2029}' | '\u{FEFF}')),
+            "{raw:?} became {got:?}"
+        );
+    }
+}
+
+/// The id half is the platform's, so it is sanitized too. An id carrying a `/` would otherwise
+/// be one listing entry that names two path components and opens none.
+#[test]
+fn an_id_cannot_carry_a_separator_into_a_component() {
+    assert_eq!(conv_dir(&conv("pricing", "C/1", ConvKind::Channel)), "pricing__C-1");
+    assert_eq!(conv_dir(&conv("pricing", "C\t1", ConvKind::Channel)), "pricing__C-1");
+    assert_eq!(entry("amy", "U\n1", ".json"), "amy__U-1.json");
+}
+
+/// A thread is named for its root and nothing else — no `unnamed__` in front — and the id is
+/// still sanitized.
+#[test]
+fn a_thread_file_is_its_root_and_the_suffix() {
+    assert_eq!(thread_file("1785737875.341929"), "1785737875.341929.jsonl");
+    assert_eq!(thread_file("a/b"), "a-b.jsonl");
+    assert!(thread_file(&"x".repeat(400)).len() <= NAME_MAX);
+}
+
+/// A cut can expose a blank `sanitize`'s own `trim` never saw, and it need not be an ASCII one.
+#[test]
+fn a_cut_does_not_leave_a_non_ascii_blank() {
+    let name = format!("{}\u{00A0}tail", "a".repeat(249));
+    let dir = conv_dir(&conv(&name, "C1", ConvKind::Channel));
+    let head = dir.trim_end_matches("__C1");
+    assert!(
+        !head.ends_with(char::is_whitespace),
+        "{dir:?} ends in a blank"
+    );
+}

@@ -1179,3 +1179,140 @@ async fn an_unsized_attachment_is_fetched_whole_past_the_ceiling() {
     let asked = vol.source.calls.files.lock().unwrap().clone();
     assert_eq!(asked, vec![None], "one unranged request");
 }
+
+
+/// `resolve` may only answer the name `listing` wrote. `users/` accepted four others.
+#[tokio::test]
+async fn a_user_file_resolves_only_under_the_name_it_is_listed_as() {
+    let mut src = TestSource::new(
+        vec![conv("C1", "pricing", ConvKind::Channel)],
+        vec![(ConvId("C1".into()), msg("1", D10 + 100, "hi"))],
+    );
+    src.users = vec![User {
+        id: "U1".into(),
+        name: "amy".into(),
+        record: serde_json::json!({"id": "U1"}),
+    }];
+    let vol = MessengerFs::new(src);
+
+    let listed = names(&vol.list(Path::new("/users")).await.unwrap());
+    assert_eq!(listed, ["amy__U1.json"], "the one name the listing writes");
+    assert!(vol.stat(Path::new("/users/amy__U1.json")).await.is_ok());
+
+    for spelling in [
+        "/users/amy__U1",                // no suffix
+        "/users/amy__U1.json.json",      // `trim_end_matches` strips repeatedly
+        "/users/U1",                     // the bare id
+        "/users/anything__U1.json",      // a name half the listing never wrote
+    ] {
+        assert!(
+            matches!(vol.stat(Path::new(spelling)).await,
+                     Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{spelling} resolved"
+        );
+    }
+}
+
+/// One file shared into two messages of a month is one entry, not two. Two entries of one name
+/// is a listing `ls` and `find` cannot make sense of.
+#[tokio::test]
+async fn one_attachment_shared_twice_is_listed_once() {
+    let file = FileRef {
+        id: "F1".into(),
+        name: "report.pdf".into(),
+        size: Some(3),
+        url: "https://example.invalid/f".into(),
+    };
+    let (mut a, mut b) = (msg("1", D10 + 100, "here"), msg("2", D10 + 200, "again"));
+    a.files = vec![file.clone()];
+    b.files = vec![file];
+    let vol = MessengerFs::new(TestSource::new(
+        vec![conv("C1", "pricing", ConvKind::Channel)],
+        vec![
+            (ConvId("C1".into()), a),
+            (ConvId("C1".into()), b),
+        ],
+    ));
+    assert_eq!(
+        names(&vol.list(Path::new("/channels/pricing__C1/2026/08/files")).await.unwrap()),
+        ["report.pdf__F1"]
+    );
+}
+
+/// The held window is keyed by what a path *means*, not how it was spelled. `resolve`
+/// normalizes, so three spellings are one file and must not be three cache identities each
+/// paying its own fetch.
+#[tokio::test]
+async fn an_aliased_spelling_reads_from_the_window_already_held() {
+    let vol = with_attachment(4096);
+    let mut buf = vec![0u8; 64];
+    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut buf, 0).await.unwrap(), 64);
+    let after_first = vol.source.calls.files.lock().unwrap().len();
+    assert_eq!(after_first, 1);
+
+    for aliased in [
+        ATTACHMENT.trim_start_matches('/'),
+        &ATTACHMENT.replace('/', "//"),
+    ] {
+        assert_eq!(
+            vol.read_at(Path::new(aliased), &mut buf, 0).await.unwrap(),
+            64,
+            "{aliased}"
+        );
+    }
+    assert_eq!(
+        vol.source.calls.files.lock().unwrap().len(),
+        after_first,
+        "one file, however it is spelled"
+    );
+}
+
+/// The budget has to see every byte a scope holds, or it bounds the wrong thing.
+///
+/// A month of attachment-heavy messages carries a `FileRef` each, and a name and a url are real
+/// bytes. With only `text` counted, a budget set just above the text total keeps such a month
+/// resident no matter how much attachment metadata rides along — so the eviction that should
+/// happen does not, and that is what this observes.
+#[tokio::test]
+async fn the_budget_counts_attachments_not_only_text() {
+    let fat = |conv: &str, day: u64| -> Vec<(ConvId, Message)> {
+        (0..20)
+            .map(|i| {
+                let mut m = msg(&format!("{conv}{i}"), day + i, "x");
+                m.files = vec![FileRef {
+                    id: format!("F{conv}{i}"),
+                    name: "a-rather-long-attachment-name-that-costs-bytes.pdf".into(),
+                    size: Some(1),
+                    url: "https://example.invalid/an/equally/long/download/url".into(),
+                }];
+                (ConvId(conv.into()), m)
+            })
+            .collect()
+    };
+    let mut msgs = fat("C1", D10 + 100);
+    msgs.extend(fat("C1", D10 - 35 * DAY));
+
+    // Room for one month's *text* twice over, but not for either month once its attachment
+    // metadata is counted too.
+    let vol = MessengerFs::with_limits(
+        TestSource::new(
+            vec![conv_born("C1", "pricing", ConvKind::Channel, D10 - 40 * DAY)],
+            msgs,
+        ),
+        MessengerLimits {
+            text_budget: 3_000,
+            ..Default::default()
+        },
+    );
+    let aug = Path::new("/channels/pricing__C1/2026/08");
+    let jul = Path::new("/channels/pricing__C1/2026/07");
+    vol.list(aug).await.unwrap();
+    vol.list(jul).await.unwrap();
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+    vol.list(aug).await.unwrap();
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before + 1,
+        "August was evicted for July, so the budget saw more than the text"
+    );
+}

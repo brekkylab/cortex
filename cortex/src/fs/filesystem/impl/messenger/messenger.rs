@@ -50,7 +50,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -59,7 +59,7 @@ use chrono::{NaiveDate, TimeZone, Utc};
 use super::limits::MessengerLimits;
 use super::paths::{
     CHANNELS, DMS, FILES, JSONL, THREADS, USERS, conv_dir, day_file, day_of, entry,
-    month_dir, month_of, months, year_dir,
+    month_dir, month_of, months, thread_file, year_dir,
 };
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
 use super::{User, render_line};
@@ -110,8 +110,20 @@ struct Body {
 
 impl Body {
     /// What the budget counts, which is every byte held.
+    ///
+    /// Not only the rendered text: a month of attachment-heavy messages carries a `FileRef`
+    /// each, and a `name` and a `url` are real bytes the budget has to see or it is bounding
+    /// the wrong thing. Ids and names are counted as their own lengths rather than by
+    /// `size_of` — the fixed part of a `Vec` is noise next to what it points at.
     fn weight(&self) -> u64 {
-        self.text.values().map(|t| t.len() as u64).sum()
+        let text: u64 = self.text.values().map(|t| t.len() as u64).sum();
+        let threads: u64 = self.threads.iter().map(|t| t.0.len() as u64).sum();
+        let files: u64 = self
+            .files
+            .iter()
+            .map(|f| (f.id.len() + f.name.len() + f.url.len()) as u64)
+            .sum();
+        text + threads + files
     }
 }
 
@@ -132,14 +144,19 @@ struct Cache {
     /// A counter and not a clock: what eviction needs is an order, and an order does not need
     /// to know what time it is.
     clock: u64,
-    /// The one attachment window held, as `(path, start, bytes)`.
+    /// The one attachment window held, as `(the path's segments, start, bytes)`.
+    ///
+    /// Segments and not the caller's `Path`, for the reason [`Scope`] is a key rather than a
+    /// path: `resolve` normalizes, so `/a/b`, `a/b` and `//a//b/` are one file — and comparing
+    /// the spelling would make them three cache identities, each paying its own fetch for the
+    /// same bytes.
     ///
     /// One and not a map, which is what makes [`window`](MessengerLimits::window) a ceiling on
     /// the whole store rather
     /// than on each open file: a reader walking a document forwards keeps replacing it, and two
     /// readers alternating between large attachments replace each other's — slower, bounded, and
     /// rare, where a map would be unbounded because nothing here is told when a file is closed.
-    window: Option<(PathBuf, u64, Vec<u8>)>,
+    window: Option<(Vec<String>, u64, Vec<u8>)>,
 }
 
 /// One assembled scope: a day of a conversation, or one thread inside it.
@@ -327,7 +344,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         if msgs.is_empty() {
             return Err(io_err(io::ErrorKind::NotFound));
         }
-        let name = format!("{}{JSONL}", root.0);
+        let name = thread_file(&root.0);
         let body = Arc::new(self.assemble(&msgs, Some(name)).await?);
         self.hold(key, body.clone());
         Ok(body)
@@ -509,14 +526,18 @@ impl<S: MessengerSource> MessengerFs<S> {
 
             [s] if self.sections().contains(&s.as_str()) => Ok(Node::Dir),
 
-            // users/<name>__<id>.json
+            // users/<name>__<id>.json — and only that spelling. `trim_end_matches` strips the
+            // suffix repeatedly and `id_of` falls back to the whole string, so a looser check
+            // accepted `amy__U1`, `amy__U1.json.json`, `U1`, and `anything__U1.json` for one
+            // user: four names a listing never wrote, and `resolve` may not answer what
+            // `listing` would not name.
             [s, name] if s == USERS => {
-                let want = id_of(name.trim_end_matches(".json"));
+                let want = id_of(name.strip_suffix(".json").ok_or(io_err(io::ErrorKind::NotFound))?);
                 let user = self
                     .users()
                     .await?
                     .into_iter()
-                    .find(|u| u.id == want)
+                    .find(|u| u.id == want && entry(&u.name, &u.id, ".json") == *name)
                     .ok_or(io_err(io::ErrorKind::NotFound))?;
                 let bytes = serde_json::to_vec_pretty(&user.record).map_err(io::Error::other)?;
                 Ok(Node::Bytes(Arc::new(bytes)))
@@ -700,7 +721,7 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
                     // this in chunks of its own choosing, so without holding it the file is
                     // fetched once per chunk — the cost `windowed` exists to bound, paid in full
                     // by the files small enough to skip it.
-                    self.cache.lock().unwrap().window = Some((path.to_path_buf(), 0, bytes));
+                    self.cache.lock().unwrap().window = Some((segments(path), 0, bytes));
                     Ok(n)
                 }
 
@@ -751,7 +772,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             [t] if t == THREADS => Ok(month
                 .threads
                 .iter()
-                .map(|r| Dirent::new(format!("{}{JSONL}", r.0), DirentKind::File))
+                .map(|r| Dirent::new(thread_file(&r.0), DirentKind::File))
                 .collect()),
 
             // Sizes come from the listing that named these, so they cost nothing to include —
@@ -837,7 +858,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             let n = (data.len() - from).min(want - filled);
             buf[filled..filled + n].copy_from_slice(&data[from..from + n]);
             filled += n;
-            self.cache.lock().unwrap().window = Some((path.to_path_buf(), start, data));
+            self.cache.lock().unwrap().window = Some((segments(path), start, data));
         }
         Ok(filled)
     }
@@ -857,13 +878,13 @@ impl<S: MessengerSource> MessengerFs<S> {
             return Ok(n);
         }
         if let Some((held, _, bytes)) = self.cache.lock().unwrap().window.as_ref()
-            && held == path
+            && *held == segments(path)
         {
             return Ok(bytes.len() as u64);
         }
         let (bytes, _) = self.source.fetch_file(f, None).await?;
         let n = bytes.len() as u64;
-        self.cache.lock().unwrap().window = Some((path.to_path_buf(), 0, bytes));
+        self.cache.lock().unwrap().window = Some((segments(path), 0, bytes));
         Ok(n)
     }
 
@@ -875,7 +896,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         let Some((held_path, start, data)) = held.window.as_ref() else {
             return 0;
         };
-        if held_path != path || at < *start || at >= *start + data.len() as u64 {
+        if *held_path != segments(path) || at < *start || at >= *start + data.len() as u64 {
             return 0;
         }
         let from = (at - *start) as usize;
