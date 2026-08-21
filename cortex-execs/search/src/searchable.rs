@@ -28,10 +28,14 @@ pub struct Hit {
 /// rendering a record — is knowledge about one lane, and belongs with that lane's backend.
 ///
 /// Not every store implements this, and that is the point. Slack refuses `search.messages` to a
-/// bot token, Discord does not offer message search to a bot at all, an object store has no
-/// text index whatsoever. A store with no index simply has no backend here, and a mount with no
-/// backend is reported as such rather than answered with an empty result — which would say
-/// "nothing there" about a place nobody looked.
+/// bot token; an object store has no text index whatsoever. A store with no index simply has no
+/// backend here, and a mount with no backend is reported as such rather than answered with an
+/// empty result — which would say "nothing there" about a place nobody looked.
+///
+/// Which stores those are is a fact about somebody else's API on a date, and it moves. Discord
+/// offered bots no message search until it shipped one in March 2026 — and this trait is why
+/// that cost a backend rather than a redesign: all that changed was whether one type implements
+/// it.
 pub trait Searchable: Send + Sync {
     /// Hits for `query`, most relevant or most recent first, at most `count` of them.
     ///

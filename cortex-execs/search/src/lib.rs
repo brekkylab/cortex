@@ -25,8 +25,8 @@
 //!
 //! # Why a command and not a method on the stores
 //!
-//! Not every service has an index. Slack refuses `search.messages` to a bot token, Discord does
-//! not offer message search to a bot at all, an object store has no text index whatsoever. A
+//! Not every service has an index a credential may ask. Slack refuses `search.messages` to a
+//! bot token, and an object store has no text index whatsoever. A
 //! trait method some stores could only ever fail is the same mistake as a directory that is
 //! always empty — it looks like a feature and answers like a fault. A store with no index has
 //! no [`Searchable`] backend, and a fan-out *reports* that rather than answering nothing.
