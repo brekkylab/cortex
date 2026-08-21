@@ -57,7 +57,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{NaiveDate, TimeZone, Utc};
 
 use super::paths::{
-    CHANNELS, CHAT, DAY_FMT, DMS, FILES, THREADS, USERS, conv_dir, day_of, sanitize,
+    CHANNELS, CHAT, DAY_FMT, DMS, FILES, THREADS, USERS, conv_dir, day_of, entry,
 };
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
 use super::{User, render_line};
@@ -490,7 +490,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                 .into_iter()
                 .map(|u| {
                     Dirent::new(
-                        format!("{}__{}.json", sanitize(&u.name), u.id),
+                        entry(&u.name, &u.id, ".json"),
                         DirentKind::File,
                     )
                 })
@@ -645,7 +645,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                 .map(|f| {
                     let mut st = Stat::new(DirentKind::File, f.size);
                     st.mtime = Some(self.born);
-                    Dirent::with_stat(format!("{}__{}", sanitize(&f.name), f.id), st)
+                    Dirent::with_stat(entry(&f.name, &f.id, ""), st)
                 })
                 .collect()),
             _ => Err(io_err(io::ErrorKind::NotFound)),

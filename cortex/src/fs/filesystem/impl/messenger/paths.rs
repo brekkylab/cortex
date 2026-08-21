@@ -43,7 +43,7 @@ pub fn section_of(kind: ConvKind) -> &'static str {
 /// The human half is for reading and the id half is the address: a path is resolved by the id
 /// alone, so a renamed channel keeps every path anyone wrote down.
 pub fn conv_dir(conv: &Conversation) -> String {
-    format!("{}__{}", sanitize(&conv.name), conv.id.0)
+    entry(&conv.name, &conv.id.0, "")
 }
 
 /// The day directory an instant falls in.
@@ -72,6 +72,46 @@ pub fn chat_path(conv: &Conversation, msg: &Message, day: SystemTime) -> String 
         Some(root) => format!("{dir}/{THREADS}/{}/{CHAT}", root.0),
         None => format!("{dir}/{CHAT}"),
     }
+}
+
+/// The longest one path component may be, in **bytes**.
+///
+/// 255 is the floor across what this mounts on — the Linux VFS limit, and APFS's — and a name
+/// over it is not served at all. Slack alone never reaches it, because a channel name is capped
+/// at 80 characters; an attachment's name is whoever uploaded it's, and a Discord group DM or a
+/// Teams chat topic is not capped at anything this can count on.
+pub(super) const NAME_MAX: usize = 255;
+
+/// `<name>__<id><suffix>` as one path component, cut to fit.
+///
+/// `suffix` is a parameter rather than the caller's own `format!` because it spends the same
+/// budget: `__{id}.json` leaves five fewer bytes for the name than `__{id}` does, and a caller
+/// concatenating afterwards would put the component back over the limit having just fitted it.
+///
+/// The **id is never cut** — it is the address, and a path is resolved by it alone, so what
+/// gives way is the half that is only for reading. Two long names can therefore shorten to the
+/// same text; their components still differ, because the id follows.
+pub(super) fn entry(name: &str, id: &str, suffix: &str) -> String {
+    let tail = format!("__{id}{suffix}");
+    let budget = NAME_MAX.saturating_sub(tail.len());
+    let mut head = sanitize(name);
+    if head.len() > budget {
+        // Back off to a character boundary: `truncate` panics inside one, and a name cut
+        // mid-character is bytes no reader can render. `is_char_boundary(0)` is always true,
+        // so this ends.
+        let mut cut = budget;
+        while cut > 0 && !head.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        head.truncate(cut);
+        // A cut lands wherever the budget ran out, which can be mid-word and after a space.
+        // Trailing blanks in a directory name are legal and invisible, which is worse than
+        // either having them or not.
+        while head.ends_with(' ') {
+            head.pop();
+        }
+    }
+    format!("{head}{tail}")
 }
 
 /// A display name made safe to be one path component.

@@ -852,3 +852,41 @@ async fn a_held_small_file_never_answers_for_another_path() {
     assert!(n > 0);
     assert_eq!(chat[0], b'{', "the day's own bytes, not the held file's");
 }
+
+/// A conversation named past what a path component holds is listed under a name that fits, and
+/// that name is the one that opens.
+///
+/// Both halves matter and they are one test on purpose: a listing whose entries cannot be
+/// resolved is worse than an absent one, because the caller can see the name and every attempt
+/// to use it fails. Korean, because a byte limit and a character count are the same number
+/// until the text stops being ASCII — 200 characters here are 600 bytes.
+#[tokio::test]
+async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
+    let long = "가".repeat(200);
+    let vol = MessengerFs::new(TestSource::new(
+        vec![conv("C1", &long, ConvKind::Channel)],
+        vec![(ConvId("C1".into()), msg("1", D10 + 100, "on the tenth"))],
+    ));
+
+    let listed = vol.list(Path::new("/channels")).await.expect("channels list");
+    assert_eq!(listed.len(), 1);
+    let name = listed[0].name.clone();
+    assert!(name.len() <= 255, "{} bytes", name.len());
+    assert!(name.ends_with("__C1"), "the id half survived: {name}");
+
+    let days = vol
+        .list(&Path::new("/channels").join(&name))
+        .await
+        .expect("the name the listing gave has to be the name that opens");
+    assert_eq!(days.len(), 1);
+    let chat = Path::new("/channels")
+        .join(&name)
+        .join(&days[0].name)
+        .join("chat.jsonl");
+    let mut buf = vec![0u8; 512];
+    let n = vol.read_at(&chat, &mut buf, 0).await.expect("the day reads");
+    assert!(
+        String::from_utf8_lossy(&buf[..n]).contains("on the tenth"),
+        "the file behind the fitted name is the conversation's own"
+    );
+}
