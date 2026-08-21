@@ -15,6 +15,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::super::error::{ApiError, ErrorClass, SourceError, SourceResult};
 use super::super::source::{Author, Capabilities, Message, Thread};
 use super::*;
+
+/// The default attachment ceiling, which these tests exercise the edges of.
+///
+/// A function rather than a constant, because it is now a field on
+/// [`MessengerLimits`] — the tests follow the default rather than restating it.
+fn window() -> u64 {
+    MessengerLimits::default().window
+}
 use crate::BoxFuture;
 
 /// Seconds since the epoch, as an instant.
@@ -60,6 +68,8 @@ struct Calls {
     /// Every range `fetch_file` was asked for, in order. `None` is a whole-file request,
     /// which is the only shape the source can length-check.
     files: Mutex<Vec<Option<Range<u64>>>>,
+    /// The page budget the last `scan` was given — the store's, not this file's.
+    pages: AtomicUsize,
 }
 
 struct TestSource {
@@ -153,15 +163,15 @@ impl MessengerSource for TestSource {
         window: Window,
     ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
         Box::pin(async move {
-        self.calls.history.fetch_add(1, Ordering::SeqCst);
-        if self.denied.contains(conv) {
-            return Err(Self::denied_err());
-        }
-        let msgs = self
-            .of(conv)
-            .into_iter()
-            .filter(|m| m.ts >= window.start && m.ts < window.end)
-            .collect();
+            self.calls.history.fetch_add(1, Ordering::SeqCst);
+            if self.denied.contains(conv) {
+                return Err(Self::denied_err());
+            }
+            let msgs = self
+                .of(conv)
+                .into_iter()
+                .filter(|m| m.ts >= window.start && m.ts < window.end)
+                .collect();
             Ok((msgs, false))
         })
     }
@@ -169,23 +179,24 @@ impl MessengerSource for TestSource {
     fn scan<'a>(
         &'a self,
         conv: &'a ConvId,
-        _max_pages: usize,
+        max_pages: usize,
     ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
         Box::pin(async move {
-        self.calls.scan.fetch_add(1, Ordering::SeqCst);
-        if self.denied.contains(conv) {
-            return Err(Self::denied_err());
-        }
-        let all = self.of(conv);
-        let Some(days) = self.scan_floor else {
-            return Ok((all, false));
-        };
-        // A truncated walk: only the newest `days` days were reached.
-        let Some(newest) = all.last().map(|m| m.ts) else {
-            return Ok((all, false));
-        };
-        let cut = newest - Duration::from_secs(days * DAY);
-        let seen: Vec<Message> = all.into_iter().filter(|m| m.ts >= cut).collect();
+            self.calls.scan.fetch_add(1, Ordering::SeqCst);
+            self.calls.pages.store(max_pages, Ordering::SeqCst);
+            if self.denied.contains(conv) {
+                return Err(Self::denied_err());
+            }
+            let all = self.of(conv);
+            let Some(days) = self.scan_floor else {
+                return Ok((all, false));
+            };
+            // A truncated walk: only the newest `days` days were reached.
+            let Some(newest) = all.last().map(|m| m.ts) else {
+                return Ok((all, false));
+            };
+            let cut = newest - Duration::from_secs(days * DAY);
+            let seen: Vec<Message> = all.into_iter().filter(|m| m.ts >= cut).collect();
             Ok((seen, true))
         })
     }
@@ -196,13 +207,13 @@ impl MessengerSource for TestSource {
         root: &'a MsgId,
     ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
         Box::pin(async move {
-        self.calls.thread.fetch_add(1, Ordering::SeqCst);
-        let msgs = self
-            .replies
-            .iter()
-            .find(|(r, _)| r == root)
-            .map(|(_, m)| m.clone())
-            .unwrap_or_default();
+            self.calls.thread.fetch_add(1, Ordering::SeqCst);
+            let msgs = self
+                .replies
+                .iter()
+                .find(|(r, _)| r == root)
+                .map(|(_, m)| m.clone())
+                .unwrap_or_default();
             Ok((msgs, false))
         })
     }
@@ -560,11 +571,7 @@ async fn a_directory_and_a_file_are_not_interchangeable() {
     let vol = two_days();
     let mut buf = [0u8; 8];
     assert_eq!(
-        kind_of(
-            vol.read_at(Path::new("/channels"), &mut buf, 0)
-                .await
-                .err()
-        ),
+        kind_of(vol.read_at(Path::new("/channels"), &mut buf, 0).await.err()),
         Some(std::io::ErrorKind::IsADirectory)
     );
     assert_eq!(
@@ -620,7 +627,6 @@ async fn an_author_id_is_resolved_to_a_name() {
     assert!(vol.stat(Path::new("/users/김철수__U1.json")).await.is_ok());
 }
 
-
 /// A workspace whose single day holds one attachment of `size` bytes.
 fn with_attachment(size: u64) -> MessengerFs<TestSource> {
     let mut m = msg("1", D10 + 100, "see attached");
@@ -672,9 +678,9 @@ async fn an_attachment_that_fits_is_fetched_whole_and_checkable() {
 /// so a reader that only stats the file pays nothing.
 #[tokio::test]
 async fn a_large_attachment_costs_nothing_to_open() {
-    let vol = with_attachment(WINDOW * 3);
+    let vol = with_attachment(window() * 3);
     let stat = vol.stat(Path::new(ATTACHMENT)).await.expect("stats");
-    assert_eq!(stat.size, WINDOW * 3, "the size comes from the listing");
+    assert_eq!(stat.size, window() * 3, "the size comes from the listing");
     assert!(
         vol.source.calls.files.lock().unwrap().is_empty(),
         "opening a large attachment must not fetch it"
@@ -685,13 +691,16 @@ async fn a_large_attachment_costs_nothing_to_open() {
 /// point of the window, since a reader asks in 128 KiB pieces at most.
 #[tokio::test]
 async fn one_window_serves_many_reads() {
-    let vol = with_attachment(WINDOW * 2);
-    
+    let vol = with_attachment(window() * 2);
+
     // Sixteen 32 KiB reads, the size FUSE-T was measured to ask for.
     for i in 0..16u64 {
         let at = i * 32 * 1024;
         let mut buf = vec![0u8; 32 * 1024];
-        let n = vol.read_at(Path::new(ATTACHMENT), &mut buf, at).await.unwrap();
+        let n = vol
+            .read_at(Path::new(ATTACHMENT), &mut buf, at)
+            .await
+            .unwrap();
         assert_eq!(n, buf.len());
         assert_eq!(buf[0], at as u8, "window served from the wrong offset");
     }
@@ -709,26 +718,41 @@ async fn one_window_serves_many_reads() {
 /// offset visible rather than merely short.
 #[tokio::test]
 async fn a_request_the_window_half_covers_is_filled_not_truncated() {
-    let vol = with_attachment(WINDOW + 4096);
-    
+    let vol = with_attachment(window() + 4096);
+
     // Establish a window at 0. A window starts where the miss was, so this one ends exactly
-    // at WINDOW — which is what lets the next read straddle its edge.
+    // at window() — which is what lets the next read straddle its edge.
     let mut first = vec![0u8; 64];
-    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut first, 0).await.unwrap(), 64);
+    assert_eq!(
+        vol.read_at(Path::new(ATTACHMENT), &mut first, 0)
+            .await
+            .unwrap(),
+        64
+    );
     assert_eq!(vol.source.calls.files.lock().unwrap().len(), 1);
 
     // Eight bytes inside the held window, eight past it.
     let mut buf = vec![0u8; 16];
-    let n = vol.read_at(Path::new(ATTACHMENT), &mut buf, WINDOW - 8).await.unwrap();
-    assert_eq!(n, 16, "a partly covered request must be filled, not truncated");
+    let n = vol
+        .read_at(Path::new(ATTACHMENT), &mut buf, window() - 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        n, 16,
+        "a partly covered request must be filled, not truncated"
+    );
     for (i, b) in buf.iter().enumerate() {
-        assert_eq!(*b, (WINDOW - 8 + i as u64) as u8, "byte {i} across the seam");
+        assert_eq!(
+            *b,
+            (window() - 8 + i as u64) as u8,
+            "byte {i} across the seam"
+        );
     }
 
     let asked = vol.source.calls.files.lock().unwrap().clone();
     assert_eq!(
         asked,
-        vec![Some(0..WINDOW), Some(WINDOW..(WINDOW + 4096))],
+        vec![Some(0..window()), Some(window()..(window() + 4096))],
         "the second fetch starts where the held window ended"
     );
 }
@@ -737,10 +761,20 @@ async fn a_request_the_window_half_covers_is_filled_not_truncated() {
 /// refuse the range, and refusing here costs nothing.
 #[tokio::test]
 async fn a_read_past_the_end_asks_for_nothing() {
-    let vol = with_attachment(WINDOW * 2);
-        let mut buf = vec![0u8; 64];
-    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut buf, WINDOW * 2).await.unwrap(), 0);
-    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut buf, WINDOW * 9).await.unwrap(), 0);
+    let vol = with_attachment(window() * 2);
+    let mut buf = vec![0u8; 64];
+    assert_eq!(
+        vol.read_at(Path::new(ATTACHMENT), &mut buf, window() * 2)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        vol.read_at(Path::new(ATTACHMENT), &mut buf, window() * 9)
+            .await
+            .unwrap(),
+        0
+    );
     assert!(vol.source.calls.files.lock().unwrap().is_empty());
 }
 
@@ -748,14 +782,16 @@ async fn a_read_past_the_end_asks_for_nothing() {
 /// window is short rather than reaching past the end.
 #[tokio::test]
 async fn a_read_is_clipped_to_the_listed_length() {
-    let vol = with_attachment(WINDOW + 100);
-        let mut buf = vec![0u8; 4096];
-    let n = vol.read_at(Path::new(ATTACHMENT), &mut buf, WINDOW + 50).await.unwrap();
+    let vol = with_attachment(window() + 100);
+    let mut buf = vec![0u8; 4096];
+    let n = vol
+        .read_at(Path::new(ATTACHMENT), &mut buf, window() + 50)
+        .await
+        .unwrap();
     assert_eq!(n, 50, "only the 50 bytes that exist");
     let asked = vol.source.calls.files.lock().unwrap().clone();
-    assert_eq!(asked, vec![Some((WINDOW + 50)..(WINDOW + 100))]);
+    assert_eq!(asked, vec![Some((window() + 50)..(window() + 100))]);
 }
-
 
 /// A `Range` is a request, not a promise: a server may ignore it and send the file from byte
 /// zero, which it reports by answering `false`. Recorded as if it began at the requested
@@ -767,7 +803,7 @@ async fn a_server_that_ignores_the_range_is_not_served_as_the_wrong_offset() {
     m.files = vec![FileRef {
         id: "F1".into(),
         name: "doc.bin".into(),
-        size: WINDOW + 4096,
+        size: window() + 4096,
         url: "https://example.invalid/f".into(),
     }];
     let vol = MessengerFs::new(
@@ -778,20 +814,33 @@ async fn a_server_that_ignores_the_range_is_not_served_as_the_wrong_offset() {
         .ignores_range(),
     );
 
-    
     // Well past the first window, where a window mislabelled as starting at `at` would answer
     // with byte 0 of the file instead.
-    let at = WINDOW + 1000;
+    let at = window() + 1000;
     let mut buf = vec![0u8; 8];
-    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut buf, at).await.unwrap(), 8);
+    assert_eq!(
+        vol.read_at(Path::new(ATTACHMENT), &mut buf, at)
+            .await
+            .unwrap(),
+        8
+    );
     for (i, b) in buf.iter().enumerate() {
-        assert_eq!(*b, (at + i as u64) as u8, "byte {i} came from the wrong offset");
+        assert_eq!(
+            *b,
+            (at + i as u64) as u8,
+            "byte {i} came from the wrong offset"
+        );
     }
 
     // And the next read is served from the window that was recorded correctly.
     let before = vol.source.calls.files.lock().unwrap().len();
     let mut buf = vec![0u8; 8];
-    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut buf, 64).await.unwrap(), 8);
+    assert_eq!(
+        vol.read_at(Path::new(ATTACHMENT), &mut buf, 64)
+            .await
+            .unwrap(),
+        8
+    );
     assert_eq!(buf[0], 64);
     assert_eq!(
         vol.source.calls.files.lock().unwrap().len(),
@@ -816,7 +865,10 @@ async fn a_small_file_is_fetched_once_however_the_kernel_chunks_it() {
     let mut buf = vec![0u8; 128 * 1024];
     let mut at = 0u64;
     loop {
-        let n = vol.read_at(Path::new(ATTACHMENT), &mut buf, at).await.unwrap();
+        let n = vol
+            .read_at(Path::new(ATTACHMENT), &mut buf, at)
+            .await
+            .unwrap();
         if n == 0 {
             break;
         }
@@ -840,13 +892,22 @@ async fn a_small_file_is_fetched_once_however_the_kernel_chunks_it() {
 async fn a_held_small_file_never_answers_for_another_path() {
     let vol = with_attachment(4096);
     let mut buf = vec![0u8; 4096];
-    assert_eq!(vol.read_at(Path::new(ATTACHMENT), &mut buf, 0).await.unwrap(), 4096);
+    assert_eq!(
+        vol.read_at(Path::new(ATTACHMENT), &mut buf, 0)
+            .await
+            .unwrap(),
+        4096
+    );
 
     // `chat.jsonl` is assembled, not fetched, so a held window that ignored the path would show
     // up here as attachment bytes.
     let mut chat = vec![0u8; 64];
     let n = vol
-        .read_at(Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl"), &mut chat, 0)
+        .read_at(
+            Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl"),
+            &mut chat,
+            0,
+        )
         .await
         .unwrap();
     assert!(n > 0);
@@ -868,7 +929,10 @@ async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
         vec![(ConvId("C1".into()), msg("1", D10 + 100, "on the tenth"))],
     ));
 
-    let listed = vol.list(Path::new("/channels")).await.expect("channels list");
+    let listed = vol
+        .list(Path::new("/channels"))
+        .await
+        .expect("channels list");
     assert_eq!(listed.len(), 1);
     let name = listed[0].name.clone();
     assert!(name.len() <= 255, "{} bytes", name.len());
@@ -884,9 +948,152 @@ async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
         .join(&days[0].name)
         .join("chat.jsonl");
     let mut buf = vec![0u8; 512];
-    let n = vol.read_at(&chat, &mut buf, 0).await.expect("the day reads");
+    let n = vol
+        .read_at(&chat, &mut buf, 0)
+        .await
+        .expect("the day reads");
     assert!(
         String::from_utf8_lossy(&buf[..n]).contains("on the tenth"),
         "the file behind the fitted name is the conversation's own"
+    );
+}
+
+// ---- what a mount is allowed to spend --------------------------------------------------
+
+/// Two days of one channel, each with a message long enough to measure.
+fn two_fat_days(limits: MessengerLimits) -> MessengerFs<TestSource> {
+    let body = "x".repeat(400);
+    MessengerFs::with_limits(
+        TestSource::new(
+            vec![conv("C1", "pricing", ConvKind::Channel)],
+            vec![
+                (ConvId("C1".into()), msg("1", D10 + 100, &body)),
+                (ConvId("C1".into()), msg("2", D10 + 2 * DAY, &body)),
+            ],
+        ),
+        limits,
+    )
+}
+
+/// The default is what the lane always had, so a consumer that never mentions limits keeps the
+/// behaviour every other test in this file asserts.
+#[test]
+fn the_default_limits_are_the_numbers_this_lane_chose() {
+    let d = MessengerLimits::default();
+    assert_eq!(d.scan_pages, 10);
+    assert_eq!(d.window, 8 << 20);
+    assert_eq!(d.ttl, Duration::from_secs(15));
+    assert_eq!(d.text_budget, 32 << 20);
+}
+
+/// The walk budget is the store's, not a constant's: a mount told to look at one page asks for
+/// one page.
+#[tokio::test]
+async fn the_scan_budget_is_what_the_limits_say() {
+    let vol = MessengerFs::with_limits(
+        TestSource::new(
+            vec![conv("C1", "pricing", ConvKind::Channel)],
+            vec![(ConvId("C1".into()), msg("1", D10 + 100, "hello"))],
+        ),
+        MessengerLimits {
+            scan_pages: 1,
+            ..Default::default()
+        },
+    );
+    vol.list(Path::new("/channels/pricing__C1")).await.unwrap();
+    assert_eq!(
+        vol.source.calls.pages.load(Ordering::SeqCst),
+        1,
+        "the source was asked for the pages the limits allow"
+    );
+}
+
+/// A budget that fits both days keeps both: coming back to the first costs nothing.
+#[tokio::test]
+async fn a_day_within_the_budget_is_still_held() {
+    let vol = two_fat_days(MessengerLimits::default());
+    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026-08-12/chat.jsonl");
+
+    vol.stat(ten).await.unwrap();
+    vol.stat(twelve).await.unwrap();
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+    vol.stat(ten).await.unwrap();
+
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before,
+        "the first day was still held"
+    );
+}
+
+/// And a budget too small for both drops the one read longest ago, which costs its request
+/// again. That is the trade the number buys: memory against round trips.
+#[tokio::test]
+async fn past_the_text_budget_the_least_recently_used_day_goes() {
+    let vol = two_fat_days(MessengerLimits {
+        // Room for one of these days and not two.
+        text_budget: 600,
+        ..Default::default()
+    });
+    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026-08-12/chat.jsonl");
+
+    vol.stat(ten).await.unwrap();
+    vol.stat(twelve).await.unwrap();
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+    vol.stat(ten).await.unwrap();
+
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before + 1,
+        "the 10th was evicted for the 12th and had to be fetched again"
+    );
+}
+
+/// Recency and not insertion order: the day a reader keeps returning to outlives the one they
+/// passed through once, whichever arrived first.
+#[tokio::test]
+async fn a_day_that_keeps_being_read_outlives_one_that_does_not() {
+    let vol = two_fat_days(MessengerLimits {
+        text_budget: 600,
+        ..Default::default()
+    });
+    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026-08-12/chat.jsonl");
+
+    vol.stat(ten).await.unwrap();
+    vol.stat(ten).await.unwrap(); // touched again: now the most recent
+    vol.stat(twelve).await.unwrap(); // evicts the 10th, the only other entry
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+    vol.stat(twelve).await.unwrap();
+
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before,
+        "the day just read is the one still held"
+    );
+}
+
+/// A single day larger than the whole budget stays while it is the only thing held — because
+/// dropping it would refetch the same day for every chunk a kernel reads, which is the cost the
+/// attachment window exists to avoid, paid by text instead.
+#[tokio::test]
+async fn one_day_bigger_than_the_budget_is_still_held_while_it_is_read() {
+    let vol = two_fat_days(MessengerLimits {
+        text_budget: 10,
+        ..Default::default()
+    });
+    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+
+    vol.stat(ten).await.unwrap();
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+    let mut buf = [0u8; 64];
+    vol.read_at(ten, &mut buf, 0).await.unwrap();
+
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before,
+        "the read after the stat came out of what was held"
     );
 }

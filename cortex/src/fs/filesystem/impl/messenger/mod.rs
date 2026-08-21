@@ -31,6 +31,7 @@
 //! so it is a different shape with a different home, not a fifth source here.
 
 mod error;
+mod limits;
 mod messenger;
 mod paths;
 mod retry;
@@ -40,6 +41,7 @@ mod source;
 mod slack;
 
 pub use error::*;
+pub use limits::*;
 pub use messenger::*;
 pub use paths::*;
 pub use source::*;

@@ -56,54 +56,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{NaiveDate, TimeZone, Utc};
 
-use super::paths::{
-    CHANNELS, CHAT, DAY_FMT, DMS, FILES, THREADS, USERS, conv_dir, day_of, entry,
-};
+use super::limits::MessengerLimits;
+use super::paths::{CHANNELS, CHAT, DAY_FMT, DMS, FILES, THREADS, USERS, conv_dir, day_of, entry};
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
 use super::{User, render_line};
 use crate::BoxFuture;
 use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
-
-
-/// Pages of history one [`dates`](MessengerFs::dates) walk reads before giving up.
-///
-/// A budget rather than a backstop: this is the one call whose cost the tree chooses, and it
-/// buys depth of history with requests. What it cannot buy is completeness — a conversation
-/// older than the walk keeps history the listing does not name, which is why an unlisted day
-/// below the floor is fetched rather than refused.
-const SCAN_PAGES: usize = 10;
-
-/// The most bytes one open attachment may hold, and so both of the things that number
-/// decides: below it an attachment is fetched whole at `open`, above it a window at a time.
-///
-/// One constant for both because it is really one rule — a ceiling on what a handle costs in
-/// memory. A mount serving several readers holds one of these per open file, so an attachment
-/// nobody bounded is a mount a single 2 GB upload can stop.
-///
-/// Measurement sets a floor and not the value: a reader asks in 128 KiB pieces at most (32 KiB
-/// through FUSE-T, `examples/measure_read_sizes.rs`), so a window orders smaller than this
-/// spends the round trip it saved on the very next read. Anything from a few MiB up satisfies
-/// that.
-///
-/// What picks the value is a trade this lane has rather than an object store: an attachment is
-/// a document somebody posted in chat, and the *only* shape whose length can be checked
-/// against the listing is the whole one — the check that catches a refused token answering 200
-/// with a login page. So raising this verifies more of the real population, and costs that
-/// much memory per open file; lowering it drops screenshots and reports into the unverified
-/// path to save memory a mount is unlikely to be short of.
-///
-/// 8 MiB is a judgement, not a finding. It sits above where documents, images and spreadsheets
-/// land and below recordings, so the files an agent actually greps are verified and a video
-/// cannot wedge a mount. The thing that would refine it is the size distribution of attachments
-/// in real workspaces, which this crate has one sample of.
-const WINDOW: u64 = 8 << 20;
-
-/// How long anything fetched stays reusable.
-///
-/// One number for every kind, because they are all the same trade: a `stat` followed by an
-/// `open` is two calls into this volume for one thing a reader is doing, and without a window
-/// in which the second is free every `ls -l` pays for the whole listing twice.
-const TTL: Duration = Duration::from_secs(15);
 
 /// A value and when it stops being reusable.
 struct Cached<T> {
@@ -112,8 +70,12 @@ struct Cached<T> {
 }
 
 impl<T> Cached<T> {
-    fn get(entry: Option<&Cached<T>>) -> Option<&T> {
-        entry.filter(|c| c.at.elapsed() < TTL).map(|c| &c.value)
+    /// The value, if it is still within `ttl`.
+    ///
+    /// The window is passed in rather than read from a constant, because it is the store's
+    /// budget and this type does not know which store it belongs to.
+    fn get(entry: Option<&Cached<T>>, ttl: Duration) -> Option<&T> {
+        entry.filter(|c| c.at.elapsed() < ttl).map(|c| &c.value)
     }
 
     fn new(value: T) -> Self {
@@ -145,15 +107,45 @@ struct Cache {
     /// The days each conversation was seen to have, and whether the walk was truncated —
     /// which is what tells an unlisted day apart from one below the floor.
     dates: HashMap<ConvId, Cached<(Vec<NaiveDate>, bool)>>,
-    days: HashMap<(ConvId, NaiveDate), Cached<Arc<Day>>>,
-    threads: HashMap<(ConvId, MsgId), Cached<Arc<Day>>>,
+    /// Assembled scopes, days and threads together.
+    ///
+    /// One map and not two, because a thread *is* a day as far as this cache is concerned —
+    /// same type, same lifecycle, same bytes to account for. Two maps would need one budget
+    /// spanning both, which is a budget with two places to get it wrong.
+    text: HashMap<Scope, Held>,
+    /// What `text` currently holds, in the bytes the budget is written in.
+    text_bytes: u64,
+    /// Ticks on every use, so the least recently used scope is the one with the lowest stamp.
+    ///
+    /// A counter and not a clock: what eviction needs is an order, and an order does not need
+    /// to know what time it is.
+    clock: u64,
     /// The one attachment window held, as `(path, start, bytes)`.
     ///
-    /// One and not a map, which is what makes [`WINDOW`] a ceiling on the whole store rather
+    /// One and not a map, which is what makes [`window`](MessengerLimits::window) a ceiling on
+    /// the whole store rather
     /// than on each open file: a reader walking a document forwards keeps replacing it, and two
     /// readers alternating between large attachments replace each other's — slower, bounded, and
     /// rare, where a map would be unbounded because nothing here is told when a file is closed.
     window: Option<(PathBuf, u64, Vec<u8>)>,
+}
+
+/// One assembled scope: a day of a conversation, or one thread inside it.
+///
+/// A key and not a path, because the cache is asked before a path exists — and because two
+/// spellings of one day must not become two entries.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Scope {
+    Day(ConvId, NaiveDate),
+    Thread(ConvId, MsgId),
+}
+
+/// A held scope, with what eviction needs to know about it.
+struct Held {
+    day: Arc<Day>,
+    at: Instant,
+    /// The clock value of its last use. Eviction takes the smallest.
+    used: u64,
 }
 
 /// A messenger as a read-only filesystem. See the module docs.
@@ -167,14 +159,85 @@ pub struct MessengerFs<S> {
     /// pages.
     born: SystemTime,
     cache: Mutex<Cache>,
+    limits: MessengerLimits,
 }
 
 impl<S: MessengerSource> MessengerFs<S> {
+    /// A mount over `source`, with the budgets this lane chose.
     pub fn new(source: S) -> Self {
+        Self::with_limits(source, MessengerLimits::default())
+    }
+
+    /// A mount over `source` that spends what `limits` allows.
+    ///
+    /// What a host serving many mounts reaches for: every one of these holds its own caches, so
+    /// the cost of one is the cost of a thousand divided by a thousand — see [`MessengerLimits`]
+    /// for what each number buys.
+    pub fn with_limits(source: S, limits: MessengerLimits) -> Self {
         MessengerFs {
             source: Arc::new(source),
             born: SystemTime::now(),
             cache: Mutex::new(Cache::default()),
+            limits,
+        }
+    }
+
+    /// The assembled scope, if it is held and still fresh.
+    ///
+    /// Touching it on the way out is what makes the eviction order *recency* and not insertion:
+    /// the day a reader keeps coming back to outlives the one they passed through once.
+    fn held(&self, scope: &Scope) -> Option<Arc<Day>> {
+        let mut cache = self.cache.lock().unwrap();
+        let clock = cache.clock + 1;
+        let entry = cache.text.get_mut(scope)?;
+        if entry.at.elapsed() >= self.limits.ttl {
+            return None;
+        }
+        entry.used = clock;
+        let day = entry.day.clone();
+        cache.clock = clock;
+        Some(day)
+    }
+
+    /// Hold an assembled scope, dropping the least recently used until the budget is met.
+    ///
+    /// The scan for a victim is linear, which is the right shape here: the map holds as many
+    /// scopes as the budget has room for — tens, not thousands — and a heap would be more
+    /// bookkeeping than the thing it speeds up.
+    ///
+    /// Never the entry just held, and not by a special case: it was touched last, so it has the
+    /// highest stamp. That is what leaves a single day larger than the whole budget in place
+    /// while it is being read, rather than refetching it for every chunk a kernel asks for.
+    fn hold(&self, scope: Scope, day: Arc<Day>) {
+        let weight = day.chat.len() as u64;
+        let mut cache = self.cache.lock().unwrap();
+        cache.clock += 1;
+        let used = cache.clock;
+        let replaced = cache.text.insert(
+            scope,
+            Held {
+                day,
+                at: Instant::now(),
+                used,
+            },
+        );
+        if let Some(old) = replaced {
+            cache.text_bytes -= old.day.chat.len() as u64;
+        }
+        cache.text_bytes += weight;
+
+        while cache.text_bytes > self.limits.text_budget && cache.text.len() > 1 {
+            let Some(victim) = cache
+                .text
+                .iter()
+                .min_by_key(|(_, held)| held.used)
+                .map(|(scope, _)| scope.clone())
+            else {
+                break;
+            };
+            if let Some(gone) = cache.text.remove(&victim) {
+                cache.text_bytes -= gone.day.chat.len() as u64;
+            }
         }
     }
 
@@ -195,7 +258,7 @@ impl<S: MessengerSource> MessengerFs<S> {
     // ---- fetches, each answering from the cache first ---------------------------------
 
     async fn conversations(&self) -> io::Result<Vec<Conversation>> {
-        if let Some(v) = Cached::get(self.cache.lock().unwrap().convs.as_ref()) {
+        if let Some(v) = Cached::get(self.cache.lock().unwrap().convs.as_ref(), self.limits.ttl) {
             return Ok(v.clone());
         }
         let (convs, _truncated) = self.source.conversations().await?;
@@ -204,7 +267,7 @@ impl<S: MessengerSource> MessengerFs<S> {
     }
 
     async fn users(&self) -> io::Result<Vec<User>> {
-        if let Some(v) = Cached::get(self.cache.lock().unwrap().users.as_ref()) {
+        if let Some(v) = Cached::get(self.cache.lock().unwrap().users.as_ref(), self.limits.ttl) {
             return Ok(v.clone());
         }
         let (users, _truncated) = self.source.users().await?;
@@ -214,11 +277,11 @@ impl<S: MessengerSource> MessengerFs<S> {
 
     /// The days `conv` was seen to have, and whether the walk stopped short of its history.
     async fn dates(&self, conv: &ConvId) -> io::Result<(Vec<NaiveDate>, bool)> {
-        if let Some(v) = Cached::get(self.cache.lock().unwrap().dates.get(conv)) {
+        if let Some(v) = Cached::get(self.cache.lock().unwrap().dates.get(conv), self.limits.ttl) {
             return Ok(v.clone());
         }
         // One unreadable conversation is not a broken tree: it is listed, and it is empty.
-        let (msgs, truncated) = match self.source.scan(conv, SCAN_PAGES).await {
+        let (msgs, truncated) = match self.source.scan(conv, self.limits.scan_pages).await {
             Ok(v) => v,
             Err(e) if e.is_conversation_denied() => (Vec::new(), false),
             Err(e) => return Err(e.into()),
@@ -237,9 +300,9 @@ impl<S: MessengerSource> MessengerFs<S> {
 
     /// One day of a conversation, assembled from a single history call.
     async fn day(&self, conv: &ConvId, date: NaiveDate) -> io::Result<Arc<Day>> {
-        let key = (conv.clone(), date);
-        if let Some(v) = Cached::get(self.cache.lock().unwrap().days.get(&key)) {
-            return Ok(v.clone());
+        let key = Scope::Day(conv.clone(), date);
+        if let Some(day) = self.held(&key) {
+            return Ok(day);
         }
         let msgs = match self.source.history(conv, window_of(date)).await {
             Ok((msgs, _truncated)) => msgs,
@@ -247,11 +310,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             Err(e) => return Err(e.into()),
         };
         let day = Arc::new(self.assemble(&msgs).await?);
-        self.cache
-            .lock()
-            .unwrap()
-            .days
-            .insert(key, Cached::new(day.clone()));
+        self.hold(key, day.clone());
         Ok(day)
     }
 
@@ -259,9 +318,9 @@ impl<S: MessengerSource> MessengerFs<S> {
     ///
     /// [`Scope`]: Day
     async fn thread(&self, conv: &ConvId, root: &MsgId) -> io::Result<Arc<Day>> {
-        let key = (conv.clone(), root.clone());
-        if let Some(v) = Cached::get(self.cache.lock().unwrap().threads.get(&key)) {
-            return Ok(v.clone());
+        let key = Scope::Thread(conv.clone(), root.clone());
+        if let Some(day) = self.held(&key) {
+            return Ok(day);
         }
         let msgs = match self.source.thread(conv, root).await {
             Ok((msgs, _truncated)) => msgs,
@@ -272,11 +331,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             return Err(io_err(io::ErrorKind::NotFound));
         }
         let day = Arc::new(self.assemble(&msgs).await?);
-        self.cache
-            .lock()
-            .unwrap()
-            .threads
-            .insert(key, Cached::new(day.clone()));
+        self.hold(key, day.clone());
         Ok(day)
     }
 
@@ -436,8 +491,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                     .into_iter()
                     .find(|u| u.id == want)
                     .ok_or(io_err(io::ErrorKind::NotFound))?;
-                let bytes = serde_json::to_vec_pretty(&user.record)
-                    .map_err(io::Error::other)?;
+                let bytes = serde_json::to_vec_pretty(&user.record).map_err(io::Error::other)?;
                 Ok(Node::Bytes(Arc::new(bytes)))
             }
 
@@ -488,12 +542,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                 .users()
                 .await?
                 .into_iter()
-                .map(|u| {
-                    Dirent::new(
-                        entry(&u.name, &u.id, ".json"),
-                        DirentKind::File,
-                    )
-                })
+                .map(|u| Dirent::new(entry(&u.name, &u.id, ".json"), DirentKind::File))
                 .collect()),
 
             [s] if self.section_kind(s).is_some() => {
@@ -558,7 +607,7 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
                 Node::Dir => Err(io_err(io::ErrorKind::IsADirectory)),
                 Node::Bytes(data) => Ok(copy_out(&data, buf, offset)),
 
-                Node::File(f) if f.size <= WINDOW => {
+                Node::File(f) if f.size <= self.limits.window => {
                     // The listing named the size, so the end is known without asking. Without
                     // this the last read of every file — the one the kernel makes to see EOF —
                     // would fetch the whole thing to be told nothing.
@@ -596,7 +645,9 @@ impl<S: MessengerSource> MessengerFs<S> {
         let (Some(s), Some(conv_dir)) = (segs.first(), segs.get(1)) else {
             return Err(io_err(io::ErrorKind::NotFound));
         };
-        let kind = self.section_kind(s).ok_or(io_err(io::ErrorKind::NotFound))?;
+        let kind = self
+            .section_kind(s)
+            .ok_or(io_err(io::ErrorKind::NotFound))?;
         let conv = self.conv_at(kind, conv_dir).await?;
         let date = segs
             .get(2)
@@ -653,9 +704,9 @@ impl<S: MessengerSource> MessengerFs<S> {
     }
 }
 
-
 impl<S: MessengerSource> MessengerFs<S> {
-    /// An attachment past [`WINDOW`], served from the one window this store holds.
+    /// An attachment past [`window`](MessengerLimits::window), served from the one window this
+    /// store holds.
     ///
     /// A request the held window only partly covers must not stop there: the trait states that a
     /// short read is EOF, so a document would appear to end at a window boundary. Windows begin
@@ -686,8 +737,8 @@ impl<S: MessengerSource> MessengerFs<S> {
             }
             // A miss always pulls a whole window rather than only what was asked. No continuity
             // test, unlike an object store's: a document is read forwards, and the cost of being
-            // wrong is bounded by `WINDOW` on a file already past it.
-            let end = (at + WINDOW).min(f.size);
+            // wrong is bounded by the window on a file already past it.
+            let end = (at + self.limits.window).min(f.size);
             let (data, served_range) = self.source.fetch_file(f, Some(at..end)).await?;
             if data.is_empty() {
                 // A non-empty range answered with no bytes has no meaning here, and looping on it
