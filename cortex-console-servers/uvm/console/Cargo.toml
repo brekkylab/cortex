@@ -1,0 +1,42 @@
+[package]
+name = "cortex-uvm-console"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+anyhow = { workspace = true }
+
+[dependencies]
+anyhow = { workspace = true }
+bson = { workspace = true }
+# The protocol, and nothing else: what this crate puts in front of a guest is a directory
+# on this host, which is what `msb_krun` shares — cortex has no guest-shaped path through
+# it and does not need one here.
+cortex = { workspace = true }
+# `dup(2)`, to hand a boot child a copy of this process's stderr as its stdout. A guest's
+# kernel log is not the protocol and must not reach stdout, which is.
+libc = { workspace = true }
+# `blk`, for the two disks the guest overlays into a root: the session's writable ext4
+# upper and the read-only EROFS base. This crate is the only consumer of `msb_krun` in
+# the workspace — cortex itself links no VMM — so the feature is charged to the one
+# build that boots anything.
+msb_krun = { workspace = true, features = ["blk"] }
+# The image tooling: `ext4` formats the session's writable upper, `tar` and `tree` turn a
+# rootfs tarball into a file tree, and `erofs` writes that tree as the read-only base.
+microsandbox-image = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "time",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -76,8 +76,14 @@ struct cortex_fuse_t_ops {
 };
 
 /* Mount and build a session. Returns NULL on failure. The returned pointer owns
- * the channel and session and must be freed with `cortex_fuse_t_destroy`. */
-void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname, void *fs,
+ * the channel and session and must be freed with `cortex_fuse_t_destroy`.
+ *
+ * `backend` names which of FUSE-T's transports serves the mount — "nfs", "smb"
+ * or "fskit" — or is NULL to leave the choice to FUSE-T, which reads it from
+ * `fuse-t.ini` and defaults to nfs. Nothing else about the session changes with
+ * it: the vtable below is what answers either way. */
+void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname,
+                          const char *backend, void *fs,
                           const struct cortex_fuse_t_ops *ops);
 
 /* Serve requests until the session ends. Blocks; call from a dedicated thread. */

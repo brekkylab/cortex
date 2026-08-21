@@ -2,13 +2,15 @@
 resolver = "3"
 members = [
     "cortex",
-    "cortex-local-console",
-    "cortex-uvm-console",
+    "cortex-execs/mem",
+    "cortex-console-servers/local",
+    "cortex-console-servers/uvm/console",
 ]
-# The guest half of `cortex-uvm-console`. Its own workspace root, because it is
-# cross-compiled to `*-unknown-linux-musl` and a member would be built for the
-# host by a bare `cargo build` — for a target that has no host to run on.
-exclude = ["cortex-uvm-guest"]
+# `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
+# it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
+# bare `cargo build` — for a target that has no host to run on.
+#
+exclude = ["cortex-console-servers/uvm/guest"]
 
 [workspace.package]
 version = "0.1.0"
@@ -16,16 +18,16 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
-# `Mountable`/`DynMountable`/`FileHandle`/`FileExt` are async *and* object-safe
-# (`Box<dyn DynMountable>`), which native `async fn` in traits cannot be — so
-# their futures are boxed here.
+# Declared for a consumer that wants the macro, not used by any member: `FileSystem`,
+# `Client`, `Server` and `Executable` are async *and* object-safe (`dyn FileSystem`,
+# `Box<dyn Client>`), which native `async fn` in traits cannot be — and they box their
+# futures by hand, so the lifetimes are visible where the borrows are.
 async-trait = "0.1"
 # The console wire. Declared here rather than per crate because `Outcome::Result`
 # carries a `Bson` in public API: two versions of it in one build would be a type
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
-cortex-fs = { path = "cortex-fs", default-features = false }
 futures-core = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -37,10 +39,12 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
 
-# The in-process, Rust-native libkrun fork. Its `VmBuilder` exposes the
-# `.fs(..).custom(..)` hook that attaches a custom `DynFileSystem` virtio-fs
-# backend to the guest — the one thing the upstream libkrun C API and the
-# high-level microsandbox SDK do not offer.
+# The in-process, Rust-native libkrun fork. `VmBuilder` is what lets a boot be
+# assembled out of parts this workspace already holds: tagged virtio-fs shares, two
+# virtio-blk disks, and — the one that decides the design — a console port bound to a
+# file descriptor the caller opened, which is how a session's socket reaches the guest
+# with no pty and no file in between. The high-level microsandbox SDK boots images, not
+# descriptors, and offers nowhere to hand one over.
 msb_krun = "0.1"
 
 # Two image formats, in pure Rust, with no `mkfs` to shell out to: `ext4` formats
@@ -51,8 +55,9 @@ msb_krun = "0.1"
 # a guest at all.
 microsandbox-image = "0.6.7"
 
-# Host-side FUSE. A sync trait whose methods take `&self`, so it drives the same
-# `PosixFs` (interior mutability) that the krun binding does.
+# Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl`
+# on `Posix` itself rather than a wrapper holding one — the same shape `fuse-t` takes,
+# over the same `Mutex`-held inode and open tables.
 fuser = "0.17"
 # A read-only S3 backend. `default-features = false` on purpose: the default set
 # is `["fs"]`, which is object_store's *own* local-filesystem store and drags in
@@ -74,6 +79,17 @@ chrono = "0.4"
 # Notion answers in JSON and `page.json` is rendered back to it, so the backend
 # holds pages as `Value` rather than a mirror of a schema it does not own.
 serde_json = "1"
+
+# A memory store that is one file in a cortex tree. `bundled` on purpose: the store
+# is a file a delegated executable opens on a mount, and which SQLite answers for it
+# must not be whichever one the host happens to ship — the schema below uses an
+# extension that is compiled against these headers.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Nearest-neighbour search inside that same file: a `vec0` virtual table, statically
+# registered as an auto-extension rather than loaded from a `.dylib` nobody would
+# have. Pinned off the 0.1.10 alphas, whose published crate is missing a `#include`d
+# source file and does not compile.
+sqlite-vec = "0.1.9"
 
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.

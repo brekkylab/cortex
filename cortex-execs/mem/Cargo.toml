@@ -1,0 +1,32 @@
+[package]
+name = "cortex-exec-mem"
+version.workspace = true
+edition.workspace = true
+
+# `mem` against a directory on this host, with no console and no mount in front of it.
+# The same `Executable` the console reaches, so what it does here is what it does there;
+# the difference is only who supplies the tree.
+[[bin]]
+name = "mem"
+path = "src/bin/mem.rs"
+
+[dependencies]
+# RFC 3339 timestamps. A memory carries when it was written, and the store is a file
+# other tools read: a sortable, unambiguous spelling is worth a dependency.
+chrono = { workspace = true }
+# `Executable`, `ExecCall`, `Mount` — the delegation surface this crate implements.
+cortex = { workspace = true }
+# `BoxFuture`: `Executable` hands one back, and the traits here do the same so a
+# provider that waits on a network can be held behind a `dyn`.
+futures-core = { workspace = true }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+sqlite-vec = { workspace = true }
+tokio = { workspace = true, features = ["rt"] }
+# Memory identity. Ids leave this process — they are what `mem delete` and
+# `mem history` are given back — so they cannot be rowids that a re-import renumbers.
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

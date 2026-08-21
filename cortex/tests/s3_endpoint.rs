@@ -1,7 +1,7 @@
-//! A real object-store endpoint, driven through [`S3Volume::new`].
+//! A real object-store endpoint, driven through [`S3Fs::new`].
 //!
 //! Every other S3 test builds the volume from a store handed to it, which skips the
-//! one thing this file exercises: the client `S3Volume::new` builds from an
+//! one thing this file exercises: the client `S3Fs::new` builds from an
 //! [`S3Config`] — credentials, endpoint, path addressing, SigV4 — and the wire
 //! format underneath it. `ListObjectsV2` XML, a ranged `GET`, a `HEAD`, and the
 //! status codes an error arrives as are all upstream's to produce, and nothing that
@@ -23,7 +23,7 @@
 
 use std::{path::Path, process::Command};
 
-use cortex::volume::{DirentKind, FileExt, Mountable, OpenOptions, S3Config, S3Volume};
+use cortex::fs::{DirentKind, FileSystem, S3Config, S3Fs};
 
 /// The mock this drives — a stand-in for the read APIs of a dozen enterprise
 /// services, S3 among them, over a corpus rather than a live account.
@@ -34,8 +34,8 @@ const S3_PATH: &str = "/s3";
 
 /// A bucket in the mock's corpus, chosen for having several levels of prefix.
 ///
-/// Named here because bucket names are not discoverable through [`S3Volume`]:
-/// `ListBuckets` is not a `Mountable` operation, and would not be — a volume is
+/// Named here because bucket names are not discoverable through [`S3Fs`]:
+/// `ListBuckets` is not a `FileSystem` operation, and would not be — a volume is
 /// mounted *at* a bucket. If the corpus is rebuilt and this name goes away, the
 /// first assertion says so; the current list comes from a signed `GET /s3/`.
 const BUCKET: &str = "redwood-redwood";
@@ -125,7 +125,7 @@ fn config(principal: &Principal, secret: &str) -> S3Config {
 /// when the corpus is rebuilt with different people in it. The principal comes back
 /// with the volume so a test that needs a *second* client for the same caller does not
 /// have to fetch the roster again and guess which one it was.
-async fn volume() -> Option<(S3Volume, Principal)> {
+async fn volume() -> Option<(S3Fs, Principal)> {
     let Some(roster) = fetch_roster() else {
         eprintln!("skipped: cannot reach {HOST} (see this file's docs)");
         return None;
@@ -136,7 +136,7 @@ async fn volume() -> Option<(S3Volume, Principal)> {
     for (denied, principal) in roster.into_iter().enumerate() {
         // Building the client is itself a code path no other test reaches, and it
         // fails here rather than at the first request.
-        let vol = S3Volume::new(&config(&principal, &principal.secret_access_key))
+        let vol = S3Fs::new(&config(&principal, &principal.secret_access_key))
             .expect("build the S3 client");
         // The one request `check_reachable` exists to make. A caller without access is
         // told the bucket does not exist — the mock hides existence rather than
@@ -166,7 +166,7 @@ const MAX_READ: u64 = 8 << 20;
 type FindFileFut<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<(std::path::PathBuf, u64)>> + 'a>>;
 
-fn find_a_file<'a>(vol: &'a S3Volume, at: &'a Path, depth: usize) -> FindFileFut<'a> {
+fn find_a_file<'a>(vol: &'a S3Fs, at: &'a Path, depth: usize) -> FindFileFut<'a> {
     Box::pin(async move {
         if depth == 0 {
             return None;
@@ -235,34 +235,33 @@ async fn a_real_endpoint_answers_the_whole_read_surface() {
     assert!(stat.mtime.is_some(), "LastModified should reach Stat");
     assert!(stat.etag.is_some(), "ETag should reach Stat");
 
-    // A whole read, then the same bytes through one ranged GET from the middle —
-    // the second is what exercises `Range`/206 rather than a plain body.
-    let (handle, opened) = vol
-        .open(&path, OpenOptions::read_only())
-        .await
-        .expect("open the file");
-    assert_eq!(opened.size, size);
-
+    // A whole read, then the same bytes through one ranged GET from the middle — the second is
+    // what exercises `Range`/206 rather than a plain body.
     let mut whole = vec![0u8; size as usize];
-    let read = handle.read_at(&mut whole, 0).await.expect("read from 0");
+    let read = vol
+        .read_at(&path, &mut whole, 0)
+        .await
+        .expect("read from 0");
     assert_eq!(read as u64, size, "a short read here would mean EOF");
 
     let at = size / 2;
     let mut middle = vec![0u8; (size - at) as usize];
-    // A fresh handle, so this is a miss rather than the first read's window.
-    let (fresh, _) = vol
-        .open(&path, OpenOptions::read_only())
+    // The store's window is keyed by path and the first read filled it, so this one is served
+    // from cache or from a fresh range — either way the bytes have to agree.
+    let read = vol
+        .read_at(&path, &mut middle, at)
         .await
-        .expect("reopen");
-    let read = fresh.read_at(&mut middle, at).await.expect("ranged read");
+        .expect("ranged read");
     assert_eq!(read, middle.len(), "the ranged read came back short");
     assert_eq!(middle, whole[at as usize..], "ranged bytes disagree");
 
-    // Past the end is EOF, answered from the size the open recorded rather than by
-    // sending a range the store would reject.
+    // Past the end is EOF, answered from the size the store recorded rather than by sending a
+    // range it would reject.
     let mut past = [0u8; 16];
     assert_eq!(
-        fresh.read_at(&mut past, size).await.expect("read past end"),
+        vol.read_at(&path, &mut past, size)
+            .await
+            .expect("read past end"),
         0
     );
 }
@@ -280,18 +279,19 @@ async fn a_missing_key_on_a_real_endpoint_is_not_found() {
         .stat(missing)
         .await
         .expect_err("a missing key must not stat");
-    assert!(
-        matches!(err, cortex::CortexError::NotFound),
+    assert_eq!(
+        err.kind(),
+        std::io::ErrorKind::NotFound,
         "expected NotFound, got {err:?}"
     );
-    assert!(
-        matches!(
-            vol.open(missing, OpenOptions::read_only())
-                .await
-                .map(|_| ()),
-            Err(cortex::CortexError::NotFound)
-        ),
-        "open should agree with stat"
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        vol.read_at(missing, &mut buf, 0)
+            .await
+            .expect_err("a read of a missing key must not succeed")
+            .kind(),
+        std::io::ErrorKind::NotFound,
+        "a read should agree with stat"
     );
 }
 
@@ -316,14 +316,14 @@ async fn a_bad_signature_on_a_real_endpoint_is_permission_denied() {
         .expect("a file to ask about");
 
     let wrong = format!("{}x", principal.secret_access_key);
-    let vol = S3Volume::new(&config(&principal, &wrong)).expect("build the S3 client");
+    let vol = S3Fs::new(&config(&principal, &wrong)).expect("build the S3 client");
 
     let err = vol
         .stat(&path)
         .await
         .expect_err("a bad signature must not stat");
     assert!(
-        matches!(err, cortex::CortexError::PermissionDenied),
+        err.kind() == std::io::ErrorKind::PermissionDenied,
         "expected PermissionDenied from a 403 on HEAD, got {err:?}"
     );
 }

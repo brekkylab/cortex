@@ -37,15 +37,18 @@
 //! [`Console`]: crate::console::Console
 //! [`kill_on_drop`]: tokio::process::Command::kill_on_drop
 
-use std::io;
-use std::process::Stdio;
+use std::{io, process::Stdio};
 
 use futures_core::future::BoxFuture;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader};
-use tokio::process::{Child, Command};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, BufReader},
+    process::{Child, Command},
+};
 
-use crate::console::stdio::{read, write};
-use crate::console::{Call, Client, Failure, Message, Notification, Outcome, RequestId};
+use crate::console::{
+    Call, Client, Failure, Message, Notification, Outcome, RequestId,
+    stdio::{read, write},
+};
 
 /// A [`Client`] over a server process's pipes, and the process itself.
 ///
@@ -256,13 +259,17 @@ fn broke(doing: &'static str) -> impl FnOnce(io::Error) -> Failure {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
+    use std::{
+        io::Cursor,
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
 
     use super::*;
-    use crate::console::{Error, Exec, ExecCmd, ExecResult, Init, Method, Progress, Read};
+    use crate::console::{
+        Error, Exec, ExecCmd, ExecResult, Init, InitResult, Method, Progress, Read,
+    };
 
     /// Everything the client wrote, readable after it has been dropped or not — a
     /// `Vec` cannot be, once the client owns it.
@@ -340,10 +347,12 @@ mod tests {
         }
     }
 
-    fn null(id: RequestId) -> Message {
+    /// A session taken as it was described, with nothing said about a workfs — which is
+    /// what an `init` that named none is answered with.
+    fn initialized(id: RequestId) -> Message {
         Message::Response {
             id,
-            outcome: Outcome::Result(bson::Bson::Null),
+            outcome: Outcome::Result(bson::serialize_to_bson(&InitResult::default()).unwrap()),
         }
     }
 
@@ -352,12 +361,12 @@ mod tests {
     /// not numbered.
     #[tokio::test]
     async fn a_session_is_init_then_execs() {
-        let (mut client, sent) = driving(&[null(0), ran(1, b"hi\n")]).await;
+        let (mut client, sent) = driving(&[initialized(0), ran(1, b"hi\n")]).await;
 
         client
             .init(Init {
                 delegated: vec!["foo".into()],
-                volumes: Default::default(),
+                ..Init::default()
             })
             .await
             .unwrap();

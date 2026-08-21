@@ -13,9 +13,11 @@
 use std::fmt;
 
 use bson::Bson;
-use serde::de::{self, MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, MapAccess, Visitor},
+    ser::SerializeMap,
+};
 
 use crate::console::{Call, Error, Method, Notification, Outcome};
 
@@ -230,10 +232,10 @@ impl<'de> Visitor<'de> for MessageVisitor {
 mod tests {
     use bson::{Document, doc};
 
-    use super::super::{
-        Exec, ExecCmd, ExecResult, Init, Progress, Read, ReadResult, Write, WriteResult,
+    use super::{
+        super::{Exec, ExecCmd, ExecResult, Init, Progress, Read, ReadResult, Write, WriteResult},
+        *,
     };
-    use super::*;
 
     /// What a peer would have sent, and what it reads back as.
     ///
@@ -260,6 +262,7 @@ mod tests {
             ]),
             timeout_ms: Some(1_000),
             cwd: None,
+            env: Default::default(),
         }
     }
 
@@ -305,7 +308,7 @@ mod tests {
                 id: 0,
                 call: Call::Init(Init {
                     delegated: vec!["bar".into(), "foo".into()],
-                    volumes: Default::default(),
+                    ..Init::default()
                 }),
             },
             Message::Response {
@@ -367,6 +370,9 @@ mod tests {
                         stdout: vec![0, 1, 2, 255, b'\n'],
                         stderr: vec![],
                         truncated: false,
+                        // The command moved the session, which is a whole session's worth of
+                        // frames only if something survives the round trip.
+                        cwd: Some("/mnt/workfs/work".into()),
                     }))
                     .unwrap(),
                 ),
@@ -608,7 +614,7 @@ mod tests {
                 id: 0,
                 call: Call::Init(Init {
                     delegated: vec!["fetch".into()],
-                    volumes: Default::default(),
+                    ..Init::default()
                 }),
             }),
             doc! {

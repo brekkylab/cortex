@@ -25,9 +25,11 @@
 use std::fmt;
 
 use bson::Bson;
-use serde::de::{self, DeserializeOwned, MapAccess, Visitor};
-use serde::ser::SerializeMap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, DeserializeOwned, MapAccess, Visitor},
+    ser::SerializeMap,
+};
 
 /// A `result` or an `error` — never both, never neither.
 ///
@@ -103,17 +105,27 @@ impl Error {
     /// file is whatever it is, and a requester that needs to know asks with a `read`.
     pub const IO_FAILED: i64 = -32007;
 
-    /// A volume kind the server cannot realize. Answered by whatever call needed a session,
-    /// since `init` boots nothing.
+    /// `init`: a workfs URL whose scheme this server has no provider for, named in the
+    /// message.
     ///
-    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the spec is
-    /// well formed and the server is the wrong build for it.
-    pub const UNSUPPORTED_VOLUME: i64 = -32008;
+    /// `init`'s own, and not deferred to the call that needs a session, because it is
+    /// knowable the moment the frame is read: which kinds a server can realize is a fact
+    /// about the *build*, and answering a path for a tree that can never be there would be
+    /// a session in which every later path is a lie.
+    ///
+    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the workfs
+    /// is well formed and the server is the wrong build for it — a different binary, or a
+    /// different URL.
+    pub const UNSUPPORTED_WORKFS: i64 = -32008;
 
-    /// The workspace built and binding it to a filesystem interface did not — no mount
-    /// binding compiled in, no FUSE provider installed, the mount point busy.
+    /// `exec`, `read`, `write`: the workfs could not be put where `init` said it would be —
+    /// no mount binding compiled in, no FUSE provider installed, the mount point busy, the
+    /// store itself unreachable.
     ///
-    /// The volume kinds were all fine; the environment is what has to change.
+    /// Deferred like [`BOOT_FAILED`](Self::BOOT_FAILED) and for the same reason: mounting
+    /// happens when the session boots, so this reaches whoever asked for the call that
+    /// needed one. Apart from it because the kind of fix differs — the session is described
+    /// correctly and the environment is what has to change.
     pub const MOUNT_FAILED: i64 = -32009;
 
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
@@ -149,8 +161,8 @@ impl Outcome {
         }
     }
 
-    /// The `result`, as the type the method returns — `Progress` for `exec`, `()` for
-    /// `init`.
+    /// The `result`, as the type the method returns — `Progress` for `exec`, `InitResult`
+    /// for `init`.
     ///
     /// The caller supplies `T` because the caller is the end that issued the `id`
     /// and so is the only one that knows the method. A `result` that will not
@@ -252,8 +264,7 @@ impl<'de> Visitor<'de> for OutcomeVisitor {
 mod tests {
     use bson::{Document, doc};
 
-    use super::super::ExecResult;
-    use super::*;
+    use super::{super::ExecResult, *};
 
     /// Read an outcome off the bytes a document makes, which is what a peer would
     /// actually have sent — the whole point of going through the wire rather than
@@ -275,8 +286,6 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(result.clone().take::<ExecResult>().unwrap().code, 3);
-        // `init` returns nothing, and nothing is what `null` is.
-        Outcome::Result(Bson::Null).take::<()>().unwrap();
 
         // Asking for the wrong type is a peer that answered the wrong request as
         // far as anyone here can tell.

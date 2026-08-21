@@ -297,7 +297,8 @@ static const struct fuse_lowlevel_ops LL_OPS = {
     .create = ll_create,
 };
 
-void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname, void *fs,
+void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname,
+                          const char *backend, void *fs,
                           const struct cortex_fuse_t_ops *ops) {
     struct session *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -310,8 +311,19 @@ void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname, void *fs,
     if (fuse_opt_add_arg(&args, "cortex") != 0) goto fail_args;
     if (fuse_opt_add_arg(&args, "-o") != 0) goto fail_args;
     {
+        /* One `-o`, because libfuse takes a comma-separated list and a second
+         * argument would have to be paired with its own `-o`. Truncation is not
+         * a risk worth branching on: both values are ours and short, and
+         * `snprintf` bounds the buffer either way. */
         char opt[256];
-        snprintf(opt, sizeof opt, "fsname=%s", fsname);
+        int n = snprintf(opt, sizeof opt, "fsname=%s", fsname);
+        if (n < 0) goto fail_args;
+        if (backend && (size_t)n < sizeof opt) {
+            /* Omitted entirely when NULL, so FUSE-T applies whatever
+             * `fuse-t.ini` says — passing "nfs" here would override a user who
+             * had configured something else. */
+            snprintf(opt + n, sizeof opt - (size_t)n, ",backend=%s", backend);
+        }
         if (fuse_opt_add_arg(&args, opt) != 0) goto fail_args;
     }
 

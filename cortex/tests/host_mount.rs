@@ -51,8 +51,12 @@ use std::{fs, path::PathBuf};
 // One set of test bodies for both host bindings: they expose the same call
 // surface, so which is under test is a matter of which feature is on — making
 // these tests evidence that the two behave *alike*, not just that each behaves.
-use cortex::volume::HostMount;
-use cortex::volume::{InMemVolume, Mountable, OpenOptions, Workspace};
+#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
+use cortex::fs::FuseMount as HostMount;
+/// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
+#[cfg(feature = "fuse-t")]
+use cortex::fs::FuseTMount as HostMount;
+use cortex::fs::{FileSystem, InMemFs, WorkFs};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {
@@ -65,23 +69,17 @@ fn mountpoint(tag: &str) -> PathBuf {
 
 /// A volume with one file and one empty directory.
 ///
-/// The seeding drives the async `Mountable`/`FileExt` surface, so it runs on a
-/// throwaway runtime here — the crate's own `block_on` is `pub(crate)`, and the
+/// The seeding drives the store's async surface, so it runs on a throwaway runtime here — the crate's own `block_on` is `pub(crate)`, and the
 /// test bodies themselves are synchronous because a real kernel drives the mount.
-fn volume() -> InMemVolume {
-    let vol = InMemVolume::new();
+fn volume() -> InMemFs {
+    let vol = InMemFs::new();
     let rt = tokio::runtime::Runtime::new().expect("build a runtime for volume setup");
     rt.block_on(async {
-        let (file, _) = vol
-            .open(
-                std::path::Path::new("greeting.txt"),
-                OpenOptions::create_new(),
-            )
+        let hello = std::path::Path::new("hello.txt");
+        vol.create(hello).await.expect("fresh store");
+        vol.write_at(hello, b"Hello from cortex!\n", 0)
             .await
-            .unwrap();
-        cortex::volume::FileExt::write_all_at(&file, b"Hello from cortex!\n", 0)
-            .await
-            .unwrap();
+            .expect("write the greeting");
         vol.mkdir(std::path::Path::new("sub")).await.unwrap();
     });
     vol
@@ -91,7 +89,7 @@ fn volume() -> InMemVolume {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_cortex_mount() {
     let mnt = mountpoint("read");
-    let mount = HostMount::spawn(volume(), &mnt).expect("mount");
+    let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
     // `read_dir` is a real `readdir`, so this exercises the cursor protocol as
     // the kernel drives it rather than as our unit tests drive it.
@@ -113,7 +111,8 @@ fn the_operating_system_can_read_a_cortex_mount() {
     assert_eq!(meta.len(), 19);
     assert!(fs::metadata(mnt.join("sub")).unwrap().is_dir());
 
-    mount.unmount().expect("unmount");
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
@@ -129,12 +128,12 @@ fn the_operating_system_can_read_a_cortex_mount() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_multi_source_workspace() {
     let mnt = mountpoint("workspace");
-    let ws = Workspace::new()
+    let ws = WorkFs::new()
         .try_with_mount("s3-like", volume())
         .expect("mount path stays inside the workspace")
         .try_with_mount("notes", volume())
         .expect("mount path stays inside the workspace");
-    let mount = HostMount::spawn(ws, &mnt).expect("mount");
+    let mount = HostMount::try_new(ws, &mnt).expect("mount");
 
     // The mount points show up as directories even though no backend serves the
     // directory that holds them.
@@ -161,7 +160,8 @@ fn the_operating_system_can_read_a_multi_source_workspace() {
     // The synthesized root is not writable — nothing is mounted there to hold it.
     assert!(fs::create_dir(mnt.join("nope")).is_err());
 
-    mount.unmount().expect("unmount");
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
@@ -177,7 +177,7 @@ fn the_operating_system_sees_real_timestamps() {
 
     let mnt = mountpoint("times");
     let started = SystemTime::now();
-    let mount = HostMount::spawn(volume(), &mnt).expect("mount");
+    let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
     let modified = |name: &str| {
         fs::metadata(mnt.join(name))
@@ -213,7 +213,8 @@ fn the_operating_system_sees_real_timestamps() {
         "creating an entry modifies its directory"
     );
 
-    mount.unmount().expect("unmount");
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
@@ -228,7 +229,7 @@ fn the_operating_system_sees_real_timestamps() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
     let mnt = mountpoint("rename");
-    let mount = HostMount::spawn(volume(), &mnt).expect("mount");
+    let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
     // Write-temp-then-rename, exactly as an editor does.
     fs::write(mnt.join("greeting.txt.tmp"), b"edited by an editor\n").unwrap();
@@ -268,7 +269,8 @@ fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
         "a file must not replace a directory"
     );
 
-    mount.unmount().expect("unmount");
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
@@ -276,7 +278,7 @@ fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_write_to_a_cortex_mount() {
     let mnt = mountpoint("write");
-    let mount = HostMount::spawn(volume(), &mnt).expect("mount");
+    let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
     // `fs::write` is create + write + close, so this covers the whole chain the
     // kernel actually sends: CREATE, WRITE, FLUSH, RELEASE.
@@ -317,7 +319,8 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
     fs::remove_file(mnt.join("new.txt")).unwrap();
     assert!(!mnt.join("new.txt").exists());
 
-    mount.unmount().expect("unmount");
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
@@ -328,21 +331,22 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn a_read_only_mount_is_enforced_by_the_kernel() {
     let mnt = mountpoint("readonly");
-    let mount = HostMount::spawn_with(
+    let mount = HostMount::try_new_with(
         volume(),
         &mnt,
         vec![
-            cortex::volume::MountOption::FSName("cortex".into()),
-            cortex::volume::MountOption::RO,
+            cortex::fs::MountOption::FSName("cortex".into()),
+            cortex::fs::MountOption::RO,
         ],
     )
     .expect("mount");
 
-    // The write is refused by the *kernel*: the request never reaches a backend,
-    // which is stronger than each backend answering `ReadOnly` by hand.
+    // The write is refused by the *kernel*: the request never reaches a store, which is
+    // stronger than each store answering `ReadOnlyFilesystem` by hand.
     assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
     assert!(fs::write(mnt.join("nope.txt"), b"x").is_err());
 
-    mount.unmount().expect("unmount");
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }

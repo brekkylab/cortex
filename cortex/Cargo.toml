@@ -3,31 +3,12 @@ name = "cortex"
 version.workspace = true
 edition.workspace = true
 
-[[bin]]
-name = "apply_krun"
-required-features = ["krun"]
-
-# Serves both host bindings from one file, so no `required-features`: the key is
-# AND, so it cannot say "fuse or fuse-t", and naming either would lock the other
-# out. The example carries a no-feature `main` instead.
-[[example]]
-name = "mount_host"
-
-# Measures the read sizes a kernel asks for, for the S3 read-ahead window.
-[[example]]
-name = "measure_read_sizes"
-required-features = ["fuse-t"]
-
 [build-dependencies]
 cc = { workspace = true }
 pkg-config = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }
-# The volume traits are async and object-safe at once, which native `async fn` in
-# traits is not — so their futures are boxed. Unconditional: those traits are the
-# volume half's spine, not something a feature turns on.
-async-trait = { workspace = true }
 # The console wire. The protocol's shape needs a *self-describing* codec — `params`
 # and `result` are typed by a method that may arrive after them, and `result` xor
 # `error` is decided by which member is present — and BSON is the self-describing
@@ -38,24 +19,22 @@ bson = { workspace = true }
 futures-core = { workspace = true }
 fuser = { workspace = true, optional = true }
 libc = { workspace = true, optional = true }
-msb_krun = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-tempfile = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "process", "rt", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-# No *binding* by default. The crate's own layers — `Mountable`, `Workspace`, the
+# No *binding* by default. The crate's own layers — `FileSystem`, `WorkFs`, the
 # inode bookkeeping, the console — need nothing, and each interface binding brings
-# a heavy dependency: enabling any by default charges every consumer for it. A
-# consumer that mounts over HTTP has no reason to compile a hypervisor.
+# a libfuse provider with it: enabling one by default charges every consumer for
+# it. A consumer that mounts over HTTP has no reason to link libfuse.
 #
 # Count them with
 #
@@ -68,9 +47,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # unconditional build-deps `cc`/`pkg-config` are not counted.
 #
 # The numbers themselves are deliberately not written down: they go stale on every
-# dependency bump, and the conclusion does not depend on what they are — `krun`
-# brings the whole VMM tree (vmm, devices, hvf, kernel, arch) and `s3` the HTTP
-# and TLS stack under `object_store`, whatever this month's count is.
+# dependency bump, and the conclusion does not depend on what they are — `fuse`
+# brings a libfuse provider and `s3` the whole HTTP and TLS stack under
+# `object_store`, whatever this month's count is.
 #
 # Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
 # because a binding's tests only exist when its feature is on. No default set fixes
@@ -78,10 +57,10 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # every binding. Full coverage is a sweep:
 #
 #   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
-#   for f in "" "--features krun" "--features fuse" "--features fuse-t" \
+#   for f in "" "--features fuse" "--features fuse-t" \
 #            "--features fuse-no-mount" "--features s3" "--features notion" \
 #            "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,krun,s3,notion"; do cargo test -p cortex $f --all-targets; done
+#            "--features fuse,fuse-t,s3,notion"; do cargo test -p cortex $f --all-targets; done
 #
 # Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
 # unquoted expansion — under zsh pass the flags as separate arguments.
@@ -89,20 +68,11 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Editors default to no features too, so a binding shows as inactive code until
 # its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
 default = []
-# Every binding below also asks for `tokio/rt-multi-thread` and `tokio/net`: a
-# binding is a *synchronous* callback over async backends, so it blocks on one
-# process-wide runtime (`volume::adapter::block_on`), and `Builder::enable_all` is
+# Both bindings below also ask for `tokio/rt-multi-thread` and `tokio/net`: a
+# binding is a *synchronous* callback over async stores, so it blocks on one
+# process-wide runtime (`fs::mounts::block_on`), and `Builder::enable_all` is
 # cfg'd on `net` and `time` — built without them the runtime silently has no I/O
 # driver. `time` is already in the base set the console asks for.
-#
-# Boot microVMs directly on msb_krun and attach cortex filesystems to the guest.
-krun = [
-    "dep:msb_krun",
-    "dep:libc",
-    "dep:tempfile",
-    "tokio/net",
-    "tokio/rt-multi-thread",
-]
 # Mount a cortex filesystem on the host through FUSE.
 #
 # Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
@@ -121,7 +91,7 @@ fuse = ["dep:fuser", "dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # who drives the session: `fuser` reads the FUSE protocol off the mount fd
 # itself, while FUSE-T hands back a socket to its own helper and expects to drive
 # the filesystem through libfuse-t's loop. Enabling both at once is fine — they
-# are independent call surfaces over the same `PosixFs`.
+# are independent call surfaces over the same `Posix`.
 fuse-t = ["dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # Compile and unit-test the FUSE adapter with no libfuse provider installed:
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.
