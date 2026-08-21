@@ -12,6 +12,7 @@
 use std::time::SystemTime;
 
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
+use std::time::UNIX_EPOCH;
 
 use super::{ConvKind, Conversation, Message};
 
@@ -70,7 +71,11 @@ pub(super) fn day_file(at: NaiveDate) -> String {
 /// Strict about width as well as value: `8` is not a name any listing produced, and taking it
 /// would give one month two paths — and two cache entries that never see each other.
 pub(super) fn month_of(year: &str, month: &str) -> Option<(i32, u32)> {
-    if year.len() != 4 || month.len() != 2 {
+    // Digits and nothing else. `str::parse` accepts a leading sign, so a two-byte `+2` would
+    // pass a width check and mean February — giving that month a second path no listing ever
+    // named, and a second cache entry that never sees the first.
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(year, 4) || !digits(month, 2) {
         return None;
     }
     let (y, m) = (year.parse().ok()?, month.parse::<u32>().ok()?);
@@ -204,7 +209,22 @@ pub(super) fn sanitize(name: &str) -> String {
 
 /// The UTC day a timestamp falls in — the tree's bucketing rule, in one place.
 pub(super) fn day_of(ts: SystemTime) -> NaiveDate {
-    DateTime::<Utc>::from(ts).date_naive()
+    // Clamped, not unwrapped. `DateTime::<Utc>::from(SystemTime)` ends in a `timestamp_opt`
+    // that panics out of range, and every instant here came from a service's JSON — Slack's
+    // `created` is any `u64` it cares to send, and a `ts` is a string it parsed. A panic in
+    // `readdir` takes the whole mount down, so an absurd instant becomes an absurd *date* and
+    // the tree stays answerable.
+    let secs = match ts.duration_since(UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        // Before the epoch. No platform here reports one, and the tree only needs an ordering.
+        Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
+    };
+    let clamped = if secs < 0 {
+        DateTime::UNIX_EPOCH
+    } else {
+        DateTime::<Utc>::MAX_UTC
+    };
+    DateTime::from_timestamp(secs, 0).unwrap_or(clamped).date_naive()
 }
 
 #[cfg(test)]

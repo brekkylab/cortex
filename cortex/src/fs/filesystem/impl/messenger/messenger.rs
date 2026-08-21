@@ -373,7 +373,14 @@ impl<S: MessengerSource> MessengerFs<S> {
             {
                 threads.push(m.id.clone());
             }
-            files.extend(m.files.iter().cloned());
+            // By id, because one file shared into two messages of the same month arrives
+            // twice — and two entries of one name in a directory is a listing `ls` and `find`
+            // cannot make sense of.
+            for f in &m.files {
+                if !files.iter().any(|held: &FileRef| held.id == f.id) {
+                    files.push(f.clone());
+                }
+            }
         }
         Ok(Body {
             text: text.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
@@ -467,7 +474,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             // name it did not render — which is how a silent day is absent rather than zero
             // bytes, the same way `threads/` and `files/` are absent when empty.
             [f] if day.text.contains_key(f) => Ok(Node::Bytes(day.text[f].clone())),
-            [f] if f == FILES => Ok(Node::Dir),
+            [f] if f == FILES && !day.files.is_empty() => Ok(Node::Dir),
             [f, name] if f == FILES => {
                 let want = id_of(name);
                 let file = day
@@ -541,7 +548,10 @@ impl<S: MessengerSource> MessengerFs<S> {
                         // the conversation never reached, and a listing is not the only way in.
                         let month = self.month_if_present(&conv, y, m).await?;
                         match tail {
-                            [t] if t == THREADS => Ok(Node::Dir),
+                            // Gated for the reason the listing gates them: a directory that
+                            // is there and empty reads as a nothing that was asked about.
+                            // `stat` is a way in that no listing went through.
+                            [t] if t == THREADS && !month.threads.is_empty() => Ok(Node::Dir),
                             [t, name] if t == THREADS => {
                                 let root = MsgId(
                                     name.strip_suffix(JSONL)
@@ -899,7 +909,11 @@ fn today() -> NaiveDate {
 
 /// The year `seg` names, or `None` when it is not the four-digit name a listing writes.
 fn year_of(seg: &str) -> Option<i32> {
-    (seg.len() == 4).then(|| seg.parse().ok()).flatten()
+    // Digits only, for the reason `month_of` gives: `parse` takes a sign, and `+026` would be
+    // a second spelling of a year.
+    (seg.len() == 4 && seg.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| seg.parse().ok())
+        .flatten()
 }
 
 /// An errno-shaped failure with no message of its own.

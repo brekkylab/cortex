@@ -4,6 +4,7 @@
 //! the point of the file is that one rule serves both the listing and anything pointing back
 //! at it.
 
+use chrono::Datelike;
 use std::time::{Duration, UNIX_EPOCH};
 
 use super::*;
@@ -225,4 +226,63 @@ fn a_cut_does_not_leave_a_trailing_blank() {
 #[test]
 fn a_name_that_fits_is_left_alone() {
     assert_eq!(conv_dir(&conv("pricing", "C1", ConvKind::Channel)), "pricing__C1");
+}
+
+
+/// An instant no calendar has must not take the mount down.
+///
+/// `DateTime::<Utc>::from(SystemTime)` ends in a `timestamp_opt` that panics out of range, and
+/// every instant in this lane came from a service's JSON — Slack's `created` is any `u64` it
+/// cares to send. A panic in `readdir` is the whole mount, so an absurd instant has to become
+/// an absurd date instead.
+#[test]
+fn an_instant_off_the_calendar_does_not_panic() {
+    // Constructible but far past what a calendar has. `SystemTime` itself refuses a `Duration`
+    // that overflows it, so this is the widest a service's `u64` can actually reach.
+    for secs in [0, 1, 1_785_735_483, 9_999_999_999_999, 200_000_000_000_000] {
+        let d = day_of(at(secs));
+        assert!(d.year() >= 1970, "{secs} gave {d}");
+    }
+    // And before the epoch, which no platform here reports but the type permits.
+    let before = UNIX_EPOCH
+        .checked_sub(Duration::from_secs(9_999_999_999_999))
+        .expect("a pre-epoch instant");
+    assert!(day_of(before).year() <= 1970);
+}
+
+/// `parse` accepts a leading sign, so a two-byte `+2` would pass a width check and mean
+/// February — a second path for one month, and a second cache entry that never sees the first.
+#[test]
+fn a_signed_month_is_not_a_month() {
+    assert_eq!(month_of("2026", "08"), Some((2026, 8)));
+    for (y, m) in [
+        ("2026", "+8"),
+        ("2026", "+2"),
+        ("2026", "-2"),
+        ("+026", "08"),
+        ("-026", "08"),
+        ("2026", "8"),
+        ("2026", "008"),
+        ("26", "08"),
+        ("2026", "13"),
+        ("2026", "00"),
+        ("2026", " 8"),
+    ] {
+        assert_eq!(month_of(y, m), None, "{y}/{m} was accepted");
+    }
+}
+
+/// Every month between the two ends, inclusive, and nothing outside them.
+#[test]
+fn the_month_span_covers_both_ends_and_rolls_the_year() {
+    let d = |y, m, day| NaiveDate::from_ymd_opt(y, m, day).unwrap();
+    assert_eq!(months(d(2026, 8, 10), d(2026, 8, 21)), [(2026, 8)]);
+    assert_eq!(
+        months(d(2026, 11, 30), d(2027, 2, 1)),
+        [(2026, 11), (2026, 12), (2027, 1), (2027, 2)],
+        "December rolls into January"
+    );
+    // A conversation created after today has no months at all, which is what keeps a future
+    // `created` from inventing an axis.
+    assert!(months(d(2027, 1, 1), d(2026, 8, 21)).is_empty());
 }
