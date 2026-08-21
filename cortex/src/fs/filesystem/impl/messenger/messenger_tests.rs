@@ -319,42 +319,67 @@ async fn a_source_without_dms_has_no_dms_directory() {
 /// like a whole. Arithmetic over `created` reaches every day the conversation ever had, for
 /// nothing.
 #[tokio::test]
-async fn the_date_axis_is_a_calendar_and_costs_no_request() {
+async fn the_date_axis_costs_one_request_a_month() {
     let vol = two_days();
-    // The conversation listing is the only request any of this needs.
     vol.list(Path::new("/channels")).await.unwrap();
     let before = vol.source.calls.history.load(Ordering::SeqCst);
 
+    // Both levels above the month are arithmetic over `created`.
     let years = names(&vol.list(Path::new("/channels/pricing__C1")).await.unwrap());
     assert_eq!(years, ["2026"]);
     let months = names(&vol.list(Path::new("/channels/pricing__C1/2026")).await.unwrap());
     assert!(months.contains(&"08".to_string()), "{months:?}");
-    let days = names(&vol.list(Path::new("/channels/pricing__C1/2026/08")).await.unwrap());
-
-    // Created on the 5th, so the 5th is the first day and the 11th — silent — is there too.
-    assert!(days.contains(&"05".to_string()), "{days:?}");
-    assert!(days.contains(&"11".to_string()), "a silent day is still a day");
-    assert!(!days.contains(&"04".to_string()), "nothing before it existed");
-
     assert_eq!(
         vol.source.calls.history.load(Ordering::SeqCst),
         before,
-        "three listings, no history call"
+        "a year and its months are known without asking"
+    );
+
+    // The month is the one request, and it buys every day in it.
+    let days = names(&vol.list(Path::new("/channels/pricing__C1/2026/08")).await.unwrap());
+    assert_eq!(days, ["2026-08-10.jsonl", "2026-08-12.jsonl"]);
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before + 1,
+        "one month, one call"
+    );
+
+    // And reading either of them adds nothing.
+    let mut buf = vec![0u8; 512];
+    for d in ["2026-08-10", "2026-08-12"] {
+        let p = format!("/channels/pricing__C1/2026/08/{d}.jsonl");
+        assert!(vol.read_at(Path::new(&p), &mut buf, 0).await.unwrap() > 0);
+    }
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before + 1,
+        "the days were bought by the request that named them"
     );
 }
 
-/// A silent day inside the span is a real day that is empty, and finding out costs the one
-/// request that reads it. That is the calendar's price, paid where the reader asked rather than
-/// on every listing.
+/// A silent day has no file at all — not a zero-byte one.
+///
+/// The month was fetched, so which days have anything is knowledge rather than a guess, and a
+/// name with nothing behind it is what `grep -r` would open for no reason. Same rule as
+/// `threads/` and `files/`, which are absent when empty rather than there and empty.
 #[tokio::test]
-async fn a_silent_day_is_served_empty() {
+async fn a_silent_day_has_no_file() {
     let vol = two_days();
-    let p = Path::new("/channels/pricing__C1/2026/08/11/chat.jsonl");
-    let stat = vol.stat(p).await.expect("the day exists");
-    assert_eq!(stat.size, 0, "nothing was said that day");
-
-    let mut buf = vec![0u8; 64];
-    assert_eq!(vol.read_at(p, &mut buf, 0).await.unwrap(), 0);
+    let month = Path::new("/channels/pricing__C1/2026/08");
+    assert_eq!(
+        names(&vol.list(month).await.unwrap()),
+        ["2026-08-10.jsonl", "2026-08-12.jsonl"],
+        "the 11th is between two days that have messages and is not named"
+    );
+    assert!(matches!(
+        vol.stat(&month.join("2026-08-11.jsonl")).await,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    ));
+    // Nor does a day from another month resolve inside this one.
+    assert!(matches!(
+        vol.stat(&month.join("2026-09-01.jsonl")).await,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    ));
 }
 
 /// Outside the span there is nothing to fetch, and no request is spent saying so. The bottom is
@@ -364,7 +389,7 @@ async fn a_day_before_the_conversation_existed_costs_no_request() {
     let vol = two_days();
     let before = vol.source.calls.history.load(Ordering::SeqCst);
     for path in [
-        "/channels/pricing__C1/2026/08/04", // one day before `created`
+        "/channels/pricing__C1/2026/07",  // the month before `created`
         "/channels/pricing__C1/2025",       // a year before it
         "/channels/pricing__C1/2026/07",    // a month before it
     ] {
@@ -385,7 +410,7 @@ async fn a_day_before_the_conversation_existed_costs_no_request() {
 #[tokio::test]
 async fn a_day_serves_its_messages_one_per_line() {
     let vol = two_days();
-    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
     let stat = vol.stat(p).await.unwrap();
     let mut buf = vec![0u8; stat.size as usize];
     vol.read_at(p, &mut buf, 0).await.unwrap();
@@ -404,11 +429,15 @@ async fn a_day_serves_its_messages_one_per_line() {
 async fn empty_subdirectories_are_not_synthesized() {
     let vol = two_days();
     let day = names(
-        &vol.list(Path::new("/channels/pricing__C1/2026/08/10"))
+        &vol.list(Path::new("/channels/pricing__C1/2026/08"))
             .await
             .unwrap(),
     );
-    assert_eq!(day, ["chat.jsonl"], "no threads and no files that day");
+    assert_eq!(
+        day,
+        ["2026-08-10.jsonl", "2026-08-12.jsonl"],
+        "no threads and no files that month"
+    );
 
     // With a thread and an attachment, both appear.
     let mut root = msg("100", D10 + 200, "let's discuss");
@@ -435,31 +464,32 @@ async fn empty_subdirectories_are_not_synthesized() {
     )];
     let vol = MessengerFs::new(src);
     let day = names(
-        &vol.list(Path::new("/channels/pricing__C1/2026/08/10"))
+        &vol.list(Path::new("/channels/pricing__C1/2026/08"))
             .await
             .unwrap(),
     );
-    assert_eq!(day, ["chat.jsonl", "files", "threads"]);
+    assert_eq!(day, ["2026-08-10.jsonl", "files", "threads"]);
 
-    // A thread is the same shape as a day.
-    let t = names(
-        &vol.list(Path::new("/channels/pricing__C1/2026/08/10/threads/100"))
-            .await
-            .unwrap(),
-    );
-    assert_eq!(t, ["chat.jsonl"]);
+    // A thread is a file, not a directory: it has no sub-scopes of its own, and its
+    // attachments are the month's.
     assert_eq!(
         names(
-            &vol.list(Path::new("/channels/pricing__C1/2026/08/10/threads"))
+            &vol.list(Path::new("/channels/pricing__C1/2026/08/threads"))
                 .await
                 .unwrap()
         ),
-        ["100"]
+        ["100.jsonl"]
     );
+    let t = Path::new("/channels/pricing__C1/2026/08/threads/100.jsonl");
+    assert_eq!(vol.stat(t).await.unwrap().kind, DirentKind::File);
+    assert!(matches!(
+        vol.list(t).await,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotADirectory
+    ));
     // And the attachment is served at its listed length.
     let s = vol
         .stat(Path::new(
-            "/channels/pricing__C1/2026/08/10/files/report.pdf__F1",
+            "/channels/pricing__C1/2026/08/files/report.pdf__F1",
         ))
         .await
         .unwrap();
@@ -491,14 +521,13 @@ async fn an_unreadable_conversation_is_empty_rather_than_broken() {
         names(&vol.list(Path::new("/channels/secret__C2")).await.unwrap()),
         ["2026"]
     );
-    let denied = Path::new("/channels/secret__C2/2026/08/10/chat.jsonl");
-    assert_eq!(
-        vol.stat(denied).await.expect("the day is a day").size,
-        0,
+    let denied = Path::new("/channels/secret__C2/2026/08");
+    assert!(
+        vol.list(denied).await.expect("a day of it still lists").is_empty(),
         "one unreadable conversation is empty, not broken"
     );
     // The readable one is unaffected, which is the whole point.
-    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
     assert!(vol.stat(p).await.unwrap().size > 0);
 }
 
@@ -534,7 +563,7 @@ async fn a_name_with_a_separator_stays_one_component() {
 #[tokio::test]
 async fn every_write_is_refused_as_read_only() {
     let vol = two_days();
-    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
     assert!(read_only(vol.mkdir(p).await.err()));
     assert!(read_only(vol.unlink(p).await.err()));
     assert!(read_only(vol.rmdir(p).await.err()));
@@ -555,7 +584,7 @@ async fn a_directory_and_a_file_are_not_interchangeable() {
     );
     assert_eq!(
         kind_of(
-            vol.list(Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl"))
+            vol.list(Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl"))
                 .await
                 .err()
         ),
@@ -568,7 +597,7 @@ async fn a_directory_and_a_file_are_not_interchangeable() {
 #[tokio::test]
 async fn a_stat_and_an_open_share_one_request() {
     let vol = two_days();
-    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
     vol.stat(p).await.unwrap();
     let after_stat = vol.source.calls.history.load(Ordering::SeqCst);
     vol.read_at(p, &mut [0u8; 1], 0).await.unwrap();
@@ -594,7 +623,7 @@ async fn an_author_id_is_resolved_to_a_name() {
     }];
     let vol = MessengerFs::new(src);
 
-    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
     let stat = vol.stat(p).await.unwrap();
     let mut buf = vec![0u8; stat.size as usize];
     vol.read_at(p, &mut buf, 0).await.unwrap();
@@ -621,7 +650,7 @@ fn with_attachment(size: u64) -> MessengerFs<TestSource> {
     ))
 }
 
-const ATTACHMENT: &str = "/channels/pricing__C1/2026/08/10/files/doc.bin__F1";
+const ATTACHMENT: &str = "/channels/pricing__C1/2026/08/files/doc.bin__F1";
 
 /// Read `len` bytes of the attachment at `offset`.
 async fn read_bytes(vol: &MessengerFs<TestSource>, offset: u64, len: usize) -> Vec<u8> {
@@ -883,7 +912,7 @@ async fn a_held_small_file_never_answers_for_another_path() {
     let mut chat = vec![0u8; 64];
     let n = vol
         .read_at(
-            Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl"),
+            Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl"),
             &mut chat,
             0,
         )
@@ -923,7 +952,7 @@ async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
         "the name the listing gave has to be the name that opens",
     ));
     assert_eq!(years, ["2026"]);
-    let chat = root.join("2026/08/10/chat.jsonl");
+    let chat = root.join("2026/08/2026-08-10.jsonl");
     let mut buf = vec![0u8; 512];
     let n = vol
         .read_at(&chat, &mut buf, 0)
@@ -938,14 +967,19 @@ async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
 // ---- what a mount is allowed to spend --------------------------------------------------
 
 /// Two days of one channel, each with a message long enough to measure.
-fn two_fat_days(limits: MessengerLimits) -> MessengerFs<TestSource> {
+/// Two *months* of one channel, each with a message long enough to measure.
+///
+/// Months and not days, because a month is what one `history` call buys and therefore what the
+/// budget accounts for: the days inside one arrive together and are evicted together. A fixture
+/// of two days in one month would be a single entry, and nothing to evict.
+fn two_fat_months(limits: MessengerLimits) -> MessengerFs<TestSource> {
     let body = "x".repeat(400);
     MessengerFs::with_limits(
         TestSource::new(
-            vec![conv("C1", "pricing", ConvKind::Channel)],
+            vec![conv_born("C1", "pricing", ConvKind::Channel, D10 - 40 * DAY)],
             vec![
                 (ConvId("C1".into()), msg("1", D10 + 100, &body)),
-                (ConvId("C1".into()), msg("2", D10 + 2 * DAY, &body)),
+                (ConvId("C1".into()), msg("2", D10 - 35 * DAY, &body)),
             ],
         ),
         limits,
@@ -966,9 +1000,10 @@ fn the_default_limits_are_the_numbers_this_lane_chose() {
 /// A budget that fits both days keeps both: coming back to the first costs nothing.
 #[tokio::test]
 async fn a_day_within_the_budget_is_still_held() {
-    let vol = two_fat_days(MessengerLimits::default());
-    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
-    let twelve = Path::new("/channels/pricing__C1/2026/08/12/chat.jsonl");
+    let vol = two_fat_months(MessengerLimits::default());
+    // D10 is 2026-08-10 and D10 - 35 days is 2026-07-06.
+    let ten = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026/07/2026-07-06.jsonl");
 
     vol.stat(ten).await.unwrap();
     vol.stat(twelve).await.unwrap();
@@ -986,13 +1021,14 @@ async fn a_day_within_the_budget_is_still_held() {
 /// again. That is the trade the number buys: memory against round trips.
 #[tokio::test]
 async fn past_the_text_budget_the_least_recently_used_day_goes() {
-    let vol = two_fat_days(MessengerLimits {
+    let vol = two_fat_months(MessengerLimits {
         // Room for one of these days and not two.
         text_budget: 600,
         ..Default::default()
     });
-    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
-    let twelve = Path::new("/channels/pricing__C1/2026/08/12/chat.jsonl");
+    // D10 is 2026-08-10 and D10 - 35 days is 2026-07-06.
+    let ten = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026/07/2026-07-06.jsonl");
 
     vol.stat(ten).await.unwrap();
     vol.stat(twelve).await.unwrap();
@@ -1010,12 +1046,13 @@ async fn past_the_text_budget_the_least_recently_used_day_goes() {
 /// passed through once, whichever arrived first.
 #[tokio::test]
 async fn a_day_that_keeps_being_read_outlives_one_that_does_not() {
-    let vol = two_fat_days(MessengerLimits {
+    let vol = two_fat_months(MessengerLimits {
         text_budget: 600,
         ..Default::default()
     });
-    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
-    let twelve = Path::new("/channels/pricing__C1/2026/08/12/chat.jsonl");
+    // D10 is 2026-08-10 and D10 - 35 days is 2026-07-06.
+    let ten = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026/07/2026-07-06.jsonl");
 
     vol.stat(ten).await.unwrap();
     vol.stat(ten).await.unwrap(); // touched again: now the most recent
@@ -1035,11 +1072,11 @@ async fn a_day_that_keeps_being_read_outlives_one_that_does_not() {
 /// attachment window exists to avoid, paid by text instead.
 #[tokio::test]
 async fn one_day_bigger_than_the_budget_is_still_held_while_it_is_read() {
-    let vol = two_fat_days(MessengerLimits {
+    let vol = two_fat_months(MessengerLimits {
         text_budget: 10,
         ..Default::default()
     });
-    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let ten = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
 
     vol.stat(ten).await.unwrap();
     let before = vol.source.calls.history.load(Ordering::SeqCst);

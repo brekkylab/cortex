@@ -77,9 +77,9 @@ fn a_kind_picks_its_section() {
 #[test]
 fn a_day_directory_is_the_utc_day() {
     // 2026-08-03T23:00:00Z — still the 3rd in UTC, already the 4th in Seoul.
-    assert_eq!(day_dir(at(1_785_798_000)), "2026/08/03");
+    assert_eq!(day_dir(at(1_785_798_000)), "2026/08");
     // One hour later crosses midnight UTC.
-    assert_eq!(day_dir(at(1_785_801_600)), "2026/08/04");
+    assert_eq!(day_dir(at(1_785_801_600)), "2026/08");
 }
 
 #[test]
@@ -87,7 +87,7 @@ fn a_message_posted_to_the_conversation_is_in_the_days_own_file() {
     let c = conv("pricing", "C1", ConvKind::Channel);
     assert_eq!(
         chat_path(&c, &msg(1_785_737_875, None), at(1_785_737_875)),
-        "channels/pricing__C1/2026/08/03/chat.jsonl"
+        "channels/pricing__C1/2026/08/2026-08-03.jsonl"
     );
 }
 
@@ -105,7 +105,7 @@ fn a_thread_root_is_still_in_the_days_own_file() {
     );
     assert_eq!(
         chat_path(&c, &root, at(1_785_737_875)),
-        "channels/pricing__C1/2026/08/03/chat.jsonl"
+        "channels/pricing__C1/2026/08/2026-08-03.jsonl"
     );
 }
 
@@ -123,7 +123,7 @@ fn a_reply_is_under_its_roots_day_and_not_its_own() {
     );
     assert_eq!(
         chat_path(&c, &reply, at(1_785_737_875)),
-        "channels/pricing__C1/2026/08/03/threads/1785737875.341929/chat.jsonl",
+        "channels/pricing__C1/2026/08/threads/1785737875.341929.jsonl",
         "the thread's day, not the reply's"
     );
 }
@@ -133,7 +133,7 @@ fn a_dm_lands_in_the_dms_section() {
     let c = conv("김철수", "D1", ConvKind::Dm);
     assert_eq!(
         chat_path(&c, &msg(1_785_737_875, None), at(1_785_737_875)),
-        "dms/김철수__D1/2026/08/03/chat.jsonl"
+        "dms/김철수__D1/2026/08/2026-08-03.jsonl"
     );
 }
 

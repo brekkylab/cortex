@@ -48,7 +48,7 @@
 //! timestamp and replies are not in it, and scanning every day for late replies is the cost
 //! the bounded walk exists to avoid.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -58,8 +58,8 @@ use chrono::{NaiveDate, TimeZone, Utc};
 
 use super::limits::MessengerLimits;
 use super::paths::{
-    CHANNELS, CHAT, DMS, FILES, THREADS, USERS, conv_dir, date_of, day_of, days, entry, months,
-    pad2, year_dir, years,
+    CHANNELS, DMS, FILES, JSONL, THREADS, USERS, conv_dir, day_file, day_of, entry,
+    month_dir, month_of, months, year_dir,
 };
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
 use super::{User, render_line};
@@ -94,13 +94,25 @@ impl<T> Cached<T> {
 /// The three fields arrive together and are read separately, which is the reason this is one
 /// cache entry and not three: `ls` of a day, `ls` of its `threads/`, `ls` of its `files/` and
 /// `cat chat.jsonl` are four operations over one request.
-struct Day {
-    /// `chat.jsonl`'s bytes, already rendered.
-    chat: Arc<Vec<u8>>,
-    /// Roots that have replies — the `threads/` listing.
+struct Body {
+    /// Rendered lines, by the file name each is served under.
+    ///
+    /// A month has one entry per day that has anything — which is why a silent day is not a
+    /// name in the listing rather than a name with nothing behind it. A thread has exactly one,
+    /// under `<root>.jsonl`. Resolving a file is a lookup in here, whichever scope it is.
+    text: BTreeMap<String, Arc<Vec<u8>>>,
+    /// Roots that have replies — the month's `threads/` listing. Empty for a thread.
     threads: Vec<MsgId>,
-    /// Attachments posted that day.
+    /// Attachments posted in the month. Empty for a thread, whose attachments are the month's:
+    /// one `files/` per month rather than the same file under a day and again under a thread.
     files: Vec<FileRef>,
+}
+
+impl Body {
+    /// What the budget counts, which is every byte held.
+    fn weight(&self) -> u64 {
+        self.text.values().map(|t| t.len() as u64).sum()
+    }
 }
 
 #[derive(Default)]
@@ -136,13 +148,14 @@ struct Cache {
 /// spellings of one day must not become two entries.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Scope {
-    Day(ConvId, NaiveDate),
+    /// One `history` call's worth: a month of a conversation.
+    Month(ConvId, i32, u32),
     Thread(ConvId, MsgId),
 }
 
 /// A held scope, with what eviction needs to know about it.
 struct Held {
-    day: Arc<Day>,
+    body: Arc<Body>,
     at: Instant,
     /// The clock value of its last use. Eviction takes the smallest.
     used: u64,
@@ -186,7 +199,7 @@ impl<S: MessengerSource> MessengerFs<S> {
     ///
     /// Touching it on the way out is what makes the eviction order *recency* and not insertion:
     /// the day a reader keeps coming back to outlives the one they passed through once.
-    fn held(&self, scope: &Scope) -> Option<Arc<Day>> {
+    fn held(&self, scope: &Scope) -> Option<Arc<Body>> {
         let mut cache = self.cache.lock().unwrap();
         let clock = cache.clock + 1;
         let entry = cache.text.get_mut(scope)?;
@@ -194,9 +207,9 @@ impl<S: MessengerSource> MessengerFs<S> {
             return None;
         }
         entry.used = clock;
-        let day = entry.day.clone();
+        let body = entry.body.clone();
         cache.clock = clock;
-        Some(day)
+        Some(body)
     }
 
     /// Hold an assembled scope, dropping the least recently used until the budget is met.
@@ -208,21 +221,21 @@ impl<S: MessengerSource> MessengerFs<S> {
     /// Never the entry just held, and not by a special case: it was touched last, so it has the
     /// highest stamp. That is what leaves a single day larger than the whole budget in place
     /// while it is being read, rather than refetching it for every chunk a kernel asks for.
-    fn hold(&self, scope: Scope, day: Arc<Day>) {
-        let weight = day.chat.len() as u64;
+    fn hold(&self, scope: Scope, body: Arc<Body>) {
+        let weight = body.weight();
         let mut cache = self.cache.lock().unwrap();
         cache.clock += 1;
         let used = cache.clock;
         let replaced = cache.text.insert(
             scope,
             Held {
-                day,
+                body,
                 at: Instant::now(),
                 used,
             },
         );
         if let Some(old) = replaced {
-            cache.text_bytes -= old.day.chat.len() as u64;
+            cache.text_bytes -= old.body.weight();
         }
         cache.text_bytes += weight;
 
@@ -236,7 +249,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                 break;
             };
             if let Some(gone) = cache.text.remove(&victim) {
-                cache.text_bytes -= gone.day.chat.len() as u64;
+                cache.text_bytes -= gone.body.weight();
             }
         }
     }
@@ -275,28 +288,36 @@ impl<S: MessengerSource> MessengerFs<S> {
         Ok(users)
     }
 
-    async fn day(&self, conv: &ConvId, date: NaiveDate) -> io::Result<Arc<Day>> {
-        let key = Scope::Day(conv.clone(), date);
-        if let Some(day) = self.held(&key) {
-            return Ok(day);
+    /// A month, which is the one request the date axis costs.
+    ///
+    /// What comes back is partitioned into a file per day that has anything — so the days are
+    /// bought by the same request that named the month, and reading any of them afterwards is
+    /// free. Fetching a day at a time would ask once per day to learn the same thing, and most
+    /// days in most conversations have nothing to learn.
+    async fn month(&self, conv: &ConvId, year: i32, month: u32) -> io::Result<Arc<Body>> {
+        let key = Scope::Month(conv.clone(), year, month);
+        if let Some(body) = self.held(&key) {
+            return Ok(body);
         }
-        let msgs = match self.source.history(conv, window_of(date)).await {
+        let msgs = match self.source.history(conv, window_of(year, month)).await {
             Ok((msgs, _truncated)) => msgs,
             Err(e) if e.is_conversation_denied() => Vec::new(),
             Err(e) => return Err(e.into()),
         };
-        let day = Arc::new(self.assemble(&msgs).await?);
-        self.hold(key, day.clone());
-        Ok(day)
+        let body = Arc::new(self.assemble(&msgs, None).await?);
+        self.hold(key, body.clone());
+        Ok(body)
     }
 
-    /// One thread, which is [`Scope`]-identical to a day: same files, same `chat.jsonl`.
+    /// One thread, served as the single file `threads/<root>.jsonl`.
     ///
-    /// [`Scope`]: Day
-    async fn thread(&self, conv: &ConvId, root: &MsgId) -> io::Result<Arc<Day>> {
+    /// A file and not a directory, unlike the day it hangs under: a thread has no sub-scopes of
+    /// its own, and its attachments are the month's — one `files/` rather than the same
+    /// attachment under a day and again under the thread that carried it.
+    async fn thread(&self, conv: &ConvId, root: &MsgId) -> io::Result<Arc<Body>> {
         let key = Scope::Thread(conv.clone(), root.clone());
-        if let Some(day) = self.held(&key) {
-            return Ok(day);
+        if let Some(body) = self.held(&key) {
+            return Ok(body);
         }
         let msgs = match self.source.thread(conv, root).await {
             Ok((msgs, _truncated)) => msgs,
@@ -306,15 +327,20 @@ impl<S: MessengerSource> MessengerFs<S> {
         if msgs.is_empty() {
             return Err(io_err(io::ErrorKind::NotFound));
         }
-        let day = Arc::new(self.assemble(&msgs).await?);
-        self.hold(key, day.clone());
-        Ok(day)
+        let name = format!("{}{JSONL}", root.0);
+        let body = Arc::new(self.assemble(&msgs, Some(name)).await?);
+        self.hold(key, body.clone());
+        Ok(body)
     }
 
-    /// Render a run of messages into the three things a directory serves.
-    async fn assemble(&self, msgs: &[super::Message]) -> io::Result<Day> {
-        // Names resolved once for the whole run rather than per line: the directory is one
-        // call and a line without a name is a line nobody can `grep` for by person.
+    /// Render a run of messages into what a scope serves.
+    ///
+    /// `as_one` names the single file everything goes into, which is what a thread wants. Left
+    /// out, the run is partitioned by the UTC day each message falls in — a month's own shape,
+    /// and the reason a day file exists only for a day that has one.
+    async fn assemble(&self, msgs: &[super::Message], as_one: Option<String>) -> io::Result<Body> {
+        // Names resolved once for the whole run rather than per line: the roster is one call
+        // and a line without a name is a line nobody can `grep` for by person.
         let by_id: HashMap<String, String> = self
             .users()
             .await
@@ -323,7 +349,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             .map(|u| (u.id, u.name))
             .collect();
 
-        let mut chat = Vec::new();
+        let mut text: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut threads = Vec::new();
         let mut files = Vec::new();
         for m in msgs {
@@ -333,7 +359,12 @@ impl<S: MessengerSource> MessengerFs<S> {
             {
                 m.from.name = Some(n.clone());
             }
-            chat.extend_from_slice(&render_line(&m));
+            let into = as_one
+                .clone()
+                .unwrap_or_else(|| day_file(day_of(m.ts)));
+            text.entry(into)
+                .or_default()
+                .extend_from_slice(&render_line(&m));
             // A root with replies, which is what `threads/` lists. A reply names its root and
             // is not itself one.
             if let Some(t) = &m.thread
@@ -344,10 +375,10 @@ impl<S: MessengerSource> MessengerFs<S> {
             }
             files.extend(m.files.iter().cloned());
         }
-        Ok(Day {
-            chat: Arc::new(chat),
-            threads,
-            files,
+        Ok(Body {
+            text: text.into_iter().map(|(k, v)| (k, Arc::new(v))).collect(),
+            threads: if as_one.is_some() { Vec::new() } else { threads },
+            files: if as_one.is_some() { Vec::new() } else { files },
         })
     }
 
@@ -378,17 +409,23 @@ impl<S: MessengerSource> MessengerFs<S> {
         self.conv_at(kind, dir).await
     }
 
-    /// The day `date` names, or `NotFound` when it is not a day this conversation has.
+    /// The month `seg` names, or `NotFound` when the conversation never reached it.
     ///
-    /// "Has" is the calendar: from the day it was created to today. Outside that there is
-    /// nothing to fetch and no request is spent finding out. Inside it, an empty day is a real
-    /// day that happens to be empty — the directory is there because the day was, and its
-    /// `chat.jsonl` is zero bytes.
-    async fn day_if_present(&self, conv: &Conversation, date: NaiveDate) -> io::Result<Arc<Day>> {
-        if date < day_of(conv.created) || date > today() {
+    /// "Reached" is the calendar: from the month it was created in to this one. Outside that
+    /// there is nothing to fetch and no request is spent finding out. Inside it, a month
+    /// nothing was said in is a real month that is empty — the directory is there because the
+    /// month was, and it lists nothing.
+    async fn month_if_present(
+        &self,
+        conv: &Conversation,
+        y: &str,
+        m: &str,
+    ) -> io::Result<Arc<Body>> {
+        let (year, month) = month_of(y, m).ok_or(io_err(io::ErrorKind::NotFound))?;
+        if !months(day_of(conv.created), today()).contains(&(year, month)) {
             return Err(io_err(io::ErrorKind::NotFound));
         }
-        self.day(&conv.id, date).await
+        self.month(&conv.id, year, month).await
     }
 
     /// The sections this source actually has. `dms/` is absent rather than empty when the
@@ -419,10 +456,17 @@ impl<S: MessengerSource> MessengerFs<S> {
 
     /// Resolve everything below a day or thread directory: the shared tail of both, since a
     /// thread is the same shape as a day.
-    async fn within(&self, day: Arc<Day>, rest: &[String]) -> io::Result<Node> {
+    async fn within(&self, day: Arc<Body>, rest: &[String]) -> io::Result<Node> {
         match rest {
             [] => Ok(Node::Dir),
-            [f] if f == CHAT => Ok(Node::Bytes(day.chat.clone())),
+            // Absent on a day nothing was said, for the reason `threads/` and `files/` are:
+            // a nothing that is *there* reads as a nothing that was asked about. The day
+            // itself is a directory because the day existed; the file is the messages, and
+            // there are none.
+            // A file is whatever the scope rendered under that name. Nothing is served for a
+            // name it did not render — which is how a silent day is absent rather than zero
+            // bytes, the same way `threads/` and `files/` are absent when empty.
+            [f] if day.text.contains_key(f) => Ok(Node::Bytes(day.text[f].clone())),
             [f] if f == FILES => Ok(Node::Dir),
             [f, name] if f == FILES => {
                 let want = id_of(name);
@@ -477,28 +521,40 @@ impl<S: MessengerSource> MessengerFs<S> {
                 let conv = self.conv_at(kind, conv_dir).await?;
                 match rest {
                     // Each level is checked on the way down: `stat` has to refuse a year the
-                    // conversation never had, and a listing is not the only way in.
                     [] => Ok(Node::Dir),
-                    [y] => year_in(y, &conv).map(|_| Node::Dir),
-                    [y, m] => {
-                        let year = year_in(y, &conv)?;
-                        month_in(m, year, &conv).map(|_| Node::Dir)
+                    // A year on its own, refused unless the conversation reached it. Checked
+                    // here because `stat` is a way in that no listing went through.
+                    [y] => {
+                        let ok = year_of(y).is_some_and(|year| {
+                            months(day_of(conv.created), today())
+                                .iter()
+                                .any(|(yy, _)| *yy == year)
+                        });
+                        if ok {
+                            Ok(Node::Dir)
+                        } else {
+                            Err(io_err(io::ErrorKind::NotFound))
+                        }
                     }
-                    [y, m, d, tail @ ..] => {
-                        let date =
-                            date_of(y, m, d).ok_or(io_err(io::ErrorKind::NotFound))?;
-                        let day = self.day_if_present(&conv, date).await?;
+                    [y, m, tail @ ..] => {
+                        // The month is checked before it is fetched: `stat` has to refuse one
+                        // the conversation never reached, and a listing is not the only way in.
+                        let month = self.month_if_present(&conv, y, m).await?;
                         match tail {
                             [t] if t == THREADS => Ok(Node::Dir),
-                            [t, root, within @ ..] if t == THREADS => {
-                                let root = MsgId(root.clone());
-                                if !day.threads.contains(&root) {
+                            [t, name] if t == THREADS => {
+                                let root = MsgId(
+                                    name.strip_suffix(JSONL)
+                                        .ok_or(io_err(io::ErrorKind::NotFound))?
+                                        .to_string(),
+                                );
+                                if !month.threads.contains(&root) {
                                     return Err(io_err(io::ErrorKind::NotFound));
                                 }
                                 let thread = self.thread(&conv.id, &root).await?;
-                                self.within(thread, within).await
+                                self.within(thread, std::slice::from_ref(name)).await
                             }
-                            _ => self.within(day, tail).await,
+                            _ => self.within(month, tail).await,
                         }
                     }
                 }
@@ -539,11 +595,17 @@ impl<S: MessengerSource> MessengerFs<S> {
                     .collect())
             }
 
-            // The date axis, all three levels of it. Arithmetic over the conversation's own
-            // `created` — no request past the one that listed the conversation.
+            // The date axis. Arithmetic over the conversation's own `created` — no request
+            // past the one that listed the conversation, and never a window: every month the
+            // conversation ever had is here, whether or not anything was said in it.
             [s, cd] if self.section_kind(s).is_some() => {
                 let conv = self.conv_of(s, cd).await?;
-                Ok(years(day_of(conv.created), today())
+                let mut years: Vec<i32> = months(day_of(conv.created), today())
+                    .into_iter()
+                    .map(|(y, _)| y)
+                    .collect();
+                years.dedup();
+                Ok(years
                     .into_iter()
                     .map(|y| Dirent::new(year_dir(y), DirentKind::Dir))
                     .collect())
@@ -551,21 +613,16 @@ impl<S: MessengerSource> MessengerFs<S> {
 
             [s, cd, y] if self.section_kind(s).is_some() => {
                 let conv = self.conv_of(s, cd).await?;
-                let year = year_in(y, &conv)?;
-                Ok(months(year, day_of(conv.created), today())
+                let year = year_of(y).ok_or(io_err(io::ErrorKind::NotFound))?;
+                let listed: Vec<Dirent> = months(day_of(conv.created), today())
                     .into_iter()
-                    .map(|m| Dirent::new(pad2(m), DirentKind::Dir))
-                    .collect())
-            }
-
-            [s, cd, y, m] if self.section_kind(s).is_some() => {
-                let conv = self.conv_of(s, cd).await?;
-                let year = year_in(y, &conv)?;
-                let month = month_in(m, year, &conv)?;
-                Ok(days(year, month, day_of(conv.created), today())
-                    .into_iter()
-                    .map(|d| Dirent::new(pad2(d), DirentKind::Dir))
-                    .collect())
+                    .filter(|(yy, _)| *yy == year)
+                    .map(|(_, m)| Dirent::new(month_dir(m), DirentKind::Dir))
+                    .collect();
+                if listed.is_empty() {
+                    return Err(io_err(io::ErrorKind::NotFound));
+                }
+                Ok(listed)
             }
 
             _ => match self.resolve(path).await? {
@@ -641,57 +698,48 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
 }
 
 impl<S: MessengerSource> MessengerFs<S> {
-    /// Listings for the directories inside a day or a thread.
+    /// Listings for the directories inside a month.
+    ///
+    /// Three shapes and no recursion: the month itself, its `threads/`, its `files/`. A thread
+    /// is a file rather than a directory, so there is nothing below it to list.
     async fn list_dir(&self, segs: &[String]) -> io::Result<Vec<Dirent>> {
-        let (Some(s), Some(conv_dir)) = (segs.first(), segs.get(1)) else {
+        let (Some(s), Some(cd), Some(y), Some(m)) =
+            (segs.first(), segs.get(1), segs.get(2), segs.get(3))
+        else {
             return Err(io_err(io::ErrorKind::NotFound));
         };
-        let kind = self
-            .section_kind(s)
-            .ok_or(io_err(io::ErrorKind::NotFound))?;
-        let conv = self.conv_at(kind, conv_dir).await?;
-        let date = match segs.get(2..5) {
-            Some([y, m, d]) => date_of(y, m, d).ok_or(io_err(io::ErrorKind::NotFound))?,
-            _ => return Err(io_err(io::ErrorKind::NotFound)),
-        };
-        let day = self.day_if_present(&conv, date).await?;
+        let conv = self.conv_of(s, cd).await?;
+        let month = self.month_if_present(&conv, y, m).await?;
 
-        // A thread's own subdirectories reuse the day's shape, so resolve which scope this
-        // listing is inside before naming its entries.
-        let (scope, tail) = match &segs[5..] {
-            [t, root, rest @ ..] if t == THREADS => {
-                (self.thread(&conv.id, &MsgId(root.clone())).await?, rest)
-            }
-            rest => (day.clone(), rest),
-        };
-
-        match tail {
-            [] if segs.len() == 5 => {
-                // The day itself: chat.jsonl, plus whichever of the two directories has
-                // anything in it. An empty one would be a claim the tree cannot support.
-                let mut out = vec![Dirent::new(CHAT, DirentKind::File)];
-                if !scope.threads.is_empty() {
+        match &segs[4..] {
+            // A file per day that has anything, plus whichever of the two directories is
+            // non-empty. A day nothing was said on is not a name here — the month was fetched,
+            // so this is knowledge rather than a guess, and a name with nothing behind it is
+            // what `grep -r` would open for no reason.
+            [] => {
+                let mut out: Vec<Dirent> = month
+                    .text
+                    .keys()
+                    .map(|n| Dirent::new(n.clone(), DirentKind::File))
+                    .collect();
+                if !month.threads.is_empty() {
                     out.push(Dirent::new(THREADS, DirentKind::Dir));
                 }
-                if !scope.files.is_empty() {
+                if !month.files.is_empty() {
                     out.push(Dirent::new(FILES, DirentKind::Dir));
                 }
                 Ok(out)
             }
-            [t] if t == THREADS => Ok(day
+
+            [t] if t == THREADS => Ok(month
                 .threads
                 .iter()
-                .map(|r| Dirent::new(r.0.clone(), DirentKind::Dir))
+                .map(|r| Dirent::new(format!("{}{JSONL}", r.0), DirentKind::File))
                 .collect()),
-            [] => {
-                // A thread directory.
-                let mut out = vec![Dirent::new(CHAT, DirentKind::File)];
-                if !scope.files.is_empty() {
-                    out.push(Dirent::new(FILES, DirentKind::Dir));
-                }
-                Ok(out)
-            }
-            [f] if f == FILES => Ok(scope
+
+            // Sizes come from the listing that named these, so they cost nothing to include —
+            // which saves a caller an `lstat` per entry that a plain `ls` never asked for.
+            [f] if f == FILES => Ok(month
                 .files
                 .iter()
                 .map(|f| {
@@ -700,6 +748,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                     Dirent::with_stat(entry(&f.name, &f.id, ""), st)
                 })
                 .collect()),
+
             _ => Err(io_err(io::ErrorKind::NotFound)),
         }
     }
@@ -803,31 +852,11 @@ fn today() -> NaiveDate {
     Utc::now().date_naive()
 }
 
-/// The year `seg` names, refused unless it is one this conversation has.
-///
-/// Checked here rather than left to an empty listing: a year outside the span is not a year with
-/// nothing in it, and `NotFound` is what says so.
-fn year_in(seg: &str, conv: &Conversation) -> io::Result<i32> {
-    let year: i32 = (seg.len() == 4)
-        .then(|| seg.parse().ok())
-        .flatten()
-        .ok_or(io_err(io::ErrorKind::NotFound))?;
-    if !years(day_of(conv.created), today()).contains(&year) {
-        return Err(io_err(io::ErrorKind::NotFound));
-    }
-    Ok(year)
-}
 
-/// The month `seg` names within `year`, refused unless the conversation reaches it.
-fn month_in(seg: &str, year: i32, conv: &Conversation) -> io::Result<u32> {
-    let month: u32 = (seg.len() == 2)
-        .then(|| seg.parse().ok())
-        .flatten()
-        .ok_or(io_err(io::ErrorKind::NotFound))?;
-    if !months(year, day_of(conv.created), today()).contains(&month) {
-        return Err(io_err(io::ErrorKind::NotFound));
-    }
-    Ok(month)
+
+/// The year `seg` names, or `None` when it is not the four-digit name a listing writes.
+fn year_of(seg: &str) -> Option<i32> {
+    (seg.len() == 4).then(|| seg.parse().ok()).flatten()
 }
 
 /// An errno-shaped failure with no message of its own.
@@ -855,21 +884,23 @@ fn id_of(entry: &str) -> &str {
     entry.rsplit_once("__").map(|(_, id)| id).unwrap_or(entry)
 }
 
-/// The half-open span a date directory stands for.
-fn window_of(date: NaiveDate) -> Window {
-    let start = Utc
-        .from_utc_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight exists"))
-        .into();
-    let end = Utc
-        .from_utc_datetime(
-            &date
-                .succ_opt()
-                .expect("a date has a successor")
-                .and_hms_opt(0, 0, 0)
-                .expect("midnight exists"),
-        )
-        .into();
-    Window { start, end }
+/// The half-open span a month directory stands for.
+fn window_of(year: i32, month: u32) -> Window {
+    let first = NaiveDate::from_ymd_opt(year, month, 1).expect("a month has a first");
+    let next = if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+    }
+    .expect("a month has a next");
+    let at = |d: NaiveDate| {
+        Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight exists"))
+            .into()
+    };
+    Window {
+        start: at(first),
+        end: at(next),
+    }
 }
 
 #[cfg(test)]

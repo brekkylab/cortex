@@ -316,11 +316,9 @@ async fn the_workspace_opens_as_a_tree() {
     eprintln!("channels: {}", channels.len());
     assert!(!channels.is_empty(), "a workspace with no channels proves nothing");
 
-    // Down the date axis to a day that has something. Every level lists without a request,
-    // and the axis is a calendar — so the newest directories are usually empty and finding
-    // content is a search. What no fixture can check is that the *live* tree agrees with
-    // `paths.rs` about how these are spelled.
-    let mut probes = 0usize;
+    // Down the date axis. Years and months are arithmetic over `created`, so those two
+    // listings cost nothing; the month is the one request, and what it names is exactly the
+    // days that have something. No probing — which is the difference the axis was changed for.
     let mut found = None;
     'outer: for c in &channels {
         let conv = format!("/channels/{}", c.name);
@@ -328,41 +326,42 @@ async fn the_workspace_opens_as_a_tree() {
             assert_eq!(y.len(), 4, "a year is four digits, got {y:?}");
             for m in newest(&vol, &format!("{conv}/{y}")).await {
                 assert_eq!(m.len(), 2, "a month is two, got {m:?}");
-                for d in newest(&vol, &format!("{conv}/{y}/{m}")).await {
-                    if probes >= 60 {
-                        eprintln!("gave up after {probes} probes");
-                        break 'outer;
-                    }
-                    probes += 1;
-                    let at = format!("{conv}/{y}/{m}/{d}");
-                    let st = vol.stat(Path::new(&format!("{at}/chat.jsonl"))).await;
-                    if st.is_ok_and(|st| st.size > 0) {
-                        found = Some(at);
-                        break 'outer;
-                    }
+                let at = format!("{conv}/{y}/{m}");
+                let days: Vec<String> = newest(&vol, &at)
+                    .await
+                    .into_iter()
+                    .filter(|n| n.ends_with(".jsonl"))
+                    .collect();
+                if let Some(d) = days.first() {
+                    // The live tree has to agree with `paths.rs` about how this is spelled.
+                    assert!(
+                        d.starts_with(&format!("{y}-{m}-")),
+                        "a day file names its own month: {d:?} in {at}"
+                    );
+                    found = Some((conv.clone(), at, d.clone()));
+                    break 'outer;
                 }
             }
         }
     }
-    let Some(day_dir) = found else {
-        eprintln!("no day in reach had messages; nothing further to exercise");
+    let Some((conv, month_dir, day)) = found else {
+        eprintln!("no month had messages; nothing further to exercise");
         return;
     };
-    eprintln!("entering {day_dir} after {probes} probes");
-    let conv = day_dir.rsplitn(4, '/').last().unwrap().to_string();
+    eprintln!("entering {month_dir}, newest day {day}");
 
     let entries: Vec<String> = vol
-        .list(Path::new(&day_dir))
+        .list(Path::new(&month_dir))
         .await
         .expect("a day lists")
         .iter()
         .map(|e| e.name.clone())
         .collect();
     eprintln!("  {entries:?}");
-    assert!(entries.contains(&"chat.jsonl".to_string()));
+    assert!(entries.contains(&day), "the month lists the day it answered with");
 
     // And the file reads, one JSON object per line, through a handle like any other file.
-    let p = format!("{day_dir}/chat.jsonl");
+    let p = format!("{month_dir}/{day}");
     let stat = vol.stat(Path::new(&p)).await.expect("chat.jsonl stats");
     let mut buf = vec![0u8; stat.size as usize];
     let n = vol
@@ -440,36 +439,27 @@ async fn a_bad_token_is_refused_rather_than_read_as_empty() {
     );
 }
 
-/// A day that actually has messages, as `(conversation root, "YYYY/MM/DD")`.
+/// A day file that has messages, as `(conversation root, "YYYY/MM", "YYYY-MM-DD.jsonl")`.
 ///
-/// A search and not a lookup, which is the date axis's cost showing up: the axis is a calendar,
-/// so the newest directories are usually the emptiest — a workspace quiet for a fortnight has a
-/// fortnight of empty days at the top of it. Walking newest-first and stopping at the first
-/// non-empty day is what a reader has to do too, which is the point of exercising it here.
-///
-/// `budget` caps the `stat`s, because each one is a request against a live workspace.
-async fn day_with_content(fs: &WorkFs, root: &str, budget: usize) -> Option<(String, String)> {
+/// A lookup rather than a search: years and months are arithmetic, and one month's listing
+/// names exactly the days that have anything. Newest month first, so an active workspace stops
+/// at the first one.
+async fn day_with_content(fs: &WorkFs, root: &str) -> Option<(String, String, String)> {
     let convs = fs
         .list(Path::new(&format!("{root}/channels")))
         .await
         .expect("a mounted store lists its channels");
-    let mut spent = 0usize;
     for c in &convs {
         let conv = format!("{root}/channels/{}", c.name);
         for y in newest_first(fs, &conv).await {
             for m in newest_first(fs, &format!("{conv}/{y}")).await {
-                for d in newest_first(fs, &format!("{conv}/{y}/{m}")).await {
-                    if spent >= budget {
-                        eprintln!("gave up after {spent} probes");
-                        return None;
-                    }
-                    spent += 1;
-                    let at = format!("{y}/{m}/{d}");
-                    let p = format!("{conv}/{at}/chat.jsonl");
-                    if fs.stat(Path::new(&p)).await.is_ok_and(|st| st.size > 0) {
-                        eprintln!("found content after {spent} probes");
-                        return Some((conv, at));
-                    }
+                let at = format!("{conv}/{y}/{m}");
+                if let Some(d) = newest_first(fs, &at)
+                    .await
+                    .into_iter()
+                    .find(|n| n.ends_with(".jsonl"))
+                {
+                    return Some((conv, format!("{y}/{m}"), d));
                 }
             }
         }
@@ -558,18 +548,18 @@ async fn a_second_workspace_is_a_second_mount() {
     }
 
     // The read path, which is where a mistake would be quiet rather than loud.
-    let Some((conv, day)) = day_with_content(&fs, "/chat/one", 60).await else {
-        eprintln!("no day in reach had messages; nothing further to exercise");
+    let Some((conv, month, day)) = day_with_content(&fs, "/chat/one").await else {
+        eprintln!("no month had messages; nothing further to exercise");
         return;
     };
     let relative = conv
         .strip_prefix("/chat/one/")
         .expect("the discovered path is under the mount it came from");
-    eprintln!("reading {relative}/{day} through both mounts");
+    eprintln!("reading {relative}/{month}/{day} through both mounts");
 
     let mut bytes = Vec::new();
     for at in ["/chat/one", "/chat/two/nested"] {
-        let p = format!("{at}/{relative}/{day}/chat.jsonl");
+        let p = format!("{at}/{relative}/{month}/{day}");
         let stat = fs.stat(Path::new(&p)).await.expect("chat.jsonl stats");
         let mut buf = vec![0u8; stat.size as usize];
         let n = fs.read_at(Path::new(&p), &mut buf, 0).await.expect("reads");

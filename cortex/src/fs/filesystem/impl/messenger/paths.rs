@@ -20,86 +20,78 @@ pub(super) const CHANNELS: &str = "channels";
 pub(super) const DMS: &str = "dms";
 pub(super) const USERS: &str = "users";
 
-/// The file a day's (or a thread's) messages are served as.
-pub(super) const CHAT: &str = "chat.jsonl";
 /// The directories inside a day.
 pub(super) const THREADS: &str = "threads";
 pub(super) const FILES: &str = "files";
 
-/// A day is three directories and not one name.
+/// The two directories a month is listed under, and the file a day is served as.
 ///
-/// `2026/08/10` rather than `2026-08-10`, because the directories are a *calendar* — every day
-/// between a conversation's creation and today is there whether or not it holds anything, so a
-/// flat axis puts a thousand entries in one listing for a channel a few years old. Split, no
-/// listing is longer than the months in a year or the days in a month.
+/// A month is the *fetch* unit and a day is the *file* unit, which is the whole of why they are
+/// spelled separately. One request buys a month, and what it learned is which days in it have
+/// anything — so the month's listing names exactly those, and no day directory has to exist for
+/// a day nobody spoke on. Splitting the fetch any finer would cost a request per day to find
+/// out the same thing.
 ///
-/// Zero-padded and fixed width, so a lexical sort is a chronological one — which is what `ls`
-/// does without being asked.
+/// The year is its own directory so that a year is a *path*: `grep -r .../2025/` is the
+/// question "what happened last year" asked without knowing how months are spelled, where one
+/// flat `2025-03/` level needs a glob and the convention behind it. It also keeps a listing
+/// under twelve entries however old the conversation is.
+///
+/// The day's name repeats both, deliberately. `2026-08-03.jsonl` says what it is when a path is
+/// truncated, a basename is passed on, or a file is copied somewhere else — the same trade
+/// `<name>__<id>` makes, where the id alone would have addressed it.
+pub(super) const DAY_FMT: &str = "%Y-%m-%d";
+/// What a rendered run of messages is served as, whichever scope it came from.
+pub(super) const JSONL: &str = ".jsonl";
+
+/// The year directory `at` falls in.
 pub(super) fn year_dir(year: i32) -> String {
     format!("{year:04}")
 }
 
-/// A month or a day, as the two-digit name it is listed under.
-pub(super) fn pad2(n: u32) -> String {
-    format!("{n:02}")
+/// The month directory inside its year.
+pub(super) fn month_dir(month: u32) -> String {
+    format!("{month:02}")
 }
 
-/// The three components a date is spelled as, joined.
-pub(super) fn day_path(date: NaiveDate) -> String {
-    format!(
-        "{}/{}/{}",
-        year_dir(date.year()),
-        pad2(date.month()),
-        pad2(date.day())
-    )
+/// `<year>/<month>`, which is where a day file lives.
+pub(super) fn month_path(at: NaiveDate) -> String {
+    format!("{}/{}", year_dir(at.year()), month_dir(at.month()))
 }
 
-/// The date `y/m/d` names, or `None` when any component is not the name this writes.
+/// The file a day's messages are served as, inside its month.
+pub(super) fn day_file(at: NaiveDate) -> String {
+    format!("{}{JSONL}", at.format(DAY_FMT))
+}
+
+/// The `(year, month)` a `<year>/<month>` pair means, or `None` when either is not a name this
+/// writes.
 ///
-/// Strict about width as well as value: `2026/8/10` is not a name any listing produced, and
-/// accepting it would give one day two paths — and two cache entries that never see each
-/// other.
-pub(super) fn date_of(y: &str, m: &str, d: &str) -> Option<NaiveDate> {
-    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+/// Strict about width as well as value: `8` is not a name any listing produced, and taking it
+/// would give one month two paths — and two cache entries that never see each other.
+pub(super) fn month_of(year: &str, month: &str) -> Option<(i32, u32)> {
+    if year.len() != 4 || month.len() != 2 {
         return None;
     }
-    NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)
+    let (y, m) = (year.parse().ok()?, month.parse::<u32>().ok()?);
+    (1..=12).contains(&m).then_some((y, m))
 }
 
-/// The years a conversation created at `created` has, up to and including today.
-pub(super) fn years(created: NaiveDate, today: NaiveDate) -> Vec<i32> {
-    (created.year()..=today.year()).collect()
-}
 
-/// The months of `year` that fall within `[created, today]`.
-pub(super) fn months(year: i32, created: NaiveDate, today: NaiveDate) -> Vec<u32> {
-    let first = if year == created.year() { created.month() } else { 1 };
-    let last = if year == today.year() { today.month() } else { 12 };
-    (first..=last).collect()
-}
-
-/// The days of `year`-`month` that fall within `[created, today]`.
+/// Every month between `created` and `today`, oldest first.
 ///
-/// The month's own length comes from the calendar rather than a table: the first of the next
-/// month, less one day, is right in February of every year without anybody writing the rule
-/// down.
-pub(super) fn days(year: i32, month: u32, created: NaiveDate, today: NaiveDate) -> Vec<u32> {
-    let Some(first_of) = NaiveDate::from_ymd_opt(year, month, 1) else {
-        return Vec::new();
-    };
-    let in_month = match month {
-        12 => NaiveDate::from_ymd_opt(year + 1, 1, 1),
-        _ => NaiveDate::from_ymd_opt(year, month + 1, 1),
+/// The whole date axis of a conversation, and arithmetic — so listing it costs nothing and is
+/// never a window. The count is the conversation's *lifetime* in months and has nothing to do
+/// with how much was said: a channel carrying fifty thousand messages a day has no more entries
+/// than a silent one of the same age.
+pub(super) fn months(created: NaiveDate, today: NaiveDate) -> Vec<(i32, u32)> {
+    let mut out = Vec::new();
+    let (mut y, mut m) = (created.year(), created.month());
+    while (y, m) <= (today.year(), today.month()) {
+        out.push((y, m));
+        (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
     }
-    .map(|next| next.signed_duration_since(first_of).num_days() as u32)
-    .unwrap_or(0);
-
-    (1..=in_month)
-        .filter(|d| {
-            NaiveDate::from_ymd_opt(year, month, *d)
-                .is_some_and(|date| date >= created && date <= today)
-        })
-        .collect()
+    out
 }
 
 /// The section a conversation of this kind is listed under.
@@ -124,7 +116,7 @@ pub fn conv_dir(conv: &Conversation) -> String {
 /// and a bucketing rule that moved with the reader's clock would file the same message under
 /// different days for two readers of one mount.
 pub fn day_dir(at: SystemTime) -> String {
-    day_path(day_of(at))
+    month_path(day_of(at))
 }
 
 /// The tree-relative path of the file this message's line is in.
@@ -134,15 +126,16 @@ pub fn day_dir(at: SystemTime) -> String {
 /// the day it was started on. A caller has to pass it: a root is named by a platform id, which
 /// is opaque here, so this cannot recover the root's instant from the message alone.
 pub fn chat_path(conv: &Conversation, msg: &Message, day: SystemTime) -> String {
+    let date = day_of(day);
     let dir = format!(
         "{}/{}/{}",
         section_of(conv.kind),
         conv_dir(conv),
-        day_dir(day)
+        month_path(date)
     );
     match msg.thread.as_ref().and_then(|t| t.root.as_ref()) {
-        Some(root) => format!("{dir}/{THREADS}/{}/{CHAT}", root.0),
-        None => format!("{dir}/{CHAT}"),
+        Some(root) => format!("{dir}/{THREADS}/{}{JSONL}", root.0),
+        None => format!("{dir}/{}", day_file(date)),
     }
 }
 
