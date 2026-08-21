@@ -187,7 +187,12 @@ pub(super) fn entry(name: &str, id: &str, suffix: &str) -> String {
 pub(super) fn sanitize(name: &str) -> String {
     let cleaned: String = name
         .chars()
-        .map(|c| if c == '/' || c == '\0' { '-' } else { c })
+        // A control character is legal in a POSIX name and hostile in every other way. A
+        // newline breaks anything that reads a listing a line at a time, a tab breaks the
+        // `<path>\t<record>` a search hit is printed as, and an escape sequence rewrites
+        // whatever a terminal already drew. Slack's own channel names cannot carry one, but a
+        // display name and an uploaded filename are whoever typed them.
+        .map(|c| if c == '/' || c.is_control() { '-' } else { c })
         .collect();
     let cleaned = cleaned.trim().trim_start_matches('.').to_string();
     if cleaned.is_empty() {

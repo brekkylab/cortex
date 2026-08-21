@@ -66,6 +66,29 @@ fn a_name_that_would_leave_its_component_is_sanitized() {
     );
 }
 
+/// A control character is legal in a POSIX name and breaks every format built on lines.
+///
+/// A newline splits a listing into two entries, a tab splits a search hit's `<path>\t<record>`
+/// in the wrong place, and an escape sequence rewrites what a terminal already drew. Slack's own
+/// channel names cannot carry one; a display name and an uploaded filename are whoever typed
+/// them, which is where this comes from.
+#[test]
+fn a_control_character_never_reaches_a_path() {
+    for (raw, want) in [
+        ("two\nlines", "two-lines__C1"),
+        ("a\tb", "a-b__C1"),
+        ("re\rwrite", "re-write__C1"),
+        ("esc\u{1b}[2Kape", "esc-[2Kape__C1"),
+    ] {
+        let got = conv_dir(&conv(raw, "C1", ConvKind::Channel));
+        assert_eq!(got, want, "{raw:?}");
+        assert!(
+            !got.chars().any(char::is_control),
+            "{got:?} still carries one"
+        );
+    }
+}
+
 #[test]
 fn a_kind_picks_its_section() {
     assert_eq!(section_of(ConvKind::Channel), "channels");
