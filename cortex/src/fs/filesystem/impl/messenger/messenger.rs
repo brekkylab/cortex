@@ -57,7 +57,10 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{NaiveDate, TimeZone, Utc};
 
 use super::limits::MessengerLimits;
-use super::paths::{CHANNELS, CHAT, DAY_FMT, DMS, FILES, THREADS, USERS, conv_dir, day_of, entry};
+use super::paths::{
+    CHANNELS, CHAT, DMS, FILES, THREADS, USERS, conv_dir, date_of, day_of, days, entry, months,
+    pad2, year_dir, years,
+};
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
 use super::{User, render_line};
 use crate::BoxFuture;
@@ -104,9 +107,6 @@ struct Day {
 struct Cache {
     convs: Option<Cached<Vec<Conversation>>>,
     users: Option<Cached<Vec<User>>>,
-    /// The days each conversation was seen to have, and whether the walk was truncated —
-    /// which is what tells an unlisted day apart from one below the floor.
-    dates: HashMap<ConvId, Cached<(Vec<NaiveDate>, bool)>>,
     /// Assembled scopes, days and threads together.
     ///
     /// One map and not two, because a thread *is* a day as far as this cache is concerned —
@@ -275,30 +275,6 @@ impl<S: MessengerSource> MessengerFs<S> {
         Ok(users)
     }
 
-    /// The days `conv` was seen to have, and whether the walk stopped short of its history.
-    async fn dates(&self, conv: &ConvId) -> io::Result<(Vec<NaiveDate>, bool)> {
-        if let Some(v) = Cached::get(self.cache.lock().unwrap().dates.get(conv), self.limits.ttl) {
-            return Ok(v.clone());
-        }
-        // One unreadable conversation is not a broken tree: it is listed, and it is empty.
-        let (msgs, truncated) = match self.source.scan(conv, self.limits.scan_pages).await {
-            Ok(v) => v,
-            Err(e) if e.is_conversation_denied() => (Vec::new(), false),
-            Err(e) => return Err(e.into()),
-        };
-        let mut days: Vec<NaiveDate> = msgs.iter().map(|m| day_of(m.ts)).collect();
-        days.sort_unstable();
-        days.dedup();
-        let out = (days, truncated);
-        self.cache
-            .lock()
-            .unwrap()
-            .dates
-            .insert(conv.clone(), Cached::new(out.clone()));
-        Ok(out)
-    }
-
-    /// One day of a conversation, assembled from a single history call.
     async fn day(&self, conv: &ConvId, date: NaiveDate) -> io::Result<Arc<Day>> {
         let key = Scope::Day(conv.clone(), date);
         if let Some(day) = self.held(&key) {
@@ -391,28 +367,28 @@ impl<S: MessengerSource> MessengerFs<S> {
             .ok_or(io_err(io::ErrorKind::NotFound))
     }
 
-    /// Whether `date` is a day of `conv` that may be served, and its content if so.
+    /// The conversation a `<section>/<dir>` pair names.
     ///
-    /// The three-case rule from the module docs lives here, and nowhere else.
-    async fn day_if_present(&self, conv: &ConvId, date: NaiveDate) -> io::Result<Arc<Day>> {
-        let (days, truncated) = self.dates(conv).await?;
-        if days.binary_search(&date).is_ok() {
-            return self.day(conv, date).await;
-        }
-        // Inside a range the walk covered, an unlisted day is empty and known to be: the walk
-        // saw every day from its floor to the newest message, so this costs no request.
-        let floor = days.first().copied();
-        let inside = floor.is_some_and(|f| date >= f);
-        if inside || !truncated {
+    /// The three date levels all need it — for `created` and nothing else — so the two steps
+    /// they share are one call rather than three copies of it.
+    async fn conv_of(&self, section: &str, dir: &str) -> io::Result<Conversation> {
+        let kind = self
+            .section_kind(section)
+            .ok_or(io_err(io::ErrorKind::NotFound))?;
+        self.conv_at(kind, dir).await
+    }
+
+    /// The day `date` names, or `NotFound` when it is not a day this conversation has.
+    ///
+    /// "Has" is the calendar: from the day it was created to today. Outside that there is
+    /// nothing to fetch and no request is spent finding out. Inside it, an empty day is a real
+    /// day that happens to be empty — the directory is there because the day was, and its
+    /// `chat.jsonl` is zero bytes.
+    async fn day_if_present(&self, conv: &Conversation, date: NaiveDate) -> io::Result<Arc<Day>> {
+        if date < day_of(conv.created) || date > today() {
             return Err(io_err(io::ErrorKind::NotFound));
         }
-        // Below a truncated walk's floor. The walk never reached here, so nothing has been
-        // proved — ask, and serve it only if it has messages.
-        let day = self.day(conv, date).await?;
-        if day.chat.is_empty() {
-            return Err(io_err(io::ErrorKind::NotFound));
-        }
-        Ok(day)
+        self.day(&conv.id, date).await
     }
 
     /// The sections this source actually has. `dms/` is absent rather than empty when the
@@ -500,11 +476,18 @@ impl<S: MessengerSource> MessengerFs<S> {
                 let kind = self.section_kind(s).expect("checked");
                 let conv = self.conv_at(kind, conv_dir).await?;
                 match rest {
+                    // Each level is checked on the way down: `stat` has to refuse a year the
+                    // conversation never had, and a listing is not the only way in.
                     [] => Ok(Node::Dir),
-                    [date, tail @ ..] => {
-                        let date = NaiveDate::parse_from_str(date, DAY_FMT)
-                            .map_err(|_| io_err(io::ErrorKind::NotFound))?;
-                        let day = self.day_if_present(&conv.id, date).await?;
+                    [y] => year_in(y, &conv).map(|_| Node::Dir),
+                    [y, m] => {
+                        let year = year_in(y, &conv)?;
+                        month_in(m, year, &conv).map(|_| Node::Dir)
+                    }
+                    [y, m, d, tail @ ..] => {
+                        let date =
+                            date_of(y, m, d).ok_or(io_err(io::ErrorKind::NotFound))?;
+                        let day = self.day_if_present(&conv, date).await?;
                         match tail {
                             [t] if t == THREADS => Ok(Node::Dir),
                             [t, root, within @ ..] if t == THREADS => {
@@ -556,14 +539,32 @@ impl<S: MessengerSource> MessengerFs<S> {
                     .collect())
             }
 
-            // A conversation lists the days it has.
-            [s, conv_dir] if self.section_kind(s).is_some() => {
-                let kind = self.section_kind(s).expect("checked");
-                let conv = self.conv_at(kind, conv_dir).await?;
-                let (days, _) = self.dates(&conv.id).await?;
-                Ok(days
+            // The date axis, all three levels of it. Arithmetic over the conversation's own
+            // `created` — no request past the one that listed the conversation.
+            [s, cd] if self.section_kind(s).is_some() => {
+                let conv = self.conv_of(s, cd).await?;
+                Ok(years(day_of(conv.created), today())
                     .into_iter()
-                    .map(|d| Dirent::new(d.format(DAY_FMT).to_string(), DirentKind::Dir))
+                    .map(|y| Dirent::new(year_dir(y), DirentKind::Dir))
+                    .collect())
+            }
+
+            [s, cd, y] if self.section_kind(s).is_some() => {
+                let conv = self.conv_of(s, cd).await?;
+                let year = year_in(y, &conv)?;
+                Ok(months(year, day_of(conv.created), today())
+                    .into_iter()
+                    .map(|m| Dirent::new(pad2(m), DirentKind::Dir))
+                    .collect())
+            }
+
+            [s, cd, y, m] if self.section_kind(s).is_some() => {
+                let conv = self.conv_of(s, cd).await?;
+                let year = year_in(y, &conv)?;
+                let month = month_in(m, year, &conv)?;
+                Ok(days(year, month, day_of(conv.created), today())
+                    .into_iter()
+                    .map(|d| Dirent::new(pad2(d), DirentKind::Dir))
                     .collect())
             }
 
@@ -649,15 +650,15 @@ impl<S: MessengerSource> MessengerFs<S> {
             .section_kind(s)
             .ok_or(io_err(io::ErrorKind::NotFound))?;
         let conv = self.conv_at(kind, conv_dir).await?;
-        let date = segs
-            .get(2)
-            .and_then(|d| NaiveDate::parse_from_str(d, DAY_FMT).ok())
-            .ok_or(io_err(io::ErrorKind::NotFound))?;
-        let day = self.day_if_present(&conv.id, date).await?;
+        let date = match segs.get(2..5) {
+            Some([y, m, d]) => date_of(y, m, d).ok_or(io_err(io::ErrorKind::NotFound))?,
+            _ => return Err(io_err(io::ErrorKind::NotFound)),
+        };
+        let day = self.day_if_present(&conv, date).await?;
 
         // A thread's own subdirectories reuse the day's shape, so resolve which scope this
         // listing is inside before naming its entries.
-        let (scope, tail) = match &segs[3..] {
+        let (scope, tail) = match &segs[5..] {
             [t, root, rest @ ..] if t == THREADS => {
                 (self.thread(&conv.id, &MsgId(root.clone())).await?, rest)
             }
@@ -665,7 +666,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         };
 
         match tail {
-            [] if segs.len() == 3 => {
+            [] if segs.len() == 5 => {
                 // The day itself: chat.jsonl, plus whichever of the two directories has
                 // anything in it. An empty one would be a claim the tree cannot support.
                 let mut out = vec![Dirent::new(CHAT, DirentKind::File)];
@@ -791,6 +792,42 @@ fn copy_out(data: &[u8], buf: &mut [u8], offset: u64) -> usize {
     let n = (data.len() - from).min(buf.len());
     buf[..n].copy_from_slice(&data[from..from + n]);
     n
+}
+
+/// Today, in UTC — the top of every conversation's date axis.
+///
+/// Read on each listing rather than fixed at construction, unlike
+/// [`born`](MessengerFs::born): a mount left open across midnight has to start listing the new
+/// day, where a directory's reported mtime must not move.
+fn today() -> NaiveDate {
+    Utc::now().date_naive()
+}
+
+/// The year `seg` names, refused unless it is one this conversation has.
+///
+/// Checked here rather than left to an empty listing: a year outside the span is not a year with
+/// nothing in it, and `NotFound` is what says so.
+fn year_in(seg: &str, conv: &Conversation) -> io::Result<i32> {
+    let year: i32 = (seg.len() == 4)
+        .then(|| seg.parse().ok())
+        .flatten()
+        .ok_or(io_err(io::ErrorKind::NotFound))?;
+    if !years(day_of(conv.created), today()).contains(&year) {
+        return Err(io_err(io::ErrorKind::NotFound));
+    }
+    Ok(year)
+}
+
+/// The month `seg` names within `year`, refused unless the conversation reaches it.
+fn month_in(seg: &str, year: i32, conv: &Conversation) -> io::Result<u32> {
+    let month: u32 = (seg.len() == 2)
+        .then(|| seg.parse().ok())
+        .flatten()
+        .ok_or(io_err(io::ErrorKind::NotFound))?;
+    if !months(year, day_of(conv.created), today()).contains(&month) {
+        return Err(io_err(io::ErrorKind::NotFound));
+    }
+    Ok(month)
 }
 
 /// An errno-shaped failure with no message of its own.

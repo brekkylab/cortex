@@ -11,8 +11,6 @@
 
 use std::time::Duration;
 
-/// Pages of history one date walk reads before giving up.
-const SCAN_PAGES: usize = 10;
 
 /// The most bytes one open attachment may hold.
 const WINDOW: u64 = 8 << 20;
@@ -29,16 +27,6 @@ const TEXT_BUDGET: u64 = 32 << 20;
 /// this gets exactly the behaviour it always had.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MessengerLimits {
-    /// Pages of history one date walk reads before giving up. Default 10.
-    ///
-    /// A budget rather than a backstop: listing a conversation's days is the one call whose
-    /// cost the tree chooses, and it buys depth of history with requests. What it cannot buy is
-    /// completeness — a conversation older than the walk keeps history the listing does not
-    /// name, which is why an unlisted day below the floor is fetched rather than refused.
-    ///
-    /// Raise it for a mount that is walked rarely and read deeply; lower it for one where an
-    /// `ls` has to be quick and old history is reachable by path anyway.
-    pub scan_pages: usize,
 
     /// The most bytes one open attachment may hold, and so both of the things that number
     /// decides: below it an attachment is fetched whole at `open`, above it a window at a time.
@@ -88,7 +76,6 @@ pub struct MessengerLimits {
 impl Default for MessengerLimits {
     fn default() -> Self {
         MessengerLimits {
-            scan_pages: SCAN_PAGES,
             window: WINDOW,
             ttl: TTL,
             text_budget: TEXT_BUDGET,

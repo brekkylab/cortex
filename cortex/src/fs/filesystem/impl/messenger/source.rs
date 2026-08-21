@@ -14,17 +14,24 @@
 //! alternative has a name — every unified messenger project that flattened its sources to a
 //! common struct lost the platform-specific half with it.
 //!
-//! # Why `scan` and `history` are separate questions
+//! # Why there is no method for "which days are there"
 //!
-//! `history` answers "what is in this window". `scan` answers "which windows are there at
-//! all", and no messenger API has an endpoint for it: the tree learns a conversation's days
-//! by walking its newest messages backwards for a bounded number of pages and listing what
-//! it saw. Generating the calendar instead — every day between the conversation's creation
-//! and now — invents a directory for every silent day, and the reader is an agent, which
-//! cannot tell a quiet day from a failed request and pays a request to find out.
+//! No messenger API has an endpoint for it, and the two ways to answer it without one both
+//! cost something. Walking the newest messages backwards spends a request per conversation and
+//! *cannot finish*: two hundred messages is a month of a quiet channel and four hours of a busy
+//! one, so the listing it produces is a window that reads like a whole — and the reader is an
+//! agent, which has no way to tell the difference and stops looking.
 //!
-//! The two are one call on some platforms and two on others, which is exactly why the
-//! *tree* asks them separately and the source decides how to serve each.
+//! So the tree generates the axis instead, from [`Conversation::created`] to today. Every day
+//! in a conversation's life is a directory whether or not it holds anything, and finding out
+//! costs the request that reads it. What that buys is a listing that spends **no** request and
+//! is never a window: an agent sees the whole span, and can tell how much there is before
+//! asking for any of it.
+//!
+//! The cost is bounded by a conversation's *lifetime* rather than by its traffic — a channel
+//! carrying fifty thousand messages a day has no more directories than a silent one of the same
+//! age — and the axis is split into `<year>/<month>/<day>` so no single listing is longer than
+//! the days in a month.
 
 use std::ops::Range;
 use std::time::SystemTime;
@@ -68,6 +75,14 @@ pub struct Conversation {
     /// allowed — the id half still identifies it.
     pub name: String,
     pub kind: ConvKind,
+    /// When the conversation was created.
+    ///
+    /// The tree's date axis is a calendar from here to today, so this is not decoration: it is
+    /// the *bottom* of what a reader may address, and it is why no request is spent finding out
+    /// which days a conversation has. Every platform reports it in the listing this came from —
+    /// Slack's `created`, a Discord channel's snowflake, a Teams chat's `createdDateTime` — so
+    /// it costs nothing to carry.
+    pub created: SystemTime,
 }
 
 /// Who sent a message.
@@ -223,15 +238,6 @@ pub trait MessengerSource: Send + Sync {
         &'a self,
         conv: &'a ConvId,
         window: Window,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>>;
-
-    /// The conversation's newest messages backwards, at most `max_pages` pages, returned
-    /// oldest-first. True means the walk stopped at that ceiling and older messages exist
-    /// that it did not reach. See the module docs for why this is not `history`.
-    fn scan<'a>(
-        &'a self,
-        conv: &'a ConvId,
-        max_pages: usize,
     ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>>;
 
     /// A thread: its root followed by every reply, oldest-first.

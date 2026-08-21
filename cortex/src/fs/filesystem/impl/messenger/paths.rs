@@ -11,7 +11,7 @@
 
 use std::time::SystemTime;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use super::{ConvKind, Conversation, Message};
 
@@ -26,9 +26,81 @@ pub(super) const CHAT: &str = "chat.jsonl";
 pub(super) const THREADS: &str = "threads";
 pub(super) const FILES: &str = "files";
 
-/// How a day directory is spelled. One constant, because a listing writes these names and a
-/// path parser reads them back.
-pub(super) const DAY_FMT: &str = "%Y-%m-%d";
+/// A day is three directories and not one name.
+///
+/// `2026/08/10` rather than `2026-08-10`, because the directories are a *calendar* — every day
+/// between a conversation's creation and today is there whether or not it holds anything, so a
+/// flat axis puts a thousand entries in one listing for a channel a few years old. Split, no
+/// listing is longer than the months in a year or the days in a month.
+///
+/// Zero-padded and fixed width, so a lexical sort is a chronological one — which is what `ls`
+/// does without being asked.
+pub(super) fn year_dir(year: i32) -> String {
+    format!("{year:04}")
+}
+
+/// A month or a day, as the two-digit name it is listed under.
+pub(super) fn pad2(n: u32) -> String {
+    format!("{n:02}")
+}
+
+/// The three components a date is spelled as, joined.
+pub(super) fn day_path(date: NaiveDate) -> String {
+    format!(
+        "{}/{}/{}",
+        year_dir(date.year()),
+        pad2(date.month()),
+        pad2(date.day())
+    )
+}
+
+/// The date `y/m/d` names, or `None` when any component is not the name this writes.
+///
+/// Strict about width as well as value: `2026/8/10` is not a name any listing produced, and
+/// accepting it would give one day two paths — and two cache entries that never see each
+/// other.
+pub(super) fn date_of(y: &str, m: &str, d: &str) -> Option<NaiveDate> {
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(y.parse().ok()?, m.parse().ok()?, d.parse().ok()?)
+}
+
+/// The years a conversation created at `created` has, up to and including today.
+pub(super) fn years(created: NaiveDate, today: NaiveDate) -> Vec<i32> {
+    (created.year()..=today.year()).collect()
+}
+
+/// The months of `year` that fall within `[created, today]`.
+pub(super) fn months(year: i32, created: NaiveDate, today: NaiveDate) -> Vec<u32> {
+    let first = if year == created.year() { created.month() } else { 1 };
+    let last = if year == today.year() { today.month() } else { 12 };
+    (first..=last).collect()
+}
+
+/// The days of `year`-`month` that fall within `[created, today]`.
+///
+/// The month's own length comes from the calendar rather than a table: the first of the next
+/// month, less one day, is right in February of every year without anybody writing the rule
+/// down.
+pub(super) fn days(year: i32, month: u32, created: NaiveDate, today: NaiveDate) -> Vec<u32> {
+    let Some(first_of) = NaiveDate::from_ymd_opt(year, month, 1) else {
+        return Vec::new();
+    };
+    let in_month = match month {
+        12 => NaiveDate::from_ymd_opt(year + 1, 1, 1),
+        _ => NaiveDate::from_ymd_opt(year, month + 1, 1),
+    }
+    .map(|next| next.signed_duration_since(first_of).num_days() as u32)
+    .unwrap_or(0);
+
+    (1..=in_month)
+        .filter(|d| {
+            NaiveDate::from_ymd_opt(year, month, *d)
+                .is_some_and(|date| date >= created && date <= today)
+        })
+        .collect()
+}
 
 /// The section a conversation of this kind is listed under.
 pub fn section_of(kind: ConvKind) -> &'static str {
@@ -52,7 +124,7 @@ pub fn conv_dir(conv: &Conversation) -> String {
 /// and a bucketing rule that moved with the reader's clock would file the same message under
 /// different days for two readers of one mount.
 pub fn day_dir(at: SystemTime) -> String {
-    day_of(at).format(DAY_FMT).to_string()
+    day_path(day_of(at))
 }
 
 /// The tree-relative path of the file this message's line is in.

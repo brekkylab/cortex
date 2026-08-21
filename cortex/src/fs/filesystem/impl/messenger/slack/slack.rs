@@ -200,17 +200,6 @@ impl MessengerSource for SlackSource {
         })
     }
 
-    fn scan<'a>(
-        &'a self,
-        conv: &'a ConvId,
-        max_pages: usize,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
-        Box::pin(async move {
-            let (msgs, truncated) = self.api.scan_history(&conv.0, max_pages).await?;
-            Ok((msgs.iter().filter_map(message).collect(), truncated))
-        })
-    }
-
     fn thread<'a>(
         &'a self,
         conv: &'a ConvId,
@@ -287,6 +276,11 @@ fn conversation(c: &Value, members: &[Value]) -> Option<Conversation> {
     Some(Conversation {
         id: ConvId(id.to_string()),
         name,
+        // Seconds, unlike the `updated` beside it in the same object, which is milliseconds.
+        // Absent for a conversation Slack did not report one for, and then the epoch — which
+        // makes the calendar start further back than it needs to rather than cut a day off it.
+        created: UNIX_EPOCH
+            + Duration::from_secs(c.get("created").and_then(Value::as_u64).unwrap_or(0)),
         kind: if is_im || is_mpim {
             ConvKind::Dm
         } else {

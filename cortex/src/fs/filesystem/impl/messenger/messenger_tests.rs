@@ -62,14 +62,11 @@ fn msg(id: &str, ts: u64, text: &str) -> Message {
 
 #[derive(Default)]
 struct Calls {
-    scan: AtomicUsize,
     history: AtomicUsize,
     thread: AtomicUsize,
     /// Every range `fetch_file` was asked for, in order. `None` is a whole-file request,
     /// which is the only shape the source can length-check.
     files: Mutex<Vec<Option<Range<u64>>>>,
-    /// The page budget the last `scan` was given — the store's, not this file's.
-    pages: AtomicUsize,
 }
 
 struct TestSource {
@@ -81,8 +78,6 @@ struct TestSource {
     caps: Capabilities,
     /// Conversations that answer every read with a per-conversation denial.
     denied: Vec<ConvId>,
-    /// How far back `scan` may see, in days from the newest message. `None` = everything.
-    scan_floor: Option<u64>,
     /// Answer every ranged fetch with the whole file, as a server that ignores `Range` does.
     ignores_range: bool,
     calls: Calls,
@@ -100,7 +95,6 @@ impl TestSource {
                 dms: true,
             },
             denied: Vec::new(),
-            scan_floor: None,
             ignores_range: false,
             calls: Calls::default(),
         }
@@ -121,10 +115,6 @@ impl TestSource {
         self
     }
 
-    fn floor(mut self, days: u64) -> Self {
-        self.scan_floor = Some(days);
-        self
-    }
 
     fn ignores_range(mut self) -> Self {
         self.ignores_range = true;
@@ -173,31 +163,6 @@ impl MessengerSource for TestSource {
                 .filter(|m| m.ts >= window.start && m.ts < window.end)
                 .collect();
             Ok((msgs, false))
-        })
-    }
-
-    fn scan<'a>(
-        &'a self,
-        conv: &'a ConvId,
-        max_pages: usize,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
-        Box::pin(async move {
-            self.calls.scan.fetch_add(1, Ordering::SeqCst);
-            self.calls.pages.store(max_pages, Ordering::SeqCst);
-            if self.denied.contains(conv) {
-                return Err(Self::denied_err());
-            }
-            let all = self.of(conv);
-            let Some(days) = self.scan_floor else {
-                return Ok((all, false));
-            };
-            // A truncated walk: only the newest `days` days were reached.
-            let Some(newest) = all.last().map(|m| m.ts) else {
-                return Ok((all, false));
-            };
-            let cut = newest - Duration::from_secs(days * DAY);
-            let seen: Vec<Message> = all.into_iter().filter(|m| m.ts >= cut).collect();
-            Ok((seen, true))
         })
     }
 
@@ -250,11 +215,18 @@ impl MessengerSource for TestSource {
     }
 }
 
+/// A conversation created five days before [`D10`], so the calendar its date axis is generated
+/// from starts there and reaches today.
 fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
+    conv_born(id, name, kind, D10 - 5 * DAY)
+}
+
+fn conv_born(id: &str, name: &str, kind: ConvKind, created: u64) -> Conversation {
     Conversation {
         id: ConvId(id.into()),
         name: name.into(),
         kind,
+        created: at(created),
     }
 }
 
@@ -340,76 +312,80 @@ async fn a_source_without_dms_has_no_dms_directory() {
     ));
 }
 
-/// The days a conversation *has*, not the days it has existed. The 11th is between two days
-/// with messages and must not appear.
+/// The date axis is three levels of calendar, and listing any of them asks nothing.
+///
+/// This is the trade the axis exists for: a walk would spend a request per conversation and
+/// still only reach its newest messages, so the listing it produced would be a window that read
+/// like a whole. Arithmetic over `created` reaches every day the conversation ever had, for
+/// nothing.
 #[tokio::test]
-async fn a_conversation_lists_only_the_days_it_has() {
+async fn the_date_axis_is_a_calendar_and_costs_no_request() {
     let vol = two_days();
-    let days = names(&vol.list(Path::new("/channels/pricing__C1")).await.unwrap());
-    assert_eq!(days, ["2026-08-10", "2026-08-12"]);
-}
-
-/// And the silent day in between is refused *without asking*. The walk already covered that
-/// range, so a request would be spent to learn what is already known — which is the cost an
-/// agent pays for every empty directory a tree invents.
-#[tokio::test]
-async fn a_silent_day_inside_the_walk_costs_no_request() {
-    let vol = two_days();
-    vol.list(Path::new("/channels/pricing__C1")).await.unwrap();
+    // The conversation listing is the only request any of this needs.
+    vol.list(Path::new("/channels")).await.unwrap();
     let before = vol.source.calls.history.load(Ordering::SeqCst);
 
-    let e = vol
-        .stat(Path::new("/channels/pricing__C1/2026-08-11"))
-        .await;
-    assert!(matches!(e, Err(ref e) if e.kind() == std::io::ErrorKind::NotFound));
+    let years = names(&vol.list(Path::new("/channels/pricing__C1")).await.unwrap());
+    assert_eq!(years, ["2026"]);
+    let months = names(&vol.list(Path::new("/channels/pricing__C1/2026")).await.unwrap());
+    assert!(months.contains(&"08".to_string()), "{months:?}");
+    let days = names(&vol.list(Path::new("/channels/pricing__C1/2026/08")).await.unwrap());
+
+    // Created on the 5th, so the 5th is the first day and the 11th — silent — is there too.
+    assert!(days.contains(&"05".to_string()), "{days:?}");
+    assert!(days.contains(&"11".to_string()), "a silent day is still a day");
+    assert!(!days.contains(&"04".to_string()), "nothing before it existed");
+
     assert_eq!(
         vol.source.calls.history.load(Ordering::SeqCst),
         before,
-        "a day the walk proved empty must not be fetched"
+        "three listings, no history call"
     );
 }
 
-/// Below a truncated walk's floor nothing has been proved, so the day is fetched — and served
-/// only if it turns out to have messages. That is what keeps old history reachable by name
-/// while no empty directory is ever listed.
+/// A silent day inside the span is a real day that is empty, and finding out costs the one
+/// request that reads it. That is the calendar's price, paid where the reader asked rather than
+/// on every listing.
 #[tokio::test]
-async fn a_day_below_a_truncated_floor_is_fetched_and_served() {
-    // Messages 30 days apart, with a walk that only reaches the newest 5 days.
-    let vol = MessengerFs::new(
-        TestSource::new(
-            vec![conv("C1", "pricing", ConvKind::Channel)],
-            vec![
-                (ConvId("C1".into()), msg("old", D10, "long ago")),
-                (ConvId("C1".into()), msg("new", D10 + 30 * DAY, "recent")),
-            ],
-        )
-        .floor(5),
+async fn a_silent_day_is_served_empty() {
+    let vol = two_days();
+    let p = Path::new("/channels/pricing__C1/2026/08/11/chat.jsonl");
+    let stat = vol.stat(p).await.expect("the day exists");
+    assert_eq!(stat.size, 0, "nothing was said that day");
+
+    let mut buf = vec![0u8; 64];
+    assert_eq!(vol.read_at(p, &mut buf, 0).await.unwrap(), 0);
+}
+
+/// Outside the span there is nothing to fetch, and no request is spent saying so. The bottom is
+/// the conversation's own creation — a date before it never existed to have messages in.
+#[tokio::test]
+async fn a_day_before_the_conversation_existed_costs_no_request() {
+    let vol = two_days();
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+    for path in [
+        "/channels/pricing__C1/2026/08/04", // one day before `created`
+        "/channels/pricing__C1/2025",       // a year before it
+        "/channels/pricing__C1/2026/07",    // a month before it
+    ] {
+        assert!(
+            matches!(vol.stat(Path::new(path)).await,
+                     Err(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "{path} is outside the span"
+        );
+    }
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before,
+        "the span is arithmetic; being outside it is not a question for the source"
     );
-
-    // The listing names only what the walk saw.
-    let days = names(&vol.list(Path::new("/channels/pricing__C1")).await.unwrap());
-    assert_eq!(days, ["2026-09-09"], "the walk reached only the newest day");
-
-    // The old day is not listed and is still reachable.
-    let s = vol
-        .stat(Path::new("/channels/pricing__C1/2026-08-10"))
-        .await
-        .expect("a day below the floor is reachable by name");
-    assert_eq!(s.kind, DirentKind::Dir);
-
-    // A day below the floor that has nothing is still not there.
-    assert!(matches!(
-        vol.stat(Path::new("/channels/pricing__C1/2026-08-11"))
-            .await,
-        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
-    ));
 }
 
 /// One line per message, and the day holds exactly its own.
 #[tokio::test]
 async fn a_day_serves_its_messages_one_per_line() {
     let vol = two_days();
-    let p = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
     let stat = vol.stat(p).await.unwrap();
     let mut buf = vec![0u8; stat.size as usize];
     vol.read_at(p, &mut buf, 0).await.unwrap();
@@ -428,7 +404,7 @@ async fn a_day_serves_its_messages_one_per_line() {
 async fn empty_subdirectories_are_not_synthesized() {
     let vol = two_days();
     let day = names(
-        &vol.list(Path::new("/channels/pricing__C1/2026-08-10"))
+        &vol.list(Path::new("/channels/pricing__C1/2026/08/10"))
             .await
             .unwrap(),
     );
@@ -459,7 +435,7 @@ async fn empty_subdirectories_are_not_synthesized() {
     )];
     let vol = MessengerFs::new(src);
     let day = names(
-        &vol.list(Path::new("/channels/pricing__C1/2026-08-10"))
+        &vol.list(Path::new("/channels/pricing__C1/2026/08/10"))
             .await
             .unwrap(),
     );
@@ -467,14 +443,14 @@ async fn empty_subdirectories_are_not_synthesized() {
 
     // A thread is the same shape as a day.
     let t = names(
-        &vol.list(Path::new("/channels/pricing__C1/2026-08-10/threads/100"))
+        &vol.list(Path::new("/channels/pricing__C1/2026/08/10/threads/100"))
             .await
             .unwrap(),
     );
     assert_eq!(t, ["chat.jsonl"]);
     assert_eq!(
         names(
-            &vol.list(Path::new("/channels/pricing__C1/2026-08-10/threads"))
+            &vol.list(Path::new("/channels/pricing__C1/2026/08/10/threads"))
                 .await
                 .unwrap()
         ),
@@ -483,7 +459,7 @@ async fn empty_subdirectories_are_not_synthesized() {
     // And the attachment is served at its listed length.
     let s = vol
         .stat(Path::new(
-            "/channels/pricing__C1/2026-08-10/files/report.pdf__F1",
+            "/channels/pricing__C1/2026/08/10/files/report.pdf__F1",
         ))
         .await
         .unwrap();
@@ -509,18 +485,21 @@ async fn an_unreadable_conversation_is_empty_rather_than_broken() {
         names(&vol.list(Path::new("/channels")).await.unwrap()),
         ["pricing__C1", "secret__C2"]
     );
-    // And empty rather than an error.
-    assert!(
-        vol.list(Path::new("/channels/secret__C2"))
-            .await
-            .unwrap()
-            .is_empty()
+    // Its date axis is arithmetic, so it is there whether or not the conversation can be read
+    // — and reading a day of it answers empty rather than failing.
+    assert_eq!(
+        names(&vol.list(Path::new("/channels/secret__C2")).await.unwrap()),
+        ["2026"]
+    );
+    let denied = Path::new("/channels/secret__C2/2026/08/10/chat.jsonl");
+    assert_eq!(
+        vol.stat(denied).await.expect("the day is a day").size,
+        0,
+        "one unreadable conversation is empty, not broken"
     );
     // The readable one is unaffected, which is the whole point.
-    assert_eq!(
-        names(&vol.list(Path::new("/channels/pricing__C1")).await.unwrap()),
-        ["2026-08-10"]
-    );
+    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    assert!(vol.stat(p).await.unwrap().size > 0);
 }
 
 /// A path is an address, so it resolves on the id. A name is what a workspace renames, and a
@@ -555,7 +534,7 @@ async fn a_name_with_a_separator_stays_one_component() {
 #[tokio::test]
 async fn every_write_is_refused_as_read_only() {
     let vol = two_days();
-    let p = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
     assert!(read_only(vol.mkdir(p).await.err()));
     assert!(read_only(vol.unlink(p).await.err()));
     assert!(read_only(vol.rmdir(p).await.err()));
@@ -576,7 +555,7 @@ async fn a_directory_and_a_file_are_not_interchangeable() {
     );
     assert_eq!(
         kind_of(
-            vol.list(Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl"))
+            vol.list(Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl"))
                 .await
                 .err()
         ),
@@ -589,7 +568,7 @@ async fn a_directory_and_a_file_are_not_interchangeable() {
 #[tokio::test]
 async fn a_stat_and_an_open_share_one_request() {
     let vol = two_days();
-    let p = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
     vol.stat(p).await.unwrap();
     let after_stat = vol.source.calls.history.load(Ordering::SeqCst);
     vol.read_at(p, &mut [0u8; 1], 0).await.unwrap();
@@ -615,7 +594,7 @@ async fn an_author_id_is_resolved_to_a_name() {
     }];
     let vol = MessengerFs::new(src);
 
-    let p = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let p = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
     let stat = vol.stat(p).await.unwrap();
     let mut buf = vec![0u8; stat.size as usize];
     vol.read_at(p, &mut buf, 0).await.unwrap();
@@ -642,7 +621,7 @@ fn with_attachment(size: u64) -> MessengerFs<TestSource> {
     ))
 }
 
-const ATTACHMENT: &str = "/channels/pricing__C1/2026-08-10/files/doc.bin__F1";
+const ATTACHMENT: &str = "/channels/pricing__C1/2026/08/10/files/doc.bin__F1";
 
 /// Read `len` bytes of the attachment at `offset`.
 async fn read_bytes(vol: &MessengerFs<TestSource>, offset: u64, len: usize) -> Vec<u8> {
@@ -904,7 +883,7 @@ async fn a_held_small_file_never_answers_for_another_path() {
     let mut chat = vec![0u8; 64];
     let n = vol
         .read_at(
-            Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl"),
+            Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl"),
             &mut chat,
             0,
         )
@@ -938,15 +917,13 @@ async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
     assert!(name.len() <= 255, "{} bytes", name.len());
     assert!(name.ends_with("__C1"), "the id half survived: {name}");
 
-    let days = vol
-        .list(&Path::new("/channels").join(&name))
-        .await
-        .expect("the name the listing gave has to be the name that opens");
-    assert_eq!(days.len(), 1);
-    let chat = Path::new("/channels")
-        .join(&name)
-        .join(&days[0].name)
-        .join("chat.jsonl");
+    // Down the axis from the fitted name: every level has to resolve under it.
+    let root = Path::new("/channels").join(&name);
+    let years = names(&vol.list(&root).await.expect(
+        "the name the listing gave has to be the name that opens",
+    ));
+    assert_eq!(years, ["2026"]);
+    let chat = root.join("2026/08/10/chat.jsonl");
     let mut buf = vec![0u8; 512];
     let n = vol
         .read_at(&chat, &mut buf, 0)
@@ -980,40 +957,18 @@ fn two_fat_days(limits: MessengerLimits) -> MessengerFs<TestSource> {
 #[test]
 fn the_default_limits_are_the_numbers_this_lane_chose() {
     let d = MessengerLimits::default();
-    assert_eq!(d.scan_pages, 10);
     assert_eq!(d.window, 8 << 20);
     assert_eq!(d.ttl, Duration::from_secs(15));
     assert_eq!(d.text_budget, 32 << 20);
 }
 
-/// The walk budget is the store's, not a constant's: a mount told to look at one page asks for
-/// one page.
-#[tokio::test]
-async fn the_scan_budget_is_what_the_limits_say() {
-    let vol = MessengerFs::with_limits(
-        TestSource::new(
-            vec![conv("C1", "pricing", ConvKind::Channel)],
-            vec![(ConvId("C1".into()), msg("1", D10 + 100, "hello"))],
-        ),
-        MessengerLimits {
-            scan_pages: 1,
-            ..Default::default()
-        },
-    );
-    vol.list(Path::new("/channels/pricing__C1")).await.unwrap();
-    assert_eq!(
-        vol.source.calls.pages.load(Ordering::SeqCst),
-        1,
-        "the source was asked for the pages the limits allow"
-    );
-}
 
 /// A budget that fits both days keeps both: coming back to the first costs nothing.
 #[tokio::test]
 async fn a_day_within_the_budget_is_still_held() {
     let vol = two_fat_days(MessengerLimits::default());
-    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
-    let twelve = Path::new("/channels/pricing__C1/2026-08-12/chat.jsonl");
+    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026/08/12/chat.jsonl");
 
     vol.stat(ten).await.unwrap();
     vol.stat(twelve).await.unwrap();
@@ -1036,8 +991,8 @@ async fn past_the_text_budget_the_least_recently_used_day_goes() {
         text_budget: 600,
         ..Default::default()
     });
-    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
-    let twelve = Path::new("/channels/pricing__C1/2026-08-12/chat.jsonl");
+    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026/08/12/chat.jsonl");
 
     vol.stat(ten).await.unwrap();
     vol.stat(twelve).await.unwrap();
@@ -1059,8 +1014,8 @@ async fn a_day_that_keeps_being_read_outlives_one_that_does_not() {
         text_budget: 600,
         ..Default::default()
     });
-    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
-    let twelve = Path::new("/channels/pricing__C1/2026-08-12/chat.jsonl");
+    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
+    let twelve = Path::new("/channels/pricing__C1/2026/08/12/chat.jsonl");
 
     vol.stat(ten).await.unwrap();
     vol.stat(ten).await.unwrap(); // touched again: now the most recent
@@ -1084,7 +1039,7 @@ async fn one_day_bigger_than_the_budget_is_still_held_while_it_is_read() {
         text_budget: 10,
         ..Default::default()
     });
-    let ten = Path::new("/channels/pricing__C1/2026-08-10/chat.jsonl");
+    let ten = Path::new("/channels/pricing__C1/2026/08/10/chat.jsonl");
 
     vol.stat(ten).await.unwrap();
     let before = vol.source.calls.history.load(Ordering::SeqCst);
