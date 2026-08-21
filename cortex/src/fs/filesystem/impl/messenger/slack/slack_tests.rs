@@ -89,7 +89,7 @@ fn an_attachment_without_a_size_or_a_url_is_dropped() {
     });
     let f = file(&with).expect("a complete file");
     assert_eq!(f.id, "F1");
-    assert_eq!(f.size, 966_750);
+    assert_eq!(f.size, Some(966_750));
 
     assert!(file(&serde_json::json!({"id": "F1", "name": "x", "size": 1})).is_none());
     assert!(

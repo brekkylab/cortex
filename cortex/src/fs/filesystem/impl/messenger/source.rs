@@ -121,9 +121,25 @@ pub struct FileRef {
     pub id: String,
     /// Name as posted. The tree makes a filename out of it and its id.
     pub name: String,
-    /// Exact length, which the tree reports as the file's size and a download is checked
-    /// against — a body that is not this long is a login page or a truncation, not the file.
-    pub size: u64,
+    /// Exact length, when the listing said one.
+    ///
+    /// `None` is a platform that does not: Slack's file object carries `size`, a Teams
+    /// `chatMessageAttachment` carries `content`, `contentType`, `contentUrl`, `id`, `name`,
+    /// `teamsAppId` and `thumbnailUrl` — and no length anywhere.
+    ///
+    /// It forfeits two things, and both for the same reason rather than by choice:
+    ///
+    /// * **Windowing.** A window ends at `min(offset + window, size)`, so without a size there
+    ///   is no end to stop at. An unsized attachment is fetched whole however large it is,
+    ///   which is why the ceiling a mount sets does not bind it.
+    /// * **The length check.** A body that is not as long as the listing promised is a login
+    ///   page or a truncation rather than the file — the check that catches a refused token
+    ///   answering `200`. With nothing promised there is nothing to compare.
+    ///
+    /// A source that can cheaply learn the length should, rather than leave this `None`: one
+    /// `Range: bytes=0-0` returns the total in `Content-Range`, and a listing that spends that
+    /// per attachment buys back both of the above.
+    pub size: Option<u64>,
     /// Where the bytes are, in whatever form the source will hand back to itself.
     pub url: String,
 }

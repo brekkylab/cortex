@@ -196,13 +196,17 @@ impl MessengerSource for TestSource {
             self.calls.files.lock().unwrap().push(range.clone());
             // Content a test can locate itself in: byte `n` is `n as u8`, so a window served
             // from the wrong offset is visible rather than merely short.
-            let all: Vec<u8> = (0..file.size).map(|i| i as u8).collect();
+            // An unsized file is a platform that did not say — the bytes are still there, and
+            // the length is whatever the source hands back. `UNSIZED_LEN` stands for a length
+            // only the download reveals.
+            let len = file.size.unwrap_or(UNSIZED_LEN);
+            let all: Vec<u8> = (0..len).map(|i| i as u8).collect();
             match range {
                 // The second value is the whole point: `false` says the range was ignored and
                 // these are the file's bytes from zero.
                 Some(_) if self.ignores_range => Ok((all, false)),
                 Some(r) => {
-                    let end = r.end.min(file.size) as usize;
+                    let end = r.end.min(len) as usize;
                     Ok((all[r.start as usize..end].to_vec(), true))
                 }
                 None => Ok((all, false)),
@@ -448,7 +452,7 @@ async fn empty_subdirectories_are_not_synthesized() {
     root.files = vec![FileRef {
         id: "F1".into(),
         name: "report.pdf".into(),
-        size: 3,
+        size: Some(3),
         url: "https://example.invalid/f".into(),
     }];
     let mut src = TestSource::new(
@@ -637,6 +641,11 @@ async fn an_author_id_is_resolved_to_a_name() {
 
 /// A workspace whose single day holds one attachment of `size` bytes.
 fn with_attachment(size: u64) -> MessengerFs<TestSource> {
+    sized_attachment(Some(size))
+}
+
+/// The same, with whatever the listing said about the length — including nothing.
+fn sized_attachment(size: Option<u64>) -> MessengerFs<TestSource> {
     let mut m = msg("1", D10 + 100, "see attached");
     m.files = vec![FileRef {
         id: "F1".into(),
@@ -649,6 +658,9 @@ fn with_attachment(size: u64) -> MessengerFs<TestSource> {
         vec![(ConvId("C1".into()), m)],
     ))
 }
+
+/// How long the fixture's unsized attachment turns out to be — a number only a download says.
+const UNSIZED_LEN: u64 = 4096;
 
 const ATTACHMENT: &str = "/channels/pricing__C1/2026/08/files/doc.bin__F1";
 
@@ -811,7 +823,7 @@ async fn a_server_that_ignores_the_range_is_not_served_as_the_wrong_offset() {
     m.files = vec![FileRef {
         id: "F1".into(),
         name: "doc.bin".into(),
-        size: window() + 4096,
+        size: Some(window() + 4096),
         url: "https://example.invalid/f".into(),
     }];
     let vol = MessengerFs::new(
@@ -1088,4 +1100,82 @@ async fn one_day_bigger_than_the_budget_is_still_held_while_it_is_read() {
         before,
         "the read after the stat came out of what was held"
     );
+}
+
+
+/// A listing that names no length still serves the file, and `stat` answers with a real number.
+///
+/// There is no honest placeholder for a size: zero says the file is empty and every tool
+/// believes it. So the length is learned by fetching, and the bytes are held — a `stat` then a
+/// read costs the one request the read would have cost by itself.
+#[tokio::test]
+async fn an_attachment_with_no_listed_length_is_measured_by_reading_it() {
+    const SIZE: u64 = UNSIZED_LEN;
+    let vol = sized_attachment(None);
+    let p = Path::new(ATTACHMENT);
+
+    let st = vol.stat(p).await.expect("an unsized attachment stats");
+    assert_eq!(st.size, SIZE, "the length came from the bytes");
+    assert_eq!(vol.source.calls.files.lock().unwrap().len(), 1);
+
+    // And the read that follows is served from what the stat already fetched.
+    let mut buf = vec![0u8; SIZE as usize];
+    assert_eq!(vol.read_at(p, &mut buf, 0).await.unwrap(), SIZE as usize);
+    assert_eq!(
+        vol.source.calls.files.lock().unwrap().len(),
+        1,
+        "stat then read is one request, not two"
+    );
+    assert_eq!(buf[0], 0);
+    assert_eq!(buf[SIZE as usize - 1], (SIZE - 1) as u8);
+}
+
+/// A length nobody stated is not a length to check a download against, and not one a listing
+/// may print. `Dirent::stat` is an `Option` for exactly this.
+#[tokio::test]
+async fn a_listing_leaves_an_unmeasured_size_empty() {
+    let vol = sized_attachment(None);
+    let files = vol
+        .list(Path::new("/channels/pricing__C1/2026/08/files"))
+        .await
+        .expect("the month lists its files");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].name, "doc.bin__F1");
+    assert!(
+        files[0].stat().is_none(),
+        "a plain `ls` must not spend a request per entry to print a number"
+    );
+    assert!(
+        vol.source.calls.files.lock().unwrap().is_empty(),
+        "and listing asked for no bytes at all"
+    );
+}
+
+/// An unsized file is never windowed, however big it turns out to be: a window ends at
+/// `min(offset + window, size)`, and there is no end without a size. The ceiling a mount sets
+/// does not bind this one, which is the cost the platform imposes rather than a choice here.
+#[tokio::test]
+async fn an_unsized_attachment_is_fetched_whole_past_the_ceiling() {
+    let mut m = msg("1", D10 + 100, "see attached");
+    m.files = vec![FileRef {
+        id: "F1".into(),
+        name: "doc.bin".into(),
+        size: None,
+        url: "https://example.invalid/f".into(),
+    }];
+    let vol = MessengerFs::with_limits(
+        TestSource::new(
+            vec![conv("C1", "pricing", ConvKind::Channel)],
+            vec![(ConvId("C1".into()), m)],
+        ),
+        MessengerLimits {
+            window: 64,
+            ..Default::default()
+        },
+    );
+    let mut buf = vec![0u8; 128];
+    let n = vol.read_at(Path::new(ATTACHMENT), &mut buf, 0).await.unwrap();
+    assert_eq!(n, 128, "served past the window with no range asked for");
+    let asked = vol.source.calls.files.lock().unwrap().clone();
+    assert_eq!(asked, vec![None], "one unranged request");
 }

@@ -353,7 +353,7 @@ fn file(f: &Value) -> Option<FileRef> {
             .and_then(Value::as_str)
             .unwrap_or("untitled")
             .to_string(),
-        size: f.get("size").and_then(Value::as_u64)?,
+        size: Some(f.get("size").and_then(Value::as_u64)?),
         url: f
             .get("url_private_download")
             .or_else(|| f.get("url_private"))

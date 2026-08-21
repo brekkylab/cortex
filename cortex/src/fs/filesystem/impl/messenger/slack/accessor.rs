@@ -519,7 +519,7 @@ impl SlackAccessor {
         &self,
         url: &str,
         range: Option<std::ops::Range<u64>>,
-        size: u64,
+        size: Option<u64>,
     ) -> SourceResult<(Vec<u8>, bool)> {
         // A read of no bytes needs no request. The inclusive-end conversion below cannot
         // express one — `8..8` becomes `bytes=8-8`, which asks for the single byte the
@@ -555,7 +555,13 @@ impl SlackAccessor {
         // the caller must slice the full body itself.
         let served_range = ranged && status == reqwest::StatusCode::PARTIAL_CONTENT;
         let bytes = resp.bytes().await?.to_vec();
-        if !served_range && bytes.len() as u64 != size {
+        // Only against a length the listing actually gave. `None` is a platform that does not
+        // say one, and comparing against nothing would either pass everything or fail
+        // everything — see `FileRef::size` for what that forfeits.
+        if let Some(size) = size
+            && !served_range
+            && bytes.len() as u64 != size
+        {
             return Err(SourceError::io(format!(
                 "slack file download was {} bytes, not the listed {size}",
                 bytes.len()

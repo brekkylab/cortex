@@ -152,7 +152,7 @@ async fn a_range_of_no_bytes_needs_no_request() {
     // the shapes under test.
     for (start, end) in [(8u64, 8u64), (8, 2), (0, 0)] {
         let (bytes, _) = a
-            .download_file("https://evil.example.com/f.pdf", Some(start..end), 100)
+            .download_file("https://evil.example.com/f.pdf", Some(start..end), Some(100))
             .await
             .unwrap_or_else(|e| panic!("{start}..{end} must answer without a request: {e}"));
         assert!(bytes.is_empty(), "{start}..{end} asked for no bytes");

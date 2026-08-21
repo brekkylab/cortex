@@ -639,7 +639,7 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
             match self.resolve(path).await? {
                 Node::Dir => Ok(self.dir()),
                 Node::Bytes(b) => Ok(self.file(b.len() as u64)),
-                Node::File(f) => Ok(self.file(f.size)),
+                Node::File(f) => Ok(self.file(self.measure(path, &f).await?)),
             }
         })
     }
@@ -665,11 +665,14 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
                 Node::Dir => Err(io_err(io::ErrorKind::IsADirectory)),
                 Node::Bytes(data) => Ok(copy_out(&data, buf, offset)),
 
-                Node::File(f) if f.size <= self.limits.window => {
-                    // The listing named the size, so the end is known without asking. Without
-                    // this the last read of every file — the one the kernel makes to see EOF —
-                    // would fetch the whole thing to be told nothing.
-                    if buf.is_empty() || offset >= f.size {
+                // Whole, which is every file the store is not going to window: one at or under
+                // the ceiling, and one whose length nobody said — see [`FileRef::size`].
+                Node::File(f) if f.size.is_none_or(|n| n <= self.limits.window) => {
+                    // When the listing named a size the end is known without asking, and
+                    // without this the last read of every file — the one the kernel makes to
+                    // see EOF — would fetch the whole thing to be told nothing. An unsized
+                    // file has no such shortcut and finds its end by running out of bytes.
+                    if buf.is_empty() || f.size.is_some_and(|n| offset >= n) {
                         return Ok(0);
                     }
                     let held = self.serve_held(path, offset, buf);
@@ -691,7 +694,11 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
                     Ok(n)
                 }
 
-                Node::File(f) => self.windowed(path, &f, buf, offset).await,
+                // Larger than the ceiling *and* measured, which the guard above leaves.
+                Node::File(f) => {
+                    let size = f.size.expect("the arm above took every unsized file");
+                    self.windowed(path, &f, size, buf, offset).await
+                }
             }
         })
     }
@@ -743,9 +750,19 @@ impl<S: MessengerSource> MessengerFs<S> {
                 .files
                 .iter()
                 .map(|f| {
-                    let mut st = Stat::new(DirentKind::File, f.size);
-                    st.mtime = Some(self.born);
-                    Dirent::with_stat(entry(&f.name, &f.id, ""), st)
+                    let name = entry(&f.name, &f.id, "");
+                    // Sizes come from the listing that named these, so including them costs
+                    // nothing — which saves a caller an `lstat` per entry that a plain `ls`
+                    // never asked for. A platform that did not say leaves the field empty
+                    // rather than a number nobody measured.
+                    match f.size {
+                        Some(size) => {
+                            let mut st = Stat::new(DirentKind::File, size);
+                            st.mtime = Some(self.born);
+                            Dirent::with_stat(name, st)
+                        }
+                        None => Dirent::new(name, DirentKind::File),
+                    }
                 })
                 .collect()),
 
@@ -766,15 +783,16 @@ impl<S: MessengerSource> MessengerFs<S> {
         &self,
         path: &Path,
         f: &FileRef,
+        size: u64,
         buf: &mut [u8],
         offset: u64,
     ) -> io::Result<usize> {
-        if buf.is_empty() || offset >= f.size {
+        if buf.is_empty() || offset >= size {
             return Ok(0);
         }
         // Never past the end the listing named: a range beyond it is a request the source would
         // refuse, and refusing here costs no round trip.
-        let want = (buf.len() as u64).min(f.size - offset) as usize;
+        let want = (buf.len() as u64).min(size - offset) as usize;
         let buf = &mut buf[..want];
 
         let mut filled = 0usize;
@@ -788,7 +806,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             // A miss always pulls a whole window rather than only what was asked. No continuity
             // test, unlike an object store's: a document is read forwards, and the cost of being
             // wrong is bounded by the window on a file already past it.
-            let end = (at + self.limits.window).min(f.size);
+            let end = (at + self.limits.window).min(size);
             let (data, served_range) = self.source.fetch_file(f, Some(at..end)).await?;
             if data.is_empty() {
                 // A non-empty range answered with no bytes has no meaning here, and looping on it
@@ -812,6 +830,31 @@ impl<S: MessengerSource> MessengerFs<S> {
             self.cache.lock().unwrap().window = Some((path.to_path_buf(), start, data));
         }
         Ok(filled)
+    }
+
+    /// How long an attachment is, asking only when the listing did not say.
+    ///
+    /// A size is what `stat` has to answer with, and there is no honest placeholder: zero says
+    /// the file is empty and every tool believes it. So an unsized file is fetched, and the
+    /// bytes are held under this path — which makes the read that follows free, so a `stat`
+    /// then a `cat` costs the one request it would have cost anyway.
+    ///
+    /// The consequence is that `ls -l` over unsized attachments spends a request each, where a
+    /// plain `ls` spends none: the listing leaves [`Dirent::stat`] empty rather than inventing
+    /// a number, which is what that field being an `Option` is for.
+    async fn measure(&self, path: &Path, f: &FileRef) -> io::Result<u64> {
+        if let Some(n) = f.size {
+            return Ok(n);
+        }
+        if let Some((held, _, bytes)) = self.cache.lock().unwrap().window.as_ref()
+            && held == path
+        {
+            return Ok(bytes.len() as u64);
+        }
+        let (bytes, _) = self.source.fetch_file(f, None).await?;
+        let n = bytes.len() as u64;
+        self.cache.lock().unwrap().window = Some((path.to_path_buf(), 0, bytes));
+        Ok(n)
     }
 
     /// Serve as much of `out` as the held window covers *for this path*, returning how much that

@@ -234,7 +234,7 @@ async fn a_real_workspace_answers_the_read_surface() {
             let url = f["url_private_download"].as_str().unwrap();
             let size = f["size"].as_u64().unwrap();
             let name = f["name"].as_str().unwrap_or("?");
-            let (bytes, _) = api.download_file(url, None, size).await.expect("download");
+            let (bytes, _) = api.download_file(url, None, Some(size)).await.expect("download");
             eprintln!("file {name}: {} bytes", bytes.len());
             assert_eq!(bytes.len() as u64, size);
 
@@ -261,7 +261,7 @@ async fn a_real_workspace_answers_the_read_surface() {
             // a kernel will actually read this file — never once, whole.
             let mid = (size / 2) as usize;
             let (chunk, served_range) = api
-                .download_file(url, Some(mid as u64..mid as u64 + 64), size)
+                .download_file(url, Some(mid as u64..mid as u64 + 64), Some(size))
                 .await
                 .expect("ranged download");
             let want = &bytes[mid..(mid + 64).min(bytes.len())];

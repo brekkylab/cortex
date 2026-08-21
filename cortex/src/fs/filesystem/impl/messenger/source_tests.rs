@@ -130,7 +130,7 @@ fn files_carry_the_length_a_download_is_verified_by() {
     m.files = vec![FileRef {
         id: "F1".into(),
         name: "report.pdf".into(),
-        size: 966_750,
+        size: Some(966_750),
         // Never rendered: a url is a credential-bearing fetch the source performs, not
         // something a reader should be handed.
         url: "https://files.slack.com/secret".into(),
