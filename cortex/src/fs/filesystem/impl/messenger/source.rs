@@ -129,6 +129,36 @@ pub struct Message {
     pub raw: Value,
 }
 
+/// One hit from a platform's own message index, and where in the tree it can be read.
+///
+/// Search is not part of [`MessengerSource`]: Slack refuses it to a bot token, Discord does
+/// not offer it to a bot at all, and a trait method some sources could only ever fail is the
+/// empty directory of a trait. So a source that *can* search says so with an inherent method
+/// handing these back, and a caller that has one uses it — while the tree, which needs every
+/// source to answer the same questions, never asks.
+///
+/// The message is the same [`Message`] a day's file is rendered from, so a hit and the line it
+/// points at cannot disagree about what the message is.
+#[derive(Clone, Debug)]
+pub struct SearchHit {
+    /// The conversation it was posted in, as the search answer describes it.
+    ///
+    /// A whole record and not an id, so a caller can name the directory without a second
+    /// request. It is not necessarily what a *listing* would say, though: a platform may hand
+    /// back an index's own idea of a conversation — a one-to-one DM with no display name, for
+    /// one — so a caller that has the listing should prefer it and keep this as the fallback.
+    /// Either way the id half is the address, so a path built from this still resolves.
+    pub conv: Conversation,
+    pub msg: Message,
+    /// When the thread this message is in was started, for a reply.
+    ///
+    /// A thread is served under its **root's** day, and a root is named by a platform id this
+    /// crate treats as opaque — so a source that can recover the root's instant says it here
+    /// rather than leaving a caller to parse an id it is not allowed to understand. `None` for
+    /// a message that is not a reply, whose own instant names its day.
+    pub thread_started: Option<SystemTime>,
+}
+
 /// A half-open span of time — one day of the tree, as the source should ask for it.
 ///
 /// `SystemTime` and not a date, so the trait needs no calendar: turning `2026-08-10/` into

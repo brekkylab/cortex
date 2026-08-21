@@ -25,7 +25,7 @@ use super::accessor::{SlackAccessor, SlackConfig};
 use super::super::error::SourceResult;
 use super::super::source::{
     Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerSource, Message,
-    MsgId, Thread, User, Window,
+    MsgId, SearchHit, Thread, User, Window,
 };
 
 /// Both kinds of a section, asked for in one call.
@@ -63,6 +63,79 @@ impl SlackSource {
             api: SlackAccessor::new(config)?,
             reads_as_user: config.user_token.as_deref().is_some_and(|t| !t.is_empty()),
         })
+    }
+
+
+    /// Slack's own message index, as hits that point back into the tree.
+    ///
+    /// Inherent rather than a [`MessengerSource`] method, for the reason [`SearchHit`] gives.
+    /// Needs the user token: Slack refuses `search.messages` to a bot, and
+    /// [`SlackAccessor::search_available`] is what a caller asks before offering the feature.
+    ///
+    /// # Why the response is rewritten before it is converted
+    ///
+    /// A search match is a message object with two differences from the same message in
+    /// `conversations.history`, and both would be silent:
+    ///
+    /// * **No `thread_ts`.** The match does not carry it, so a reply would look like a
+    ///   conversation message and its path would name the wrong file. The permalink does carry
+    ///   it, so for a *reply* it is spliced back in and the one Slack→[`Message`] converter
+    ///   serves both paths. For a **root** it is not: a root's `thread_ts` points at itself, and
+    ///   with no `reply_count` in the match the converter would render `"replies":0` onto a
+    ///   root that has replies. An absent `thread` says "not stated", which is true; a zero
+    ///   would say something false, and the file two paths away says it correctly.
+    /// * **A different `username`.** In history that field is what a *webhook asserted about
+    ///   itself*, which is why it lands in [`Author::claimed`]. In a search match it is the
+    ///   account's own handle, which is not a claim at all — keeping it would file a fact as an
+    ///   assertion, and the two are separate fields precisely so that cannot happen. So it is
+    ///   dropped, and the author's name is resolved from the id like everywhere else.
+    pub async fn search(&self, query: &str, count: usize) -> SourceResult<Vec<SearchHit>> {
+        let answer = self.api.search_messages(query, count).await?;
+        let matches = answer
+            .get("messages")
+            .and_then(|m| m.get("matches"))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        let mut out = Vec::with_capacity(matches.len());
+        for m in matches {
+            // The match carries the channel's whole record — id, name and the `is_*` flags
+            // that decide the section — so the same converter the listing uses builds it, with
+            // no roster to resolve a DM's partner against.
+            let Some(conv) = m.get("channel").and_then(|c| conversation(c, &[])) else {
+                continue;
+            };
+            let mut m = m.clone();
+            if let Some(obj) = m.as_object_mut() {
+                obj.remove("username");
+                let own = obj.get("ts").and_then(Value::as_str).unwrap_or_default().to_string();
+                match permalink_thread_ts(obj.get("permalink")) {
+                    // A reply: the root it belongs to is what decides which file it is in.
+                    Some(root) if root != own => {
+                        obj.insert("thread_ts".into(), Value::String(root));
+                    }
+                    // A root points at itself, and the index carries no `reply_count`. Splicing
+                    // it in would render `"replies":0` onto a root that has four — a number the
+                    // file has and this answer does not. So the thread is left off the line
+                    // entirely, which is what an absent key already means here: not stated.
+                    _ => {}
+                }
+            }
+            let Some(msg) = message(&m) else { continue };
+            // Only a reply needs it: a root's own instant already names its day.
+            let thread_started = msg
+                .thread
+                .as_ref()
+                .and_then(|t| t.root.as_ref())
+                .and_then(|r| parse_ts(&r.0));
+            out.push(SearchHit {
+                conv,
+                msg,
+                thread_started,
+            });
+        }
+        Ok(out)
     }
 
     /// List one section.
@@ -175,6 +248,19 @@ impl MessengerSource for SlackSource {
 }
 
 // ---- Slack's vocabulary ---------------------------------------------------------------
+
+/// The `thread_ts` a permalink carries, which is where a search match keeps it.
+///
+/// `.../p1785737892782639?thread_ts=1785737875.341929` — present on a reply and on a root
+/// (pointing at itself), absent on a message that is not in a thread at all.
+fn permalink_thread_ts(link: Option<&Value>) -> Option<String> {
+    let query = link?.as_str()?.split_once('?')?.1;
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("thread_ts="))
+        .filter(|ts| !ts.is_empty())
+        .map(str::to_string)
+}
 
 /// One conversation, or `None` for a row with no id — which is not a conversation whatever
 /// else it is.
