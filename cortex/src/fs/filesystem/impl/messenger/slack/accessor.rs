@@ -100,20 +100,42 @@ fn api_base(base_url: Option<&str>) -> String {
 /// request fail to leave: every url it accepts is one the caller then sends a token to,
 /// which is not a thing a unit test should be doing.
 fn check_file_host(url: &reqwest::Url, base_url: Option<&str>) -> SourceResult<()> {
-    let allowed = base_url.and_then(|b| {
-        reqwest::Url::parse(b)
-            .ok()
-            .and_then(|u| u.host_str().map(String::from))
-    });
-    let host = url.host_str().unwrap_or_default().to_string();
-    let ok = match &allowed {
-        // Mock/gateway deployment: the file host is the configured origin.
-        Some(h) => &host == h,
-        None => host == "slack.com" || host.ends_with(".slack.com"),
+    // An *origin*, not a host: scheme, host and port together. A host check alone accepts
+    // `http://files.slack.com/…`, and the token then crosses the wire in clear — which is a
+    // whole Slack account to anyone on the path. In gateway mode it also accepts every port on
+    // the gateway's host, which turns one attacker-supplied file URL into an authenticated GET
+    // against whatever else is listening there.
+    //
+    // The URL is API data — `url_private_download` out of a message's file metadata — so this
+    // is the one place a hostile response is stopped from choosing where the credential goes.
+    let port = |u: &reqwest::Url| u.port_or_known_default();
+    let ok = match base_url.and_then(|b| reqwest::Url::parse(b).ok()) {
+        // Mock or gateway deployment: the configured origin decides, so a plain-HTTP local
+        // mock still works — the operator chose it, and only for the origin they named.
+        Some(base) => {
+            url.scheme() == base.scheme()
+                && url.host_str().is_some()
+                && url.host_str() == base.host_str()
+                && port(url) == port(&base)
+        }
+        // Slack itself is always HTTPS on the default port. The leading dot is what keeps
+        // `evilslack.com` and `slack.com.evil.test` out.
+        None => {
+            url.scheme() == "https"
+                && port(url) == Some(443)
+                && url
+                    .host_str()
+                    .is_some_and(|h| h == "slack.com" || h.ends_with(".slack.com"))
+        }
     };
     if !ok {
+        // The origin and not the URL: a path or query is not this gate's business, and an
+        // error is a place a credential must never appear.
         return Err(SourceError::io(format!(
-            "slack file url host {host:?} is not a Slack host; refusing to send token"
+            "slack file url origin {}://{}{} is not one this mount may send the token to",
+            url.scheme(),
+            url.host_str().unwrap_or("<no host>"),
+            url.port().map(|p| format!(":{p}")).unwrap_or_default(),
         )));
     }
     Ok(())

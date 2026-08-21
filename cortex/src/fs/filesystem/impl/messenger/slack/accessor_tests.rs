@@ -173,7 +173,7 @@ fn a_file_download_only_ever_reaches_slack() {
     };
     let refused = |u: &str, base: Option<&str>| match check(u, base) {
         Ok(()) => panic!("{u} was accepted"),
-        Err(e) => assert!(e.to_string().contains("not a Slack host"), "{e}"),
+        Err(e) => assert!(e.to_string().contains("may send the token to"), "{e}"),
     };
 
     assert!(check("https://files.slack.com/f.pdf", None).is_ok());
@@ -183,10 +183,21 @@ fn a_file_download_only_ever_reaches_slack() {
     // else's subdomain — the two ways a bare `contains` would let a lookalike through.
     refused("https://slack.com.evil.example/f.pdf", None);
     refused("https://notslack.com/f.pdf", None);
+    // The host is right and the origin is not. Plain HTTP would put the token on the wire in
+    // clear, and a port Slack does not serve is not Slack.
+    refused("http://files.slack.com/f.pdf", None);
+    refused("https://files.slack.com:8443/f.pdf", None);
+    // Userinfo is not the host, whatever it is spelled to look like.
+    refused("https://files.slack.com@evil.example/f.pdf", None);
 
     // A base_url deployment narrows it to that one origin: Slack's own hosts are no longer
-    // where this mount's files come from.
+    // where this mount's files come from, and neither is any other port or scheme on the
+    // gateway's own host — one file URL must not become an authenticated GET against whatever
+    // else is listening there.
     let mock = Some("http://localhost:8000");
     assert!(check("http://localhost:8000/files/f.pdf", mock).is_ok());
     refused("https://files.slack.com/f.pdf", mock);
+    refused("http://localhost:22/f.pdf", mock);
+    refused("http://localhost:9200/_search", mock);
+    refused("https://localhost:8000/f.pdf", mock);
 }
