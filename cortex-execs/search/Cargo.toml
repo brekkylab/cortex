@@ -1,0 +1,37 @@
+[package]
+name = "cortex-exec-search"
+version.workspace = true
+edition.workspace = true
+
+# The same `Executable` a console reaches, against the stores on this host and with no console
+# in front of them. Useful for seeing what a query costs before an agent runs it.
+[[bin]]
+name = "search"
+path = "src/bin/search.rs"
+required-features = ["messenger"]
+
+[features]
+# Nothing by default: the command is the trait, the routing and the report, and none of that
+# knows a service. A backend is what knows one, so each is opted into.
+default = []
+# Chat, through the messenger lane. `cortex/slack` because that is the one source in the lane
+# whose service offers an index today.
+messenger = ["slack"]
+slack = ["cortex/slack"]
+
+[dependencies]
+# `Executable`, `ExecCall`, `Mount` — the delegation surface this crate implements. The lane
+# types a backend needs arrive with that backend's own feature.
+cortex = { workspace = true }
+# `BoxFuture`: `Executable` hands one back, and `Searchable` does the same so a backend that
+# waits on a network can be held behind a `dyn`.
+futures-core = { workspace = true }
+# The binary drives one runtime and the clients behind the backends wait on a network, so `net`
+# and `time` are named here rather than inherited: `enable_all` is cfg'd on them, and a runtime
+# built without them has no I/O driver — silently, which is the failure worth two words.
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+
+[dev-dependencies]
+# Fixtures carry a service's own record, which is a `serde_json::Value` in the lane's types.
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

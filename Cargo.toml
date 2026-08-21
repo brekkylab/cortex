@@ -4,6 +4,7 @@ members = [
     "cortex",
     "cortex-execs/index",
     "cortex-execs/mem",
+    "cortex-execs/search",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
 ]

@@ -575,6 +575,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex-exec-search"
+version = "0.1.0"
+dependencies = [
+ "cortex",
+ "futures-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "cortex-local-console"
 version = "0.1.0"
 dependencies = [
