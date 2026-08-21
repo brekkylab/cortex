@@ -16,7 +16,7 @@
 //!   of named files says things no index can express.
 //!
 //! ```text
-//! search 'pricing' | cut -f1 | sort -u | xargs grep -nH 'A/B ?test'
+//! search 'pricing' | cut -f1 | sort -u | tr '\\n' '\\0' | xargs -0 grep -nHE 'A/B ?test'
 //! ```
 //!
 //! That pipeline is why this crate does not grow a query language. An index is asked for plain

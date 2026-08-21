@@ -39,8 +39,10 @@ Examples
     # the files to read next
     search 'pricing policy' | cut -f1 | sort -u
 
-    # what an index cannot express: recall from the index, precision from the tree
-    search 'pricing' | cut -f1 | sort -u | xargs grep -nH 'A/B ?test'
+    # what an index cannot express: recall from the index, precision from the tree.
+    # NUL-separated, because a name can hold a space and `xargs` splits on one; `-E`,
+    # because `?` is a literal in the pattern language `grep` uses by default.
+    search 'pricing' | cut -f1 | sort -u | tr '\\n' '\\0' | xargs -0 grep -nHE 'A/B ?test'
 
 One search is one request per store; walking the tree is not. A day of chat costs a call and
 each thread costs another, so `grep -r` over a mount is thousands of them and a rate limit
