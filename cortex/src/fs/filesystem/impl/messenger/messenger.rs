@@ -54,23 +54,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{NaiveDate, TimeZone, Utc};
 
+use super::paths::{
+    CHANNELS, CHAT, DAY_FMT, DMS, FILES, THREADS, USERS, conv_dir, day_of, sanitize,
+};
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
 use super::{User, render_line};
 use crate::BoxFuture;
 use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
 
-/// The three sections at the mount root.
-const CHANNELS: &str = "channels";
-const DMS: &str = "dms";
-const USERS: &str = "users";
-
-/// The file a day's (or a thread's) messages are served as.
-const CHAT: &str = "chat.jsonl";
-/// The directories inside a day.
-const THREADS: &str = "threads";
-const FILES: &str = "files";
 
 /// Pages of history one [`dates`](MessengerFs::dates) walk reads before giving up.
 ///
@@ -455,7 +448,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                 match rest {
                     [] => Ok(Node::Dir),
                     [date, tail @ ..] => {
-                        let date = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                        let date = NaiveDate::parse_from_str(date, DAY_FMT)
                             .map_err(|_| io_err(io::ErrorKind::NotFound))?;
                         let day = self.day_if_present(&conv.id, date).await?;
                         match tail {
@@ -510,12 +503,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                     .await?
                     .into_iter()
                     .filter(|c| c.kind == kind)
-                    .map(|c| {
-                        Dirent::new(
-                            format!("{}__{}", sanitize(&c.name), c.id.0),
-                            DirentKind::Dir,
-                        )
-                    })
+                    .map(|c| Dirent::new(conv_dir(&c), DirentKind::Dir))
                     .collect())
             }
 
@@ -526,7 +514,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                 let (days, _) = self.dates(&conv.id).await?;
                 Ok(days
                     .into_iter()
-                    .map(|d| Dirent::new(d.format("%Y-%m-%d").to_string(), DirentKind::Dir))
+                    .map(|d| Dirent::new(d.format(DAY_FMT).to_string(), DirentKind::Dir))
                     .collect())
             }
 
@@ -612,7 +600,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         let conv = self.conv_at(kind, conv_dir).await?;
         let date = segs
             .get(2)
-            .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            .and_then(|d| NaiveDate::parse_from_str(d, DAY_FMT).ok())
             .ok_or(io_err(io::ErrorKind::NotFound))?;
         let day = self.day_if_present(&conv.id, date).await?;
 
@@ -777,29 +765,6 @@ fn segments(path: &Path) -> Vec<String> {
 /// somebody titled a channel `a__b` would otherwise do.
 fn id_of(entry: &str) -> &str {
     entry.rsplit_once("__").map(|(_, id)| id).unwrap_or(entry)
-}
-
-/// A display name made safe to be one path component.
-///
-/// `/` would open a directory nobody created and a leading `.` hides the entry from an `ls`
-/// that did not ask; a name that is entirely separators still has to leave something behind,
-/// or two conversations collapse onto one path.
-fn sanitize(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| if c == '/' || c == '\0' { '-' } else { c })
-        .collect();
-    let cleaned = cleaned.trim().trim_start_matches('.').to_string();
-    if cleaned.is_empty() {
-        "unnamed".to_string()
-    } else {
-        cleaned
-    }
-}
-
-/// The UTC day a timestamp falls in — the tree's bucketing rule, in one place.
-fn day_of(ts: SystemTime) -> NaiveDate {
-    DateTime::<Utc>::from(ts).date_naive()
 }
 
 /// The half-open span a date directory stands for.

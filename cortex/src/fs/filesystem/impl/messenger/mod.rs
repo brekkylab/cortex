@@ -32,6 +32,7 @@
 
 mod error;
 mod messenger;
+mod paths;
 mod retry;
 mod source;
 
@@ -40,6 +41,7 @@ mod slack;
 
 pub use error::*;
 pub use messenger::*;
+pub use paths::*;
 pub use source::*;
 
 #[cfg(feature = "slack")]

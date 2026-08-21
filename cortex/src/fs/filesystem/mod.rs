@@ -28,8 +28,8 @@ pub use r#impl::{InMemFs, PassthroughFs};
 #[cfg(feature = "slack")]
 pub use r#impl::{
     Author, Capabilities, ConvId, ConvKind, Conversation, ErrorClass, FileRef, MessengerSource,
-    Message, MsgId, MessengerFs, SlackAccessor, SlackConfig, SlackSource, SourceError, SourceResult, Thread, User,
-    Window, render_line,
+    Message, MsgId, MessengerFs, SlackAccessor, SlackConfig, SlackSource, SourceError,
+    SourceResult, Thread, User, Window, chat_path, conv_dir, day_dir, render_line, section_of,
 };
 #[cfg(feature = "notion")]
 pub use r#impl::{NotionConfig, NotionFs};
