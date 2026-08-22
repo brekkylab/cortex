@@ -23,6 +23,7 @@ ailoy = { path = "../../../ailoy" }
 # which variable was unset, which model was asked, what it answered — and a caller reading
 # stderr wants the chain, not its last link.
 anyhow = { workspace = true }
+charabia = { version = "0.10" }
 # RFC 3339 timestamps. A memory carries when it was written, and the store is a file
 # other tools read: a sortable, unambiguous spelling is worth a dependency.
 chrono = { workspace = true }

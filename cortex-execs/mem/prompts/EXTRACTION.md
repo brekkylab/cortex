@@ -66,10 +66,6 @@ CRITICAL: "User went to Paris last week" is useless 6 months later. "User went t
 
 Today's system date. May be years after Observation Date. Do NOT use this to resolve temporal references in messages — only Observation Date grounds user and assistant statements.
 
-## Language
-
-A BCP 47 language tag — "en", "ko-KR", "zh-Hant-TW" — naming the language every memory's "text" must be written in. It is a property of where the memories are kept, not of this conversation, so it is often not the language the messages are in.
-
 ## Optional Inputs
 
 - **includes**: Topics to focus on
@@ -167,25 +163,15 @@ Preserve exact dates, durations, and temporal relationships. Convert relative �
 ### Numerically Precise
 Preserve exact quantities as stated. "416 pages" stays "416 pages", not "about 400 pages."
 
-### Written in the Language Given
+### Written in English
 
-Every memory's "text" is written in the language specified by `Language` field, whatever language the messages were in.
+Every memory's "text" is written in English, whatever language the messages were in.
 
 Translate as much as can be translated.
-Verbs, relations, feelings, roles, and the ordinary words a fact is made of are all written in the target language.
-A phrase kept in the language of the conversation, because that is how it was said, leaves a memory half in the wrong language, and half is worse than either.
-
-Keep the original wording ONLY where translating it would stop it being the same information:
-- Proper nouns: names of people, places, organizations, brands
-- Titles: books, films, songs, games, articles
-- Quoted text, reproduced as it was said
-- Identifiers: codes, handles, model names, file and command names
-
-A title translated is a title nobody can search for.
+Verbs, relations, feelings, roles, and the ordinary words a fact is made of are all written in English.
 
 Translating must not add a fact.
-Some languages force a distinction the message never made, such as a word for a sibling that also states who is older, or a form of address that also states a relationship.
-Where that happens, choose the wording that states only what was said.
+English forces distinctions many languages leave unsaid: a pronoun that states gender, a noun that states one or many, an article that states which one.
 
 ### Preserve Specific Details — Never Generalize Concrete Information
 
@@ -440,29 +426,6 @@ Output:
 ]}
 
 Three key lessons: (1) The existing memory "John has a dog named Max" does NOT mean all Max-related information is captured — the camping trip is a new event with specific activities (hiking, swimming) and must be extracted. (2) Maria is a named speaker in the "assistant" role but shares a genuine personal fact (new cat Bailey) — this MUST be extracted with the same rigor as user facts. Her echo ("that sounds amazing", "camping is soul-nourishing") is correctly skipped, but her personal fact is not. (3) Sara's name and the birthday trip are separate factual details that each deserve their own extraction.
-
-
-## Example 13: A Language That Is Not the Conversation's
-
-Summary: ""
-Recently Extracted: []
-Existing Memories: []
-New Messages:
-[{"role": "user", "content": "I started 'The Nightingale' by Kristin Hannah on the flight home — my sister Emma lent me her copy. 416 pages, so it lasted the whole trip. Loved it, though the ending wrecked me."},
- {"role": "assistant", "content": "It does that to people. If you want another in that vein, try 'All the Light We Cannot See'."}]
-Observation Date: 2023-05-15
-Language: ko-KR
-
-Output:
-{"memory": [
-  {"id": "0", "text": "사용자는 2023년 5월 15일 집으로 돌아오는 비행기에서 Kristin Hannah의 'The Nightingale'을 읽기 시작해 여행 내내 읽었고, 이 책은 416페이지 분량이다"},
-  {"id": "1", "text": "사용자는 'The Nightingale'을 자신의 자매 Emma에게서 빌렸으며, 책을 매우 좋아했고 결말에서 크게 감정적으로 흔들렸다"},
-  {"id": "2", "text": "사용자는 'The Nightingale'과 비슷한 작품으로 'All the Light We Cannot See'를 추천받았다"}
-]}
-
-The conversation is in English and Language is "ko-KR", so the memories are Korean. What stayed as given: the two titles, the author's name, and Emma. What was translated: everything else, including the emotional reaction, which is a description and not a name. "416 pages" kept its value as "416페이지", and the date is grounded against Observation Date and then written the way the target language writes a date. "Sister" became "자매" rather than a word that also says whether Emma is older, because translating must not add a fact the message never stated.
-
-The mirror case is the same rule: a Korean conversation with Language "en" produces English memories, with the Korean names, titles and quoted phrases left exactly as they were written.
 
 
 # CRITICAL: Exhaustive Extraction Checklist

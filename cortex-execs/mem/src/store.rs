@@ -22,8 +22,6 @@ use std::{io, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
-use crate::lang::Lang;
-
 /// How long a connection waits for another writer before giving up.
 ///
 /// A rollback-journal store serializes writers, and `mem` is invoked once per command: the
@@ -48,26 +46,21 @@ const SCHEMA_VERSION: &str = "1";
 #[derive(Debug)]
 pub struct Store {
     /// The one connection, taken under a lock by whatever asks the file a question.
+    // An expectation and not an allow: `insert` and `search` are what ask, and the day either
+    // arrives this becomes an error asking to be deleted.
+    #[expect(dead_code, reason = "nothing asks the file a question yet")]
     conn: Mutex<Connection>,
 }
 
 impl Store {
     /// Make the store at `path`, and write into it the facts that hold for its whole life.
     ///
-    /// `lang` is the language its memories are written in. It belongs to the file rather than to
-    /// a command, because it is what every later extraction has to agree with: a store whose
-    /// memories are half English and half Korean answers a search in whichever language the last
-    /// caller happened to be using, which is to say it answers badly in both. Settling it once,
-    /// here, is what lets `insert` be told the language instead of guessing it per conversation.
-    /// A [`Lang`] and not a string, so what is written into the file is a tag any reader can act
-    /// on — this store has no way to check a label after the fact, and the type is that check.
-    ///
     /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) when there is already a file at `path`.
     /// This is the one command that brings a store into being, so being handed a name that is
     /// taken is an ambiguity and not a detail to smooth over: the caller either meant a store
-    /// they already have — in which case they wanted `insert`, and the language they just typed
-    /// would have been quietly ignored — or they meant a new one and named the wrong file.
-    pub fn try_new(path: impl AsRef<Path>, lang: &Lang) -> io::Result<Store> {
+    /// they already have — in which case they wanted `insert` — or they meant a new one and
+    /// named the wrong file.
+    pub fn try_new(path: impl AsRef<Path>) -> io::Result<Store> {
         let path = path.as_ref();
         // The absence of the file *is* the check, so it is made by the creation rather than by a
         // `try_exists` before it: two `mem init`s racing for one name both see nothing there, and
@@ -92,8 +85,8 @@ impl Store {
             conn.execute_batch("create table meta (key text primary key, value text not null)")
                 .map_err(sql_error)?;
             conn.execute(
-                "insert into meta (key, value) values ('schema_version', ?1), ('lang', ?2)",
-                (SCHEMA_VERSION, lang.as_str()),
+                "insert into meta (key, value) values ('schema_version', ?1)",
+                (SCHEMA_VERSION,),
             )
             .map_err(sql_error)?;
 
@@ -183,43 +176,6 @@ impl Store {
             )),
         }
     }
-
-    /// The language this store's memories are written in.
-    ///
-    /// Asked of the file each time rather than read once and held, because the file is where it
-    /// lives: a copy on this struct would be a second answer to the same question, and the one
-    /// that goes stale is always the copy. It is read on the way into an extraction and nowhere
-    /// in a loop, so the query costs nothing worth arranging around.
-    ///
-    /// [`InvalidData`](io::ErrorKind::InvalidData) when the row is missing or is not a tag. Both
-    /// mean the same thing — the file was not written by a `mem` that agrees with this one about
-    /// its own metadata — and both are worth refusing here rather than defaulting to a language,
-    /// which would write English memories into a Korean store and make the mixture the store's
-    /// [`try_new`](Store::try_new) exists to prevent.
-    pub fn lang(&self) -> io::Result<Lang> {
-        let said: Option<String> = self
-            .conn
-            .lock()
-            .expect("a poisoned store lock means a panic while it was held")
-            .query_row("select value from meta where key = 'lang'", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(sql_error)?;
-
-        let Some(said) = said else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "this store does not say which language its memories are written in",
-            ));
-        };
-        said.parse::<Lang>().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("this store's language is `{said}`, which is not a language tag: {e}"),
-            )
-        })
-    }
 }
 
 /// Open one connection, with the pragmas this store needs.
@@ -250,11 +206,6 @@ fn sql_error(e: rusqlite::Error) -> io::Error {
 mod tests {
     use super::*;
 
-    /// A tag, for the tests that only need one to hand.
-    fn lang(tag: &str) -> Lang {
-        tag.parse().expect("a language tag")
-    }
-
     /// What a store says about itself, read off the file rather than off the handle that made
     /// it: what `init` leaves behind is read by the next command, in another process.
     fn meta(path: &Path) -> std::collections::BTreeMap<String, String> {
@@ -267,16 +218,13 @@ mod tests {
     }
 
     #[test]
-    fn a_new_store_remembers_the_language_it_was_made_for() {
+    fn a_new_store_says_which_schema_it_is() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("notes.sqlite");
 
-        Store::try_new(&path, &lang("ko-kr")).expect("a store can be made");
+        Store::try_new(&path).expect("a store can be made");
 
         let said = meta(&path);
-        // The tag as it was normalized and not as it was typed: what the file holds is what the
-        // next reader has to act on.
-        assert_eq!(said.get("lang").map(String::as_str), Some("ko-KR"));
         assert_eq!(
             said.get("schema_version").map(String::as_str),
             Some(SCHEMA_VERSION)
@@ -289,41 +237,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("notes.sqlite");
 
-        Store::try_new(&path, &lang("en")).expect("a store can be made");
+        Store::try_new(&path).expect("a store can be made");
         Store::try_from_file(&path).expect("and opened again, in another call");
-    }
-
-    /// The language is asked of the file by whoever writes to it — an extraction has to be told
-    /// which language to write in, and the file is what settled it.
-    #[test]
-    fn a_store_says_which_language_it_holds() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let path = dir.path().join("notes.sqlite");
-
-        Store::try_new(&path, &lang("ko_kr")).expect("a store can be made");
-        let opened = Store::try_from_file(&path).expect("a store can be opened");
-        assert_eq!(opened.lang().expect("it says so"), lang("ko-KR"));
-    }
-
-    /// A label this crate cannot act on is refused rather than answered with a default: a store
-    /// told to write English memories into a Korean file is the mixture `try_new` exists to
-    /// prevent, and defaulting would be how it happened.
-    #[test]
-    fn a_language_that_is_not_a_tag_is_no_language_to_write_in() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let path = dir.path().join("notes.sqlite");
-        Store::try_new(&path, &lang("en")).expect("a store can be made");
-
-        // Written around the type, which is the only way to get here: `try_new` takes a `Lang`.
-        Connection::open(&path)
-            .unwrap()
-            .execute("update meta set value = 'Korean' where key = 'lang'", [])
-            .unwrap();
-
-        let opened = Store::try_from_file(&path).expect("the schema is still this one");
-        let e = opened.lang().expect_err("`Korean` is not a tag");
-        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert!(e.to_string().contains("Korean"), "{e}");
     }
 
     /// A store that is not there is not made: the name was wrong, and an empty store would
@@ -368,7 +283,7 @@ mod tests {
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "create table meta (key text primary key, value text not null);
-             insert into meta (key, value) values ('schema_version', '99'), ('lang', 'en')",
+             insert into meta (key, value) values ('schema_version', '99')",
         )
         .unwrap();
         drop(conn);
@@ -386,7 +301,7 @@ mod tests {
         let path = dir.path().join("notes.sqlite");
         std::fs::write(&path, b"not a store, and not to be lost either").unwrap();
 
-        let e = Store::try_new(&path, &lang("en")).expect_err("the name is taken");
+        let e = Store::try_new(&path).expect_err("the name is taken");
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -398,7 +313,7 @@ mod tests {
     #[test]
     fn a_store_cannot_be_made_in_a_directory_that_is_not_there() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let e = Store::try_new(&dir.path().join("nope").join("notes.sqlite"), &lang("en"))
+        let e = Store::try_new(dir.path().join("nope").join("notes.sqlite"))
             .expect_err("there is no such directory");
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
@@ -416,7 +331,7 @@ mod tests {
         mode.set_mode(0o500);
         std::fs::set_permissions(dir.path(), mode.clone()).unwrap();
 
-        let refused = Store::try_new(&path, &lang("en"));
+        let refused = Store::try_new(&path);
 
         // Put back before the assertions, so a failing one does not leave a directory the
         // harness cannot clean up.

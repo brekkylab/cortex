@@ -41,7 +41,7 @@ use anyhow::{Context as _, anyhow, bail};
 use futures::StreamExt as _;
 use serde::Deserialize;
 
-use crate::{lang::Lang, memory::Memory};
+use crate::memory::Memory;
 
 /// The extraction instructions, as they are actually sent.
 ///
@@ -67,7 +67,14 @@ use crate::{lang::Lang, memory::Memory};
 /// properties the schema does not name, so a model still obeying the section that asked for one
 /// would have had its whole answer rejected.
 ///
-/// The other two edits are to prose rather than to the answer. `# ROLE` no longer opens with a
+/// The language a memory is written in is not an input either. Upstream is handed a `Language`
+/// tag per call and writes its memories in it; here every memory is English, so the section that
+/// named the tag, the guideline that pointed at it and the example that demonstrated writing in
+/// another language are one guideline instead — write English, and keep names, titles, quoted text
+/// and identifiers in the script they were written in. A tag would be a knob two conversations set
+/// two ways, and a store whose memories are half in one language answers a search well in neither.
+///
+/// Two more edits are to prose rather than to the answer. `# ROLE` no longer opens with a
 /// persona and "your sole operation is ADD", because there is one operation here — naming it the
 /// sole one describes a set of alternatives this prompt was never given. And `## New Messages`
 /// now says which two fields of a turn are the input, `role` and `content` and nothing else,
@@ -87,7 +94,7 @@ use crate::{lang::Lang, memory::Memory};
 /// dropping them, because a prompt that describes a section its input does not contain reads
 /// to the model as a section that happened to be empty, where a missing one reads as an
 /// instruction it failed to follow.
-const INSTRUCTIONS: &str = include_str!("../ADDITIVE_EXTRACTION_PROMPT.md");
+const INSTRUCTIONS: &str = include_str!("../prompts/EXTRACTION.md");
 
 /// The provider used when `$MEM_LLM_PROVIDER` says nothing.
 const DEFAULT_PROVIDER: &str = "openai";
@@ -107,12 +114,6 @@ const DEFAULT_PROVIDER: &str = "openai";
 /// anything better. A conversation with no readable turns at all is answered without asking a
 /// model, since there is nothing for it to read.
 ///
-/// `lang` is the language the memories are to be written in, which is the store's and not the
-/// conversation's: a Korean conversation put into an English store has to arrive as English
-/// memories, or the store answers a search in whichever language its last caller happened to use.
-/// It is passed rather than inferred because inferring it is the mistake — the language of the
-/// messages is exactly the wrong answer whenever the two differ.
-///
 /// `env` is the environment the call was made in —
 /// [`ExecCall::env`](cortex::exec::ExecCall::env) — and not this process's, because the two are
 /// not the same environment. Run as a program they hold the same variables and the distinction
@@ -122,7 +123,6 @@ const DEFAULT_PROVIDER: &str = "openai";
 pub async fn extract_memories(
     conversation: &[Message],
     existing: &[String],
-    lang: &Lang,
     env: &BTreeMap<String, String>,
 ) -> anyhow::Result<Vec<Memory>> {
     let turns = turns(conversation);
@@ -149,8 +149,7 @@ pub async fn extract_memories(
         .build()
         .with_context(|| format!("building an extraction agent for `{model}`"))?;
 
-    let query =
-        Message::new(Role::User).with_contents([Part::text(user_prompt(&turns, &offered, lang))]);
+    let query = Message::new(Role::User).with_contents([Part::text(user_prompt(&turns, &offered))]);
 
     let mut answer: Option<String> = None;
     {
@@ -254,7 +253,7 @@ fn offer(existing: &[String]) -> String {
 /// against now — but `insert` is told a conversation and not when it was held, so today is
 /// the only honest answer to both. Threading a real observation date through is a change to
 /// what `insert` accepts, and until then saying "today" twice is at least not a lie.
-fn user_prompt(turns: &[serde_json::Value], offered: &str, lang: &Lang) -> String {
+fn user_prompt(turns: &[serde_json::Value], offered: &str) -> String {
     let today = chrono::Utc::now().date_naive();
     let new_messages = serde_json::to_string(turns).unwrap_or_else(|_| "[]".to_string());
 
@@ -269,7 +268,6 @@ fn user_prompt(turns: &[serde_json::Value], offered: &str, lang: &Lang) -> Strin
         format!("## New Messages\n{new_messages}"),
         format!("## Observation Date\n{today}"),
         format!("## Current Date\n{today}"),
-        format!("## Language\n{lang}"),
         "# Output:".to_string(),
     ]
     .join("\n\n")
@@ -470,10 +468,6 @@ mod tests {
         Message::new(role).with_contents([Part::text(text)])
     }
 
-    fn lang(tag: &str) -> Lang {
-        tag.parse().expect("a language tag")
-    }
-
     #[test]
     fn only_the_two_sides_that_said_something_are_read() {
         let conversation = [
@@ -594,7 +588,7 @@ mod tests {
     #[test]
     fn the_prompt_names_every_section_the_instructions_read() {
         let turns = turns(&[msg(Role::User, "I switched to oat milk")]);
-        let prompt = user_prompt(&turns, "[]", &lang("ko-KR"));
+        let prompt = user_prompt(&turns, "[]");
         for section in [
             "## Summary",
             "## Last k Messages",
@@ -603,7 +597,6 @@ mod tests {
             "## New Messages",
             "## Observation Date",
             "## Current Date",
-            "## Language",
             "# Output:",
         ] {
             assert!(
@@ -613,9 +606,9 @@ mod tests {
         }
         assert!(prompt.contains(r#"{"role":"user","content":"I switched to oat milk"}"#));
         assert!(
-            prompt.contains("## Language\nko-KR"),
-            "the tag itself is the section: a name for the language would be the one thing the \
-             instructions say it is not"
+            !prompt.contains("Language"),
+            "no section names a language: every memory is English, and an input that could say \
+             otherwise is one the instructions no longer read"
         );
     }
 
@@ -718,7 +711,7 @@ mod tests {
     async fn a_conversation_with_no_turns_needs_no_model() {
         let conversation = [msg(Role::System, "You are a helpful assistant.")];
         assert!(
-            extract_memories(&conversation, &[], &lang("en"), &BTreeMap::new())
+            extract_memories(&conversation, &[], &BTreeMap::new())
                 .await
                 .unwrap()
                 .is_empty()

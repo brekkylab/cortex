@@ -24,8 +24,6 @@ mod args {
     use ailoy::message::Message;
     use clap::Parser;
 
-    use crate::lang::Lang;
-
     #[derive(Debug, Parser)]
     #[command(
         name = "mem",
@@ -104,24 +102,6 @@ mod args {
         /// three functions later.
         #[arg(long_help = None)]
         pub store: PathBuf,
-
-        /// the language its memories are written in, as a language tag: en, ko-KR, zh-Hant-TW
-        ///
-        /// A property of the store and not of a call, which is why it is settled here: every
-        /// later extraction writes in it, and a file whose memories are half in one language and
-        /// half in another is one that answers a search well in neither.
-        ///
-        /// An option and not a positional, because the default is the answer almost every caller
-        /// wants and a positional would make them type it to get to the arguments after it.
-        ///
-        /// A [`Lang`] and not a `String`, so that what reaches the store is a tag and not
-        /// whatever was typed — see that module for what is accepted and why the answer is BCP
-        /// 47 rather than a word. Parsed here, which is what makes a language nobody can read
-        /// back a line that was *not understood*: exit `2` and clap naming the argument, rather
-        /// than a store created and then labelled with a mystery.
-        #[arg(long, default_value = "en", long_help = None,
-              value_parser = |tag: &str| tag.parse::<Lang>())]
-        pub lang: Lang,
     }
 
     /// `mem insert <store> <messages>` — a conversation, read for what is worth keeping.
@@ -248,11 +228,11 @@ impl Executable for Mem {
             };
 
             match command {
-                args::Command::Init(init) => {
+                args::Command::Init(_) => {
                     // The host path, because that is where a file is actually made — and the
                     // caller's name for it in everything said about it, since the host path is
                     // on the far side of a mount they cannot see.
-                    match crate::store::Store::try_new(&store, &init.lang) {
+                    match crate::store::Store::try_new(&store) {
                         // The store, named as it was asked for, and nothing else: a line a
                         // script can read as the path it now has. What went right needs no
                         // sentence — the file is the answer.
@@ -280,30 +260,12 @@ impl Executable for Mem {
                     // The store first, and before the model: `insert` writes to a store that
                     // exists, and a caller who named the wrong file should learn it from the
                     // file and not from a provider they have already paid.
-                    let opened = match crate::store::Store::try_from_file(&store) {
-                        Ok(opened) => opened,
-                        Err(e) => {
-                            return ExecResult::failed(
-                                1,
-                                format!("mem: {}: {e}\n", store_path.display()),
-                            );
-                        }
-                    };
-
-                    // The language the memories are to be written in, and the store's rather
-                    // than this conversation's: what a search over the file has to be able to
-                    // assume is that everything in it is written one way. Asked before the model
-                    // for the same reason the store was — a file that cannot say what language
-                    // it holds is a store to fix, not one to spend a provider call on.
-                    let lang = match opened.lang() {
-                        Ok(lang) => lang,
-                        Err(e) => {
-                            return ExecResult::failed(
-                                1,
-                                format!("mem: {}: {e}\n", store_path.display()),
-                            );
-                        }
-                    };
+                    if let Err(e) = crate::store::Store::try_from_file(&store) {
+                        return ExecResult::failed(
+                            1,
+                            format!("mem: {}: {e}\n", store_path.display()),
+                        );
+                    }
 
                     // Nothing offered as already held. What fills that slice is a search of the
                     // store for the memories nearest this conversation, and the store is the
@@ -313,9 +275,7 @@ impl Executable for Mem {
                     // `call.env` and not this process's: what pays for the call is the key the
                     // calling session had.
                     let memories =
-                        match extractor::extract_memories(&insert.messages, &[], &lang, &call.env)
-                            .await
-                        {
+                        match extractor::extract_memories(&insert.messages, &[], &call.env).await {
                             Ok(memories) => memories,
                             // `1`: the line was understood and the work did not happen. `{e:#}` for
                             // the whole chain — which variable was unset, which model was asked,
@@ -385,13 +345,17 @@ mod tests {
 
         // Through the command line, so this covers what a caller types. The store is named and
         // unused: the extraction never looks at it.
+        //
+        // Korean, and deliberately carrying no name, title or quoted phrase — those are kept as
+        // they were written, so a conversation with one in it could not tell a memory written in
+        // English from a memory written in Korean.
         let command = parse(&[
             "insert",
             "unused.sqlite",
             r#"{"role":"user","contents":[{"type":"text","text":
-               "I switched from almond milk to oat milk after developing an almond sensitivity."}]}"#,
+               "아몬드 알레르기가 생겨서 아몬드 우유에서 오트 우유로 바꿨어요."}]}"#,
             r#"{"role":"assistant","contents":[{"type":"text","text":
-               "Noted — I will keep that in mind for recipe suggestions."}]}"#,
+               "알겠습니다 — 레시피를 추천할 때 참고하겠습니다."}]}"#,
         ])
         .expect("the conversation parses");
         let args::Command::Insert(insert) = command else {
@@ -401,11 +365,7 @@ mod tests {
         // What a delegated call is handed as `call.env`; here the program's own environment,
         // which is where `.env` just landed.
         let env = std::env::vars().collect();
-        // Korean for an English conversation, which is the arrangement worth asking a real model
-        // about: the language is the store's, so agreeing with it means disagreeing with every
-        // message in front of it.
-        let lang = "ko-KR".parse().expect("a language tag");
-        let memories = extractor::extract_memories(&insert.messages, &[], &lang, &env)
+        let memories = extractor::extract_memories(&insert.messages, &[], &env)
             .await
             .expect("the extraction answers");
 
@@ -426,40 +386,26 @@ mod tests {
                 .any(|m| m.text.to_lowercase().contains("oat")),
             "the switch to oat milk is what this conversation is about: {memories:#?}"
         );
+        let hangul = |text: &str| {
+            text.chars().any(|c| {
+                matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}')
+            })
+        };
+        assert!(
+            !memories.iter().any(|m| hangul(&m.text)),
+            "the conversation is Korean and the memories are English: {memories:#?}"
+        );
     }
 
-    /// A store is written in some language, and `en` is the one nobody has to say.
+    /// A store is all `init` needs to be told.
     #[test]
-    fn a_store_is_made_for_a_language_and_english_is_assumed() {
+    fn a_store_is_made_by_naming_it() {
         let args::Command::Init(init) =
             parse(&["init", "notes.sqlite"]).expect("a store is all init needs to be told")
         else {
             panic!("init was asked for");
         };
         assert_eq!(init.store, Path::new("notes.sqlite"));
-        assert_eq!(init.lang.as_str(), "en");
-
-        let args::Command::Init(init) =
-            parse(&["init", "notes.sqlite", "--lang", " ko_kr "]).expect("a language can be named")
-        else {
-            panic!("init was asked for");
-        };
-        assert_eq!(
-            init.lang.as_str(),
-            "ko-KR",
-            "what the store is labelled with is the tag, not the typing"
-        );
-    }
-
-    /// A language nobody can read back is a line that was *not understood* — refused where the
-    /// arguments are read, so no store is made to hold a label that means nothing.
-    #[test]
-    fn a_language_that_is_not_a_tag_is_a_misunderstood_line() {
-        for written in ["   ", "Korean", "ko-KRR"] {
-            let e = parse(&["init", "notes.sqlite", "--lang", written])
-                .expect_err(&format!("`{written}` is not a language tag"));
-            assert_eq!(e.kind(), ErrorKind::ValueValidation, "`{written}`");
-        }
     }
 
     /// End to end, as a caller would: a file where there was none, and the second attempt at the
@@ -486,10 +432,7 @@ mod tests {
         };
 
         let made = Mem::new()
-            .exec(
-                &call(&["init", "notes.sqlite", "--lang", "ko"]),
-                Some(&here),
-            )
+            .exec(&call(&["init", "notes.sqlite"]), Some(&here))
             .await;
         assert_eq!(
             made.exit_code,
