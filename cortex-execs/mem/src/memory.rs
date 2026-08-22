@@ -54,13 +54,6 @@ impl Memory {
     /// outside this compares a term to a string somebody typed — a query is cut by this same
     /// method and compared to what it produced, which is the only comparison that holds
     /// whichever way charabia normalizes.
-    ///
-    #[cfg_attr(
-        not(test),
-        // An expectation and not an allow: `insert` writes these and `search` asks for them,
-        // and the day either arrives this becomes an error asking to be deleted.
-        expect(dead_code, reason = "nothing indexes a memory yet")
-    )]
     pub fn tokenize(&self) -> Vec<String> {
         // Built once. What a `Tokenizer` holds is the normalizer and segmenter configuration,
         // and the dictionaries behind those are statics in charabia.

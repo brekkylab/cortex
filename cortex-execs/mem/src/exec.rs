@@ -259,13 +259,19 @@ impl Executable for Mem {
                 args::Command::Insert(insert) => {
                     // The store first, and before the model: `insert` writes to a store that
                     // exists, and a caller who named the wrong file should learn it from the
-                    // file and not from a provider they have already paid.
-                    if let Err(e) = crate::store::Store::try_from_file(&store) {
-                        return ExecResult::failed(
-                            1,
-                            format!("mem: {}: {e}\n", store_path.display()),
-                        );
-                    }
+                    // file and not from a provider they have already paid. Held open across the
+                    // extraction rather than reopened after it — a connection is not a lock, and
+                    // what the write needs is the file that was checked and not another one that
+                    // has the same name by the time the model answers.
+                    let store = match crate::store::Store::try_from_file(&store) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            return ExecResult::failed(
+                                1,
+                                format!("mem: {}: {e}\n", store_path.display()),
+                            );
+                        }
+                    };
 
                     // Nothing offered as already held. What fills that slice is a search of the
                     // store for the memories nearest this conversation, and the store is the
@@ -283,30 +289,28 @@ impl Executable for Mem {
                             Err(e) => return ExecResult::failed(1, format!("mem: {e:#}\n")),
                         };
 
-                    // Reported and not kept. Writing these to the store is what remains, and
-                    // until it is here the difference has to be *said*: a caller who read a
-                    // zero exit and an empty store would have every reason to think `mem` had
-                    // decided there was nothing worth remembering.
+                    // Written before anything is said about them, so that what a caller reads on
+                    // stdout is what the store holds and not what a model answered: a write that
+                    // fails after the lines were printed would have told them the opposite of
+                    // what happened.
+                    if let Err(e) = store.insert(&memories) {
+                        return ExecResult::failed(
+                            1,
+                            format!("mem: {}: {e}\n", store_path.display()),
+                        );
+                    }
+
                     // One memory per line, which is what a memory being a statement makes
                     // possible: nothing here has to say which turn it came from or when,
-                    // because a memory that needed either would not have been written.
+                    // because a memory that needed either would not have been written. Nothing
+                    // worth remembering is therefore no output at all — the honest answer for a
+                    // conversation that carried none, and the one a script reading lines wants.
                     let mut said = String::new();
                     for memory in &memories {
                         said.push_str(&memory.text);
                         said.push('\n');
                     }
-                    ExecResult {
-                        stdout: said.into_bytes(),
-                        stderr: format!(
-                            "mem: {} memories were found and none were written to {}: \
-                             storing is not implemented yet\n",
-                            memories.len(),
-                            store.display()
-                        )
-                        .into_bytes(),
-                        exit_code: 0,
-                        timed_out: false,
-                    }
+                    ExecResult::ok(said)
                 }
                 args::Command::Search(search) => todo!(
                     "answer {:?} from the store at {}",
@@ -492,6 +496,73 @@ mod tests {
         assert!(
             !said.contains("API_KEY"),
             "the store was the answer, and no model was asked: {said}"
+        );
+    }
+
+    /// The whole line with the model taken out of it: a store that exists, a conversation with
+    /// nothing readable in it, and therefore nothing to write. It is the one path through
+    /// `insert` that reaches the store without asking a provider anything, which is what makes
+    /// it the test that the two halves are wired together at all — a zero exit here says the
+    /// store was opened and written to, since either failing is a `1`.
+    #[tokio::test]
+    async fn insert_writes_to_the_store_it_was_given() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+        let here = Here(dir.path().to_path_buf());
+
+        let made = Mem::new()
+            .exec(
+                &ExecCall {
+                    name: "mem".into(),
+                    args: ["init", "notes.sqlite"].map(String::from).into(),
+                    cwd: Some(String::new()),
+                    env: Default::default(),
+                },
+                Some(&here),
+            )
+            .await;
+        assert_eq!(made.exit_code, 0);
+
+        // A system turn is nobody speaking, so there is nothing here for an extraction to read
+        // and no model is asked — which is also why this test needs no key.
+        let result = Mem::new()
+            .exec(
+                &ExecCall {
+                    name: "mem".into(),
+                    args: [
+                        "insert",
+                        "notes.sqlite",
+                        r#"{"role":"system","contents":[{"type":"text","text":"Be helpful."}]}"#,
+                    ]
+                    .map(String::from)
+                    .into(),
+                    cwd: Some(String::new()),
+                    env: Default::default(),
+                },
+                Some(&here),
+            )
+            .await;
+
+        assert_eq!(
+            result.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "nothing was remembered, so there is no line saying one was: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(
+            result.stderr.is_empty(),
+            "and nothing to explain: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
     }
 
