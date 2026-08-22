@@ -146,6 +146,19 @@ mod args {
         /// so there is nothing here to match and nothing to escape.
         #[arg(long_help = None)]
         pub query: String,
+
+        /// how many memories to answer with
+        ///
+        /// A search that answered with everything it could rank would be answering with the
+        /// store: the memories are ordered by how near they are, and past the first few that
+        /// nearness is a formality — a memory sharing one common word with the question is on
+        /// the list. So the bound is part of what makes the answer an answer, and the flag is
+        /// for the caller who wants a longer one rather than a way to switch a limit on.
+        ///
+        /// Ten because both readers of this want about that many: a person reads a screen, and
+        /// an `insert` offering the neighbourhood to an extraction pays per memory it offers.
+        #[arg(short = 'n', long, default_value_t = 10, long_help = None)]
+        pub limit: usize,
     }
 }
 
@@ -312,11 +325,40 @@ impl Executable for Mem {
                     }
                     ExecResult::ok(said)
                 }
-                args::Command::Search(search) => todo!(
-                    "answer {:?} from the store at {}",
-                    search.query,
-                    store.display()
-                ),
+                args::Command::Search(search) => {
+                    let store = match crate::store::Store::try_from_file(&store) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            return ExecResult::failed(
+                                1,
+                                format!("mem: {}: {e}\n", store_path.display()),
+                            );
+                        }
+                    };
+
+                    let found = match store.search(&search.query, search.limit) {
+                        Ok(found) => found,
+                        Err(e) => {
+                            return ExecResult::failed(
+                                1,
+                                format!("mem: {}: {e}\n", store_path.display()),
+                            );
+                        }
+                    };
+
+                    // One memory per line, nearest first, and the same lines `insert` prints —
+                    // what a search answers with is memories, and a memory is the statement.
+                    // Nothing near the query is no lines and a zero: the store was read and it
+                    // holds nothing near this, which is an answer and not a failure. A caller
+                    // that wants to act on emptiness reads no lines, which is the same test they
+                    // would make of any command that lists things.
+                    let mut said = String::new();
+                    for text in &found {
+                        said.push_str(text);
+                        said.push('\n');
+                    }
+                    ExecResult::ok(said)
+                }
             }
         }
         .boxed()
@@ -564,6 +606,131 @@ mod tests {
             "and nothing to explain: {}",
             String::from_utf8_lossy(&result.stderr)
         );
+    }
+
+    /// `search` end to end, as a caller types it: memories in a store, a question asked of it,
+    /// and the answer on stdout nearest first. The store is written through [`crate::store`]
+    /// rather than through `mem insert`, because what a memory *is* is settled by then — going
+    /// through the extraction would put a model in the middle of a test about lines of output.
+    #[tokio::test]
+    async fn search_answers_with_the_memories_nearest_the_question() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+        let here = Here(dir.path().to_path_buf());
+
+        let store = crate::store::Store::try_new(dir.path().join("notes.sqlite"))
+            .expect("a store can be made");
+        store
+            .insert(&[
+                crate::memory::Memory {
+                    text: "User drinks tea".into(),
+                },
+                crate::memory::Memory {
+                    text: "User switched to oat milk".into(),
+                },
+            ])
+            .expect("the memories are written");
+        drop(store);
+
+        let ask = |args: &[&str]| ExecCall {
+            name: "mem".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: Some(String::new()),
+            env: Default::default(),
+        };
+
+        let answered = Mem::new()
+            .exec(&ask(&["search", "notes.sqlite", "oat milk"]), Some(&here))
+            .await;
+        assert_eq!(
+            answered.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&answered.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&answered.stdout),
+            "User switched to oat milk\n"
+        );
+
+        // The bound reaches the store: two memories are near "user", and one line comes back.
+        let one = Mem::new()
+            .exec(
+                &ask(&["search", "notes.sqlite", "user", "-n", "1"]),
+                Some(&here),
+            )
+            .await;
+        assert_eq!(one.exit_code, 0);
+        assert_eq!(one.stdout.iter().filter(|b| **b == b'\n').count(), 1);
+
+        // Nothing near the question is no lines and a zero: the store was read, and it holds
+        // nothing near this.
+        let nothing = Mem::new()
+            .exec(&ask(&["search", "notes.sqlite", "almond"]), Some(&here))
+            .await;
+        assert_eq!(nothing.exit_code, 0);
+        assert!(nothing.stdout.is_empty());
+        assert!(nothing.stderr.is_empty());
+    }
+
+    /// A store that is not there is the answer, and the same one `insert` gives: a search that
+    /// made an empty store would answer every question with nothing, forever.
+    #[tokio::test]
+    async fn searching_a_store_that_is_not_there_says_so() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        let result = Mem::new()
+            .exec(
+                &ExecCall {
+                    name: "mem".into(),
+                    args: ["search", "missing.sqlite", "oat milk"]
+                        .map(String::from)
+                        .into(),
+                    cwd: Some(String::new()),
+                    env: Default::default(),
+                },
+                Some(&Here(dir.path().to_path_buf())),
+            )
+            .await;
+
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stdout.is_empty(), "nothing to read as a memory");
+        let said = String::from_utf8_lossy(&result.stderr);
+        assert!(said.contains("missing.sqlite"), "{said}");
+        assert!(
+            !dir.path().join("missing.sqlite").exists(),
+            "searching made nothing"
+        );
+    }
+
+    /// A search is a store and a question, and the count is the caller's to raise.
+    #[test]
+    fn a_search_is_bounded_whether_or_not_the_caller_says_so() {
+        let args::Command::Search(search) =
+            parse(&["search", "notes.sqlite", "oat milk"]).expect("a store and a question")
+        else {
+            panic!("search was asked for");
+        };
+        assert_eq!(search.query, "oat milk");
+        assert_eq!(search.limit, 10);
+
+        let args::Command::Search(search) =
+            parse(&["search", "notes.sqlite", "oat milk", "-n", "3"]).expect("a shorter answer")
+        else {
+            panic!("search was asked for");
+        };
+        assert_eq!(search.limit, 3);
     }
 
     /// A turn per argument, in the order they were written: argv carries the list.

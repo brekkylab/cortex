@@ -43,41 +43,44 @@ pub struct Memory {
     pub text: String,
 }
 
-impl Memory {
-    /// The terms this memory is found by, in the order they were written.
-    ///
-    /// # What a term is
-    ///
-    /// Not a word of the text, and not a substring of it: a term is what the language's own
-    /// tokenizer made of the text, normalized. Korean comes back as morphemes in decomposed
-    /// jamo, Chinese as words in traditional characters, whatever was written. So nothing
-    /// outside this compares a term to a string somebody typed — a query is cut by this same
-    /// method and compared to what it produced, which is the only comparison that holds
-    /// whichever way charabia normalizes.
-    pub fn tokenize(&self) -> Vec<String> {
-        // Built once. What a `Tokenizer` holds is the normalizer and segmenter configuration,
-        // and the dictionaries behind those are statics in charabia.
-        static TOKENIZER: OnceLock<Tokenizer<'static>> = OnceLock::new();
-        let tokenizer =
-            TOKENIZER.get_or_init(|| TokenizerBuilder::<Vec<u8>>::default().into_tokenizer());
+/// The terms `text` is found by, in the order they were written.
+///
+/// # What a term is
+///
+/// Not a word of the text, and not a substring of it: a term is what the language's own
+/// tokenizer made of the text, normalized. Korean comes back as morphemes in decomposed jamo,
+/// Chinese as words in traditional characters, whatever was written. So nothing outside this
+/// compares a term to a string somebody typed — a query is cut by this same function and
+/// compared to what it produced, which is the only comparison that holds whichever way charabia
+/// normalizes.
+///
+/// # Why this takes text and not a [`Memory`]
+///
+/// Both sides of a search come through here, and only one of them is a memory. A query is a
+/// phrase somebody typed a moment ago and will not be kept — making it a `Memory` to have it cut
+/// would be calling something a memory in order to reach a method, on the way to an argument
+/// that says a memory is a statement that stands on its own. One function over text is the same
+/// guarantee without the pretence: what is indexed and what is asked for cannot be cut two ways,
+/// because there is only one way.
+pub fn terms(text: &str) -> Vec<String> {
+    // Built once. What a `Tokenizer` holds is the normalizer and segmenter configuration,
+    // and the dictionaries behind those are statics in charabia.
+    static TOKENIZER: OnceLock<Tokenizer<'static>> = OnceLock::new();
+    let tokenizer =
+        TOKENIZER.get_or_init(|| TokenizerBuilder::<Vec<u8>>::default().into_tokenizer());
 
-        tokenizer
-            .tokenize(&self.text)
-            // Separators and whatever charabia could not classify are not terms. Only what it
-            // calls a word is a thing a search can ask for.
-            .filter(|token| token.is_word())
-            .map(|token| token.lemma().to_string())
-            .collect()
-    }
+    tokenizer
+        .tokenize(text)
+        // Separators and whatever charabia could not classify are not terms. Only what it
+        // calls a word is a thing a search can ask for.
+        .filter(|token| token.is_word())
+        .map(|token| token.lemma().to_string())
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn terms(text: &str) -> Vec<String> {
-        Memory { text: text.into() }.tokenize()
-    }
 
     /// What a search has to be able to rely on: the terms a query is cut into are terms the
     /// text was indexed under. Every assertion below is one of these in disguise.

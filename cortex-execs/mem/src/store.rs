@@ -22,7 +22,7 @@ use std::{io, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
-use crate::memory::Memory;
+use crate::memory::{Memory, terms};
 
 /// How long a connection waits for another writer before giving up.
 ///
@@ -67,7 +67,7 @@ const SCHEMA_VERSION: &str = "1";
 ///
 /// # `memory_fts_index`
 ///
-/// The inverted index over [`Memory::tokenize`], one FTS5 row per memory under the same rowid.
+/// The inverted index over [`terms`], one FTS5 row per memory under the same rowid.
 /// It is what makes "the memories nearest a query" a question SQLite can answer by term at all,
 /// and it brings `bm25()` with it — the ranking a keyword half of a search needs, which a table
 /// of `(memory, term)` pairs would leave to be hand-written against statistics it would also
@@ -103,6 +103,19 @@ const INSERT: &str = include_str!("../queries/insert.sql");
 /// [`SCHEMA`] on why the terms are an index and not data — so the two writes are two statements,
 /// held together by the transaction around them instead.
 const INDEX: &str = include_str!("../queries/index.sql");
+
+/// The memories nearest a query, nearest first — `queries/search.sql`.
+///
+/// `bm25()` ascending is best first: FTS5 scores a better match as a more negative number, so
+/// the ordering that reads as backwards is the one that puts the nearest memory on the first
+/// line. The rowid after it is not a second opinion about nearness but a tiebreak — two memories
+/// the ranking cannot separate would otherwise come back in whatever order the index walked
+/// them, and a search that answers the same question two ways is one nobody can test or script
+/// against. Oldest first among equals, since that is what a rowid is.
+///
+/// The join is how a contentless index is read at all: `memory_fts_index` holds no copy of the
+/// text, so what a match produces is rowids, and the memories are on the other side of them.
+const SEARCH: &str = include_str!("../queries/search.sql");
 
 /// An open memory store.
 ///
@@ -257,15 +270,15 @@ impl Store {
     /// microsecond would be recording the order this loop ran in.
     ///
     /// The terms are taken here rather than accepted from the caller, which is what keeps a
-    /// memory's index and its text from being able to disagree: [`Memory::tokenize`] is the only
-    /// way into `memory_fts_index`, and a search cuts a query by the same method.
+    /// memory's index and its text from being able to disagree: [`terms`] is the only way into
+    /// `memory_fts_index`, and [`Store::search`] cuts a query with the same function.
     pub fn insert(&self, memories: &[Memory]) -> io::Result<()> {
         // Before the lock, because this is the one expensive thing here: charabia is walking
         // text against a dictionary, and doing it while holding the file's write lock would make
         // every other writer wait on work that has nothing to do with the file.
         let indexed: Vec<(&str, String)> = memories
             .iter()
-            .map(|memory| (memory.text.as_str(), memory.tokenize().join(" ")))
+            .map(|memory| (memory.text.as_str(), terms(&memory.text).join(" ")))
             .collect();
 
         // A poisoned lock is a panic that happened while somebody held this connection, and it
@@ -294,6 +307,63 @@ impl Store {
         }
 
         tx.commit().map_err(sql_error)
+    }
+
+    /// The memories nearest `query`, nearest first, and at most `limit` of them.
+    ///
+    /// # What "nearest" means here
+    ///
+    /// A memory is near a query when it holds the query's terms, and nearer the more of them it
+    /// holds and the rarer they are — which is what `bm25` computes, and the reason the terms
+    /// are asked for as `or` and not `and`. Every term is a hard requirement under `and`, so a
+    /// question asked in a sentence — the way a person asks one — would answer nothing at all
+    /// the moment one of its words was not in the store, and the memory that answered it
+    /// perfectly except for `Tuesday` would be indistinguishable from a store that knew nothing.
+    /// Under `or` that memory is simply the top line, and the ranking does the work the filter
+    /// was doing badly.
+    ///
+    /// The cost of `or` is a long tail: a common word matches memories that have nothing to do
+    /// with the question, ranked low but present. `limit` is what makes that a non-issue rather
+    /// than a flaw — an answer is the first few lines, and the tail is never reached.
+    ///
+    /// # A query with no terms in it
+    ///
+    /// Punctuation, whitespace, nothing at all: no memories, and no error. There is no question
+    /// here for the index to answer — a term is what [`terms`] made of the text, and it made
+    /// none — and "no memories are near this" is a true answer to it. Refusing instead would be
+    /// this function deciding that the caller made a mistake, on the evidence of a string it
+    /// cannot read the intent of.
+    pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<String>> {
+        // Cut by the same function that cut the memories, which is the whole contract between
+        // the two halves: what charabia does to `서울에서` on the way in is what it does to
+        // `서울` on the way out, and neither side is ever compared to a string as typed.
+        let asked = terms(query);
+        if asked.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Every term quoted, because FTS5 reads the pattern as an expression in a small language
+        // of its own — `AND`, `NOT`, `*`, `:` and parentheses all mean something in it. A term is
+        // text and not an expression, and a caller searching for `NOT` means the word. Quoting is
+        // how FTS5 is told so, and doubling is its own escape for a quote inside a quoted string.
+        let expression = asked
+            .iter()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        // SQLite counts in `i64`, and a `usize` that will not fit one is a caller asking for
+        // more memories than a store could hold — which `i64::MAX` is also the answer to.
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(SEARCH).map_err(sql_error)?;
+        let found = stmt
+            .query_map((&expression, limit), |row| row.get(0))
+            .map_err(sql_error)?
+            .collect::<Result<Vec<String>, _>>()
+            .map_err(sql_error)?;
+        Ok(found)
     }
 }
 
@@ -372,33 +442,17 @@ mod tests {
         rows.collect::<Result<_, _>>().unwrap()
     }
 
-    /// What the term index is *for*, asked of it directly: the memories whose terms include
-    /// every term of `query`.
-    ///
-    /// The query goes through [`Memory::tokenize`] like the memory did, which is the whole
-    /// contract between the two halves — nothing here compares a term to a string typed in this
-    /// file. Each term is quoted because FTS5 reads its query as an expression, and a term is
-    /// text and not one; the doubling is FTS5's own escape for a quote inside a quoted string.
-    fn found(path: &Path, query: &str) -> Vec<String> {
-        let asked = Memory { text: query.into() }.tokenize();
-        assert!(!asked.is_empty(), "nothing to ask for in {query:?}");
-        let expression = asked
+    /// A store holding these memories, in this order.
+    fn holding(dir: &Path, texts: &[&str]) -> Store {
+        let store = Store::try_new(dir.join("notes.sqlite")).expect("a store can be made");
+        let memories: Vec<Memory> = texts
             .iter()
-            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let conn = connect(path, OpenFlags::SQLITE_OPEN_READ_ONLY).expect("the file opens");
-        let mut stmt = conn
-            .prepare(
-                "select memory.text from memory_fts_index
-                 join memory on memory.rowid = memory_fts_index.rowid
-                 where memory_fts_index match ?1
-                 order by bm25(memory_fts_index)",
-            )
-            .unwrap();
-        let rows = stmt.query_map((&expression,), |row| row.get(0)).unwrap();
-        rows.collect::<Result<_, _>>().unwrap()
+            .map(|text| Memory {
+                text: (*text).to_string(),
+            })
+            .collect();
+        store.insert(&memories).expect("the memories are written");
+        store
     }
 
     /// A memory goes in as a row and comes back as one, with the two facts the store gave it:
@@ -450,30 +504,175 @@ mod tests {
     #[test]
     fn a_memory_is_found_by_its_terms() {
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let path = dir.path().join("notes.sqlite");
-        let store = Store::try_new(&path).expect("a store can be made");
+        let store = holding(
+            dir.path(),
+            &[
+                "User switched to oat milk",
+                "User met a friend 서울에서 last Tuesday",
+            ],
+        );
 
-        store
-            .insert(&[
-                Memory {
-                    text: "User switched to oat milk".into(),
-                },
-                Memory {
-                    text: "User met a friend 서울에서 last Tuesday".into(),
-                },
-            ])
-            .expect("the memories are written");
+        let found = |query: &str| store.search(query, 10).expect("the store answers");
 
-        assert_eq!(found(&path, "oat milk"), ["User switched to oat milk"]);
+        assert_eq!(found("oat milk"), ["User switched to oat milk"]);
         assert_eq!(
-            found(&path, "서울"),
+            found("서울"),
             ["User met a friend 서울에서 last Tuesday"],
             "the particle came off the noun on the way in, and there is none on the way out"
         );
         // A term of both is both, and a term of neither is nothing: what is being asked of the
         // index is which memories hold the terms, not which hold the string.
-        assert_eq!(found(&path, "User").len(), 2, "lowercased on both sides");
-        assert!(found(&path, "almond").is_empty());
+        assert_eq!(found("User").len(), 2, "lowercased on both sides");
+        assert!(found("almond").is_empty());
+    }
+
+    /// What a ranking is for: the memory that holds more of the question comes first, and the
+    /// one that shares a single common word with it is last rather than absent.
+    #[test]
+    fn the_nearest_memory_is_the_first_line() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(
+            dir.path(),
+            &[
+                "User drinks coffee every morning",
+                "User switched to oat milk",
+                "User switched to oat milk in coffee after an almond allergy",
+            ],
+        );
+
+        let found = store
+            .search("oat milk in coffee", 10)
+            .expect("the store answers");
+        assert_eq!(
+            found,
+            [
+                "User switched to oat milk in coffee after an almond allergy",
+                "User switched to oat milk",
+                "User drinks coffee every morning",
+            ],
+            "every memory holds a term of the question, and they are ordered by how much of it"
+        );
+    }
+
+    /// A question asked the way a person asks one. Under `and` every word would be a
+    /// requirement and `Tuesday` alone would answer nothing; the memory that answers it is the
+    /// first line instead.
+    #[test]
+    fn a_question_is_answered_by_what_is_nearest_and_not_only_by_what_holds_all_of_it() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(
+            dir.path(),
+            &["User met a friend 서울에서 last Tuesday", "User drinks tea"],
+        );
+
+        let found = store
+            .search("which friend did the user meet in 서울", 10)
+            .expect("the store answers");
+        assert_eq!(
+            found.first().map(String::as_str),
+            Some("User met a friend 서울에서 last Tuesday"),
+            "not one memory holds every term of that question: {found:?}"
+        );
+    }
+
+    /// The bound is part of the answer: what comes back is the nearest `limit`, and it is the
+    /// nearest that survive the cut rather than whichever the index reached first.
+    ///
+    /// Which one that is, for a question of a single word, is decided by how much of each
+    /// memory the word accounts for — `bm25` weighs a term against the length of what holds it,
+    /// so the statement that is *about* coffee outranks the longer one that mentions it. Both
+    /// hold the term exactly once, so nothing but the length separates them.
+    #[test]
+    fn a_search_answers_with_at_most_what_was_asked_for() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(
+            dir.path(),
+            &[
+                "User switched to oat milk in coffee after an almond allergy",
+                "User drinks tea",
+                "User drinks coffee",
+            ],
+        );
+
+        let found = store.search("coffee", 1).expect("the store answers");
+        assert_eq!(
+            found,
+            ["User drinks coffee"],
+            "one memory, and the nearest of the two that hold the term"
+        );
+        assert!(
+            store.search("drinks", 0).unwrap().is_empty(),
+            "none is none"
+        );
+    }
+
+    /// Two memories a ranking cannot separate come back in the order they were written, every
+    /// time — a search that answered the same question two ways could not be scripted against.
+    #[test]
+    fn memories_the_ranking_cannot_separate_are_ordered_by_when_they_were_written() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(dir.path(), &["User drinks tea", "User drinks tea"]);
+
+        for _ in 0..4 {
+            assert_eq!(
+                store.search("tea", 10).expect("the store answers"),
+                ["User drinks tea", "User drinks tea"]
+            );
+        }
+    }
+
+    /// Nothing to ask for is no memories and no error: a term is what the tokenizer made of the
+    /// text, it made none, and "nothing is near this" is a true answer to that.
+    #[test]
+    fn a_query_with_no_terms_in_it_finds_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(dir.path(), &["User drinks tea"]);
+
+        for query in ["", "   ", "!!! ..."] {
+            assert!(
+                store
+                    .search(query, 10)
+                    .expect("no terms is not an error")
+                    .is_empty(),
+                "{query:?} asks for nothing"
+            );
+        }
+    }
+
+    /// FTS5 reads its pattern as an expression in a language of its own, and a query is not one:
+    /// a caller who typed `NOT` meant the word, and one who typed a quote meant a quote.
+    #[test]
+    fn a_query_that_looks_like_an_expression_is_read_as_words() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(
+            dir.path(),
+            &["User said NOT to recommend almond milk", "User drinks tea"],
+        );
+
+        assert_eq!(
+            store.search("NOT almond", 10).expect("the store answers"),
+            ["User said NOT to recommend almond milk"]
+        );
+        // Nothing here matches; what is being asserted is that asking does not fail.
+        for query in [r#"a "quoted" phrase"#, "(unbalanced", "star*", "col:on"] {
+            store
+                .search(query, 10)
+                .unwrap_or_else(|e| panic!("{query:?} is words and not syntax: {e}"));
+        }
+    }
+
+    /// A store with nothing in it answers every question with nothing, which is the one thing
+    /// `init` promises and `search` must not turn into an error.
+    #[test]
+    fn an_empty_store_answers_with_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(dir.path(), &[]);
+        assert!(
+            store
+                .search("oat milk", 10)
+                .expect("a store answers")
+                .is_empty()
+        );
     }
 
     /// Nothing to write is a write of nothing, and a store that is unchanged by it. A
