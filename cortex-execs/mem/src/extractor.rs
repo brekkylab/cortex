@@ -175,17 +175,24 @@ pub async fn extract_memories(
     Ok(answer.parse::<Answer>()?.memory)
 }
 
-/// The conversation's readable turns, in order and in the form they are sent.
+/// A turn as the instructions read one: who spoke, and what they said.
 ///
-/// A role and what was said, which is what the instructions show themselves reading — so the
-/// turns are built as that object rather than as some intermediate of this module's own. There
-/// is only one shape a turn has here, and a type that existed to be converted into this one on
-/// the next line would be a second spelling of it.
+/// A role and what was said, which is what the instructions show themselves reading — so a turn
+/// is that and nothing else, and its `Serialize` is how it reaches them. There is only one shape
+/// a turn has here, and a type that existed to be converted into this one on the next line would
+/// be a second spelling of it.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+struct Turn {
+    role: &'static str,
+    content: String,
+}
+
+/// The conversation's readable turns, in order and in the form they are sent.
 ///
 /// A turn contributes nothing when it has no text after flattening — an assistant message that
 /// is only a tool call, say — and is dropped rather than sent as an empty string, which the
 /// model would have to guess the meaning of.
-fn turns(conversation: &[Message]) -> Vec<serde_json::Value> {
+fn turns(conversation: &[Message]) -> Vec<Turn> {
     conversation
         .iter()
         .filter_map(|message| {
@@ -196,9 +203,29 @@ fn turns(conversation: &[Message]) -> Vec<serde_json::Value> {
                 Role::System | Role::Tool => return None,
             };
             let content = flatten(message);
-            (!content.is_empty()).then(|| serde_json::json!({ "role": role, "content": content }))
+            (!content.is_empty()).then_some(Turn { role, content })
         })
         .collect()
+}
+
+/// The conversation as one piece of text, for asking a store what it already holds near it.
+///
+/// Built out of [`turns`] rather than out of the messages, so that what the store is asked about
+/// is the same text the extraction will be shown. The two are one question in two halves — "what
+/// do you already hold near this?" and "what is new in this?" — and asking them about different
+/// text is how a neighbourhood comes back that has nothing to do with what the model then reads.
+/// A system turn is dropped from both for the same reason: it is the caller's instruction to a
+/// model, and searching a store for it would answer with whatever memories happen to share its
+/// wording.
+///
+/// The roles are left out. What is wanted from this is terms, and `user` and `assistant` are two
+/// words that every conversation contains and no memory is about.
+pub fn as_query(conversation: &[Message]) -> String {
+    turns(conversation)
+        .into_iter()
+        .map(|turn| turn.content)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// A message's parts as one string.
@@ -253,7 +280,7 @@ fn offer(existing: &[String]) -> String {
 /// against now — but `insert` is told a conversation and not when it was held, so today is
 /// the only honest answer to both. Threading a real observation date through is a change to
 /// what `insert` accepts, and until then saying "today" twice is at least not a lie.
-fn user_prompt(turns: &[serde_json::Value], offered: &str) -> String {
+fn user_prompt(turns: &[Turn], offered: &str) -> String {
     let today = chrono::Utc::now().date_naive();
     let new_messages = serde_json::to_string(turns).unwrap_or_else(|_| "[]".to_string());
 
@@ -479,9 +506,37 @@ mod tests {
         assert_eq!(
             turns(&conversation),
             [
-                serde_json::json!({ "role": "user", "content": "I switched to oat milk." }),
-                serde_json::json!({ "role": "assistant", "content": "Noted." }),
+                Turn {
+                    role: "user",
+                    content: "I switched to oat milk.".into()
+                },
+                Turn {
+                    role: "assistant",
+                    content: "Noted.".into()
+                },
             ]
+        );
+    }
+
+    /// The same turns, as the text a store is asked about — and without the roles, which every
+    /// conversation contains and no memory is about.
+    #[test]
+    fn a_conversation_asks_a_store_about_what_was_said_in_it() {
+        let conversation = [
+            msg(Role::System, "You are a helpful assistant."),
+            msg(Role::User, "I switched to oat milk."),
+            msg(Role::Assistant, "Noted."),
+        ];
+        assert_eq!(
+            as_query(&conversation),
+            "I switched to oat milk.\nNoted.",
+            "the instruction to the model is not something anybody said"
+        );
+        assert_eq!(as_query(&[]), "");
+        assert_eq!(
+            as_query(&[msg(Role::System, "Be helpful.")]),
+            "",
+            "nothing was said, so there is nothing to ask a store about"
         );
     }
 

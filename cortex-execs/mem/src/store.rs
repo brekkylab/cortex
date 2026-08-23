@@ -18,7 +18,7 @@
 //! the ability to create a sibling file, and concurrent writers wait on
 //! [`BUSY_TIMEOUT`](self::BUSY_TIMEOUT) rather than racing.
 
-use std::{io, path::Path, sync::Mutex};
+use std::{collections::HashSet, io, path::Path, sync::Mutex};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
 
@@ -346,8 +346,17 @@ impl Store {
         // of its own — `AND`, `NOT`, `*`, `:` and parentheses all mean something in it. A term is
         // text and not an expression, and a caller searching for `NOT` means the word. Quoting is
         // how FTS5 is told so, and doubling is its own escape for a quote inside a quoted string.
+        //
+        // Once each, because `bm25` adds up a contribution per term of the pattern: a term named
+        // twice counts twice, and what a memory is *about* would then be outweighed by whichever
+        // word the query happened to repeat. On a phrase somebody typed that is a rounding error;
+        // on a whole conversation asked as one question — which is how `insert` finds the
+        // memories it already holds — the repeated words are `the` and `user`, and they would
+        // decide the answer. First seen wins, so the order is still the order they were written.
+        let mut seen = HashSet::new();
         let expression = asked
             .iter()
+            .filter(|term| seen.insert(term.as_str()))
             .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -619,6 +628,34 @@ mod tests {
                 ["User drinks tea", "User drinks tea"]
             );
         }
+    }
+
+    /// A word repeated in the question does not count twice. `bm25` adds up a contribution per
+    /// term of the pattern, so a whole conversation asked as one question — which is what
+    /// `insert` asks to find the memories it already holds — would otherwise be decided by
+    /// whichever common word it happened to repeat, and not by what it is about.
+    ///
+    /// The corpus is chosen so that the two orders differ if the repetition is passed through:
+    /// doubling `oat` lifts the memory that holds only `oat` above the one that holds only
+    /// `milk`.
+    #[test]
+    fn a_word_repeated_in_a_question_is_asked_once() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(
+            dir.path(),
+            &["oat milk", "milk chocolate bar", "oat porridge bowl"],
+        );
+
+        let once = store.search("oat milk", 10).expect("the store answers");
+        assert_eq!(
+            once,
+            ["oat milk", "milk chocolate bar", "oat porridge bowl"]
+        );
+        assert_eq!(
+            store.search("oat oat milk", 10).expect("the store answers"),
+            once,
+            "saying `oat` twice is asking the same question"
+        );
     }
 
     /// Nothing to ask for is no memories and no error: a term is what the tokenizer made of the

@@ -162,6 +162,19 @@ mod args {
     }
 }
 
+/// How many held memories an `insert` shows the extraction.
+///
+/// Not a bound on an answer — nobody reads these — but on what one call is willing to spend on
+/// not repeating itself. The two costs are asymmetric, which is what settles the number: a
+/// memory left out of the neighbourhood is offered as new and becomes a duplicate row that
+/// nothing later retires, where a memory included needlessly is a sentence of prompt on one
+/// call. So this errs high, and higher than the ten a person is shown by `search`.
+///
+/// It is a constant and not a flag because the caller it would be a flag for does not exist: an
+/// `insert` is issued by a session that has just finished talking, and how many memories the
+/// extraction needs to see in order not to repeat one is a fact about the extraction.
+const NEIGHBOURHOOD: usize = 20;
+
 /// The `mem` command, as a name a console can delegate.
 #[derive(Debug, Clone, Default)]
 pub struct Mem {}
@@ -286,15 +299,33 @@ impl Executable for Mem {
                         }
                     };
 
-                    // Nothing offered as already held. What fills that slice is a search of the
-                    // store for the memories nearest this conversation, and the store is the
-                    // half that is not here yet — so every memory the extraction finds is new,
-                    // which is the right answer for an empty store and a wasteful one for any
-                    // other.
+                    // What the store already holds near this conversation, so that the
+                    // extraction can decline to restate it. Nothing here reconciles anything —
+                    // the neighbourhood is shown and never written back — but without it every
+                    // insert offers every fact it finds as new, and a store told the same thing
+                    // twice holds it twice with nothing to tell the copies apart. That is the
+                    // one kind of damage this command can do that no later command undoes.
+                    //
+                    // Failing rather than carrying on with an empty neighbourhood: a store that
+                    // cannot be read is about to be written to, and the honest thing to do about
+                    // a half-working store is not to add rows to it.
+                    let existing =
+                        match store.search(&extractor::as_query(&insert.messages), NEIGHBOURHOOD) {
+                            Ok(existing) => existing,
+                            Err(e) => {
+                                return ExecResult::failed(
+                                    1,
+                                    format!("mem: {}: {e}\n", store_path.display()),
+                                );
+                            }
+                        };
+
                     // `call.env` and not this process's: what pays for the call is the key the
                     // calling session had.
                     let memories =
-                        match extractor::extract_memories(&insert.messages, &[], &call.env).await {
+                        match extractor::extract_memories(&insert.messages, &existing, &call.env)
+                            .await
+                        {
                             Ok(memories) => memories,
                             // `1`: the line was understood and the work did not happen. `{e:#}` for
                             // the whole chain — which variable was unset, which model was asked,
@@ -440,6 +471,91 @@ mod tests {
         assert!(
             !memories.iter().any(|m| hangul(&m.text)),
             "the conversation is Korean and the memories are English: {memories:#?}"
+        );
+    }
+
+    /// The same conversation twice, through the whole command both times. The second `insert`
+    /// is shown what the first wrote and has nothing left to add — which is the only way to see
+    /// that the neighbourhood reaches the extraction at all, since everything between the
+    /// search and the answer happens inside a model.
+    ///
+    /// Ignored for the reason the test above is, and worth running whenever anything on the
+    /// path between [`Store::search`](crate::store::Store::search) and the prompt changes: a
+    /// store that quietly stopped offering what it holds looks exactly like one that works,
+    /// until it has two copies of everything.
+    ///
+    /// ```text
+    /// cargo test -p cortex-exec-mem a_conversation_inserted_twice -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "asks a real provider: needs a key, a network, and spends money"]
+    async fn a_conversation_inserted_twice_is_not_remembered_twice() {
+        dotenvy::dotenv().ok();
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+        let here = Here(dir.path().to_path_buf());
+
+        let env: std::collections::BTreeMap<_, _> = std::env::vars().collect();
+        let call = |args: &[&str]| ExecCall {
+            name: "mem".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: Some(String::new()),
+            env: env.clone(),
+        };
+
+        let made = Mem::new()
+            .exec(&call(&["init", "notes.sqlite"]), Some(&here))
+            .await;
+        assert_eq!(
+            made.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let conversation = [
+            "insert",
+            "notes.sqlite",
+            r#"{"role":"user","contents":[{"type":"text","text":
+               "I switched from almond milk to oat milk because I developed an almond allergy."}]}"#,
+            r#"{"role":"assistant","contents":[{"type":"text","text":
+               "Noted — I will keep that in mind when suggesting recipes."}]}"#,
+        ];
+
+        let first = Mem::new().exec(&call(&conversation), Some(&here)).await;
+        assert_eq!(
+            first.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let first = String::from_utf8_lossy(&first.stdout);
+        println!("--- first insert ---\n{first}");
+        assert!(!first.trim().is_empty(), "the conversation carries a fact");
+
+        let again = Mem::new().exec(&call(&conversation), Some(&here)).await;
+        assert_eq!(
+            again.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+        let again = String::from_utf8_lossy(&again.stdout);
+        println!("--- second insert ---\n{again}");
+
+        // What can honestly be asserted about a model's judgement: not that it writes nothing,
+        // but that it does not write the store over again. A fact phrased a second way is one
+        // line; a store that was never shown its own contents answers with all of them.
+        let lines = |said: &str| said.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            lines(&again) < lines(&first),
+            "the second reading was shown what the first wrote:\n{again}"
         );
     }
 
