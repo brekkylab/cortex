@@ -9,7 +9,7 @@ When a conversation covers multiple topics, extract each one separately. Do not 
 
 # INPUTS
 
-## New Messages
+## Messages
 
 The current conversation turn(s).
 Exactly two fields of a turn are your input: "role", which is always "user" or "assistant", and "content", what was said in that turn.
@@ -27,27 +27,15 @@ Do NOT extract:
 - Generic assistant acknowledgments ("Sure!", "Great question!")
 - Assistant meta-commentary about its own capabilities
 
-## Summary
-
-A narrative summary of the user's profile from prior conversations. May be empty for new users. Use it to enrich extractions — it holds established context like names, locations, and relationships.
-
-## Recently Extracted Memories
-
-Memories already captured from recent messages in this session (up to 20). This is your primary deduplication reference — do not re-extract information already captured here.
-
 ## Existing Memories
 
 Memories currently in the system relevant to this conversation. Formatted as:
-[{"id": "uuid-string", "text": "..."}, ...]
+[{"id": "0", "text": "..."}, ...]
 
-Use these ONLY for deduplication — do NOT extract new memories from Existing Memories. Your extractions must come exclusively from New Messages. If new information in New Messages is semantically equivalent to an Existing Memory with no meaningful new context, skip it.
+Use these ONLY for deduplication — do NOT extract new memories from Existing Memories. Your extractions must come exclusively from Messages. If new information in Messages is semantically equivalent to an Existing Memory with no meaningful new context, skip it.
 
 
 IMPORTANT: An existing memory about an entity (e.g., "User has a dog named Max") does NOT mean all information about that entity has been captured. New events, activities, experiences, or details about a known entity MUST still be extracted as separate memories. Only skip extraction when the specific fact or event itself is already captured — not merely because the entity appears in an existing memory. "User has a dog named Max" and "User went on a camping trip with Max where they hiked and swam" are two distinct memories, not duplicates.
-
-## Last k Messages
-
-Recent messages (up to 20) preceding New Messages. Use to resolve references and pronouns in New Messages.
 
 ## Observation Date
 
@@ -65,13 +53,6 @@ CRITICAL: "User went to Paris last week" is useless 6 months later. "User went t
 ## Current Date
 
 Today's system date. May be years after Observation Date. Do NOT use this to resolve temporal references in messages — only Observation Date grounds user and assistant statements.
-
-## Optional Inputs
-
-- **includes**: Topics to focus on
-- **excludes**: Topics to skip
-- **custom_instructions**: User-defined rules (highest priority)
-- **feedback_str**: Adjust extraction based on this feedback
 
 
 # GUIDELINES
@@ -222,7 +203,7 @@ Misinterpreting the user's words is worse than not extracting at all.
   - RIGHT: "The Bajimaya v Reward Homes case involved construction starting in 2014, contract signed in 2015, with completion due by October 2015" / "The tribunal found Reward Homes breached its contract through poor workmanship, waterproofing defects, and non-compliance with the Building Code of Australia"
   - WRONG: "Assistant created a D&D adventure with enemies"
   - RIGHT: "The Lost Temple of the Djinn adventure includes 4 Mummies (AC 11, 45 HP), 2 Construct Guardians (AC 17, 110 HP), and 6 Skeletal Warriors (AC 12, 22 HP)"
-- **No Detail Contamination from Context**: When extracting from New Messages, do NOT import or merge details from Existing Memories or Recent Memories into the new extraction UNLESS the new message explicitly references those details. If the New Message says "I had a great meal" and an Existing Memory says "User's favorite restaurant is Olive Garden," do NOT produce "User had a great meal at Olive Garden" — the new message never mentioned the restaurant. Each extraction must be faithful to its source message only.
+- **No Detail Contamination from Context**: When extracting from Messages, do NOT import or merge details from Existing Memories into the new extraction UNLESS the message explicitly references those details. If a Message says "I had a great meal" and an Existing Memory says "User's favorite restaurant is Olive Garden," do NOT produce "User had a great meal at Olive Garden" — the message never mentioned the restaurant. Each extraction must be faithful to its source message only.
 
 
 # EXAMPLES
@@ -230,10 +211,8 @@ Misinterpreting the user's words is worse than not extracting at all.
 
 ## Example 1: Multi-Topic Extraction
 
-Summary: ""
-Recently Extracted: []
 Existing Memories: []
-New Messages:
+Messages:
 [{"role": "user", "content": "Hey! I'm Marcus. I just got promoted to Senior Engineer at Shopify last week - been grinding for two years for this. My wife Elena and I celebrated with dinner at Osteria Francescana, it's our go-to spot for special occasions. We're also expecting our first baby in March!"},
  {"role": "assistant", "content": "Congratulations on everything, Marcus! What exciting times."}]
 Observation Date: 2025-08-19
@@ -250,10 +229,8 @@ Three distinct topics — career, relationship/dining, family milestone — each
 
 ## Example 2: Extracting from Assistant Recommendations
 
-Summary: "User is an aspiring stand-up comedian interested in improving their craft."
-Recently Extracted: []
 Existing Memories: []
-New Messages:
+Messages:
 [{"role": "user", "content": "Can you recommend some sports documentaries on Netflix with strong storytelling? I love \"The Last Dance\" by Michael Jordan."},
  {"role": "assistant", "content": "Great taste! Here are some Netflix documentaries known for their storytelling: 1) \"Formula 1: Drive to Survive\" (behind the scenes of Formula 1 racing) 2) \"Athlete A\" (investigative look at USA Gymnastics) 3) \"The Battered Bastards of Baseball\" (independent baseball story). All focus on powerful, narrative-driven sports stories."}]
 Observation Date: 2023-06-01
@@ -264,37 +241,33 @@ Output:
   {"id": "1", "text": "User was recommended the following sports documentaries on Netflix for storytelling: 'Formula 1: Drive to Survive', 'Athlete A', and 'The Battered Bastards of Baseball'"}
 ]}
 
-The user's viewing preference (Netflix stand-up comedy) is extracted alongside the assistant's specific recommendations. Both are valuable for future personalization.
+The user's viewing preference is extracted alongside the assistant's specific recommendations. Both are valuable for future personalization.
 
 
 ## Example 3: Nothing to Extract
 
-Summary: "User is a product manager named David."
 Existing Memories: [{"id": "0", "text": "David is a product manager at a fintech startup"}]
-New Messages:
+Messages:
 [{"role": "user", "content": "Hey, good morning!"},
  {"role": "assistant", "content": "Good morning, David! How can I help you today?"}]
 Observation Date: 2025-08-19
 
 Output: {"memory": []}
 
-## Example 5: Deduplication — Skip Already Captured
+## Example 4: Deduplication — Skip Already Captured
 
-Recently Extracted: ["Marcus was promoted to Senior Engineer at Shopify around August 12, 2025"]
 Existing Memories: [{"id": "0", "text": "Marcus was promoted to Senior Engineer at Shopify around August 12, 2025"}]
-New Messages:
+Messages:
 [{"role": "user", "content": "Still can't believe I got the senior engineer promotion at Shopify!"}]
 Observation Date: 2025-08-19
 
 Output: {"memory": []}
 
 
-## Example 6: Extract ALL Dimensions — Don't Miss Secondary Info
+## Example 5: Extract ALL Dimensions — Don't Miss Secondary Info
 
-Summary: "User is an aspiring actor."
-Recently Extracted: []
 Existing Memories: []
-New Messages:
+Messages:
 [{"role": "user", "content": "As an aspiring actor, I'm looking for advice on improving my craft. Can you recommend some films on Netflix with strong acting performances like Daniel Day-Lewis in 'There Will Be Blood'? I also want to find online resources for acting techniques."},
  {"role": "assistant", "content": "For Netflix films with great acting, check out 'Marriage Story' and 'The Irishman'. For acting techniques, I'd recommend 'An Actor Prepares' by Stanislavski and the MasterClass by Helen Mirren."}]
 Observation Date: 2023-06-01
@@ -309,11 +282,10 @@ Output:
 Three dimensions: (1) career aspiration, (2) entertainment viewing preference, (3) specific recommendations. Each extracted separately.
 
 
-## Example 7: Vague Temporal References with Historical Observation Date
+## Example 6: Vague Temporal References with Historical Observation Date
 
-Recently Extracted: ["User started reading 'The Hitchhiker's Guide to the Galaxy' on January 16, 2022"]
 Existing Memories: [{"id": "0", "text": "User started reading 'The Hitchhiker's Guide to the Galaxy' on January 16, 2022"}]
-New Messages:
+Messages:
 [{"role": "user", "content": "I've actually listened to Ready Player One as an audiobook recently and enjoyed the pop culture references."}]
 Observation Date: 2022-01-16
 Current Date: 2026-02-18
@@ -324,12 +296,10 @@ Output:
 "Recently" is grounded to the Observation Date (January 2022), NOT Current Date (February 2026). The Hitchhiker's Guide memory already exists — not re-extracted.
 
 
-## Example 8: Document / Reference Material — Extract Content, Not Actions
+## Example 7: Document / Reference Material — Extract Content, Not Actions
 
-Summary: ""
-Recently Extracted: []
 Existing Memories: []
-New Messages:
+Messages:
 [{"role": "user", "content": "I want you to remember this case. If you understand, just say acknowledged. Bajimaya v Reward Homes Pty Ltd [2021] NSWCATAP 297 — The construction began in 2014, contract signed in 2015 with completion due by October 2015. The plaintiff received keys in December 2016 and found defects including incomplete works, poor workmanship, and non-compliance with the building code. The tribunal found the builder breached contract."},
  {"role": "assistant", "content": "Acknowledged."}]
 Observation Date: 2024-03-10
@@ -344,12 +314,10 @@ Output:
 The user shared reference material to be remembered. Extract the actual factual content — dates, parties, findings — NOT "User shared a case summary" or "User asked to remember a case."
 
 
-## Example 9: Structured Data with Counts and Specifics
+## Example 8: Structured Data with Counts and Specifics
 
-Summary: ""
-Recently Extracted: []
 Existing Memories: []
-New Messages:
+Messages:
 [{"role": "user", "content": "Here are the enemy stat blocks for our D&D campaign: Mummies (4): AC 11, HP 45, Speed 20 ft, with Curse of the Pharaohs (DC 15 Wisdom) and Mummy Rot (DC 15 Constitution). Construct Guardians (2): AC 17, HP 110, Speed 30 ft, with Immutable Form, Magic Resistance, and Siege Monster. Skeletal Warriors (6): AC 12, HP 22, Speed 30 ft, with Undead Fortitude."},
  {"role": "assistant", "content": "Got it! I've noted all the stat blocks. Ready when you want to start the encounter."}]
 Observation Date: 2024-01-15
@@ -364,12 +332,10 @@ Output:
 Every count (4 Mummies, 2 Construct Guardians, 6 Skeletal Warriors) and every specific value (AC, HP, DCs, trait names) is preserved. Dropping the counts or stat values would destroy the most queryable information.
 
 
-## Example 10: Two Topics in One Message
+## Example 9: Two Topics in One Message
 
-Summary: ""
-Recently Extracted: []
 Existing Memories: [{"id": "a1b2c3d4-5678-9abc-def0-111111111111", "text": "User has a dog named Poppy, a golden retriever"}, {"id": "b2c3d4e5-6789-abcd-ef01-222222222222", "text": "User works as a Senior Engineer at Shopify"}]
-New Messages:
+Messages:
 [{"role": "user", "content": "Poppy had her vet checkup yesterday — she's healthy but needs to lose a few pounds. Also, I'm switching teams at work next month to the payments platform."}]
 Observation Date: 2025-03-15
 
@@ -382,12 +348,10 @@ Output:
 One message carried two unrelated topics and both were extracted. Neither was skipped for appearing in an Existing Memory: the existing memories establish that Poppy and Shopify are known, not that the checkup and the team switch are already captured.
 
 
-## Example 11: Long Multi-Topic Conversation — Don't Stop After First Topic
+## Example 10: Long Multi-Topic Conversation — Don't Stop After First Topic
 
-Summary: ""
-Recently Extracted: []
 Existing Memories: []
-New Messages:
+Messages:
 [{"role": "user", "content": "I adopted a puppy named Max last weekend! He's a beagle mix."},
  {"role": "assistant", "content": "Congratulations! How's he settling in?"},
  {"role": "user", "content": "Great! Oh, and I also started pottery classes on Tuesdays. Made a mug with my daughter's face on it."},
@@ -407,12 +371,10 @@ Output:
 FIVE topics across 5 messages — each one extracted separately. Do not stop after the first topic (the puppy). The pottery mug detail, the sister's move, and the emotional reaction to the promotion are all distinct, extractable facts.
 
 
-## Example 12: Multi-Speaker Conversation — Extract From ALL Speakers
+## Example 11: Multi-Speaker Conversation — Extract From ALL Speakers
 
-Summary: "John has a dog named Max."
-Recently Extracted: []
 Existing Memories: [{"id": "a1b2c3d4-0000-0000-0000-111111111111", "text": "John has a dog named Max"}]
-New Messages:
+Messages:
 [{"role": "user", "content": "John: Max and I had a blast on our camping trip last summer. We hiked, swam, and made great memories. It was a really peaceful experience."},
  {"role": "assistant", "content": "Maria: That sounds amazing! I actually just got a new cat named Bailey last week — she's been such a joy already. Camping with pets is so soul-nourishing."},
  {"role": "user", "content": "John: Congrats on Bailey! Here's a picture of my family too — that was from a trip we took for my daughter Sara's birthday last fall."}]

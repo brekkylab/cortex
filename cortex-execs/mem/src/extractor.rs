@@ -74,26 +74,51 @@ use crate::memory::Memory;
 /// and identifiers in the script they were written in. A tag would be a knob two conversations set
 /// two ways, and a store whose memories are half in one language answers a search well in neither.
 ///
-/// Two more edits are to prose rather than to the answer. `# ROLE` no longer opens with a
-/// persona and "your sole operation is ADD", because there is one operation here — naming it the
-/// sole one describes a set of alternatives this prompt was never given. And `## New Messages`
-/// now says which two fields of a turn are the input, `role` and `content` and nothing else,
-/// because a conversation in this workspace carries more than that: a message has `thinking` and
-/// `tool_calls` beside its contents, and a `Tool` turn is a whole role of machine output.
-/// [`turns`] and [`flatten`] drop all of it before anything is sent, so the sentence is not what
-/// makes the input clean — it is what keeps a model from reading such material as something
-/// somebody said in the case where it arrives inside a turn's text anyway.
+/// # The inputs it does not have
+///
+/// `# INPUTS` describes four sections, and [`user_prompt`] sends four. Upstream describes eight,
+/// and the four that are gone are the ones nothing here could fill: `Summary`,
+/// `Recently Extracted Memories`, `Last k Messages`, and the optional
+/// `includes`/`excludes`/`custom_instructions`/`feedback_str`. A prompt that describes an input
+/// it is never given is not a section that happens to be empty — it is an instruction the model
+/// cannot follow, and it pays for the words twice, once to describe the input and once to
+/// wonder where it went.
+///
+/// `Last k Messages` is the one that could not be filled even in principle: it is the window of
+/// turns *preceding* the ones being read, and `insert` is handed a conversation rather than a
+/// position in one. What it was for — resolving a pronoun against what came before — the
+/// conversation does itself, because all of it is sent. With it gone there is one set of
+/// messages and nothing to tell them apart from, which is why `## Messages` is not
+/// `## New Messages`.
+///
+/// `Recently Extracted Memories` is the one worth arguing. Upstream keeps a session's own
+/// deduplication list beside the store's, for a reading split across several calls. Here the two
+/// lists would be one: a conversation is read in a single call, and what the store holds near it
+/// is already `## Existing Memories`. There is no earlier chunk of this same reading whose
+/// memories have not landed yet.
+///
+/// `Summary` would be a profile written by something that does not exist. Nothing in this crate
+/// summarises a user, and an empty section under instructions that say to enrich extractions
+/// with it is worse than no section at all.
+///
+/// # Edits to prose
+///
+/// `# ROLE` no longer opens with a persona and "your sole operation is ADD", because there is
+/// one operation here — naming it the sole one describes a set of alternatives this prompt was
+/// never given. And `## Messages` now says which two fields of a turn are the input, `role` and
+/// `content` and nothing else, because a conversation in this workspace carries more than that:
+/// a message has `thinking` and `tool_calls` beside its contents, and a `Tool` turn is a whole
+/// role of machine output. [`turns`] and [`flatten`] drop all of it before anything is sent, so
+/// the sentence is not what makes the input clean — it is what keeps a model from reading such
+/// material as something somebody said in the case where it arrives inside a turn's text anyway.
+///
+/// `## Existing Memories` shows its ids as `"0"` because that is what [`offer`] sends, where
+/// upstream shows a UUID. The examples lost the two input lines they carried for sections that
+/// are gone, and are numbered without the gap upstream has.
 ///
 /// Nothing else is changed, and the prompt is kept as a file rather than a string literal, so
 /// that it stays diffable against the upstream one: a prompt quietly improved in a dozen places
 /// is a prompt nobody can tell apart from the version it was tested as.
-///
-/// Kept that way, it names inputs beyond what is supplied here — `Summary`,
-/// `Recently Extracted Memories`, `Last k Messages`, and the optional
-/// `includes`/`excludes`/`feedback`. [`user_prompt`] emits those sections empty rather than
-/// dropping them, because a prompt that describes a section its input does not contain reads
-/// to the model as a section that happened to be empty, where a missing one reads as an
-/// instruction it failed to follow.
 const INSTRUCTIONS: &str = include_str!("../prompts/EXTRACTION.md");
 
 /// The provider used when `$MEM_LLM_PROVIDER` says nothing.
@@ -272,7 +297,11 @@ fn offer(existing: &[String]) -> String {
     serde_json::to_string(&listed).unwrap_or_else(|_| "[]".to_string())
 }
 
-/// The sections the instructions expect, in the order they name them.
+/// The sections the instructions name, all of them, in the order they are named.
+///
+/// All of them and no others is the property worth having, and it is asserted rather than
+/// maintained by hand: see [`INSTRUCTIONS`] on why a section described and not sent is worse
+/// than one that was never described.
 ///
 /// `Observation Date` and `Current Date` are both today. The distinction the instructions
 /// draw between them is real and worth keeping the sections for — a conversation imported
@@ -282,17 +311,11 @@ fn offer(existing: &[String]) -> String {
 /// what `insert` accepts, and until then saying "today" twice is at least not a lie.
 fn user_prompt(turns: &[Turn], offered: &str) -> String {
     let today = chrono::Utc::now().date_naive();
-    let new_messages = serde_json::to_string(turns).unwrap_or_else(|_| "[]".to_string());
+    let messages = serde_json::to_string(turns).unwrap_or_else(|_| "[]".to_string());
 
-    // Empty rather than absent: see INSTRUCTIONS. `Summary` and `Last k Messages` are
-    // free text the instructions read as prose, so their empty form is nothing at all;
-    // `Recently Extracted Memories` is a JSON list, so its empty form is an empty list.
     [
-        "## Summary\n".to_string(),
-        "## Last k Messages\n".to_string(),
-        "## Recently Extracted Memories\n[]".to_string(),
         format!("## Existing Memories\n{offered}"),
-        format!("## New Messages\n{new_messages}"),
+        format!("## Messages\n{messages}"),
         format!("## Observation Date\n{today}"),
         format!("## Current Date\n{today}"),
         "# Output:".to_string(),
@@ -640,31 +663,75 @@ mod tests {
             .expect("the output schema must be valid JSON Schema");
     }
 
+    /// The inputs the instructions describe and the sections the prompt sends are the same set,
+    /// asserted in both directions.
+    ///
+    /// Read off [`INSTRUCTIONS`] rather than listed here, because a list written in this file is
+    /// a third copy of the same fact and drifts from both: a section renamed in the prompt file
+    /// and not in [`user_prompt`] would leave a hand-written list passing, describing an input
+    /// the model is never sent. What the two directions catch are the two ways that goes wrong —
+    /// an input described and not supplied, and a section supplied that nothing explains.
     #[test]
-    fn the_prompt_names_every_section_the_instructions_read() {
+    fn the_prompt_sends_every_input_the_instructions_describe_and_no_other() {
+        // The `## ` headings under `# INPUTS`, up to wherever the next top-level heading starts.
+        let described: Vec<&str> = INSTRUCTIONS
+            .lines()
+            .skip_while(|line| line.trim() != "# INPUTS")
+            .take_while(|line| !line.starts_with("# GUIDELINES"))
+            .filter(|line| line.starts_with("## "))
+            .collect();
+        assert!(
+            !described.is_empty(),
+            "the instructions describe their inputs under `# INPUTS`"
+        );
+
         let turns = turns(&[msg(Role::User, "I switched to oat milk")]);
         let prompt = user_prompt(&turns, "[]");
-        for section in [
-            "## Summary",
-            "## Last k Messages",
-            "## Recently Extracted Memories",
-            "## Existing Memories",
-            "## New Messages",
-            "## Observation Date",
-            "## Current Date",
-            "# Output:",
-        ] {
+        let sent: Vec<&str> = prompt
+            .lines()
+            .filter(|line| line.starts_with("## "))
+            .collect();
+
+        for section in &described {
             assert!(
-                prompt.contains(section),
-                "the instructions describe `{section}`, so the prompt has to carry it"
+                sent.contains(section),
+                "the instructions describe `{section}` and the prompt does not send it: {sent:?}"
             );
         }
+        for section in &sent {
+            assert!(
+                described.contains(section),
+                "the prompt sends `{section}` and the instructions do not describe it: \
+                 {described:?}"
+            );
+        }
+
+        // Not an input, so it is not in the set above — and the one line the model is told to
+        // answer after.
+        assert!(prompt.contains("# Output:"));
         assert!(prompt.contains(r#"{"role":"user","content":"I switched to oat milk"}"#));
         assert!(
             !prompt.contains("Language"),
             "no section names a language: every memory is English, and an input that could say \
              otherwise is one the instructions no longer read"
         );
+    }
+
+    /// The inputs upstream fills from a service and this crate cannot: gone from the
+    /// instructions, not sent empty. See [`INSTRUCTIONS`].
+    #[test]
+    fn the_instructions_describe_no_input_this_crate_has_nothing_to_put_in() {
+        for absent in [
+            "## Summary",
+            "## Recently Extracted Memories",
+            "## Last k Messages",
+            "## Optional Inputs",
+        ] {
+            assert!(
+                !INSTRUCTIONS.contains(absent),
+                "`{absent}` is an input nothing here supplies"
+            );
+        }
     }
 
     #[test]
