@@ -1409,3 +1409,36 @@ async fn a_listing_buys_the_month_and_the_days_come_with_it() {
         "the listing already paid for them"
     );
 }
+
+/// A month directory is arithmetic. `stat` on one must not fetch it.
+///
+/// This is the arm a kernel finds and the trait alone does not: NFS looks up every entry a
+/// readdir named, so one `ls <year>` becomes a lookup per month — and with a bare month falling
+/// through to the fetching arm, twelve month fetches. Measured against a live mount before the
+/// fix, `ls 2026` took eighteen seconds.
+#[tokio::test]
+async fn stat_on_a_month_directory_costs_no_request() {
+    let vol = two_days();
+    // The conversation listing is the only thing allowed to have cost anything.
+    vol.list(Path::new("/channels")).await.unwrap();
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+
+    // Every month of the span, the way a readdir of the year would.
+    let year = Path::new("/channels/pricing__C1/2026");
+    for m in names(&vol.list(year).await.unwrap()) {
+        let st = vol.stat(&year.join(&m)).await.expect("a month stats");
+        assert_eq!(st.kind, DirentKind::Dir, "{m}");
+    }
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before,
+        "a month is a name, not a fetch"
+    );
+
+    // And a month outside the span is still refused, also for nothing.
+    assert!(matches!(
+        vol.stat(Path::new("/channels/pricing__C1/2026/07")).await,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+    ));
+    assert_eq!(vol.source.calls.history.load(Ordering::SeqCst), before);
+}

@@ -625,6 +625,21 @@ impl<S: MessengerSource> MessengerFs<S> {
                             Err(io_err(io::ErrorKind::NotFound))
                         }
                     }
+                    // A month on its own is arithmetic, and this arm is what keeps it that
+                    // way: without it a bare month falls into `[y, m, tail @ ..]` below with an
+                    // empty tail and fetches the whole month to answer `stat`. Nothing in the
+                    // unit suite stats a month directory, so the cost only showed up once a
+                    // kernel was in front of the tree — NFS looks up every entry a readdir
+                    // named, so one `ls <year>` became twelve month fetches.
+                    [y, m] => {
+                        let (year, mon) =
+                            month_of(y, m).ok_or(io_err(io::ErrorKind::NotFound))?;
+                        if self.reaches(&conv, year, mon) {
+                            Ok(Node::Dir)
+                        } else {
+                            Err(io_err(io::ErrorKind::NotFound))
+                        }
+                    }
                     // A day file names the one day it wants, so only that day is fetched. The
                     // arms below need the month itself — a listing has to name every day that
                     // has anything, and `threads/`/`files/` are the month's.
