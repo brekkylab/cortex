@@ -65,8 +65,12 @@ impl<S: MessengerSource + MessengerIndex> Searchable for Messenger<S> {
                 return Ok(Vec::new());
             }
 
-            // Both cost one request and both are cached by the source, so they are fetched once
-            // for the whole answer rather than per hit.
+            // Once for the whole answer rather than per hit, which is why they are fetched
+            // before the map and not inside it. Neither is cheap and neither is kept: a
+            // roster is `ceil(members / 200)` requests, and a source holds nothing between
+            // calls — the tree's cache belongs to the mount, not to this. So two searches in
+            // one second pay for the roster twice, and on a large workspace that is most of
+            // what a search costs.
             let names = self.roster().await;
             let listed = self.listing().await;
 

@@ -10,8 +10,8 @@
 //!
 //! This is the other half, and the division is the whole design:
 //!
-//! * **recall** comes from whatever index the service already has — one request, and it reaches
-//!   content the tree would have to walk to find;
+//! * **recall** comes from whatever index the service already has — one query, whatever its
+//!   pages cost, and it reaches content the tree would have to walk to find;
 //! * **precision** comes from the tree, because the hits are *paths*, and `grep` over a handful
 //!   of named files says things no index can express.
 //!
