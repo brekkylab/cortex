@@ -1,6 +1,6 @@
 //! The Slack Web API client behind the Slack mount.
 //!
-//! Three things make this unlike [`NotionVolume`](crate::fs::NotionVolume)'s inline
+//! Three things make this unlike [`NotionFs`](crate::fs::NotionFs)'s inline
 //! client:
 //!
 //! - **Slack signals failure inside a 200** (`{"ok": false, "error": …}`), so a status-only
@@ -147,12 +147,12 @@ fn check_file_host(url: &reqwest::Url, base_url: Option<&str>) -> SourceResult<(
 /// "even if the end of the conversation history hasn't been reached", and a rate-limited
 /// app gets 15 objects per response regardless. Nothing here may assume a full page.
 ///
-/// A day's window and the two directory listings each tend to fit in one page. A history
-/// *walk* is the one caller bounded by pages rather than by messages, so a larger page
-/// would reach further back for the same number of requests — but how much further cannot
-/// be measured from here, while the cost is certain: every page of a walk is held in memory
-/// at once. Unmeasurable gain, measurable cost, and past Slack's own advice — so the walk
-/// asks for the same 200 as everything else.
+/// A day's window and the two directory listings each tend to fit in one page, so for most of
+/// what this client asks the size decides nothing. Where it decides something is a walk long
+/// enough to page, and there it trades requests against nothing else: every page is held until
+/// the walk ends either way, so the peak is the whole listing whatever the page size was. A
+/// larger page would spend fewer requests on it — and Slack advises against one, which settles
+/// a trade with nothing on the other side.
 const PAGE_LIMIT: usize = 200;
 /// Pages a walk will follow before deciding the cursor is broken rather than long.
 ///
@@ -287,7 +287,7 @@ impl SlackAccessor {
     ///
     /// The single gate on the API. Slack answers HTTP 200 with `{"ok": false, "error": …}`
     /// for application errors, so this checks `ok` and turns a failure into a typed
-    /// [`SlackApiError`] — without it, every permission error and rate limit would read as
+    /// [`ApiError`] — without it, every permission error and rate limit would read as
     /// a successful empty response. A 429 or 5xx (transport-level) and `error:
     /// "ratelimited"` (application-level) both retry with bounded backoff.
     async fn call(&self, method: &str, params: &[(&str, String)]) -> SourceResult<Value> {

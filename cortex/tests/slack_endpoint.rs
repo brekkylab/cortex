@@ -357,7 +357,7 @@ async fn the_workspace_opens_as_a_tree() {
 
     // And the file reads, one JSON object per line, through a handle like any other file.
     let p = format!("{month_dir}/{day}");
-    let stat = vol.stat(Path::new(&p)).await.expect("chat.jsonl stats");
+    let stat = vol.stat(Path::new(&p)).await.expect("the day file stats");
     let mut buf = vec![0u8; stat.size as usize];
     let n = vol
         .read_at(Path::new(&p), &mut buf, 0)
@@ -367,7 +367,7 @@ async fn the_workspace_opens_as_a_tree() {
     let text = String::from_utf8(buf).expect("utf-8");
 
     let lines: Vec<&str> = text.lines().collect();
-    eprintln!("  chat.jsonl: {} bytes, {} lines", stat.size, lines.len());
+    eprintln!("  day file: {} bytes, {} lines", stat.size, lines.len());
     assert!(!lines.is_empty(), "a listed day is never empty");
     for l in &lines {
         let v: serde_json::Value = serde_json::from_str(l).expect("one object per line");
@@ -555,7 +555,7 @@ async fn a_second_workspace_is_a_second_mount() {
     let mut bytes = Vec::new();
     for at in ["/chat/one", "/chat/two/nested"] {
         let p = format!("{at}/{relative}/{month}/{day}");
-        let stat = fs.stat(Path::new(&p)).await.expect("chat.jsonl stats");
+        let stat = fs.stat(Path::new(&p)).await.expect("the day file stats");
         let mut buf = vec![0u8; stat.size as usize];
         let n = fs.read_at(Path::new(&p), &mut buf, 0).await.expect("reads");
         buf.truncate(n);

@@ -7,7 +7,7 @@
 //! Slack float-seconds string, a Discord snowflake, an RFC 3339 instant), an author is an
 //! [`Author`], a thread is [`Thread`]. That is what makes one `jq` filter work across every
 //! source — the point of the lane, and the reason the tree-building code
-//! ([`MessengerVolume`](super::MessengerVolume)) is written once rather than per platform.
+//! ([`MessengerFs`](super::MessengerFs)) is written once rather than per platform.
 //!
 //! Not normalized: [`Message::raw`] keeps the platform's own object. A normalization that
 //! cannot be escaped is one that decides in advance what nobody will need, and the
@@ -22,16 +22,16 @@
 //! one, so the listing it produces is a window that reads like a whole — and the reader is an
 //! agent, which has no way to tell the difference and stops looking.
 //!
-//! So the tree generates the axis instead, from [`Conversation::created`] to today. Every day
-//! in a conversation's life is a directory whether or not it holds anything, and finding out
-//! costs the request that reads it. What that buys is a listing that spends **no** request and
-//! is never a window: an agent sees the whole span, and can tell how much there is before
-//! asking for any of it.
+//! So the tree generates the axis instead, from [`Conversation::created`] to today. `<year>/`
+//! and `<month>/` are arithmetic over those two dates: they are always complete, they are never
+//! a window, and listing them spends no request past the one that listed the conversation. An
+//! agent sees the whole span before asking for any of it, and a channel carrying fifty thousand
+//! messages a day has no more of them than a silent one of the same age.
 //!
-//! The cost is bounded by a conversation's *lifetime* rather than by its traffic — a channel
-//! carrying fifty thousand messages a day has no more directories than a silent one of the same
-//! age — and the axis is split into `<year>/<month>/<day>` so no single listing is longer than
-//! the days in a month.
+//! A month is where that stops being free, and it is the unit a window buys. Inside one, only a
+//! day that *has* messages is a name — a day file, not a directory level — because naming every
+//! silent day is what the walk was rejected for, and an agent cannot tell an empty directory
+//! from a failed request without paying a round trip to find out.
 
 use std::ops::Range;
 use std::time::SystemTime;

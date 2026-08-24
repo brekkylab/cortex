@@ -208,7 +208,7 @@ pub struct MessengerFs<S> {
     source: Arc<S>,
     /// The timestamp every synthesized directory reports.
     ///
-    /// Fixed at construction for the reason [`Workspace`](crate::fs::Workspace)'s is: a
+    /// Fixed at construction for the reason [`WorkFs`](crate::fs::WorkFs)'s is: a
     /// directory advertising `now()` on each `stat` looks perpetually modified, and a guest
     /// that negotiated `AUTO_INVAL_DATA` watches that field to decide when to drop cached
     /// pages.
@@ -406,10 +406,16 @@ impl<S: MessengerSource> MessengerFs<S> {
     /// and the reason a day file exists only for a day that has one.
     async fn assemble(&self, msgs: &[super::Message], as_one: Option<String>) -> io::Result<Body> {
         // Names resolved once for the whole run rather than per line, because a line without a
-        // name is a line nobody can `grep` for by person. Not cheap, and the cost does not
-        // scale with what is being read: a roster is `ceil(members / 200)` requests, so a
-        // large workspace pays more to name a month than to fetch it. Held for `ttl` like
-        // everything else, which is the only thing keeping the next scope from paying again.
+        // name is a line nobody can `grep` for by person.
+        //
+        // Not cheap, and cheap in a different currency: a roster is at least
+        // `ceil(members / 200)` requests — at least, because a page may come back short of what
+        // it was asked for — so its price is set by how large the workspace is, where the
+        // window's is set by how much the channel said. Two unrelated numbers, neither of which
+        // dominates. What is worth knowing is that this one does not shrink when less is read:
+        // three lines of one day cost the same roster as a year of the busiest channel. Held
+        // for `ttl` like everything else, which is the only thing keeping the next scope from
+        // paying it again.
         let by_id: HashMap<String, String> = self
             .users()
             .await

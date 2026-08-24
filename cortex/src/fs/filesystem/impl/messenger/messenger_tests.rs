@@ -964,7 +964,7 @@ async fn a_held_small_file_never_answers_for_another_path() {
         4096
     );
 
-    // `chat.jsonl` is assembled, not fetched, so a held window that ignored the path would show
+    // A day file is assembled, not fetched, so a held window that ignored the path would show
     // up here as attachment bytes.
     let mut chat = vec![0u8; 64];
     let n = vol

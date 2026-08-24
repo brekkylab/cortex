@@ -1,8 +1,7 @@
 //! The messenger lane: work chat as a tree an agent can `grep`.
 //!
-//! One [`Mountable`](crate::fs::Mountable) implementation
-//! ([`MessengerVolume`](messenger::MessengerVolume), arriving next) over any number of
-//! [`MessengerSource`]s. That split is the whole design, and it is the answer to a specific
+//! One [`FileSystem`](crate::fs::FileSystem) implementation ([`MessengerFs`]) over any number
+//! of [`MessengerSource`]s. That split is the whole design, and it is the answer to a specific
 //! failure: a messenger has no hierarchy to mirror — S3 has keys, Notion a page tree, Drive
 //! folders — so its tree has to be *synthesized* along the time axis, and synthesizing it
 //! once per platform is how four adapters end up with four layouts that only a document
