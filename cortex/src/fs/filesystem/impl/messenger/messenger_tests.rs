@@ -67,6 +67,10 @@ struct Calls {
     /// Every range `fetch_file` was asked for, in order. `None` is a whole-file request,
     /// which is the only shape the source can length-check.
     files: Mutex<Vec<Option<Range<u64>>>>,
+    /// Every window `history` was asked for, as `(start, end)` seconds since the epoch. The
+    /// count alone cannot tell a month's request from a day's, and which one the tree asks for
+    /// is the whole point of having both.
+    windows: Mutex<Vec<(u64, u64)>>,
 }
 
 struct TestSource {
@@ -154,6 +158,14 @@ impl MessengerSource for TestSource {
     ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
         Box::pin(async move {
             self.calls.history.fetch_add(1, Ordering::SeqCst);
+            let secs = |t: std::time::SystemTime| {
+                t.duration_since(std::time::UNIX_EPOCH).expect("after the epoch").as_secs()
+            };
+            self.calls
+                .windows
+                .lock()
+                .unwrap()
+                .push((secs(window.start), secs(window.end)));
             if self.denied.contains(conv) {
                 return Err(Self::denied_err());
             }
@@ -1314,5 +1326,53 @@ async fn the_budget_counts_attachments_not_only_text() {
         vol.source.calls.history.load(Ordering::SeqCst),
         before + 1,
         "August was evicted for July, so the budget saw more than the text"
+    );
+}
+
+
+/// Reading one day fetches one day, not its month.
+///
+/// The month is what a *listing* needs — it has to name every day that has anything. A `cat`
+/// names the day it wants, and a month of a busy channel is hundreds of calls: 9,000 messages
+/// is 180 at Graph's fifty per page and 600 at Slack's unlisted fifteen. A `search` hit names
+/// exactly one day, which makes this the dominant read.
+#[tokio::test]
+async fn reading_one_day_asks_for_one_day() {
+    let vol = two_days();
+    let before = vol.source.calls.history.load(Ordering::SeqCst);
+
+    let mut buf = vec![0u8; 512];
+    let p = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
+    assert!(vol.read_at(p, &mut buf, 0).await.unwrap() > 0);
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        before + 1,
+        "one call"
+    );
+
+    // And it asked for that day, not the month around it.
+    let asked = vol.source.calls.windows.lock().unwrap().clone();
+    let (start, end) = asked.last().copied().expect("a window was asked for");
+    assert_eq!(end - start, DAY, "a day's span, not a month's");
+}
+
+/// A listing buys the month, and every day in it is then free — which is what keeps `grep -r`
+/// over a month at one request.
+#[tokio::test]
+async fn a_listing_buys_the_month_and_the_days_come_with_it() {
+    let vol = two_days();
+    let month = Path::new("/channels/pricing__C1/2026/08");
+    let days = names(&vol.list(month).await.unwrap());
+    assert_eq!(days, ["2026-08-10.jsonl", "2026-08-12.jsonl"]);
+    let after_listing = vol.source.calls.history.load(Ordering::SeqCst);
+
+    let mut buf = vec![0u8; 512];
+    for d in &days {
+        assert!(vol.read_at(&month.join(d), &mut buf, 0).await.unwrap() > 0);
+    }
+    assert_eq!(
+        vol.source.calls.history.load(Ordering::SeqCst),
+        after_listing,
+        "the listing already paid for them"
     );
 }

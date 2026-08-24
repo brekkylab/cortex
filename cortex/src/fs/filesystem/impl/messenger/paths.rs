@@ -194,6 +194,19 @@ pub(super) fn entry(name: &str, id: &str, suffix: &str) -> String {
     format!("{head}{tail}")
 }
 
+/// The date a day file's name means, checked against the month it was found in.
+///
+/// The month check is what stops `2026-09-01.jsonl` resolving inside `2026/08/` — a name the
+/// listing for that month would never write.
+pub(super) fn day_of_file(seg: &str, year: i32, month: u32) -> Option<NaiveDate> {
+    let stem = seg.strip_suffix(JSONL)?;
+    if stem.len() != 10 {
+        return None;
+    }
+    let date = NaiveDate::parse_from_str(stem, DAY_FMT).ok()?;
+    (date.year() == year && date.month() == month).then_some(date)
+}
+
 /// The file a thread is served as: its root's id and nothing else.
 ///
 /// Not [`entry`], which would put `unnamed__` in front of it — a thread has no name of its own,

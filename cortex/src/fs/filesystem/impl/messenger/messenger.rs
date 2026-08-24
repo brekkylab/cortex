@@ -54,11 +54,11 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{NaiveDate, TimeZone, Utc};
+use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 
 use super::limits::MessengerLimits;
 use super::paths::{
-    CHANNELS, DMS, FILES, JSONL, THREADS, USERS, conv_dir, day_file, day_of, entry,
+    CHANNELS, DMS, FILES, JSONL, THREADS, USERS, conv_dir, day_file, day_of, day_of_file, entry,
     month_dir, month_of, months, thread_file, year_dir,
 };
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
@@ -165,8 +165,17 @@ struct Cache {
 /// spellings of one day must not become two entries.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum Scope {
-    /// One `history` call's worth: a month of a conversation.
+    /// A whole month, which is what a listing needs: it has to name every day that has
+    /// anything, and only the month's own window answers that.
     Month(ConvId, i32, u32),
+    /// One day, which is what reading a day file needs.
+    ///
+    /// Separate from `Month` because the two questions cost differently. A month of a busy
+    /// channel is hundreds of calls — 9,000 messages is 180 of them at Graph's fifty per page,
+    /// 600 at Slack's unlisted fifteen — and spending that to answer `cat` on one day is the
+    /// wrong trade, especially since a `search` hit names exactly one day. A month already
+    /// held answers a day for free; a day never fetches its month.
+    Day(ConvId, NaiveDate),
     Thread(ConvId, MsgId),
 }
 
@@ -326,6 +335,29 @@ impl<S: MessengerSource> MessengerFs<S> {
         Ok(body)
     }
 
+    /// One day, from whichever scope already answers it.
+    ///
+    /// The month first, because a listing usually came before the read and bought every day in
+    /// it — that is what keeps `grep -r` over a month at one request. Failing that, the day's
+    /// own window, which is one call for any day a person could have written.
+    async fn day(&self, conv: &ConvId, date: NaiveDate) -> io::Result<Arc<Body>> {
+        if let Some(month) = self.held(&Scope::Month(conv.clone(), date.year(), date.month())) {
+            return Ok(month);
+        }
+        let key = Scope::Day(conv.clone(), date);
+        if let Some(body) = self.held(&key) {
+            return Ok(body);
+        }
+        let msgs = match self.source.history(conv, window_of_day(date)).await {
+            Ok((msgs, _truncated)) => msgs,
+            Err(e) if e.is_conversation_denied() => Vec::new(),
+            Err(e) => return Err(e.into()),
+        };
+        let body = Arc::new(self.assemble(&msgs, None).await?);
+        self.hold(key, body.clone());
+        Ok(body)
+    }
+
     /// One thread, served as the single file `threads/<root>.jsonl`.
     ///
     /// A file and not a directory, unlike the day it hangs under: a thread has no sub-scopes of
@@ -431,6 +463,23 @@ impl<S: MessengerSource> MessengerFs<S> {
             .section_kind(section)
             .ok_or(io_err(io::ErrorKind::NotFound))?;
         self.conv_at(kind, dir).await
+    }
+
+    /// Whether the conversation reaches `year`-`month` at all. Arithmetic; no request.
+    fn reaches(&self, conv: &Conversation, year: i32, month: u32) -> bool {
+        months(day_of(conv.created), today()).contains(&(year, month))
+    }
+
+    /// Resolve `tail` against the month itself, for the names a day fetch cannot answer.
+    async fn in_month(
+        &self,
+        conv: &Conversation,
+        y: &str,
+        m: &str,
+        tail: &[String],
+    ) -> io::Result<Node> {
+        let month = self.month_if_present(conv, y, m).await?;
+        self.within(month, tail).await
     }
 
     /// The month `seg` names, or `NotFound` when the conversation never reached it.
@@ -563,6 +612,22 @@ impl<S: MessengerSource> MessengerFs<S> {
                         } else {
                             Err(io_err(io::ErrorKind::NotFound))
                         }
+                    }
+                    // A day file names the one day it wants, so only that day is fetched. The
+                    // arms below need the month itself — a listing has to name every day that
+                    // has anything, and `threads/`/`files/` are the month's.
+                    [y, m, name] if month_of(y, m).is_some() && name.ends_with(JSONL) => {
+                        let (year, mon) = month_of(y, m).expect("checked");
+                        let Some(date) = day_of_file(name, year, mon) else {
+                            // Not a day file of this month: `threads` and `files` are handled
+                            // below, and anything else is nothing.
+                            return self.in_month(&conv, y, m, std::slice::from_ref(name)).await;
+                        };
+                        if !self.reaches(&conv, year, mon) {
+                            return Err(io_err(io::ErrorKind::NotFound));
+                        }
+                        self.within(self.day(&conv.id, date).await?, std::slice::from_ref(name))
+                            .await
                     }
                     [y, m, tail @ ..] => {
                         // The month is checked before it is fetched: `stat` has to refuse one
@@ -960,6 +1025,18 @@ fn segments(path: &Path) -> Vec<String> {
 /// somebody titled a channel `a__b` would otherwise do.
 fn id_of(entry: &str) -> &str {
     entry.rsplit_once("__").map(|(_, id)| id).unwrap_or(entry)
+}
+
+/// The half-open span one day file stands for.
+fn window_of_day(date: NaiveDate) -> Window {
+    let at = |d: NaiveDate| {
+        Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0).expect("midnight exists"))
+            .into()
+    };
+    Window {
+        start: at(date),
+        end: at(date.succ_opt().expect("a date has a successor")),
+    }
 }
 
 /// The half-open span a month directory stands for.
