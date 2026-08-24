@@ -75,9 +75,9 @@ fn volume() -> InMemFs {
     let vol = InMemFs::new();
     let rt = tokio::runtime::Runtime::new().expect("build a runtime for volume setup");
     rt.block_on(async {
-        let hello = std::path::Path::new("hello.txt");
-        vol.create(hello).await.expect("fresh store");
-        vol.write_at(hello, b"Hello from cortex!\n", 0)
+        let greeting = std::path::Path::new("greeting.txt");
+        vol.create(greeting).await.expect("fresh store");
+        vol.write_at(greeting, b"Hello from cortex!\n", 0)
             .await
             .expect("write the greeting");
         vol.mkdir(std::path::Path::new("sub")).await.unwrap();
