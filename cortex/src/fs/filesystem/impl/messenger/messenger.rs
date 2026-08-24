@@ -58,7 +58,7 @@ use chrono::{Datelike, NaiveDate, TimeZone, Utc};
 
 use super::limits::MessengerLimits;
 use super::paths::{
-    CHANNELS, DMS, FILES, JSONL, THREADS, USERS, conv_dir, day_file, day_of, day_of_file, entry,
+    CHANNELS, DMS, FILES, JSONL, THREADS, USERS, conv_dir, day_file, day_of, day_of_file, entry, file_entry,
     month_dir, month_of, months, thread_file, year_dir,
 };
 use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
@@ -542,11 +542,14 @@ impl<S: MessengerSource> MessengerFs<S> {
             [f] if day.text.contains_key(f) => Ok(Node::Bytes(day.text[f].clone())),
             [f] if f == FILES && !day.files.is_empty() => Ok(Node::Dir),
             [f, name] if f == FILES => {
-                let want = id_of(name);
+                // Matched by rebuilding the listed name rather than by parsing this one. The
+                // extension now sits past the id, so `id_of` would take `F1.pdf` for the id —
+                // and rebuilding is what keeps `resolve` unable to answer a name `listing`
+                // would not have written.
                 let file = day
                     .files
                     .iter()
-                    .find(|f| f.id == want)
+                    .find(|f| file_entry(&f.name, &f.id) == *name)
                     .ok_or(io_err(io::ErrorKind::NotFound))?;
                 Ok(Node::File(file.clone()))
             }
@@ -846,7 +849,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                 .files
                 .iter()
                 .map(|f| {
-                    let name = entry(&f.name, &f.id, "");
+                    let name = file_entry(&f.name, &f.id);
                     // Sizes come from the listing that named these, so including them costs
                     // nothing — which saves a caller an `lstat` per entry that a plain `ls`
                     // never asked for. A platform that did not say leaves the field empty

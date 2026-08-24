@@ -505,7 +505,7 @@ async fn empty_subdirectories_are_not_synthesized() {
     // And the attachment is served at its listed length.
     let s = vol
         .stat(Path::new(
-            "/channels/pricing__C1/2026/08/files/report.pdf__F1",
+            "/channels/pricing__C1/2026/08/files/report__F1.pdf",
         ))
         .await
         .unwrap();
@@ -674,7 +674,7 @@ fn sized_attachment(size: Option<u64>) -> MessengerFs<TestSource> {
 /// How long the fixture's unsized attachment turns out to be — a number only a download says.
 const UNSIZED_LEN: u64 = 4096;
 
-const ATTACHMENT: &str = "/channels/pricing__C1/2026/08/files/doc.bin__F1";
+const ATTACHMENT: &str = "/channels/pricing__C1/2026/08/files/doc__F1.bin";
 
 /// Read `len` bytes of the attachment at `offset`.
 async fn read_bytes(vol: &MessengerFs<TestSource>, offset: u64, len: usize) -> Vec<u8> {
@@ -1152,7 +1152,7 @@ async fn a_listing_leaves_an_unmeasured_size_empty() {
         .await
         .expect("the month lists its files");
     assert_eq!(files.len(), 1);
-    assert_eq!(files[0].name, "doc.bin__F1");
+    assert_eq!(files[0].name, "doc__F1.bin");
     assert!(
         files[0].stat().is_none(),
         "a plain `ls` must not spend a request per entry to print a number"
@@ -1247,7 +1247,7 @@ async fn one_attachment_shared_twice_is_listed_once() {
     ));
     assert_eq!(
         names(&vol.list(Path::new("/channels/pricing__C1/2026/08/files")).await.unwrap()),
-        ["report.pdf__F1"]
+        ["report__F1.pdf"]
     );
 }
 

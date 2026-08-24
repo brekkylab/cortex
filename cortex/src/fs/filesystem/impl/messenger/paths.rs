@@ -207,6 +207,43 @@ pub(super) fn day_of_file(seg: &str, year: i32, month: u32) -> Option<NaiveDate>
     (date.year() == year && date.month() == month).then_some(date)
 }
 
+/// The name an attachment is listed and opened under: `<stem>__<id><.ext>`.
+///
+/// The extension moves to the end, past the id. `deck (3).pptx__F0BM…` is what putting the id
+/// last produces, and it defeats everything that dispatches on a suffix — `ls files/*.pptx`
+/// matches nothing, `file` cannot guess, and a viewer will not open it. `users/` already had
+/// this right by passing `.json` as the suffix; this is the same rule for a name whose
+/// extension arrived inside it.
+///
+/// One extension, the last one. `archive.tar.gz` becomes `archive.tar__F1.gz`, so `*.gz`
+/// matches and `*.tar.gz` does not — recognizing compound suffixes would be a table of them,
+/// and the table is never finished.
+///
+/// A leading dot is not an extension: `.gitignore` is a name, so it stays whole.
+pub(super) fn file_entry(name: &str, id: &str) -> String {
+    match split_ext(name) {
+        Some((stem, ext)) => entry(stem, id, ext),
+        None => entry(name, id, ""),
+    }
+}
+
+/// `name` as `(stem, ".ext")`, or `None` when it has no extension to move.
+///
+/// Deliberately narrow about what counts: alphanumeric, at most as long as the longest suffix
+/// anyone actually registers. A name like `report.final version` has a dot and no extension,
+/// and splitting it would put half a word after the id.
+fn split_ext(name: &str) -> Option<(&str, &str)> {
+    const LONGEST: usize = 16;
+    let dot = name.rfind('.')?;
+    if dot == 0 {
+        return None;
+    }
+    let ext = &name[dot..];
+    let looks_like_one = (2..=LONGEST + 1).contains(&ext.len())
+        && ext[1..].chars().all(|c| c.is_ascii_alphanumeric());
+    looks_like_one.then(|| (&name[..dot], ext))
+}
+
 /// The file a thread is served as: its root's id and nothing else.
 ///
 /// Not [`entry`], which would put `unnamed__` in front of it — a thread has no name of its own,

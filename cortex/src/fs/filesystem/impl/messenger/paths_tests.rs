@@ -342,3 +342,41 @@ fn a_cut_does_not_leave_a_non_ascii_blank() {
         "{dir:?} ends in a blank"
     );
 }
+
+
+/// An attachment's extension goes past the id, because everything that dispatches on a suffix
+/// reads the *end* of a name. With the id last, `ls files/*.pptx` matches nothing.
+#[test]
+fn an_attachment_keeps_its_extension_at_the_end() {
+    assert_eq!(file_entry("deck (3).pptx", "F1"), "deck (3)__F1.pptx");
+    assert_eq!(file_entry("식단표.pdf", "F2"), "식단표__F2.pdf");
+    // One extension, the last one. `*.gz` matches; `*.tar.gz` does not, and a table of
+    // compound suffixes is never finished.
+    assert_eq!(file_entry("archive.tar.gz", "F3"), "archive.tar__F3.gz");
+}
+
+/// A dot is not always an extension, and splitting the wrong one puts half a word past the id.
+#[test]
+fn a_dot_that_is_not_an_extension_is_left_alone() {
+    // No extension at all.
+    assert_eq!(file_entry("Makefile", "F1"), "Makefile__F1");
+    // A leading dot is a name, not a suffix.
+    assert_eq!(file_entry(".gitignore", "F2"), "gitignore__F2");
+    // Words, not a suffix: too long, or not alphanumeric.
+    assert_eq!(file_entry("report.final version", "F3"), "report.final version__F3");
+    assert_eq!(
+        file_entry("notes.averyverylongsuffixindeed", "F4"),
+        "notes.averyverylongsuffixindeed__F4"
+    );
+    // A trailing dot has nothing after it.
+    assert_eq!(file_entry("weird.", "F5"), "weird.__F5");
+}
+
+/// The suffix spends the same 255 bytes, so a long name still fits and the id still survives.
+#[test]
+fn a_long_attachment_name_is_cut_and_keeps_both_ends() {
+    let name = format!("{}.pdf", "a".repeat(400));
+    let got = file_entry(&name, "F1");
+    assert_eq!(got.len(), NAME_MAX);
+    assert!(got.ends_with("__F1.pdf"), "{got}");
+}
