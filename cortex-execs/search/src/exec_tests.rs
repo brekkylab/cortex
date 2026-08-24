@@ -149,6 +149,26 @@ async fn a_scope_narrows_by_prefix() {
     assert!(!text.contains("mail/work"), "the scope excluded it: {text}");
 }
 
+/// The root is the prefix rule's one exception: it is a prefix of every path, and trimming its
+/// only character leaves nothing for a comparison to match. Spelled either way it has to mean
+/// every store — reading as "no store mounted under " is the silent-nothing this crate refuses.
+#[tokio::test]
+async fn the_root_scope_is_every_store() {
+    for spelling in ["/", "//", ""] {
+        let search = Search::new()
+            .with("chat/slack", Fake::with(&[("a", "{}")]))
+            .with("mail/work", Fake::with(&[("b", "{}")]));
+
+        let r = run(search, &["--in", spelling, "가격"]).await;
+        let text = out(&r);
+        assert_eq!(r.exit_code, 0, "--in {spelling:?}: {}", said(&r));
+        assert!(
+            text.contains("chat/slack/a\t") && text.contains("mail/work/b\t"),
+            "--in {spelling:?} reached both: {text}"
+        );
+    }
+}
+
 /// A typo must not read as "nothing there". The candidates are named, because the question the
 /// caller asked was answerable and this was not the answer.
 #[tokio::test]

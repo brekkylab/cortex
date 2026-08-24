@@ -93,7 +93,15 @@ impl Args {
                 }
                 "--in" => {
                     let v = it.next().ok_or_else(|| usage_error("--in needs a path"))?;
-                    scope = Some(v.trim_matches('/').to_string());
+                    // The root is the one path the prefix rule cannot express, because
+                    // trimming its only character leaves nothing to compare against. It is
+                    // also the prefix of every path there is, so `--in /` is the same request
+                    // as no flag at all and is normalized to it here rather than reaching
+                    // `selected` as a scope no store can match.
+                    scope = match v.trim_matches('/') {
+                        "" => None,
+                        at => Some(at.to_string()),
+                    };
                 }
                 other => words.push(other),
             }
@@ -168,7 +176,8 @@ impl Search {
     /// The stores `--in` names, or all of them.
     ///
     /// A prefix and not a name, so `--in chat` reaches every chat store: narrowing is the point
-    /// of the flag and a reader thinks in paths, not in registrations.
+    /// of the flag and a reader thinks in paths, not in registrations. `--in /` names the root,
+    /// which every store is under, and arrives here as `None` for that reason.
     fn selected(&self, scope: Option<&str>) -> Vec<&Store> {
         match scope {
             None => self.stores.iter().collect(),
