@@ -22,6 +22,17 @@ pub(super) const MAX_RETRIES: u32 = 5;
 /// Cap on an ordinary retry wait. These calls sit behind a filesystem op the caller blocks
 /// on, so the budget stays short. Raising it means moving the wait off that path, not just
 /// raising the number.
+///
+/// Per request, and there is no total — which is worth knowing here, because the reasoning
+/// above once had a bounded page count behind it and no longer does. A listing that pages
+/// multiplies this by however many pages it walks, and a walk follows its cursor to the end,
+/// so on a tier that throttles every page one `ls` waits longer than anything sits through and
+/// the kernel abandons the read.
+///
+/// Left that way on purpose. A total budget would not help where the product gets large: those
+/// are the tiers where a single month already costs hundreds of requests, so bounding the wait
+/// makes them fail sooner rather than work. And on the tiers that do work it would be a fresh
+/// way to fail a listing for being long, which is the whole reason the page ceiling went.
 pub(super) const MAX_BACKOFF: Duration = Duration::from_secs(16);
 
 /// Ceiling on a `Retry-After` this lane will sit out (see [`next_wait`]). Rate-limit delays
