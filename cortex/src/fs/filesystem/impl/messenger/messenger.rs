@@ -92,8 +92,8 @@ impl<T> Cached<T> {
 /// What one [`history`](MessengerSource::history) call produced, kept whole.
 ///
 /// The three fields arrive together and are read separately, which is the reason this is one
-/// cache entry and not three: `ls` of a day, `ls` of its `threads/`, `ls` of its `files/` and
-/// `cat chat.jsonl` are four operations over one request.
+/// cache entry and not three: `ls` of a month, `ls` of its `threads/`, `ls` of its `files/`
+/// and `cat` of any day in it are four operations over one fetch.
 struct Body {
     /// Rendered lines, by the file name each is served under.
     ///
@@ -314,10 +314,11 @@ impl<S: MessengerSource> MessengerFs<S> {
         Ok(users)
     }
 
-    /// A month, which is the one request the date axis costs.
+    /// A month, which is the one *fetch* the date axis costs — one window, however many pages
+    /// the service breaks it into, plus the roster [`assemble`](Self::assemble) needs.
     ///
     /// What comes back is partitioned into a file per day that has anything — so the days are
-    /// bought by the same request that named the month, and reading any of them afterwards is
+    /// bought by the same fetch that named the month, and reading any of them afterwards is
     /// free. Fetching a day at a time would ask once per day to learn the same thing, and most
     /// days in most conversations have nothing to learn.
     async fn month(&self, conv: &ConvId, year: i32, month: u32) -> io::Result<Arc<Body>> {
@@ -338,8 +339,8 @@ impl<S: MessengerSource> MessengerFs<S> {
     /// One day, from whichever scope already answers it.
     ///
     /// The month first, because a listing usually came before the read and bought every day in
-    /// it — that is what keeps `grep -r` over a month at one request. Failing that, the day's
-    /// own window, which is one call for any day a person could have written.
+    /// it — that is what keeps `grep -r` over a month at one fetch rather than one per file.
+    /// Failing that, the day's own window, which is a fetch for that day alone.
     async fn day(&self, conv: &ConvId, date: NaiveDate) -> io::Result<Arc<Body>> {
         if let Some(month) = self.held(&Scope::Month(conv.clone(), date.year(), date.month())) {
             return Ok(month);
@@ -388,8 +389,11 @@ impl<S: MessengerSource> MessengerFs<S> {
     /// out, the run is partitioned by the UTC day each message falls in — a month's own shape,
     /// and the reason a day file exists only for a day that has one.
     async fn assemble(&self, msgs: &[super::Message], as_one: Option<String>) -> io::Result<Body> {
-        // Names resolved once for the whole run rather than per line: the roster is one call
-        // and a line without a name is a line nobody can `grep` for by person.
+        // Names resolved once for the whole run rather than per line, because a line without a
+        // name is a line nobody can `grep` for by person. Not cheap, and the cost does not
+        // scale with what is being read: a roster is `ceil(members / 200)` requests, so a
+        // large workspace pays more to name a month than to fetch it. Held for `ttl` like
+        // everything else, which is the only thing keeping the next scope from paying again.
         let by_id: HashMap<String, String> = self
             .users()
             .await
