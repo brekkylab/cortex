@@ -159,10 +159,15 @@ const PAGE_LIMIT: usize = 200;
 /// Not a budget. A budget stops early and hands back part of an answer as if it were the
 /// whole one, which is the failure this lane exists to refuse — a listing short by two
 /// thousand channels is indistinguishable from a workspace that has two thousand fewer. The
-/// only thing that legitimately ends a cursor walk is running out of cursor, so this is set
-/// where nothing real can reach it: two million items at [`PAGE_LIMIT`], where the largest
-/// Enterprise Grid roster is a few hundred thousand. Reaching it means a server handed out
-/// cursors forever, which is a fault and answers as one.
+/// only thing that legitimately ends a cursor walk is running out of cursor, so this is set far
+/// past any listing this client has reason to expect: two million items at [`PAGE_LIMIT`].
+/// Reaching it means a server handed out cursors forever, which is a fault and answers as one.
+///
+/// It is a poor detector of that fault, and knowingly so. Two million requests is not a wait
+/// anything survives — a read behind a mount is abandoned by the kernel long before — so what
+/// this catches is a loop in a batch job, not one behind an `ls`. Catching it where it shows
+/// would mean noticing that a cursor came back unchanged, which is a different check and not
+/// one this makes.
 const PAGE_GUARD: usize = 10_000;
 
 /// Errors that mean "this conversation is not readable by this token", as opposed to "the
