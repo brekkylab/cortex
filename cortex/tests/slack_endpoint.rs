@@ -130,40 +130,43 @@ async fn a_real_workspace_answers_the_read_surface() {
     eprintln!("users: {}", users.len());
     assert!(!users.is_empty(), "a workspace has at least the installer");
 
-    // --- which days a conversation has ----------------------------------------------
-    // The bounded walk the tree's date listing is built on. Whichever conversation the token
-    // can actually read: a bot in none of them lists channels fine and reads none of them,
+    // --- a conversation's messages --------------------------------------------------
+    // Over the widest window there is, because no endpoint answers "which days does this
+    // have" and the axis is arithmetic instead: `history` over a range is the only question
+    // Slack takes, and a month of one is what the tree asks. Whichever conversation the token
+    // can actually read — a bot in none of them lists channels fine and reads none of them,
     // which is the soft-fail path rather than a failure.
-    let mut scanned = None;
+    const SPAN: (&str, &str) = ("0", "9999999999");
+    let mut found = None;
     for c in &channels {
         let id = c["id"].as_str().unwrap_or_default();
-        match api.scan_history(id, 2).await {
+        match api.conversation_history(id, SPAN.0, SPAN.1).await {
             Ok((msgs, trunc)) if !msgs.is_empty() => {
-                scanned = Some((id.to_string(), msgs, trunc));
+                found = Some((id.to_string(), msgs, trunc));
                 break;
             }
             Ok(_) => continue,
             // One conversation being unreadable must not fail the tree — the whole point of
             // the class. Anything wider propagates and fails this test, which is correct.
             Err(e) if e.is_conversation_denied() => continue,
-            Err(e) => panic!("scan_history: {e}"),
+            Err(e) => panic!("conversations.history: {e}"),
         }
     }
-    let Some((channel, msgs, truncated)) = scanned else {
+    let Some((channel, msgs, truncated)) = found else {
         eprintln!("no readable conversation had messages; nothing further to exercise");
         return;
     };
     eprintln!(
-        "scanned {channel}: {} messages, walk {}",
+        "{channel}: {} messages, paging {}",
         msgs.len(),
         if truncated { "truncated" } else { "complete" }
     );
 
-    // Oldest-first is what the tree's date bucketing assumes.
+    // Oldest-first is what the tree's day partitioning assumes.
     let order: Vec<&str> = msgs.iter().map(ts_of).collect();
     assert!(
         order.windows(2).all(|w| w[0] <= w[1]),
-        "scan_history must answer oldest-first"
+        "conversations.history must answer oldest-first"
     );
 
     // --- one day's history ----------------------------------------------------------

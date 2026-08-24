@@ -373,22 +373,9 @@ impl SlackAccessor {
         params: &[(&str, String)],
         items_key: &str,
     ) -> SourceResult<(Vec<Value>, bool)> {
-        self.paginate_upto(method, params, items_key, MAX_PAGES)
-            .await
-    }
-
-    /// [`Self::paginate`] with a ceiling the caller chooses, for a walk whose cost it
-    /// budgets itself rather than one that only needs a backstop.
-    async fn paginate_upto(
-        &self,
-        method: &str,
-        params: &[(&str, String)],
-        items_key: &str,
-        max_pages: usize,
-    ) -> SourceResult<(Vec<Value>, bool)> {
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        for _ in 0..max_pages {
+        for _ in 0..MAX_PAGES {
             let mut p = params.to_vec();
             p.push(("limit", PAGE_LIMIT.to_string()));
             if let Some(c) = &cursor {
@@ -448,31 +435,6 @@ impl SlackAccessor {
                     ("inclusive", "true".to_string()),
                 ],
                 "messages",
-            )
-            .await?;
-        msgs.sort_by(|a, b| ts_of(a).total_cmp(&ts_of(b)));
-        Ok((msgs, truncated))
-    }
-
-    /// A conversation's history from its newest message backwards, at most `max_pages`
-    /// pages, returned oldest-first. The flag is true when the walk stopped at that ceiling
-    /// — there is older history it did not reach.
-    ///
-    /// This is how the tree learns which days a conversation *has*. Slack has no endpoint
-    /// for that question, and the alternative — a calendar range between `created` and the
-    /// newest message — invents a directory for every silent day in between, which on a
-    /// long quiet channel is nearly all of them.
-    pub async fn scan_history(
-        &self,
-        channel: &str,
-        max_pages: usize,
-    ) -> SourceResult<(Vec<Value>, bool)> {
-        let (mut msgs, truncated) = self
-            .paginate_upto(
-                "conversations.history",
-                &[("channel", channel.to_string())],
-                "messages",
-                max_pages,
             )
             .await?;
         msgs.sort_by(|a, b| ts_of(a).total_cmp(&ts_of(b)));
