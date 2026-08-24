@@ -243,10 +243,15 @@ pub struct Capabilities {
 /// is not object-safe, and one boxed future per call sits next to a round trip to a messenger.
 /// Writing it out rather than reaching for a macro keeps this crate's one convention.
 pub trait MessengerSource: Send + Sync {
-    /// Conversations this credential can see. The flag is true when the listing stopped at
-    /// the source's own page ceiling, so the tree can say it is partial rather than pass it
-    /// off as the whole.
-    fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<Conversation>, bool)>>;
+    /// Conversations this credential can see.
+    ///
+    /// Every one of them, or a failure. A source that pages walks to the end of its cursor
+    /// rather than stopping at a ceiling: a listing short by two thousand channels is
+    /// indistinguishable from a workspace that has two thousand fewer, and nothing in a
+    /// directory can say which it is. The one thing a source may hand back short is a walk
+    /// the service broke off partway — the pages that arrived are answers, and forty requests
+    /// spent to report a failure are forty requests spent to say nothing.
+    fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<Conversation>>>;
 
     /// Messages created within `window`, oldest-first, thread roots and standalone messages
     /// only — a root's replies come from [`thread`](Self::thread).
@@ -254,17 +259,17 @@ pub trait MessengerSource: Send + Sync {
         &'a self,
         conv: &'a ConvId,
         window: Window,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>>;
+    ) -> BoxFuture<'a, SourceResult<Vec<Message>>>;
 
     /// A thread: its root followed by every reply, oldest-first.
     fn thread<'a>(
         &'a self,
         conv: &'a ConvId,
         root: &'a MsgId,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>>;
+    ) -> BoxFuture<'a, SourceResult<Vec<Message>>>;
 
     /// Workspace members, for resolving author ids to names.
-    fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<User>, bool)>>;
+    fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<User>>>;
 
     /// An attachment's bytes. `range` is a request, not a promise: the second return value
     /// is false when the source served the whole thing and the caller must slice it itself.

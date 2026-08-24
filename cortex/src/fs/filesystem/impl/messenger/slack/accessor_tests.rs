@@ -201,3 +201,86 @@ fn a_file_download_only_ever_reaches_slack() {
     refused("http://localhost:9200/_search", mock);
     refused("https://localhost:8000/f.pdf", mock);
 }
+
+/// A page ceiling is what the flag this replaced reported, and reporting it was all anyone did
+/// with it. Sixty pages is past the fifty the ceiling used to stand at, so this is the case
+/// that used to come back short and call itself whole.
+#[tokio::test]
+async fn a_walk_follows_its_cursor_past_where_the_old_ceiling_stood() {
+    let pages = 60;
+    let got = walk(PAGE_GUARD, "test.method", |cursor| async move {
+        let n: usize = cursor.as_deref().unwrap_or("0").parse().expect("a number");
+        let items = vec![Value::from(n)];
+        let next = (n + 1 < pages).then(|| (n + 1).to_string());
+        Ok((items, next))
+    })
+    .await
+    .expect("a walk that ends");
+    assert_eq!(got.len(), pages, "every page arrived");
+}
+
+/// The last page carries items *and* no cursor, so the two have to be read in that order. Read
+/// the other way round, every listing loses its final page.
+#[tokio::test]
+async fn the_page_that_ends_the_walk_keeps_its_items() {
+    let got = walk(PAGE_GUARD, "test.method", |cursor| async move {
+        match cursor.as_deref() {
+            None => Ok((vec![Value::from(1)], Some("2".to_string()))),
+            _ => Ok((vec![Value::from(2)], None)),
+        }
+    })
+    .await
+    .expect("a walk that ends");
+    assert_eq!(got, vec![Value::from(1), Value::from(2)]);
+}
+
+/// A walk broken off partway fails, and the pages it had are dropped with it.
+///
+/// Deliberately, and it is the expensive choice: those requests are spent for nothing. But a
+/// short listing does not read as short in this tree — a day it does not name reads as a day
+/// that held nothing, and a conversation it does not name is unreachable by path — so serving
+/// one would teach the caller something untrue. An error teaches it to ask again.
+#[tokio::test]
+async fn a_walk_broken_off_partway_fails_rather_than_answering_short() {
+    let r = walk(PAGE_GUARD, "test.method", |cursor| async move {
+        match cursor.as_deref() {
+            None => Ok((vec![Value::from(1)], Some("2".to_string()))),
+            _ => Err(api_err("ratelimited")),
+        }
+    })
+    .await;
+    assert!(
+        matches!(&r, Err(SourceError::Api(e)) if e.code == "ratelimited"),
+        "the pages before it are not an answer: {r:?}"
+    );
+}
+
+/// Including a credential withdrawn between pages, which `SlackSource::section` calls out by
+/// name: answering that with a quietly smaller tree is the failure the mount check removes.
+#[tokio::test]
+async fn a_credential_lost_between_pages_fails() {
+    for code in ["invalid_auth", "token_revoked", "missing_scope"] {
+        let r = walk(PAGE_GUARD, "test.method", |cursor| async move {
+            match cursor.as_deref() {
+                None => Ok((vec![Value::from(1)], Some("2".to_string()))),
+                _ => Err(api_err(code)),
+            }
+        })
+        .await;
+        assert!(
+            matches!(&r, Err(SourceError::Api(e)) if e.code == code),
+            "{code} must not come back as a short listing: {r:?}"
+        );
+    }
+}
+
+/// The guard is for a cursor that never ends, which is a fault rather than a long listing —
+/// so it answers as one instead of handing back a prefix.
+#[tokio::test]
+async fn a_cursor_that_never_ends_is_a_fault() {
+    let r = walk(3, "test.method", |_| async move {
+        Ok((vec![Value::from(0)], Some("more".to_string())))
+    })
+    .await;
+    assert!(matches!(r, Err(SourceError::Io(_))), "{r:?}");
+}

@@ -154,11 +154,16 @@ fn check_file_host(url: &reqwest::Url, base_url: Option<&str>) -> SourceResult<(
 /// at once. Unmeasurable gain, measurable cost, and past Slack's own advice — so the walk
 /// asks for the same 200 as everything else.
 const PAGE_LIMIT: usize = 200;
-/// Pages one listing will walk before truncating. A backstop against an unbounded cursor
-/// loop, not a budget — which is why reaching it is reported in the return value rather
-/// than logged: this crate is a library, and the caller is the one that can say whether a
-/// partial listing is servable.
-const MAX_PAGES: usize = 50;
+/// Pages a walk will follow before deciding the cursor is broken rather than long.
+///
+/// Not a budget. A budget stops early and hands back part of an answer as if it were the
+/// whole one, which is the failure this lane exists to refuse — a listing short by two
+/// thousand channels is indistinguishable from a workspace that has two thousand fewer. The
+/// only thing that legitimately ends a cursor walk is running out of cursor, so this is set
+/// where nothing real can reach it: two million items at [`PAGE_LIMIT`], where the largest
+/// Enterprise Grid roster is a few hundred thousand. Reaching it means a server handed out
+/// cursors forever, which is a fault and answers as one.
+const PAGE_GUARD: usize = 10_000;
 
 /// Errors that mean "this conversation is not readable by this token", as opposed to "the
 /// request was wrong" or "Slack is down". A bot that was never invited to one channel must
@@ -363,48 +368,46 @@ impl SlackAccessor {
         }
     }
 
-    /// Walk a cursor-paginated method, collecting `items_key` across pages. Stops at
-    /// [`MAX_PAGES`] so a pathological workspace can't paginate without bound; the second
-    /// return value is true when it stopped there, so a caller can say so rather than pass
-    /// a partial off as the whole.
+    /// Walk a cursor-paginated method to its end, collecting `items_key` across pages.
+    ///
+    /// To its *end*: there is no page ceiling to report, because a ceiling reports a partial
+    /// listing as a whole one and nothing downstream could tell the difference. What ends the
+    /// walk is Slack running out of cursor — or [`PAGE_GUARD`], which is a fault.
     async fn paginate(
         &self,
         method: &str,
         params: &[(&str, String)],
         items_key: &str,
-    ) -> SourceResult<(Vec<Value>, bool)> {
-        let mut out = Vec::new();
-        let mut cursor: Option<String> = None;
-        for _ in 0..MAX_PAGES {
+    ) -> SourceResult<Vec<Value>> {
+        walk(PAGE_GUARD, method, |cursor| async move {
             let mut p = params.to_vec();
             p.push(("limit", PAGE_LIMIT.to_string()));
-            if let Some(c) = &cursor {
-                p.push(("cursor", c.clone()));
+            if let Some(c) = cursor {
+                p.push(("cursor", c));
             }
             let v = self.call(method, &p).await?;
-            if let Some(arr) = v.get(items_key).and_then(Value::as_array) {
-                out.extend(arr.iter().cloned());
-            }
-            cursor = v
+            let items = v
+                .get(items_key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let next = v
                 .get("response_metadata")
                 .and_then(|m| m.get("next_cursor"))
                 .and_then(Value::as_str)
                 .filter(|c| !c.is_empty())
                 .map(String::from);
-            if cursor.is_none() {
-                return Ok((out, false));
-            }
-        }
-        Ok((out, true))
+            Ok((items, next))
+        })
+        .await
     }
 
-    /// Conversations of `types` the token can see (`conversations.list`), and whether the
-    /// walk was truncated.
+    /// Conversations of `types` the token can see (`conversations.list`).
     ///
     /// Archived channels are included: archiving closes a channel to new messages and
     /// leaves the old ones readable, so excluding them would drop a finished project's
     /// whole record while it is still there to read.
-    pub async fn list_conversations(&self, types: &str) -> SourceResult<(Vec<Value>, bool)> {
+    pub async fn list_conversations(&self, types: &str) -> SourceResult<Vec<Value>> {
         self.paginate(
             "conversations.list",
             &[("types", types.to_string())],
@@ -424,8 +427,8 @@ impl SlackAccessor {
         channel: &str,
         oldest: &str,
         latest: &str,
-    ) -> SourceResult<(Vec<Value>, bool)> {
-        let (mut msgs, truncated) = self
+    ) -> SourceResult<Vec<Value>> {
+        let mut msgs = self
             .paginate(
                 "conversations.history",
                 &[
@@ -438,7 +441,7 @@ impl SlackAccessor {
             )
             .await?;
         msgs.sort_by(|a, b| ts_of(a).total_cmp(&ts_of(b)));
-        Ok((msgs, truncated))
+        Ok(msgs)
     }
 
     /// A thread: its root followed by every reply, oldest-first.
@@ -446,8 +449,8 @@ impl SlackAccessor {
         &self,
         channel: &str,
         ts: &str,
-    ) -> SourceResult<(Vec<Value>, bool)> {
-        let (mut msgs, truncated) = self
+    ) -> SourceResult<Vec<Value>> {
+        let mut msgs = self
             .paginate(
                 "conversations.replies",
                 &[("channel", channel.to_string()), ("ts", ts.to_string())],
@@ -455,7 +458,7 @@ impl SlackAccessor {
             )
             .await?;
         msgs.sort_by(|a, b| ts_of(a).total_cmp(&ts_of(b)));
-        Ok((msgs, truncated))
+        Ok(msgs)
     }
 
     /// Workspace members (`users.list`), bots/deleted/Slackbot included — the volume decides
@@ -464,7 +467,7 @@ impl SlackAccessor {
     ///
     /// One call answers both naming and the `users/` profiles: the response carries each
     /// member's whole record, not just their id.
-    pub async fn list_users(&self) -> SourceResult<(Vec<Value>, bool)> {
+    pub async fn list_users(&self) -> SourceResult<Vec<Value>> {
         self.paginate("users.list", &[], "members").await
     }
 
@@ -587,6 +590,45 @@ fn ts_of(m: &Value) -> f64 {
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0)
+}
+
+/// Follow a cursor to its end, or fail.
+///
+/// There is no third outcome, and the reason is what "absent" means in the tree this feeds. A
+/// day with no messages is not an empty file but no name at all, and a conversation the
+/// listing did not mention is unreachable by path as well. So a listing that came back short
+/// does not read as short — it reads as "those days held nothing" and "that channel does not
+/// exist", which is a wrong answer rather than an incomplete one. A caller cannot correct for
+/// it either, because nothing in a directory can say that it is not all of it.
+///
+/// The pages already collected are therefore dropped along with the failure. That is a real
+/// cost — a walk that dies on page 41 of 60 spent forty requests to report an error — and it
+/// is the cheaper of the two mistakes: the caller learns that it did not work and can ask
+/// again, where a short answer teaches it something untrue and it stops asking.
+///
+/// `page` is handed the cursor to ask with and answers with that page's items and the cursor
+/// after it. Where a service keeps its cursor, and what a request looks like, stays in the
+/// closure — which is what would let a second service reuse this.
+async fn walk<F, Fut>(guard: usize, method: &str, mut page: F) -> SourceResult<Vec<Value>>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = SourceResult<(Vec<Value>, Option<String>)>>,
+{
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..guard {
+        let (items, next) = page(cursor.take()).await?;
+        // Before the cursor check, so a last page's items are kept rather than dropped with
+        // the cursor that ended.
+        out.extend(items);
+        match next {
+            None => return Ok(out),
+            Some(c) => cursor = Some(c),
+        }
+    }
+    Err(SourceError::io(format!(
+        "{method}: {guard} pages and the cursor had not ended"
+    )))
 }
 
 #[cfg(test)]

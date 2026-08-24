@@ -104,15 +104,11 @@ async fn a_real_workspace_answers_the_read_surface() {
     let Some(api) = accessor() else { return };
 
     // --- conversations -------------------------------------------------------------
-    let (channels, truncated) = api
+    let channels = api
         .list_conversations("public_channel,private_channel")
         .await
         .expect("conversations.list");
-    eprintln!(
-        "channels: {} (walk {})",
-        channels.len(),
-        if truncated { "truncated" } else { "complete" }
-    );
+    eprintln!("channels: {}", channels.len());
     assert!(
         !channels.is_empty(),
         "a token that can list nothing cannot exercise anything below"
@@ -126,7 +122,7 @@ async fn a_real_workspace_answers_the_read_surface() {
     }
 
     // --- members -------------------------------------------------------------------
-    let (users, _) = api.list_users().await.expect("users.list");
+    let users = api.list_users().await.expect("users.list");
     eprintln!("users: {}", users.len());
     assert!(!users.is_empty(), "a workspace has at least the installer");
 
@@ -141,8 +137,8 @@ async fn a_real_workspace_answers_the_read_surface() {
     for c in &channels {
         let id = c["id"].as_str().unwrap_or_default();
         match api.conversation_history(id, SPAN.0, SPAN.1).await {
-            Ok((msgs, trunc)) if !msgs.is_empty() => {
-                found = Some((id.to_string(), msgs, trunc));
+            Ok(msgs) if !msgs.is_empty() => {
+                found = Some((id.to_string(), msgs));
                 break;
             }
             Ok(_) => continue,
@@ -152,15 +148,11 @@ async fn a_real_workspace_answers_the_read_surface() {
             Err(e) => panic!("conversations.history: {e}"),
         }
     }
-    let Some((channel, msgs, truncated)) = found else {
+    let Some((channel, msgs)) = found else {
         eprintln!("no readable conversation had messages; nothing further to exercise");
         return;
     };
-    eprintln!(
-        "{channel}: {} messages, paging {}",
-        msgs.len(),
-        if truncated { "truncated" } else { "complete" }
-    );
+    eprintln!("{channel}: {} messages", msgs.len());
 
     // Oldest-first is what the tree's day partitioning assumes.
     let order: Vec<&str> = msgs.iter().map(ts_of).collect();
@@ -172,7 +164,7 @@ async fn a_real_workspace_answers_the_read_surface() {
     // --- one day's history ----------------------------------------------------------
     let newest = ts_of(msgs.last().expect("non-empty"));
     let (oldest, latest) = day_around(newest);
-    let (day, _) = api
+    let day = api
         .conversation_history(&channel, &oldest, &latest)
         .await
         .expect("conversations.history");
@@ -205,7 +197,7 @@ async fn a_real_workspace_answers_the_read_surface() {
     });
     match root {
         Some(r) => {
-            let (thread, _) = api
+            let thread = api
                 .conversation_replies(&channel, ts_of(r))
                 .await
                 .expect("conversations.replies");

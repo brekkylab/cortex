@@ -144,21 +144,19 @@ impl SlackSource {
     /// already refused a token that cannot read a kind, so a `missing_scope` here means one was
     /// revoked mid-session — and answering that with a quietly smaller tree is the silent
     /// failure the mount check exists to remove.
-    async fn section(&self, types: &[&str]) -> SourceResult<(Vec<Value>, bool)> {
+    async fn section(&self, types: &[&str]) -> SourceResult<Vec<Value>> {
         self.api.list_conversations(&types.join(",")).await
     }
 }
 
 impl MessengerSource for SlackSource {
-    fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<Conversation>, bool)>> {
+    fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<Conversation>>> {
         Box::pin(async move {
-        let (chans, t1) = self.section(CHANNEL_TYPES).await?;
+        let chans = self.section(CHANNEL_TYPES).await?;
         let mut out: Vec<Conversation> = chans.iter().filter_map(|c| conversation(c, &[])).collect();
 
-        let mut truncated = t1;
         if self.reads_as_user {
-            let (dms, t2) = self.section(DM_TYPES).await?;
-            truncated |= t2;
+            let dms = self.section(DM_TYPES).await?;
             // A one-to-one DM has a partner where a channel has a name, so naming those needs
             // the member list. Fetched only when there is a DM to name — a workspace whose
             // token sees none must not pay for a roster nothing will use.
@@ -167,13 +165,13 @@ impl MessengerSource for SlackSource {
             // error anywhere — the one place in this source where a missing grant would be
             // quiet.
             let members = if dms.iter().any(|d| d.get("user").is_some()) {
-                self.api.list_users().await?.0
+                self.api.list_users().await?
             } else {
                 Vec::new()
             };
             out.extend(dms.iter().filter_map(|c| conversation(c, &members)));
         }
-            Ok((out, truncated))
+            Ok(out)
         })
     }
 
@@ -181,9 +179,9 @@ impl MessengerSource for SlackSource {
         &'a self,
         conv: &'a ConvId,
         window: Window,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
+    ) -> BoxFuture<'a, SourceResult<Vec<Message>>> {
         Box::pin(async move {
-        let (msgs, truncated) = self
+        let msgs = self
             .api
             .conversation_history(&conv.0, &to_ts(window.start), &to_ts(window.end))
             .await?;
@@ -196,7 +194,7 @@ impl MessengerSource for SlackSource {
             .filter_map(|m| message(&m))
             .filter(|m| m.ts >= window.start && m.ts < window.end)
             .collect();
-            Ok((msgs, truncated))
+            Ok(msgs)
         })
     }
 
@@ -204,17 +202,17 @@ impl MessengerSource for SlackSource {
         &'a self,
         conv: &'a ConvId,
         root: &'a MsgId,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
+    ) -> BoxFuture<'a, SourceResult<Vec<Message>>> {
         Box::pin(async move {
-            let (msgs, truncated) = self.api.conversation_replies(&conv.0, &root.0).await?;
-            Ok((msgs.iter().filter_map(message).collect(), truncated))
+            let msgs = self.api.conversation_replies(&conv.0, &root.0).await?;
+            Ok(msgs.iter().filter_map(message).collect())
         })
     }
 
-    fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<User>, bool)>> {
+    fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<User>>> {
         Box::pin(async move {
-            let (members, truncated) = self.api.list_users().await?;
-            Ok((members.iter().filter_map(user).collect(), truncated))
+            let members = self.api.list_users().await?;
+            Ok(members.iter().filter_map(user).collect())
         })
     }
 

@@ -148,15 +148,15 @@ impl TestSource {
 }
 
 impl MessengerSource for TestSource {
-    fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<Conversation>, bool)>> {
-        Box::pin(async move { Ok((self.convs.clone(), false)) })
+    fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<Conversation>>> {
+        Box::pin(async move { Ok(self.convs.clone()) })
     }
 
     fn history<'a>(
         &'a self,
         conv: &'a ConvId,
         window: Window,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
+    ) -> BoxFuture<'a, SourceResult<Vec<Message>>> {
         Box::pin(async move {
             self.calls.history.fetch_add(1, Ordering::SeqCst);
             let secs = |t: std::time::SystemTime| {
@@ -175,7 +175,7 @@ impl MessengerSource for TestSource {
                 .into_iter()
                 .filter(|m| m.ts >= window.start && m.ts < window.end)
                 .collect();
-            Ok((msgs, false))
+            Ok(msgs)
         })
     }
 
@@ -183,7 +183,7 @@ impl MessengerSource for TestSource {
         &'a self,
         _conv: &'a ConvId,
         root: &'a MsgId,
-    ) -> BoxFuture<'a, SourceResult<(Vec<Message>, bool)>> {
+    ) -> BoxFuture<'a, SourceResult<Vec<Message>>> {
         Box::pin(async move {
             self.calls.thread.fetch_add(1, Ordering::SeqCst);
             let msgs = self
@@ -192,12 +192,12 @@ impl MessengerSource for TestSource {
                 .find(|(r, _)| r == root)
                 .map(|(_, m)| m.clone())
                 .unwrap_or_default();
-            Ok((msgs, false))
+            Ok(msgs)
         })
     }
 
-    fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<(Vec<User>, bool)>> {
-        Box::pin(async move { Ok((self.users.clone(), false)) })
+    fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<User>>> {
+        Box::pin(async move { Ok(self.users.clone()) })
     }
 
     fn fetch_file<'a>(

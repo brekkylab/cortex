@@ -7,46 +7,62 @@
 //!
 //! ```text
 //! channels/<name>__<id>/
-//!   2026-08-10/               a day the conversation HAS — never a calendar
-//!     chat.jsonl              one line per message
-//!     threads/<root-id>/      a thread, same shape as a day
-//!       chat.jsonl
-//!       files/
-//!     files/<name>__<id>      attachments posted that day
+//!   2026/                     a year the conversation reaches
+//!     08/                      a month of it — the unit that gets fetched
+//!       2026-08-10.jsonl       a day that HAS messages, one line each
+//!       threads/<root-id>.jsonl   a thread, under the month its root is in
+//!       files/<stem>__<id>.ext attachments posted that month, outside a thread
 //! dms/…                       only when the source can enumerate them
 //! users/<name>__<id>.json
 //! ```
 //!
-//! # Why the date directories are what the walk saw
+//! # Why the date axis is arithmetic
 //!
-//! No messenger has an endpoint for "which days does this conversation have". The tempting
-//! answer — every day between its creation and now — invents a directory for every silent
-//! day, which on a long quiet channel is nearly all of them. The reader here is an agent,
-//! which cannot tell a quiet day from a failed request and pays a round trip to find out.
+//! No messenger has an endpoint for "which days does this conversation have" — all four ask
+//! the same way, with a window. So the axis cannot be *discovered*; it is computed, from
+//! [`Conversation::created`] up to today, and every platform carries `created` in the
+//! conversation listing already.
 //!
-//! So [`dates`](MessengerFs::dates) walks the conversation's newest messages backwards
-//! for a bounded number of pages and lists only the days it saw. Listing and reachability are
-//! then different questions, which is what keeps old history readable without presenting an
-//! empty directory:
+//! Which leaves the question of what a directory is worth. A day per day would name every
+//! silent day, and on a long quiet channel that is nearly all of them — the reader here is an
+//! agent, which cannot tell a quiet day from a failed request and pays a round trip to find
+//! out. So the levels split the difference:
 //!
-//! * a listed day is served;
-//! * a day *inside* the walked range that went unlisted is refused, at no request — the walk
-//!   already proved it empty;
-//! * a day below a truncated walk's floor is fetched, and served only if it has messages.
+//! * `<year>/<month>/` is arithmetic and always complete, so listing it spends no request
+//!   past the one that listed the conversation itself — and a month holds under twelve
+//!   entries however old the conversation is;
+//! * inside a month, only a day that *has* messages is a name. A silent day is absent rather
+//!   than an empty file, which is the distinction a listing can actually make.
 //!
-//! # One request fills three things
+//! # One window fills three listings
 //!
-//! Entering a day is one [`history`](MessengerSource::history) call, and its answer is
-//! `chat.jsonl`'s bytes, the `threads/` listing (roots with replies) and the `files/` listing
-//! together — so listing a day usually leaves reading it free. That is [`Day`], and it is
-//! cached whole.
+//! Entering a month is one [`history`](MessengerSource::history) window — plus the roster
+//! [`assemble`](MessengerFs::assemble) resolves author names from, which is its own walk and
+//! on a large workspace the larger half of the bill. What the window answers is every day
+//! file in the month, the `threads/` listing (roots with replies) and the `files/` listing
+//! together, so reading any day in it is free *while the month is still held*: past
+//! [`ttl`](MessengerLimits::ttl), or once
+//! [`text_budget`](MessengerLimits::text_budget) has evicted it, the next read pays again.
+//! That is [`Body`], and it is cached whole.
 //!
-//! # A known limit
+//! A day named directly costs its own window instead, not its month's: a `search` hit names
+//! exactly one day, and buying the month around it would spend a busy channel's whole month
+//! to answer one `cat`.
 //!
-//! A thread lives under its *root's* day, so replies written later do not appear under the
-//! day they were written. Not fixable from here: a history window selects on a message's own
-//! timestamp and replies are not in it, and scanning every day for late replies is the cost
-//! the bounded walk exists to avoid.
+//! # Two known limits
+//!
+//! A thread lives under its *root's* month, so replies written later do not appear under the
+//! month they were written, and an attachment posted in a reply is in no `files/` listing at
+//! all. Not fixable from here: a history window selects on a message's own timestamp, and
+//! replies are not in it.
+//!
+//! And a listing is all of it or an error, never part of it. That is what a source promises,
+//! and the reason it has to: a day this tree does not name reads as a day that held nothing,
+//! and a conversation it does not name is unreachable by path as well — so a short answer is
+//! not an incomplete answer here, it is a wrong one, and nothing in a directory could correct
+//! for it. The price is that a walk broken off on its last page throws away every page before
+//! it. Serving those instead would need somewhere to say they are not the whole, which is
+//! what a `.partial` beside the listing would be, and it is not built.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -300,7 +316,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         if let Some(v) = Cached::get(self.cache.lock().unwrap().convs.as_ref(), self.limits.ttl) {
             return Ok(v.clone());
         }
-        let (convs, _truncated) = self.source.conversations().await?;
+        let convs = self.source.conversations().await?;
         self.cache.lock().unwrap().convs = Some(Cached::new(convs.clone()));
         Ok(convs)
     }
@@ -309,7 +325,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         if let Some(v) = Cached::get(self.cache.lock().unwrap().users.as_ref(), self.limits.ttl) {
             return Ok(v.clone());
         }
-        let (users, _truncated) = self.source.users().await?;
+        let users = self.source.users().await?;
         self.cache.lock().unwrap().users = Some(Cached::new(users.clone()));
         Ok(users)
     }
@@ -327,7 +343,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             return Ok(body);
         }
         let msgs = match self.source.history(conv, window_of(year, month)).await {
-            Ok((msgs, _truncated)) => msgs,
+            Ok(msgs) => msgs,
             Err(e) if e.is_conversation_denied() => Vec::new(),
             Err(e) => return Err(e.into()),
         };
@@ -350,7 +366,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             return Ok(body);
         }
         let msgs = match self.source.history(conv, window_of_day(date)).await {
-            Ok((msgs, _truncated)) => msgs,
+            Ok(msgs) => msgs,
             Err(e) if e.is_conversation_denied() => Vec::new(),
             Err(e) => return Err(e.into()),
         };
@@ -370,7 +386,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             return Ok(body);
         }
         let msgs = match self.source.thread(conv, root).await {
-            Ok((msgs, _truncated)) => msgs,
+            Ok(msgs) => msgs,
             Err(e) if e.is_conversation_denied() => Vec::new(),
             Err(e) => return Err(e.into()),
         };
