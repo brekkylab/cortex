@@ -465,9 +465,18 @@ impl<S: MessengerSource> MessengerFs<S> {
         self.conv_at(kind, dir).await
     }
 
+    /// The top of the date axis: what the host pinned, or today in UTC.
+    ///
+    /// Read on every listing rather than fixed at construction, unlike
+    /// [`born`](MessengerFs::born): a mount left open across midnight has to start listing the
+    /// new day, where a directory's reported mtime must not move.
+    fn today(&self) -> NaiveDate {
+        self.limits.today.unwrap_or_else(|| Utc::now().date_naive())
+    }
+
     /// Whether the conversation reaches `year`-`month` at all. Arithmetic; no request.
     fn reaches(&self, conv: &Conversation, year: i32, month: u32) -> bool {
-        months(day_of(conv.created), today()).contains(&(year, month))
+        months(day_of(conv.created), self.today()).contains(&(year, month))
     }
 
     /// Resolve `tail` against the month itself, for the names a day fetch cannot answer.
@@ -495,7 +504,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         m: &str,
     ) -> io::Result<Arc<Body>> {
         let (year, month) = month_of(y, m).ok_or(io_err(io::ErrorKind::NotFound))?;
-        if !months(day_of(conv.created), today()).contains(&(year, month)) {
+        if !months(day_of(conv.created), self.today()).contains(&(year, month)) {
             return Err(io_err(io::ErrorKind::NotFound));
         }
         self.month(&conv.id, year, month).await
@@ -606,7 +615,7 @@ impl<S: MessengerSource> MessengerFs<S> {
                     // here because `stat` is a way in that no listing went through.
                     [y] => {
                         let ok = year_of(y).is_some_and(|year| {
-                            months(day_of(conv.created), today())
+                            months(day_of(conv.created), self.today())
                                 .iter()
                                 .any(|(yy, _)| *yy == year)
                         });
@@ -699,7 +708,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             // conversation ever had is here, whether or not anything was said in it.
             [s, cd] if self.section_kind(s).is_some() => {
                 let conv = self.conv_of(s, cd).await?;
-                let mut years: Vec<i32> = months(day_of(conv.created), today())
+                let mut years: Vec<i32> = months(day_of(conv.created), self.today())
                     .into_iter()
                     .map(|(y, _)| y)
                     .collect();
@@ -713,7 +722,7 @@ impl<S: MessengerSource> MessengerFs<S> {
             [s, cd, y] if self.section_kind(s).is_some() => {
                 let conv = self.conv_of(s, cd).await?;
                 let year = year_of(y).ok_or(io_err(io::ErrorKind::NotFound))?;
-                let listed: Vec<Dirent> = months(day_of(conv.created), today())
+                let listed: Vec<Dirent> = months(day_of(conv.created), self.today())
                     .into_iter()
                     .filter(|(yy, _)| *yy == year)
                     .map(|(_, m)| Dirent::new(month_dir(m), DirentKind::Dir))
@@ -984,17 +993,6 @@ fn copy_out(data: &[u8], buf: &mut [u8], offset: u64) -> usize {
     buf[..n].copy_from_slice(&data[from..from + n]);
     n
 }
-
-/// Today, in UTC — the top of every conversation's date axis.
-///
-/// Read on each listing rather than fixed at construction, unlike
-/// [`born`](MessengerFs::born): a mount left open across midnight has to start listing the new
-/// day, where a directory's reported mtime must not move.
-fn today() -> NaiveDate {
-    Utc::now().date_naive()
-}
-
-
 
 /// The year `seg` names, or `None` when it is not the four-digit name a listing writes.
 fn year_of(seg: &str) -> Option<i32> {

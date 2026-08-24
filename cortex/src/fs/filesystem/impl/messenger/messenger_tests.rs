@@ -10,6 +10,7 @@
 //! from a fetch that happened to come back empty.
 
 use std::ops::Range;
+use chrono::Datelike;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::error::{ApiError, ErrorClass, SourceError, SourceResult};
@@ -237,6 +238,38 @@ fn conv(id: &str, name: &str, kind: ConvKind) -> Conversation {
     conv_born(id, name, kind, D10 - 5 * DAY)
 }
 
+/// The day every fixture's axis ends at.
+///
+/// Pinned, because `Utc::now()` in the axis means a test asserting a year list has a date after
+/// which it can never pass again — `["2026"]` stops being true on 2027-01-01 and no amount of
+/// re-running fixes it.
+const FIXED_TODAY: (i32, u32, u32) = (2026, 8, 24);
+
+/// A store over `src` with the axis pinned. Every fixture goes through this rather than
+/// `MessengerFs::new`, so no test's assertion depends on the day it is run.
+/// The years a fixture conversation spans: the year it was created through the pinned today.
+///
+/// Derived rather than written out, so moving [`FIXED_TODAY`] past a new year adjusts every
+/// assertion instead of breaking three of them.
+fn span_years() -> Vec<String> {
+    let created = day_of(at(D10 - 5 * DAY)).year();
+    (created..=FIXED_TODAY.0).map(|y| y.to_string()).collect()
+}
+
+fn mounted(src: TestSource) -> MessengerFs<TestSource> {
+    MessengerFs::with_limits(src, fixed_limits())
+}
+
+fn fixed_limits() -> MessengerLimits {
+    MessengerLimits {
+        today: Some(
+            chrono::NaiveDate::from_ymd_opt(FIXED_TODAY.0, FIXED_TODAY.1, FIXED_TODAY.2)
+                .expect("a real date"),
+        ),
+        ..Default::default()
+    }
+}
+
 fn conv_born(id: &str, name: &str, kind: ConvKind, created: u64) -> Conversation {
     Conversation {
         id: ConvId(id.into()),
@@ -249,7 +282,7 @@ fn conv_born(id: &str, name: &str, kind: ConvKind, created: u64) -> Conversation
 /// One channel with a message on the 10th and one on the 12th — a gap on the 11th, which is
 /// the case the whole date design exists for.
 fn two_days() -> MessengerFs<TestSource> {
-    MessengerFs::new(TestSource::new(
+    mounted(TestSource::new(
         vec![conv("C1", "pricing", ConvKind::Channel)],
         vec![
             (ConvId("C1".into()), msg("1", D10 + 100, "on the tenth")),
@@ -292,7 +325,7 @@ async fn the_root_lists_the_sections_the_source_has() {
 /// there are no channels, when the truth is that they are somewhere else.
 #[tokio::test]
 async fn a_source_without_channels_has_no_channels_directory() {
-    let vol = MessengerFs::new(
+    let vol = mounted(
         TestSource::new(vec![conv("D1", "박지훈", ConvKind::Dm)], vec![]).no_channels(),
     );
     assert_eq!(
@@ -315,7 +348,7 @@ async fn a_source_without_channels_has_no_channels_directory() {
 /// has no way to tell the two apart.
 #[tokio::test]
 async fn a_source_without_dms_has_no_dms_directory() {
-    let vol = MessengerFs::new(
+    let vol = mounted(
         TestSource::new(vec![conv("C1", "pricing", ConvKind::Channel)], vec![]).no_dms(),
     );
     assert_eq!(
@@ -342,7 +375,7 @@ async fn the_date_axis_costs_one_request_a_month() {
 
     // Both levels above the month are arithmetic over `created`.
     let years = names(&vol.list(Path::new("/channels/pricing__C1")).await.unwrap());
-    assert_eq!(years, ["2026"]);
+    assert_eq!(years, span_years(), "created's year through today's, inclusive");
     let months = names(&vol.list(Path::new("/channels/pricing__C1/2026")).await.unwrap());
     assert!(months.contains(&"08".to_string()), "{months:?}");
     assert_eq!(
@@ -478,7 +511,7 @@ async fn empty_subdirectories_are_not_synthesized() {
             msg("101", D10 + 300, "sure"),
         ],
     )];
-    let vol = MessengerFs::new(src);
+    let vol = mounted(src);
     let day = names(
         &vol.list(Path::new("/channels/pricing__C1/2026/08"))
             .await
@@ -516,7 +549,7 @@ async fn empty_subdirectories_are_not_synthesized() {
 /// channel a bot was never invited to must not take the tree down with it.
 #[tokio::test]
 async fn an_unreadable_conversation_is_empty_rather_than_broken() {
-    let vol = MessengerFs::new(
+    let vol = mounted(
         TestSource::new(
             vec![
                 conv("C1", "pricing", ConvKind::Channel),
@@ -535,7 +568,7 @@ async fn an_unreadable_conversation_is_empty_rather_than_broken() {
     // — and reading a day of it answers empty rather than failing.
     assert_eq!(
         names(&vol.list(Path::new("/channels/secret__C2")).await.unwrap()),
-        ["2026"]
+        span_years(),
     );
     let denied = Path::new("/channels/secret__C2/2026/08");
     assert!(
@@ -565,7 +598,7 @@ async fn a_conversation_resolves_by_id_not_by_name() {
 /// name would otherwise open a directory nobody created.
 #[tokio::test]
 async fn a_name_with_a_separator_stays_one_component() {
-    let vol = MessengerFs::new(TestSource::new(
+    let vol = mounted(TestSource::new(
         vec![conv("C1", "eng/infra", ConvKind::Channel)],
         vec![],
     ));
@@ -637,7 +670,7 @@ async fn an_author_id_is_resolved_to_a_name() {
         name: "김철수".into(),
         record: serde_json::json!({"id": "U1"}),
     }];
-    let vol = MessengerFs::new(src);
+    let vol = mounted(src);
 
     let p = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
     let stat = vol.stat(p).await.unwrap();
@@ -665,7 +698,7 @@ fn sized_attachment(size: Option<u64>) -> MessengerFs<TestSource> {
         size,
         url: "https://example.invalid/f".into(),
     }];
-    MessengerFs::new(TestSource::new(
+    mounted(TestSource::new(
         vec![conv("C1", "pricing", ConvKind::Channel)],
         vec![(ConvId("C1".into()), m)],
     ))
@@ -838,7 +871,7 @@ async fn a_server_that_ignores_the_range_is_not_served_as_the_wrong_offset() {
         size: Some(window() + 4096),
         url: "https://example.invalid/f".into(),
     }];
-    let vol = MessengerFs::new(
+    let vol = mounted(
         TestSource::new(
             vec![conv("C1", "pricing", ConvKind::Channel)],
             vec![(ConvId("C1".into()), m)],
@@ -956,7 +989,7 @@ async fn a_held_small_file_never_answers_for_another_path() {
 #[tokio::test]
 async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
     let long = "가".repeat(200);
-    let vol = MessengerFs::new(TestSource::new(
+    let vol = mounted(TestSource::new(
         vec![conv("C1", &long, ConvKind::Channel)],
         vec![(ConvId("C1".into()), msg("1", D10 + 100, "on the tenth"))],
     ));
@@ -975,7 +1008,7 @@ async fn a_conversation_named_past_the_limit_is_listed_and_opens() {
     let years = names(&vol.list(&root).await.expect(
         "the name the listing gave has to be the name that opens",
     ));
-    assert_eq!(years, ["2026"]);
+    assert_eq!(years, span_years());
     let chat = root.join("2026/08/2026-08-10.jsonl");
     let mut buf = vec![0u8; 512];
     let n = vol
@@ -1048,7 +1081,7 @@ async fn past_the_text_budget_the_least_recently_used_day_goes() {
     let vol = two_fat_months(MessengerLimits {
         // Room for one of these days and not two.
         text_budget: 600,
-        ..Default::default()
+        ..fixed_limits()
     });
     // D10 is 2026-08-10 and D10 - 35 days is 2026-07-06.
     let ten = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
@@ -1072,7 +1105,7 @@ async fn past_the_text_budget_the_least_recently_used_day_goes() {
 async fn a_day_that_keeps_being_read_outlives_one_that_does_not() {
     let vol = two_fat_months(MessengerLimits {
         text_budget: 600,
-        ..Default::default()
+        ..fixed_limits()
     });
     // D10 is 2026-08-10 and D10 - 35 days is 2026-07-06.
     let ten = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
@@ -1098,7 +1131,7 @@ async fn a_day_that_keeps_being_read_outlives_one_that_does_not() {
 async fn one_day_bigger_than_the_budget_is_still_held_while_it_is_read() {
     let vol = two_fat_months(MessengerLimits {
         text_budget: 10,
-        ..Default::default()
+        ..fixed_limits()
     });
     let ten = Path::new("/channels/pricing__C1/2026/08/2026-08-10.jsonl");
 
@@ -1182,7 +1215,7 @@ async fn an_unsized_attachment_is_fetched_whole_past_the_ceiling() {
         ),
         MessengerLimits {
             window: 64,
-            ..Default::default()
+            ..fixed_limits()
         },
     );
     let mut buf = vec![0u8; 128];
@@ -1205,7 +1238,7 @@ async fn a_user_file_resolves_only_under_the_name_it_is_listed_as() {
         name: "amy".into(),
         record: serde_json::json!({"id": "U1"}),
     }];
-    let vol = MessengerFs::new(src);
+    let vol = mounted(src);
 
     let listed = names(&vol.list(Path::new("/users")).await.unwrap());
     assert_eq!(listed, ["amy__U1.json"], "the one name the listing writes");
@@ -1238,7 +1271,7 @@ async fn one_attachment_shared_twice_is_listed_once() {
     let (mut a, mut b) = (msg("1", D10 + 100, "here"), msg("2", D10 + 200, "again"));
     a.files = vec![file.clone()];
     b.files = vec![file];
-    let vol = MessengerFs::new(TestSource::new(
+    let vol = mounted(TestSource::new(
         vec![conv("C1", "pricing", ConvKind::Channel)],
         vec![
             (ConvId("C1".into()), a),
@@ -1313,7 +1346,7 @@ async fn the_budget_counts_attachments_not_only_text() {
         ),
         MessengerLimits {
             text_budget: 3_000,
-            ..Default::default()
+            ..fixed_limits()
         },
     );
     let aug = Path::new("/channels/pricing__C1/2026/08");

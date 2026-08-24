@@ -9,6 +9,7 @@
 //! Each field carries the reasoning that picked its default, because that is what a reader
 //! about to change one needs — not the value, which they can see.
 
+use chrono::NaiveDate;
 use std::time::Duration;
 
 
@@ -71,6 +72,19 @@ pub struct MessengerLimits {
     /// the number to set against the machine — either here, or by bounding how many mounts it
     /// keeps alive.
     pub text_budget: u64,
+
+    /// The day the date axis ends at, or `None` for the real clock.
+    ///
+    /// Pinned, a mount is reproducible: the same conversation lists the same months today and
+    /// next year. That is worth something to a host serving a frozen archive, and it is what
+    /// lets a test assert a year list without the assertion expiring — `Utc::now()` in the axis
+    /// means every such test has a date after which it can never pass again.
+    ///
+    /// It is also the only way to reach a month that is somehow ahead of this clock. Messages
+    /// dated in the future exist — imported archives carry them, and so does a skewed
+    /// timestamp — and with the axis stopping at the real today they are in no month any
+    /// listing names.
+    pub today: Option<NaiveDate>,
 }
 
 impl Default for MessengerLimits {
@@ -79,6 +93,7 @@ impl Default for MessengerLimits {
             window: WINDOW,
             ttl: TTL,
             text_budget: TEXT_BUDGET,
+            today: None,
         }
     }
 }
