@@ -82,6 +82,21 @@ fn magic_for(name: &str) -> Option<&'static [u8]> {
 /// Computed from the ts rather than from today, because a workspace this has never seen may
 /// have gone quiet months ago — asking for today would prove only that an empty window comes
 /// back empty.
+/// The `back`-th thirty-day window counting from now, as Slack's second-resolution strings.
+///
+/// Thirty days rather than a calendar month, because the only thing this test needs of a window
+/// is that it is bounded and that a recent one holds recent messages — and taking a dependency
+/// on a date library to align the edges would buy nothing it asserts.
+fn window_back(back: i64) -> (String, String) {
+    const WINDOW: i64 = 30 * 86_400;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64;
+    let latest = now - back * WINDOW;
+    ((latest - WINDOW).to_string(), latest.to_string())
+}
+
 fn day_around(ts: &str) -> (String, String) {
     let secs = ts
         .split('.')
@@ -127,29 +142,38 @@ async fn a_real_workspace_answers_the_read_surface() {
     assert!(!users.is_empty(), "a workspace has at least the installer");
 
     // --- a conversation's messages --------------------------------------------------
-    // Over the widest window there is, because no endpoint answers "which days does this
-    // have" and the axis is arithmetic instead: `history` over a range is the only question
-    // Slack takes, and a month of one is what the tree asks. Whichever conversation the token
-    // can actually read — a bot in none of them lists channels fine and reads none of them,
-    // which is the soft-fail path rather than a failure.
-    const SPAN: (&str, &str) = ("0", "9999999999");
+    // A window at a time, walking back from now, which is how the tree asks: no endpoint
+    // answers "which days does this have", so `history` over a range is the only question
+    // Slack takes. Bounded on purpose — the widest window there is would walk a busy
+    // channel's entire history to establish what one window establishes, and on a throttled
+    // tier that does not finish. Whichever conversation the token can actually read: a bot in
+    // none of them lists channels fine and reads none of them, which is the soft-fail path
+    // rather than a failure.
+    const WINDOWS: i64 = 24;
     let mut found = None;
-    for c in &channels {
-        let id = c["id"].as_str().unwrap_or_default();
-        match api.conversation_history(id, SPAN.0, SPAN.1).await {
-            Ok(msgs) if !msgs.is_empty() => {
-                found = Some((id.to_string(), msgs));
-                break;
+    'search: for back in 0..WINDOWS {
+        let (oldest, latest) = window_back(back);
+        for c in &channels {
+            let id = c["id"].as_str().unwrap_or_default();
+            match api.conversation_history(id, &oldest, &latest).await {
+                Ok(msgs) if !msgs.is_empty() => {
+                    found = Some((id.to_string(), msgs));
+                    break 'search;
+                }
+                Ok(_) => continue,
+                // One conversation being unreadable must not fail the tree — the whole point
+                // of the class. Anything wider propagates and fails this test, which is
+                // correct.
+                Err(e) if e.is_conversation_denied() => continue,
+                Err(e) => panic!("conversations.history: {e}"),
             }
-            Ok(_) => continue,
-            // One conversation being unreadable must not fail the tree — the whole point of
-            // the class. Anything wider propagates and fails this test, which is correct.
-            Err(e) if e.is_conversation_denied() => continue,
-            Err(e) => panic!("conversations.history: {e}"),
         }
     }
     let Some((channel, msgs)) = found else {
-        eprintln!("no readable conversation had messages; nothing further to exercise");
+        eprintln!(
+            "no readable conversation said anything in the last {WINDOWS} windows; \
+             nothing further to exercise"
+        );
         return;
     };
     eprintln!("{channel}: {} messages", msgs.len());

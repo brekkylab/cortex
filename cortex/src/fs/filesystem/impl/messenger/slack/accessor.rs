@@ -386,18 +386,7 @@ impl SlackAccessor {
                 p.push(("cursor", c));
             }
             let v = self.call(method, &p).await?;
-            let items = v
-                .get(items_key)
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let next = v
-                .get("response_metadata")
-                .and_then(|m| m.get("next_cursor"))
-                .and_then(Value::as_str)
-                .filter(|c| !c.is_empty())
-                .map(String::from);
-            Ok((items, next))
+            Ok((page_items(&v, items_key), next_cursor(&v)))
         })
         .await
     }
@@ -590,6 +579,31 @@ fn ts_of(m: &Value) -> f64 {
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0)
+}
+
+/// The items of one page, by the key the method keeps them under.
+///
+/// A key that is absent or is not an array reads as an empty page rather than a failure: Slack
+/// answers `ok: true` with the key missing for a conversation that has nothing, and a source
+/// that treated the two as the same would turn every quiet channel into an error.
+fn page_items(v: &Value, items_key: &str) -> Vec<Value> {
+    v.get(items_key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Where the next page is, or `None` when this was the last.
+///
+/// Slack signals the end two ways and both have to read as the end: the member is absent, or it
+/// is present and empty. Reading an empty string as a cursor asks for page one again forever,
+/// which is why the emptiness check is here rather than left to a caller to remember.
+fn next_cursor(v: &Value) -> Option<String> {
+    v.get("response_metadata")
+        .and_then(|m| m.get("next_cursor"))
+        .and_then(Value::as_str)
+        .filter(|c| !c.is_empty())
+        .map(String::from)
 }
 
 /// Follow a cursor to its end, or fail.

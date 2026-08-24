@@ -202,6 +202,43 @@ fn a_file_download_only_ever_reaches_slack() {
     refused("https://localhost:8000/f.pdf", mock);
 }
 
+/// The two halves of a page, which is everything Slack-specific about pagination. `walk` is
+/// tested beside this and knows none of it; between them they cover the whole loop.
+#[test]
+fn a_page_yields_its_items_and_where_the_next_one_is() {
+    let page = serde_json::json!({
+        "ok": true,
+        "channels": [{"id": "C1"}, {"id": "C2"}],
+        "response_metadata": {"next_cursor": "dGVhbTpDMg=="}
+    });
+    assert_eq!(page_items(&page, "channels").len(), 2);
+    assert_eq!(next_cursor(&page).as_deref(), Some("dGVhbTpDMg=="));
+    // And the key is per method, so asking with the wrong one must not silently borrow another.
+    assert!(page_items(&page, "members").is_empty());
+}
+
+/// Slack ends a walk two ways and both have to read as the end. An empty string read as a
+/// cursor asks for page one again, forever.
+#[test]
+fn the_end_of_a_walk_is_an_absent_or_an_empty_cursor() {
+    for meta in [
+        serde_json::json!({"ok": true}),
+        serde_json::json!({"ok": true, "response_metadata": {}}),
+        serde_json::json!({"ok": true, "response_metadata": {"next_cursor": ""}}),
+    ] {
+        assert_eq!(next_cursor(&meta), None, "{meta}");
+    }
+}
+
+/// A quiet conversation answers `ok: true` with the key missing, which is not a failure and not
+/// a fault — it is a channel where nothing was said.
+#[test]
+fn a_page_missing_its_key_is_empty_rather_than_an_error() {
+    assert!(page_items(&serde_json::json!({"ok": true}), "messages").is_empty());
+    // Present but not an array is the same: nothing to read, and nothing to panic about.
+    assert!(page_items(&serde_json::json!({"messages": 3}), "messages").is_empty());
+}
+
 /// A page ceiling is what the flag this replaced reported, and reporting it was all anyone did
 /// with it. Sixty pages is past the fifty the ceiling used to stand at, so this is the case
 /// that used to come back short and call itself whole.
