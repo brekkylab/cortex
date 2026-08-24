@@ -163,12 +163,21 @@ const PAGE_LIMIT: usize = 200;
 /// past any listing this client has reason to expect: two million items at [`PAGE_LIMIT`].
 /// Reaching it means a server handed out cursors forever, which is a fault and answers as one.
 ///
-/// It is a poor detector of that fault, and knowingly so. Two million requests is not a wait
+/// It is a poor detector of that fault, and knowingly so. Ten thousand requests is not a wait
 /// anything survives — a read behind a mount is abandoned by the kernel long before — so what
 /// this catches is a loop in a batch job, not one behind an `ls`. Catching it where it shows
 /// would mean noticing that a cursor came back unchanged, which is a different check and not
 /// one this makes.
 const PAGE_GUARD: usize = 10_000;
+
+/// The guard is a fault threshold and not a budget, which is a claim about its *size*: it has
+/// to sit past any listing a real service could answer, or it silently becomes the ceiling this
+/// lane removed. Checked at compile time rather than left to the doc, because the number it
+/// replaced was fifty and the way back is a one-character edit.
+const _: () = assert!(
+    PAGE_GUARD * PAGE_LIMIT >= 2_000_000,
+    "PAGE_GUARD is low enough that a real listing could reach it, which makes it a budget"
+);
 
 /// Errors that mean "this conversation is not readable by this token", as opposed to "the
 /// request was wrong" or "Slack is down". A bot that was never invited to one channel must

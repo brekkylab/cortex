@@ -77,26 +77,38 @@ fn magic_for(name: &str) -> Option<&'static [u8]> {
     })
 }
 
+/// The `back`-th thirty-day window counting back from `now`, as Slack's second-resolution
+/// strings.
+///
+/// Thirty days rather than a calendar month, because the only thing this test needs of a window
+/// is that it is bounded and that a recent one holds recent messages — and taking a dependency
+/// on a date library to align the edges would buy nothing it asserts.
+/// Thirty days rather than a calendar month, because the only thing this test needs of a window
+/// is that it is bounded and that a recent one holds recent messages. That is *not* how the
+/// tree asks — it walks calendar months over a conversation's whole lifetime from
+/// `Conversation::created` — so this probe reaches two years back and no further, and a
+/// workspace quiet for longer than that exercises nothing below the search.
+///
+/// `now` is passed in rather than read here so the windows tile by construction: reading the
+/// clock once per call lets it drift between them.
+fn window_back(now: i64, back: i64) -> (String, String) {
+    const WINDOW: i64 = 30 * 86_400;
+    let latest = now - back * WINDOW;
+    ((latest - WINDOW).to_string(), latest.to_string())
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs() as i64
+}
+
 /// The UTC day containing `ts`, as the `(oldest, latest)` pair a history window takes.
 ///
 /// Computed from the ts rather than from today, because a workspace this has never seen may
 /// have gone quiet months ago — asking for today would prove only that an empty window comes
 /// back empty.
-/// The `back`-th thirty-day window counting from now, as Slack's second-resolution strings.
-///
-/// Thirty days rather than a calendar month, because the only thing this test needs of a window
-/// is that it is bounded and that a recent one holds recent messages — and taking a dependency
-/// on a date library to align the edges would buy nothing it asserts.
-fn window_back(back: i64) -> (String, String) {
-    const WINDOW: i64 = 30 * 86_400;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs() as i64;
-    let latest = now - back * WINDOW;
-    ((latest - WINDOW).to_string(), latest.to_string())
-}
-
 fn day_around(ts: &str) -> (String, String) {
     let secs = ts
         .split('.')
@@ -142,37 +154,53 @@ async fn a_real_workspace_answers_the_read_surface() {
     assert!(!users.is_empty(), "a workspace has at least the installer");
 
     // --- a conversation's messages --------------------------------------------------
-    // A window at a time, walking back from now, which is how the tree asks: no endpoint
-    // answers "which days does this have", so `history` over a range is the only question
-    // Slack takes. Bounded on purpose — the widest window there is would walk a busy
-    // channel's entire history to establish what one window establishes, and on a throttled
-    // tier that does not finish. Whichever conversation the token can actually read: a bot in
-    // none of them lists channels fine and reads none of them, which is the soft-fail path
-    // rather than a failure.
+    // A window at a time, walking back from now. No endpoint answers "which days does this
+    // have", so `history` over a range is the only question Slack takes, and the widest range
+    // there is would walk a busy channel's entire history to establish what one window
+    // establishes. Newest window first, because that is where an active workspace answers on
+    // the first request.
+    //
+    // A conversation the token cannot read drops out of the search rather than being asked
+    // again: the denial is a fact about the pair, not about the window, and re-asking it once
+    // per window is how a token that has left every channel turns C requests into 24×C.
     const WINDOWS: i64 = 24;
+    let now = now_secs();
+    let mut candidates: Vec<String> = channels
+        .iter()
+        .filter_map(|c| c["id"].as_str().map(str::to_string))
+        .collect();
+    let listed = candidates.len();
     let mut found = None;
     'search: for back in 0..WINDOWS {
-        let (oldest, latest) = window_back(back);
-        for c in &channels {
-            let id = c["id"].as_str().unwrap_or_default();
+        if candidates.is_empty() {
+            break;
+        }
+        let (oldest, latest) = window_back(now, back);
+        let mut denied = Vec::new();
+        for id in &candidates {
             match api.conversation_history(id, &oldest, &latest).await {
                 Ok(msgs) if !msgs.is_empty() => {
-                    found = Some((id.to_string(), msgs));
+                    found = Some((id.clone(), msgs));
                     break 'search;
                 }
                 Ok(_) => continue,
                 // One conversation being unreadable must not fail the tree — the whole point
                 // of the class. Anything wider propagates and fails this test, which is
                 // correct.
-                Err(e) if e.is_conversation_denied() => continue,
+                Err(e) if e.is_conversation_denied() => denied.push(id.clone()),
                 Err(e) => panic!("conversations.history: {e}"),
             }
         }
+        candidates.retain(|id| !denied.contains(id));
     }
     let Some((channel, msgs)) = found else {
         eprintln!(
-            "no readable conversation said anything in the last {WINDOWS} windows; \
-             nothing further to exercise"
+            "nothing said in the last {} days ({WINDOWS} windows of 30) by any of the {} \
+             conversations that stayed readable, out of {listed} listed; nothing further to \
+             exercise. A workspace quiet for longer than that exercises none of the rest, \
+             which is the cost of not walking every channel's whole history to find out.",
+            WINDOWS * 30,
+            candidates.len()
         );
         return;
     };
@@ -287,7 +315,7 @@ async fn a_real_workspace_answers_the_read_surface() {
             let got = if served_range {
                 &chunk[..]
             } else {
-                &chunk[mid..(mid + 64).min(chunk.len())]
+                chunk.get(mid..).unwrap_or(&[])
             };
             assert_eq!(got, want, "a ranged read disagreed with the whole file");
             eprintln!(

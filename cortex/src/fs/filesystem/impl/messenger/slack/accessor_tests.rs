@@ -292,25 +292,6 @@ async fn a_walk_broken_off_partway_fails_rather_than_answering_short() {
     );
 }
 
-/// Including a credential withdrawn between pages, which `SlackSource::section` calls out by
-/// name: answering that with a quietly smaller tree is the failure the mount check removes.
-#[tokio::test]
-async fn a_credential_lost_between_pages_fails() {
-    for code in ["invalid_auth", "token_revoked", "missing_scope"] {
-        let r = walk(PAGE_GUARD, "test.method", |cursor| async move {
-            match cursor.as_deref() {
-                None => Ok((vec![Value::from(1)], Some("2".to_string()))),
-                _ => Err(api_err(code)),
-            }
-        })
-        .await;
-        assert!(
-            matches!(&r, Err(SourceError::Api(e)) if e.code == code),
-            "{code} must not come back as a short listing: {r:?}"
-        );
-    }
-}
-
 /// The guard is for a cursor that never ends, which is a fault rather than a long listing —
 /// so it answers as one instead of handing back a prefix.
 #[tokio::test]

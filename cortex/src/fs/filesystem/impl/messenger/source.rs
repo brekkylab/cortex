@@ -22,9 +22,9 @@
 //! one, so the listing it produces is a window that reads like a whole — and the reader is an
 //! agent, which has no way to tell the difference and stops looking.
 //!
-//! So the tree generates the axis instead, from [`Conversation::created`] to today. `<year>/`
-//! and `<month>/` are arithmetic over those two dates: they are always complete, they are never
-//! a window, and listing them spends no request past the one that listed the conversation. An
+//! So the tree generates the axis instead, from [`Conversation::created`] to today. The
+//! `<year>/` and `<month>/` *names* are arithmetic over those two dates: always complete, never
+//! a window, and spelling them costs nothing past the walk that listed the conversations. An
 //! agent sees the whole span before asking for any of it, and a channel carrying fifty thousand
 //! messages a day has no more of them than a silent one of the same age.
 //!
@@ -245,12 +245,17 @@ pub struct Capabilities {
 pub trait MessengerSource: Send + Sync {
     /// Conversations this credential can see.
     ///
-    /// Every one of them, or a failure. A source that pages walks to the end of its cursor
-    /// rather than stopping at a ceiling: a listing short by two thousand channels is
-    /// indistinguishable from a workspace that has two thousand fewer, and nothing in a
-    /// directory can say which it is. The one thing a source may hand back short is a walk
-    /// the service broke off partway — the pages that arrived are answers, and forty requests
-    /// spent to report a failure are forty requests spent to say nothing.
+    /// Every one of them, or a failure — never part of them, and there is no exception. A
+    /// source that pages walks to the end of its cursor rather than stopping at a ceiling, and
+    /// one the service breaks off partway fails, dropping the pages it had. Expensive, and the
+    /// alternative is worse: a listing short by two thousand channels is indistinguishable from
+    /// a workspace that has two thousand fewer, nothing in a directory can say which it is, and
+    /// the tree makes those channels unreachable by path as well.
+    ///
+    /// The same holds for [`history`](Self::history), [`thread`](Self::thread) and
+    /// [`users`](Self::users): each answers with all of what was asked for, or fails. A short
+    /// month is a day this tree does not name, and an unnamed day reads as a day that held
+    /// nothing.
     fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<Conversation>>>;
 
     /// Messages created within `window`, oldest-first, thread roots and standalone messages

@@ -28,9 +28,9 @@
 //! agent, which cannot tell a quiet day from a failed request and pays a round trip to find
 //! out. So the levels split the difference:
 //!
-//! * `<year>/<month>/` is arithmetic and always complete, so listing it spends no request
-//!   past the one that listed the conversation itself — and a month holds under twelve
-//!   entries however old the conversation is;
+//! * the `<year>/` and `<month>/` *names* are arithmetic and always complete, so a year lists
+//!   at most twelve entries however old the conversation is, and neither level costs anything
+//!   past the walk that listed the conversations — entering a month is where that stops;
 //! * inside a month, only a day that *has* messages is a name. A silent day is absent rather
 //!   than an empty file, which is the distinction a listing can actually make.
 //!
@@ -40,10 +40,12 @@
 //! [`assemble`](MessengerFs::assemble) resolves author names from, which is its own walk and
 //! on a large workspace the larger half of the bill. What the window answers is every day
 //! file in the month, the `threads/` listing (roots with replies) and the `files/` listing
-//! together, so reading any day in it is free *while the month is still held*: past
-//! [`ttl`](MessengerLimits::ttl), or once
-//! [`text_budget`](MessengerLimits::text_budget) has evicted it, the next read pays again.
-//! That is [`Body`], and it is cached whole.
+//! together, so reading any *day* in it is free while the month is still held — not a thread
+//! and not an attachment, each of which is its own fetch. And held is the operative word: past
+//! [`ttl`](MessengerLimits::ttl), once
+//! [`text_budget`](MessengerLimits::text_budget) has evicted it, or once the conversation
+//! listing behind it has expired — that shares the same `ttl` and was fetched first, so it goes
+//! first — the next read pays again. That is [`Body`], and it is cached whole.
 //!
 //! A day named directly costs its own window instead, not its month's: a `search` hit names
 //! exactly one day, and buying the month around it would spend a busy channel's whole month
