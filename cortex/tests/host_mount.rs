@@ -324,6 +324,36 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
     fs::remove_dir_all(&mnt).ok();
 }
 
+/// `>>` through a real mount, which the contract has no flag for on purpose: the
+/// kernel resolves `O_APPEND` itself and sends the absolute end offset, so a backend
+/// that only writes where it is told already appends. Every other write in this file
+/// starts from an offset the test chose, so none of them would notice if that stopped
+/// being true.
+#[test]
+#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+fn the_operating_system_can_append_to_a_cortex_mount() {
+    use std::io::Write;
+
+    let mnt = mountpoint("append");
+    let mount = HostMount::try_new(volume(), &mnt).expect("mount");
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(mnt.join("greeting.txt"))
+        .unwrap();
+    file.write_all(b"and again\n").unwrap();
+    drop(file);
+
+    assert_eq!(
+        fs::read_to_string(mnt.join("greeting.txt")).unwrap(),
+        "Hello from cortex!\nand again\n"
+    );
+
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
+    fs::remove_dir_all(&mnt).ok();
+}
+
 /// `fuser`-only: mount options are part of its call surface, and FUSE-T's are a
 /// different set. The behaviour under test is the kernel's, not ours.
 #[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
