@@ -28,7 +28,11 @@ serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "process", "rt", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `net` for the loopback listener the Slack client's tests answer from. A canned two-page
+# response over a real socket is the only way to reach `paginate` and the orderings it applies
+# — everything below it is a free function with its own test, and everything above it was green
+# with the middle stubbed out.
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 
 [features]
 # No *binding* by default. The crate's own layers — `FileSystem`, `WorkFs`, the

@@ -302,3 +302,174 @@ async fn a_cursor_that_never_ends_is_a_fault() {
     .await;
     assert!(matches!(r, Err(SourceError::Io(_))), "{r:?}");
 }
+
+// --- a loopback Slack ----------------------------------------------------------------------
+//
+// Everything above this line asserts a decision without a socket, which is right for a
+// decision. What none of it can reach is `paginate`: stub its body to return no items and no
+// cursor and the whole suite stays green, because the cursor member, the `limit` it asks for and
+// the ordering the two history methods apply are all *between* the free functions and the tree.
+// `SlackConfig::base_url` exists for a mock, so this is one.
+
+/// A Slack that answers with canned bodies, in order, and remembers what it was asked.
+struct Loopback {
+    base: String,
+    asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Loopback {
+    /// One body per request. A request past the last is not answered, which is how a test that
+    /// expected fewer pages than the client asked for fails rather than hangs — the client's
+    /// own connect timeout ends it.
+    async fn serving(bodies: Vec<String>) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let base = format!("http://{}", listener.local_addr().expect("an address"));
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+
+        tokio::spawn(async move {
+            for body in bodies {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // Enough of the head to see the request line. Read to the blank line rather
+                // than to EOF: the client keeps the connection open waiting for a response.
+                let mut head = Vec::new();
+                loop {
+                    let mut chunk = [0u8; 512];
+                    match sock.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => head.extend_from_slice(&chunk[..n]),
+                    }
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let line = String::from_utf8_lossy(&head)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                log.lock().expect("a lock").push(line);
+
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+
+        Loopback { base, asked }
+    }
+
+    fn accessor(&self) -> SlackAccessor {
+        SlackAccessor::new(&SlackConfig {
+            base_url: Some(self.base.clone()),
+            ..config(Some("xoxp-loopback"), None)
+        })
+        .expect("a client")
+    }
+
+    fn asked(&self) -> Vec<String> {
+        self.asked.lock().expect("a lock").clone()
+    }
+}
+
+/// `paginate` end to end: the cursor comes out of `response_metadata`, goes back in as a
+/// parameter, and every page asks for `PAGE_LIMIT`.
+#[tokio::test]
+async fn paginate_threads_the_cursor_and_asks_for_a_full_page() {
+    let fake = Loopback::serving(vec![
+        r#"{"ok":true,"channels":[{"id":"C1"}],"response_metadata":{"next_cursor":"NEXT"}}"#
+            .to_string(),
+        r#"{"ok":true,"channels":[{"id":"C2"}],"response_metadata":{"next_cursor":""}}"#
+            .to_string(),
+    ])
+    .await;
+
+    let got = fake
+        .accessor()
+        .list_conversations("public_channel")
+        .await
+        .expect("two pages");
+
+    assert_eq!(got.len(), 2, "both pages arrived: {got:?}");
+    let asked = fake.asked();
+    assert_eq!(asked.len(), 2, "one request per page: {asked:?}");
+    assert!(
+        asked.iter().all(|q| q.contains(&format!("limit={PAGE_LIMIT}"))),
+        "every page asks for a full one: {asked:?}"
+    );
+    assert!(
+        !asked[0].contains("cursor="),
+        "the first page has no cursor to send: {}",
+        asked[0]
+    );
+    assert!(
+        asked[1].contains("cursor=NEXT"),
+        "the second page sends what the first returned: {}",
+        asked[1]
+    );
+}
+
+/// Slack answers newest-first and the tree partitions by day in the order it is handed, so this
+/// sort is the only thing making a day file readable top to bottom. Deleting it passed every
+/// other test in this crate.
+#[tokio::test]
+async fn history_answers_oldest_first_however_slack_ordered_it() {
+    let fake = Loopback::serving(vec![
+        r#"{"ok":true,"messages":[
+             {"ts":"300.000000","text":"third"},
+             {"ts":"100.000000","text":"first"},
+             {"ts":"200.000000","text":"second"}
+           ]}"#
+        .to_string(),
+    ])
+    .await;
+
+    let got = fake
+        .accessor()
+        .conversation_history("C1", "0", "999")
+        .await
+        .expect("one page");
+
+    let order: Vec<&str> = got.iter().map(|m| m["ts"].as_str().unwrap_or("")).collect();
+    assert_eq!(
+        order,
+        ["100.000000", "200.000000", "300.000000"],
+        "oldest first, whatever order it arrived in"
+    );
+}
+
+/// A thread's root has to come first or its file cannot be read top to bottom, and a root's ts
+/// is the smallest in the thread — so the same sort carries it.
+#[tokio::test]
+async fn a_thread_answers_with_its_root_first() {
+    let fake = Loopback::serving(vec![
+        r#"{"ok":true,"messages":[
+             {"ts":"100.000200","thread_ts":"100.000000","text":"reply"},
+             {"ts":"100.000000","thread_ts":"100.000000","text":"root"}
+           ]}"#
+        .to_string(),
+    ])
+    .await;
+
+    let got = fake
+        .accessor()
+        .conversation_replies("C1", "100.000000")
+        .await
+        .expect("one page");
+
+    assert_eq!(
+        got.first().and_then(|m| m["text"].as_str()),
+        Some("root"),
+        "the root leads: {got:?}"
+    );
+}
