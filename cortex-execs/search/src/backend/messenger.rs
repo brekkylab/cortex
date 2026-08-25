@@ -39,6 +39,15 @@ impl<S: MessengerSource + MessengerIndex> Messenger<S> {
     /// Empty when the roster cannot be read, and then the name is simply absent from the line —
     /// which is what an absent `name` already means in this format. One missing grant does not
     /// turn a search into a failure.
+    ///
+    /// Two failures reach here and no others. A dead credential does not: the index is asked
+    /// first and propagates, so the store reports that it could not search at all. What is left
+    /// is an install granted `search:read` and not `users:read`, where every hit comes back
+    /// nameless every time and the cause is a scope table away — and a roster walk the service
+    /// broke off, which a source answers all-or-nothing, so past two hundred members a throttle
+    /// that outlives its retries costs every name rather than the pages it did not reach. Both
+    /// are more legible than the partial roster they replaced: all of the hits missing a name
+    /// reads as a fault, where five of twenty reads as five people who left.
     async fn roster(&self) -> HashMap<String, String> {
         match self.source.users().await {
             Ok(users) => users.into_iter().map(|u| (u.id, u.name)).collect(),
@@ -49,6 +58,10 @@ impl<S: MessengerSource + MessengerIndex> Messenger<S> {
     /// The listing's own record per conversation, which is the authority on the human half of a
     /// directory name — an index may answer with less, a one-to-one DM with no display name for
     /// one. Empty when it cannot be read, and then each hit's own record names its path.
+    ///
+    /// A path built that way still opens: `<name>__<id>` is addressed by the id, and the tree
+    /// resolves a conversation directory by the half after `__`. What differs is the readable
+    /// half, so a hit's path can be spelled unlike the same directory in `ls`.
     async fn listing(&self) -> HashMap<String, Conversation> {
         match self.source.conversations().await {
             Ok(convs) => convs.into_iter().map(|c| (c.id.0.clone(), c)).collect(),
