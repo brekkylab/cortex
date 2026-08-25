@@ -172,7 +172,11 @@ async fn a_reply_names_its_threads_file_under_the_roots_day() {
         hits: vec![SearchHit {
             conv: conv("pricing", "C1", ConvKind::Channel),
             msg: msg(
-                ROOT_TS + 300_000,
+                // A month later than its root, deliberately: `chat_path` spends `day` on the
+                // month directory alone, so a reply written in the same month as its root
+                // produces the same path whether the day came from the thread or from the
+                // reply. Same-month, this test passes against `day = hit.msg.ts`.
+                ROOT_TS + 3_000_000,
                 "좋은데?",
                 Some(Thread {
                     root: Some(MsgId("1785737875.341929".into())),

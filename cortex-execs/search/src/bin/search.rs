@@ -39,7 +39,9 @@ async fn run() -> ExitCode {
 
     // Before any credential, deliberately: `--help` is a question about the command and not
     // about a service, and answering it with "no token" tells the asker nothing they asked.
-    if args.iter().any(|a| a == "--help" || a == "-h") {
+    // Asked of the parser rather than of the argument list, so the answer here and the answer
+    // through a console cannot differ — `--in --help` is a missing query to both.
+    if cortex_exec_search::wants_help(&args) {
         print!("{}", cortex_exec_search::usage());
         return ExitCode::SUCCESS;
     }

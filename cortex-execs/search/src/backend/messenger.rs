@@ -145,11 +145,14 @@ impl<S: MessengerSource + MessengerIndex> Searchable for Messenger<S> {
             }
 
             // Once for the whole answer rather than per hit, which is why they are fetched
-            // before the map and not inside it. Neither is cheap and neither is kept: a
-            // roster is `ceil(members / 200)` requests, and a source holds nothing between
-            // calls — the tree's cache belongs to the mount, not to this. So two searches in
-            // one second pay for the roster twice, and on a large workspace that is most of
-            // what a search costs.
+            // before the map and not inside it. Neither is cheap: a roster is
+            // `ceil(members / 200)` requests, and on a large workspace that is most of what a
+            // cold search costs. Held afterwards — see `names` and `convs` — so the cost lands
+            // on the first search of a session rather than on every one.
+            //
+            // Twice on a cold one, in fact: `conversations()` walks the roster again inside
+            // itself to name a DM's partner, and neither slot can dedupe a call made below the
+            // trait. Not fixed here, because the fix is a source that names its own messages.
             let names = self.roster().await;
             let listed = self.listing().await;
 

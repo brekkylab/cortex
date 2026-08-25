@@ -17,8 +17,15 @@ pub struct Hit {
     /// The hit as the file at `path` spells it — one line of it, for a line-oriented file.
     ///
     /// Bytes and not a string: this is copied out of a file's own format, and a command that
-    /// decoded it would have to guess at an encoding nobody asked it about. Ends with a
-    /// newline if the format's lines do.
+    /// decoded it would have to guess at an encoding nobody asked it about.
+    ///
+    /// It has to end with a newline. The command prints `<path>\t<record>` and reads the result
+    /// back with `cut -f1`, so a record that does not terminate its own line runs the next hit's
+    /// path onto it and every hit after the first is lost to the pipeline — silently, and with
+    /// nothing in the exit code to say so. A backend whose format is not line-oriented has to
+    /// choose a line for this. The command appends one if a backend does not, because it cannot
+    /// check a contract it does not implement, but a record arriving without one is a defect in
+    /// the backend.
     pub record: Vec<u8>,
 }
 
@@ -29,8 +36,12 @@ pub struct Hit {
 ///
 /// Not every store implements this, and that is the point. Slack refuses `search.messages` to a
 /// bot token; an object store has no text index whatsoever. A store with no index simply has no
-/// backend here, and a mount with no backend is reported as such rather than answered with an
-/// empty result — which would say "nothing there" about a place nobody looked.
+/// backend here, and is not asked — which is not the same as being answered with an empty
+/// result, and never says "nothing there" about a place nobody looked.
+///
+/// It is also not the same as being *named*. The fan-out knows the backends it was handed and
+/// nothing else, so a mount registered with none is invisible to it: the report says what was
+/// asked. Only `--in` can name an unsearchable place, because there the reader spelled it.
 ///
 /// Which stores those are is a fact about somebody else's API on a date, and it moves. Discord
 /// offered bots no message search until it shipped one in March 2026 — and this trait is why

@@ -240,7 +240,12 @@ async fn help_needs_no_store_and_no_credential() {
     assert_eq!(r.exit_code, 0);
     let text = out(&r);
     assert!(text.contains("search <query>"), "{text}");
-    assert!(text.contains("Exit codes follow grep"), "{text}");
+    // Named rather than merely present: `--help` is where the exit codes are documented, and
+    // they are close to `grep`'s without being `grep`'s — a store that could not be asked
+    // leaves a zero exit here and a 2 there. A reader who assumes parity acts on a partial
+    // answer, so the text has to say which it is.
+    assert!(text.contains("Exit codes:"), "{text}");
+    assert!(text.contains("not the same"), "{text}");
 }
 
 #[tokio::test]
@@ -254,4 +259,65 @@ async fn a_query_is_required_and_a_count_has_to_be_a_number() {
     let r = run(search(), &["--count", "many", "가격"]).await;
     assert_eq!(r.exit_code, 2);
     assert!(said(&r).contains("not a number"), "{}", said(&r));
+}
+
+/// A record is required to end its own line. The command terminates one that does not, because
+/// the failure is invisible: two hits on one line is one line to `cut -f1`, and every hit after
+/// the first is gone with a zero exit and nothing in the report.
+#[tokio::test]
+async fn a_record_that_does_not_end_its_line_still_gets_one() {
+    struct Blunt;
+    impl Searchable for Blunt {
+        fn search<'a>(&'a self, _q: &'a str, _n: usize) -> BoxFuture<'a, SearchResult> {
+            Box::pin(async move {
+                Ok(vec![
+                    Hit { path: "a".into(), record: b"{\"t\":1}".to_vec() },
+                    Hit { path: "b".into(), record: b"{\"t\":2}".to_vec() },
+                ])
+            })
+        }
+    }
+
+    let r = run(Search::new().with("chat/slack", Blunt), &["가격"]).await;
+    let text = out(&r);
+    assert_eq!(
+        text.lines().count(),
+        2,
+        "two hits are two lines, whatever the backend terminated: {text:?}"
+    );
+    // And the first field of each line is still a path a reader can open.
+    let first: Vec<&str> = text.lines().filter_map(|l| l.split('\t').next()).collect();
+    assert_eq!(first, ["chat/slack/a", "chat/slack/b"], "{text:?}");
+}
+
+/// A query with no content in it is not a search. Both spellings reach the parser as at least
+/// one word, so the guard has to be about the joined query rather than the argument count.
+#[tokio::test]
+async fn a_query_with_no_content_is_refused_before_any_store_is_asked() {
+    for argv in [vec![""], vec!["   "], vec!["", ""], vec!["\t"]] {
+        let search = Search::new().with("chat/slack", Fake::with(&[("a", "{}")]));
+        let r = run(search, &argv).await;
+        assert_eq!(r.exit_code, 2, "{argv:?} reached a store: {}", out(&r));
+        assert!(said(&r).contains("no query"), "{}", said(&r));
+    }
+}
+
+/// The binary answers `--help` before it can build a store, so it has to ask the parser what
+/// help means rather than scan for the word. Scanning is how the two came apart: `--in --help`
+/// is help to a scan and a missing query to `exec`, and one command cannot answer twice.
+#[test]
+fn help_is_what_the_parser_says_it_is_and_not_what_a_scan_says() {
+    let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    for asks in [vec!["--help"], vec!["-h"], vec!["가격", "--help"]] {
+        assert!(wants_help(&argv(&asks)), "{asks:?}");
+    }
+    // `--help` in the position of a flag's value is that value, both here and in `exec`.
+    for does_not in [
+        vec!["--in", "--help"],
+        vec!["--count", "--help"],
+        vec!["--in", "-h"],
+        vec!["가격"],
+    ] {
+        assert!(!wants_help(&argv(&does_not)), "{does_not:?}");
+    }
 }

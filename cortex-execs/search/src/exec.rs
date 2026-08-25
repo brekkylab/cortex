@@ -44,12 +44,19 @@ Examples
     # because `?` is a literal in the pattern language `grep` uses by default.
     search 'pricing' | cut -f1 | sort -u | tr '\\n' '\\0' | xargs -0 grep -nHE 'A/B ?test'
 
-One search is one request per store; walking the tree is not. A day of chat costs a call and
-each thread costs another, so `grep -r` over a mount is thousands of them and a rate limit
-answers first. Search to find the files, then read those.
+One search asks each store's index once; walking the tree asks per file. A day of chat costs a
+call and each thread costs another, so `grep -r` over a mount is thousands of them and a rate
+limit answers first. Search to find the files, then read those.
 
-Exit codes follow grep: 0 found something, 1 every store answered and none had it, 2 nothing
-could be searched — or something could not, and nothing was found.
+The index query is one request. Naming what comes back is not: a messenger store resolves author
+names and conversation names from listings that page, so a cold search spends those too and holds
+them for a few minutes. Search to find the files, then read those.
+
+Exit codes: 0 found something, 1 every store answered and none had it, 2 nothing could be
+searched — or something could not, and nothing was found. Close to `grep`'s and not the same:
+`grep` answers 2 when a file was unreadable even though another matched, where this answers 0 and
+names the store it could not ask on stderr. A caller that must not act on a partial answer reads
+the report, not the code.
 ";
 
 /// What the command was asked to do.
@@ -107,11 +114,16 @@ impl Args {
             }
         }
 
-        if words.is_empty() {
+        // Joined first, because emptiness is a property of the query and not of the argument
+        // count: `search ""` and `search "" ""` both arrive as one or more words and both mean
+        // nothing. Sending either on spends a request per store against the budget this command
+        // exists to conserve, to ask a service a question with no content in it.
+        let query = words.join(" ");
+        if query.trim().is_empty() {
             return Err(usage_error("no query"));
         }
         Ok(Parsed::Run(Args {
-            query: words.join(" "),
+            query,
             count,
             scope,
         }))
@@ -134,6 +146,17 @@ fn usage_error(what: &str) -> Failure {
 /// What the command says about itself, before there is anything to search with.
 pub fn usage() -> &'static str {
     USAGE
+}
+
+/// Whether this argv is asking for help, by the same reading the command gives it.
+///
+/// Exists so a caller that has to answer `--help` *before* it can build the stores — the binary
+/// does, because building them wants a credential and a question about the command is not a
+/// question about a service — asks the parser rather than scanning for the word. Scanning is how
+/// the two disagreed: `--in --help` is help to a scan and a missing query to the parser, and a
+/// command that answers one way as a binary and another way through a console is two commands.
+pub fn wants_help(args: &[String]) -> bool {
+    matches!(Args::parse(args), Ok(Parsed::Help))
 }
 
 /// One store, under the path it is mounted at.
@@ -241,6 +264,14 @@ impl Search {
                     for hit in found {
                         hits.extend_from_slice(line(store, &hit).as_bytes());
                         hits.extend_from_slice(&hit.record);
+                        // A record is required to end its own line and the shipped backend does.
+                        // Terminated here anyway, because the alternative when one does not is
+                        // two hits on one line — which `cut -f1` reads as one, losing the rest
+                        // with no error and a zero exit. Not a check a caller could make either:
+                        // the damage is in bytes it never sees.
+                        if !hit.record.ends_with(b"\n") {
+                            hits.push(b'\n');
+                        }
                     }
                 }
                 Err(why) => {

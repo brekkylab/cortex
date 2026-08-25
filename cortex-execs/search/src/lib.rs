@@ -29,7 +29,12 @@
 //! bot token, and an object store has no text index whatsoever. A
 //! trait method some stores could only ever fail is the same mistake as a directory that is
 //! always empty — it looks like a feature and answers like a fault. A store with no index has
-//! no [`Searchable`] backend, and a fan-out *reports* that rather than answering nothing.
+//! no [`Searchable`] backend and is not asked.
+//!
+//! What that costs is worth naming: the registry is what the session handed over, so a store
+//! nobody registered is not merely unasked, it is unknown — and a fan-out cannot report a place
+//! it never learned about. `--in` naming one does say so, because there the reader supplied the
+//! name. Without `--in` the report lists what was asked and nothing else.
 //!
 //! # What it does not replace
 //!
@@ -42,5 +47,5 @@ mod searchable;
 
 pub mod backend;
 
-pub use exec::{Search, usage};
+pub use exec::{Search, usage, wants_help};
 pub use searchable::{Hit, SearchResult, Searchable};
