@@ -56,11 +56,25 @@ struct Fake {
     users: Vec<User>,
     /// The platform has no index for this credential, which is not the same as no matches.
     no_index: bool,
+    /// What the backend actually asked the source for, so a claim about cost is asserted
+    /// rather than asserted-to.
+    asked: std::sync::Arc<Asked>,
+}
+
+#[derive(Default)]
+struct Asked {
+    users: std::sync::atomic::AtomicUsize,
+    convs: std::sync::atomic::AtomicUsize,
 }
 
 impl MessengerSource for Fake {
     fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<Conversation>>> {
-        Box::pin(async move { Ok(self.convs.clone()) })
+        Box::pin(async move {
+            self.asked
+                .convs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.convs.clone())
+        })
     }
 
     fn history<'a>(
@@ -80,7 +94,12 @@ impl MessengerSource for Fake {
     }
 
     fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<User>>> {
-        Box::pin(async move { Ok(self.users.clone()) })
+        Box::pin(async move {
+            self.asked
+                .users
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.users.clone())
+        })
     }
 
     fn fetch_file<'a>(
@@ -253,4 +272,38 @@ async fn no_index_is_an_error_and_says_why() {
     .await
     .expect_err("a bot token cannot search");
     assert!(err.contains("user token"), "{err}");
+}
+
+/// Two searches cost one roster, not two.
+///
+/// The point of the slots, and the reason they are here rather than deeper: a source keeps
+/// nothing between calls, and the tree's cache belongs to the mount — a different object over
+/// the same credential. On a workspace of any size the roster is most of what a search costs,
+/// so paying it once per query is paying it once per thing the reader wonders.
+#[tokio::test]
+async fn a_second_search_does_not_buy_the_roster_again() {
+    let asked = std::sync::Arc::new(Asked::default());
+    let backend = Messenger::new(Fake {
+        hits: vec![SearchHit {
+            conv: conv("pricing", "C1", ConvKind::Channel),
+            msg: msg(ROOT_TS, "발표영상", None),
+            thread_started: None,
+        }],
+        convs: vec![conv("pricing", "C1", ConvKind::Channel)],
+        users: vec![User {
+            id: "U1".into(),
+            name: "kim".into(),
+            record: serde_json::Value::Null,
+        }],
+        asked: asked.clone(),
+        ..Default::default()
+    });
+
+    for _ in 0..3 {
+        backend.search("가격", 20).await.expect("searched");
+    }
+
+    let seen = |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(seen(&asked.users), 1, "three searches, one roster");
+    assert_eq!(seen(&asked.convs), 1, "three searches, one listing");
 }

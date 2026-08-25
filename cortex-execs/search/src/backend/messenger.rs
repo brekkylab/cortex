@@ -8,6 +8,8 @@
 use cortex::BoxFuture;
 use cortex::fs::{Conversation, MessengerSource, SearchHit, chat_path, render_line};
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::{Hit, SearchResult, Searchable};
 
@@ -23,14 +25,64 @@ pub trait MessengerIndex: Send + Sync {
     ) -> BoxFuture<'a, Result<Vec<SearchHit>, String>>;
 }
 
+/// How long a fetched roster or listing stays reusable. Five minutes.
+///
+/// Longer than the tree's fifteen seconds because the gap it exists to cover is a different
+/// one. There, the pair is a `stat` and the `open` behind it — two syscalls of one command,
+/// which is why seconds are enough. Here it is two *searches*, and what sits between them is
+/// whoever is reading deciding what to ask next. Fifteen seconds would expire in that gap and
+/// buy nothing.
+///
+/// Freshness and not correctness, as it is there: what goes stale is a display name, and the
+/// id it belongs to is on the same line either way.
+const REUSE: Duration = Duration::from_secs(300);
+
+/// Something fetched, and when.
+struct Held<T> {
+    value: T,
+    at: Instant,
+}
+
 /// The messenger backend over one source.
 pub struct Messenger<S> {
     source: S,
+    /// The roster and the conversation listing, held between calls.
+    ///
+    /// Held *here* because nothing below holds them: a source keeps nothing between calls, and
+    /// the tree's cache belongs to the mount, which is a different object over the same
+    /// credential. Without this, two searches a second apart pay for the roster twice — and on
+    /// a large workspace the roster is most of what a search costs.
+    ///
+    /// A `Mutex` because [`Executable::exec`](cortex::exec::Executable::exec) takes `&self`,
+    /// the same reason the mount's cache is one. Contention is not a concern: a fan-out asks
+    /// its stores one at a time.
+    names: Mutex<Option<Held<HashMap<String, String>>>>,
+    convs: Mutex<Option<Held<HashMap<String, Conversation>>>>,
 }
 
 impl<S: MessengerSource + MessengerIndex> Messenger<S> {
     pub fn new(source: S) -> Self {
-        Messenger { source }
+        Messenger {
+            source,
+            names: Mutex::new(None),
+            convs: Mutex::new(None),
+        }
+    }
+
+    /// What `slot` holds, if it was filled recently enough.
+    fn held<T: Clone>(slot: &Mutex<Option<Held<T>>>) -> Option<T> {
+        let guard = slot.lock().expect("a lock");
+        guard
+            .as_ref()
+            .filter(|h| h.at.elapsed() < REUSE)
+            .map(|h| h.value.clone())
+    }
+
+    fn hold<T>(slot: &Mutex<Option<Held<T>>>, value: T) {
+        *slot.lock().expect("a lock") = Some(Held {
+            value,
+            at: Instant::now(),
+        });
     }
 
     /// Author id to name, for the same reason the tree resolves them: a line nobody can `grep`
@@ -49,10 +101,17 @@ impl<S: MessengerSource + MessengerIndex> Messenger<S> {
     /// are more legible than the partial roster they replaced: all of the hits missing a name
     /// reads as a fault, where five of twenty reads as five people who left.
     async fn roster(&self) -> HashMap<String, String> {
-        match self.source.users().await {
+        if let Some(held) = Self::held(&self.names) {
+            return held;
+        }
+        let built = match self.source.users().await {
             Ok(users) => users.into_iter().map(|u| (u.id, u.name)).collect(),
             Err(_) => HashMap::new(),
-        }
+        };
+        // Held even when it came back empty: a failure that repeats every call is not worth
+        // asking about once per search, and the emptiness is what the caller renders either way.
+        Self::hold(&self.names, built.clone());
+        built
     }
 
     /// The listing's own record per conversation, which is the authority on the human half of a
@@ -63,10 +122,17 @@ impl<S: MessengerSource + MessengerIndex> Messenger<S> {
     /// resolves a conversation directory by the half after `__`. What differs is the readable
     /// half, so a hit's path can be spelled unlike the same directory in `ls`.
     async fn listing(&self) -> HashMap<String, Conversation> {
-        match self.source.conversations().await {
+        if let Some(held) = Self::held(&self.convs) {
+            return held;
+        }
+        let built = match self.source.conversations().await {
             Ok(convs) => convs.into_iter().map(|c| (c.id.0.clone(), c)).collect(),
             Err(_) => HashMap::new(),
-        }
+        };
+        // Held even when it came back empty: a failure that repeats every call is not worth
+        // asking about once per search, and the emptiness is what the caller renders either way.
+        Self::hold(&self.convs, built.clone());
+        built
     }
 }
 
