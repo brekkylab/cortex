@@ -5,6 +5,8 @@
 //! 131 crates, and a consumer serving local files should not compile an HTTP and TLS stack to
 //! do it.
 
+#[cfg(feature = "gdrive")]
+mod gdrive;
 mod inmem;
 #[cfg(feature = "notion")]
 mod notion;
@@ -12,6 +14,8 @@ mod passthrough;
 #[cfg(feature = "s3")]
 mod s3;
 
+#[cfg(feature = "gdrive")]
+pub use gdrive::*;
 pub use inmem::*;
 #[cfg(feature = "notion")]
 pub use notion::*;

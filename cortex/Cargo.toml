@@ -97,6 +97,16 @@ fuse-t = ["dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.
 fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
 s3 = ["dep:object_store", "tokio/net", "tokio/rt-multi-thread"]
+# Google Drive as a read-only backend: the folder tree as directories, and the
+# Docs-editors types served as their own APIs' JSON rather than as an export.
+gdrive = [
+    "dep:reqwest",
+    "dep:chrono",
+    "dep:serde_json",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/sync",
+]
 # A Notion workspace as a read-only backend: pages and their block trees rendered
 # to `page.json` on read.
 notion = [

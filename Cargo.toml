@@ -67,12 +67,14 @@ object_store = { version = "0.14", default-features = false, features = ["aws"] 
 
 # The Notion backend: an async HTTP client, plus the two things its payloads are
 # made of — page ids are UUIDs, and its timestamps are RFC 3339. reqwest 0.13
-# renamed `rustls-tls` → `rustls` and made `query`/`form` optional; pagination
-# uses `.query()`, so it is named.
+# renamed `rustls-tls` → `rustls` and made `query`/`form` optional; Notion's
+# pagination uses `.query()` and Google's token endpoint takes a form body, so
+# both are named.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
     "query",
+    "form",
 ] }
 uuid = "1"
 chrono = "0.4"

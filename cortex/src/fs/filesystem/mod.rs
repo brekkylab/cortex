@@ -25,6 +25,8 @@ pub use filesystem::*;
 // default features at all: `s3` costs 131 crates, and a build that serves local files should
 // not compile an HTTP and TLS stack to do it.
 pub use r#impl::{InMemFs, PassthroughFs};
+#[cfg(feature = "gdrive")]
+pub use r#impl::{GdriveConfig, GdriveFs, Origins};
 #[cfg(feature = "notion")]
 pub use r#impl::{NotionConfig, NotionFs};
 #[cfg(feature = "s3")]
