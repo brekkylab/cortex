@@ -1,8 +1,12 @@
 //! What the Google providers share: where each of Google's services can be reached.
 //!
-//! Drive, Docs, Sheets and Slides are four APIs on four hosts, and a deployment that is
-//! not production Google may put any of them anywhere. That belongs to no one accessor,
-//! so it lives beside them rather than inside whichever one happened to need it first.
+//! Drive and the OAuth token endpoint are two hosts, and a deployment that is not
+//! production Google may put either anywhere. That belongs to no one accessor, so it
+//! lives beside them rather than inside whichever one happened to need it first.
+//!
+//! There were five here once, when a document was read through the Docs, Sheets and
+//! Slides APIs. An export goes through Drive's own `exportLinks` instead, and the host
+//! that serves it is Google's to name in the redirect rather than ours to configure.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,15 +30,6 @@ pub struct Origins {
     /// Serves `drive/v3` (`{drive}/v3/files`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drive: Option<String>,
-    /// Serves the Docs API (`{docs}/v1/documents/…`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub docs: Option<String>,
-    /// Serves the Sheets API (`{sheets}/v4/spreadsheets/…`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sheets: Option<String>,
-    /// Serves the Slides API (`{slides}/v1/presentations/…`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub slides: Option<String>,
 }
 
 impl Origins {
@@ -44,18 +39,15 @@ impl Origins {
         *self == Self::default()
     }
 
-    /// Every service behind one host, laid out the way Google's own paths read:
-    /// `{host}/gmail`, `{host}/oauth2`, `{host}/drive` and so on. A convenience for a
-    /// deployment that fronts all of them, not a substitute for the per-service knobs.
+    /// Both behind one host, laid out the way Google's own paths read: `{host}/oauth2`
+    /// and `{host}/drive`. A convenience for a deployment that fronts them, not a
+    /// substitute for the per-service knobs.
     pub fn behind(host: &str) -> Self {
         let h = host.trim_end_matches('/');
         let at = |service: &str| Some(format!("{h}/{service}"));
         Self {
             oauth: at("oauth2"),
             drive: at("drive"),
-            docs: at("docs"),
-            sheets: at("sheets"),
-            slides: at("slides"),
         }
     }
 
@@ -74,21 +66,23 @@ mod tests {
 
     /// An override replaces an origin and nothing else, so whoever sets one does not
     /// also have to know which path this code would have appended.
+    /// An override replaces an origin and nothing else, so whoever sets one does not
+    /// also have to know which path this code would have appended.
     #[test]
     fn an_override_replaces_only_its_own_origin() {
         let o = Origins {
-            sheets: Some("http://localhost:9000/sheets-api/".into()),
+            drive: Some("http://localhost:9000/drive-api/".into()),
             ..Default::default()
         };
         assert_eq!(
-            Origins::origin(&o.sheets, "https://sheets.googleapis.com"),
-            "http://localhost:9000/sheets-api",
+            Origins::origin(&o.drive, "https://www.googleapis.com/drive"),
+            "http://localhost:9000/drive-api",
             "trailing slash trimmed, so the caller need not care"
         );
         assert_eq!(
-            Origins::origin(&o.docs, "https://docs.googleapis.com"),
-            "https://docs.googleapis.com",
-            "the rest stay on Google"
+            Origins::origin(&o.oauth, "https://oauth2.googleapis.com"),
+            "https://oauth2.googleapis.com",
+            "the other stays on Google"
         );
     }
 
@@ -99,9 +93,6 @@ mod tests {
         let o = Origins::behind("https://mock.example.com/");
         assert_eq!(o.oauth.as_deref(), Some("https://mock.example.com/oauth2"));
         assert_eq!(o.drive.as_deref(), Some("https://mock.example.com/drive"));
-        assert_eq!(o.docs.as_deref(), Some("https://mock.example.com/docs"));
-        assert_eq!(o.sheets.as_deref(), Some("https://mock.example.com/sheets"));
-        assert_eq!(o.slides.as_deref(), Some("https://mock.example.com/slides"));
         assert!(!o.is_default());
         assert!(Origins::default().is_default(), "nothing set stays absent");
     }
