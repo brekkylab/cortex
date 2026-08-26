@@ -9,6 +9,8 @@ use std::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use unicode_normalization::UnicodeNormalization;
+
 use super::accessor::{GdriveAccessor, GdriveConfig, MAX_DOCUMENT_BYTES};
 use crate::{
     BoxFuture,
@@ -485,7 +487,7 @@ impl GdriveFs {
         let children = Box::pin(self.list_dir(&parent)).await?;
         let entry = children
             .iter()
-            .find(|c| c.vfs_name == name && c.kind.is_dir())
+            .find(|c| same_name(&c.vfs_name, &name) && c.kind.is_dir())
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         Ok(match entry.kind {
             GKind::SharedWithMe => Listing::SharedWithMe,
@@ -547,7 +549,7 @@ impl GdriveFs {
         let children = self.list_dir(&parent).await?;
         children
             .iter()
-            .find(|c| c.vfs_name == name)
+            .find(|c| same_name(&c.vfs_name, &name))
             .cloned()
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
@@ -955,6 +957,29 @@ fn unique_name(name: &str, existing: &HashSet<String>) -> String {
 
 /// Split a path into `(parent_dir, last_segment)`. `/a/b` -> (`/a`, `b`);
 /// `/a` -> (`/`, `a`).
+/// Whether two names are the same name, in the sense a directory has to mean it.
+///
+/// One name has two spellings in Unicode — `한` is a single code point composed, or three
+/// jamo decomposed, and Japanese voiced marks work the same way — and both spellings are
+/// in play at once here, from two directions.
+///
+/// macOS hands a lookup the *decomposed* form of whatever a listing returned, whichever
+/// form the listing used. And Drive stores whichever form the client that uploaded a file
+/// happened to send: measured on one real folder, ten names composed and four decomposed,
+/// side by side.
+///
+/// So a byte comparison answers `ENOENT` for a name `ls` printed a moment earlier — and
+/// which files it does that to depends on what uploaded them, which is the worst kind of
+/// inconsistency to debug. Measured before this: of eight Korean-named files, seven opened
+/// only under the composed spelling and one only under the decomposed one, while `readdir`
+/// gave every one of them decomposed.
+///
+/// Bytes first, because that is the answer for every ASCII name and most others; the
+/// composition runs only when a byte comparison has already failed.
+fn same_name(a: &str, b: &str) -> bool {
+    a == b || (a.is_ascii() == b.is_ascii() && !a.is_ascii() && a.nfc().eq(b.nfc()))
+}
+
 /// A `&Path` in the form the resolver works in: `/` for the root, `/a/b` under it.
 ///
 /// `..` is refused rather than walked. A Drive name survives the sanitizer with almost

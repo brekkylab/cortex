@@ -25,6 +25,7 @@ uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["io-std", "io-util", "process", "rt", "time"] }
 
 [dev-dependencies]
@@ -103,6 +104,7 @@ gdrive = [
     "dep:reqwest",
     "dep:chrono",
     "dep:serde_json",
+    "dep:unicode-normalization",
     "tokio/net",
     "tokio/rt-multi-thread",
     "tokio/sync",

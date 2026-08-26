@@ -1480,3 +1480,55 @@ async fn gdrive_live_a_zip_reader_can_find_the_end_of_a_document() {
     }
     assert!(seen > 0, "no Docs-editors document found");
 }
+
+/// A name found by its other spelling, because a directory has only one name per file.
+///
+/// `한` is one code point composed and three jamo decomposed. macOS hands a lookup the
+/// decomposed form of whatever a listing returned, and Drive stores whichever form the
+/// uploading client sent — so both spellings arrive, and a byte comparison answers
+/// `ENOENT` for a name `ls` had just printed.
+#[test]
+fn one_name_is_found_by_either_spelling() {
+    // 한글.txt, composed and decomposed. Written as escapes so an editor cannot quietly
+    // normalise the file and turn this into a comparison of a string with itself.
+    let composed = "\u{d55c}\u{ae00}.txt";
+    let decomposed = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}.txt";
+    assert_ne!(composed, decomposed, "the fixture has to be two spellings");
+    assert!(same_name(composed, decomposed));
+    assert!(same_name(decomposed, composed));
+
+    // And it stays a comparison: two different names are still different.
+    assert!(!same_name(composed, "\u{d55c}\u{ae00}2.txt"));
+    assert!(!same_name("a.txt", "b.txt"));
+    assert!(same_name("a.txt", "a.txt"));
+}
+
+/// A composed name resolves through a listing that carries the decomposed one.
+#[tokio::test]
+async fn a_listing_answers_a_lookup_in_the_other_spelling() {
+    let decomposed = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}.pdf";
+    let composed = "\u{d55c}\u{ae00}.pdf";
+    let mock = start(
+        json!([row(decomposed, "P1", "application/pdf", Some("11"))]),
+        HashMap::from([("P1".to_string(), b"hello world".to_vec())]),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+
+    let listed = fs.list(Path::new("/My Drive")).await.unwrap();
+    assert_eq!(listed[0].name, decomposed, "the listing keeps Drive's own spelling");
+
+    // What a macOS lookup does: ask by the other spelling.
+    let bytes = fs
+        .read_window(&PathBuf::from(format!("/My Drive/{composed}")), None)
+        .await
+        .expect("the composed spelling names the same file");
+    assert_eq!(bytes, b"hello world");
+    assert_eq!(
+        fs.stat(&PathBuf::from(format!("/My Drive/{composed}")))
+            .await
+            .unwrap()
+            .size,
+        11
+    );
+}
