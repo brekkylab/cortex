@@ -632,11 +632,35 @@ impl FileSystem for GdriveFs {
                 return Ok(Stat::new(DirentKind::Dir, 0));
             }
             let child = self.resolve(&path).await?;
-            // A file Drive listed without a size: learn the real one from one ranged
-            // response header rather than leaving the placeholder, which would make
-            // `ls -l` lie and a reader truncate the body at 8 MiB.
+            // The length a caller is about to seek by, so it is worth a request to get
+            // right. Every tool that reads a file's end reads this number: `lseek(0,
+            // SEEK_END)` is answered from the kernel's cached attributes and never asks
+            // the file, so an estimate here is an estimate for `unzip`, `tar`, `mmap`
+            // and everything built on them. A zip is the sharp case — its directory sits
+            // at the end, and a reader that seeks to the wrong end reports a corrupt
+            // archive for a file that is intact.
             let size = match (&child.serves, child.size) {
+                // Drive listed no length: one ranged response header has it, which is
+                // cheaper than the object and cached for the session.
                 (Serves::Original, None) => self.probed_len(&child.id).await,
+                // A document's length is knowable no other way than by producing it —
+                // there is no `Content-Length`, `HEAD` answers `0`, and a range is
+                // ignored. So this exports it, and the export is held: whatever reads
+                // next spends nothing, because a document has no windows and would have
+                // produced the same bytes anyway.
+                //
+                // Only `ls -l`, `du` and `find -size` pay for this without reading, and
+                // only for documents small enough to serve. Past the ceiling nothing can
+                // read the document at all, so its length is left an estimate — there is
+                // no one to mislead.
+                (Serves::Native(api, link), listed)
+                    if listed.is_none_or(|n| n <= MAX_DOCUMENT_BYTES) =>
+                {
+                    self.exported(&child.id, *api, link, listed)
+                        .await
+                        .ok()
+                        .map(|b| b.len() as u64)
+                }
                 _ => None,
             };
             Ok(Stat {
@@ -709,6 +733,18 @@ fn kind_of(c: &Child) -> DirentKind {
 /// the length was measured, so a document's placeholder reads as a size like any
 /// other until something opens the file and [`FileSystem::stat`] probes it.
 fn dirent_for(c: &Child) -> Dirent {
+    // A document's length is not free from a listing, so this does not claim one. Drive's
+    // `size` estimates the export within 0.3% on the files measured, which is close
+    // enough to refuse an oversized one and not close enough to be a length: a reader
+    // seeking to that end lands in the wrong place. [`FileSystem::stat`] produces the
+    // export and answers exactly, and a consumer that wants the number asks for it there.
+    //
+    // The FUSE bindings are unaffected either way — neither implements `readdirplus`, so
+    // a listing's attributes never reach a kernel. This is for the consumers that do read
+    // them, and it keeps them from meeting an estimate dressed as a measurement.
+    if matches!(c.serves, Serves::Native(..)) {
+        return Dirent::new(c.vfs_name.clone(), kind_of(c));
+    }
     Dirent::with_stat(
         c.vfs_name.clone(),
         Stat {

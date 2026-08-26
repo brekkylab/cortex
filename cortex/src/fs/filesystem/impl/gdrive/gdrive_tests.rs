@@ -9,14 +9,20 @@ use serde_json::json;
 use super::super::Origins;
 use super::*;
 
-/// The size a listing row came with.
+/// The size a listing row came with, for the rows that come with one.
 ///
-/// Every row this backend builds carries a [`Stat`] (see [`dirent_for`]), so a row
-/// without one is a bug here rather than a case to handle.
+/// A document's row carries no `Stat` on purpose — its length is not free from a
+/// listing, and `dirent_for` says so by leaving it out. Every other row has one, so
+/// its absence there is a bug rather than a case to handle.
 fn size_of(e: &Dirent) -> u64 {
     e.stat()
-        .expect("a gdrive listing row always carries its stat")
+        .expect("only a document's row omits its stat")
         .size
+}
+
+/// Whether a listing row claims a size at all.
+fn claims_a_size(e: &Dirent) -> bool {
+    e.stat().is_some()
 }
 
 fn file_row(name: &str, id: &str, mime: &str) -> Value {
@@ -408,10 +414,13 @@ async fn gdrive_mock_tree_and_reads() {
             let mp = Path::new(&p);
             let bytes = r.read_window(mp, None).await.expect("read file");
             if looks_like_an_export(e) {
-                // A document's JSON: the listing could only estimate its
-                // length, so just check the read produced something.
+                // A document. The listing claims no length at all, and `stat` answers
+                // the exact one by producing the export.
                 converted += 1;
                 assert!(!bytes.is_empty(), "{p}: the export was empty");
+                assert!(!claims_a_size(e), "{p}: a document's row claims no size");
+                let st = r.stat(mp).await.expect("stat");
+                assert_eq!(st.size, bytes.len() as u64, "{p}: stat is the real length");
             } else {
                 assert_eq!(size_of(e), bytes.len() as u64, "{p}: listed size vs read");
                 let st = r.stat(mp).await.expect("stat");
@@ -478,7 +487,11 @@ async fn gdrive_live_tree_and_reads() {
             .expect("section readdir");
         eprintln!("{section}: {} entries", entries.len());
         for e in entries.iter().take(5) {
-            eprintln!("  {:>6}B {:?} {}", size_of(e), e.kind, e.name);
+            let size = match e.stat() {
+                Some(st) => st.size.to_string(),
+                None => "?".to_string(),
+            };
+            eprintln!("  {size:>10}B {:?} {}", e.kind, e.name);
         }
         // Read the first file: what comes back is the file itself, at the
         // length the listing promised.
@@ -548,12 +561,12 @@ async fn gdrive_live_a_document_is_served_as_its_export() {
             let Some(e) = natives.iter().find(|x| x.name.ends_with(suffix)) else {
                 continue;
             };
-            let listed = size_of(e);
             let p = PathBuf::from(format!("/{section}/{}", e.name));
+            assert!(!claims_a_size(e), "{}: a document's row claims no size", e.name);
             let t0 = std::time::Instant::now();
             let bytes = r.read_window(&p, None).await.expect("read the export");
             eprintln!(
-                "  {} -> {} bytes in {:.2}s (listing said {listed})",
+                "  {} -> {} bytes in {:.2}s",
                 e.name,
                 bytes.len(),
                 t0.elapsed().as_secs_f64()
@@ -576,14 +589,13 @@ async fn gdrive_live_a_document_is_served_as_its_export() {
                 e.name
             );
 
-            // The listing's number is Drive's stored size, which is an estimate of the
-            // export rather than its length. Close, and not equal — 0.3% on the files
-            // measured, so this holds it to a factor rather than to a value.
-            assert!(
-                listed / 2 < bytes.len() as u64 && bytes.len() as u64 <= listed * 2,
-                "{}: listed {listed} against {} exported, which is not the right order",
-                e.name,
-                bytes.len()
+            // `stat` produced the export to answer, so it is the length and not an
+            // estimate of one. Everything that seeks to a file's end reads this number.
+            assert_eq!(
+                r.stat(&p).await.expect("stat").size,
+                bytes.len() as u64,
+                "{}: stat is the real length",
+                e.name
             );
 
             // Held, so a second read of the same document does not produce it again.
@@ -985,13 +997,12 @@ async fn an_unsized_file_is_measured_then_read_by_the_window() {
     let file = Path::new("/My Drive/big.pdf");
 
     let listed = fs.list(dir).await.unwrap();
-    // The placeholder, because Drive listed no size. A `Stat` has no field for saying
-    // the number is a placeholder rather than a length, so the number itself is the
-    // whole of what a listing can report — see `dirent_for`.
+    // A blob, so the row does carry a length — and the placeholder, because Drive listed
+    // no size for this one. `stat` turns it into the real number with one ranged byte.
     assert_eq!(
         size_of(&listed[0]),
         UNKNOWN_LENGTH_SIZE,
-        "a listing that cannot know the length reports the placeholder"
+        "a blob with no listed size reports the placeholder"
     );
 
     // The stat behind the listing resolves it — one ranged byte, not a download.
@@ -1046,7 +1057,10 @@ async fn a_document_is_built_once_and_served_from_the_cache() {
     let fs = mounted(&mock.config());
     let listed = fs.list(Path::new("/My Drive")).await.unwrap();
     assert_eq!(listed[0].name, "notes.docx");
-    assert_eq!(size_of(&listed[0]), UNKNOWN_LENGTH_SIZE);
+    assert!(
+        !claims_a_size(&listed[0]),
+        "a document's row leaves the length to `stat`"
+    );
 
     // The mock has no Docs endpoint, so a read fails — what matters is that the
     // listing already refused to call the placeholder a length, which is what keeps
@@ -1396,4 +1410,73 @@ async fn a_large_file_still_reads_by_the_window() {
         "and only the window moved, not {} bytes",
         mock.bytes_sent()
     );
+}
+
+/// Live: `stat` answers a document's real length, so a reader that seeks to the end
+/// lands on it.
+///
+/// An OOXML file keeps its directory at the *end*, and every zip reader finds it by
+/// seeking there — `lseek(0, SEEK_END)` is answered from the size `stat` gave, never by
+/// asking the file. Drive's listed size only estimates the export (measured off by
+/// −4.9 MB on one deck and +533 KB on one workbook, so it errs both ways), and a reader
+/// that trusts it looks for the directory somewhere the directory is not. `unzip` then
+/// calls an intact file corrupt.
+#[tokio::test]
+#[ignore = "requires GOOGLE_* env + network"]
+async fn gdrive_live_a_zip_reader_can_find_the_end_of_a_document() {
+    let Some(cfg) = live_config() else {
+        eprintln!("set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN to run");
+        return;
+    };
+    let fs = GdriveFs::new(&cfg).unwrap();
+    let mut seen = 0usize;
+    for section in [SHARED_WITH_ME_NAME, MY_DRIVE_NAME] {
+        let dir = PathBuf::from(format!("/{section}"));
+        let Ok(entries) = fs.list(&dir).await else { continue };
+        for e in &entries {
+            if !e.name.ends_with(".xlsx") && !e.name.ends_with(".docx") {
+                continue;
+            }
+            let p = dir.join(&e.name);
+            let Ok(c) = fs.resolve(p.to_str().unwrap()).await else { continue };
+            if !matches!(c.serves, Serves::Native(..)) {
+                continue;
+            }
+            // The listing declines to claim one, which is what sends a caller here.
+            assert!(!claims_a_size(e), "{}: a document's row claims no size", e.name);
+
+            let claimed = fs.stat(&p).await.unwrap().size;
+            let all = fs.read_window(&p, None).await.unwrap();
+            eprintln!(
+                "  {}  stat {claimed}, read {} bytes",
+                e.name,
+                all.len()
+            );
+            assert_eq!(
+                claimed,
+                all.len() as u64,
+                "{}: stat is the length a reader will seek by",
+                e.name
+            );
+
+            // What `unzip` does: seek to the end `stat` named, read back, and look for
+            // the end-of-central-directory signature.
+            let tail = fs
+                .read_window(&p, Some(claimed.saturating_sub(22)..claimed))
+                .await
+                .unwrap();
+            assert_eq!(
+                &tail[..4],
+                b"PK\x05\x06",
+                "{}: the central directory is where `stat` says the file ends",
+                e.name
+            );
+            seen += 1;
+            break;
+        }
+        if seen > 0 {
+            break;
+        }
+    }
+    assert!(seen > 0, "no Docs-editors document found");
 }
