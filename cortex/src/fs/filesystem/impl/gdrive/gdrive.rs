@@ -17,15 +17,14 @@ use crate::{
 
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
-/// The mount root mirrors Drive's own sidebar as virtual sections. `My Drive` is
-/// the literal Drive folder id `root`; `Shared with me` is a sentinel resolved
-/// to a `sharedWithMe=true` listing (shared items carry no `parents`, so the
-/// folder tree alone would never surface them). The sentinel contains `@`, which
-/// the Drive id alphabet (`[A-Za-z0-9_-]`) never does, so it can't collide with
-/// a real file id. Names are Drive's own English section labels.
+/// The mount root mirrors Drive's own sidebar as virtual sections. `My Drive` is the
+/// literal Drive folder id `root`, and a shared drive has a drive id of its own —
+/// but `Shared with me` answers to no id at all, because Drive holds no folder for
+/// it. What it gathers carries no `parents`, so the folder tree alone would never
+/// surface any of it. [`GKind`] is what tells the three apart; see [`Listing`] for
+/// where that decides the query. Names are Drive's own English section labels.
 const MY_DRIVE_ID: &str = "root";
 const MY_DRIVE_NAME: &str = "My Drive";
-const SHARED_WITH_ME_ID: &str = "@sharedWithMe";
 const SHARED_WITH_ME_NAME: &str = "Shared with me";
 
 /// Whether a listing entry's name is one an export would produce.
@@ -136,7 +135,6 @@ const MAX_PROBED_LENGTHS: usize = 50_000;
 /// `ls` anyway.
 const MAX_FOLDER_FILES: usize = 10_000;
 
-
 /// Whether Drive holds real bytes for this row. The Docs-editors types (and Forms,
 /// Maps, Drawings) do not — `alt=media` answers *"Only files with binary content can be
 /// downloaded. Use Export with Docs Editors files."* The first three are exported
@@ -170,13 +168,35 @@ enum NativeApi {
 enum GKind {
     Folder,
     SharedDrive,
+    /// The `Shared with me` section, which is not a folder anywhere: Drive has no id
+    /// for it, and only `sharedWithMe=true` gathers what it holds.
+    SharedWithMe,
     File,
 }
 
 impl GKind {
     fn is_dir(self) -> bool {
-        matches!(self, GKind::Folder | GKind::SharedDrive)
+        matches!(
+            self,
+            GKind::Folder | GKind::SharedDrive | GKind::SharedWithMe
+        )
     }
+}
+
+/// What listing a directory takes, which is not the same question as what it is called.
+///
+/// Two of the root's three sections resolve to an id Drive knows, and the third
+/// resolves to none: `Shared with me` is a view rather than a folder. An `Option<String>`
+/// would say the same thing and let a caller reach past it into a query that needs an id
+/// — this cannot be read without deciding which of the two it is.
+enum Listing {
+    /// A real Drive folder. `drive_id` scopes it to a shared drive when it lives in one.
+    Folder {
+        id: String,
+        drive_id: Option<String>,
+    },
+    /// Everything shared with this account. It has no id to ask about.
+    SharedWithMe,
 }
 
 /// One resolved Drive entry, as the VFS sees it.
@@ -310,7 +330,9 @@ impl GdriveFs {
         };
         let mut children = vec![
             section(MY_DRIVE_NAME, MY_DRIVE_ID, GKind::Folder, None),
-            section(SHARED_WITH_ME_NAME, SHARED_WITH_ME_ID, GKind::Folder, None),
+            // No id: nothing reads one for this kind, and `Listing` is what makes that
+            // hold rather than a convention.
+            section(SHARED_WITH_ME_NAME, "", GKind::SharedWithMe, None),
         ];
         let listed = self.accessor.list_shared_drives().await;
         // A failure here is indistinguishable from an account with no shared drives,
@@ -360,15 +382,20 @@ impl GdriveFs {
             complete = ok;
             sections
         } else {
-            let (folder_id, drive_id) = self.folder_id_of(folder).await?;
-            let files = if folder_id == SHARED_WITH_ME_ID {
-                self.accessor.list_shared_with_me(MAX_FOLDER_FILES).await
-            } else {
-                self.accessor
-                    .list_files(&folder_id, drive_id.as_deref(), MAX_FOLDER_FILES)
-                    .await
-            }
-            .map_err(not_found_or_backend)?;
+            let listing = self.how_to_list(folder).await?;
+            let (files, drive_id) = match &listing {
+                Listing::SharedWithMe => (
+                    self.accessor.list_shared_with_me(MAX_FOLDER_FILES).await,
+                    None,
+                ),
+                Listing::Folder { id, drive_id } => (
+                    self.accessor
+                        .list_files(id, drive_id.as_deref(), MAX_FOLDER_FILES)
+                        .await,
+                    drive_id.clone(),
+                ),
+            };
+            let files = files.map_err(not_found_or_backend)?;
             let mut children: Vec<Child> = files.iter().filter_map(child_from_file).collect();
             // Children of a shared drive stay scoped to it (list_files needs the
             // drive id); the drive's own listing rows don't carry `driveId`.
@@ -400,14 +427,25 @@ impl GdriveFs {
     /// Resolve a folder path to its Drive id (+ shared-drive id) by walking
     /// parent listings from the root sections (`/My Drive` = the literal Drive
     /// id `root`; `/` itself is virtual and handled by [`Self::list_dir`]).
-    async fn folder_id_of(&self, folder: &str) -> io::Result<(String, Option<String>)> {
+    /// What listing `folder` takes, found by asking its parent about it.
+    ///
+    /// The parent knew what each of its children was; a path does not carry that, so the
+    /// listing of the parent is where it is recovered. A shared drive's `driveId` travels
+    /// this way too — the rows inside one do not carry it, so each level hands it down.
+    async fn how_to_list(&self, folder: &str) -> io::Result<Listing> {
         let (parent, name) = split_last(folder);
         let children = Box::pin(self.list_dir(&parent)).await?;
         let entry = children
             .iter()
             .find(|c| c.vfs_name == name && c.kind.is_dir())
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        Ok((entry.id.clone(), entry.drive_id.clone()))
+        Ok(match entry.kind {
+            GKind::SharedWithMe => Listing::SharedWithMe,
+            _ => Listing::Folder {
+                id: entry.id.clone(),
+                drive_id: entry.drive_id.clone(),
+            },
+        })
     }
 
     /// The probed length of `id`, remembered so the kernel's per-entry `getattr`
@@ -674,16 +712,16 @@ fn child_from_file(f: &Value) -> Option<Child> {
         // Drawing, and for the same reason: a name that cannot be read is worse than
         // an absence.
         let (api, export, ext) = native_kind(mime)?;
-        let link = f
-            .get("exportLinks")?
-            .get(export)?
-            .as_str()?
-            .to_string();
+        let link = f.get("exportLinks")?.get(export)?.as_str()?.to_string();
         // Drive's `size` is what it *stores*, which is what an export hands back —
         // within 0.3% on the two documents measured. It is an estimate and treated as
         // one: `entry_size` reports it, and `read_window` refuses on it before a byte
         // moves, but the length a read answers with is the length that arrived.
-        (format!("{name}{ext}"), Serves::Native(api, link), listed_size)
+        (
+            format!("{name}{ext}"),
+            Serves::Native(api, link),
+            listed_size,
+        )
     };
     Some(Child {
         vfs_name,
