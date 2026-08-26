@@ -1319,3 +1319,81 @@ async fn a_backwards_window_does_not_take_the_process_down() {
         .unwrap();
     assert_eq!(got.len(), 512);
 }
+
+/// A small file is fetched once, however the kernel chops the reads up.
+///
+/// Drive charges by the request: a download is 200 quota units whether it moves 200 KiB
+/// or 20 MB, so answering eighty chunk reads with eighty ranged requests costs eighty
+/// times what one whole fetch does. Past `WHOLE_BLOB_LIMIT` the ranged read is still
+/// right — a head-read must not pay for the tail — and that half is the test below this.
+#[tokio::test]
+async fn a_small_file_is_fetched_once_for_every_chunk_of_it() {
+    const REAL: usize = 300 * 1024;
+    const CHUNK: u64 = 64 * 1024;
+    let mock = start(
+        json!([row(
+            "small.bin",
+            "S1",
+            "application/octet-stream",
+            Some("307200")
+        )]),
+        HashMap::from([("S1".to_string(), vec![b'q'; REAL])]),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let file = Path::new("/My Drive/small.bin");
+    fs.list(Path::new("/My Drive")).await.unwrap();
+    mock.reset();
+
+    let mut got = 0usize;
+    for i in 0..(REAL as u64 / CHUNK) {
+        let w = fs
+            .read_window(file, Some(i * CHUNK..(i + 1) * CHUNK))
+            .await
+            .unwrap();
+        assert_eq!(w.len() as u64, CHUNK, "chunk {i}");
+        got += w.len();
+    }
+    assert_eq!(got as u64, (REAL as u64 / CHUNK) * CHUNK);
+
+    let media = mock.media_ranges();
+    assert_eq!(
+        media.len(),
+        1,
+        "one fetch for the whole file, but the server saw {media:?}"
+    );
+    assert_eq!(media[0], None, "and unranged, since a range is what costs twice");
+}
+
+/// And past the limit the window still reaches Drive, so a head-read stays cheap.
+#[tokio::test]
+async fn a_large_file_still_reads_by_the_window() {
+    const REAL: usize = 10 * 1024 * 1024;
+    let mock = start(
+        json!([row(
+            "big.bin",
+            "B1",
+            "application/octet-stream",
+            Some("10485760")
+        )]),
+        HashMap::from([("B1".to_string(), vec![b'z'; REAL])]),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let file = Path::new("/My Drive/big.bin");
+    fs.list(Path::new("/My Drive")).await.unwrap();
+    mock.reset();
+
+    let head = fs.read_window(file, Some(0..4096)).await.unwrap();
+    assert_eq!(head.len(), 4096);
+    assert_eq!(
+        mock.media_ranges(),
+        vec![Some("bytes=0-4095".to_string())],
+        "the range went down to the provider rather than pulling 10 MB"
+    );
+    assert!(
+        mock.bytes_sent() < 64 * 1024,
+        "and only the window moved, not {} bytes",
+        mock.bytes_sent()
+    );
+}

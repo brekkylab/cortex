@@ -127,6 +127,21 @@ const DIR_TTL: Duration = Duration::from_secs(300);
 /// produce the whole document — which is what `find -size` and `ls -l` must not cost.
 const UNKNOWN_LENGTH_SIZE: u64 = 8 * 1024 * 1024;
 
+/// A blob at or under this is fetched whole, once, and every chunk after that is cut
+/// out of what is held.
+///
+/// Drive charges by the request and not by the byte: a download is 200 quota units
+/// however few bytes it moves, so a 20 MB file read at 256 KiB a time costs 16,000
+/// units where reading it whole costs 200. The ranged read is still the right shape
+/// past this line — a reader that wants a file's head, or a `grep` that abandons it
+/// after one buffer, must not pay for the rest — and the 1.79 GB archive in the corpus
+/// answers its first 4 KiB in a second because of it.
+///
+/// 8 MiB is where the two stop trading evenly. Under it a whole fetch is a handful of
+/// chunks' worth of bytes and one request instead of dozens; over it the bytes a
+/// head-read would waste outgrow what the requests cost.
+const WHOLE_BLOB_LIMIT: u64 = 8 * 1024 * 1024;
+
 /// Cap on remembered probe results — one per file ever sized in this mount.
 const MAX_PROBED_LENGTHS: usize = 50_000;
 
@@ -233,6 +248,9 @@ type CachedListing = (Instant, Arc<Vec<Child>>);
 /// rather than copying a megabyte per chunk.
 type CachedExport = (Instant, Arc<Vec<u8>>);
 
+/// The one small blob held whole, and which file it is: `(id, fetched-at, bytes)`.
+type HeldBlob = (String, Instant, Arc<Vec<u8>>);
+
 pub struct GdriveFs {
     accessor: GdriveAccessor,
     /// Lengths learned by probing (file id → bytes), for the rows Drive listed
@@ -251,6 +269,13 @@ pub struct GdriveFs {
     /// document — and an export is seconds, 44 of them measured on a 13.6 MB deck. Held
     /// as an `Arc` because a read borrows it rather than copying a megabyte per chunk.
     exports: Mutex<HashMap<String, CachedExport>>,
+    /// The last small blob read whole: `(file id, when, bytes)`.
+    ///
+    /// One slot rather than a map, because a reader works through one file at a time —
+    /// `cat`, `grep` and `cp` all do — so what the next chunk needs is what the last
+    /// chunk had. A map would hold [`WHOLE_BLOB_LIMIT`] per file ever touched until the
+    /// TTL ran out; this holds it once.
+    blob: Mutex<Option<HeldBlob>>,
 }
 
 impl GdriveFs {
@@ -260,7 +285,30 @@ impl GdriveFs {
             probed: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
             exports: Mutex::new(HashMap::new()),
+            blob: Mutex::new(None),
         })
+    }
+
+    /// A small blob's bytes, whole, from the slot when they are fresh and from Drive
+    /// otherwise.
+    ///
+    /// Unranged on purpose: a range is what makes Drive answer twice for one file, and
+    /// this exists to make it answer once. See [`WHOLE_BLOB_LIMIT`].
+    async fn whole_blob(&self, id: &str) -> io::Result<Arc<Vec<u8>>> {
+        if let Some((held, at, bytes)) = self.blob.lock().await.as_ref()
+            && held == id
+            && at.elapsed() < DIR_TTL
+        {
+            return Ok(bytes.clone());
+        }
+        let bytes = self
+            .accessor
+            .download(id, None)
+            .await
+            .map_err(not_found_or_backend)?;
+        let bytes = Arc::new(bytes);
+        *self.blob.lock().await = Some((id.to_string(), Instant::now(), bytes.clone()));
+        Ok(bytes)
     }
 
     /// A document's exported bytes, from the cache when they are fresh and from Drive
@@ -530,6 +578,21 @@ impl GdriveFs {
             // Ranged: a reader walking a big file, or a search tool sampling its
             // head, must not pull the whole object per chunk.
             Serves::Original => {
+                // Small enough to hold: one unranged fetch answers every chunk that
+                // follows. The length has to be known without asking for it — a probe
+                // is a request, which is the cost this is avoiding — so a blob Drive
+                // listed without a size reads by the window unless `stat` already
+                // learned it.
+                let known = match child.size {
+                    Some(n) => Some(n),
+                    None => self.probed.lock().await.get(&child.id).copied(),
+                };
+                if let Some(n) = known
+                    && n <= WHOLE_BLOB_LIMIT
+                {
+                    let bytes = self.whole_blob(&child.id).await?;
+                    return Ok(slice(&bytes, range));
+                }
                 let bytes = self
                     .accessor
                     .download(&child.id, range.clone())
