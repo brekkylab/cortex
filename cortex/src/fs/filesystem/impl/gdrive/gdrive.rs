@@ -653,6 +653,13 @@ impl FileSystem for GdriveFs {
                 // only for documents small enough to serve. Past the ceiling nothing can
                 // read the document at all, so its length is left an estimate — there is
                 // no one to mislead.
+                //
+                // An estimate could not have been made close enough. A zip reader scans
+                // backwards from the end it was told, over a bounded window: bisected
+                // against Info-ZIP on a real export, 70,639 bytes of over-report still
+                // opened and 70,640 did not. Drive's listed size missed by −4,910,139 to
+                // +533,322 across five measured documents, both directions, so no margin
+                // fits inside that window. The number has to be produced, not guessed.
                 (Serves::Native(api, link), listed)
                     if listed.is_none_or(|n| n <= MAX_DOCUMENT_BYTES) =>
                 {
@@ -698,6 +705,14 @@ impl FileSystem for GdriveFs {
             // Short is EOF and nothing else, which holds here because the window came
             // back whole: Drive served exactly the range, or `slice` cut it from bytes
             // this already had. Neither can answer part of a window it holds.
+            //
+            // A short answer does not reach a caller as one, though, and that is why the
+            // size `stat` reports has to be right rather than close. Through a mount the
+            // kernel fills what this declines to serve, out to the length it was told the
+            // file has: measured on a document whose `stat` over-reported by 152,083
+            // bytes, `cat` handed back exactly the claimed 60,063,731 with the tail all
+            // `0x00`. So `cp` does not rescue a wrong length — it copies the padding — and
+            // a reader looking for anything at the end finds zeros.
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
             Ok(n)
