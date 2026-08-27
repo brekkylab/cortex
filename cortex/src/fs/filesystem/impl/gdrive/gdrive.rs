@@ -634,42 +634,38 @@ impl FileSystem for GdriveFs {
                 return Ok(Stat::new(DirentKind::Dir, 0));
             }
             let child = self.resolve(&path).await?;
-            // The length a caller is about to seek by, so it is worth a request to get
-            // right. Every tool that reads a file's end reads this number: `lseek(0,
-            // SEEK_END)` is answered from the kernel's cached attributes and never asks
-            // the file, so an estimate here is an estimate for `unzip`, `tar`, `mmap`
-            // and everything built on them. A zip is the sharp case — its directory sits
-            // at the end, and a reader that seeks to the wrong end reports a corrupt
-            // archive for a file that is intact.
+            // A file Drive listed without a size: learn the real one from one ranged
+            // response header rather than leaving the placeholder, which would make
+            // `ls -l` lie and a reader truncate the body at 8 MiB.
             let size = match (&child.serves, child.size) {
-                // Drive listed no length: one ranged response header has it, which is
-                // cheaper than the object and cached for the session.
                 (Serves::Original, None) => self.probed_len(&child.id).await,
-                // A document's length is knowable no other way than by producing it —
-                // there is no `Content-Length`, `HEAD` answers `0`, and a range is
-                // ignored. So this exports it, and the export is held: whatever reads
-                // next spends nothing, because a document has no windows and would have
-                // produced the same bytes anyway.
+                // A document keeps the estimate the listing gave, and a zip reader
+                // cannot open one in place because of it. That is the trade, and it is
+                // the way round it is because the number cannot be had cheaply.
                 //
-                // Only `ls -l`, `du` and `find -size` pay for this without reading, and
-                // only for documents small enough to serve. Past the ceiling nothing can
-                // read the document at all, so its length is left an estimate — there is
-                // no one to mislead.
+                // There is no cheap way. The link the listing carries sends no
+                // `Content-Length`, answers `HEAD` with `0`, and ignores a range;
+                // `files.export` does declare a length, but only by rendering the export
+                // first — measured at 1.5-1.8 s for a document, 1.3-2.6 s for a
+                // spreadsheet and 8.8-39.6 s for a deck, 5.9 s averaged over eleven, and
+                // one of those spent 39.6 s to answer `403` because the export cleared
+                // 10 MB even though the listing said 8.7. Nor is a render kept: three
+                // `HEAD`s in a row on one deck cost 8.81, 9.11 and 8.29 s.
                 //
-                // An estimate could not have been made close enough. A zip reader scans
-                // backwards from the end it was told, over a bounded window: bisected
-                // against Info-ZIP on a real export, 70,639 bytes of over-report still
-                // opened and 70,640 did not. Drive's listed size missed by −4,910,139 to
-                // +533,322 across five measured documents, both directions, so no margin
-                // fits inside that window. The number has to be produced, not guessed.
-                (Serves::Native(api, link), listed)
-                    if listed.is_none_or(|n| n <= MAX_DOCUMENT_BYTES) =>
-                {
-                    self.exported(&child.id, *api, link, listed)
-                        .await
-                        .ok()
-                        .map(|b| b.len() as u64)
-                }
+                // And `stat` is asked once per entry per listing, because FUSE-T serves
+                // the mount over NFS and an NFS client fills an attribute for every name
+                // it lists. A shared folder of 129 entries, 40 of them documents, listed
+                // in 108 s when this produced the lengths against 1.09 s when it did not,
+                // and nothing about that scales — the cost is per document, forever.
+                //
+                // What the estimate costs in exchange is bounded and known. A zip reader
+                // scans backwards from the end it was told, over a window bisected
+                // against Info-ZIP at 70,639 bytes, and the listing's size missed by
+                // −4,910,139 to +533,322 across six measured documents — both directions,
+                // so no margin fits. `unzip` on a document therefore reports an intact
+                // file corrupt, and a copy of it carries the kernel's zero padding rather
+                // than the real end. Blob files are unaffected: Drive sizes those
+                // exactly.
                 _ => None,
             };
             Ok(Stat {
@@ -750,18 +746,6 @@ fn kind_of(c: &Child) -> DirentKind {
 /// the length was measured, so a document's placeholder reads as a size like any
 /// other until something opens the file and [`FileSystem::stat`] probes it.
 fn dirent_for(c: &Child) -> Dirent {
-    // A document's length is not free from a listing, so this does not claim one. Drive's
-    // `size` estimates the export within 0.3% on the files measured, which is close
-    // enough to refuse an oversized one and not close enough to be a length: a reader
-    // seeking to that end lands in the wrong place. [`FileSystem::stat`] produces the
-    // export and answers exactly, and a consumer that wants the number asks for it there.
-    //
-    // The FUSE bindings are unaffected either way — neither implements `readdirplus`, so
-    // a listing's attributes never reach a kernel. This is for the consumers that do read
-    // them, and it keeps them from meeting an estimate dressed as a measurement.
-    if matches!(c.serves, Serves::Native(..)) {
-        return Dirent::new(c.vfs_name.clone(), kind_of(c));
-    }
     Dirent::with_stat(
         c.vfs_name.clone(),
         Stat {
