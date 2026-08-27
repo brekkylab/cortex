@@ -100,15 +100,20 @@ const MAX_TABS: usize = 64;
 ///
 /// It cannot be 0. Reads run under the guest's FUSE mount with `direct_io`, and a
 /// 0-length file was measured (in ailoy's Drive mount, which hit this first) to
-/// clamp reads to nothing — and a search tool skips a file it is told is empty. An
-/// over-estimate is safe in the other direction: the read returns the real bytes
-/// and then empty at EOF, so `cat` stops at the true end.
+/// clamp reads to nothing — and a search tool skips a file it is told is empty.
+///
+/// An over-estimate does *not* mean `cat` stops at the true end: the client bounds a
+/// read by the length it was told, so it asks for the whole 8 MiB and takes back 8 MiB.
+/// [`FileSystem::read_at`] fills the part past the JSON with newlines for that reason.
+/// Before it did, the kernel filled it with `0x00` and every JSON parser threw at the
+/// seam — measured on a live mount, a 1,574,113-byte deck read as 8,388,608 bytes of
+/// which 6,814,495 were zeros, and `json.load` raised rather than skipped.
 ///
 /// 8 MiB. A document reports its exact length from the moment something first reads it,
 /// so this is what an *unread* document shows and not what a document shows. Measured
 /// JSON lengths were 7 KB to 2.5 MB, so the placeholder is generous and one-sided — a
-/// reader that trusts it reads past the end into zeros rather than stopping short of
-/// content, which for a front-to-back format costs nothing it cannot skip.
+/// reader that trusts it reads past the end into whitespace rather than stopping short
+/// of content, and JSON is defined to ignore what follows it.
 ///
 /// This is a placeholder, not a measurement — `find -size` and `ls -l` see it until
 /// something reads the file. Making it exact up front costs one render per
@@ -633,6 +638,18 @@ impl GdriveFs {
 }
 
 impl GdriveFs {
+    /// Whether this path is served as a document's own JSON.
+    ///
+    /// What [`FileSystem::read_at`] pads with is only sound because the answer is yes: a
+    /// blob is bytes and padding one corrupts it, where a document is JSON and JSON is
+    /// defined to ignore the whitespace after it.
+    async fn serves_json(&self, path: &Path) -> bool {
+        let Ok(path) = vpath(path) else { return false };
+        self.resolve(&path)
+            .await
+            .is_ok_and(|c| matches!(c.serves, Serves::Native(..)))
+    }
+
     /// One file's bytes, or one window of them.
     ///
     /// Kept apart from [`FileSystem::read_at`] because the two count in different
@@ -769,16 +786,43 @@ impl FileSystem for GdriveFs {
             // asks, so what comes back either covers the window or ran out of file.
             //
             // A short answer would not reach a caller as one anyway. Through a mount the
-            // kernel fills whatever this declines to serve, out to the length it was told
+            // client fills whatever this declines to serve, out to the length it was told
             // the file has: measured on a document whose `stat` over-reported by 152,083
             // bytes, `cat` handed back exactly the claimed 60,063,731 with the tail all
-            // `0x00`. So `cp` does not rescue a wrong length — it copies the padding — and
-            // a reader looking for anything at the end finds zeros. For documents that is
-            // now an accepted cost rather than a bug; see the revert of 1c9e67b for what
-            // the alternative was measured to cost.
+            // `0x00`. So `cp` does not rescue a wrong length — it copies the padding.
+            //
+            // Which is why a document fills its own tail below rather than leaving the
+            // byte to the kernel. The length stays an estimate — see the revert of 1c9e67b
+            // for what producing a real one was measured to cost — but the filler is now a
+            // byte the format it is filling can absorb.
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
-            Ok(n)
+            // A full window is the common case and needs nothing more.
+            if n == buf.len() {
+                return Ok(n);
+            }
+            // Short. For a blob that is the true end and the whole story, because Drive
+            // sizes those exactly. For a document it is instead the read running past the
+            // end of the JSON and into the span [`UNKNOWN_LENGTH_SIZE`] claimed — and
+            // something is going to fill that span either way. Filling it here with
+            // newlines rather than leaving the kernel to fill it with `0x00` is what makes
+            // the over-estimate cost what its doc comment says it costs: JSON is defined to
+            // absorb trailing whitespace, so the document still parses, where the zero
+            // padding made every parser throw at the seam.
+            //
+            // Newline rather than space so that a 6.8 MB tail is empty lines instead of one
+            // enormous line, which keeps `grep` and friends cheap on the real content.
+            //
+            // Asked only when the window came back short, so a walk does not pay a second
+            // `resolve` per window: a blob is short once, at its end, and a document only
+            // past the JSON.
+            let end = offset.saturating_add(n as u64);
+            if end >= UNKNOWN_LENGTH_SIZE || !self.serves_json(path).await {
+                return Ok(n);
+            }
+            let pad = ((UNKNOWN_LENGTH_SIZE - end) as usize).min(buf.len() - n);
+            buf[n..n + pad].fill(b'\n');
+            Ok(n + pad)
         })
     }
 }

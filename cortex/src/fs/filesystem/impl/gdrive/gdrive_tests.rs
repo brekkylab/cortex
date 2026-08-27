@@ -1143,6 +1143,126 @@ async fn a_document_is_built_once_and_served_from_the_cache() {
     );
 }
 
+/// The placeholder is what an *unread* document shows, so one document answers `stat`
+/// with two different numbers depending on whether anything has read it yet.
+///
+/// This is the asymmetry a reader trips on, and it is worth a test of its own because
+/// neither half is wrong on its own. A first read is told 8 MiB and the kernel pads
+/// whatever [`GdriveFs::read_at`] declines to serve out to that length; a second read
+/// inside [`DIR_TTL`] is told the truth and stops at the end. So a parser that chokes
+/// on the padding succeeds when it is simply run again, which reads as a flake rather
+/// than as the length having been a placeholder.
+#[tokio::test]
+async fn a_document_stats_as_the_placeholder_until_it_is_read() {
+    const PAD: usize = 4096;
+    let mock = start_with_document(
+        json!([row(
+            "notes",
+            "D1",
+            "application/vnd.google-apps.document",
+            None
+        )]),
+        HashMap::new(),
+        Some(PAD),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let path = Path::new("/My Drive/notes.gdoc.json");
+
+    // Nothing has rendered it, so the only number there is to report is the placeholder.
+    assert_eq!(
+        fs.stat(path).await.unwrap().size,
+        UNKNOWN_LENGTH_SIZE,
+        "an unread document has no length to report"
+    );
+
+    let body = fs.read_window(path, Some(0..64 * 1024)).await.unwrap();
+    assert!(
+        (body.len() as u64) < UNKNOWN_LENGTH_SIZE,
+        "the document is far shorter than the placeholder claims it is"
+    );
+
+    // Rendering it is what produces the length, so the same call now answers differently.
+    assert_eq!(
+        fs.stat(path).await.unwrap().size,
+        body.len() as u64,
+        "a document that has been read reports what it actually is"
+    );
+}
+
+/// The span the placeholder claims but the JSON does not fill gets newlines, so a
+/// document that is read in one go is still a document.
+///
+/// This is the whole point of padding it here rather than leaving the byte to the
+/// kernel. Measured on a live mount before the change: a 1,574,113-byte deck read back
+/// as 8,388,608 bytes whose last 6,814,495 were `0x00`, and `json.load` raised
+/// `Expecting value` at the seam instead of skipping it. JSON ignores the whitespace
+/// after a value and does not ignore a NUL, so the filler decides whether the read is
+/// usable — and it costs nothing, being the same bytes either way.
+#[tokio::test]
+async fn a_document_is_padded_out_with_whitespace_and_not_with_zeros() {
+    const PAD: usize = 4096;
+    let mock = start_with_document(
+        json!([row(
+            "notes",
+            "D1",
+            "application/vnd.google-apps.document",
+            None
+        )]),
+        HashMap::new(),
+        Some(PAD),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let path = Path::new("/My Drive/notes.gdoc.json");
+
+    // Read it the way a reader that trusted `stat` reads it: to the claimed end.
+    let claimed = fs.stat(path).await.unwrap().size;
+    assert_eq!(claimed, UNKNOWN_LENGTH_SIZE);
+    let mut whole = vec![0u8; claimed as usize];
+    let mut at = 0usize;
+    while at < whole.len() {
+        let n = fs.read_at(path, &mut whole[at..], at as u64).await.unwrap();
+        assert_ne!(n, 0, "a read inside the claimed length never says end of file");
+        at += n;
+    }
+
+    let json_len = serde_json::from_slice::<Value>(&whole[..])
+        .map(|_| ())
+        .map(|()| whole.iter().rposition(|b| *b != b'\n').unwrap() + 1)
+        .expect("the whole claimed length parses as one JSON document");
+    assert!(json_len < claimed as usize, "the JSON is shorter than the claim");
+    assert!(
+        whole[json_len..].iter().all(|b| *b == b'\n'),
+        "everything past the JSON is newline, and none of it is zero"
+    );
+}
+
+/// A blob is bytes, so its short read stays short. Padding one would corrupt it, and
+/// nothing needs padding: Drive sizes blobs exactly, so nobody reads past their end.
+#[tokio::test]
+async fn a_blob_is_never_padded() {
+    const LEN: usize = 5000;
+    let body: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
+    let mock = start(
+        json!([row("data", "B1", "application/octet-stream", Some("5000"))]),
+        HashMap::from([("B1".to_string(), body.clone())]),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let path = Path::new("/My Drive/data");
+    assert_eq!(fs.stat(path).await.unwrap().size, LEN as u64);
+
+    // A window straddling the end: the real bytes, and then the end, with nothing added.
+    let mut buf = vec![0xAAu8; 64 * 1024];
+    let n = fs
+        .read_at(path, &mut buf, (LEN - 100) as u64)
+        .await
+        .unwrap();
+    assert_eq!(n, 100, "a blob stops at its own end");
+    assert_eq!(&buf[..100], &body[LEN - 100..]);
+}
+
 /// A document over the ceiling must stop being read, not be read and then refused.
 ///
 /// None of these endpoints declares a length — Docs, Slides and Sheets all answer as
