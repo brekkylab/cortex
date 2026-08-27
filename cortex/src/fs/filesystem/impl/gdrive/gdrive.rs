@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use unicode_normalization::UnicodeNormalization;
 
-use super::accessor::{GdriveAccessor, GdriveConfig, MAX_DOCUMENT_BYTES};
+use super::accessor::{GdriveAccessor, GdriveConfig};
 use crate::{
     BoxFuture,
     fs::{Dirent, DirentKind, FileSystem, Stat},
@@ -29,74 +29,49 @@ const MY_DRIVE_ID: &str = "root";
 const MY_DRIVE_NAME: &str = "My Drive";
 const SHARED_WITH_ME_NAME: &str = "Shared with me";
 
-/// Whether a listing entry's name is one an export would produce.
+/// Whether a listing entry is a document's JSON rather than a file's own bytes.
 ///
-/// It cannot answer whether the entry *is* an export: an uploaded `.pptx` reads the same
-/// as an exported deck, which is what serving the export buys. Only [`Serves`] separates
-/// them, and only `resolve` has it. This is the weaker question a name can answer, and
-/// it is asked of [`NATIVE_KINDS`] so a type added there is covered without being added
-/// twice.
+/// By the suffix rather than by a mime: [`Stat`] carries no content type, and it would
+/// be a second copy of what the name already says. [`NATIVE_KINDS`] is the one place
+/// the pairing lives, so a type added there is answered here without being added twice.
 #[cfg(test)]
-fn looks_like_an_export(e: &Dirent) -> bool {
+fn is_native_json(e: &Dirent) -> bool {
     NATIVE_KINDS
         .iter()
-        .any(|(_, _, _, ext)| e.name.ends_with(ext))
+        .any(|(_, _, suffix)| e.name.ends_with(suffix))
 }
 
-/// How each Docs-editors type is served: what Drive exports it as, and the extension
-/// the entry then carries.
+/// How each Docs-editors type is served: the API that answers for it, and the
+/// suffix its entry carries.
 ///
-/// These types hold no bytes of their own. `alt=media` refuses them outright
-/// (measured: `403`, *"Only files with binary content can be downloaded. Use Export
-/// with Docs Editors files."*), so an export is the only form there is, and the
-/// Office one is the form a reader can open.
-///
-/// The extension is the export's own, because that is now what the bytes are. A Drive
-/// name carries none of its own, so the suffix is also what says which of the three
-/// the entry came from.
-///
-/// **A spreadsheet loses more than layout here.** Google exports an in-cell image as a
-/// picture floating over the sheet rather than as the cell's value, so a `VLOOKUP` that
-/// returned the image in Sheets returns `#N/A` in Excel; named ranges can arrive as
-/// `#REF!` in the same file. Measured on a real workbook, and reproduced by downloading
-/// it from Drive's own UI — it is Google's export, not this path. Nothing here can
-/// repair it: the cell has no cached value to fall back on.
-const NATIVE_KINDS: &[(&str, NativeApi, &str, &str)] = &[
+/// These types hold no bytes of their own — Drive can only export a rendering of
+/// them — so the document's own API is the only form that carries everything:
+/// formulas, slide geometry, and the character indices an edit has to address.
+/// The suffix says which document it is, since the Drive name has no extension.
+const NATIVE_KINDS: &[(&str, NativeApi, &str)] = &[
     (
         "application/vnd.google-apps.document",
         NativeApi::Doc,
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        ".docx",
+        ".gdoc.json",
     ),
     (
         "application/vnd.google-apps.spreadsheet",
         NativeApi::Sheet,
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        ".xlsx",
+        ".gsheet.json",
     ),
     (
         "application/vnd.google-apps.presentation",
         NativeApi::Slides,
-        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        ".pptx",
+        ".gslide.json",
     ),
 ];
 
-/// The export MIME and extension for a native mime, if it is one.
-fn native_kind(mime: &str) -> Option<(NativeApi, &'static str, &'static str)> {
+/// The API and suffix for a native mime, if it is one.
+fn native_kind(mime: &str) -> Option<(NativeApi, &'static str)> {
     NATIVE_KINDS
         .iter()
-        .find(|(m, _, _, _)| *m == mime)
-        .map(|(_, api, export, ext)| (*api, *export, *ext))
-}
-
-/// The export MIME this document is served as.
-fn export_mime(api: NativeApi) -> &'static str {
-    NATIVE_KINDS
-        .iter()
-        .find(|(_, a, _, _)| *a == api)
-        .map(|(_, _, m, _)| *m)
-        .unwrap_or("")
+        .find(|(m, _, _)| *m == mime)
+        .map(|(_, api, suffix)| (*api, *suffix))
 }
 
 /// Per-directory listing TTL, matching the metadata cache's own listing TTL.
@@ -110,6 +85,17 @@ fn export_mime(api: NativeApi) -> &'static str {
 /// span between the two numbers `ls` answered from one snapshot while reads resolved
 /// against another.
 const DIR_TTL: Duration = Duration::from_secs(300);
+/// Ceiling on the cell values one spreadsheet's JSON will carry, spent tab by tab
+/// in the workbook's own order until it runs out.
+///
+/// Values are proportional to what is actually filled in — 443 B to 105 KB per tab
+/// measured, an 8-tab workbook around 185 KB — so this bounds the outlier rather
+/// than the common case. A workbook of 634,410 cells exists in the corpus.
+const GRID_BYTES_BUDGET: u64 = 8 * 1024 * 1024;
+/// Tabs whose values are requested in one `batchGet`. Each title rides in the
+/// query string, so an unbounded count would eventually build an unsendable URL.
+const MAX_TABS: usize = 64;
+
 /// Size reported for a document whose length nobody has learned yet.
 ///
 /// It cannot be 0. Reads run under the guest's FUSE mount with `direct_io`, and a
@@ -118,15 +104,17 @@ const DIR_TTL: Duration = Duration::from_secs(300);
 /// over-estimate is safe in the other direction: the read returns the real bytes
 /// and then empty at EOF, so `cat` stops at the true end.
 ///
-/// Rarely reached, now that a document reports Drive's own `size`: that number is what
-/// Drive stores, which is an estimate of the export and not a good one — see
-/// `FILE_FIELDS`. This is what is left for the rows Drive lists without one at all,
-/// which do occur (three spreadsheets in the corpus).
+/// 8 MiB. A document reports its exact length from the moment something first reads it,
+/// so this is what an *unread* document shows and not what a document shows. Measured
+/// JSON lengths were 7 KB to 2.5 MB, so the placeholder is generous and one-sided — a
+/// reader that trusts it reads past the end into zeros rather than stopping short of
+/// content, which for a front-to-back format costs nothing it cannot skip.
 ///
-/// It cannot be made exact for those. A blob's length is one ranged byte away, but an
-/// export honours no range at all (measured: `bytes=0-0` answers `200` with the whole
-/// object, `HEAD` answers a `content-length` of `0`), so the only way to learn it is to
-/// produce the whole document — which is what `find -size` and `ls -l` must not cost.
+/// This is a placeholder, not a measurement — `find -size` and `ls -l` see it until
+/// something reads the file. Making it exact up front costs one render per
+/// document: measured 2.4s for a six-document folder listing, 6.3s when the
+/// kernel's per-entry `getattr` serialises them. See
+/// [`GdriveFs::resolve_size_on_stat`].
 const UNKNOWN_LENGTH_SIZE: u64 = 8 * 1024 * 1024;
 
 /// How much a blob read fetches once it is clear the reader is walking the file, so a
@@ -180,26 +168,25 @@ const MAX_FOLDER_FILES: usize = 10_000;
 
 /// Whether Drive holds real bytes for this row. The Docs-editors types (and Forms,
 /// Maps, Drawings) do not — `alt=media` answers *"Only files with binary content can be
-/// downloaded. Use Export with Docs Editors files."* The first three are exported
-/// instead; the rest export to nothing and are not listed.
+/// downloaded. Use Export with Docs Editors files."* The first three have APIs of their
+/// own and are served from those; the rest have nothing to serve and are not listed.
 fn has_original_bytes(mime: &str) -> bool {
     !mime.starts_with("application/vnd.google-apps.")
 }
 
 /// What an entry hands back when read.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Serves {
     /// A directory — nothing to read.
     Nothing,
-    /// The file's own bytes (`alt=media`), ranged. Drive holds these, so a reader can
-    /// seek inside one and pay for the window it asks for.
+    /// The file's own bytes (`alt=media`), ranged.
     Original,
-    /// A Docs-editors document, exported to its Office form. The link comes from the
-    /// listing rather than from a path this builds — see `FILE_FIELDS`.
-    Native(NativeApi, String),
+    /// The document's own structure, from its own API (`documents.get` and
+    /// friends) rather than Drive.
+    Native(NativeApi),
 }
 
-/// Which Docs-editors type a document is.
+/// Which API answers for a document's structure.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum NativeApi {
     Doc,
@@ -245,9 +232,8 @@ enum Listing {
 /// One resolved Drive entry, as the VFS sees it.
 #[derive(Clone)]
 struct Child {
-    /// Listing name: the sanitized (and, on collision, disambiguated) Drive name —
-    /// plus the export's extension when the entry is a Docs-editors document, since a
-    /// Drive name carries none of its own.
+    /// Listing name: the sanitized (and, on collision, disambiguated) Drive
+    /// name — plus a `.json` suffix when the entry serves a document's API JSON.
     vfs_name: String,
     id: String,
     /// Set when the entry lives in a shared drive (listing scope).
@@ -259,11 +245,11 @@ struct Child {
     serves: Serves,
     /// Byte length as the listing reported it, which means two different things.
     ///
-    /// For a file Drive holds bytes for it is exact, and a reader can seek inside it.
-    /// For a document it is the size of what Drive *stores* — an estimate of the export
-    /// that errs low on text by up to a factor of 23 measured, so it can refuse one that
-    /// is already over and can never admit one safely, and is nowhere near the length a
-    /// read answers with. `None` for either is [`UNKNOWN_LENGTH_SIZE`], via `entry_size`.
+    /// For a file Drive holds bytes for it is exact, and a reader can seek inside it. For
+    /// a document it is the size of what Drive *stores*, which describes neither the JSON
+    /// served nor anything else a reader sees — 4,775 stored against 133,625 of JSON on
+    /// one measured document. It is kept for the ceiling check and nothing else; the
+    /// length an entry reports comes from `entry_size`.
     size: Option<u64>,
 }
 
@@ -272,9 +258,9 @@ struct Child {
 /// 10,000 entries).
 type CachedListing = (Instant, Arc<Vec<Child>>);
 
-/// One document's export as the cache holds it: shared, so a read borrows the bytes
+/// One document's JSON as the cache holds it: shared, so a read borrows the bytes
 /// rather than copying a megabyte per chunk.
-type CachedExport = (Instant, Arc<Vec<u8>>);
+type CachedRender = (Instant, Arc<Vec<u8>>);
 
 /// The one span of one blob this holds.
 struct HeldSpan {
@@ -300,14 +286,14 @@ pub struct GdriveFs {
     /// parent listings, so one cached listing answers readdir, stat and the lookup
     /// a read starts with; fetching the bytes themselves still costs a request.
     dir_cache: Mutex<HashMap<String, CachedListing>>,
-    /// A document's exported bytes, once fetched (file id → bytes).
+    /// A document's JSON, once produced (file id → bytes).
     ///
-    /// A document has no windows: an export honours no range, so a read of one produces
-    /// all of it however few bytes were asked for. A kernel asks in chunks, so without
-    /// this a 1 MB document read at 128 KiB a time is eight exports of the same
-    /// document — and an export is seconds, 44 of them measured on a 13.6 MB deck. Held
-    /// as an `Arc` because a read borrows it rather than copying a megabyte per chunk.
-    exports: Mutex<HashMap<String, CachedExport>>,
+    /// A document has no windows: its API answers with the whole thing or nothing, so a
+    /// read of one produces all of it however few bytes were asked for. A kernel asks in
+    /// chunks, so without this a 1 MB document read at 128 KiB a time is eight renders of
+    /// the same document — and a render is about a second. Held as an `Arc` because a
+    /// read borrows it rather than copying a megabyte per chunk.
+    rendered: Mutex<HashMap<String, CachedRender>>,
     /// The last span of a blob read, and where in which file it came from.
     ///
     /// One slot rather than a map, because a reader works through one file at a time —
@@ -323,7 +309,7 @@ impl GdriveFs {
             accessor: GdriveAccessor::new(config)?,
             probed: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
-            exports: Mutex::new(HashMap::new()),
+            rendered: Mutex::new(HashMap::new()),
             blob: Mutex::new(None),
         })
     }
@@ -385,7 +371,7 @@ impl GdriveFs {
         Ok((start, bytes))
     }
 
-    /// A document's exported bytes, from the cache when they are fresh and from Drive
+    /// A document's JSON, from the cache when one is fresh and from its own API
     /// otherwise.
     ///
     /// On [`DIR_TTL`] rather than a number of its own, for the reason that constant
@@ -393,44 +379,23 @@ impl GdriveFs {
     /// a read of the same document answers from another, and the listing is what named
     /// the document in the first place.
     ///
-    /// Two ceilings, because only one of them can be trusted. The listing's `size` is an
-    /// estimate of the export that errs low on text, so all it can do is refuse a document
-    /// already over by that number *before a byte moves* — and a document it admits, or
-    /// one Drive listed without a size at all, gets no such mercy, so
-    /// [`MAX_DOCUMENT_BYTES`] is passed down as well and cuts the
-    /// stream off frame by frame. Neither is redundant: the first is fast and
-    /// approximate, the second is exact and expensive.
-    async fn exported(
-        &self,
-        id: &str,
-        api: NativeApi,
-        link: &str,
-        listed: Option<u64>,
-    ) -> io::Result<Arc<Vec<u8>>> {
-        if let Some((at, bytes)) = self.exports.lock().await.get(id)
+    /// A document over the accessor's whole-read ceiling never arrives, so nothing
+    /// unbounded is stored; what bounds the *map* is the same sweep `dir_cache` uses,
+    /// which drops what has aged out on the way in.
+    async fn rendered_json(&self, id: &str, api: NativeApi) -> io::Result<Arc<Vec<u8>>> {
+        if let Some((at, bytes)) = self.rendered.lock().await.get(id)
             && at.elapsed() < DIR_TTL
         {
             return Ok(bytes.clone());
         }
-        // Refused on the estimate, before anything is fetched. Without this the only
-        // ceiling is the one that counts frames as they arrive, which means paying
-        // `MAX_DOCUMENT_BYTES` of transfer to learn a document is too big — every time
-        // the cache goes cold. A 401 MB workbook exists in the corpus.
-        if let Some(n) = listed
-            && n > MAX_DOCUMENT_BYTES
-        {
-            return Err(io::Error::other(format!(
-                "the document is {n} bytes, over the {MAX_DOCUMENT_BYTES} byte limit \
-                 for a whole-document read"
-            )));
+        let bytes = match api {
+            NativeApi::Sheet => self.spreadsheet_bytes(id).await,
+            NativeApi::Doc => self.accessor.document_json(id).await,
+            NativeApi::Slides => self.accessor.presentation_json(id).await,
         }
-        let bytes = self
-            .accessor
-            .export_document(link, export_mime(api), MAX_DOCUMENT_BYTES)
-            .await
-            .map_err(not_found_or_backend)?;
+        .map_err(not_found_or_backend)?;
         let bytes = Arc::new(bytes);
-        let mut cache = self.exports.lock().await;
+        let mut cache = self.rendered.lock().await;
         cache.retain(|_, (at, _)| at.elapsed() < DIR_TTL);
         cache.insert(id.to_string(), (Instant::now(), bytes.clone()));
         Ok(bytes)
@@ -571,6 +536,45 @@ impl GdriveFs {
         })
     }
 
+    /// A spreadsheet's JSON: its structure, with each tab's cell values folded in
+    /// under `values`.
+    ///
+    /// Two calls, because Sheets has no single one that answers both cheaply.
+    /// `spreadsheets.get` gives the workbook's shape (3.7-19.5 KB measured) and,
+    /// with it, the tab titles that name the ranges; `values:batchGet` then returns
+    /// the used range of every tab at once. The flag that looks like the direct
+    /// route — `includeGridData=true` — bills per *allocated* cell, and the first
+    /// real workbook tried allocated 210,125 for an estimated 189 MB, so it is not
+    /// a route at all. See [`GdriveAccessor::sheet_values_batch`].
+    ///
+    /// A tab whose values exceed the budget is left out with a `valuesOmitted` note
+    /// on it, so a reader sees a stated omission rather than an empty sheet.
+    async fn spreadsheet_bytes(&self, id: &str) -> anyhow::Result<Vec<u8>> {
+        let mut v: Value = serde_json::from_slice(&self.accessor.spreadsheet_json(id).await?)?;
+        let titles: Vec<String> = tab_titles(&v);
+        if titles.is_empty() {
+            return pretty(&v);
+        }
+        // Whole tabs by name: an A1 range with no cell part means "everything used".
+        // A values endpoint that is missing (a Drive-only mock) or forbidden (the
+        // Sheets API not enabled on the project) costs the cells, not the read —
+        // the workbook's shape is still worth serving, with the reason attached.
+        let batch = match self.accessor.sheet_values_batch(id, &titles).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Not logged as well. The reason goes into the workbook itself, which is
+                // the copy the reader actually meets — a line on stderr would say the
+                // same thing to someone who is not looking at it.
+                if let Some(obj) = v.as_object_mut() {
+                    obj.insert("valuesUnavailable".into(), Value::String(format!("{e:#}")));
+                }
+                return pretty(&v);
+            }
+        };
+        fold_values(&mut v, &batch, &titles);
+        pretty(&v)
+    }
+
     /// The probed length of `id`, remembered so the kernel's per-entry `getattr`
     /// storm costs one request, not one per stat. `None` when the probe fails —
     /// the placeholder stands rather than a wrong number.
@@ -679,12 +683,10 @@ impl GdriveFs {
                 // `span` returns, so neither subtraction goes backwards.
                 Ok(slice(&bytes, Some(r.start - at..r.end.saturating_sub(at))))
             }
-            // A document, exported once and then held. An export honours no range
-            // (measured: `bytes=0-0` answers `200` with the whole object, and `HEAD`
-            // answers `content-length: 0`), so the window is ours to cut out of what
-            // the export handed back.
-            Serves::Native(api, link) => {
-                let bytes = self.exported(&child.id, api, &link, child.size).await?;
+            // A document from its own API, produced once and then held: its API has no
+            // notion of a range, so the window is ours to cut out of the whole thing.
+            Serves::Native(api) => {
+                let bytes = self.rendered_json(&child.id, api).await?;
                 Ok(slice(&bytes, range))
             }
             // Only a directory serves nothing, and directories were rejected
@@ -707,33 +709,27 @@ impl FileSystem for GdriveFs {
             // `ls -l` lie and a reader truncate the body at 8 MiB.
             let size = match (&child.serves, child.size) {
                 (Serves::Original, None) => self.probed_len(&child.id).await,
-                // A document keeps the estimate the listing gave, and a zip reader
-                // cannot open one in place because of it. That is the trade, and it is
-                // the way round it is because the number cannot be had cheaply.
+                // A document reports the length of the JSON it is served as, once
+                // something has produced that JSON. This costs no request: producing it
+                // is what a read does anyway, and the bytes are still held.
                 //
-                // There is no cheap way. The link the listing carries sends no
-                // `Content-Length`, answers `HEAD` with `0`, and ignores a range;
-                // `files.export` does declare a length, but only by rendering the export
-                // first — measured at 1.5-1.8 s for a document, 1.3-2.6 s for a
-                // spreadsheet and 8.8-39.6 s for a deck, 5.9 s averaged over eleven, and
-                // one of those spent 39.6 s to answer `403` because the export cleared
-                // 10 MB even though the listing said 8.7. Nor is a render kept: three
-                // `HEAD`s in a row on one deck cost 8.81, 9.11 and 8.29 s.
+                // Before that it is the placeholder, and there is no cheap way to do
+                // better. The API answers `HEAD` with `400`, so the length cannot be had
+                // without the body, and the body is the whole document. Asking for one
+                // per entry is what a listing would then cost — `stat` runs once per name
+                // because FUSE-T serves over NFS and an NFS client fills an attribute for
+                // every entry it lists — which is a second per document, forever.
                 //
-                // And `stat` is asked once per entry per listing, because FUSE-T serves
-                // the mount over NFS and an NFS client fills an attribute for every name
-                // it lists. A shared folder of 129 entries, 40 of them documents, listed
-                // in 108 s when this produced the lengths against 1.09 s when it did not,
-                // and nothing about that scales — the cost is per document, forever.
-                //
-                // What the estimate costs in exchange is bounded and known. A zip reader
-                // scans backwards from the end it was told, over a window bisected
-                // against Info-ZIP at 70,639 bytes, and the listing's size missed by
-                // −4,910,139 to +533,322 across six measured documents — both directions,
-                // so no margin fits. `unzip` on a document therefore reports an intact
-                // file corrupt, and a copy of it carries the kernel's zero padding rather
-                // than the real end. Blob files are unaffected: Drive sizes those
-                // exactly.
+                // Reporting it high rather than low is the deliberate half. JSON is read
+                // front to back, so a reader that trusts the placeholder runs past the
+                // end into zeros, which it can skip; a number that fell short would hide
+                // content instead, with nothing to recover it from.
+                (Serves::Native(..), _) => {
+                    let held = self.rendered.lock().await;
+                    held.get(&child.id)
+                        .filter(|(at, _)| at.elapsed() < DIR_TTL)
+                        .map(|(_, bytes)| bytes.len() as u64)
+                }
                 _ => None,
             };
             Ok(Stat {
@@ -867,30 +863,21 @@ fn child_from_file(f: &Value) -> Option<Child> {
             size: None,
         });
     }
-    let listed_size = f
-        .get("size")
-        .and_then(|s| s.as_str())
-        .and_then(|s| s.parse::<u64>().ok());
     let (vfs_name, serves, size) = if has_original_bytes(mime) {
         // Drive reports the length up front, so this entry is honest about its
         // size and a reader can seek inside it.
-        (name, Serves::Original, listed_size)
+        let size = f
+            .get("size")
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse::<u64>().ok());
+        (name, Serves::Original, size)
     } else {
-        // A native document, exported. Without a link there is nothing to serve, so
-        // the row becomes no entry at all — the same answer this gives a Form or a
-        // Drawing, and for the same reason: a name that cannot be read is worse than
-        // an absence.
-        let (api, export, ext) = native_kind(mime)?;
-        let link = f.get("exportLinks")?.get(export)?.as_str()?.to_string();
-        // Drive's `size` is what it *stores*, which is an estimate of the export and
-        // wrong by up to a factor of 23 on text. It is treated as the estimate it is:
-        // `entry_size` reports it, and `read_window` refuses on it before a byte moves,
-        // but the length a read answers with is the length that arrived.
-        (
-            format!("{name}{ext}"),
-            Serves::Native(api, link),
-            listed_size,
-        )
+        // A native document: served as its own API's JSON. Drive's `size` is dropped
+        // here rather than carried: it describes what Drive stores, which is neither the
+        // JSON's length nor within an order of magnitude of it, so keeping it would only
+        // give `entry_size` a wrong number to prefer over the placeholder.
+        let (api, suffix) = native_kind(mime)?;
+        (format!("{name}{suffix}"), Serves::Native(api), None)
     };
     Some(Child {
         vfs_name,
@@ -902,6 +889,149 @@ fn child_from_file(f: &Value) -> Option<Child> {
         serves,
         size,
     })
+}
+
+/// Attach each tab's values to the tab they belong to.
+///
+/// Paired by sheet title, not by position. `valueRanges` comes back in request order,
+/// but the request is built from a *filtered and truncated* view of `sheets` — a sheet
+/// with no title cannot be addressed and a workbook past [`MAX_TABS`] is cut off — so
+/// walking the two in step hands one tab another's cells and shifts every tab after
+/// it. `valueRanges[].range` names its own sheet, which removes the guesswork.
+///
+/// A tab that ends up with no values says why: it was never requested, nothing came
+/// back for it, or its cells did not fit the budget. The budget is spent tab by tab
+/// and an oversized one does not consume the remainder — a 20-byte tab after a large
+/// one still fits.
+fn fold_values(workbook: &mut Value, batch: &Value, requested: &[String]) {
+    let mut by_title: HashMap<String, Value> = HashMap::new();
+    for vr in batch
+        .get("valueRanges")
+        .and_then(|r| r.as_array())
+        .into_iter()
+        .flatten()
+    {
+        let Some(title) = vr.get("range").and_then(|r| r.as_str()).map(range_title) else {
+            continue;
+        };
+        let values = vr.get("values").cloned().unwrap_or(Value::Array(vec![]));
+        by_title.insert(title, values);
+    }
+    let asked: HashSet<&str> = requested.iter().map(String::as_str).collect();
+
+    let mut budget = GRID_BYTES_BUDGET;
+    for tab in workbook
+        .get_mut("sheets")
+        .and_then(|s| s.as_array_mut())
+        .into_iter()
+        .flatten()
+    {
+        let title = tab
+            .pointer("/properties/title")
+            .and_then(|t| t.as_str())
+            .map(str::to_string);
+        let Some(obj) = tab.as_object_mut() else {
+            continue;
+        };
+        let note = |reason: &str| serde_json::json!({ "reason": reason });
+        let Some(title) = title else {
+            obj.insert(
+                "valuesOmitted".into(),
+                note("this sheet has no title, so its cells cannot be addressed"),
+            );
+            continue;
+        };
+        if !asked.contains(title.as_str()) {
+            obj.insert(
+                "valuesOmitted".into(),
+                serde_json::json!({
+                    "reason": "past the tab cap, so its values were never requested",
+                    "tabCap": MAX_TABS,
+                }),
+            );
+            continue;
+        }
+        let Some(values) = by_title.get(&title) else {
+            obj.insert(
+                "valuesOmitted".into(),
+                note("the values request returned nothing for this sheet"),
+            );
+            continue;
+        };
+        let cost = served_len(values);
+        if cost > budget {
+            obj.insert(
+                "valuesOmitted".into(),
+                serde_json::json!({
+                    "reason": "over the size budget",
+                    "bytes": cost,
+                    "budgetLeft": budget,
+                }),
+            );
+            continue;
+        }
+        budget -= cost;
+        obj.insert("values".into(), values.clone());
+    }
+}
+
+/// The sheet a returned A1 range belongs to: `'메인화면'!A1:Z968` -> `메인화면`.
+///
+/// The title is everything before the last `!`, unquoted — a quoted title may itself
+/// contain `!`, and a literal quote inside one arrives doubled.
+fn range_title(range: &str) -> String {
+    let sheet = match range.rsplit_once('!') {
+        Some((sheet, _)) => sheet,
+        None => range,
+    };
+    match sheet.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+        Some(inner) => inner.replace("''", "'"),
+        None => sheet.to_string(),
+    }
+}
+
+/// Pretty-printed JSON with a trailing newline — the form every document is served
+/// in, so the bytes read as lines rather than one long string.
+fn pretty(v: &Value) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(v)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// A workbook's tab titles, in order, capped at [`MAX_TABS`].
+fn tab_titles(workbook: &Value) -> Vec<String> {
+    workbook
+        .get("sheets")
+        .and_then(|s| s.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.pointer("/properties/title")?.as_str())
+        .map(str::to_string)
+        .take(MAX_TABS)
+        .collect()
+}
+
+/// How many bytes `v` will add to the served file, counted without building them.
+///
+/// Pretty-printed, because that is the form the file is served in: a values array is
+/// rows of columns of short strings, and indenting one puts every cell on its own
+/// line. Measured on a 200x20 grid, that is 1.66x the compact form — so a budget
+/// checked against compact bytes admits a file half again as large as it allows.
+fn served_len(v: &Value) -> u64 {
+    struct Counting(u64);
+    impl std::io::Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Counting(0);
+    serde_json::to_writer_pretty(&mut c, v)
+        .map(|()| c.0)
+        .unwrap_or(0)
 }
 
 fn time_field(f: &Value, key: &str) -> Option<std::time::SystemTime> {
@@ -939,17 +1069,17 @@ fn sanitize_name(name: &str) -> String {
 /// Give every child a unique `vfs_name`: on a collision, number it ` (2)`, ` (3)`,
 /// … so duplicate Drive names don't shadow each other in readdir/resolve.
 ///
-/// The number goes *before* the extension. Appending it (`sheet.xlsx (2)`) kept the
-/// name unique but took the entry out of every glob a reader would use to find it —
-/// measured against a real account, two of 33 spreadsheets were invisible to
-/// `**/*.xlsx`.
+/// The number goes *before* the extension. Appending it (`sheet.gsheet.json (2)`)
+/// kept the name unique but took the entry out of every glob a reader would use to
+/// find it — measured against a real account, two of 33 spreadsheets were invisible
+/// to `**/*.gsheet.json`.
 fn disambiguate(children: &mut [Child]) {
     let mut seen: HashSet<String> = HashSet::new();
     for c in children.iter_mut() {
         if seen.insert(c.vfs_name.clone()) {
             continue;
         }
-        let (stem, ext) = split_extension(&c.vfs_name, &c.serves);
+        let (stem, ext) = split_extension(&c.vfs_name, c.serves);
         let mut n = 2;
         loop {
             let cand = format!("{stem} ({n}){ext}");
@@ -965,18 +1095,18 @@ fn disambiguate(children: &mut [Child]) {
 /// Split a listing name into the part a number can follow and the extension it must
 /// stay in front of.
 ///
-/// A document's extension is known exactly, from [`NATIVE_KINDS`] rather than from the
-/// name. A file keeps whatever follows its last dot when that looks like an extension.
-/// A directory has none to protect, so `v1.2` numbers as `v1.2 (2)`.
-fn split_extension<'a>(name: &'a str, serves: &Serves) -> (&'a str, &'a str) {
-    if *serves == Serves::Nothing {
+/// A document's suffix is known exactly (`.gsheet.json`, not `.json`). A file keeps
+/// whatever follows its last dot when that looks like an extension. A directory has
+/// no extension to protect, so `v1.2` numbers as `v1.2 (2)`.
+fn split_extension(name: &str, serves: Serves) -> (&str, &str) {
+    if serves == Serves::Nothing {
         return (name, "");
     }
-    if let Serves::Native(api, _) = serves {
+    if let Serves::Native(api) = serves {
         let suffix = NATIVE_KINDS
             .iter()
-            .find(|(_, a, _, _)| a == api)
-            .map(|(_, _, _, ext)| *ext)
+            .find(|(_, a, _)| *a == api)
+            .map(|(_, _, s)| *s)
             .unwrap_or("");
         if let Some(stem) = name.strip_suffix(suffix) {
             return (stem, suffix);

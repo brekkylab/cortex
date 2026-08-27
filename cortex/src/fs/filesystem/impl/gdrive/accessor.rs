@@ -9,6 +9,12 @@ use tokio::sync::Mutex;
 /// The origin each service lives on, without the version suffix this code appends —
 /// see [`Origins`], which overrides these one at a time.
 const DRIVE_ORIGIN: &str = "https://www.googleapis.com/drive";
+/// The Docs-editors types live behind their own APIs, on their own hosts. Drive can
+/// only *export* them; their structure (paragraph indices, formulas, slide geometry)
+/// exists nowhere else.
+const DOCS_ORIGIN: &str = "https://docs.googleapis.com";
+const SHEETS_ORIGIN: &str = "https://sheets.googleapis.com";
+const SLIDES_ORIGIN: &str = "https://slides.googleapis.com";
 
 /// Every host this accessor talks to, resolved once from a config.
 ///
@@ -19,12 +25,18 @@ const DRIVE_ORIGIN: &str = "https://www.googleapis.com/drive";
 struct Endpoints {
     drive: String,
     token: String,
+    docs: String,
+    sheets: String,
+    slides: String,
 }
 
 fn endpoints(o: &Origins) -> Endpoints {
     Endpoints {
         drive: format!("{}/v3", Origins::origin(&o.drive, DRIVE_ORIGIN)),
         token: format!("{}/token", Origins::origin(&o.oauth, OAUTH_ORIGIN)),
+        docs: format!("{}/v1", Origins::origin(&o.docs, DOCS_ORIGIN)),
+        sheets: format!("{}/v4", Origins::origin(&o.sheets, SHEETS_ORIGIN)),
+        slides: format!("{}/v1", Origins::origin(&o.slides, SLIDES_ORIGIN)),
     }
 }
 
@@ -42,36 +54,12 @@ const FILE_FIELDS: &[&str] = &[
     // absent for folders and shortcuts. (enterprise-mock omits it on native
     // docs — a divergence from Google, so don't rely on either shape.)
     //
-    // For a document it is the size of what Drive *stores*, which is near what an
-    // export hands back only when the document is mostly images. Over six measured:
-    //
-    //   401,518,068 -> 400,984,746    +0.13%   images
-    //    60,063,731 ->  59,911,656    +0.25%   images
-    //     3,588,735 ->   3,705,698     -3.3%   text
-    //     8,762,033 ->  13,672,172      -56%   text
-    //        26,210 ->      32,151      -23%   text
-    //        17,796 ->     409,242    -2,300%  text
-    //
-    // Text compresses tighter in Drive's own form than in OOXML, so the number errs
-    // *low* there and by any amount. It is therefore a one-sided guard: refusing a
-    // document whose listed size already clears a ceiling never refuses one that would
-    // have fitted, while a document it admits may still be far over — which is what the
-    // frame counter is for. Never the entry's length, either; see `entry_size`.
+    // Never the entry's own length. For a blob it is exact, but a document is served as
+    // its API's JSON and Drive's number describes neither that nor anything else a
+    // reader sees — 4,775 stored against 133,625 of JSON on one measured document. It is
+    // kept because `read_window` refuses on it before a byte moves, and because a blob
+    // Drive lists *without* one has to be told apart from a blob it sized as zero.
     "size",
-    // Where an export of a Docs-editors file can actually be fetched, per MIME type.
-    //
-    // `files.export` caps at 10 MB and answers `exportSizeLimitExceeded` past it, with
-    // no partial download to work around it: a 5 MiB range and a 1 MiB range both drew
-    // the same `403`, after 48 and 41 seconds spent rendering the export they refused.
-    //
-    // Nothing documents this link as the way around that. Google's guide offers it as
-    // how to export *within a browser*, says nothing about exceeding 10 MB, and puts the
-    // cap only on `files.export`. That it has no cap of its own is measured — a 401 MB
-    // workbook came through — not promised. Read rather than built: the path
-    // shape differs per type (`/spreadsheets/export` against
-    // `/feeds/download/documents/export/Export`), and a URL this constructed would be
-    // a second copy of a layout Google never promised to keep.
-    "exportLinks",
     "modifiedTime",
     "createdTime",
     "webViewLink",
@@ -91,18 +79,16 @@ const MAX_RETRIES: u32 = 5;
 const MAX_BACKOFF: Duration = Duration::from_secs(16);
 const JITTER_MAX_MS: u64 = 1000;
 
-/// Ceiling on one document's export.
+/// Ceiling on one document's JSON.
 ///
-/// An export honours no range: a read of any part of a document produces all of it, so
-/// this is the memory one read costs, and it is held until the listing TTL runs out.
-/// 64 MiB against measured exports of 32 KB to 14 MB leaves room well past anything
-/// ordinary while keeping that footprint bounded.
+/// A document has no ranges: a read of any part of it produces the whole thing, so its
+/// size sets the memory a single read costs — body, parsed tree, indented output.
 ///
-/// It is not the only guard, and not the first one. Drive's listed `size` refuses a
-/// document that is already over by that number before a byte moves — which is how a
-/// 401 MB workbook in the corpus costs nothing to refuse rather than 64 MiB. But the
-/// listed size errs low on text-heavy documents, by up to a factor of 23 measured, so
-/// plenty of documents clear it and land here instead. This is the guard that holds.
+/// 64 MiB against a measured worst case of 2.5 MB leaves room far past any document in a
+/// real account while keeping one read's footprint bounded. The JSON stays small where an
+/// export does not: a 60 MB document is 2.5 MB of it, and a 401 MB workbook is 20,009
+/// bytes — that workbook could not be served as an export at all, being over this ceiling
+/// as one.
 pub(super) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Whether a 403 body names a limit that clears by waiting.
@@ -146,11 +132,11 @@ fn first_chars(s: &str, n: usize) -> &str {
 
 /// Read a response body, refusing at `limit` rather than after it.
 ///
-/// The obvious guard — check `Content-Length`, then buffer — never fires here: an export
-/// declares no length (measured: no `Content-Length`, no `Transfer-Encoding`, just an
-/// HTTP/2 stream; `HEAD` answers a `content-length` of `0`, and `Range` is ignored), so
-/// the only check that could run was the one after the whole body had already been
-/// allocated. Reading frame by frame makes the limit mean what it says.
+/// The obvious guard — check `Content-Length`, then buffer — never fires here: none of
+/// these endpoints declares a length (measured on Docs, Slides, `spreadsheets.get` and
+/// `values:batchGet`: no `Content-Length`, no `Transfer-Encoding`, just an HTTP/2
+/// stream), so the only check that ran was the one after the whole body had already
+/// been allocated. Reading frame by frame makes the limit mean what it says.
 async fn body_within(
     mut resp: reqwest::Response,
     limit: u64,
@@ -166,16 +152,17 @@ async fn body_within(
     Ok(out)
 }
 
-/// Whether a redirect target is one of Google's own content hosts.
+/// A tab name as an A1 range: quoted, with any literal quote doubled.
 ///
-/// Exports land on `doc-<something>.googleusercontent.com`, which is a family rather
-/// than one name, so this matches the suffix. A bare `ends_with` would also accept
-/// `evilgoogleusercontent.com`, hence the dot.
-fn is_google_content_host(url: &reqwest::Url) -> bool {
-    url.scheme() == "https"
-        && url
-            .host_str()
-            .is_some_and(|h| h == "googleusercontent.com" || h.ends_with(".googleusercontent.com"))
+/// A bare name mostly works and then abruptly doesn't. Measured against a real
+/// spreadsheet: `ranges=메인화면` answered `'메인화면'!A1:Z968`, while `ranges=A1`
+/// answered `'메인화면'!A1` — the *first* sheet's cell, not a sheet of that name, and
+/// `B2` and `A:A` the same way. So a tab named like a cell reference returns someone
+/// else's cells, which the caller then attaches to the wrong tab. Quoting is what A1
+/// notation specifies for a name, and the same measurement shows it changes nothing
+/// for the ordinary ones.
+fn quote_a1(tab: &str) -> String {
+    format!("'{}'", tab.replace('\'', "''"))
 }
 
 /// Exponential backoff with jitter for retry `n` (0-based), per Google's API
@@ -225,13 +212,6 @@ pub struct GdriveConfig {
 /// would also do for listing, but `drive.readonly` is the documented one).
 pub struct GdriveAccessor {
     client: reqwest::Client,
-    /// The client the export path uses, which differs from the one above in exactly one
-    /// way: it does not follow redirects.
-    ///
-    /// An export answers `307` to a host that is not the one the token belongs to, so
-    /// who receives the token has to be this code's decision and not a policy default.
-    /// See [`Self::export_document`].
-    export_client: reqwest::Client,
     config: GdriveConfig,
     /// Every API host, resolved once from [`GdriveConfig::origins`].
     urls: Endpoints,
@@ -250,15 +230,6 @@ impl GdriveAccessor {
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
-            // A longer ceiling than the API client's, because this one waits on a
-            // document being *rendered* rather than on a JSON reply: 67 seconds
-            // measured on a 401 MB workbook, 10 on a 60 MB document.
-            export_client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(180))
-                .connect_timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             config: config.clone(),
@@ -317,71 +288,6 @@ impl GdriveAccessor {
         build: impl Fn(&str) -> reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::Response> {
         self.send_retrying(build, MAX_RETRIES).await
-    }
-
-    /// A Docs-editors document, exported, from a link the *listing* handed over.
-    ///
-    /// Two legs, on purpose. The link answers `307` to a `googleusercontent.com` host
-    /// whose query carries its own signed grant, so the token belongs on the first leg
-    /// and nowhere else; measured, that second host serves the bytes with no
-    /// `Authorization` at all. Following the redirect inside the client would leave
-    /// which host receives the token up to a library default, and that is not a default
-    /// worth depending on — so this reads the `Location` and issues the second request
-    /// itself, without the token.
-    ///
-    /// `expect` is the MIME the caller asked to export as, and it is checked. Every
-    /// failure this endpoint produces is an HTML page (measured: `401` for a document
-    /// the token may not read, `404` for an unknown id and for a format it does not
-    /// serve), and a `200` carrying HTML is what a proxy or a captive portal looks
-    /// like. Neither may become the bytes of a file.
-    ///
-    /// Nothing here is logged. The redirect's `dat=` parameter *is* a credential for
-    /// that object, so the URL is as sensitive as the token that fetched it.
-    pub async fn export_document(
-        &self,
-        link: &str,
-        expect: &str,
-        limit: u64,
-    ) -> anyhow::Result<Vec<u8>> {
-        let first = self
-            .send_with_refresh(|t| self.export_client.get(link).bearer_auth(t))
-            .await?;
-        let status = first.status();
-        let resp = if status.is_redirection() {
-            let to = first
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| anyhow::anyhow!("export: {status} with no Location"))?;
-            let to = reqwest::Url::parse(to).map_err(|e| anyhow::anyhow!("export: {e}"))?;
-            // The host is the server's to name and ours to accept. Nothing is sent to it,
-            // but its answer becomes the bytes of a file, so an unexpected host must not
-            // get to supply them.
-            if !is_google_content_host(&to) {
-                anyhow::bail!(
-                    "export redirected to {}, which is not a host this mount reads from",
-                    to.host_str().unwrap_or("<no host>")
-                );
-            }
-            self.export_client.get(to).send().await?
-        } else {
-            first
-        };
-        let resp = resp.error_for_status()?;
-        let got = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        if got != expect {
-            anyhow::bail!("export answered {got:?} where {expect:?} was asked for");
-        }
-        body_within(resp, limit, "export").await
     }
 
     /// As [`Self::send_with_refresh`], with a caller-chosen retry ceiling.
@@ -567,11 +473,12 @@ impl GdriveAccessor {
             .map_err(|e| anyhow::anyhow!("gdrive probe {id}: bad total {total:?}: {e}"))
     }
 
-    /// A blob file's bytes (`files.get?alt=media`), or just one window of them.
+    /// Files whose *contents* match `phrase`, via Drive's own index
+    /// (`q=fullText contains`).
     ///
-    /// A Docs-editors document has no bytes and 403s here — *"Only files with binary
-    /// content can be downloaded. Use Export with Docs Editors files."* — so it goes
-    /// through [`Self::export_document`] instead.
+    /// A blob file's bytes (`files.get?alt=media`), or just one window of them.
+    /// A Docs-editors document has no bytes and 403s here; it is served as its own
+    /// API's JSON instead (see [`Self::document_json`] and friends).
     ///
     /// The range is what makes serving originals affordable, and how wide to make it is
     /// the caller's to decide — see `GdriveFs::span`, which sizes it by whether the reader
@@ -611,6 +518,92 @@ impl GdriveAccessor {
             return Ok(Vec::new());
         }
         Ok(resp.error_for_status()?.bytes().await?.to_vec())
+    }
+
+    /// A Google Doc's own structure (`documents.get`).
+    ///
+    /// Not an export: paragraphs, styles, tables, footnotes and — crucially for
+    /// editing — the character indices every `batchUpdate` addresses. Measured on
+    /// a real account: 59 KB to 2.4 MB, roughly 10-9,000x the exported text,
+    /// because every run carries its styling.
+    pub async fn document_json(&self, id: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_pretty(&format!("{}/documents/{id}", self.urls.docs))
+            .await
+    }
+
+    /// A presentation's own structure (`presentations.get`): pages, shapes,
+    /// transforms, speaker notes. Measured 1.3-2.2 MB even for a 6 KB deck —
+    /// slide geometry dwarfs the text.
+    pub async fn presentation_json(&self, id: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_pretty(&format!("{}/presentations/{id}", self.urls.slides))
+            .await
+    }
+
+    /// A spreadsheet's structure, without cell data (`spreadsheets.get`).
+    ///
+    /// 3.7-19.5 KB measured, and it carries what addressing a cell needs: sheet
+    /// ids, titles, grid extents, named ranges, charts, conditional formats.
+    pub async fn spreadsheet_json(&self, id: &str) -> anyhow::Result<Vec<u8>> {
+        self.get_pretty(&format!("{}/spreadsheets/{id}", self.urls.sheets))
+            .await
+    }
+
+    /// Cell values for the named tabs (`spreadsheets.values.batchGet`).
+    ///
+    /// This, not `includeGridData=true`, is how the grid comes back. That flag
+    /// bills per **allocated** cell at 578-920 bytes each (measured), and a tab
+    /// allocates 1000x26 whether or not one cell is filled — the first real
+    /// workbook tried had 210,125 allocated cells, an estimated 189 MB. `batchGet`
+    /// returns the used range only, and the same workbook's values were 443 B to
+    /// 105 KB per tab.
+    ///
+    /// Values are formatted as the sheet displays them, so what a reader greps is
+    /// what a person sees in the cell.
+    pub async fn sheet_values_batch(&self, id: &str, tabs: &[String]) -> anyhow::Result<Value> {
+        let quoted: Vec<String> = tabs.iter().map(|t| quote_a1(t)).collect();
+        let mut params: Vec<(&str, &str)> = vec![
+            ("majorDimension", "ROWS"),
+            ("valueRenderOption", "FORMATTED_VALUE"),
+            ("dateTimeRenderOption", "FORMATTED_STRING"),
+        ];
+        params.extend(quoted.iter().map(|r| ("ranges", r.as_str())));
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/spreadsheets/{id}/values:batchGet", self.urls.sheets),
+            &params,
+        )?;
+        let resp = self
+            .send_with_refresh(|t| self.client.get(url.clone()).bearer_auth(t))
+            .await?
+            .error_for_status()?;
+        // Bounded while reading, not after: the tree parsed from this costs several
+        // times its bytes, and the budget that decides how much of it is kept applies
+        // after the parse — too late to protect anything.
+        let raw = body_within(resp, MAX_DOCUMENT_BYTES, "spreadsheet values").await?;
+        Ok(serde_json::from_slice(&raw)?)
+    }
+
+    /// GET a JSON API response, pretty-printed so the bytes read as lines rather
+    /// than one long string — the difference between a file a reader can scan and
+    /// one it can only parse.
+    ///
+    /// Refuses a response over [`MAX_DOCUMENT_BYTES`]. This is where a document's
+    /// memory is spent — the raw body, the `Value` tree parsed from it (several times
+    /// its size), and the indented copy written back out — and where the only honest
+    /// limit can live: a reader cannot ask for part of a document, so serving one is
+    /// all-or-nothing, and past some size the answer has to be "no" rather than a
+    /// gigabyte of allocations per read. Enforced while the body is read (see
+    /// [`body_within`]) — these endpoints declare no length to check beforehand.
+    async fn get_pretty(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        let resp = self
+            .send_with_refresh(|t| self.client.get(url).bearer_auth(t))
+            .await?
+            .error_for_status()?;
+        let raw = body_within(resp, MAX_DOCUMENT_BYTES, "document").await?;
+        let v: Value = serde_json::from_slice(&raw)?;
+        drop(raw);
+        let mut bytes = serde_json::to_vec_pretty(&v)?;
+        bytes.push(b'\n');
+        Ok(bytes)
     }
 
     /// Shared drives visible to the account.
@@ -663,27 +656,79 @@ impl GdriveAccessor {
 mod tests {
     use super::*;
 
-    /// Two hosts in production, each overridable on its own, and the version suffix is
-    /// the official one either way — so nothing here depends on how a particular
+    /// Five hosts in production, each overridable on its own, and the version suffix
+    /// is the official one either way — so nothing here depends on how a particular
     /// deployment lays out its paths.
     #[test]
     fn each_service_keeps_its_official_path_under_any_origin() {
         let e = endpoints(&Origins::default());
         assert_eq!(e.drive, "https://www.googleapis.com/drive/v3");
         assert_eq!(e.token, "https://oauth2.googleapis.com/token");
+        assert_eq!(e.docs, "https://docs.googleapis.com/v1");
+        assert_eq!(e.sheets, "https://sheets.googleapis.com/v4");
+        assert_eq!(e.slides, "https://slides.googleapis.com/v1");
 
-        // One moves, the other stays on Google.
+        // One service moves, the rest stay on Google.
         let e = endpoints(&Origins {
-            drive: Some("http://localhost:9000/drive-api/".into()),
+            sheets: Some("http://localhost:9000/sheets-api/".into()),
             ..Default::default()
         });
-        assert_eq!(e.drive, "http://localhost:9000/drive-api/v3");
-        assert_eq!(e.token, "https://oauth2.googleapis.com/token");
+        assert_eq!(e.sheets, "http://localhost:9000/sheets-api/v4");
+        assert_eq!(e.docs, "https://docs.googleapis.com/v1");
 
-        // `behind` covers one host serving both; trailing slash tolerated.
+        // `behind` covers one host serving all of them; trailing slash tolerated.
         let e = endpoints(&Origins::behind("http://localhost:8000/"));
         assert_eq!(e.drive, "http://localhost:8000/drive/v3");
         assert_eq!(e.token, "http://localhost:8000/oauth2/token");
+        assert_eq!(e.docs, "http://localhost:8000/docs/v1");
+        assert_eq!(e.sheets, "http://localhost:8000/sheets/v4");
+        assert_eq!(e.slides, "http://localhost:8000/slides/v1");
+    }
+
+    /// A tab name can hold anything a person types — spaces, `#`, quotes — and it
+    /// rides in the query string, so it has to survive encoding.
+    #[test]
+    fn a_tab_name_survives_the_query_string() {
+        let url = reqwest::Url::parse_with_params(
+            "https://sheets.googleapis.com/v4/spreadsheets/x/values:batchGet",
+            &[("ranges", "한 장/정리"), ("ranges", "'Sheet 1'!A1:D9")],
+        )
+        .unwrap();
+        let got: Vec<_> = url
+            .query_pairs()
+            .filter(|(k, _)| k == "ranges")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(got, vec!["한 장/정리", "'Sheet 1'!A1:D9"]);
+        assert!(url.query().unwrap().contains("%2F"), "{url}");
+    }
+
+    /// The document ceiling and the content cache's budget have to meet: a document
+    /// the provider will produce must be one the cache can keep, or a chunked read of
+    /// it re-renders per chunk.
+    #[test]
+    fn a_document_that_can_be_produced_can_be_cached() {
+        const CONTENT_CACHE_BUDGET: u64 = 128 << 20;
+        // Compile-time: the two limits are a pair, and a later edit to either has to
+        // keep them one.
+        const _: () = assert!(MAX_DOCUMENT_BYTES <= CONTENT_CACHE_BUDGET);
+        // And far above anything measured: 3.4MB was the largest real document.
+        const _: () = assert!(MAX_DOCUMENT_BYTES >= 16 << 20);
+    }
+
+    /// A tab is named by a person but read as A1 notation, where a name that looks
+    /// like a cell reference *is* one (measured: `ranges=A1` returned the first
+    /// sheet's A1 cell, not the sheet named `A1`).
+    #[test]
+    fn a_tab_name_is_quoted_so_it_stays_a_name() {
+        assert_eq!(quote_a1("메인화면"), "'메인화면'");
+        assert_eq!(quote_a1("1. 낚시 스킬+매크로"), "'1. 낚시 스킬+매크로'");
+        // Unquoted, each of these addresses cells instead of a sheet.
+        assert_eq!(quote_a1("A1"), "'A1'");
+        assert_eq!(quote_a1("A:A"), "'A:A'");
+        assert_eq!(quote_a1("Sheet1!B2"), "'Sheet1!B2'");
+        // A quote in the name closes the quoting unless doubled.
+        assert_eq!(quote_a1("it's"), "'it''s'");
     }
 
     /// Drive uses 403 for a limit that clears by waiting, which the status alone reads

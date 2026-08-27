@@ -3,7 +3,7 @@
 //! ```text
 //! My Drive/                 the folder tree, from Drive's own `root`
 //!   q3.pdf                  a blob, served as its own bytes
-//!   plan.docx              a Docs-editors document, served as its Office export
+//!   plan.gdoc.json          a Docs-editors document, served as its API's JSON
 //! Shared with me/           what this account was given
 //! <shared drive>/           one directory per shared drive this account can see
 //! ```
@@ -16,53 +16,56 @@
 //! consent round trip belongs to whatever set the mount up, the same way the Slack lane
 //! takes a token it did not mint.
 //!
-//! **The Docs-editors types hold no bytes.** `files.get?alt=media` refuses them
-//! outright — *"Only files with binary content can be downloaded. Use Export with Docs
-//! Editors files."* — so each is served as its Office export, which is the form a reader
-//! can open. The extension is the export's own, and it is also what says which of the
-//! three the entry came from, since a Drive name carries none.
+//! **The Docs-editors types hold no bytes.** `files.get?alt=media` answers 403 for a Doc, a
+//! Sheet or a Slides deck, because Drive can only export a rendering of one. Each is served
+//! as its own API's JSON instead, which is the only form that carries formulas, slide
+//! geometry, and the character indices an edit has to address. The suffix says which of the
+//! three it was, since a Drive name has no extension.
 //!
 //! ```text
-//! <name>.docx    a Google Doc
-//! <name>.xlsx    a Google Sheet
-//! <name>.pptx    a Google Slides deck
+//! <name>.gdoc.json     paragraphs, styles, tables, and the character indices an edit
+//!                      addresses
+//! <name>.gsheet.json   tabs, named ranges, charts, and each tab's cell values under
+//!                      `sheets[].values` (`sheets[].valuesOmitted` past the budget)
+//! <name>.gslide.json   pages, shapes, transforms, speaker notes
 //! ```
 //!
-//! Every *other* Google-native type — Forms, Drawings, Maps, Apps Script — is not listed
-//! at all: none of them exports to anything, and a name that cannot be read is worse
-//! than an absence.
+//! Their text is split across style runs, so a `grep` here finds words rather than phrases,
+//! and `-A`/`-B` shows JSON siblings rather than the document's next lines. Every *other*
+//! Google-native type — Forms, Drawings, Maps, Apps Script — is not listed at all: none of
+//! them answers an API or exports to anything, and a name that cannot be read is worse than
+//! an absence.
 //!
-//! Two files of one name are numbered before the extension (`report (2).pdf`), because
-//! Drive lets a folder hold both and a directory cannot.
+//! Two files of one name are numbered before the extension (`report (2).pdf`), because Drive
+//! lets a folder hold both and a directory cannot.
 //!
-//! **A listing no longer says which of the two an entry was.** An uploaded `.pptx` and
-//! an exported Google Slides deck read the same, and that is what serving the export
-//! buys: a reader opens either without knowing. What separates them is what a read
-//! costs — a real file reads by spans of it, an export does not — so the difference
-//! survives where it matters and is invisible where it does not.
+//! **A listing says which of the two an entry was, by its extension.** An uploaded
+//! `.pptx` keeps its name; a Google Slides deck is served as `<name>.gslide.json`, the
+//! deck as its own API describes it. That is deliberate — the alternative was an Office
+//! export, which reads like a real file and cannot be read at all.
 //!
-//! ## Exporting through the link the listing hands over
+//! ## Why not the Office export
 //!
-//! `files.export` is not the path taken. It caps at 10 MB and refuses past it with no
-//! partial download to work around it — not even by asking in pieces: a 5 MiB range and
-//! a 1 MiB range both answered `403` on a document over the cap, after spending 48 and
-//! 41 seconds rendering the export they then refused. Of 38 documents in the corpus six
-//! are over the cap by the listed size, and the listing understates the export often
-//! enough that some of the other 32 fail too. Drive answers instead with `exportLinks`,
-//! a per-MIME map on the file resource, which the listing carries for free.
+//! It was tried, and reverted. `files.export` caps at 10 MB and refuses past it, not even
+//! in pieces — a 5 MiB range and a 1 MiB range both drew `403`, after 48 and 41 seconds
+//! spent rendering the export they then refused. The `exportLinks` URL has no such cap,
+//! but it declares no length either: no `Content-Length`, `HEAD` answers `0`, ranges are
+//! ignored. So the only way to learn how long an export is, is to render it — measured
+//! at 1.5-1.8 s for a document, 1.3-2.6 s for a spreadsheet, 8.8-39.6 s for a deck.
 //!
-//! Nothing documents that link as the way around the cap. Google's own guide presents it
-//! as how to export *within a browser*, says nothing about exceeding 10 MB, and puts the
-//! cap only on `files.export`. That the link has no cap of its own is measured, not
-//! promised — a 401 MB workbook came through it — so this path rests on behaviour Google
-//! could take back.
+//! And that length is what a zip reader needs. An OOXML file keeps its directory at the
+//! *end*, so every reader of one — `unzip`, Word, Excel, Keynote, LibreOffice — seeks
+//! there from the length `stat` gave. Drive's listed size missed by −4,910,139 to
+//! +533,322 across six documents, against a backward-scan window bisected at 70,639
+//! bytes, so an estimate cannot be made close enough. `stat` producing the export instead
+//! put one `ls -l` of a 129-entry folder at 108 s, because FUSE-T serves over NFS and an
+//! NFS client wants an attribute for every name it lists.
 //!
-//! That link answers `307` to a `googleusercontent.com` host whose query holds its own
-//! signed grant, so the two legs are issued separately: the token rides the first and
-//! nothing rides the second, which is measured to need none. The redirect's host is
-//! checked, the answer's `Content-Type` is checked (every failure this endpoint produces
-//! is an HTML page — `401` unreadable, `404` unknown), and the redirect URL is never
-//! logged, being a credential for that object.
+//! The JSON has none of that shape. It is read front to back, so a wrong length costs
+//! only the bytes past it rather than the whole file; its own API answers in about a
+//! second whatever the document's size, because nothing is rendered; and it is 10-30x
+//! smaller — a 401 MB workbook is 20,009 bytes of JSON, and this tree cannot read that
+//! workbook as an export at all.
 //!
 //! ## What a read costs
 //!
@@ -73,26 +76,13 @@
 //!   request per window put a 641 MB archive at 0.04 MB/s. A first read takes 8 MiB and a
 //!   read carrying on from the last takes 64 MiB, which is where the rate tops out at
 //!   11-12 MB/s. `head` of that archive moves 8 MiB; `cat` of it moves all 641 MB in 53 s.
-//! * **A document has no windows.** An export honours no range (`bytes=0-0` answers
-//!   `200` with the whole object; `HEAD` answers a `content-length` of `0`), so any read
-//!   produces all of it, and it is held for the listing TTL rather than produced again
-//!   per chunk. Drive's own `size` refuses a document already over by that number
-//!   before a byte moves, but it errs low on text — by a factor of 23 measured — so the
-//!   frame counter behind it is what actually bounds the read.
+//! * A document has no windows. Any read of one produces the whole JSON, and until
+//!   something does, its size is a **placeholder rather than a length** — `ls -l` and
+//!   `find -size` are wrong about an unread document, and [`Stat`](crate::fs::Stat) has no
+//!   field in which to say so. Once one has been read the real length is reported, which
+//!   costs no request: the bytes were already produced. A spreadsheet costs two requests
+//!   rather than one, the grid coming separately from the workbook.
 //! * A listing is held for five minutes, so a change just made in Drive may not show yet.
-//!
-//! ## What an export loses
-//!
-//! **A spreadsheet can come back wrong, and nothing here can repair it.** Google exports
-//! an in-cell image as a picture floating over the sheet rather than as the cell's value,
-//! so a `VLOOKUP` that returned that image in Sheets returns `#N/A` in Excel; named
-//! ranges can arrive as `#REF!` in the same file. Measured on a real workbook and
-//! reproduced by downloading it from Drive's own UI, so it is Google's export rather than
-//! this path — and the cell has no cached value to fall back on. Documents and decks
-//! carry neither formulas nor in-cell images, and do not have the problem.
-//!
-//! And an Office file is a zip, so `grep` finds nothing inside one. What a reader wants
-//! from a document here is to open it, which is the trade this makes.
 
 mod accessor;
 mod gdrive;

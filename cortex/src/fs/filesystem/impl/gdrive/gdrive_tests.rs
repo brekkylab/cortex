@@ -20,8 +20,7 @@ fn size_of(e: &Dirent) -> u64 {
 }
 
 fn file_row(name: &str, id: &str, mime: &str) -> Value {
-    let mut v = export_links_for(mime, id);
-    let base = json!({
+    json!({
         "id": id,
         "name": name,
         "mimeType": mime,
@@ -30,24 +29,7 @@ fn file_row(name: &str, id: &str, mime: &str) -> Value {
         "createdTime": "2025-11-01T12:00:00Z",
         "webViewLink": format!("https://drive.google.com/file/d/{id}/view"),
         "owners": [{"displayName": "Mia Lopez", "emailAddress": "mia@acme.com"}],
-    });
-    let obj = v.as_object_mut().unwrap();
-    for (k, val) in base.as_object().unwrap() {
-        obj.insert(k.clone(), val.clone());
-    }
-    v
-}
-
-/// A row's `exportLinks`, which is what makes a Docs-editors row into an entry: a
-/// document with no link to export through is not something the mount can serve, so
-/// `child_from_file` drops it the way it drops a Form.
-fn export_links_for(mime: &str, id: &str) -> Value {
-    match NATIVE_KINDS.iter().find(|(m, _, _, _)| *m == mime) {
-        Some((_, _, export, _)) => json!({
-            "exportLinks": { *export: format!("https://example.invalid/export?id={id}") }
-        }),
-        None => json!({}),
-    }
+    })
 }
 
 /// What one Drive row becomes on the mount. A file with bytes keeps its own
@@ -69,51 +51,31 @@ fn a_row_becomes_the_thing_it_can_serve() {
         "notes.md"
     );
 
-    // Docs-editors types: one entry, the Office export. The extension says which kind
-    // it came from, since the Drive name carries none.
+    // Docs-editors types: one entry, the document's own API JSON. The suffix
+    // says which kind it is, since the Drive name carries no extension.
     for (mime, suffix, api) in [
         (
             "application/vnd.google-apps.document",
-            ".docx",
+            ".gdoc.json",
             NativeApi::Doc,
         ),
         (
             "application/vnd.google-apps.spreadsheet",
-            ".xlsx",
+            ".gsheet.json",
             NativeApi::Sheet,
         ),
         (
             "application/vnd.google-apps.presentation",
-            ".pptx",
+            ".gslide.json",
             NativeApi::Slides,
         ),
     ] {
         let c = entry("Q3 Plan", mime).unwrap();
         assert_eq!(c.vfs_name, format!("Q3 Plan{suffix}"), "{mime}");
-        assert!(matches!(&c.serves, Serves::Native(a, _) if *a == api), "{mime}");
-        // Drive's own `size`, which for a document is what it stores — an estimate of
-        // the export rather than the placeholder an unread document used to report.
-        assert_eq!(entry_size(&c), 47065, "{mime}");
-        // And the link came from the listing, not from a path this built.
-        assert!(
-            matches!(&c.serves, Serves::Native(_, l) if l.contains("export?id=")),
-            "{mime}"
-        );
+        assert_eq!(c.serves, Serves::Native(api), "{mime}");
+        // Its length is only known once the API has answered.
+        assert_eq!(entry_size(&c), UNKNOWN_LENGTH_SIZE, "{mime}");
     }
-
-    // A document Drive listed without one still has nowhere to learn its length: an
-    // export honours no range, so there is no cheap probe the way a blob has.
-    let mut sizeless = file_row("Q3 Plan", "id1", "application/vnd.google-apps.document");
-    sizeless.as_object_mut().unwrap().remove("size");
-    assert_eq!(
-        entry_size(&child_from_file(&sizeless).unwrap()),
-        UNKNOWN_LENGTH_SIZE
-    );
-
-    // And one with no export link is not an entry at all — the same answer a Form gets.
-    let mut linkless = file_row("Q3 Plan", "id1", "application/vnd.google-apps.document");
-    linkless.as_object_mut().unwrap().remove("exportLinks");
-    assert!(child_from_file(&linkless).is_none());
 
     // Nothing to convert, nothing to serve: not listed at all.
     for mime in [
@@ -163,7 +125,7 @@ fn non_ascii_names_survive_and_sizes_are_drives_own() {
         "application/vnd.google-apps.document",
     ))
     .unwrap();
-    assert_eq!(doc.vfs_name, "분기 보고서.docx");
+    assert_eq!(doc.vfs_name, "분기 보고서.gdoc.json");
 }
 
 /// A row Drive reported no size for still lists, with the placeholder rather
@@ -197,7 +159,7 @@ fn drive_names_cannot_escape_their_directory() {
         "application/vnd.google-apps.document",
     ))
     .unwrap();
-    assert_eq!(native.vfs_name, "untitled.docx");
+    assert_eq!(native.vfs_name, "untitled.gdoc.json");
 }
 
 #[test]
@@ -218,10 +180,10 @@ fn disambiguate_keeps_a_name_findable_by_its_extension() {
     };
     let mut children = vec![
         // Three spreadsheets of the same Drive name: the number has to land
-        // before `.xlsx` or a `**/*.xlsx` search loses two of them.
-        mk("report.xlsx", Serves::Native(NativeApi::Sheet, String::new())),
-        mk("report.xlsx", Serves::Native(NativeApi::Sheet, String::new())),
-        mk("report.xlsx", Serves::Native(NativeApi::Sheet, String::new())),
+        // before `.gsheet.json` or a `**/*.gsheet.json` search loses two of them.
+        mk("report.gsheet.json", Serves::Native(NativeApi::Sheet)),
+        mk("report.gsheet.json", Serves::Native(NativeApi::Sheet)),
+        mk("report.gsheet.json", Serves::Native(NativeApi::Sheet)),
         // A plain file keeps its own extension.
         mk("photo.jpeg", Serves::Original),
         mk("photo.jpeg", Serves::Original),
@@ -236,9 +198,9 @@ fn disambiguate_keeps_a_name_findable_by_its_extension() {
     assert_eq!(
         names,
         vec![
-            "report.xlsx",
-            "report (2).xlsx",
-            "report (3).xlsx",
+            "report.gsheet.json",
+            "report (2).gsheet.json",
+            "report (3).gsheet.json",
             "photo.jpeg",
             "photo (2).jpeg",
             "notes",
@@ -257,6 +219,30 @@ fn shared_drive_names_dodge_the_root_sections() {
     assert_eq!(
         unique_name(MY_DRIVE_NAME, &existing),
         "My Drive [Shared Drive]"
+    );
+}
+
+/// The budget bounds the file that gets served, so it has to be measured in the
+/// form that gets served: indenting a grid of short cells costs half again its
+/// compact size (1.66x measured here), and a budget checked against the compact
+/// form quietly allows that much more.
+#[test]
+fn a_tabs_cost_is_measured_as_it_will_be_written() {
+    let values: Value = serde_json::json!(
+        (0..200)
+            .map(|r| (0..20).map(|c| format!("{r}-{c}")).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+    let compact = serde_json::to_vec(&values).unwrap().len() as u64;
+    let served = served_len(&values);
+    assert_eq!(
+        served,
+        serde_json::to_vec_pretty(&values).unwrap().len() as u64,
+        "counted, not estimated"
+    );
+    assert!(
+        served * 2 > compact * 3,
+        "indenting a grid costs at least half again: {compact} -> {served}"
     );
 }
 
@@ -282,6 +268,123 @@ async fn a_search_hit_the_mount_cannot_serve_is_still_reported() {
             .or_else(|| row.get("name").and_then(|n| n.as_str()).map(str::to_string));
         assert!(name.is_some(), "a hit always has a name to report");
     }
+}
+
+fn workbook(titles: &[Option<&str>]) -> Value {
+    serde_json::json!({
+        "sheets": titles
+            .iter()
+            .map(|t| match t {
+                Some(t) => serde_json::json!({ "properties": { "title": t } }),
+                None => serde_json::json!({ "properties": {} }),
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn batch(pairs: &[(&str, &str)]) -> Value {
+    serde_json::json!({
+        "valueRanges": pairs
+            .iter()
+            .map(|(range, cell)| serde_json::json!({
+                "range": range,
+                "values": [[cell]],
+            }))
+            .collect::<Vec<_>>()
+    })
+}
+
+fn values_of(wb: &Value, i: usize) -> Option<String> {
+    wb["sheets"][i]["values"][0][0].as_str().map(str::to_string)
+}
+
+fn omitted_reason(wb: &Value, i: usize) -> Option<String> {
+    wb["sheets"][i]["valuesOmitted"]["reason"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Values are paired by the sheet they name, not by their position in the reply.
+/// A sheet the request had to skip — one with no title — used to consume the next
+/// sheet's values and shift the rest, which is the same wrong-cells outcome
+/// `quote_a1` exists to prevent, reached from the other side.
+#[test]
+fn a_skipped_sheet_does_not_shift_everyone_elses_values() {
+    let mut wb = workbook(&[Some("Alpha"), None, Some("Gamma")]);
+    // The request only asked for the titled sheets.
+    let asked = vec!["Alpha".to_string(), "Gamma".to_string()];
+    fold_values(
+        &mut wb,
+        &batch(&[("Alpha!A1", "ALPHA-CELL"), ("Gamma!A1", "GAMMA-CELL")]),
+        &asked,
+    );
+    assert_eq!(values_of(&wb, 0).as_deref(), Some("ALPHA-CELL"));
+    assert_eq!(values_of(&wb, 2).as_deref(), Some("GAMMA-CELL"));
+    assert_eq!(values_of(&wb, 1), None, "the titleless sheet gets nothing");
+    assert!(
+        omitted_reason(&wb, 1).is_some_and(|r| r.contains("no title")),
+        "and says why"
+    );
+}
+
+/// Past the cap no request was made, so the tail has no values — and used to have
+/// no explanation either, the one silent omission in this file.
+#[test]
+fn a_tab_past_the_cap_says_it_was_never_asked_for() {
+    let titles: Vec<String> = (0..MAX_TABS + 2).map(|i| format!("T{i}")).collect();
+    let mut wb = workbook(&titles.iter().map(|t| Some(t.as_str())).collect::<Vec<_>>());
+    let asked = titles[..MAX_TABS].to_vec();
+    let pairs: Vec<(String, String)> = asked
+        .iter()
+        .map(|t| (format!("{t}!A1"), format!("{t}-CELL")))
+        .collect();
+    let refs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(r, c)| (r.as_str(), c.as_str()))
+        .collect();
+    fold_values(&mut wb, &batch(&refs), &asked);
+
+    assert_eq!(values_of(&wb, 0).as_deref(), Some("T0-CELL"));
+    for i in MAX_TABS..MAX_TABS + 2 {
+        assert_eq!(values_of(&wb, i), None);
+        assert!(
+            omitted_reason(&wb, i).is_some_and(|r| r.contains("tab cap")),
+            "tab {i} must not be silently empty"
+        );
+    }
+}
+
+/// One oversized tab used to zero the budget, so every later tab was dropped
+/// however small. The budget is spent tab by tab, which is what the constant says.
+#[test]
+fn an_oversized_tab_does_not_spend_the_rest_of_the_budget() {
+    let mut wb = workbook(&[Some("small1"), Some("huge"), Some("small2")]);
+    let huge = "x".repeat(GRID_BYTES_BUDGET as usize + 1);
+    let mut b = batch(&[("small1!A1", "a"), ("small2!A1", "b")]);
+    b["valueRanges"].as_array_mut().unwrap().insert(
+        1,
+        serde_json::json!({ "range": "huge!A1", "values": [[huge]] }),
+    );
+    fold_values(&mut wb, &b, &["small1", "huge", "small2"].map(String::from));
+
+    assert_eq!(values_of(&wb, 0).as_deref(), Some("a"));
+    assert!(omitted_reason(&wb, 1).is_some_and(|r| r.contains("budget")));
+    assert_eq!(
+        values_of(&wb, 2).as_deref(),
+        Some("b"),
+        "a small tab after a large one still fits"
+    );
+}
+
+/// The reply names its sheet in A1 notation, which is what the pairing reads.
+#[test]
+fn a_returned_range_names_its_sheet() {
+    assert_eq!(range_title("Sheet1!A1:Z1000"), "Sheet1");
+    assert_eq!(range_title("'메인화면'!A1:Z968"), "메인화면");
+    // A quoted title can hold the characters that would otherwise confuse this.
+    assert_eq!(range_title("'Sheet1!B2'!A1:Z10"), "Sheet1!B2");
+    assert_eq!(range_title("'it''s'!A1"), "it's");
+    assert_eq!(range_title("Sheet1"), "Sheet1");
 }
 
 /// A range that asks backwards is empty, not a crash. The window arrives from
@@ -407,11 +510,11 @@ async fn gdrive_mock_tree_and_reads() {
             }
             let mp = Path::new(&p);
             let bytes = r.read_window(mp, None).await.expect("read file");
-            if looks_like_an_export(e) {
+            if is_native_json(e) {
                 // A document's JSON: the listing could only estimate its
                 // length, so just check the read produced something.
                 converted += 1;
-                assert!(!bytes.is_empty(), "{p}: the export was empty");
+                assert!(!bytes.is_empty(), "{p}: native json was empty");
             } else {
                 assert_eq!(size_of(e), bytes.len() as u64, "{p}: listed size vs read");
                 let st = r.stat(mp).await.expect("stat");
@@ -484,7 +587,7 @@ async fn gdrive_live_tree_and_reads() {
         // length the listing promised.
         if let Some(f) = entries
             .iter()
-            .find(|e| e.kind == DirentKind::File && !looks_like_an_export(e) && size_of(e) > 0)
+            .find(|e| e.kind == DirentKind::File && !is_native_json(e) && size_of(e) > 0)
         {
             let mp = PathBuf::from(format!("/{section}/{}", f.name));
             let head = r
@@ -509,16 +612,12 @@ async fn gdrive_live_tree_and_reads() {
         }
     }
 }
-
-/// Live: a document is served as its Office export, and that export is a real one.
-///
-/// An OOXML file is a zip, so the check is the zip's own signature plus the parts every
-/// one of the three carries. Not a byte comparison against a stored fixture: Google
-/// rebuilds the export on each request and it is not reproducible — the same unedited
-/// workbook came back 35 bytes shorter on a second fetch, seconds later.
+/// Live: a Docs-editors document is served as its own API's JSON, and a
+/// spreadsheet's stays small — the grid it deliberately omits runs to hundreds
+/// of megabytes.
 #[tokio::test]
 #[ignore = "requires GOOGLE_* env + network"]
-async fn gdrive_live_a_document_is_served_as_its_export() {
+async fn gdrive_live_native_json_is_served() {
     let Some(cfg) = live_config() else {
         eprintln!("set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN to run");
         return;
@@ -531,84 +630,83 @@ async fn gdrive_live_a_document_is_served_as_its_export() {
             .list(&PathBuf::from(format!("/{section}")))
             .await
             .expect("section readdir");
-        // By what the entry *is*, not by what it is called. An uploaded `.pptx` and an
-        // exported Google Slides deck now carry the same name in this tree — which is
-        // the point of serving the export, and it means the listing alone cannot pick
-        // one out. `resolve` can.
-        let mut natives = Vec::new();
-        for e in &entries {
-            let path = format!("/{section}/{}", e.name);
-            if let Ok(c) = r.resolve(&path).await
-                && matches!(c.serves, Serves::Native(..))
-            {
-                natives.push(e);
-            }
-        }
-        for suffix in [".xlsx", ".docx", ".pptx"] {
-            let Some(e) = natives.iter().find(|x| x.name.ends_with(suffix)) else {
+        for suffix in [".gsheet.json", ".gdoc.json", ".gslide.json"] {
+            let Some(e) = entries.iter().find(|e| e.name.ends_with(suffix)) else {
                 continue;
             };
-            let listed = size_of(e);
             let p = PathBuf::from(format!("/{section}/{}", e.name));
             let t0 = std::time::Instant::now();
-            let bytes = r.read_window(&p, None).await.expect("read the export");
+            let bytes = r.read_window(&p, None).await.expect("read native json");
+            let v: Value = serde_json::from_slice(&bytes).expect("native json parses");
             eprintln!(
-                "  {} -> {} bytes in {:.2}s (listing said {listed})",
+                "  {} -> {} bytes in {:.2}s, top keys {:?}",
                 e.name,
                 bytes.len(),
-                t0.elapsed().as_secs_f64()
+                t0.elapsed().as_secs_f64(),
+                v.as_object().map(|o| o.keys().take(4).collect::<Vec<_>>())
             );
-
-            assert_eq!(
-                &bytes[..4],
-                b"PK\x03\x04",
-                "{}: an OOXML file is a zip, and this is a zip's first local header",
-                e.name
-            );
-            // Not at a fixed offset: Google writes the parts in an order of its own
-            // (a measured export opens with `xl/comments1.xml`), so this looks for the
-            // part every OOXML package must contain rather than for the first one.
-            assert!(
-                bytes
-                    .windows(19)
-                    .any(|w| w == b"[Content_Types].xml"),
-                "{}: every OOXML package carries its content-type part",
-                e.name
-            );
-
-            // No assertion relating `listed` to what arrived. It was held to a factor
-            // of two here, which is false: the listing understates a text-heavy export
-            // by any amount, and one document in the corpus lists 17,796 against 409,242
-            // exported. The two checks above already say this is the right object; a
-            // bound that only holds for image-heavy documents says nothing and fails on
-            // whichever one the listing happens to return first.
-            eprintln!("    listing said {listed}, export was {}", bytes.len());
-
-            // Held, so a second read of the same document does not produce it again.
-            // Compared against the first rather than against a clock: what is being
-            // held is an export that took seconds, and the point is the ratio.
-            let t1 = std::time::Instant::now();
-            let again = r.read_window(&p, Some(0..64)).await.expect("second read");
-            let (first, second) = (t0.elapsed(), t1.elapsed());
-            eprintln!(
-                "    first {:.2}s, again {:.4}s",
-                first.as_secs_f64(),
-                second.as_secs_f64()
-            );
-            assert_eq!(again.len(), 64.min(bytes.len()));
-            assert!(
-                second * 10 < first,
-                "{}: the second read cost {second:?} against the first's {first:?}, \
-                 so the export was produced twice",
-                e.name
-            );
+            // A spreadsheet carries its cells, unless its allocated grid is
+            // over the limit — then it says so instead of moving 200-349MB.
+            if suffix == ".gsheet.json" {
+                assert!(v.get("sheets").is_some(), "workbook shape is present");
+                // `includeGridData` would put cells under sheets[].data. Nothing
+                // should be taking that route — it measured 189MB on this very
+                // workbook.
+                assert!(
+                    !v["sheets"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .any(|s| s.get("data").is_some()),
+                    "{}: cells must come from values, not the allocated grid",
+                    e.name
+                );
+                let tabs = v["sheets"].as_array().cloned().unwrap_or_default();
+                for t in &tabs {
+                    eprintln!(
+                        "    tab {:?}: {} rows{}",
+                        t.pointer("/properties/title").and_then(|x| x.as_str()),
+                        t["values"].as_array().map_or(0, |r| r.len()),
+                        if t.get("valuesOmitted").is_some() {
+                            " (values omitted)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                assert!(
+                    tabs.iter()
+                        .all(|t| t.get("values").is_some() || t.get("valuesOmitted").is_some()),
+                    "{}: every tab carries its values or says why not",
+                    e.name
+                );
+                // The point of carrying values at all: a cell's text is in the
+                // bytes, so a reader searching the tree finds it. Cells holding a
+                // line break are excluded on purpose — JSON escapes those to
+                // `\n`, so a phrase spanning one is not literally in the file.
+                let a_cell = tabs
+                    .iter()
+                    .flat_map(|t| t["values"].as_array().cloned().unwrap_or_default())
+                    .flat_map(|row| row.as_array().cloned().unwrap_or_default())
+                    .find_map(|c| {
+                        c.as_str()
+                            .filter(|s| s.trim().len() > 3 && !s.contains(['\n', '"', '\\']))
+                            .map(str::to_string)
+                    })
+                    .expect("some cell holds plain text");
+                eprintln!("    a cell reads {a_cell:?}");
+                assert!(
+                    String::from_utf8_lossy(&bytes).contains(&a_cell),
+                    "a cell's text is greppable in the served bytes"
+                );
+            }
             seen += 1;
         }
         if seen > 0 {
             break;
         }
     }
-    assert!(seen > 0, "no Docs-editors document found");
+    assert!(seen > 0, "no native document found");
 }
 
 #[tokio::test]
@@ -629,7 +727,7 @@ async fn gdrive_live_originals_read_by_range() {
         // must never be needed for.
         let Some(big) = entries
             .iter()
-            .filter(|e| e.kind == DirentKind::File && !looks_like_an_export(e) && size_of(e) > 0)
+            .filter(|e| e.kind == DirentKind::File && !is_native_json(e) && size_of(e) > 0)
             .max_by_key(|e| size_of(e))
         else {
             continue;
@@ -936,27 +1034,14 @@ fn mounted(cfg: &GdriveConfig) -> GdriveFs {
 }
 
 fn row(name: &str, id: &str, mime: &str, size: Option<&str>) -> Value {
-    row_at("http://127.0.0.1:0", name, id, mime, size)
-}
-
-/// A listing row whose export link points back at `addr`, so a document read reaches
-/// the mock rather than Google.
-fn row_at(addr: &str, name: &str, id: &str, mime: &str, size: Option<&str>) -> Value {
     let mut v = json!({
         "id": id,
         "name": name,
         "mimeType": mime,
         "modifiedTime": "2026-01-30T09:00:00Z",
     });
-    let obj = v.as_object_mut().unwrap();
     if let Some(s) = size {
-        obj.insert("size".into(), json!(s));
-    }
-    if let Some((_, _, export, _)) = NATIVE_KINDS.iter().find(|(m, _, _, _)| *m == mime) {
-        obj.insert(
-            "exportLinks".into(),
-            json!({ *export: format!("{addr}/export?id={id}") }),
-        );
+        v.as_object_mut().unwrap().insert("size".into(), json!(s));
     }
     v
 }
@@ -1036,14 +1121,14 @@ async fn a_document_is_built_once_and_served_from_the_cache() {
     .await;
     let fs = mounted(&mock.config());
     let listed = fs.list(Path::new("/My Drive")).await.unwrap();
-    assert_eq!(listed[0].name, "notes.docx");
+    assert_eq!(listed[0].name, "notes.gdoc.json");
     assert_eq!(size_of(&listed[0]), UNKNOWN_LENGTH_SIZE);
 
     // The mock has no Docs endpoint, so a read fails — what matters is that the
     // listing already refused to call the placeholder a length, which is what keeps
     // `whole_or_small` from treating it as a small, cacheable object.
     let st = fs
-        .stat(Path::new("/My Drive/notes.docx"))
+        .stat(Path::new("/My Drive/notes.gdoc.json"))
         .await
         .unwrap();
     assert_eq!(
@@ -1051,7 +1136,7 @@ async fn a_document_is_built_once_and_served_from_the_cache() {
         "a document has no length until it is built"
     );
     assert!(
-        fs.read_window(Path::new("/My Drive/notes.docx"), Some(0..CHUNK))
+        fs.read_window(Path::new("/My Drive/notes.gdoc.json"), Some(0..CHUNK))
         .await
         .is_err(),
         "the mock serves no document API"
@@ -1079,7 +1164,7 @@ async fn an_oversized_document_stops_being_read() {
     )
     .await;
     let fs = mounted(&mock.config());
-    let path = Path::new("/My Drive/huge.docx");
+    let path = Path::new("/My Drive/huge.gdoc.json");
     // A document past the ceiling still stats: nothing renders it to find out.
     fs.stat(path).await.unwrap();
 
@@ -1225,19 +1310,20 @@ async fn a_listing_cache_does_not_grow_without_bound() {
 /// Each service is reached at its own origin, and only its own.
 ///
 /// A single `base_url` could not express this: it stood in for every host, with the
-/// intermediate path (`/drive`, `/oauth2`) chosen by the client rather than the
-/// deployment, so a gateway serving one of them somewhere else could not be pointed at.
-/// Two listeners here, on paths neither Google nor our own mock uses.
+/// intermediate path (`/drive`, `/sheets`) chosen by the client rather than the
+/// deployment, so a gateway serving one service somewhere else could not be pointed
+/// at. Two listeners here, on paths neither Google nor our own mock uses.
 #[tokio::test]
 async fn one_service_can_move_without_moving_the_others() {
-    // Gateway A: Drive, on a path of its own choosing.
-    let a = start(json!([row("q3.pdf", "P1", "application/pdf", Some("11"))]), {
-        let mut m = HashMap::new();
-        m.insert("P1".to_string(), b"hello world".to_vec());
-        m
-    })
-    .await;
-    // Gateway B: the token endpoint only, on a different port.
+    let sheet = row(
+        "budget",
+        "S1",
+        "application/vnd.google-apps.spreadsheet",
+        None,
+    );
+    // Gateway A: Drive and the token endpoint, Drive on a path of its own choosing.
+    let a = start(json!([sheet]), HashMap::new()).await;
+    // Gateway B: Sheets only, on a different port.
     let b = start(json!([]), HashMap::new()).await;
 
     let fs = mounted(&GdriveConfig {
@@ -1246,12 +1332,19 @@ async fn one_service_can_move_without_moving_the_others() {
         refresh_token: "rt".into(),
         origins: Origins {
             drive: Some(format!("{}/drive", a.addr)),
-            oauth: Some(format!("{}/oauth2", b.addr)),
+            oauth: Some(format!("{}/oauth2", a.addr)),
+            sheets: Some(format!("{}/sheets", b.addr)),
+            ..Default::default()
         },
     });
 
     let listed = fs.list(Path::new("/My Drive")).await.unwrap();
-    assert_eq!(listed[0].name, "q3.pdf");
+    assert_eq!(listed[0].name, "budget.gsheet.json");
+
+    // The listing came from A; the workbook has to come from B.
+    let path = Path::new("/My Drive/budget.gsheet.json");
+    fs.stat(path).await.unwrap();
+    let _ = fs.read_window(path, None).await;
 
     let hit = |m: &Mock, needle: &str| {
         m.seen
@@ -1262,12 +1355,16 @@ async fn one_service_can_move_without_moving_the_others() {
             .count()
     };
     assert!(hit(&a, "/drive/v3/files") > 0, "A served the listing");
-    assert!(hit(&b, "/oauth2/token") > 0, "B served the token");
+    assert!(hit(&a, "/oauth2/token") > 0, "A served the token");
+    assert!(
+        hit(&b, "/sheets/v4/spreadsheets/S1") > 0,
+        "B served the workbook, so the override reached it"
+    );
     assert_eq!(hit(&b, "/drive/v3"), 0, "and B was never asked for Drive");
     assert_eq!(
-        hit(&a, "/oauth2/token"),
+        hit(&a, "/sheets/v4"),
         0,
-        "nor A for the token: one origin moving does not move the other"
+        "nor A for Sheets: one origin moving does not move the rest"
     );
 }
 
