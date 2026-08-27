@@ -183,6 +183,17 @@ impl NetworkAccess {
     /// // Resolve names, talk to whatever is on 8080 here, and reach nothing else.
     /// NetworkAccess::host().with_host_ports([8080]);
     /// ```
+    ///
+    /// # Reaching one from inside
+    ///
+    /// `host.microsandbox.internal` is the name of the machine the server runs on, answered by
+    /// the session's own resolver. A command in the session fetches that name on port 8080 and
+    /// gets whatever is listening on 8080 here.
+    ///
+    /// It has to be a name rather than an address because there is no address to publish: the
+    /// backend assigns one per session, so nothing writing a command could know it. Resolving
+    /// the name grants nothing on its own, and a port that was not granted is refused whether it
+    /// is asked for by name or by number.
     pub fn with_host_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
         self.host_ports = ports.into_iter().collect();
         self

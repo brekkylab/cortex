@@ -457,19 +457,30 @@ async fn a_reference_that_is_not_one_is_refused_before_a_vm_is_started() {
 
 /// A listener on this host, and the port it is on.
 ///
-/// One connection, one canned HTTP response, and done — `wget` is what asks, so it has to be
-/// HTTP rather than bytes. The thread is returned so a caller can hold it for the length of the
-/// test; nothing joins it, because a reach that was refused is a connection that never came.
+/// One canned HTTP response per connection, and as many connections as are asked for — `wget`
+/// is what asks, so it has to be HTTP rather than bytes. The thread is returned so a caller can
+/// hold it for the length of the test; nothing joins it, because a reach that was refused is a
+/// connection that never came.
 fn host_listener() -> (u16, std::thread::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this host");
     let port = listener.local_addr().expect("its address").port();
     let served = std::thread::spawn(move || {
-        if let Ok((mut connection, _)) = listener.accept() {
+        while let Ok((mut connection, _)) = listener.accept() {
             use std::io::Write as _;
             let _ = connection.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nreached");
         }
     });
     (port, served)
+}
+
+/// The same fetch, by the name the stack answers for the machine it runs beside.
+///
+/// `host.microsandbox.internal` is synthesized by the stack's own resolver rather than looked
+/// up anywhere, which is what spares a command from digging the gateway out of `resolv.conf`:
+/// the addresses are assigned per sandbox slot, so nothing writing a command can know them, and
+/// this name is a constant.
+fn fetch_by_host_name(port: u16) -> String {
+    format!("wget -q -T 5 -O - http://host.microsandbox.internal:{port}/")
 }
 
 /// A guest command that fetches `port` on the gateway — which is this host, one rewrite later.
@@ -580,6 +591,25 @@ async fn a_host_session_reaches_the_doors_it_was_granted() {
         out.code,
         0,
         "a port nobody granted was reached, so the grant is the machine and not a door: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The same door by name, which is how a command would actually be written: the gateway's
+    // address is assigned per sandbox and this is the constant that stands for it.
+    let out = fx.output(&fetch_by_host_name(granted)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reached",
+        "the granted port was not reachable by name: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // **Resolving the name grants nothing.** It answers for every port on this machine and the
+    // policy is still what decides which of them reply.
+    let out = fx.output(&fetch_by_host_name(ungranted)).await;
+    assert_ne!(
+        out.code, 0,
+        "the name reached a port nobody granted, so resolving it is a grant: {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
 
