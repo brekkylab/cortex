@@ -110,7 +110,7 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // does not end.
     let mut stack = match args.network {
         Network::Disabled => None,
-        reach => Some(net::start(reach)?),
+        reach => Some(net::start(reach, &args.host_ports)?),
     };
     if let Some(stack) = &mut stack {
         let (mac, backend) = stack.device();

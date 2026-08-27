@@ -455,6 +455,35 @@ async fn a_reference_that_is_not_one_is_refused_before_a_vm_is_started() {
     );
 }
 
+/// A listener on this host, and the port it is on.
+///
+/// One connection, one canned HTTP response, and done — `wget` is what asks, so it has to be
+/// HTTP rather than bytes. The thread is returned so a caller can hold it for the length of the
+/// test; nothing joins it, because a reach that was refused is a connection that never came.
+fn host_listener() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this host");
+    let port = listener.local_addr().expect("its address").port();
+    let served = std::thread::spawn(move || {
+        if let Ok((mut connection, _)) = listener.accept() {
+            use std::io::Write as _;
+            let _ = connection.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nreached");
+        }
+    });
+    (port, served)
+}
+
+/// A guest command that fetches `port` on the gateway — which is this host, one rewrite later.
+///
+/// The address comes out of the guest's own `resolv.conf` because that is where the gateway is
+/// written down: the stack names itself as the resolver, so the nameserver line *is* the
+/// gateway. Nothing in the guest was told this host's real address, and nothing could be.
+fn fetch_from_gateway(port: u16) -> String {
+    format!(
+        "wget -q -T 5 -O - \
+         http://$(awk '/^nameserver/{{print $2; exit}}' /etc/resolv.conf):{port}/"
+    )
+}
+
 /// A session that asked for nothing has no interface to configure, which is the default and the
 /// thing most worth keeping true.
 ///
@@ -481,19 +510,31 @@ async fn a_session_is_air_gapped_unless_a_network_was_asked_for() {
     assert_eq!(fx.output("cat /etc/resolv.conf").await.code, 1);
 }
 
-/// The default posture: names resolve, and nothing else leaves.
+/// The default posture: names resolve, granted doors open, everything else refused.
 ///
-/// Which is two claims about one device. The interface came up and a lookup was answered — by
-/// the stack in the console server process, since there is nothing else on that network to
-/// answer it. And a connection to the address that lookup returned is *refused*, because the
-/// policy allows the resolver and nothing more.
+/// Four claims about one device. The interface came up and a lookup was answered — by the stack
+/// in the console server process, since there is nothing else on that network to answer it. A
+/// listener on *this host* is reached, which is what makes `host` a reach rather than an error
+/// message. **A second listener on this host is not**, which is the property the grant exists
+/// for: a door is a port and never the machine. And a public address is refused.
 ///
-/// `getent hosts` rather than a ping: ICMP is a different permission from a name, and what is
-/// under test here is the resolver.
+/// Both listeners are plain loopback on the test's own side. Nothing tells the guest where they
+/// are: it dials the gateway, and the stack rewrites that to the host's loopback when it dials
+/// out — the mechanism under test as much as the rules are.
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
-async fn the_default_posture_resolves_names_and_refuses_the_rest() {
-    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "host")]).await;
+async fn a_host_session_reaches_the_doors_it_was_granted() {
+    let (granted, _open) = host_listener();
+    let (ungranted, _shut) = host_listener();
+
+    let mut fx = Fixture::asking_for_reach(NetworkAccess::host().with_host_ports([granted]))
+        .await
+        .expect("a session with a granted port");
+
+    // What the server says it gave, which is both halves of the answer.
+    let answered = fx.console.network().expect("a server that says").clone();
+    assert_eq!(answered.reach, "host");
+    assert_eq!(answered.host_ports, [granted]);
 
     // The interface the stack assigned, configured by the guest with no `ip` binary in sight.
     let routes = fx.output("cat /proc/net/route").await.stdout;
@@ -513,6 +554,8 @@ async fn the_default_posture_resolves_names_and_refuses_the_rest() {
         "no resolver was written"
     );
 
+    // `getent hosts` rather than a ping: ICMP is a different permission from a name, and what
+    // is under test here is the resolver.
     let out = fx.output("getent hosts example.com").await;
     assert_eq!(
         out.code,
@@ -520,6 +563,24 @@ async fn the_default_posture_resolves_names_and_refuses_the_rest() {
         "a name did not resolve: {:?} {:?}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The door that was granted.
+    let out = fx.output(&fetch_from_gateway(granted)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reached",
+        "the granted port was not reached: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the one beside it, which was not. The whole reason ports are named one at a time.
+    let out = fx.output(&fetch_from_gateway(ungranted)).await;
+    assert_ne!(
+        out.code,
+        0,
+        "a port nobody granted was reached, so the grant is the machine and not a door: {:?}",
+        String::from_utf8_lossy(&out.stdout)
     );
 
     // …and that is all it gets. `wget` is busybox's here and exits non-zero on a refusal; what
@@ -533,15 +594,25 @@ async fn the_default_posture_resolves_names_and_refuses_the_rest() {
     );
 }
 
-/// `public` reaches the internet, where the default posture does not.
+/// `public` reaches the internet, and *not* this machine's ports.
 ///
-/// The same command, on a session that asked for egress: what separates the two is the policy
-/// and nothing else. Both directions are asserted because either alone is half a claim — a
-/// posture that refuses everything and one that allows everything each pass one of them.
+/// The second half is the one worth a boot: **widening what a session reaches outside must not
+/// widen what it reaches in here.** A session that asked for the internet to fetch a package did
+/// not thereby ask to talk to whatever else this host is listening on, and the only thing that
+/// opens those is a grant it did not make.
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
-async fn a_public_session_reaches_the_internet() {
+async fn a_public_session_reaches_the_internet_and_not_this_hosts_ports() {
+    let (ungranted, _shut) = host_listener();
     let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "public")]).await;
+
+    let out = fx.output(&fetch_from_gateway(ungranted)).await;
+    assert_ne!(
+        out.code,
+        0,
+        "the internet came with a door onto this host: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
 
     let out = fx
         .output("wget -q -T 10 -O /dev/null http://example.com/")
@@ -562,6 +633,28 @@ async fn a_public_session_reaches_the_internet() {
         0,
         "plain HTTP reached the internet and HTTPS did not: {:?}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A door onto a machine the guest cannot send a packet to is two settings that cannot both
+/// have been meant, and is said at `init` like any other.
+///
+/// **Not** `#[ignore]`d: nothing boots, which is the property being asserted.
+#[tokio::test]
+async fn a_granted_port_without_a_network_is_refused_before_a_vm_is_started() {
+    let asked = NetworkAccess::none().with_host_ports([8080]);
+    let err = match Fixture::asking_for_reach(asked).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened with doors onto a network it does not have"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::INVALID_PARAMS),
+        "answered {err:?} — a contradiction is not a name nobody defined"
     );
 }
 

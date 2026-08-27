@@ -197,6 +197,10 @@ struct Session {
     /// decides a *device*, which is attached before a kernel comes up.
     network: Network,
 
+    /// TCP ports on this host the guest may open, on top of what `network` allows. A separate
+    /// axis and not a wider reach: see [`HOST_PORTS`](cortex_uvm_boot::HOST_PORTS).
+    host_ports: Vec<u16>,
+
     /// `None` until something boots one: a `start`, or the first call that needs it.
     guest: Option<Guest>,
 }
@@ -215,12 +219,13 @@ impl Session {
     fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
         let image = base(config.image.as_ref())?;
-        let network = reach(config.network.as_ref())?;
+        let (network, host_ports) = reach(config.network.as_ref())?;
 
         self.guest = None;
         self.workfs = workfs;
         self.image = image;
         self.network = network;
+        self.host_ports = host_ports.clone();
         self.config = config;
 
         let path = self
@@ -243,7 +248,7 @@ impl Session {
                 .map(|reference| ImageSource::new(reference.to_string())),
             // What the session got, whether it asked or not — the one place a client that
             // asked for nothing can learn what this server's own setting turned out to be.
-            network: Some(NetworkAccess::new(network.as_str())),
+            network: Some(NetworkAccess::new(network.as_str()).with_host_ports(host_ports)),
         })
     }
 
@@ -287,9 +292,14 @@ impl Session {
             }
 
             let image = self.image.as_ref().map(Reference::to_string);
-            let mut guest = Guest::boot(self.workfs.as_deref(), image.as_deref(), self.network)
-                .await
-                .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
+            let mut guest = Guest::boot(
+                self.workfs.as_deref(),
+                image.as_deref(),
+                self.network,
+                &self.host_ports,
+            )
+            .await
+            .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
 
             // The tree **does** go in the replay, and it is the same URL the client sent:
             // the guest mounted that host directory at that host path, so what the agent is
@@ -344,22 +354,43 @@ fn base(asked: Option<&ImageSource>) -> Result<Option<Reference>, Outcome> {
 /// read from its own environment like `CORTEX_UVM_IMAGE` and answered back at `init`.
 const NETWORK: &str = "CORTEX_UVM_NETWORK";
 
-/// The reach a session asked for, or this server's own when it asked for nothing.
+/// The host TCP ports a session gets when its client did not say. Read here for the same reason
+/// as [`NETWORK`], and parsed here because a boot is handed the ports and not the string.
+const HOST_PORTS: &str = "CORTEX_UVM_HOST_PORTS";
+
+/// The ports [`HOST_PORTS`] names, comma-separated, and an empty list for absent or empty.
+fn parse_host_ports(value: Option<&str>) -> anyhow::Result<Vec<u16>> {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .filter(|port| !port.is_empty())
+        .map(|port| {
+            port.parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("{HOST_PORTS}: {port} is not a port number"))
+        })
+        .collect()
+}
+
+/// The reach a session asked for, or this server's own when it asked for nothing — and the host
+/// ports granted alongside it.
 ///
-/// Every name the protocol defines is one this backend can answer, so the only refusal here is
-/// a name nobody defined. That is the whole of the check — and it is worth making at `init`
-/// anyway, because a reach decides whether a virtio-net device is attached and a device is
-/// attached before a kernel comes up. A client told now can ask for something else; one told at
-/// its first command has already paid for a boot it cannot use.
-fn reach(asked: Option<&NetworkAccess>) -> Result<Network, Outcome> {
+/// Every name the protocol defines is one this backend can answer, so the only refusals here are
+/// a name nobody defined and a grant that cannot mean anything. Both are worth making at `init`
+/// rather than later, because a reach decides whether a virtio-net device is attached and a
+/// device is attached before a kernel comes up. A client told now can ask for something else;
+/// one told at its first command has already paid for a boot it cannot use.
+fn reach(asked: Option<&NetworkAccess>) -> Result<(Network, Vec<u16>), Outcome> {
     let Some(asked) = asked else {
         // Nothing asked, so this server's own setting stands — and is answered back, which is
         // how the client finds out what that was.
-        return Network::parse(std::env::var(NETWORK).ok().as_deref())
-            .map_err(|e| refused(Error::INVALID_PARAMS, e.to_string()));
+        let network = Network::parse(std::env::var(NETWORK).ok().as_deref())
+            .map_err(|e| refused(Error::INVALID_PARAMS, e.to_string()))?;
+        let ports = parse_host_ports(std::env::var(HOST_PORTS).ok().as_deref())
+            .map_err(|e| refused(Error::INVALID_PARAMS, e.to_string()))?;
+        return Ok((network, ports));
     };
 
-    Network::parse(Some(&asked.reach)).map_err(|_| {
+    let network = Network::parse(Some(&asked.reach)).map_err(|_| {
         refused(
             Error::UNSUPPORTED_NETWORK,
             format!(
@@ -367,7 +398,23 @@ fn reach(asked: Option<&NetworkAccess>) -> Result<Network, Outcome> {
                 asked.reach
             ),
         )
-    })
+    })?;
+
+    // A door onto a machine the guest has no way to send a packet to is not a narrower session,
+    // it is two settings that cannot both have been meant. Said now, while the client can pick
+    // which one it wanted.
+    if network == Network::Disabled && !asked.host_ports.is_empty() {
+        return Err(refused(
+            Error::INVALID_PARAMS,
+            format!(
+                "host_ports {:?} were granted to a session that asked for no network — a port on \
+                 this host needs a device to reach it through",
+                asked.host_ports
+            ),
+        ));
+    }
+
+    Ok((network, asked.host_ports.clone()))
 }
 
 /// The host directory a workfs URL names, or why it names none this backend can use.

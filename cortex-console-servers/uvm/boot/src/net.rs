@@ -29,7 +29,9 @@
 use anyhow::Context as _;
 use cortex_uvm_boot::Network;
 use microsandbox_network::network::SmoltcpNetwork;
-use microsandbox_network::policy::{Action, Destination, DestinationGroup, NetworkPolicy, Rule};
+use microsandbox_network::policy::{
+    Action, Destination, DestinationGroup, Direction, NetworkPolicy, PortRange, Protocol, Rule,
+};
 use msb_krun::backends::net::NetBackend;
 
 /// A running stack, and everything whose lifetime is the VM's.
@@ -42,19 +44,19 @@ pub struct Stack {
     _runtime: tokio::runtime::Runtime,
 }
 
-/// Bring a stack up under the policy `reach` describes.
+/// Bring a stack up under the policy `reach` and `host_ports` describe.
 ///
 /// Never called for [`Network::Disabled`], which attaches no device at all: a policy that
 /// refuses everything and a guest with no interface are not the same thing, and the second is
 /// the one worth having when nothing was asked for.
-pub fn start(reach: Network) -> anyhow::Result<Stack> {
+pub fn start(reach: Network, host_ports: &[u16]) -> anyhow::Result<Stack> {
     debug_assert!(reach != Network::Disabled);
 
     // Everything but the policy left as the stack's own default: the addresses, the MTU, the
     // DNS timeouts. This process has an opinion about what a sandbox may reach and none about
     // how the stack goes about it.
     let config = microsandbox_network::config::NetworkConfig {
-        policy: policy(reach),
+        policy: policy(reach, host_ports),
         ..Default::default()
     };
 
@@ -96,15 +98,35 @@ impl Stack {
     }
 }
 
-/// The policy a reach means.
+/// The policy a reach and a grant mean.
 ///
-/// Deny by default in both directions, with the allowances added on top. Which makes the order
-/// below load-bearing in one place: **`Rule::allow_dns` has to be there for any of the rest to
-/// be reachable**, because it is the narrow rule (UDP and TCP :53, to the gateway only) that
-/// lets a name be resolved at all. A policy without it refuses every lookup, and a caller who
-/// asked for the public internet gets a sandbox that can open a connection to an address it has
-/// no way to learn.
-fn policy(reach: Network) -> NetworkPolicy {
+/// Deny by default in both directions, with the allowances added on top.
+///
+/// # Two axes, and why the host is the narrow one
+///
+/// `reach` says how far *out* a session goes; `host_ports` says which doors on **this machine**
+/// are open to it. Neither implies the other, and that is deliberate: the convenient way to
+/// spell host reach is `DestinationGroup::Host` with no ports on it, and a rule with no ports
+/// matches every port. Written that way, a session granted one service on this machine would
+/// have them all — and widening the outside would silently widen the inside.
+///
+/// So the host rules are built one port at a time, TCP only. A connection the guest opens to the
+/// gateway is rewritten to the host's loopback when the stack dials it, which is what makes a
+/// granted port an actual door onto whatever the operator is running there.
+///
+/// # `allow_dns` comes first and is load-bearing
+///
+/// It is the narrow rule (UDP and TCP :53, to the gateway only) that lets a name be resolved at
+/// all. Under deny-by-default a policy without it refuses every lookup, and a caller who asked
+/// for the public internet gets a sandbox that can open a connection to an address it has no way
+/// to learn.
+///
+/// # What resolution costs
+///
+/// The stack forwards queries upstream, to whatever the host's own `/etc/resolv.conf` names. So
+/// any reach that can resolve can also put bytes into a hostname and watch them leave. **The
+/// only air gap here is [`Network::Disabled`]**, which attaches no device.
+fn policy(reach: Network, host_ports: &[u16]) -> NetworkPolicy {
     if matches!(reach, Network::Full) {
         return NetworkPolicy::allow_all();
     }
@@ -115,6 +137,13 @@ fn policy(reach: Network) -> NetworkPolicy {
             DestinationGroup::Public,
         )));
     }
+    rules.extend(host_ports.iter().map(|&port| Rule {
+        direction: Direction::Egress,
+        destination: Destination::Group(DestinationGroup::Host),
+        protocols: vec![Protocol::Tcp],
+        ports: vec![PortRange::single(port)],
+        action: Action::Allow,
+    }));
 
     NetworkPolicy {
         default_egress: Action::Deny,

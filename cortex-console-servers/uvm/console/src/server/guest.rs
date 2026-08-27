@@ -113,6 +113,7 @@ impl Guest {
         workfs: Option<&Path>,
         image: Option<&str>,
         network: Network,
+        host_ports: &[u16],
     ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image(image).await?;
@@ -135,6 +136,7 @@ impl Guest {
             base_format: base.format,
             session: session.path().to_path_buf(),
             network,
+            host_ports: host_ports.to_vec(),
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),

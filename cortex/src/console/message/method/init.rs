@@ -113,7 +113,7 @@ impl ImageSource {
 /// | `reach` | means |
 /// |---|---|
 /// | `none` | no network at all |
-/// | `host` | enough to resolve a name, and nothing further |
+/// | `host` | enough to resolve a name, and whatever [`host_ports`](Self::host_ports) granted |
 /// | `public` | the public internet; not a private range, and not the server's own host |
 /// | `full` | whatever the server itself can reach, unrestricted |
 ///
@@ -133,22 +133,59 @@ impl ImageSource {
 /// more than it asked to is the failure this member exists to prevent, and one that quietly
 /// reached less is a client debugging a refused connection it was told it would not get.
 ///
-/// # Why this is an object holding one member
+/// # The reach is how far out, and the ports are which doors in
 ///
-/// The same reason [`WorkFsSource`] is. A reach narrower than these names — a list of hosts, a
-/// set of ports — needs somewhere to say which, and that belongs beside the name rather than
-/// encoded into it.
+/// [`host_ports`](Self::host_ports) is a second axis and not a fifth name, because **widening
+/// what a session reaches outside must not widen what it reaches on the server's own machine.**
+/// A session named `public` to fetch a package is not thereby asking to talk to whatever else
+/// that machine is listening on, and one granted a port to reach a local model proxy is not
+/// asking for the internet.
+///
+/// So the two are said separately and neither implies the other. It is also what makes `host`
+/// worth asking for: on its own it resolves names and no more, and with a port it is how a
+/// session talks to something the operator put there on purpose.
+///
+/// # Why an object and not a string
+///
+/// The same reason [`WorkFsSource`] is one. A reach is not always a single word — the ports
+/// below are the first proof of it, and a list of hosts would be the next — and those belong
+/// beside the name rather than encoded into it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAccess {
     /// `none`, `host`, `public`, `full`.
     pub reach: String,
+
+    /// TCP ports on the server's own machine this session may open, on top of whatever
+    /// [`reach`](Self::reach) allows. Empty grants none.
+    ///
+    /// **One port at a time, and never a range meaning "the machine".** A grant is a door onto
+    /// something the operator is running there, and the whole reason it is spelled out is that
+    /// the convenient way to say "the host" says every port on it.
+    ///
+    /// Meaningless without a network, so a `none` session naming ports is a contradiction a
+    /// server refuses rather than a grant it quietly drops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_ports: Vec<u16>,
 }
 
 impl NetworkAccess {
     pub fn new(reach: impl Into<String>) -> Self {
         NetworkAccess {
             reach: reach.into(),
+            host_ports: Vec::new(),
         }
+    }
+
+    /// The TCP ports on the server's own machine this session may open.
+    ///
+    /// ```
+    /// # use cortex::console::NetworkAccess;
+    /// // Resolve names, talk to whatever is on 8080 here, and reach nothing else.
+    /// NetworkAccess::host().with_host_ports([8080]);
+    /// ```
+    pub fn with_host_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.host_ports = ports.into_iter().collect();
+        self
     }
 
     /// No network at all.
@@ -156,7 +193,7 @@ impl NetworkAccess {
         NetworkAccess::new("none")
     }
 
-    /// Enough to resolve a name, and nothing further.
+    /// Enough to resolve a name, plus whatever ports were granted.
     pub fn host() -> Self {
         NetworkAccess::new("host")
     }
@@ -550,6 +587,39 @@ mod tests {
         );
     }
 
+    /// A grant travels beside the name, and a session without one serializes to what it always
+    /// did — which is what lets this member arrive without every existing peer noticing.
+    #[test]
+    fn a_host_port_grant_is_said_beside_the_reach() {
+        let init = Init {
+            delegated: Vec::new(),
+            workfs: None,
+            image: None,
+            network: Some(NetworkAccess::host().with_host_ports([8080, 3000])),
+        };
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(
+            doc,
+            doc! {"delegated": [], "network": {"reach": "host", "host_ports": [8080, 3000]}}
+        );
+        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
+
+        // No grant is no member, not an empty one.
+        let doc = bson::serialize_to_document(&NetworkAccess::host()).unwrap();
+        assert_eq!(doc, doc! {"reach": "host"});
+        assert_eq!(
+            bson::deserialize_from_document::<NetworkAccess>(doc).unwrap(),
+            NetworkAccess::host(),
+        );
+
+        // And the two axes are independent: naming one says nothing about the other.
+        assert!(NetworkAccess::public().host_ports.is_empty());
+        assert_eq!(
+            NetworkAccess::host().with_host_ports([8080]).reach,
+            NetworkAccess::host().reach,
+        );
+    }
+
     /// The names are constructors so a caller does not spell them, and they are what a server
     /// branches on — so the two have to be the same strings.
     #[test]
@@ -559,7 +629,6 @@ mod tests {
         assert_eq!(NetworkAccess::public().reach, "public");
         assert_eq!(NetworkAccess::full().reach, "full");
     }
-
 
     /// The two things a server reads off a URL, and the one it can act on.
     #[test]

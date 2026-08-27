@@ -115,6 +115,25 @@ pub struct BootArgs {
     /// *device*, which is attached before a kernel comes up.
     pub network: Network,
 
+    /// TCP ports on the host this session may open, beyond whatever [`network`](Self::network)
+    /// allows.
+    ///
+    /// # Why a grant of its own and not a wider [`Network`]
+    ///
+    /// Because the convenient way to say "the host" is `DestinationGroup::Host` with no ports on
+    /// it, and a rule with no ports matches **every** port. Spelling host reach that way would
+    /// mean a session that asked to talk to one service on this machine could talk to all of
+    /// them — and, worse, that widening a session's *outside* reach silently widened its inside
+    /// one.
+    ///
+    /// So the two are separate axes. `network` says how far out a session goes; this says which
+    /// doors on this machine are open to it, one port at a time, TCP only. A session gets both,
+    /// and neither implies the other.
+    ///
+    /// Meaningless without a device, so [`Network::Disabled`] with ports named is a
+    /// contradiction the server refuses rather than a grant it quietly drops.
+    pub host_ports: Vec<u16>,
+
     /// Guest vCPUs and memory, when the server was told to override them.
     pub vcpus: Option<u8>,
     pub memory_mib: Option<u32>,
@@ -140,6 +159,9 @@ impl BootArgs {
         put("--base-format", OsStr::new(self.base_format.as_str()));
         put("--session", self.session.as_os_str());
         put("--network", OsStr::new(self.network.as_str()));
+        for port in &self.host_ports {
+            put("--host-port", OsStr::new(&port.to_string()));
+        }
         if let Some(workfs) = &self.workfs {
             put("--workfs", workfs.as_os_str());
         }
@@ -165,6 +187,7 @@ impl BootArgs {
         let mut base_format = None;
         let mut session = None;
         let mut network = None;
+        let mut host_ports = Vec::new();
         let mut workfs = None;
         let mut vcpus = None;
         let mut memory_mib = None;
@@ -186,6 +209,7 @@ impl BootArgs {
                 "--base-format" => base_format = Some(text(&flag, value()?)?),
                 "--session" => session = Some(PathBuf::from(value()?)),
                 "--network" => network = Some(text(&flag, value()?)?),
+                "--host-port" => host_ports.push(number(&flag, value()?)?),
                 "--workfs" => workfs = Some(PathBuf::from(value()?)),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
@@ -211,6 +235,7 @@ impl BootArgs {
                 Some(name) => Network::parse(Some(&name))?,
                 None => anyhow::bail!("--network is missing — a boot is started by a server"),
             },
+            host_ports,
             workfs,
             vcpus,
             memory_mib,
@@ -311,17 +336,27 @@ pub enum Network {
     /// statement than any policy over a device that is there.
     Disabled,
 
-    /// A device, and a policy that allows the gateway's resolver and nothing else.
+    /// A device, the gateway's resolver, and whatever [`HOST_PORTS`] granted. Nothing else.
     ///
     /// The default, and the reason there is a default at all: names resolve, so a command that
     /// tries to reach the internet fails at a refused connection rather than at a lookup that
-    /// hangs — and nothing leaves the host. A caller who wants egress asks for it.
+    /// hangs. A caller who wants egress asks for it.
+    ///
+    /// What makes it a reach rather than an error message is the ports: a session granted one
+    /// talks to whatever the operator put on the host — a model proxy, a registry cache, a
+    /// sidecar — without any of it being on the internet.
+    ///
+    /// **Not an air gap.** The stack forwards lookups to the host's own resolver, so a name is a
+    /// way out for anything small enough to spell. [`Disabled`](Self::Disabled) is the air gap.
     #[default]
     HostOnly,
 
-    /// [`HostOnly`](Self::HostOnly) plus the public internet. Private ranges and the host's own
-    /// loopback stay refused: a sandbox that can reach a LAN is reaching things nobody
-    /// published to it.
+    /// [`HostOnly`](Self::HostOnly) plus the public internet. Private ranges, link-local
+    /// addresses and the host's own loopback stay refused: a sandbox that can reach a LAN is
+    /// reaching things nobody published to it.
+    ///
+    /// Reaching the host is still only what [`HOST_PORTS`] granted, which is the point of that
+    /// being a separate grant: **widening the outside must never widen the inside.**
     Public,
 
     /// Everything, with no policy. For a caller who has decided the sandbox boundary is
@@ -371,6 +406,7 @@ mod tests {
             base_format: BaseFormat::Vmdk,
             session: "/tmp/session.ext4".into(),
             network: Network::Public,
+            host_ports: vec![8080, 3000],
             workfs: Some("/Users/someone/project".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
@@ -492,6 +528,40 @@ mod tests {
         assert_eq!(Network::parse(Some("")).expect("empty"), Network::default());
         for typo in ["hsot", "on", "true", "1", "HOST"] {
             assert!(Network::parse(Some(typo)).is_err(), "{typo} was accepted");
+        }
+    }
+
+    /// A grant round trips, and silence is no grant. Same reasoning as the reach above: the two
+    /// halves are a boot apart, so a list that spelled one way and read another is a session
+    /// whose doors are not the ones anybody named.
+    #[test]
+    fn a_host_port_grant_round_trips_and_defaults_to_nothing() {
+        for ports in [vec![], vec![8080], vec![8080, 3000, 65535]] {
+            let granted = BootArgs {
+                host_ports: ports.clone(),
+                ..args()
+            };
+            assert_eq!(
+                BootArgs::parse(granted.to_args())
+                    .expect("its own spelling")
+                    .host_ports,
+                ports,
+            );
+        }
+
+        // No grant is no flag, which is what an empty list has to spell: `--host-port` with
+        // nothing after it would be a port named by the empty string.
+        let none = BootArgs {
+            host_ports: Vec::new(),
+            ..args()
+        };
+        assert!(!none.to_args().iter().any(|arg| arg == "--host-port"));
+
+        // A port is a number and nothing else — 65536 is not one, and neither is a name.
+        for typo in ["http", "65536", "-1"] {
+            let mut spelled = none.to_args();
+            spelled.extend(["--host-port".into(), typo.into()]);
+            assert!(BootArgs::parse(spelled).is_err(), "{typo} was accepted");
         }
     }
 }
