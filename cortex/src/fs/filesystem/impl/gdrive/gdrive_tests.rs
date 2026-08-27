@@ -1004,7 +1004,7 @@ async fn an_unsized_file_is_measured_then_read_by_the_window() {
         "measured by asking for one byte"
     );
 
-    // Windows stay windows.
+    // And the windows after it come out of one span rather than one request each.
     mock.reset();
     for i in 0..4u64 {
         let got = fs
@@ -1015,15 +1015,8 @@ async fn an_unsized_file_is_measured_then_read_by_the_window() {
     }
     assert_eq!(
         mock.media_ranges(),
-        (0..4)
-            .map(|i| Some(format!("bytes={}-{}", i * CHUNK, (i + 1) * CHUNK - 1)))
-            .collect::<Vec<_>>(),
-        "each window asks for itself"
-    );
-    assert_eq!(
-        mock.bytes_sent(),
-        4 * CHUNK,
-        "and the server sends only those windows"
+        vec![Some(format!("bytes=0-{}", 8 * 1024 * 1024 - 1))],
+        "one span answered all four windows"
     );
 }
 
@@ -1324,8 +1317,8 @@ async fn a_backwards_window_does_not_take_the_process_down() {
 ///
 /// Drive charges by the request: a download is 200 quota units whether it moves 200 KiB
 /// or 20 MB, so answering eighty chunk reads with eighty ranged requests costs eighty
-/// times what one whole fetch does. Past `WHOLE_BLOB_LIMIT` the ranged read is still
-/// right — a head-read must not pay for the tail — and that half is the test below this.
+/// times what one span does. A file smaller than the first span is the degenerate case —
+/// that span comes back short, holding all of it, and every window after is free.
 #[tokio::test]
 async fn a_small_file_is_fetched_once_for_every_chunk_of_it() {
     const REAL: usize = 300 * 1024;
@@ -1362,12 +1355,24 @@ async fn a_small_file_is_fetched_once_for_every_chunk_of_it() {
         1,
         "one fetch for the whole file, but the server saw {media:?}"
     );
-    assert_eq!(media[0], None, "and unranged, since a range is what costs twice");
+    assert_eq!(
+        media[0],
+        Some(format!("bytes=0-{}", 8 * 1024 * 1024 - 1)),
+        "the first span, which a file this size answers whole"
+    );
 }
 
-/// And past the limit the window still reaches Drive, so a head-read stays cheap.
+/// A head-read costs its window; only a walk pays for a span.
+///
+/// The kernel asks in 64 KiB windows and that is not ours to choose; sending each one
+/// down as its own ranged request is what made a 641 MB archive take two and a half
+/// hours. But a span is not free either — 0.90 s for a window against 5.63 s for 64 MiB
+/// — and the tools that read a file's head and stop would pay all of it for one buffer.
+/// So the size of a fetch follows what the last one did: the first read of a file, and
+/// any jump away from where the last span ended, takes its window; a read carrying on
+/// from that end takes a span.
 #[tokio::test]
-async fn a_large_file_still_reads_by_the_window() {
+async fn a_head_read_costs_its_window_and_only_a_walk_pays_for_a_span() {
     const REAL: usize = 10 * 1024 * 1024;
     let mock = start(
         json!([row(
@@ -1384,16 +1389,63 @@ async fn a_large_file_still_reads_by_the_window() {
     fs.list(Path::new("/My Drive")).await.unwrap();
     mock.reset();
 
+    const SPAN: u64 = 64 * 1024 * 1024;
+    const SPAN_1: u64 = 8 * 1024 * 1024;
+    const CHUNK: u64 = 64 * 1024;
+
+    // What `file` and a `grep` that abandons a binary after one buffer do. One span, not
+    // the 10 MB behind it — and the first span rather than the window, because NFS fires
+    // read-ahead the moment a file is touched and every window of it looks like a walk.
     let head = fs.read_window(file, Some(0..4096)).await.unwrap();
     assert_eq!(head.len(), 4096);
     assert_eq!(
         mock.media_ranges(),
-        vec![Some("bytes=0-4095".to_string())],
-        "the range went down to the provider rather than pulling 10 MB"
+        vec![Some(format!("bytes=0-{}", SPAN_1 - 1))],
+        "the first fetch is the first span, not the window and not the whole file"
     );
-    assert!(
-        mock.bytes_sent() < 64 * 1024,
-        "and only the window moved, not {} bytes",
-        mock.bytes_sent()
+
+    // Every window inside it is free, read-ahead included.
+    mock.reset();
+    for i in 1..16 {
+        let w = fs
+            .read_window(file, Some(i * CHUNK..(i + 1) * CHUNK))
+            .await
+            .unwrap();
+        assert_eq!(w.len() as u64, CHUNK, "window {i}");
+    }
+    assert_eq!(
+        mock.media_ranges(),
+        Vec::<Option<String>>::new(),
+        "the first span already had them"
+    );
+
+    // Carrying on from the end of it is a walk, and a walk gets a read span. The window
+    // straddles the boundary, so this also says no read comes back short of what it
+    // asked for — which `read_at` would report to the kernel as the end of the file.
+    mock.reset();
+    let over = fs
+        .read_window(file, Some(SPAN_1 - CHUNK / 2..SPAN_1 + CHUNK / 2))
+        .await
+        .unwrap();
+    assert_eq!(over.len() as u64, CHUNK, "a window across the span boundary");
+    assert_eq!(
+        mock.media_ranges(),
+        vec![Some(format!(
+            "bytes={}-{}",
+            SPAN_1 - CHUNK / 2,
+            SPAN_1 - CHUNK / 2 + SPAN - 1
+        ))],
+        "a read span, beginning where the reader asked rather than on a fixed boundary"
+    );
+
+    // And a jump away from it is not a walk, so it pays for a first span again rather
+    // than pulling 64 MiB to answer 4 KiB somewhere new.
+    mock.reset();
+    let back = fs.read_window(file, Some(1024..1024 + 4096)).await.unwrap();
+    assert_eq!(back.len(), 4096);
+    assert_eq!(
+        mock.media_ranges(),
+        vec![Some(format!("bytes=1024-{}", 1024 + SPAN_1 - 1))],
+        "a read that does not continue the last one is not a walk"
     );
 }

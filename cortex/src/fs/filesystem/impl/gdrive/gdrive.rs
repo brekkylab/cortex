@@ -129,20 +129,46 @@ const DIR_TTL: Duration = Duration::from_secs(300);
 /// produce the whole document — which is what `find -size` and `ls -l` must not cost.
 const UNKNOWN_LENGTH_SIZE: u64 = 8 * 1024 * 1024;
 
-/// A blob at or under this is fetched whole, once, and every chunk after that is cut
-/// out of what is held.
+/// How much a blob read fetches once it is clear the reader is walking the file, so a
+/// walk pays a round trip per span of this size rather than one per window.
 ///
-/// Drive charges by the request and not by the byte: a download is 200 quota units
-/// however few bytes it moves, so a 20 MB file read at 256 KiB a time costs 16,000
-/// units where reading it whole costs 200. The ranged read is still the right shape
-/// past this line — a reader that wants a file's head, or a `grep` that abandons it
-/// after one buffer, must not pay for the rest — and the 1.79 GB archive in the corpus
-/// answers its first 4 KiB in a second because of it.
+/// The kernel's window is 64 KiB and not ours to choose. Sending each one down as its
+/// own ranged request is what made a 641 MB archive take two and a half hours: 10,250
+/// requests, and a request is 200 quota units however few bytes it moves.
 ///
-/// 8 MiB is where the two stop trading evenly. Under it a whole fetch is a handful of
-/// chunks' worth of bytes and one request instead of dozens; over it the bytes a
-/// head-read would waste outgrow what the requests cost.
-const WHOLE_BLOB_LIMIT: u64 = 8 * 1024 * 1024;
+/// Measured against Drive, a ranged request costs a round trip and then bytes, and the
+/// two cross over around here:
+///
+/// ```text
+///            time to first byte   total     MB/s
+///   64 KiB         0.82 s         0.90 s    0.07
+///    8 MiB         0.97 s         1.57 s    5.09
+///   32 MiB         0.88 s         4.82 s    6.63
+///   64 MiB         0.86 s         5.63 s   11.37
+///  128 MiB         0.76 s        10.82 s   11.83
+/// ```
+///
+/// The trip is flat at about 0.9 s whatever is asked for, so bigger spans keep paying
+/// off until the transfer itself is the cost — which is at 64 MiB, where the rate tops
+/// out around 11 MB/s. Past it only the request count falls, and 128 MiB measured
+/// *slower* than 64 for the same archive.
+///
+/// This is not what the *first* fetch takes. That one is [`FIRST_SPAN`], so a reader that
+/// stops after a buffer never pays for a span it will not use.
+const READ_SPAN: u64 = 64 * 1024 * 1024;
+
+/// What the first fetch of a file takes, before anything says the reader is walking it.
+///
+/// It cannot be the window the kernel asked for, however little that reader wants. The
+/// mount is served over NFS, whose client fires around a megabyte of read-ahead the
+/// moment a file is touched, and every window of it continues the one before — which is
+/// a walk by any test this layer can apply. `head -c 8` measured 7.94 s that way: one
+/// window, and then [`READ_SPAN`] fetched for read-ahead nobody would read.
+///
+/// 8 MiB swallows that read-ahead whole, so a head-read is one fetch of 1.57 s and stops
+/// there. A reader that really is walking spends this span and gets [`READ_SPAN`] for the
+/// next one, which is where the rate tops out.
+const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
 /// Cap on remembered probe results — one per file ever sized in this mount.
 const MAX_PROBED_LENGTHS: usize = 50_000;
@@ -250,8 +276,19 @@ type CachedListing = (Instant, Arc<Vec<Child>>);
 /// rather than copying a megabyte per chunk.
 type CachedExport = (Instant, Arc<Vec<u8>>);
 
-/// The one small blob held whole, and which file it is: `(id, fetched-at, bytes)`.
-type HeldBlob = (String, Instant, Arc<Vec<u8>>);
+/// The one span of one blob this holds.
+struct HeldSpan {
+    id: String,
+    /// Where in the file the span begins. A read cuts by absolute offset, so this is
+    /// needed to answer one.
+    at: u64,
+    /// Drive answered shorter than the span asked for, which means the span runs to the
+    /// end of the file. Without this a read near the end misses every time — the span
+    /// does not reach the offset asked for, and never will.
+    to_eof: bool,
+    when: Instant,
+    bytes: Arc<Vec<u8>>,
+}
 
 pub struct GdriveFs {
     accessor: GdriveAccessor,
@@ -271,13 +308,13 @@ pub struct GdriveFs {
     /// document — and an export is seconds, 44 of them measured on a 13.6 MB deck. Held
     /// as an `Arc` because a read borrows it rather than copying a megabyte per chunk.
     exports: Mutex<HashMap<String, CachedExport>>,
-    /// The last small blob read whole: `(file id, when, bytes)`.
+    /// The last span of a blob read, and where in which file it came from.
     ///
     /// One slot rather than a map, because a reader works through one file at a time —
-    /// `cat`, `grep` and `cp` all do — so what the next chunk needs is what the last
-    /// chunk had. A map would hold [`WHOLE_BLOB_LIMIT`] per file ever touched until the
-    /// TTL ran out; this holds it once.
-    blob: Mutex<Option<HeldBlob>>,
+    /// `cat`, `grep` and `cp` all do — so what the next window needs is what the last
+    /// one had. A map would hold [`READ_SPAN`] per file ever touched until the TTL ran
+    /// out; this holds it once.
+    blob: Mutex<Option<HeldSpan>>,
 }
 
 impl GdriveFs {
@@ -291,26 +328,61 @@ impl GdriveFs {
         })
     }
 
-    /// A small blob's bytes, whole, from the slot when they are fresh and from Drive
-    /// otherwise.
+    /// The span covering `want` bytes from `start`, from the slot when it reaches and
+    /// from Drive otherwise. The span's own start comes back beside its bytes, because
+    /// the caller cuts by an offset into the file rather than into the buffer.
     ///
-    /// Unranged on purpose: a range is what makes Drive answer twice for one file, and
-    /// this exists to make it answer once. See [`WHOLE_BLOB_LIMIT`].
-    async fn whole_blob(&self, id: &str) -> io::Result<Arc<Vec<u8>>> {
-        if let Some((held, at, bytes)) = self.blob.lock().await.as_ref()
-            && held == id
-            && at.elapsed() < DIR_TTL
-        {
-            return Ok(bytes.clone());
-        }
+    /// Spans begin where a reader asks rather than on fixed boundaries. A sequential
+    /// walk then lands inside the held span until it is spent and starts the next one
+    /// exactly where it left off, so no window is ever split across two spans and no
+    /// read comes back short of what it asked for — which [`FileSystem::read_at`] would
+    /// report to the kernel as the end of the file.
+    ///
+    /// How much a miss fetches depends on what the last one did. A read that carries on
+    /// from where the held span ended is a reader walking the file, and gets a whole
+    /// [`READ_SPAN`]; anything else — a different file, a jump to somewhere new — gets
+    /// [`FIRST_SPAN`]. So a reader that stops after a buffer pays for 8 MiB it mostly
+    /// throws away, and only a walk pays for the 64 MiB that a walk actually spends.
+    ///
+    /// A span is never smaller than the window asked for, so an oversized read is
+    /// answered whole rather than truncated.
+    async fn span(&self, id: &str, start: u64, want: u64) -> io::Result<(u64, Arc<Vec<u8>>)> {
+        let walking = {
+            let held = self.blob.lock().await;
+            match held.as_ref() {
+                Some(held) if held.id == id && held.when.elapsed() < DIR_TTL => {
+                    if held.at <= start
+                        && (start.saturating_add(want)
+                            <= held.at.saturating_add(held.bytes.len() as u64)
+                            || held.to_eof)
+                    {
+                        return Ok((held.at, held.bytes.clone()));
+                    }
+                    // Not covered, but beginning inside what was — at its end, or
+                    // straddling it — so the reader spent the span and wants the next.
+                    // Not just `== end`: a window whose size does not divide the span
+                    // reaches past it from inside, and that is the same walk.
+                    held.at <= start && start <= held.at.saturating_add(held.bytes.len() as u64)
+                }
+                _ => false,
+            }
+        };
+        let len = want.max(if walking { READ_SPAN } else { FIRST_SPAN });
         let bytes = self
             .accessor
-            .download(id, None)
+            .download(id, Some(start..start.saturating_add(len)))
             .await
             .map_err(not_found_or_backend)?;
+        let to_eof = (bytes.len() as u64) < len;
         let bytes = Arc::new(bytes);
-        *self.blob.lock().await = Some((id.to_string(), Instant::now(), bytes.clone()));
-        Ok(bytes)
+        *self.blob.lock().await = Some(HeldSpan {
+            id: id.to_string(),
+            at: start,
+            to_eof,
+            when: Instant::now(),
+            bytes: bytes.clone(),
+        });
+        Ok((start, bytes))
     }
 
     /// A document's exported bytes, from the cache when they are fresh and from Drive
@@ -577,39 +649,34 @@ impl GdriveFs {
             return Err(io::Error::other(format!("is a directory: {path}")));
         }
         match child.serves {
-            // Ranged: a reader walking a big file, or a search tool sampling its
-            // head, must not pull the whole object per chunk.
+            // Answered out of a span: a window reaches Drive only when the span held
+            // does not already cover it. Which file it is and how long, neither matters
+            // here — a small file is simply one span that came back short, so the two
+            // cases the size used to sort out are the same case.
             Serves::Original => {
-                // Small enough to hold: one unranged fetch answers every chunk that
-                // follows. The length has to be known without asking for it — a probe
-                // is a request, which is the cost this is avoiding — so a blob Drive
-                // listed without a size reads by the window unless `stat` already
-                // learned it.
-                let known = match child.size {
-                    Some(n) => Some(n),
-                    None => self.probed.lock().await.get(&child.id).copied(),
+                let Some(r) = range else {
+                    // No window named at all, which is a direct caller asking for the
+                    // object rather than a kernel asking for a chunk of it. Spanning it
+                    // would answer with the first span and call that the whole file.
+                    return self
+                        .accessor
+                        .download(&child.id, None)
+                        .await
+                        .map_err(not_found_or_backend);
                 };
-                if let Some(n) = known
-                    && n <= WHOLE_BLOB_LIMIT
-                {
-                    let bytes = self.whole_blob(&child.id).await?;
-                    return Ok(slice(&bytes, range));
+                // Saturating, because `end - start` on a backwards range underflows and
+                // takes the process with it.
+                let want = r.end.saturating_sub(r.start);
+                // An empty window is not a read. `accessor::download` turns one away by
+                // itself, but a span asks for a span's worth around it and would sail
+                // straight past that — 8 MiB fetched to answer with an empty vector.
+                if want == 0 {
+                    return Ok(Vec::new());
                 }
-                let bytes = self
-                    .accessor
-                    .download(&child.id, range.clone())
-                    .await
-                    .map_err(not_found_or_backend)?;
-                // Drive honored the range, so the window is already the answer;
-                // fall back to slicing if it sent the whole object anyway. Saturating,
-                // because `end - start` on a backwards range underflows and takes the
-                // process with it.
-                Ok(match &range {
-                    Some(r) if bytes.len() as u64 > r.end.saturating_sub(r.start) => {
-                        slice(&bytes, range)
-                    }
-                    _ => bytes,
-                })
+                let (at, bytes) = self.span(&child.id, r.start, want).await?;
+                // Back to an offset into the buffer. `at <= r.start` holds for anything
+                // `span` returns, so neither subtraction goes backwards.
+                Ok(slice(&bytes, Some(r.start - at..r.end.saturating_sub(at))))
             }
             // A document, exported once and then held. An export honours no range
             // (measured: `bytes=0-0` answers `200` with the whole object, and `HEAD`
