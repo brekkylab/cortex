@@ -86,9 +86,9 @@ const JITTER_MAX_MS: u64 = 1000;
 ///
 /// 64 MiB against a measured worst case of 2.5 MB leaves room far past any document in a
 /// real account while keeping one read's footprint bounded. The JSON stays small where an
-/// export does not: a 60 MB document is 2.5 MB of it, and a 401 MB workbook is 20,009
-/// bytes — that workbook could not be served as an export at all, being over this ceiling
-/// as one.
+/// export does not: a 60 MB document is 2.5 MB of it, and a 401 MB workbook is 242,935
+/// bytes — that workbook could not be served as an export at all, its 382 MiB being far
+/// over this ceiling.
 pub(super) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Whether a 403 body names a limit that clears by waiting.

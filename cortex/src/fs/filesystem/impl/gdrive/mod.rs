@@ -64,8 +64,10 @@
 //! The JSON has none of that shape. It is read front to back, so a wrong length costs
 //! only the bytes past it rather than the whole file; its own API answers in about a
 //! second whatever the document's size, because nothing is rendered; and it is 10-30x
-//! smaller — a 401 MB workbook is 20,009 bytes of JSON, and this tree cannot read that
-//! workbook as an export at all.
+//! smaller — a 401 MB workbook is 242,935 bytes of JSON, eight tabs and all, where as an
+//! export this tree cannot touch it: `ls` shows 401 MB and any read fails outright,
+//! because a document has no windows and the whole 382 MiB export would have to be held
+//! to answer one.
 //!
 //! ## What a read costs
 //!
