@@ -9,7 +9,7 @@
 //!   started, told, and never asked anything, which is what made `cortex-uvm-boot` a separate
 //!   binary rather than a rewrite.
 //! - **the boot process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`SHARE_ENV`],
-//!   [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`], [`IMAGE_SPEC_PATH`]). The other end of
+//!   [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]). The other end of
 //!   that one is `cortex-uvm-guest`'s `contract` module, which **has to change with this
 //!   file** — that crate is built for a different target and takes nothing it does not need,
 //!   so the compiler will not notice a mismatch.

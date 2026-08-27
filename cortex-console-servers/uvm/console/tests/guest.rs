@@ -543,7 +543,9 @@ async fn the_default_posture_resolves_names_and_refuses_the_rest() {
 async fn a_public_session_reaches_the_internet() {
     let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "public")]).await;
 
-    let out = fx.output("wget -q -T 10 -O /dev/null http://example.com/").await;
+    let out = fx
+        .output("wget -q -T 10 -O /dev/null http://example.com/")
+        .await;
     assert_eq!(
         out.code,
         0,
@@ -552,7 +554,9 @@ async fn a_public_session_reaches_the_internet() {
     );
 
     // And over TLS, which is a different path through the stack: a stream it does not read.
-    let out = fx.output("wget -q -T 10 -O /dev/null https://example.com/").await;
+    let out = fx
+        .output("wget -q -T 10 -O /dev/null https://example.com/")
+        .await;
     assert_eq!(
         out.code,
         0,
