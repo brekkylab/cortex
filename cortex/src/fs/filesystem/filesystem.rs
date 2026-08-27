@@ -32,6 +32,7 @@
 
 use std::{io, path::Path, sync::Arc, time::SystemTime};
 
+use super::Searchable;
 use crate::BoxFuture;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,6 +410,27 @@ pub trait FileSystem: Send + Sync {
         let _ = path;
         Box::pin(async { Ok(()) })
     }
+
+    /// This store's own index, if its service keeps one this credential may ask.
+    ///
+    /// `None` by default, and that is the ordinary answer: a passthrough directory has no
+    /// index, an object store has no text index whatsoever, and a chat source reached with a
+    /// bot token may be refused the one its service does keep. A store that would only ever
+    /// fail here should leave this alone rather than answer with an index that errors — the two
+    /// are not the same to a caller, and a fan-out reports "asked and refused" differently from
+    /// "has none at all".
+    ///
+    /// Borrowed from the store rather than built, because an index answers out of what the
+    /// store already holds: the conversation listing and roster a directory listing paid for
+    /// are what name a hit's path, so a search behind a warm mount spends one request and not
+    /// three.
+    ///
+    /// Not part of the namespace or the data plane, and reached by neither. No path names an
+    /// index, deliberately: a directory that answered searches would have to invent a spelling
+    /// for a query, and a query belongs to the service rather than to this tree.
+    fn index(&self) -> Option<&dyn Searchable> {
+        None
+    }
 }
 
 /// A shared backend is itself a backend: every call forwards to the one inside.
@@ -478,5 +500,9 @@ impl<T: FileSystem + ?Sized> FileSystem for Arc<T> {
 
     fn flush<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         (**self).flush(path)
+    }
+
+    fn index(&self) -> Option<&dyn Searchable> {
+        (**self).index()
     }
 }

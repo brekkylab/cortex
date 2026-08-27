@@ -1,22 +1,26 @@
-//! `search` against real services, with no console and no mount in front of them.
+//! `search` against real services, with no console and nothing mounted on the host.
 //!
-//! The same [`Executable`] a console reaches, so what it answers here is what it answers there;
-//! the difference is only who registers the backends.
+//! The same [`Executable`] a console reaches, over a [`WorkFs`] assembled the way a session
+//! assembles one — so what it answers here is what it answers there. The difference is only
+//! that nothing puts this workspace in front of a kernel, which costs nothing: `search` names
+//! files rather than reading them, so it needs the mount table and not the mount.
 //!
 //! ```sh
 //! set -a; . ./.env; set +a
 //! search 'pricing' --in chat/slack
 //! ```
 //!
-//! What is registered depends on what the environment carries. `SLACK_USER_TOKEN` mounts a
-//! Slack workspace's index at `chat/slack`; a bot token cannot search, and the command says so
-//! rather than answering with nothing. With nothing set, `search` reports that no store has an
-//! index — which is the honest answer and not an empty result.
+//! What is searchable depends on what the environment carries. `SLACK_USER_TOKEN` mounts a
+//! Slack workspace at `chat/slack`, and mounting is the whole of the registration. A bot token
+//! mounts just as well and simply has no index to offer, which the command reports rather than
+//! answering with nothing. With nothing set, `search` reports that no store has an index —
+//! which is the honest answer and not an empty result.
 
 use std::io::Write;
 use std::process::ExitCode;
 
 use cortex::exec::{ExecCall, Executable};
+use cortex::fs::WorkFs;
 use cortex_exec_search::Search;
 
 fn main() -> ExitCode {
@@ -52,7 +56,7 @@ async fn run() -> ExitCode {
         cwd: None,
         env: Default::default(),
     };
-    let out = registered().exec(&call, None).await;
+    let out = Search::over(&workspace()).exec(&call, None).await;
 
     // Written rather than printed: a record is bytes copied out of a file's own format, and
     // nothing here has a reason to decode and re-encode them.
@@ -63,20 +67,21 @@ async fn run() -> ExitCode {
     ExitCode::from(u8::try_from(out.exit_code).unwrap_or(2))
 }
 
-/// Whatever this environment can search.
+/// The workspace this environment can assemble.
 ///
-/// A backend is registered only when its credential is present, so the report a fan-out prints
-/// names the stores that actually exist rather than a roster of what might have.
-fn registered() -> Search {
-    let mut search = Search::new();
+/// A store is mounted only when its credential is present, so what a fan-out reports on is what
+/// actually exists rather than a roster of what might have. Whether any of them can be
+/// *searched* is not decided here: that is the store's own
+/// [`index`](cortex::fs::FileSystem::index), and reading it is [`Search::over`]'s job.
+fn workspace() -> WorkFs {
+    let mut work = WorkFs::new();
 
     #[cfg(feature = "slack")]
     if let Some(token) = std::env::var("SLACK_USER_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
     {
-        use cortex::fs::{SlackConfig, SlackSource};
-        use cortex_exec_search::backend::messenger::Messenger;
+        use cortex::fs::{MessengerFs, SlackConfig, SlackSource};
 
         let config = SlackConfig {
             user_token: Some(token),
@@ -85,11 +90,17 @@ fn registered() -> Search {
                 .ok()
                 .filter(|u| !u.is_empty()),
         };
+        // Neither failure is fatal and both are said: a workspace missing one store is still a
+        // workspace, and naming the one that is missing is more use than exiting.
         match SlackSource::new(&config) {
-            Ok(source) => search = search.with("chat/slack", Messenger::new(source)),
+            Ok(source) => {
+                if let Err(e) = work.mount("chat/slack", MessengerFs::new(source)) {
+                    eprintln!("search: chat/slack: {e}");
+                }
+            }
             Err(e) => eprintln!("search: chat/slack: {e}"),
         }
     }
 
-    search
+    work
 }

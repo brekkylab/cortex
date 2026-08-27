@@ -286,6 +286,46 @@ pub trait MessengerSource: Send + Sync {
 
     /// See [`Capabilities`].
     fn capabilities(&self) -> Capabilities;
+
+    /// This source's own message index, if its service keeps one this credential may ask.
+    ///
+    /// `None` by default, which is the honest answer for most of the lane on most credentials.
+    /// Slack keeps a message index and refuses it to a bot token; Discord gave bots none at all
+    /// until March 2026. A method every source had to write would be one most of them could
+    /// only ever fail, which is the mistake [`FileSystem::index`] is shaped to avoid one level
+    /// up — and this is how a source tells the tree above it which of the two it is.
+    ///
+    /// Separate from the rest of the trait because the rest is the set of questions *every*
+    /// source answers, and this is the one only some can. What reads it is
+    /// [`MessengerFs::index`](super::MessengerFs), which is what turns "this source can be
+    /// asked" into "this mount can be searched".
+    ///
+    /// [`FileSystem::index`]: crate::fs::FileSystem::index
+    fn as_index(&self) -> Option<&dyn MessengerIndex> {
+        None
+    }
+}
+
+/// A source whose service keeps a message index this credential may ask.
+///
+/// One method, and it answers in the lane's own [`SearchHit`] rather than in the tree's
+/// vocabulary: a source knows how to ask its service and how to normalize what came back, and
+/// nothing about which file a message's line ends up in. Turning a hit into a path is the
+/// tree's, because the tree is what spells paths — see [`MessengerFs`](super::MessengerFs).
+///
+/// Reached only through [`MessengerSource::as_index`]. A source that implements this and
+/// forgets to override that is a source nothing will ever ask, which is why the override is one
+/// line and sits next to the impl.
+pub trait MessengerIndex: Send + Sync {
+    /// Matches for `query`, most relevant or most recent first, at most `count` of them.
+    ///
+    /// The query is the service's own syntax, untouched. See
+    /// [`Searchable::search`](crate::fs::Searchable::search) for why nothing translates it.
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        count: usize,
+    ) -> BoxFuture<'a, SourceResult<Vec<SearchHit>>>;
 }
 
 /// The one line format, shared by every source.

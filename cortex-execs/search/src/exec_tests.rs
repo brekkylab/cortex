@@ -1,19 +1,30 @@
 //! Unit tests for the command.
 //!
-//! No backend here reaches anything: fake ones hand back fixtures, because what these assert is
+//! Nothing here reaches anything: fake stores hand back fixtures, because what these assert is
 //! what the command decides — which stores get asked, what the report says, where the mount
-//! prefix goes, and which exit code a caller reads. A backend's own answers are its own tests.
+//! prefix goes, and which exit code a caller reads. A store's own answers are its own tests.
+//!
+//! The stores are *mounted* rather than registered, because that is the only way in: `Search`
+//! reads the mount table, so a test that handed it a path directly would be testing a door that
+//! does not exist.
 
+use std::io;
+use std::path::Path;
+
+use cortex::fs::{Dirent, FileSystem, Hit, SearchResult, Searchable, Stat, WorkFs};
 use futures_core::future::BoxFuture;
 
 use super::*;
-use crate::{Hit, SearchResult, Searchable};
 
-/// A backend that answers with whatever it was built with.
+/// A store that answers its index with whatever it was built with, and answers everything else
+/// with nothing — no test here opens a file.
 struct Fake {
     hits: Vec<(&'static str, &'static str)>,
     refuse: Option<&'static str>,
     describe: &'static str,
+    /// Whether this store has an index at all, which is not the same as having one that
+    /// refuses: a store with none is never asked, and never appears in the report.
+    indexed: bool,
 }
 
 impl Fake {
@@ -22,20 +33,51 @@ impl Fake {
             hits: hits.to_vec(),
             refuse: None,
             describe: "",
+            indexed: true,
         }
     }
 
     fn refusing(why: &'static str) -> Self {
         Fake {
-            hits: Vec::new(),
             refuse: Some(why),
-            describe: "",
+            ..Fake::with(&[])
+        }
+    }
+
+    /// A store like any other, with nothing to ask. A passthrough directory, an object store.
+    fn unindexed() -> Self {
+        Fake {
+            indexed: false,
+            ..Fake::with(&[])
         }
     }
 
     fn described(mut self, what: &'static str) -> Self {
         self.describe = what;
         self
+    }
+}
+
+impl FileSystem for Fake {
+    fn stat<'a>(&'a self, _path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
+        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    }
+
+    fn list<'a>(&'a self, _path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn read_at<'a>(
+        &'a self,
+        _path: &'a Path,
+        _buf: &'a mut [u8],
+        _offset: u64,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+    }
+
+    fn index(&self) -> Option<&dyn Searchable> {
+        self.indexed.then_some(self as &dyn Searchable)
     }
 }
 
@@ -61,6 +103,23 @@ impl Searchable for Fake {
     }
 }
 
+/// A workspace under construction, so a test reads like the wiring it stands for.
+///
+/// `with` is `WorkFs::mount` and nothing else — the point of the test double is that there is
+/// no second way to put a store in front of `Search`.
+struct Work(WorkFs);
+
+impl Work {
+    fn new() -> Self {
+        Work(WorkFs::new())
+    }
+
+    fn with<S: FileSystem + 'static>(mut self, at: &str, store: S) -> Self {
+        self.0.mount(at, store).expect("mounted");
+        self
+    }
+}
+
 fn call(args: &[&str]) -> ExecCall {
     ExecCall {
         name: "search".into(),
@@ -70,8 +129,8 @@ fn call(args: &[&str]) -> ExecCall {
     }
 }
 
-async fn run(search: Search, args: &[&str]) -> ExecResult {
-    search.exec(&call(args), None).await
+async fn run(work: Work, args: &[&str]) -> ExecResult {
+    Search::over(&work.0).exec(&call(args), None).await
 }
 
 fn out(r: &ExecResult) -> String {
@@ -84,7 +143,7 @@ fn said(r: &ExecResult) -> String {
 
 #[tokio::test]
 async fn a_hit_arrives_under_the_path_its_store_is_mounted_at() {
-    let search = Search::new().with(
+    let search = Work::new().with(
         "chat/slack",
         Fake::with(&[(
             "channels/pricing__C1/2026/08/2026-08-03.jsonl",
@@ -103,7 +162,7 @@ async fn a_hit_arrives_under_the_path_its_store_is_mounted_at() {
 /// report about which stores were asked cannot be on stdout.
 #[tokio::test]
 async fn the_report_is_on_stderr_and_the_hits_on_stdout() {
-    let search = Search::new()
+    let search = Work::new()
         .with("chat/slack", Fake::with(&[("a/chat.jsonl", "{}")]))
         .with("docs/notion", Fake::with(&[]).described("titles only"));
     let r = run(search, &["가격"]).await;
@@ -123,7 +182,7 @@ async fn the_report_is_on_stderr_and_the_hits_on_stdout() {
 
 #[tokio::test]
 async fn without_a_scope_every_store_is_asked() {
-    let search = Search::new()
+    let search = Work::new()
         .with("chat/slack", Fake::with(&[("a", "{}")]))
         .with("mail/work", Fake::with(&[("b", "{}")]));
     let r = run(search, &["가격"]).await;
@@ -135,7 +194,7 @@ async fn without_a_scope_every_store_is_asked() {
 /// `--in` is a prefix and not a name: narrowing is what it is for, and a reader thinks in paths.
 #[tokio::test]
 async fn a_scope_narrows_by_prefix() {
-    let search = Search::new()
+    let search = Work::new()
         .with("chat/slack", Fake::with(&[("a", "{}")]))
         .with("chat/discord", Fake::with(&[("b", "{}")]))
         .with("mail/work", Fake::with(&[("c", "{}")]));
@@ -155,7 +214,7 @@ async fn a_scope_narrows_by_prefix() {
 #[tokio::test]
 async fn the_root_scope_is_every_store() {
     for spelling in ["/", "//", ""] {
-        let search = Search::new()
+        let search = Work::new()
             .with("chat/slack", Fake::with(&[("a", "{}")]))
             .with("mail/work", Fake::with(&[("b", "{}")]));
 
@@ -173,7 +232,7 @@ async fn the_root_scope_is_every_store() {
 /// caller asked was answerable and this was not the answer.
 #[tokio::test]
 async fn a_scope_nobody_serves_is_an_error_and_names_the_candidates() {
-    let search = Search::new().with("chat/slack", Fake::with(&[("a", "{}")]));
+    let search = Work::new().with("chat/slack", Fake::with(&[("a", "{}")]));
     let r = run(search, &["--in", "chta/slack", "가격"]).await;
     assert_eq!(r.exit_code, 2);
     let report = said(&r);
@@ -186,7 +245,7 @@ async fn a_scope_nobody_serves_is_an_error_and_names_the_candidates() {
 
 #[tokio::test]
 async fn every_store_answered_and_none_had_it_is_exit_one() {
-    let search = Search::new()
+    let search = Work::new()
         .with("chat/slack", Fake::with(&[]))
         .with("mail/work", Fake::with(&[]));
     let r = run(search, &["없는말"]).await;
@@ -202,7 +261,7 @@ async fn every_store_answered_and_none_had_it_is_exit_one() {
 /// said the thing is absent.
 #[tokio::test]
 async fn a_store_that_could_not_look_makes_nothing_found_exit_two() {
-    let search = Search::new()
+    let search = Work::new()
         .with("chat/slack", Fake::refusing("needs a user token"))
         .with("mail/work", Fake::with(&[]));
     let r = run(search, &["가격"]).await;
@@ -218,7 +277,7 @@ async fn a_store_that_could_not_look_makes_nothing_found_exit_two() {
 /// refusal is reported beside it.
 #[tokio::test]
 async fn a_refusal_beside_a_hit_still_exits_zero_and_is_reported() {
-    let search = Search::new()
+    let search = Work::new()
         .with("chat/slack", Fake::refusing("expired token"))
         .with("mail/work", Fake::with(&[("b", "{}")]));
     let r = run(search, &["가격"]).await;
@@ -228,15 +287,15 @@ async fn a_refusal_beside_a_hit_still_exits_zero_and_is_reported() {
 }
 
 #[tokio::test]
-async fn nothing_registered_says_so_rather_than_finding_nothing() {
-    let r = run(Search::new(), &["가격"]).await;
+async fn an_empty_workspace_says_so_rather_than_finding_nothing() {
+    let r = run(Work::new(), &["가격"]).await;
     assert_eq!(r.exit_code, 2);
-    assert!(said(&r).contains("no store has an index"), "{}", said(&r));
+    assert!(said(&r).contains("nothing is mounted"), "{}", said(&r));
 }
 
 #[tokio::test]
 async fn help_needs_no_store_and_no_credential() {
-    let r = run(Search::new(), &["--help"]).await;
+    let r = run(Work::new(), &["--help"]).await;
     assert_eq!(r.exit_code, 0);
     let text = out(&r);
     assert!(text.contains("search <query>"), "{text}");
@@ -250,7 +309,7 @@ async fn help_needs_no_store_and_no_credential() {
 
 #[tokio::test]
 async fn a_query_is_required_and_a_count_has_to_be_a_number() {
-    let search = || Search::new().with("chat/slack", Fake::with(&[("a", "{}")]));
+    let search = || Work::new().with("chat/slack", Fake::with(&[("a", "{}")]));
 
     let r = run(search(), &["--count", "5"]).await;
     assert_eq!(r.exit_code, 2);
@@ -267,6 +326,25 @@ async fn a_query_is_required_and_a_count_has_to_be_a_number() {
 #[tokio::test]
 async fn a_record_that_does_not_end_its_line_still_gets_one() {
     struct Blunt;
+    impl FileSystem for Blunt {
+        fn stat<'a>(&'a self, _p: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
+            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+        }
+        fn list<'a>(&'a self, _p: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+        fn read_at<'a>(
+            &'a self,
+            _p: &'a Path,
+            _b: &'a mut [u8],
+            _o: u64,
+        ) -> BoxFuture<'a, io::Result<usize>> {
+            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+        }
+        fn index(&self) -> Option<&dyn Searchable> {
+            Some(self)
+        }
+    }
     impl Searchable for Blunt {
         fn search<'a>(&'a self, _q: &'a str, _n: usize) -> BoxFuture<'a, SearchResult> {
             Box::pin(async move {
@@ -278,7 +356,7 @@ async fn a_record_that_does_not_end_its_line_still_gets_one() {
         }
     }
 
-    let r = run(Search::new().with("chat/slack", Blunt), &["가격"]).await;
+    let r = run(Work::new().with("chat/slack", Blunt), &["가격"]).await;
     let text = out(&r);
     assert_eq!(
         text.lines().count(),
@@ -295,7 +373,7 @@ async fn a_record_that_does_not_end_its_line_still_gets_one() {
 #[tokio::test]
 async fn a_query_with_no_content_is_refused_before_any_store_is_asked() {
     for argv in [vec![""], vec!["   "], vec!["", ""], vec!["\t"]] {
-        let search = Search::new().with("chat/slack", Fake::with(&[("a", "{}")]));
+        let search = Work::new().with("chat/slack", Fake::with(&[("a", "{}")]));
         let r = run(search, &argv).await;
         assert_eq!(r.exit_code, 2, "{argv:?} reached a store: {}", out(&r));
         assert!(said(&r).contains("no query"), "{}", said(&r));
@@ -320,4 +398,100 @@ fn help_is_what_the_parser_says_it_is_and_not_what_a_scan_says() {
     ] {
         assert!(!wants_help(&argv(&does_not)), "{does_not:?}");
     }
+}
+
+/// The three states the report has to keep apart: found nothing, could not look, and has
+/// nothing to look with. The third is the one a list of backends could not express — the store
+/// was never handed over, so the fan-out could not name a place it had not heard of.
+#[tokio::test]
+async fn a_store_with_no_index_is_named_as_unsearched() {
+    let r = run(
+        Work::new()
+            .with("chat/slack", Fake::with(&[("a", "{}")]))
+            .with("files/s3", Fake::unindexed()),
+        &["가격"],
+    )
+    .await;
+
+    assert_eq!(r.exit_code, 0, "one store answered, so this is a find");
+    let said = said(&r);
+    assert!(said.contains("chat/slack  1 hit"), "{said}");
+    assert!(
+        said.contains("files/s3  no index"),
+        "a place nobody looked has to say so: {said}"
+    );
+    assert!(
+        !said.contains("files/s3  0 hits"),
+        "and must not read as a place that answered: {said}"
+    );
+}
+
+/// Having no index moves no exit code. It is a fact about the store, where a refusal is a
+/// fault — so a workspace with one searchable store and five plain ones still answers 1 when
+/// the searchable one simply has nothing.
+#[tokio::test]
+async fn no_index_is_not_a_failure() {
+    let r = run(
+        Work::new()
+            .with("chat/slack", Fake::with(&[]))
+            .with("files/s3", Fake::unindexed()),
+        &["가격"],
+    )
+    .await;
+
+    assert_eq!(r.exit_code, 1, "everything that could answer did, and none had it");
+    assert!(said(&r).contains("files/s3  no index"), "{}", said(&r));
+}
+
+/// A scope that reaches only stores with no index is not an empty result: nothing was read, so
+/// nothing may be reported absent. The reader named the place, so the answer is about it.
+#[tokio::test]
+async fn a_scope_with_no_index_in_it_is_an_error_and_points_at_grep() {
+    let r = run(
+        Work::new()
+            .with("chat/slack", Fake::with(&[("a", "{}")]))
+            .with("files/s3", Fake::unindexed()),
+        &["--in", "files/s3", "가격"],
+    )
+    .await;
+
+    assert_eq!(r.exit_code, 2, "not an empty result");
+    let said = said(&r);
+    assert!(said.contains("files/s3  no index"), "{said}");
+    assert!(said.contains("nothing in scope has an index"), "{said}");
+    assert!(said.contains("grep"), "it has to say what does work: {said}");
+}
+
+/// A prefix nobody mounted is still the older error, and it names what *is* mounted — including
+/// the stores that have no index, because a typo is as likely to be one of those.
+#[tokio::test]
+async fn a_scope_nobody_mounted_names_what_is_mounted() {
+    let r = run(
+        Work::new()
+            .with("chat/slack", Fake::with(&[("a", "{}")]))
+            .with("files/s3", Fake::unindexed()),
+        &["--in", "files/typo", "가격"],
+    )
+    .await;
+
+    assert_eq!(r.exit_code, 2);
+    let said = said(&r);
+    assert!(said.contains("no store mounted under files/typo"), "{said}");
+    assert!(said.contains("chat/slack"), "{said}");
+    assert!(said.contains("files/s3"), "{said}");
+}
+
+/// The prefix on a hit is the mount table's own key, so there is no second spelling to drift.
+#[tokio::test]
+async fn the_prefix_is_the_path_the_store_was_mounted_at() {
+    let r = run(
+        Work::new().with("chat/acme", Fake::with(&[("channels/x__C1/2026/08/2026-08-03.jsonl", "{}")])),
+        &["가격"],
+    )
+    .await;
+    assert!(
+        out(&r).starts_with("chat/acme/channels/x__C1/"),
+        "{}",
+        out(&r)
+    );
 }

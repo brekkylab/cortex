@@ -580,7 +580,6 @@ version = "0.1.0"
 dependencies = [
  "cortex",
  "futures-core",
- "serde_json",
  "tokio",
 ]
 

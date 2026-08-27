@@ -15,12 +15,14 @@
 
 mod filesystem;
 mod r#impl;
+mod searchable;
 // Visible to the whole `fs` subtree, because the bindings marshal: they need the attribute
 // layout, the errno table and the open-flag decoding that `Posix` answers a kernel with, and
 // none of that is a store's business or a consumer's.
 pub(super) mod posix;
 
 pub use filesystem::*;
+pub use searchable::*;
 // A store that reaches the network is behind its own feature, for the reason the crate has no
 // default features at all: `s3` costs 131 crates, and a build that serves local files should
 // not compile an HTTP and TLS stack to do it.

@@ -24,8 +24,8 @@ use crate::BoxFuture;
 use super::accessor::{SlackAccessor, SlackConfig};
 use super::super::error::SourceResult;
 use super::super::source::{
-    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerSource, Message,
-    MsgId, SearchHit, Thread, User, Window,
+    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerIndex,
+    MessengerSource, Message, MsgId, SearchHit, Thread, User, Window,
 };
 
 /// Both kinds of a section, asked for in one call.
@@ -231,6 +231,26 @@ impl MessengerSource for SlackSource {
             // empty — an empty one would say this person has no DMs.
             dms: self.reads_as_user,
         }
+    }
+
+    /// Slack keeps a message index, and `search.messages` is **user token only** — a bot token
+    /// is refused it whatever scopes the install was granted.
+    ///
+    /// So this is `None` for a bot-token mount, and the difference is worth having: a store
+    /// that says it has no index is reported as such, where one that offered an index and then
+    /// failed every call would spend a request to say the same thing and read as a fault.
+    fn as_index(&self) -> Option<&dyn MessengerIndex> {
+        self.reads_as_user.then_some(self as &dyn MessengerIndex)
+    }
+}
+
+impl MessengerIndex for SlackSource {
+    fn search<'a>(
+        &'a self,
+        query: &'a str,
+        count: usize,
+    ) -> BoxFuture<'a, SourceResult<Vec<SearchHit>>> {
+        Box::pin(async move { SlackSource::search(self, query, count).await })
     }
 }
 

@@ -3,35 +3,33 @@ name = "cortex-exec-search"
 version.workspace = true
 edition.workspace = true
 
-# The same `Executable` a console reaches, against the stores on this host and with no console
-# in front of them. Useful for seeing what a query costs before an agent runs it.
+# The same `Executable` a console reaches, over a workspace assembled from this host's
+# credentials. Useful for seeing what a query costs before an agent runs it.
 [[bin]]
 name = "search"
 path = "src/bin/search.rs"
-required-features = ["messenger"]
+required-features = ["slack"]
 
 [features]
-# Nothing by default: the command is the trait, the routing and the report, and none of that
-# knows a service. A backend is what knows one, so each is opted into.
+# Nothing by default, and the library needs nothing: the command is the routing, the report and
+# the exit codes, and none of that knows a service. What a feature buys here is a *store* for
+# the binary to mount — the indexes themselves belong to `cortex`, behind that crate's features.
 default = []
-# Chat, through the messenger lane. `cortex/slack` because that is the one source in the lane
-# whose service offers an index today.
-messenger = ["slack"]
+# A Slack workspace for the binary to mount. `cortex/slack` is where the store and its index
+# live; this crate gains no code with it, only something to put in the tree.
 slack = ["cortex/slack"]
 
 [dependencies]
-# `Executable`, `ExecCall`, `Mount` — the delegation surface this crate implements. The lane
-# types a backend needs arrive with that backend's own feature.
+# Everything this crate is written against: `Executable` and `ExecCall` are the delegation
+# surface it implements, and `WorkFs`, `FileSystem::index`, `Searchable` and `Hit` are the
+# stores it fans out over. A store with a store's own index arrives with a `cortex` feature.
 cortex = { workspace = true }
-# `BoxFuture`: `Executable` hands one back, and `Searchable` does the same so a backend that
-# waits on a network can be held behind a `dyn`.
+# `BoxFuture`: `Executable` hands one back, so the command is written in terms of one.
 futures-core = { workspace = true }
-# The binary drives one runtime and the clients behind the backends wait on a network, so `net`
+# The binary drives one runtime and the clients behind the stores wait on a network, so `net`
 # and `time` are named here rather than inherited: `enable_all` is cfg'd on them, and a runtime
 # built without them has no I/O driver — silently, which is the failure worth two words.
 tokio = { workspace = true, features = ["net", "rt", "time"] }
 
 [dev-dependencies]
-# Fixtures carry a service's own record, which is a `serde_json::Value` in the lane's types.
-serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

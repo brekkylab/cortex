@@ -1,10 +1,10 @@
 //! The command: a query in, paths and records out, one report line per store asked.
 
-use cortex::exec::{ExecCall, ExecResult, Executable};
-use cortex::fs::Mount;
-use futures_core::future::BoxFuture;
+use std::sync::Arc;
 
-use crate::{Hit, Searchable};
+use cortex::exec::{ExecCall, ExecResult, Executable};
+use cortex::fs::{FileSystem, Hit, Mount, WorkFs};
+use futures_core::future::BoxFuture;
 
 /// Hits per store when nobody says. Small on purpose: this is the step that decides *where to
 /// look*, and a caller that wants more can ask for more.
@@ -28,8 +28,13 @@ write plain words there: an operator one service understands is literal text to 
     --help          this
 
 Results go to stdout, one hit per line: the path of the file it can be read in, a tab, then
-the hit as that file spells it. Which stores were asked, and what each answered, goes to
-stderr — so a pipeline sees only hits.
+the hit as that file spells it. Which stores were asked, what each answered, and which were not
+asked at all goes to stderr — so a pipeline sees only hits.
+
+    # chat/slack   12 hits (messages)      asked, and here is what it had
+    # docs/notion   0 hits (titles only)   asked, and it has none
+    # mail/work    could not search: ...   asked, and it would not answer
+    # files/s3      no index               nobody looked here — try grep
 
 Examples
 
@@ -53,7 +58,9 @@ names and conversation names from listings that page, so a cold search spends th
 them for a few minutes. Search to find the files, then read those.
 
 Exit codes: 0 found something, 1 every store answered and none had it, 2 nothing could be
-searched — or something could not, and nothing was found. Close to `grep`'s and not the same:
+searched — or something could not, and nothing was found. A store with no index moves none of
+them: it is a fact about that store and not a fault, so it is named and then left out of the
+arithmetic. Close to `grep`'s and not the same:
 `grep` answers 2 when a file was unreadable even though another matched, where this answers 0 and
 names the store it could not ask on stderr. A caller that must not act on a partial answer reads
 the report, not the code.
@@ -159,36 +166,53 @@ pub fn wants_help(args: &[String]) -> bool {
     matches!(Args::parse(args), Ok(Parsed::Help))
 }
 
-/// One store, under the path it is mounted at.
+/// One store that has an index, under the path the workspace mounts it at.
 struct Store {
     at: String,
-    backend: Box<dyn Searchable>,
+    fs: Arc<dyn FileSystem>,
 }
 
-/// `search`, over the stores it was given.
+/// `search`, over the stores a workspace mounts.
 ///
-/// The registry is built by whoever wired the session, because that is the only place that
-/// knows what is mounted where — a mount table hands out paths, not the stores behind them.
-#[derive(Default)]
+/// Built from the mount table and from nothing else, which is the whole of why there is one
+/// constructor. A hit's path is only openable because it is prefixed with where its store
+/// actually is, so a path this command was told separately is a path that can disagree with the
+/// tree — and a wrong prefix is indistinguishable downstream from a file that was deleted.
+/// Taking both from [`WorkFs::indexes`] means there is no second spelling to keep in step.
 pub struct Search {
     stores: Vec<Store>,
 }
 
 impl Search {
-    pub fn new() -> Self {
-        Search::default()
-    }
-
-    /// Register `backend` as the index for the store mounted at `at`.
+    /// `search` over every store in `work`.
     ///
-    /// The path is what a reader will see in front of every hit from this backend, so it has to
-    /// be the same path the store was mounted at.
-    pub fn with(mut self, at: impl Into<String>, backend: impl Searchable + 'static) -> Self {
-        self.stores.push(Store {
-            at: at.into().trim_matches('/').to_string(),
-            backend: Box::new(backend),
-        });
-        self
+    /// Mounting is the whole of the registration: a store that answers
+    /// [`FileSystem::index`](cortex::fs::FileSystem::index) is searchable from the moment it is
+    /// in the tree. Neither that nor its opposite is a thing to remember to do.
+    ///
+    /// Every mount is taken, not only the ones with an index, because the ones without are
+    /// something a reader has to be told. "Nothing found here" and "nobody looked here" are
+    /// different answers, and a fan-out that never learned a store existed can only give the
+    /// first.
+    ///
+    /// The stores are held by [`Arc`] rather than borrowed, because this outlives the workspace
+    /// value: a binding takes the `WorkFs` by value to mount it, so a `Search` that borrowed
+    /// could not be registered in an [`ExecutableSet`](cortex::exec::ExecutableSet) and handed
+    /// to a console. Build this before mounting and both halves work off the same table.
+    pub fn over(work: &WorkFs) -> Self {
+        Search {
+            stores: work
+                .stores()
+                .into_iter()
+                .map(|(at, fs)| Store {
+                    // The mount table's own key, trimmed the way `--in` is so the two compare:
+                    // a scope is written by a reader and a key is written by the table, and a
+                    // leading slash on either would make one path two.
+                    at: at.to_string_lossy().trim_matches('/').to_string(),
+                    fs,
+                })
+                .collect(),
+        }
     }
 
     /// One line for [`ExecutableSet::register`](cortex::exec::ExecutableSet::register).
@@ -221,20 +245,22 @@ impl Search {
 
         let stores = self.selected(args.scope.as_deref());
         if stores.is_empty() {
-            let known: Vec<&str> = self.stores.iter().map(|s| s.at.as_str()).collect();
-            // A typo must not read as "nothing there": the answer to a scope nobody serves is
-            // that nobody serves it, and the candidates say what would have.
+            let mounted: Vec<&str> = self.stores.iter().map(|s| s.at.as_str()).collect();
+            // Nothing is *mounted* there, which is a different sentence from nothing being
+            // searchable there — that one is settled further down, after the stores in scope
+            // have been asked. A typo must not read as "nothing there" either way, so the
+            // candidates say what would have been reached.
             return Err(Failure {
                 code: 2,
                 message: match args.scope {
-                    Some(p) if known.is_empty() => {
-                        format!("search: no store has an index, so --in {p} reaches none\n")
+                    Some(p) if mounted.is_empty() => {
+                        format!("search: nothing is mounted, so --in {p} reaches none\n")
                     }
                     Some(p) => format!(
-                        "search: no store mounted under {p}\n       searchable: {}\n",
-                        known.join(", ")
+                        "search: no store mounted under {p}\n       mounted: {}\n",
+                        mounted.join(", ")
                     ),
-                    None => "search: no store has an index\n".to_string(),
+                    None => "search: nothing is mounted\n".to_string(),
                 },
             });
         }
@@ -245,8 +271,18 @@ impl Search {
         let mut hits = Vec::new();
         let mut report = Vec::new();
         let mut refused = 0usize;
+        let mut asked = 0usize;
         for store in &stores {
-            match store.backend.search(&args.query, args.count).await {
+            // Three states here and not two, which is the whole of why the mount table is read
+            // rather than a list of backends. A store with no index is not a failure and not an
+            // empty answer: it is a place nobody looked, it says so on its own line, and it
+            // moves no exit code — where a *refusal* below is a fault and forces one.
+            let Some(index) = store.fs.index() else {
+                report.extend_from_slice(format!("# {}  no index\n", store.at).as_bytes());
+                continue;
+            };
+            asked += 1;
+            match index.search(&args.query, args.count).await {
                 Ok(found) => {
                     report.extend_from_slice(
                         format!(
@@ -254,7 +290,7 @@ impl Search {
                             store.at,
                             found.len(),
                             if found.len() == 1 { "" } else { "s" },
-                            match store.backend.describe() {
+                            match index.describe() {
                                 "" => String::new(),
                                 d => format!(" ({d})"),
                             }
@@ -281,6 +317,17 @@ impl Search {
                     );
                 }
             }
+        }
+
+        if asked == 0 {
+            // Every store in scope was mounted and none had an index, so nothing was searched
+            // at all. That is the same 2 an outright failure gets, and for the same reason:
+            // answering 1 would say the thing is not there, about a place nobody read.
+            let mut message = String::from_utf8_lossy(&report).into_owned();
+            message.push_str(
+                "search: nothing in scope has an index\n                        an index is what this command asks; grep reads the files themselves\n",
+            );
+            return Err(Failure { code: 2, message });
         }
 
         if hits.is_empty() {

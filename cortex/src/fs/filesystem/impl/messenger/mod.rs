@@ -34,6 +34,7 @@ mod limits;
 mod messenger;
 mod paths;
 mod retry;
+mod search;
 mod source;
 
 #[cfg(feature = "slack")]

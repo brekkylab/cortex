@@ -23,18 +23,50 @@
 //! words, which every index can do; anything sharper happens locally, where it is portable
 //! already.
 //!
-//! # Why a command and not a method on the stores
+//! # Where the stores come from
+//!
+//! From the mount table, and from nowhere else. [`Search::over`] reads
+//! [`WorkFs::stores`](cortex::fs::WorkFs::stores), so mounting *is* the registration: a store
+//! that answers [`FileSystem::index`](cortex::fs::FileSystem::index) is searchable from the
+//! moment it is in the tree, and one that does not is named as unsearched rather than asked.
+//!
+//! That is not a convenience. A hit is only useful because its path opens, and it opens only
+//! because it is prefixed with where the store actually is. A command told that path separately
+//! is a command that can be told a different one, and a wrong prefix is indistinguishable
+//! downstream from a file that was deleted — hits that name nothing, a zero exit code, and
+//! nothing anywhere saying why. Taking the path and the index from the same table leaves no
+//! second spelling to keep in step.
+//!
+//! # Why an index is an `Option` on the store and not a method every store writes
 //!
 //! Not every service has an index a credential may ask. Slack refuses `search.messages` to a
-//! bot token, and an object store has no text index whatsoever. A
-//! trait method some stores could only ever fail is the same mistake as a directory that is
-//! always empty — it looks like a feature and answers like a fault. A store with no index has
-//! no [`Searchable`] backend and is not asked.
+//! bot token, and an object store has no text index whatsoever. A trait method some stores
+//! could only ever fail is the same mistake as a directory that is always empty — it looks like
+//! a feature and answers like a fault. So the capability is
+//! [`FileSystem::index`](cortex::fs::FileSystem::index), `None` by default, and a store that
+//! has none is never asked rather than asked and failed.
 //!
-//! What that costs is worth naming: the registry is what the session handed over, so a store
-//! nobody registered is not merely unasked, it is unknown — and a fan-out cannot report a place
-//! it never learned about. `--in` naming one does say so, because there the reader supplied the
-//! name. Without `--in` the report lists what was asked and nothing else.
+//! # Three answers, not two
+//!
+//! Which is why the whole mount table is read and not a list of the stores that can be asked.
+//! A reader looking at the report has to be able to tell these apart:
+//!
+//! ```text
+//! # chat/slack   12 hits (messages)      asked, and here is what it had
+//! # docs/notion   0 hits (titles only)   asked, and it has none
+//! # mail/work    could not search: …     asked, and it would not answer
+//! # files/s3      no index               nobody looked here
+//! ```
+//!
+//! The last two are the pair worth the trouble. A refusal is a **fault** — a token somebody can
+//! renew, a scope somebody can grant — and it forces a non-zero exit, because a store that could
+//! not look has not said the thing is absent. Having no index is a **fact**: there is nothing to
+//! fix, it moves no exit code, and what it calls for is `grep`, which reads the files rather
+//! than asking about them.
+//!
+//! A fan-out built from a list of backends could not draw that last line at all. The store was
+//! never handed over, so there was no place to report — and "nothing found" would have been said
+//! about somewhere nobody read.
 //!
 //! # What it does not replace
 //!
@@ -43,9 +75,5 @@
 //! one ranking. Use it to find where to look; use the files to read what is there.
 
 mod exec;
-mod searchable;
-
-pub mod backend;
 
 pub use exec::{Search, usage, wants_help};
-pub use searchable::{Hit, SearchResult, Searchable};

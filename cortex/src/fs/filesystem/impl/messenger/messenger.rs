@@ -79,10 +79,12 @@ use super::paths::{
     CHANNELS, DMS, FILES, JSONL, THREADS, USERS, conv_dir, day_file, day_of, day_of_file, entry, file_entry,
     month_dir, month_of, months, thread_file, year_dir,
 };
-use super::source::{ConvId, ConvKind, Conversation, FileRef, MessengerSource, MsgId, Window};
+use super::source::{
+    ConvId, ConvKind, Conversation, FileRef, MessengerIndex, MessengerSource, MsgId, Window,
+};
 use super::{User, render_line};
 use crate::BoxFuture;
-use crate::fs::{Dirent, DirentKind, FileSystem, Stat};
+use crate::fs::{Dirent, DirentKind, FileSystem, Searchable, Stat};
 
 /// A value and when it stops being reusable.
 struct Cached<T> {
@@ -314,7 +316,15 @@ impl<S: MessengerSource> MessengerFs<S> {
 
     // ---- fetches, each answering from the cache first ---------------------------------
 
-    async fn conversations(&self) -> io::Result<Vec<Conversation>> {
+    /// The source's own index, when it has one.
+    ///
+    /// Here rather than read off `self.source` in `search.rs`, because the field is this
+    /// module's and the capability is the only part of it a sibling needs.
+    pub(super) fn source_index(&self) -> Option<&dyn MessengerIndex> {
+        self.source.as_index()
+    }
+
+    pub(super) async fn conversations(&self) -> io::Result<Vec<Conversation>> {
         if let Some(v) = Cached::get(self.cache.lock().unwrap().convs.as_ref(), self.limits.ttl) {
             return Ok(v.clone());
         }
@@ -323,7 +333,7 @@ impl<S: MessengerSource> MessengerFs<S> {
         Ok(convs)
     }
 
-    async fn users(&self) -> io::Result<Vec<User>> {
+    pub(super) async fn users(&self) -> io::Result<Vec<User>> {
         if let Some(v) = Cached::get(self.cache.lock().unwrap().users.as_ref(), self.limits.ttl) {
             return Ok(v.clone());
         }
@@ -785,6 +795,15 @@ impl<S: MessengerSource> MessengerFs<S> {
 }
 
 impl<S: MessengerSource> FileSystem for MessengerFs<S> {
+    /// `Some(self)` exactly when the source has an index to ask, and `None` otherwise.
+    ///
+    /// The condition is the source's rather than this type's, which is why it is read here
+    /// instead of being a bound on the impl: a bound would mean a source without an index could
+    /// not be mounted at all, and reading files is most of what this tree is for.
+    fn index(&self) -> Option<&dyn Searchable> {
+        self.source_index().map(|_| self as &dyn Searchable)
+    }
+
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             match self.resolve(path).await? {

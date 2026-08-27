@@ -6,7 +6,7 @@
 //!
 //! It is itself a [`FileSystem`], so it can be driven by the same bindings as any single
 //! store — and even mounted inside another one. That costs nothing to arrange now that the
-//! trait is object-safe: the table holds `Box<dyn FileSystem>` and forwards, where a trait
+//! trait is object-safe: the table holds `Arc<dyn FileSystem>` and forwards, where a trait
 //! with an associated handle type would need the whole call erased and re-typed on the way
 //! through.
 //!
@@ -21,6 +21,7 @@ use std::{
     io,
     ops::Bound::{Excluded, Unbounded},
     path::{Component, Path, PathBuf},
+    sync::Arc,
     time::SystemTime,
 };
 
@@ -40,7 +41,7 @@ pub struct WorkFs {
     /// is a reverse range scan (see [`WorkFs::route`]), and all keys sharing a prefix form one
     /// contiguous run (see [`WorkFs::descendant_mounts`]). A store mounted at the empty path is
     /// the root and serves anything no deeper mount claims.
-    mounts: BTreeMap<PathBuf, Box<dyn FileSystem>>,
+    mounts: BTreeMap<PathBuf, Arc<dyn FileSystem>>,
 
     /// The paths in this tree that something has declared to be skills, keyed the same way the
     /// mount table is.
@@ -86,7 +87,7 @@ impl WorkFs {
         store: M,
     ) -> io::Result<Self> {
         self.mounts
-            .insert(mount_key(path.as_ref())?, Box::new(store));
+            .insert(mount_key(path.as_ref())?, Arc::new(store));
         Ok(self)
     }
 
@@ -101,7 +102,7 @@ impl WorkFs {
         if self.mounts.contains_key(&key) {
             return Err(io::ErrorKind::AlreadyExists.into());
         }
-        self.mounts.insert(key, Box::new(store));
+        self.mounts.insert(key, Arc::new(store));
         Ok(())
     }
 
@@ -110,7 +111,7 @@ impl WorkFs {
     /// Any skill mark the removal orphaned goes with it. Not the marks *below* `path`, which is
     /// a different set: a skill under a mount of its own is still served after the mount above
     /// it goes, and only the ones nothing serves any more are dropped.
-    pub fn unmount(&mut self, path: impl AsRef<Path>) -> io::Result<Box<dyn FileSystem>> {
+    pub fn unmount(&mut self, path: impl AsRef<Path>) -> io::Result<Arc<dyn FileSystem>> {
         let key = mount_key(path.as_ref())?;
         let store = self.mounts.remove(&key).ok_or_else(not_found)?;
         // Collected first: the test borrows the whole table, which `retain` would not allow.
@@ -124,6 +125,38 @@ impl WorkFs {
             self.skills.remove(&skill);
         }
         Ok(store)
+    }
+
+    /// Every store this workspace mounts, with the path it is mounted at.
+    ///
+    /// The one place a path and a store are put together, which is the point of it being here
+    /// rather than in whatever fans out over them: the mount table already knows where each
+    /// store is, and a consumer that was told a path separately can be told a different one. A
+    /// path built to point back into this tree is only openable because it is prefixed with
+    /// where the store actually is, so a second spelling of that is a path nobody can read —
+    /// silently, since nothing downstream can tell a wrong prefix from a deleted file.
+    ///
+    /// **All of them, not only the interesting ones.** A consumer that wants the ones with an
+    /// index reads [`FileSystem::index`] on each — and the ones *without* are the reason this
+    /// does not filter: a store that cannot answer a question is a different fact from a store
+    /// nobody asked, and only a consumer that was handed both can tell a reader which it was.
+    ///
+    /// The store comes back as an [`Arc`] and not a borrow because a workspace does not outlive
+    /// being used: a binding takes it by value to mount it ([`FuseMount::try_new`] and its
+    /// siblings are `T: FileSystem + 'static`), so anything holding a reference into the table
+    /// could not survive the call that puts the tree on the host. Sharing is free here for the
+    /// reason the [`FileSystem`] impl on `Arc` gives: with no opens to keep straight, two
+    /// holders are only two callers.
+    ///
+    /// Ordered by mount path, which is [`BTreeMap`]'s order and stable across calls — so a
+    /// report naming the stores it asked names them the same way twice.
+    ///
+    /// [`FuseMount::try_new`]: crate::fs::FuseMount::try_new
+    pub fn stores(&self) -> Vec<(PathBuf, Arc<dyn FileSystem>)> {
+        self.mounts
+            .iter()
+            .map(|(at, store)| (at.clone(), Arc::clone(store)))
+            .collect()
     }
 
     /// Normalize `path` into the form both the mount table and the skill registry are keyed by.
@@ -193,7 +226,7 @@ impl WorkFs {
     fn descendant_mounts<'a>(
         &'a self,
         prefix: &'a Path,
-    ) -> impl Iterator<Item = (&'a PathBuf, &'a Box<dyn FileSystem>)> {
+    ) -> impl Iterator<Item = (&'a PathBuf, &'a Arc<dyn FileSystem>)> {
         self.mounts
             .range((Excluded(prefix.to_path_buf()), Unbounded))
             .take_while(move |(k, _)| k.starts_with(prefix))

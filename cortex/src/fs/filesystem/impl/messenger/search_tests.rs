@@ -1,19 +1,21 @@
-//! Unit tests for the messenger backend.
+//! Unit tests for the tree answering its own index.
 //!
 //! Nothing here reaches a network. A fake source hands back fixtures, because what these assert
-//! is what the backend decides: which file a hit's path names, whose name goes on the record,
-//! and that the record is spelled the way that file spells it.
+//! is what the *tree* decides: which file a hit's path names, whose name goes on the record, and
+//! that the record is spelled the way that file spells it.
 
+use std::sync::Arc as StdArc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use cortex::BoxFuture;
-use cortex::fs::{
-    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, Message, MessengerSource, MsgId,
-    SearchHit, SourceResult, Thread, User, Window,
+use super::super::error::{SourceError, SourceResult};
+use super::super::source::{
+    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerIndex, MessengerSource,
+    Message, MsgId, SearchHit, Thread, User, Window,
 };
-
-use super::*;
-use crate::{Hit, Searchable};
+use super::super::messenger::MessengerFs;
+use crate::BoxFuture;
+use crate::fs::{FileSystem, Hit, Searchable};
 
 /// `2026-08-03T06:17:55Z`, the instant a real workspace's thread was started on.
 const ROOT_TS: u64 = 1_785_737_875;
@@ -49,30 +51,39 @@ fn msg(ts: u64, text: &str, thread: Option<Thread>) -> Message {
     }
 }
 
+/// What a fake source does when its index is asked.
+#[derive(Default, PartialEq)]
+enum Index {
+    /// It has one and it answers.
+    #[default]
+    Answers,
+    /// It has one and this credential is refused it — a request is spent to find out.
+    Refuses,
+    /// It has none at all, so nothing may ask.
+    Absent,
+}
+
 #[derive(Default)]
 struct Fake {
     hits: Vec<SearchHit>,
     convs: Vec<Conversation>,
     users: Vec<User>,
-    /// The platform has no index for this credential, which is not the same as no matches.
-    no_index: bool,
-    /// What the backend actually asked the source for, so a claim about cost is asserted
-    /// rather than asserted-to.
-    asked: std::sync::Arc<Asked>,
+    index: Index,
+    /// What the tree actually asked the source for, so a claim about cost is asserted rather
+    /// than asserted-to.
+    asked: StdArc<Asked>,
 }
 
 #[derive(Default)]
 struct Asked {
-    users: std::sync::atomic::AtomicUsize,
-    convs: std::sync::atomic::AtomicUsize,
+    users: AtomicUsize,
+    convs: AtomicUsize,
 }
 
 impl MessengerSource for Fake {
     fn conversations<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<Conversation>>> {
         Box::pin(async move {
-            self.asked
-                .convs
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.asked.convs.fetch_add(1, Ordering::SeqCst);
             Ok(self.convs.clone())
         })
     }
@@ -95,9 +106,7 @@ impl MessengerSource for Fake {
 
     fn users<'a>(&'a self) -> BoxFuture<'a, SourceResult<Vec<User>>> {
         Box::pin(async move {
-            self.asked
-                .users
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.asked.users.fetch_add(1, Ordering::SeqCst);
             Ok(self.users.clone())
         })
     }
@@ -116,6 +125,10 @@ impl MessengerSource for Fake {
             dms: true,
         }
     }
+
+    fn as_index(&self) -> Option<&dyn MessengerIndex> {
+        (self.index != Index::Absent).then_some(self as &dyn MessengerIndex)
+    }
 }
 
 impl MessengerIndex for Fake {
@@ -123,18 +136,18 @@ impl MessengerIndex for Fake {
         &'a self,
         _query: &'a str,
         _count: usize,
-    ) -> BoxFuture<'a, Result<Vec<SearchHit>, String>> {
+    ) -> BoxFuture<'a, SourceResult<Vec<SearchHit>>> {
         Box::pin(async move {
-            match self.no_index {
-                true => Err("slack search needs a user token (xoxp-)".to_string()),
-                false => Ok(self.hits.clone()),
+            match self.index {
+                Index::Refuses => Err(SourceError::io("slack search needs a user token (xoxp-)")),
+                _ => Ok(self.hits.clone()),
             }
         })
     }
 }
 
 async fn hits(fake: Fake) -> Result<Vec<Hit>, String> {
-    Messenger::new(fake).search("가격", 20).await
+    MessengerFs::new(fake).search("가격", 20).await
 }
 
 fn one(hits: &[Hit]) -> (&str, String) {
@@ -266,28 +279,44 @@ async fn an_author_is_named_from_the_roster() {
     );
 }
 
-/// A refusal is the service's own sentence, carried up for the command to report.
+/// A refusal is the service's own sentence, carried up for a fan-out to report.
 #[tokio::test]
-async fn no_index_is_an_error_and_says_why() {
+async fn an_index_that_refuses_is_an_error_and_says_why() {
     let err = hits(Fake {
-        no_index: true,
+        index: Index::Refuses,
         ..Default::default()
     })
     .await
-    .expect_err("a bot token cannot search");
+    .expect_err("this credential cannot search");
     assert!(err.contains("user token"), "{err}");
 }
 
-/// Two searches cost one roster, not two.
-///
-/// The point of the slots, and the reason they are here rather than deeper: a source keeps
-/// nothing between calls, and the tree's cache belongs to the mount — a different object over
-/// the same credential. On a workspace of any size the roster is most of what a search costs,
-/// so paying it once per query is paying it once per thing the reader wonders.
+/// Having no index and being refused one are different answers, and the difference is a
+/// request: a mount whose source has none is never asked at all.
 #[tokio::test]
-async fn a_second_search_does_not_buy_the_roster_again() {
-    let asked = std::sync::Arc::new(Asked::default());
-    let backend = Messenger::new(Fake {
+async fn a_source_with_no_index_offers_the_tree_none() {
+    let has = MessengerFs::new(Fake::default());
+    assert!(has.index().is_some(), "this source answers its index");
+
+    let has_not = MessengerFs::new(Fake {
+        index: Index::Absent,
+        ..Default::default()
+    });
+    assert!(
+        has_not.index().is_none(),
+        "a source with no index must not look like one that has an empty one"
+    );
+}
+
+/// Two searches cost one roster, not two — and a listing before them costs none of it again.
+///
+/// The point of the impl being on the tree rather than beside it. A source keeps nothing between
+/// calls, so without the store's own cache every query pays for the roster, and on a workspace
+/// of any size the roster is most of what a query costs.
+#[tokio::test]
+async fn searches_share_the_stores_cache() {
+    let asked = StdArc::new(Asked::default());
+    let store = MessengerFs::new(Fake {
         hits: vec![SearchHit {
             conv: conv("pricing", "C1", ConvKind::Channel),
             msg: msg(ROOT_TS, "발표영상", None),
@@ -303,11 +332,14 @@ async fn a_second_search_does_not_buy_the_roster_again() {
         ..Default::default()
     });
 
+    // A directory listing first, because that is the order a reader arrives in: they were
+    // reading the tree and then asked it a question.
+    store.list(std::path::Path::new("channels")).await.expect("listed");
     for _ in 0..3 {
-        backend.search("가격", 20).await.expect("searched");
+        store.search("가격", 20).await.expect("searched");
     }
 
-    let seen = |c: &std::sync::atomic::AtomicUsize| c.load(std::sync::atomic::Ordering::SeqCst);
+    let seen = |c: &AtomicUsize| c.load(Ordering::SeqCst);
+    assert_eq!(seen(&asked.convs), 1, "a listing and three searches, one listing fetch");
     assert_eq!(seen(&asked.users), 1, "three searches, one roster");
-    assert_eq!(seen(&asked.convs), 1, "three searches, one listing");
 }
