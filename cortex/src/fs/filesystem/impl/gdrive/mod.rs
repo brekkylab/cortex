@@ -38,16 +38,24 @@
 //! **A listing no longer says which of the two an entry was.** An uploaded `.pptx` and
 //! an exported Google Slides deck read the same, and that is what serving the export
 //! buys: a reader opens either without knowing. What separates them is what a read
-//! costs — a real file reads by the window, an export does not — so the difference
+//! costs — a real file reads by spans of it, an export does not — so the difference
 //! survives where it matters and is invisible where it does not.
 //!
 //! ## Exporting through the link the listing hands over
 //!
 //! `files.export` is not the path taken. It caps at 10 MB and refuses past it with no
-//! partial download to work around it, and of four real documents measured **three were
-//! over the cap** — the capped endpoint is the exception, not the rule. Drive answers
-//! instead with `exportLinks`, a per-MIME map on the file resource, which the listing
-//! carries for free.
+//! partial download to work around it — not even by asking in pieces: a 5 MiB range and
+//! a 1 MiB range both answered `403` on a document over the cap, after spending 48 and
+//! 41 seconds rendering the export they then refused. Of 38 documents in the corpus six
+//! are over the cap by the listed size, and the listing understates the export often
+//! enough that some of the other 32 fail too. Drive answers instead with `exportLinks`,
+//! a per-MIME map on the file resource, which the listing carries for free.
+//!
+//! Nothing documents that link as the way around the cap. Google's own guide presents it
+//! as how to export *within a browser*, says nothing about exceeding 10 MB, and puts the
+//! cap only on `files.export`. That the link has no cap of its own is measured, not
+//! promised — a 401 MB workbook came through it — so this path rests on behaviour Google
+//! could take back.
 //!
 //! That link answers `307` to a `googleusercontent.com` host whose query holds its own
 //! signed grant, so the two legs are issued separately: the token rides the first and
@@ -60,13 +68,17 @@
 //!
 //! Every one of them is network:
 //!
-//! * A real file reads by the window, so `head` moves what it asks for and `cat` of a
-//!   70 MB file moves 70 MB.
+//! * A real file reads by spans, not by the window the kernel asked for. The window is
+//!   64 KiB, and a request costs a round trip of about 0.9 s whatever its size, so one
+//!   request per window put a 641 MB archive at 0.04 MB/s. A first read takes 8 MiB and a
+//!   read carrying on from the last takes 64 MiB, which is where the rate tops out at
+//!   11-12 MB/s. `head` of that archive moves 8 MiB; `cat` of it moves all 641 MB in 53 s.
 //! * **A document has no windows.** An export honours no range (`bytes=0-0` answers
 //!   `200` with the whole object; `HEAD` answers a `content-length` of `0`), so any read
 //!   produces all of it, and it is held for the listing TTL rather than produced again
-//!   per chunk. Drive's own `size` is what bounds this: it estimates the export within
-//!   0.3%, so an oversized document is refused before a byte moves.
+//!   per chunk. Drive's own `size` refuses a document already over by that number
+//!   before a byte moves, but it errs low on text — by a factor of 23 measured — so the
+//!   frame counter behind it is what actually bounds the read.
 //! * A listing is held for five minutes, so a change just made in Drive may not show yet.
 //!
 //! ## What an export loses

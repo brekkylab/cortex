@@ -576,15 +576,13 @@ async fn gdrive_live_a_document_is_served_as_its_export() {
                 e.name
             );
 
-            // The listing's number is Drive's stored size, which is an estimate of the
-            // export rather than its length. Close, and not equal — 0.3% on the files
-            // measured, so this holds it to a factor rather than to a value.
-            assert!(
-                listed / 2 < bytes.len() as u64 && bytes.len() as u64 <= listed * 2,
-                "{}: listed {listed} against {} exported, which is not the right order",
-                e.name,
-                bytes.len()
-            );
+            // No assertion relating `listed` to what arrived. It was held to a factor
+            // of two here, which is false: the listing understates a text-heavy export
+            // by any amount, and one document in the corpus lists 17,796 against 409,242
+            // exported. The two checks above already say this is the right object; a
+            // bound that only holds for image-heavy documents says nothing and fails on
+            // whichever one the listing happens to return first.
+            eprintln!("    listing said {listed}, export was {}", bytes.len());
 
             // Held, so a second read of the same document does not produce it again.
             // Compared against the first rather than against a clock: what is being
@@ -966,13 +964,13 @@ fn row_at(addr: &str, name: &str, id: &str, mime: &str, size: Option<&str>) -> V
 /// A file Drive listed without a `size`, read the way every caller reads: list the
 /// folder, then read windows of it.
 ///
-/// The listing can only offer a placeholder, and the danger is that the placeholder
-/// is believed. It is under the cacheable limit, so a reader that trusts it fetches
-/// the whole object for each window and then throws it away, because the object is
-/// over that limit once its real length is known: measured at 80 MB to deliver 1 MB
-/// before the length was marked as the estimate it is.
+/// The listing can only offer a placeholder, and the danger is that the placeholder is
+/// believed — `stat` has to resolve it, from one ranged byte rather than a download, or
+/// `ls -l` lies and a reader stops at 8 MiB. The windows after it then come out of one
+/// span, which is the point of the span: 80 MB moved to deliver 1 MB before any of this
+/// was in place.
 #[tokio::test]
-async fn an_unsized_file_is_measured_then_read_by_the_window() {
+async fn an_unsized_file_is_measured_then_read_by_spans() {
     const REAL: usize = 20 * 1024 * 1024;
     const CHUNK: u64 = 256 * 1024;
     let mock = start(

@@ -119,9 +119,9 @@ const DIR_TTL: Duration = Duration::from_secs(300);
 /// and then empty at EOF, so `cat` stops at the true end.
 ///
 /// Rarely reached, now that a document reports Drive's own `size`: that number is what
-/// Drive stores, which is what an export hands back — within 0.3% on the documents
-/// measured. This is what is left for the rows Drive lists without one, which do
-/// occur (three spreadsheets in the corpus).
+/// Drive stores, which is an estimate of the export and not a good one — see
+/// `FILE_FIELDS`. This is what is left for the rows Drive lists without one at all,
+/// which do occur (three spreadsheets in the corpus).
 ///
 /// It cannot be made exact for those. A blob's length is one ranged byte away, but an
 /// export honours no range at all (measured: `bytes=0-0` answers `200` with the whole
@@ -260,10 +260,10 @@ struct Child {
     /// Byte length as the listing reported it, which means two different things.
     ///
     /// For a file Drive holds bytes for it is exact, and a reader can seek inside it.
-    /// For a document it is the size of what Drive *stores* — an estimate of the
-    /// export, within 0.3% on the two measured — good enough to refuse an oversized
-    /// one before a byte moves, and not good enough to be the length a read answers
-    /// with. `None` for either is [`UNKNOWN_LENGTH_SIZE`], via `entry_size`.
+    /// For a document it is the size of what Drive *stores* — an estimate of the export
+    /// that errs low on text by up to a factor of 23 measured, so it can refuse one that
+    /// is already over and can never admit one safely, and is nowhere near the length a
+    /// read answers with. `None` for either is [`UNKNOWN_LENGTH_SIZE`], via `entry_size`.
     size: Option<u64>,
 }
 
@@ -394,9 +394,10 @@ impl GdriveFs {
     /// the document in the first place.
     ///
     /// Two ceilings, because only one of them can be trusted. The listing's `size` is an
-    /// estimate of the export (within 0.3% on the documents measured), so it refuses an
-    /// oversized document *before a byte moves* — and a document Drive listed without one
-    /// gets no such mercy, so [`MAX_DOCUMENT_BYTES`] is passed down as well and cuts the
+    /// estimate of the export that errs low on text, so all it can do is refuse a document
+    /// already over by that number *before a byte moves* — and a document it admits, or
+    /// one Drive listed without a size at all, gets no such mercy, so
+    /// [`MAX_DOCUMENT_BYTES`] is passed down as well and cuts the
     /// stream off frame by frame. Neither is redundant: the first is fast and
     /// approximate, the second is exact and expensive.
     async fn exported(
@@ -767,17 +768,18 @@ impl FileSystem for GdriveFs {
             let bytes = self
                 .read_window(path, Some(offset..offset.saturating_add(want)))
                 .await?;
-            // Short is EOF and nothing else, which holds here because the window came
-            // back whole: Drive served exactly the range, or `slice` cut it from bytes
-            // this already had. Neither can answer part of a window it holds.
+            // Short is EOF and nothing else, which holds because a span never splits a
+            // window: `span` fetches from where the read begins and at least as far as it
+            // asks, so what comes back either covers the window or ran out of file.
             //
-            // A short answer does not reach a caller as one, though, and that is why the
-            // size `stat` reports has to be right rather than close. Through a mount the
-            // kernel fills what this declines to serve, out to the length it was told the
-            // file has: measured on a document whose `stat` over-reported by 152,083
+            // A short answer would not reach a caller as one anyway. Through a mount the
+            // kernel fills whatever this declines to serve, out to the length it was told
+            // the file has: measured on a document whose `stat` over-reported by 152,083
             // bytes, `cat` handed back exactly the claimed 60,063,731 with the tail all
             // `0x00`. So `cp` does not rescue a wrong length — it copies the padding — and
-            // a reader looking for anything at the end finds zeros.
+            // a reader looking for anything at the end finds zeros. For documents that is
+            // now an accepted cost rather than a bug; see the revert of 1c9e67b for what
+            // the alternative was measured to cost.
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
             Ok(n)
@@ -880,10 +882,10 @@ fn child_from_file(f: &Value) -> Option<Child> {
         // an absence.
         let (api, export, ext) = native_kind(mime)?;
         let link = f.get("exportLinks")?.get(export)?.as_str()?.to_string();
-        // Drive's `size` is what it *stores*, which is what an export hands back —
-        // within 0.3% on the two documents measured. It is an estimate and treated as
-        // one: `entry_size` reports it, and `read_window` refuses on it before a byte
-        // moves, but the length a read answers with is the length that arrived.
+        // Drive's `size` is what it *stores*, which is an estimate of the export and
+        // wrong by up to a factor of 23 on text. It is treated as the estimate it is:
+        // `entry_size` reports it, and `read_window` refuses on it before a byte moves,
+        // but the length a read answers with is the length that arrived.
         (
             format!("{name}{ext}"),
             Serves::Native(api, link),

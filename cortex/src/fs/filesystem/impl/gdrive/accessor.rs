@@ -42,18 +42,32 @@ const FILE_FIELDS: &[&str] = &[
     // absent for folders and shortcuts. (enterprise-mock omits it on native
     // docs — a divergence from Google, so don't rely on either shape.)
     //
-    // For a document it is the size of what Drive *stores*, which is what an export
-    // hands back: measured against two real files, within 0.3% of the exported bytes
-    // (401,518,068 listed against 400,984,746 exported; 60,063,731 against
-    // 59,911,656). Close enough to refuse an oversized document before a byte moves,
-    // and not close enough to serve as the entry's length — see `entry_size`.
+    // For a document it is the size of what Drive *stores*, which is near what an
+    // export hands back only when the document is mostly images. Over six measured:
+    //
+    //   401,518,068 -> 400,984,746    +0.13%   images
+    //    60,063,731 ->  59,911,656    +0.25%   images
+    //     3,588,735 ->   3,705,698     -3.3%   text
+    //     8,762,033 ->  13,672,172      -56%   text
+    //        26,210 ->      32,151      -23%   text
+    //        17,796 ->     409,242    -2,300%  text
+    //
+    // Text compresses tighter in Drive's own form than in OOXML, so the number errs
+    // *low* there and by any amount. It is therefore a one-sided guard: refusing a
+    // document whose listed size already clears a ceiling never refuses one that would
+    // have fitted, while a document it admits may still be far over — which is what the
+    // frame counter is for. Never the entry's length, either; see `entry_size`.
     "size",
     // Where an export of a Docs-editors file can actually be fetched, per MIME type.
     //
     // `files.export` caps at 10 MB and answers `exportSizeLimitExceeded` past it, with
-    // no partial download to work around it — of four real documents measured, three
-    // were over the cap, so the capped endpoint is the exception and this is the rule.
-    // Google names these links as the way through. Read rather than built: the path
+    // no partial download to work around it: a 5 MiB range and a 1 MiB range both drew
+    // the same `403`, after 48 and 41 seconds spent rendering the export they refused.
+    //
+    // Nothing documents this link as the way around that. Google's guide offers it as
+    // how to export *within a browser*, says nothing about exceeding 10 MB, and puts the
+    // cap only on `files.export`. That it has no cap of its own is measured — a 401 MB
+    // workbook came through — not promised. Read rather than built: the path
     // shape differs per type (`/spreadsheets/export` against
     // `/feeds/download/documents/export/Export`), and a URL this constructed would be
     // a second copy of a layout Google never promised to keep.
@@ -84,10 +98,11 @@ const JITTER_MAX_MS: u64 = 1000;
 /// 64 MiB against measured exports of 32 KB to 14 MB leaves room well past anything
 /// ordinary while keeping that footprint bounded.
 ///
-/// It is not the only guard, and not the first one. Drive's listed `size` estimates the
-/// export within 0.3%, so an oversized document is refused before a byte moves; this is
-/// what catches the documents Drive lists without a size, and it is the reason a 401 MB
-/// workbook in the corpus costs 64 MiB rather than 401 MB to refuse.
+/// It is not the only guard, and not the first one. Drive's listed `size` refuses a
+/// document that is already over by that number before a byte moves — which is how a
+/// 401 MB workbook in the corpus costs nothing to refuse rather than 64 MiB. But the
+/// listed size errs low on text-heavy documents, by up to a factor of 23 measured, so
+/// plenty of documents clear it and land here instead. This is the guard that holds.
 pub(super) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Whether a 403 body names a limit that clears by waiting.
@@ -558,11 +573,11 @@ impl GdriveAccessor {
     /// content can be downloaded. Use Export with Docs Editors files."* — so it goes
     /// through [`Self::export_document`] instead.
     ///
-    /// The range is what makes serving originals affordable. A filesystem read
-    /// arrives in chunks, and a search tool reads only the head of a file before
-    /// deciding it is binary — without `Range`, each of those chunk reads would
-    /// pull the whole object, so one `grep` over a folder of 5 MB PDFs would
-    /// transfer gigabytes to look at a few kilobytes.
+    /// The range is what makes serving originals affordable, and how wide to make it is
+    /// the caller's to decide — see `GdriveFs::span`, which sizes it by whether the reader
+    /// looks to be walking the file. Without `Range` at all, every chunk read would pull
+    /// the whole object, so one `grep` over a folder of 5 MB PDFs would transfer gigabytes
+    /// to look at a few kilobytes.
     pub async fn download(
         &self,
         id: &str,
