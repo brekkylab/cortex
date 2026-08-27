@@ -70,6 +70,9 @@ pub const WORKFS_ENV: &str = "CORTEX_UVM_WORKFS";
 /// The read-only base image, as a host path (the child) — and as a guest block device
 /// (the guest). Both ends of the overlay are named twice for that reason: one side has a
 /// file, the other has a device.
+///
+/// A server's answer and not a caller's: the path is whatever provisioning the session's image
+/// produced. **Which image** is `CORTEX_UVM_IMAGE`, or the `init` that beats it.
 pub const BASE_IMAGE_ENV: &str = "CORTEX_UVM_BASE_IMAGE";
 
 /// How the base image is laid out on the host, spelled as one of [`BaseFormat`]'s names.
@@ -78,7 +81,8 @@ pub const BASE_IMAGE_ENV: &str = "CORTEX_UVM_BASE_IMAGE";
 /// descriptor stitching per-layer EROFS blobs, where a tarball's is a single raw EROFS, and
 /// the guest mounts both as `erofs` — the difference is only what the VMM has to read.
 ///
-/// Also the caller's knob for an image built elsewhere, alongside [`BASE_IMAGE_ENV`].
+/// Computed by the server and never set by hand: what a base is laid out as is decided by how
+/// it was provisioned, one function above the process that reads this.
 pub const BASE_FORMAT_ENV: &str = "CORTEX_UVM_BASE_FORMAT";
 
 /// The session's writable image, as a host path.

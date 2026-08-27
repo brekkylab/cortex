@@ -389,3 +389,51 @@ async fn a_delegated_call_carries_the_directory_and_the_environment_together() {
         b"in work\n"
     );
 }
+
+/// A base image is refused here, and named.
+///
+/// The one thing this backend cannot be asked for. A command here is a process on this host,
+/// running against the filesystem this server can already see: there is no root to swap and no
+/// overlay to put one under, so an image is not a narrower session this could give but a
+/// different backend entirely. Refusing says so while the client can still pick one.
+#[tokio::test]
+async fn a_host_local_session_has_no_base_to_swap() {
+    use cortex::console::ImageSource;
+
+    // Asking for nothing is not asking for less: the session every client had before there was
+    // a base to name.
+    let console = built_on(None).await.expect("a session that named nothing");
+    assert_eq!(
+        console.image(),
+        None,
+        "this backend named a base it has not got"
+    );
+    drop(console);
+
+    let err = match built_on(Some(ImageSource::new("python:3.13-slim"))).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened on an image this backend cannot provide"),
+    };
+    let failure = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        failure.code(),
+        Some(Error::UNSUPPORTED_IMAGE),
+        "refused as {failure:?}, which is a different problem"
+    );
+}
+
+/// A console over the real binary with no tree, naming a base or naming none.
+async fn built_on(image: Option<cortex::console::ImageSource>) -> anyhow::Result<Console> {
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+    server.stderr(Stdio::inherit());
+
+    let mut builder = Console::builder()
+        .client(StdioClient::new(server)?)
+        .executables(ExecutableSet::new());
+    if let Some(image) = image {
+        builder = builder.image(image);
+    }
+    builder.build().await
+}

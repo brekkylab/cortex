@@ -130,6 +130,13 @@ impl Error {
 
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
     /// error) belongs to whoever reads the frame, not here.
+    /// The base image a session asked for is one this backend cannot give it.
+    ///
+    /// Not a reference that could not be fetched, which is a boot that failed: this is a
+    /// backend with no base to swap at all, because its commands run on the server's own
+    /// filesystem. Said at `init`, while the client can still ask for something else.
+    pub const UNSUPPORTED_IMAGE: i64 = -32011;
+
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;

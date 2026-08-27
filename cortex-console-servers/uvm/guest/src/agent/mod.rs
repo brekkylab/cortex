@@ -336,6 +336,9 @@ impl Session {
                 path: path.to_string_lossy().into_owned(),
             }),
             cwd: self.named_cwd(),
+            // Nothing to say: this agent is running *inside* the base and never heard which
+            // one it is. The answer the client sees is the console server's, one boot up.
+            image: None,
         })
     }
 

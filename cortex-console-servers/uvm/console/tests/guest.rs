@@ -35,7 +35,7 @@ use std::{
 
 use cortex::{
     BoxFuture,
-    console::{Console, ExecResult, ReadResult},
+    console::{Console, ExecResult, ImageSource, ReadResult},
     exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
     fs::Mount,
 };
@@ -153,6 +153,31 @@ impl Fixture {
             .expect("building the console");
 
         Fixture { console }
+    }
+
+    /// A fixture whose session names its base over the channel, the way a client does.
+    ///
+    /// Over the channel and not through the server's environment, which is the point: what a
+    /// client declares in its `init` is what the session runs on, and the server's own setting
+    /// is only the answer when nothing was declared.
+    async fn asking_for(image: ImageSource) -> anyhow::Result<Fixture> {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client = cortex::console::stdio::StdioClient::new(server)?;
+
+        let console = Console::builder()
+            .client(client)
+            .image(image)
+            .executables(
+                ExecutableSet::new()
+                    .register("report", "report the call it was made with", Report)
+                    .register("rawbytes", "answer bytes that are not text", RawBytes)
+                    .register("cat-here", "read a file where the command stood", CatHere),
+            )
+            .build()
+            .await?;
+
+        Ok(Fixture { console })
     }
 
     /// A fixture whose session works in `root`, which is a directory on this host.
@@ -307,7 +332,17 @@ async fn commands_run_in_a_guest_of_their_own() {
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and a registry pull"]
 async fn an_oci_image_is_a_base_and_its_environment_is_the_command_s() {
-    let mut fx = Fixture::with_env(&[("CORTEX_UVM_IMAGE", "python:3.13-slim")]).await;
+    let mut fx = Fixture::asking_for(ImageSource::new("python:3.13-slim"))
+        .await
+        .expect("a session on an image it named");
+
+    // **The answer is this server's spelling, not an echo.** A bare reference names a default
+    // registry, and which one it was is the thing the client could not have worked out.
+    assert_eq!(
+        fx.console.image().map(|image| image.reference.as_str()),
+        Some("docker.io/library/python:3.13-slim"),
+        "the server did not say which image the session got"
+    );
 
     let out = fx.output("python3 -c 'print(1 + 1)'").await;
     assert_eq!(
@@ -344,6 +379,59 @@ async fn an_oci_image_is_a_base_and_its_environment_is_the_command_s() {
     assert_eq!(
         fx.output("command -v python3").await.stdout,
         b"/usr/local/bin/python3\n"
+    );
+}
+
+/// What a client names beats what this server was configured with, and both are answered.
+///
+/// **Not** `#[ignore]`d, because nothing boots: naming a base settles which image a guest will
+/// be built on, and settling it is `init`'s. The pull it implies is the first boot's.
+#[tokio::test]
+async fn the_base_in_force_is_answered_whoever_chose_it() {
+    // Nothing declared, so this server's own setting stands — and is answered, which is how a
+    // client that declared nothing finds out what it got.
+    let quiet = Fixture::with_env(&[("CORTEX_UVM_IMAGE", "alpine:3.21")]).await;
+    assert_eq!(
+        quiet.console.image().map(|image| image.reference.as_str()),
+        Some("docker.io/library/alpine:3.21"),
+    );
+    drop(quiet);
+
+    // Declared, and it wins: the environment above says something else entirely.
+    let asked = Fixture::asking_for(ImageSource::new("python:3.13-slim"))
+        .await
+        .expect("a session on an image it named");
+    assert_eq!(
+        asked.console.image().map(|image| image.reference.as_str()),
+        Some("docker.io/library/python:3.13-slim"),
+    );
+    drop(asked);
+
+    // And a session on the pinned rootfs has no reference to give, which is not the same as a
+    // server declining to answer but reads the same way to a client.
+    let bare = Fixture::new().await;
+    assert_eq!(bare.console.image(), None);
+}
+
+/// A reference that is not one is refused at `init`, before a VM is worth starting.
+///
+/// The line this draws is between a name that cannot be parsed and a name that cannot be
+/// fetched. The first is the client's mistake and is knowable from the frame; the second is a
+/// registry's answer and takes a pull, so it belongs to a boot.
+#[tokio::test]
+async fn a_reference_that_is_not_one_is_refused_before_a_vm_is_started() {
+    let err = match Fixture::asking_for(ImageSource::new("nota reference")).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened on something that is not a reference"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::INVALID_PARAMS),
+        "answered {err:?} — a malformed reference is not a backend that would not come up"
     );
 }
 

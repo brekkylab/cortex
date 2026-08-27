@@ -15,7 +15,7 @@
 //!
 //! # Two ways to a base image
 //!
-//! An **OCI reference** ([`IMAGE_ENV`]) is pulled: layers arrive from a registry, each is
+//! An **OCI reference** is pulled: layers arrive from a registry, each is
 //! encoded as its own EROFS, and a descriptor stitches the set into one disk. That is the
 //! path for `python:3.13` and anything else somebody already publishes, and the layer store
 //! underneath it is content-addressed, so images sharing a base share the copy of it.
@@ -29,7 +29,6 @@
 //! an [`ImageSpec`] saying what the image expects of a process running in it. The tarball has
 //! nothing to say, and says nothing.
 //!
-//! [`BASE_IMAGE_ENV`]: crate::contract::BASE_IMAGE_ENV
 
 use std::{
     io,
@@ -45,8 +44,7 @@ use microsandbox_image::{
 };
 
 use crate::contract::{
-    BASE_FORMAT_ENV, BASE_IMAGE_ENV, BaseFormat, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec,
-    SESSION_IMAGE_ENV,
+    BaseFormat, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec, SESSION_IMAGE_ENV,
 };
 
 /// The guest half, cross-compiled and embedded by `build.rs`. Written into every boot
@@ -142,24 +140,17 @@ pub const IMAGE_ENV: &str = "CORTEX_UVM_IMAGE";
 /// The read-only base image every session overlays, provisioning it once if it is not
 /// cached.
 ///
-/// Three sources, in the order a caller's own answer beats a computed one:
+/// Three sources, in the order a client's own answer beats a server's:
 ///
-/// - `CORTEX_UVM_BASE_IMAGE` — an image built some other way, taken as given, its layout
-///   read from `CORTEX_UVM_BASE_FORMAT`. Nothing is known about its contents, so it carries
-///   no [`ImageSpec`].
-/// - [`IMAGE_ENV`] — an OCI reference, pulled and materialized (see [`pull`]).
-/// - neither — the pinned rootfs tarball, encoded to an EROFS (see [`Rootfs`]).
-pub async fn base_image() -> anyhow::Result<BaseImage> {
-    if let Some(image) = std::env::var_os(BASE_IMAGE_ENV) {
-        return Ok(BaseImage {
-            path: PathBuf::from(image),
-            format: base_format()?.unwrap_or_default(),
-            spec: ImageSpec::default(),
-        });
-    }
-
-    if let Some(reference) = std::env::var(IMAGE_ENV).ok().filter(|r| !r.is_empty()) {
-        return pull(&reference).await;
+/// Two sources, and the choice between them was made at `init`:
+///
+/// - `reference` — an OCI image, pulled and materialized (see [`pull`]). What the session named,
+///   or what [`IMAGE_ENV`] named for a session that named nothing; the server settled which
+///   before calling here.
+/// - `None` — the pinned rootfs tarball, encoded to an EROFS (see [`Rootfs`]).
+pub async fn base_image(reference: Option<&str>) -> anyhow::Result<BaseImage> {
+    if let Some(reference) = reference {
+        return pull(reference).await;
     }
 
     let rootfs = Rootfs::host();
@@ -174,14 +165,6 @@ pub async fn base_image() -> anyhow::Result<BaseImage> {
         format: BaseFormat::Raw,
         spec: ImageSpec::default(),
     })
-}
-
-/// What the caller said the base image's layout is, if anything.
-fn base_format() -> anyhow::Result<Option<BaseFormat>> {
-    match std::env::var(BASE_FORMAT_ENV) {
-        Ok(spelling) if !spelling.is_empty() => BaseFormat::parse(&spelling).map(Some),
-        _ => Ok(None),
-    }
 }
 
 /// Pull an OCI image and make a base out of it.
@@ -457,7 +440,7 @@ impl Rootfs {
                 name: "alpine-3.24.1-x86_64",
             },
             // A guest runs the host's architecture, so there is nothing to fall back to.
-            other => panic!("no base rootfs pinned for a {other} host — set {BASE_IMAGE_ENV}"),
+            other => panic!("no base rootfs pinned for a {other} host — name an image instead"),
         }
     }
 

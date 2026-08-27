@@ -105,9 +105,9 @@ impl Guest {
     /// `workfs` is a directory on this host, or `None` for a session with no tree. It is
     /// shared into the guest **at its own path** — see [`boot`](crate::boot), which is where
     /// that decision is argued.
-    pub async fn boot(workfs: Option<&Path>) -> anyhow::Result<Guest> {
+    pub async fn boot(workfs: Option<&Path>, image: Option<&str>) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
-        let base = assets::base_image().await?;
+        let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
 
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
