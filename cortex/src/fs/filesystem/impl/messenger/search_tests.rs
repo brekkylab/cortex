@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::super::error::{SourceError, SourceResult};
 use super::super::source::{
-    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerIndex, MessengerSource,
+    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerSearch, MessengerSource,
     Message, MsgId, SearchHit, Thread, User, Window,
 };
 use super::super::messenger::MessengerFs;
@@ -126,12 +126,12 @@ impl MessengerSource for Fake {
         }
     }
 
-    fn as_index(&self) -> Option<&dyn MessengerIndex> {
-        (self.index != Index::Absent).then_some(self as &dyn MessengerIndex)
+    fn searchable(&self) -> Option<&dyn MessengerSearch> {
+        (self.index != Index::Absent).then_some(self as &dyn MessengerSearch)
     }
 }
 
-impl MessengerIndex for Fake {
+impl MessengerSearch for Fake {
     fn search<'a>(
         &'a self,
         _query: &'a str,
@@ -296,14 +296,14 @@ async fn an_index_that_refuses_is_an_error_and_says_why() {
 #[tokio::test]
 async fn a_source_with_no_index_offers_the_tree_none() {
     let has = MessengerFs::new(Fake::default());
-    assert!(has.index().is_some(), "this source answers its index");
+    assert!(has.searchable().is_some(), "this source answers its index");
 
     let has_not = MessengerFs::new(Fake {
         index: Index::Absent,
         ..Default::default()
     });
     assert!(
-        has_not.index().is_none(),
+        has_not.searchable().is_none(),
         "a source with no index must not look like one that has an empty one"
     );
 }

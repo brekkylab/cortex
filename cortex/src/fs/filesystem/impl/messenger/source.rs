@@ -292,7 +292,7 @@ pub trait MessengerSource: Send + Sync {
     /// `None` by default, which is the honest answer for most of the lane on most credentials.
     /// Slack keeps a message index and refuses it to a bot token; Discord gave bots none at all
     /// until March 2026. A method every source had to write would be one most of them could
-    /// only ever fail, which is the mistake [`FileSystem::index`] is shaped to avoid one level
+    /// only ever fail, which is the mistake [`FileSystem::searchable`] is shaped to avoid one level
     /// up — and this is how a source tells the tree above it which of the two it is.
     ///
     /// Separate from the rest of the trait because the rest is the set of questions *every*
@@ -300,8 +300,8 @@ pub trait MessengerSource: Send + Sync {
     /// [`MessengerFs::index`](super::MessengerFs), which is what turns "this source can be
     /// asked" into "this mount can be searched".
     ///
-    /// [`FileSystem::index`]: crate::fs::FileSystem::index
-    fn as_index(&self) -> Option<&dyn MessengerIndex> {
+    /// [`FileSystem::searchable`]: crate::fs::FileSystem::searchable
+    fn searchable(&self) -> Option<&dyn MessengerSearch> {
         None
     }
 }
@@ -313,10 +313,10 @@ pub trait MessengerSource: Send + Sync {
 /// nothing about which file a message's line ends up in. Turning a hit into a path is the
 /// tree's, because the tree is what spells paths — see [`MessengerFs`](super::MessengerFs).
 ///
-/// Reached only through [`MessengerSource::as_index`]. A source that implements this and
+/// Reached only through [`MessengerSource::searchable`]. A source that implements this and
 /// forgets to override that is a source nothing will ever ask, which is why the override is one
 /// line and sits next to the impl.
-pub trait MessengerIndex: Send + Sync {
+pub trait MessengerSearch: Send + Sync {
     /// Matches for `query`, most relevant or most recent first, at most `count` of them.
     ///
     /// The query is the service's own syntax, untouched. See

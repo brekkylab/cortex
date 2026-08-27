@@ -137,7 +137,7 @@ impl WorkFs {
     /// silently, since nothing downstream can tell a wrong prefix from a deleted file.
     ///
     /// **All of them, not only the interesting ones.** A consumer that wants the ones with an
-    /// index reads [`FileSystem::index`] on each — and the ones *without* are the reason this
+    /// index reads [`FileSystem::searchable`] on each — and the ones *without* are the reason this
     /// does not filter: a store that cannot answer a question is a different fact from a store
     /// nobody asked, and only a consumer that was handed both can tell a reader which it was.
     ///

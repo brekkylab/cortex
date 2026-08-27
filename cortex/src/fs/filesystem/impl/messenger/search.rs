@@ -7,7 +7,7 @@
 //!
 //! # Why the tree does this and not the source
 //!
-//! A [`MessengerIndex`] answers in matches, which carry a conversation and a message and no
+//! A [`MessengerSearch`] answers in matches, which carry a conversation and a message and no
 //! path at all. Spelling the path is [`chat_path`], and it needs two things the match does not
 //! have: the conversation as the *listing* describes it, and the roster that resolves an author
 //! id to a name.
@@ -37,11 +37,11 @@ use crate::fs::{Hit, SearchResult, Searchable};
 impl<S: MessengerSource> Searchable for MessengerFs<S> {
     fn search<'a>(&'a self, query: &'a str, count: usize) -> BoxFuture<'a, SearchResult> {
         Box::pin(async move {
-            // Unreachable through `FileSystem::index`, which hands out `Some(self)` only when
+            // Unreachable through `FileSystem::searchable`, which hands out `Some(self)` only when
             // the source has one. Answered rather than panicked because this is a public trait
             // method and nothing stops a caller holding the store directly.
             let index = self
-                .source_index()
+                .source_searchable()
                 .ok_or_else(|| String::from("this source has no index"))?;
 
             let found = index.search(query, count).await.map_err(|e| e.to_string())?;

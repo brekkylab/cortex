@@ -72,7 +72,7 @@ async fn run() -> ExitCode {
 /// A store is mounted only when its credential is present, so what a fan-out reports on is what
 /// actually exists rather than a roster of what might have. Whether any of them can be
 /// *searched* is not decided here: that is the store's own
-/// [`index`](cortex::fs::FileSystem::index), and reading it is [`Search::over`]'s job.
+/// [`searchable`](cortex::fs::FileSystem::searchable), and reading it is [`Search::over`]'s job.
 fn workspace() -> WorkFs {
     let mut work = WorkFs::new();
 

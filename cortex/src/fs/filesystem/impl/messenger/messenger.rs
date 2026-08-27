@@ -80,7 +80,7 @@ use super::paths::{
     month_dir, month_of, months, thread_file, year_dir,
 };
 use super::source::{
-    ConvId, ConvKind, Conversation, FileRef, MessengerIndex, MessengerSource, MsgId, Window,
+    ConvId, ConvKind, Conversation, FileRef, MessengerSearch, MessengerSource, MsgId, Window,
 };
 use super::{User, render_line};
 use crate::BoxFuture;
@@ -320,8 +320,8 @@ impl<S: MessengerSource> MessengerFs<S> {
     ///
     /// Here rather than read off `self.source` in `search.rs`, because the field is this
     /// module's and the capability is the only part of it a sibling needs.
-    pub(super) fn source_index(&self) -> Option<&dyn MessengerIndex> {
-        self.source.as_index()
+    pub(super) fn source_searchable(&self) -> Option<&dyn MessengerSearch> {
+        self.source.searchable()
     }
 
     pub(super) async fn conversations(&self) -> io::Result<Vec<Conversation>> {
@@ -800,8 +800,8 @@ impl<S: MessengerSource> FileSystem for MessengerFs<S> {
     /// The condition is the source's rather than this type's, which is why it is read here
     /// instead of being a bound on the impl: a bound would mean a source without an index could
     /// not be mounted at all, and reading files is most of what this tree is for.
-    fn index(&self) -> Option<&dyn Searchable> {
-        self.source_index().map(|_| self as &dyn Searchable)
+    fn searchable(&self) -> Option<&dyn Searchable> {
+        self.source_searchable().map(|_| self as &dyn Searchable)
     }
 
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {

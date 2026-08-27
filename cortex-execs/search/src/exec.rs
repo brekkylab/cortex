@@ -34,7 +34,7 @@ asked at all goes to stderr — so a pipeline sees only hits.
     # chat/slack   12 hits (messages)      asked, and here is what it had
     # docs/notion   0 hits (titles only)   asked, and it has none
     # mail/work    could not search: ...   asked, and it would not answer
-    # files/s3      no index               nobody looked here — try grep
+    # files/s3      not searchable         nobody looked here — try grep
 
 Examples
 
@@ -187,7 +187,7 @@ impl Search {
     /// `search` over every store in `work`.
     ///
     /// Mounting is the whole of the registration: a store that answers
-    /// [`FileSystem::index`](cortex::fs::FileSystem::index) is searchable from the moment it is
+    /// [`FileSystem::searchable`](cortex::fs::FileSystem::searchable) is searchable from the moment it is
     /// in the tree. Neither that nor its opposite is a thing to remember to do.
     ///
     /// Every mount is taken, not only the ones with an index, because the ones without are
@@ -277,8 +277,8 @@ impl Search {
             // rather than a list of backends. A store with no index is not a failure and not an
             // empty answer: it is a place nobody looked, it says so on its own line, and it
             // moves no exit code — where a *refusal* below is a fault and forces one.
-            let Some(index) = store.fs.index() else {
-                report.extend_from_slice(format!("# {}  no index\n", store.at).as_bytes());
+            let Some(index) = store.fs.searchable() else {
+                report.extend_from_slice(format!("# {}  not searchable\n", store.at).as_bytes());
                 continue;
             };
             asked += 1;
@@ -325,7 +325,7 @@ impl Search {
             // answering 1 would say the thing is not there, about a place nobody read.
             let mut message = String::from_utf8_lossy(&report).into_owned();
             message.push_str(
-                "search: nothing in scope has an index\n                        an index is what this command asks; grep reads the files themselves\n",
+                "search: nothing in scope is searchable\n                        this command asks a service to search; grep reads the files itself\n",
             );
             return Err(Failure { code: 2, message });
         }

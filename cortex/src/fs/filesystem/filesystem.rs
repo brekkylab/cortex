@@ -428,7 +428,7 @@ pub trait FileSystem: Send + Sync {
     /// Not part of the namespace or the data plane, and reached by neither. No path names an
     /// index, deliberately: a directory that answered searches would have to invent a spelling
     /// for a query, and a query belongs to the service rather than to this tree.
-    fn index(&self) -> Option<&dyn Searchable> {
+    fn searchable(&self) -> Option<&dyn Searchable> {
         None
     }
 }
@@ -502,7 +502,7 @@ impl<T: FileSystem + ?Sized> FileSystem for Arc<T> {
         (**self).flush(path)
     }
 
-    fn index(&self) -> Option<&dyn Searchable> {
-        (**self).index()
+    fn searchable(&self) -> Option<&dyn Searchable> {
+        (**self).searchable()
     }
 }

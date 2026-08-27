@@ -27,7 +27,7 @@
 //!
 //! From the mount table, and from nowhere else. [`Search::over`] reads
 //! [`WorkFs::stores`](cortex::fs::WorkFs::stores), so mounting *is* the registration: a store
-//! that answers [`FileSystem::index`](cortex::fs::FileSystem::index) is searchable from the
+//! that answers [`FileSystem::searchable`](cortex::fs::FileSystem::searchable) is searchable from the
 //! moment it is in the tree, and one that does not is named as unsearched rather than asked.
 //!
 //! That is not a convenience. A hit is only useful because its path opens, and it opens only
@@ -43,7 +43,7 @@
 //! bot token, and an object store has no text index whatsoever. A trait method some stores
 //! could only ever fail is the same mistake as a directory that is always empty — it looks like
 //! a feature and answers like a fault. So the capability is
-//! [`FileSystem::index`](cortex::fs::FileSystem::index), `None` by default, and a store that
+//! [`FileSystem::searchable`](cortex::fs::FileSystem::searchable), `None` by default, and a store that
 //! has none is never asked rather than asked and failed.
 //!
 //! # Three answers, not two
@@ -55,7 +55,7 @@
 //! # chat/slack   12 hits (messages)      asked, and here is what it had
 //! # docs/notion   0 hits (titles only)   asked, and it has none
 //! # mail/work    could not search: …     asked, and it would not answer
-//! # files/s3      no index               nobody looked here
+//! # files/s3      not searchable         nobody looked here
 //! ```
 //!
 //! The last two are the pair worth the trouble. A refusal is a **fault** — a token somebody can

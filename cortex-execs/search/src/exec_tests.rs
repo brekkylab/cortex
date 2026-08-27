@@ -76,7 +76,7 @@ impl FileSystem for Fake {
         Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
     }
 
-    fn index(&self) -> Option<&dyn Searchable> {
+    fn searchable(&self) -> Option<&dyn Searchable> {
         self.indexed.then_some(self as &dyn Searchable)
     }
 }
@@ -341,7 +341,7 @@ async fn a_record_that_does_not_end_its_line_still_gets_one() {
         ) -> BoxFuture<'a, io::Result<usize>> {
             Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
         }
-        fn index(&self) -> Option<&dyn Searchable> {
+        fn searchable(&self) -> Option<&dyn Searchable> {
             Some(self)
         }
     }
@@ -417,7 +417,7 @@ async fn a_store_with_no_index_is_named_as_unsearched() {
     let said = said(&r);
     assert!(said.contains("chat/slack  1 hit"), "{said}");
     assert!(
-        said.contains("files/s3  no index"),
+        said.contains("files/s3  not searchable"),
         "a place nobody looked has to say so: {said}"
     );
     assert!(
@@ -440,7 +440,7 @@ async fn no_index_is_not_a_failure() {
     .await;
 
     assert_eq!(r.exit_code, 1, "everything that could answer did, and none had it");
-    assert!(said(&r).contains("files/s3  no index"), "{}", said(&r));
+    assert!(said(&r).contains("files/s3  not searchable"), "{}", said(&r));
 }
 
 /// A scope that reaches only stores with no index is not an empty result: nothing was read, so
@@ -457,8 +457,8 @@ async fn a_scope_with_no_index_in_it_is_an_error_and_points_at_grep() {
 
     assert_eq!(r.exit_code, 2, "not an empty result");
     let said = said(&r);
-    assert!(said.contains("files/s3  no index"), "{said}");
-    assert!(said.contains("nothing in scope has an index"), "{said}");
+    assert!(said.contains("files/s3  not searchable"), "{said}");
+    assert!(said.contains("nothing in scope is searchable"), "{said}");
     assert!(said.contains("grep"), "it has to say what does work: {said}");
 }
 

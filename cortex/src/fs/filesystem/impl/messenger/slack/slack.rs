@@ -24,7 +24,7 @@ use crate::BoxFuture;
 use super::accessor::{SlackAccessor, SlackConfig};
 use super::super::error::SourceResult;
 use super::super::source::{
-    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerIndex,
+    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerSearch,
     MessengerSource, Message, MsgId, SearchHit, Thread, User, Window,
 };
 
@@ -239,12 +239,12 @@ impl MessengerSource for SlackSource {
     /// So this is `None` for a bot-token mount, and the difference is worth having: a store
     /// that says it has no index is reported as such, where one that offered an index and then
     /// failed every call would spend a request to say the same thing and read as a fault.
-    fn as_index(&self) -> Option<&dyn MessengerIndex> {
-        self.reads_as_user.then_some(self as &dyn MessengerIndex)
+    fn searchable(&self) -> Option<&dyn MessengerSearch> {
+        self.reads_as_user.then_some(self as &dyn MessengerSearch)
     }
 }
 
-impl MessengerIndex for SlackSource {
+impl MessengerSearch for SlackSource {
     fn search<'a>(
         &'a self,
         query: &'a str,

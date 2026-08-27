@@ -57,7 +57,7 @@ pub type SearchResult = Result<Vec<Hit>, String>;
 /// Deliberately one method. Everything else a hit needs — resolving a name, spelling a path,
 /// rendering a record — is knowledge about one store's layout, and belongs with that store.
 ///
-/// Reached through [`FileSystem::index`](super::FileSystem::index), which is `None` by default:
+/// Reached through [`FileSystem::searchable`](super::FileSystem::searchable), which is `None` by default:
 /// not every service has an index a credential may ask. Slack refuses `search.messages` to a
 /// bot token; an object store has no text index whatsoever. A trait method some stores could
 /// only ever fail is the same mistake as a directory that is always empty — it looks like a
@@ -73,13 +73,13 @@ pub type SearchResult = Result<Vec<Hit>, String>;
 ///
 /// Which stores those are is a fact about somebody else's API on a date, and it moves. Discord
 /// offered bots no message search until it shipped one in March 2026 — and this is why that
-/// costs an `index` override rather than a redesign.
+/// costs a `searchable` override rather than a redesign.
 ///
 /// # A store of your own
 ///
 /// Nothing here is sealed and nothing has to be registered anywhere. A store written outside
 /// this crate implements [`FileSystem`](super::FileSystem), overrides
-/// [`index`](super::FileSystem::index), and is searchable the moment it is mounted — because
+/// [`searchable`](super::FileSystem::searchable), and is reachable the moment it is mounted — because
 /// whatever fans out reads the mount table and nothing else.
 ///
 /// ```
@@ -126,7 +126,7 @@ pub type SearchResult = Result<Vec<Hit>, String>;
 /// #       Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
 /// #   }
 ///
-///     fn index(&self) -> Option<&dyn Searchable> {
+///     fn searchable(&self) -> Option<&dyn Searchable> {
 ///         Some(self)
 ///     }
 /// }
@@ -138,7 +138,7 @@ pub type SearchResult = Result<Vec<Hit>, String>;
 /// let mounted = work.stores();
 /// assert_eq!(mounted.len(), 1);
 /// assert_eq!(mounted[0].0.to_str(), Some("tickets"));
-/// assert!(mounted[0].1.index().is_some());
+/// assert!(mounted[0].1.searchable().is_some());
 /// # Ok::<(), std::io::Error>(())
 /// ```
 pub trait Searchable: Send + Sync {
