@@ -64,6 +64,13 @@ const SESSION_IMAGE_BYTES: u64 = 2 << 30;
 /// image spent on a log for writes that are about to be thrown away.
 const SESSION_JOURNAL_BLOCKS: u32 = 4096;
 
+/// How long a provisioning step has to take before finishing it is worth a line. Under this it
+/// was cached, and nobody waited.
+///
+/// Unlike every other duration in this workspace, nothing branches on it: a step that runs past
+/// this is not retried, refused or invalidated, it is only mentioned. See [`took`].
+const ANNOUNCE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Base directory for what is shared between sessions — `CORTEX_UVM_HOME`, else
 /// `$HOME/.cortex/uvm`.
 pub fn home() -> io::Result<PathBuf> {
@@ -200,6 +207,7 @@ async fn pull(reference: &str) -> anyhow::Result<BaseImage> {
     // rather than being guarded by a path test: what "cached" means is the cache's to decide,
     // and a layer that was half-written is a case only it can see.
     eprintln!("cortex-uvm-console: resolving {reference}");
+    let started = std::time::Instant::now();
     let pulled = registry
         .pull(
             &reference,
@@ -210,6 +218,7 @@ async fn pull(reference: &str) -> anyhow::Result<BaseImage> {
         )
         .await
         .map_err(|e| anyhow::anyhow!("pulling {reference}: {e}"))?;
+    took(&format_args!("{reference}"), started);
 
     let path = cache.vmdk_path(&pulled.manifest_digest);
     anyhow::ensure!(
@@ -464,6 +473,7 @@ impl Rootfs {
         // one GET.
         let tmp = dest.with_extension("download");
         eprintln!("cortex-uvm-console: downloading {}", self.url);
+        let started = std::time::Instant::now();
         let status = tokio::process::Command::new("curl")
             .arg("-fsSL")
             .arg(self.url)
@@ -489,7 +499,26 @@ impl Rootfs {
         }
 
         std::fs::rename(&tmp, &dest)?;
+        took(&format_args!("{}", self.name), started);
         Ok(dest)
+    }
+}
+
+/// Say that something slow is done, and how slow it was.
+///
+/// Only when it was actually slow. Provisioning is announced before it starts, because the point
+/// of announcing is a wait somebody is sitting through; a cached boot does the same work in
+/// milliseconds and a second line about it is noise on every session that ever starts.
+///
+/// **The pairing is what carries the information.** One line and no second one means it was
+/// already there; one line and then another means the seconds in between were this.
+fn took(what: &std::fmt::Arguments<'_>, since: std::time::Instant) {
+    let elapsed = since.elapsed();
+    if elapsed >= ANNOUNCE_AFTER {
+        eprintln!(
+            "cortex-uvm-console: {what} ready in {:.1}s",
+            elapsed.as_secs_f64()
+        );
     }
 }
 
@@ -519,6 +548,14 @@ async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Announced like the download above, and for the same reason: it is minutes of CPU on a
+    // cold cache and there is nothing else on stderr to say a session is still coming up.
+    eprintln!(
+        "cortex-uvm-console: encoding {}",
+        tarball.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let started = std::time::Instant::now();
+
     let file = tokio::fs::File::open(tarball).await?;
     let ingested = ingest_compressed_tar(file, Compression::Gzip, &ResourceLimits::default(), None)
         .await
@@ -535,5 +572,12 @@ async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("encoding the base image: {e:?}"))?;
 
     std::fs::rename(&tmp, image)?;
+    took(
+        &format_args!(
+            "{}",
+            image.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        started,
+    );
     Ok(())
 }
