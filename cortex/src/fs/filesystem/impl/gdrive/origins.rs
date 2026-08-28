@@ -19,7 +19,7 @@ pub(crate) const OAUTH_ORIGIN: &str = "https://oauth2.googleapis.com";
 /// Deployment-level only: the token endpoint receives the app's client secret, so
 /// none of this may be user-suppliable.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Origins {
+pub struct GdriveOrigins {
     /// Serves the OAuth token endpoint (`{oauth}/token`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<String>,
@@ -37,7 +37,7 @@ pub struct Origins {
     pub slides: Option<String>,
 }
 
-impl Origins {
+impl GdriveOrigins {
     /// Whether nothing is overridden, so the field can stay out of a serialized
     /// config.
     pub fn is_default(&self) -> bool {
@@ -76,17 +76,17 @@ mod tests {
     /// also have to know which path this code would have appended.
     #[test]
     fn an_override_replaces_only_its_own_origin() {
-        let o = Origins {
+        let o = GdriveOrigins {
             sheets: Some("http://localhost:9000/sheets-api/".into()),
             ..Default::default()
         };
         assert_eq!(
-            Origins::origin(&o.sheets, "https://sheets.googleapis.com"),
+            GdriveOrigins::origin(&o.sheets, "https://sheets.googleapis.com"),
             "http://localhost:9000/sheets-api",
             "trailing slash trimmed, so the caller need not care"
         );
         assert_eq!(
-            Origins::origin(&o.docs, "https://docs.googleapis.com"),
+            GdriveOrigins::origin(&o.docs, "https://docs.googleapis.com"),
             "https://docs.googleapis.com",
             "the rest stay on Google"
         );
@@ -96,13 +96,16 @@ mod tests {
     /// Google's own paths do.
     #[test]
     fn behind_one_host_lays_the_services_out_by_name() {
-        let o = Origins::behind("https://mock.example.com/");
+        let o = GdriveOrigins::behind("https://mock.example.com/");
         assert_eq!(o.oauth.as_deref(), Some("https://mock.example.com/oauth2"));
         assert_eq!(o.drive.as_deref(), Some("https://mock.example.com/drive"));
         assert_eq!(o.docs.as_deref(), Some("https://mock.example.com/docs"));
         assert_eq!(o.sheets.as_deref(), Some("https://mock.example.com/sheets"));
         assert_eq!(o.slides.as_deref(), Some("https://mock.example.com/slides"));
         assert!(!o.is_default());
-        assert!(Origins::default().is_default(), "nothing set stays absent");
+        assert!(
+            GdriveOrigins::default().is_default(),
+            "nothing set stays absent"
+        );
     }
 }

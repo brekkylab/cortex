@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use serde_json::json;
 
-use super::super::Origins;
+use super::super::GdriveOrigins;
 use super::*;
 
 /// The size a listing row came with.
@@ -428,7 +428,7 @@ fn mock_config() -> Option<GdriveConfig> {
         client_secret: "mock".into(),
         refresh_token: std::env::var("GOOGLE_MOCK_TOKEN")
             .unwrap_or_else(|_| "admin-service-token".into()),
-        origins: Origins::behind(&std::env::var("GOOGLE_API_BASE_URL").ok()?),
+        origins: GdriveOrigins::behind(&std::env::var("GOOGLE_API_BASE_URL").ok()?),
     })
 }
 
@@ -778,7 +778,7 @@ async fn gdrive_live_originals_read_by_range() {
 // Drive behind a loopback mock.
 //
 // A `tokio::net::TcpListener` answering canned Drive and Docs responses, pointed at
-// with `Origins`, counting the `Range` of every request and the bytes handed back.
+// with `GdriveOrigins`, counting the `Range` of every request and the bytes handed back.
 // Which is the only way to tell a window from a whole object, and so the only way to
 // hold the difference these tests exist for. No credentials, no new dependency.
 // ---------------------------------------------------------------------------
@@ -802,7 +802,7 @@ impl Mock {
             client_id: "cid".into(),
             client_secret: "cs".into(),
             refresh_token: "rt".into(),
-            origins: Origins::behind(&self.addr),
+            origins: GdriveOrigins::behind(&self.addr),
         }
     }
 
@@ -1112,7 +1112,6 @@ async fn an_unsized_file_is_measured_then_read_by_spans() {
     );
 }
 
-
 /// A document is the other kind of placeholder: no ranged read exists for it, so the
 /// wrapper has to fetch it whole and keep it, or every window rebuilds it.
 #[tokio::test]
@@ -1146,8 +1145,8 @@ async fn a_document_is_built_once_and_served_from_the_cache() {
     );
     assert!(
         fs.read_window(Path::new("/My Drive/notes.gdoc.json"), Some(0..CHUNK))
-        .await
-        .is_err(),
+            .await
+            .is_err(),
         "the mock serves no document API"
     );
 }
@@ -1232,7 +1231,10 @@ async fn a_document_is_padded_out_with_whitespace_and_not_with_zeros() {
     let mut at = 0usize;
     while at < whole.len() {
         let n = fs.read_at(path, &mut whole[at..], at as u64).await.unwrap();
-        assert_ne!(n, 0, "a read inside the claimed length never says end of file");
+        assert_ne!(
+            n, 0,
+            "a read inside the claimed length never says end of file"
+        );
         at += n;
     }
 
@@ -1240,7 +1242,10 @@ async fn a_document_is_padded_out_with_whitespace_and_not_with_zeros() {
         .map(|_| ())
         .map(|()| whole.iter().rposition(|b| *b != b'\n').unwrap() + 1)
         .expect("the whole claimed length parses as one JSON document");
-    assert!(json_len < claimed as usize, "the JSON is shorter than the claim");
+    assert!(
+        json_len < claimed as usize,
+        "the JSON is shorter than the claim"
+    );
     assert!(
         whole[json_len..].iter().all(|b| *b == b'\n'),
         "everything past the JSON is newline, and none of it is zero"
@@ -1298,9 +1303,7 @@ async fn an_oversized_document_stops_being_read() {
     fs.stat(path).await.unwrap();
 
     assert!(
-        fs.read_window(path, Some(0..256 * 1024))
-            .await
-            .is_err(),
+        fs.read_window(path, Some(0..256 * 1024)).await.is_err(),
         "a document past the ceiling is refused"
     );
     let sent = mock.bytes_sent();
@@ -1389,10 +1392,7 @@ async fn an_empty_window_does_not_fetch_the_object() {
     fs.stat(file).await.unwrap();
 
     mock.reset();
-    let got = fs
-        .read_window(file, Some(1024..1024))
-        .await
-        .unwrap();
+    let got = fs.read_window(file, Some(1024..1024)).await.unwrap();
     assert!(got.is_empty());
     assert_eq!(
         mock.media_ranges(),
@@ -1425,10 +1425,7 @@ async fn a_listing_cache_does_not_grow_without_bound() {
     // life of the mount — two survive, because resolving `/Shared with me` re-lists the
     // root on the way to it, and both of those are fresh.
     fs.age_listings_for_test().await;
-    let _ = fs
-        .list(Path::new("/Shared with me"))
-        .await
-        .unwrap();
+    let _ = fs.list(Path::new("/Shared with me")).await.unwrap();
     assert_eq!(
         fs.listings_retained().await,
         2,
@@ -1467,7 +1464,10 @@ async fn the_document_cache_drops_the_oldest_to_fit_the_newest() {
     let second = dir.join("second.gdoc.json");
 
     let a = fs.read_window(&first, None).await.unwrap();
-    assert!(a.len() as u64 > MAX_DOCUMENT_BYTES / 2, "one that cannot share");
+    assert!(
+        a.len() as u64 > MAX_DOCUMENT_BYTES / 2,
+        "one that cannot share"
+    );
     let (n, held) = fs.rendered_held().await;
     assert_eq!(n, 1, "the one just read");
     assert!(held <= RENDERED_BUDGET);
@@ -1515,7 +1515,7 @@ async fn one_service_can_move_without_moving_the_others() {
         client_id: "cid".into(),
         client_secret: "cs".into(),
         refresh_token: "rt".into(),
-        origins: Origins {
+        origins: GdriveOrigins {
             drive: Some(format!("{}/drive", a.addr)),
             oauth: Some(format!("{}/oauth2", a.addr)),
             sheets: Some(format!("{}/sheets", b.addr)),
@@ -1586,10 +1586,7 @@ async fn a_backwards_window_does_not_take_the_process_down() {
         assert!(got.is_empty(), "{start}..{end} should read nothing");
     }
     // And a forwards one still works.
-    let got = fs
-        .read_window(file, Some(0..512))
-        .await
-        .unwrap();
+    let got = fs.read_window(file, Some(0..512)).await.unwrap();
     assert_eq!(got.len(), 512);
 }
 
@@ -1707,7 +1704,11 @@ async fn a_head_read_costs_its_window_and_only_a_walk_pays_for_a_span() {
         .read_window(file, Some(SPAN_1 - CHUNK / 2..SPAN_1 + CHUNK / 2))
         .await
         .unwrap();
-    assert_eq!(over.len() as u64, CHUNK, "a window across the span boundary");
+    assert_eq!(
+        over.len() as u64,
+        CHUNK,
+        "a window across the span boundary"
+    );
     assert_eq!(
         mock.media_ranges(),
         vec![Some(format!(

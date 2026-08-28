@@ -60,8 +60,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 #   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
 #   for f in "" "--features fuse" "--features fuse-t" \
 #            "--features fuse-no-mount" "--features s3" "--features notion" \
+#            "--features gdrive" \
 #            "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,s3,notion"; do cargo test -p cortex $f --all-targets; done
+#            "--features fuse,fuse-t,s3,notion,gdrive"; do cargo test -p cortex $f --all-targets; done
 #
 # Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
 # unquoted expansion — under zsh pass the flags as separate arguments.

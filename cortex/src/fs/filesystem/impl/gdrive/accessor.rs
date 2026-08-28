@@ -3,11 +3,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::origins::{OAUTH_ORIGIN, Origins};
+use super::origins::{GdriveOrigins, OAUTH_ORIGIN};
 use tokio::sync::Mutex;
 
 /// The origin each service lives on, without the version suffix this code appends —
-/// see [`Origins`], which overrides these one at a time.
+/// see [`GdriveOrigins`], which overrides these one at a time.
 const DRIVE_ORIGIN: &str = "https://www.googleapis.com/drive";
 /// The Docs-editors types live behind their own APIs, on their own hosts. Drive can
 /// only *export* them; their structure (paragraph indices, formulas, slide geometry)
@@ -18,8 +18,8 @@ const SLIDES_ORIGIN: &str = "https://slides.googleapis.com";
 
 /// Every host this accessor talks to, resolved once from a config.
 ///
-/// Each is an origin from [`Origins`] plus the version suffix the official API uses,
-/// so nothing here encodes any one deployment's path layout: point `Origins::drive` at
+/// Each is an origin from [`GdriveOrigins`] plus the version suffix the official API uses,
+/// so nothing here encodes any one deployment's path layout: point `GdriveOrigins::drive` at
 /// a gateway and `/v3` still follows, exactly as it does against Google.
 #[derive(Clone)]
 struct Endpoints {
@@ -30,13 +30,13 @@ struct Endpoints {
     slides: String,
 }
 
-fn endpoints(o: &Origins) -> Endpoints {
+fn endpoints(o: &GdriveOrigins) -> Endpoints {
     Endpoints {
-        drive: format!("{}/v3", Origins::origin(&o.drive, DRIVE_ORIGIN)),
-        token: format!("{}/token", Origins::origin(&o.oauth, OAUTH_ORIGIN)),
-        docs: format!("{}/v1", Origins::origin(&o.docs, DOCS_ORIGIN)),
-        sheets: format!("{}/v4", Origins::origin(&o.sheets, SHEETS_ORIGIN)),
-        slides: format!("{}/v1", Origins::origin(&o.slides, SLIDES_ORIGIN)),
+        drive: format!("{}/v3", GdriveOrigins::origin(&o.drive, DRIVE_ORIGIN)),
+        token: format!("{}/token", GdriveOrigins::origin(&o.oauth, OAUTH_ORIGIN)),
+        docs: format!("{}/v1", GdriveOrigins::origin(&o.docs, DOCS_ORIGIN)),
+        sheets: format!("{}/v4", GdriveOrigins::origin(&o.sheets, SHEETS_ORIGIN)),
+        slides: format!("{}/v1", GdriveOrigins::origin(&o.slides, SLIDES_ORIGIN)),
     }
 }
 
@@ -202,8 +202,8 @@ pub struct GdriveConfig {
     /// mock or a gateway). Deployment-level only — the token endpoint receives the
     /// app's client secret, so this is NOT part of the mount-create API; the backend
     /// injects it from its own config.
-    #[serde(default, skip_serializing_if = "Origins::is_default")]
-    pub origins: Origins,
+    #[serde(default, skip_serializing_if = "GdriveOrigins::is_default")]
+    pub origins: GdriveOrigins,
 }
 
 /// Holds Google OAuth credentials (one refresh token) and a cached access
@@ -661,7 +661,7 @@ mod tests {
     /// deployment lays out its paths.
     #[test]
     fn each_service_keeps_its_official_path_under_any_origin() {
-        let e = endpoints(&Origins::default());
+        let e = endpoints(&GdriveOrigins::default());
         assert_eq!(e.drive, "https://www.googleapis.com/drive/v3");
         assert_eq!(e.token, "https://oauth2.googleapis.com/token");
         assert_eq!(e.docs, "https://docs.googleapis.com/v1");
@@ -669,7 +669,7 @@ mod tests {
         assert_eq!(e.slides, "https://slides.googleapis.com/v1");
 
         // One service moves, the rest stay on Google.
-        let e = endpoints(&Origins {
+        let e = endpoints(&GdriveOrigins {
             sheets: Some("http://localhost:9000/sheets-api/".into()),
             ..Default::default()
         });
@@ -677,7 +677,7 @@ mod tests {
         assert_eq!(e.docs, "https://docs.googleapis.com/v1");
 
         // `behind` covers one host serving all of them; trailing slash tolerated.
-        let e = endpoints(&Origins::behind("http://localhost:8000/"));
+        let e = endpoints(&GdriveOrigins::behind("http://localhost:8000/"));
         assert_eq!(e.drive, "http://localhost:8000/drive/v3");
         assert_eq!(e.token, "http://localhost:8000/oauth2/token");
         assert_eq!(e.docs, "http://localhost:8000/docs/v1");

@@ -95,4 +95,4 @@ pub use gdrive::GdriveFs;
 // `GdriveConfig::origins` is public, so whoever builds one has to be able to name its
 // type. The accessor beside it is not: nothing outside this module has business
 // holding a Drive client that is not a mount.
-pub use origins::Origins;
+pub use origins::GdriveOrigins;
