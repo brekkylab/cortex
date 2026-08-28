@@ -398,8 +398,6 @@ async fn a_delegated_call_carries_the_directory_and_the_environment_together() {
 /// different backend entirely. Refusing says so while the client can still pick one.
 #[tokio::test]
 async fn a_host_local_session_has_no_base_to_swap() {
-    use cortex::console::ImageSource;
-
     // Asking for nothing is not asking for less: the session every client had before there was
     // a base to name.
     let console = built_on(None).await.expect("a session that named nothing");
@@ -410,7 +408,7 @@ async fn a_host_local_session_has_no_base_to_swap() {
     );
     drop(console);
 
-    let err = match built_on(Some(ImageSource::new("python:3.13-slim"))).await {
+    let err = match built_on(Some("python:3.13-slim".into())).await {
         Err(e) => e,
         Ok(_) => panic!("a session was opened on an image this backend cannot provide"),
     };

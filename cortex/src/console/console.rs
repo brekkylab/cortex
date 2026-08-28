@@ -201,11 +201,11 @@ impl ConsoleBuilder {
     /// The base the session's commands run in, named as an OCI image.
     ///
     /// ```no_run
-    /// # use cortex::console::{Console, ImageSource};
+    /// # use cortex::console::Console;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = Console::builder()
     ///     .stdio_client(&["cortex-uvm-console"])
-    ///     .image(ImageSource::new("python:3.13-slim"))
+    ///     .image("python:3.13-slim")
     ///     .build()
     ///     .await?;
     /// # Ok(()) }
@@ -224,8 +224,8 @@ impl ConsoleBuilder {
     ///
     /// Leaving it out leaves the choice to the server, and [`Console::image`] is then how to
     /// find out what it chose.
-    pub fn image(mut self, image: ImageSource) -> Self {
-        self.image = Some(image);
+    pub fn image(mut self, image: impl Into<ImageSource>) -> Self {
+        self.image = Some(image.into());
         self
     }
 

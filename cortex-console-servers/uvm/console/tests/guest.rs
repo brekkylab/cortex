@@ -160,7 +160,7 @@ impl Fixture {
     /// Over the channel and not through the server's environment, which is the point: what a
     /// client declares in its `init` is what the session runs on, and the server's own setting
     /// is only the answer when nothing was declared.
-    async fn asking_for(image: ImageSource) -> anyhow::Result<Fixture> {
+    async fn asking_for(image: impl Into<ImageSource>) -> anyhow::Result<Fixture> {
         let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
         server.stderr(Stdio::inherit());
         let client = cortex::console::stdio::StdioClient::new(server)?;
@@ -332,7 +332,7 @@ async fn commands_run_in_a_guest_of_their_own() {
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and a registry pull"]
 async fn an_oci_image_is_a_base_and_its_environment_is_the_command_s() {
-    let mut fx = Fixture::asking_for(ImageSource::new("python:3.13-slim"))
+    let mut fx = Fixture::asking_for("python:3.13-slim")
         .await
         .expect("a session on an image it named");
 
@@ -398,7 +398,7 @@ async fn the_base_in_force_is_answered_whoever_chose_it() {
     drop(quiet);
 
     // Declared, and it wins: the environment above says something else entirely.
-    let asked = Fixture::asking_for(ImageSource::new("python:3.13-slim"))
+    let asked = Fixture::asking_for("python:3.13-slim")
         .await
         .expect("a session on an image it named");
     assert_eq!(
@@ -420,7 +420,7 @@ async fn the_base_in_force_is_answered_whoever_chose_it() {
 /// registry's answer and takes a pull, so it belongs to a boot.
 #[tokio::test]
 async fn a_reference_that_is_not_one_is_refused_before_a_vm_is_started() {
-    let err = match Fixture::asking_for(ImageSource::new("nota reference")).await {
+    let err = match Fixture::asking_for("nota reference").await {
         Err(e) => e,
         Ok(_) => panic!("a session was opened on something that is not a reference"),
     };

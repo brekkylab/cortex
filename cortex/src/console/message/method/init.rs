@@ -54,9 +54,12 @@ pub struct Init {
 ///
 /// ```
 /// # use cortex::console::ImageSource;
-/// ImageSource::new("python:3.13-slim");
+/// ImageSource::from("python:3.13-slim");
 /// ImageSource::new("ghcr.io/org/tool@sha256:2f0e…");
 /// ```
+///
+/// A reference converts, so a caller with nothing to say beyond the name passes the name:
+/// `.image("python:3.13-slim")`.
 ///
 /// The grammar is the registries' own: an optional host, a repository, and a tag or a digest.
 /// No scheme is put in front of it, because a reference already says where it comes from and
@@ -87,6 +90,24 @@ impl ImageSource {
         ImageSource {
             reference: reference.into(),
         }
+    }
+}
+
+/// So a caller who has a reference and nothing to say about it writes the reference.
+///
+/// Nothing is checked here, which is the same as [`new`](ImageSource::new) and for the same
+/// reason: whether a string is a reference is the server's to answer, and there is one place
+/// that answers it. A convenience that validated would be a second one, disagreeing with the
+/// first the day a registry's grammar moves.
+impl From<&str> for ImageSource {
+    fn from(reference: &str) -> Self {
+        ImageSource::new(reference)
+    }
+}
+
+impl From<String> for ImageSource {
+    fn from(reference: String) -> Self {
+        ImageSource::new(reference)
     }
 }
 
@@ -354,6 +375,16 @@ mod tests {
         assert_eq!(
             bson::deserialize_from_document::<InitResult>(doc).unwrap(),
             answered,
+        );
+
+        // A reference is enough on its own, and converting is the same as spelling it out.
+        assert_eq!(
+            ImageSource::from("python:3.13-slim"),
+            ImageSource::new("python:3.13-slim"),
+        );
+        assert_eq!(
+            ImageSource::from("python:3.13-slim".to_string()),
+            ImageSource::new("python:3.13-slim"),
         );
 
         // A session that says nothing about a base still serializes to what it always did.
