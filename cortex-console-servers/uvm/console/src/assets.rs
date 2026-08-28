@@ -43,9 +43,7 @@ use microsandbox_image::{
     tree::ResourceLimits,
 };
 
-use crate::contract::{
-    BaseFormat, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec, SESSION_IMAGE_ENV,
-};
+use crate::contract::{BaseFormat, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec};
 
 /// The guest half, cross-compiled and embedded by `build.rs`. Written into every boot
 /// root, which is why the guest crate optimises for size.
@@ -143,6 +141,12 @@ pub struct BaseImage {
 /// caller who wants to *follow* a tag is asking for something this does not do; a digest
 /// says what you get and is the spelling to prefer.
 pub const IMAGE_ENV: &str = "CORTEX_UVM_IMAGE";
+
+/// A writable session image to reuse instead of a fresh one, as a host path.
+///
+/// A caller's knob and not a computed value: read from this server's own environment, like
+/// [`IMAGE_ENV`]. A session that survives the console, for whoever wants one.
+pub const SESSION_IMAGE_ENV: &str = "CORTEX_UVM_SESSION_IMAGE";
 
 /// The read-only base image every session overlays, provisioning it once if it is not
 /// cached.

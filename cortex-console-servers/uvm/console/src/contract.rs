@@ -1,11 +1,11 @@
 //! What a boot tells the guest, and what a boot child is told.
 //!
-//! Two cross-process contracts happen to be the same handful of strings, so they live
-//! together:
+//! Two cross-process contracts live together here, and they are not the same kind of thing:
 //!
-//! - **this process to the boot child** ([`KERNEL_ENV`] and the rest). The child is a copy
-//!   of this binary in the [`Boot`](crate::Role::Boot) role, so both ends are this crate
-//!   and nothing here can drift.
+//! - **this process to the boot child** ([`BootArgs`]). A `Command::spawn`, so it is the
+//!   child's command line. The child is a copy of this binary in the
+//!   [`Boot`](crate::Role::Boot) role, and both ends are this one type, so nothing there
+//!   can drift.
 //! - **this process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`SHARE_ENV`],
 //!   [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]). The other end of that one is
 //!   `cortex-uvm-guest`'s `contract` module, which **has to change with this file** — the
@@ -17,10 +17,16 @@
 //! on both sides of the hypervisor is what lets a `cwd` the guest reports be a path the
 //! client can open, with nothing in the middle translating and nothing to disagree about.
 //!
-//! The environment is the channel because it is the only one libkrun's `exec` has that
-//! survives: an argument becomes part of the guest's kernel command line, which is
-//! size-limited and rejects a newline. Nothing that could grow is here — the session
-//! itself arrives on [`PORT_NAME`] as protocol frames.
+//! The **guest** half is environment because that is the only channel libkrun's `exec` has:
+//! an argv and an env value alike become part of the guest's kernel command line, which is
+//! size-limited and rejects a newline. Nothing that could grow is there — the session itself
+//! arrives on [`PORT_NAME`] as protocol frames, and an image's own `ENV` goes as a file (see
+//! [`IMAGE_SPEC_PATH`]). None of that constrains [`BootArgs`], which is an ordinary spawn.
+
+use std::{
+    ffi::{OsStr, OsString},
+    path::PathBuf,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,53 +47,6 @@ pub const PORT_NAME: &str = "cortex-console";
 /// guest saying that something is reading.
 pub const HANDSHAKE: &[u8; 8] = b"CORTEXUV";
 
-/// The libkrunfw kernel the child boots.
-pub const KERNEL_ENV: &str = "CORTEX_UVM_KERNEL";
-
-/// The boot root: a directory served as the guest's virtio-fs root, holding the guest
-/// binary and nothing else.
-pub const BOOT_ROOT_ENV: &str = "CORTEX_UVM_BOOT_ROOT";
-
-/// Where the child connects to reach this process. One socket, one connection, and its
-/// descriptor becomes the guest's console port.
-pub const CHANNEL_ENV: &str = "CORTEX_UVM_CHANNEL";
-
-/// Guest vCPU count, if the caller overrode it.
-pub const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
-
-/// Guest memory in MiB, if the caller overrode it.
-pub const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
-
-/// The host directory to put in front of the guest — the tree the session works in.
-///
-/// A path and nothing else, because that is all a tree is now: whatever it is made of was
-/// realized on the host before this, and what a guest gets is the directory it was mounted
-/// at. Nothing secret travels here, which is what lets it be an environment value at all.
-///
-/// Unset means a session that declared no tree, which is a session.
-pub const WORKFS_ENV: &str = "CORTEX_UVM_WORKFS";
-
-/// The read-only base image, as a host path (the child) — and as a guest block device
-/// (the guest). Both ends of the overlay are named twice for that reason: one side has a
-/// file, the other has a device.
-///
-/// A server's answer and not a caller's: the path is whatever provisioning the session's image
-/// produced. **Which image** is `CORTEX_UVM_IMAGE`, or the `init` that beats it.
-pub const BASE_IMAGE_ENV: &str = "CORTEX_UVM_BASE_IMAGE";
-
-/// How the base image is laid out on the host, spelled as one of [`BaseFormat`]'s names.
-///
-/// A boot is told rather than left to guess from a path: a registry pull's base is a VMDK
-/// descriptor stitching per-layer EROFS blobs, where a tarball's is a single raw EROFS, and
-/// the guest mounts both as `erofs` — the difference is only what the VMM has to read.
-///
-/// Computed by the server and never set by hand: what a base is laid out as is decided by how
-/// it was provisioned, one function above the process that reads this.
-pub const BASE_FORMAT_ENV: &str = "CORTEX_UVM_BASE_FORMAT";
-
-/// The session's writable image, as a host path.
-pub const SESSION_IMAGE_ENV: &str = "CORTEX_UVM_SESSION_IMAGE";
-
 /// The overlay's lower, as the guest sees it. Attach order is what fixes the names, so
 /// this is a promise [`crate::boot`] keeps rather than something either end computes.
 pub const GUEST_LOWER_DEV: &str = "/dev/vdb";
@@ -107,6 +66,159 @@ pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
 /// The virtio-fs tag the tree is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
 pub const WORKFS_TAG: &str = "cortexws";
+
+/// Everything a console server tells a boot, as the boot's own command line.
+///
+/// # Why arguments and not the environment
+///
+/// The two halves of this file are two channels, and only one of them is constrained. What a
+/// boot tells the *guest* has to be environment, because libkrun puts an exec's argv and env
+/// alike on the kernel command line. What a *server* tells a boot is an ordinary
+/// `Command::spawn`, and there was never a reason for it to be ambient.
+///
+/// **Ambient was the problem.** A child inherits its parent's environment, so a name the server
+/// wrote for the boot was also a name an operator could set on the server, and one of them came
+/// to mean two things. An argument cannot be inherited: everything here is either passed or
+/// absent, and absent is a parse error rather than a silently different session.
+///
+/// The other half of it is that this is one type with one `to_args` and one `parse`, so a value
+/// added to one side is a value the other side stops compiling without. The constants this
+/// replaced were shared names read in two places, which is a weaker promise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BootArgs {
+    /// The libkrunfw kernel the child boots.
+    pub kernel: PathBuf,
+
+    /// A directory served as the guest's virtio-fs root, holding the guest binary and the
+    /// image spec and nothing else.
+    pub boot_root: PathBuf,
+
+    /// Where the child connects to reach the server. One socket, one connection, and its
+    /// descriptor becomes the guest's console port.
+    pub channel: PathBuf,
+
+    /// The read-only base image, as a host path, and how the VMM has to read it. The two travel
+    /// together because they are one fact: what the server provisioned.
+    pub base: PathBuf,
+    pub base_format: BaseFormat,
+
+    /// The session's writable image, as a host path.
+    pub session: PathBuf,
+
+    /// The host directory to put in front of the guest, and `None` for a session that declared
+    /// no tree. Mounted in the guest at **this same path** — see [`SHARE_ENV`].
+    pub workfs: Option<PathBuf>,
+
+    /// Guest vCPUs and memory, when the server was told to override them.
+    pub vcpus: Option<u8>,
+    pub memory_mib: Option<u32>,
+}
+
+impl BootArgs {
+    /// The arguments a server spawns a boot with, after [`BOOT_ARG`](crate::server::BOOT_ARG).
+    ///
+    /// `OsString` throughout: a path that is not UTF-8 is still a path, and nothing here has to
+    /// read one as text. The one exception is `workfs`, which the guest is told about as a
+    /// string, and that is refused where it is used rather than here.
+    pub fn to_args(&self) -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::new();
+        let mut put = |flag: &str, value: &OsStr| {
+            args.push(OsString::from(flag));
+            args.push(value.to_os_string());
+        };
+
+        put("--kernel", self.kernel.as_os_str());
+        put("--boot-root", self.boot_root.as_os_str());
+        put("--channel", self.channel.as_os_str());
+        put("--base", self.base.as_os_str());
+        put("--base-format", OsStr::new(self.base_format.as_str()));
+        put("--session", self.session.as_os_str());
+        if let Some(workfs) = &self.workfs {
+            put("--workfs", workfs.as_os_str());
+        }
+        if let Some(vcpus) = self.vcpus {
+            put("--vcpus", OsStr::new(&vcpus.to_string()));
+        }
+        if let Some(memory) = self.memory_mib {
+            put("--memory-mib", OsStr::new(&memory.to_string()));
+        }
+        args
+    }
+
+    /// Read them back, refusing anything this does not recognise.
+    ///
+    /// A boot is started by a console server and by nothing else, so a missing argument is a
+    /// mismatch between two halves of one binary rather than a caller to be lenient with. It is
+    /// refused before a hypervisor is touched, which is the cheapest place it can be.
+    pub fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<BootArgs> {
+        let mut kernel = None;
+        let mut boot_root = None;
+        let mut channel = None;
+        let mut base = None;
+        let mut base_format = None;
+        let mut session = None;
+        let mut workfs = None;
+        let mut vcpus = None;
+        let mut memory_mib = None;
+
+        let mut args = args.into_iter();
+        while let Some(flag) = args.next() {
+            let flag = flag
+                .into_string()
+                .map_err(|flag| anyhow::anyhow!("{flag:?} is not an argument this reads"))?;
+            let mut value = || {
+                args.next()
+                    .ok_or_else(|| anyhow::anyhow!("{flag} was given nothing to be"))
+            };
+            match flag.as_str() {
+                "--kernel" => kernel = Some(PathBuf::from(value()?)),
+                "--boot-root" => boot_root = Some(PathBuf::from(value()?)),
+                "--channel" => channel = Some(PathBuf::from(value()?)),
+                "--base" => base = Some(PathBuf::from(value()?)),
+                "--base-format" => base_format = Some(text(&flag, value()?)?),
+                "--session" => session = Some(PathBuf::from(value()?)),
+                "--workfs" => workfs = Some(PathBuf::from(value()?)),
+                "--vcpus" => vcpus = Some(number(&flag, value()?)?),
+                "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
+                other => anyhow::bail!("{other} is not an argument a boot takes"),
+            }
+        }
+
+        let required = |name: &str, value: Option<PathBuf>| {
+            value
+                .ok_or_else(|| anyhow::anyhow!("{name} is missing — a boot is started by a server"))
+        };
+        Ok(BootArgs {
+            kernel: required("--kernel", kernel)?,
+            boot_root: required("--boot-root", boot_root)?,
+            channel: required("--channel", channel)?,
+            base: required("--base", base)?,
+            base_format: match base_format {
+                Some(spelling) => BaseFormat::parse(&spelling)?,
+                None => anyhow::bail!("--base-format is missing — a boot is started by a server"),
+            },
+            session: required("--session", session)?,
+            workfs,
+            vcpus,
+            memory_mib,
+        })
+    }
+}
+
+/// An argument's value as text, for the few that are not paths.
+fn text(flag: &str, value: OsString) -> anyhow::Result<String> {
+    value
+        .into_string()
+        .map_err(|value| anyhow::anyhow!("{flag} is not utf-8: {value:?}"))
+}
+
+/// An argument's value as a number. Refused rather than defaulted: a server computed it, so a
+/// value that is not one is a bug on this side of the process boundary.
+fn number<T: std::str::FromStr>(flag: &str, value: OsString) -> anyhow::Result<T> {
+    text(flag, value)?
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{flag} is not a number"))
+}
 
 /// How the read-only base image is laid out on the host — the value of [`BASE_FORMAT_ENV`],
 /// and what a boot turns into a disk format.
@@ -135,7 +247,7 @@ impl BaseFormat {
         match spelling {
             "raw" => Ok(BaseFormat::Raw),
             "vmdk" => Ok(BaseFormat::Vmdk),
-            other => anyhow::bail!("{BASE_FORMAT_ENV}: {other} is not `raw` or `vmdk`"),
+            other => anyhow::bail!("--base-format: {other} is not `raw` or `vmdk`"),
         }
     }
 }
@@ -176,6 +288,90 @@ pub struct ImageSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args() -> BootArgs {
+        BootArgs {
+            kernel: "/opt/lib/libkrunfw.dylib".into(),
+            boot_root: "/tmp/boot-root".into(),
+            channel: "/tmp/sock".into(),
+            base: "/cache/oci/vmdk/sha256_7e6269.vmdk".into(),
+            base_format: BaseFormat::Vmdk,
+            session: "/tmp/session.ext4".into(),
+            workfs: Some("/Users/someone/project".into()),
+            vcpus: Some(4),
+            memory_mib: Some(8192),
+        }
+    }
+
+    /// Everything this writes is something it reads. Both ends are this type, so the compiler
+    /// catches a field added to one side — what it cannot catch is a field written under one
+    /// name and read under another, which is what this is for.
+    #[test]
+    fn boot_arguments_round_trip() {
+        let sent = args();
+        assert_eq!(
+            BootArgs::parse(sent.to_args()).expect("its own spelling"),
+            sent
+        );
+    }
+
+    /// The optional ones are absent rather than empty, and come back absent.
+    ///
+    /// A session with no tree is the case that matters: an empty `--workfs` would be a
+    /// directory named by the empty string, and the boot would try to share it.
+    #[test]
+    fn what_was_not_said_is_not_sent() {
+        let bare = BootArgs {
+            workfs: None,
+            vcpus: None,
+            memory_mib: None,
+            ..args()
+        };
+        let spelled = bare.to_args();
+        for flag in ["--workfs", "--vcpus", "--memory-mib"] {
+            assert!(
+                !spelled.iter().any(|arg| arg == flag),
+                "{flag} was sent anyway"
+            );
+        }
+        assert_eq!(BootArgs::parse(spelled).expect("its own spelling"), bare);
+    }
+
+    /// A boot is started by a console server and by nothing else, so anything missing or
+    /// unrecognised is two halves of one binary disagreeing. Refused before a hypervisor is
+    /// touched, which is the cheapest place it can be.
+    #[test]
+    fn a_boot_refuses_arguments_a_server_would_not_have_sent() {
+        let mut short = args().to_args();
+        short.truncate(2); // just `--kernel <path>`
+        assert!(
+            BootArgs::parse(short).is_err(),
+            "a missing argument was accepted"
+        );
+
+        let mut unknown = args().to_args();
+        unknown.push("--turbo".into());
+        assert!(
+            BootArgs::parse(unknown).is_err(),
+            "an unknown argument was accepted"
+        );
+
+        let mut dangling = args().to_args();
+        dangling.push("--vcpus".into());
+        assert!(
+            BootArgs::parse(dangling).is_err(),
+            "a flag with no value was accepted"
+        );
+
+        let mut nonsense = args();
+        nonsense.vcpus = None;
+        let mut spelled = nonsense.to_args();
+        spelled.extend(["--vcpus".into(), "several".into()]);
+        assert!(
+            BootArgs::parse(spelled).is_err(),
+            "a vcpu count that is not one was accepted"
+        );
+    }
 
     /// Every spelling this writes is one it reads. The two halves are a boot apart — a server
     /// writes the name and a child in another process parses it — so a variant added with one

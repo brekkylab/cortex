@@ -84,6 +84,8 @@ mod server;
 
 use std::process::ExitCode;
 
+use crate::contract::BootArgs;
+
 /// A failure of ours, not the command's — the shell's code for "found it, could not run
 /// it".
 const NOT_EXECUTABLE: u8 = 126;
@@ -92,8 +94,9 @@ const NOT_EXECUTABLE: u8 = 126;
 enum Role {
     /// Answer the session.
     Server,
-    /// Become a micro-VM.
-    Boot,
+    /// Become a micro-VM, on the arguments the server spawned this with — or on why they
+    /// could not be read, which is a boot that fails before it touches a hypervisor.
+    Boot(anyhow::Result<BootArgs>),
 }
 
 /// Decide the role from the arguments.
@@ -103,8 +106,9 @@ enum Role {
 /// invoked under. An explicit argument is what is left, and it is one nobody types: a boot
 /// is started by [`server`] and by nothing else.
 fn role() -> Role {
-    match std::env::args().nth(1) {
-        Some(arg) if arg == server::BOOT_ARG => Role::Boot,
+    let mut args = std::env::args_os().skip(1);
+    match args.next() {
+        Some(arg) if arg == server::BOOT_ARG => Role::Boot(BootArgs::parse(args)),
         _ => Role::Server,
     }
 }
@@ -114,7 +118,7 @@ fn role() -> Role {
 /// it waits for by not existing.
 fn main() -> ExitCode {
     match role() {
-        Role::Boot => match boot::run() {
+        Role::Boot(args) => match args.and_then(boot::run) {
             // `enter` only returns on success by not returning at all: the `Ok` holds an
             // `Infallible`, and the empty match is what says so.
             Ok(never) => match never {},
