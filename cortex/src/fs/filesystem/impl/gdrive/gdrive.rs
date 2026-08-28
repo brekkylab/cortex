@@ -11,7 +11,7 @@ use tokio::sync::Mutex;
 
 use unicode_normalization::UnicodeNormalization;
 
-use super::accessor::{GdriveAccessor, GdriveConfig};
+use super::accessor::{GdriveAccessor, GdriveConfig, MAX_DOCUMENT_BYTES};
 use crate::{
     BoxFuture,
     fs::{Dirent, DirentKind, FileSystem, Stat},
@@ -164,6 +164,20 @@ const READ_SPAN: u64 = 64 * 1024 * 1024;
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
 /// Cap on remembered probe results — one per file ever sized in this mount.
+/// How many bytes of produced documents are held at once.
+///
+/// The same number as the accessor's per-document ceiling, deliberately: the two are one
+/// rule, which is that the document *being read* is always held and nothing more is
+/// promised. A reader works through one file at a time — `cat`, `grep` and `cp` all do —
+/// so a `grep -r` reads one, keeps it while its chunks arrive, and loses it to the next.
+/// Re-reading one that was dropped costs a second, which is what producing it cost.
+///
+/// Equal rather than larger because a larger number only helps a reader that goes back
+/// to a document it left, and none of the tools that walk a tree do that. It cannot be
+/// *smaller*: a document at the ceiling would then never fit, and a chunked read of it
+/// would produce it again per chunk.
+const RENDERED_BUDGET: u64 = MAX_DOCUMENT_BYTES;
+
 const MAX_PROBED_LENGTHS: usize = 50_000;
 
 /// Safety ceiling on one folder's listing (10 pages). Beyond this the listing
@@ -384,9 +398,16 @@ impl GdriveFs {
     /// a read of the same document answers from another, and the listing is what named
     /// the document in the first place.
     ///
-    /// A document over the accessor's whole-read ceiling never arrives, so nothing
-    /// unbounded is stored; what bounds the *map* is the same sweep `dir_cache` uses,
-    /// which drops what has aged out on the way in.
+    /// Bounded twice. The sweep `dir_cache` uses drops what has aged out on the way in,
+    /// and then [`RENDERED_BUDGET`] drops the oldest of what is left until the arriving
+    /// document fits.
+    ///
+    /// The TTL alone did not bound this. A document over the accessor's ceiling never
+    /// arrives, so no single entry is unbounded — but the map holds everything read in
+    /// the last five minutes, and reading is exactly what this tree is for. A `grep -r`
+    /// over a folder of documents produces every one of them and, without a budget,
+    /// keeps every one: measured on this corpus, 42 documents against JSON of 7 KB to
+    /// 2.5 MB apiece.
     async fn rendered_json(&self, id: &str, api: NativeApi) -> io::Result<Arc<Vec<u8>>> {
         if let Some((at, bytes)) = self.rendered.lock().await.get(id)
             && at.elapsed() < DIR_TTL
@@ -402,6 +423,23 @@ impl GdriveFs {
         let bytes = Arc::new(bytes);
         let mut cache = self.rendered.lock().await;
         cache.retain(|_, (at, _)| at.elapsed() < DIR_TTL);
+        // Then oldest-first until this one fits. `>` and not `>=`: a document exactly at
+        // the ceiling empties the map and goes in, which is what makes the budget mean
+        // "whatever is being read is held" rather than "sometimes it is".
+        let arriving = bytes.len() as u64;
+        let mut held: u64 = cache.values().map(|(_, b)| b.len() as u64).sum();
+        while held + arriving > RENDERED_BUDGET {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some((_, b)) = cache.remove(&oldest) {
+                held -= b.len() as u64;
+            }
+        }
         cache.insert(id.to_string(), (Instant::now(), bytes.clone()));
         Ok(bytes)
     }
@@ -613,6 +651,17 @@ impl GdriveFs {
     #[cfg(test)]
     pub(crate) async fn listings_retained(&self) -> usize {
         self.dir_cache.lock().await.len()
+    }
+
+    /// How many bytes of produced documents are retained, and across how many. Tests
+    /// only: a budget nothing can see is a budget nothing keeps.
+    #[cfg(test)]
+    pub(crate) async fn rendered_held(&self) -> (usize, u64) {
+        let cache = self.rendered.lock().await;
+        (
+            cache.len(),
+            cache.values().map(|(_, b)| b.len() as u64).sum(),
+        )
     }
 
     /// Age every retained listing past its TTL. Tests only.

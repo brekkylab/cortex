@@ -818,6 +818,15 @@ impl Mock {
             .collect()
     }
 
+    /// Whether any request went to a target containing `needle`.
+    fn asked_for(&self, needle: &str) -> bool {
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.target.contains(needle))
+    }
+
     fn bytes_sent(&self) -> u64 {
         *self.body_bytes.lock().unwrap()
     }
@@ -1424,6 +1433,62 @@ async fn a_listing_cache_does_not_grow_without_bound() {
         fs.listings_retained().await,
         2,
         "expired listings are dropped, the fresh ones kept"
+    );
+}
+
+/// The document cache is a budget, not a high-water mark.
+///
+/// The TTL alone did not bound it. Nothing over the accessor's ceiling arrives, so no
+/// single entry is unbounded — but the map held everything read in the last five
+/// minutes, and reading is what this tree is for. A `grep -r` over a folder of documents
+/// produces every one of them, and without a budget keeps every one.
+///
+/// The budget is the per-document ceiling, so the rule is one sentence: whatever is
+/// being read is held, and nothing more is promised. Two documents that cannot both fit
+/// are the case that says so.
+#[tokio::test]
+async fn the_document_cache_drops_the_oldest_to_fit_the_newest() {
+    // Two documents, each over half the budget, so the second cannot join the first.
+    const PAD: usize = 40 * 1024 * 1024;
+    let mock = start_with_document(
+        json!([
+            row("first", "D1", "application/vnd.google-apps.document", None),
+            row("second", "D2", "application/vnd.google-apps.document", None),
+        ]),
+        HashMap::new(),
+        Some(PAD),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let dir = Path::new("/My Drive");
+    fs.list(dir).await.unwrap();
+
+    let first = dir.join("first.gdoc.json");
+    let second = dir.join("second.gdoc.json");
+
+    let a = fs.read_window(&first, None).await.unwrap();
+    assert!(a.len() as u64 > MAX_DOCUMENT_BYTES / 2, "one that cannot share");
+    let (n, held) = fs.rendered_held().await;
+    assert_eq!(n, 1, "the one just read");
+    assert!(held <= RENDERED_BUDGET);
+
+    let b = fs.read_window(&second, None).await.unwrap();
+    assert_eq!(b.len(), a.len(), "the mock pads both the same");
+    let (n, held) = fs.rendered_held().await;
+    assert_eq!(n, 1, "the first was dropped rather than joined");
+    assert!(
+        held <= RENDERED_BUDGET,
+        "{held} bytes held against a {RENDERED_BUDGET} budget"
+    );
+
+    // And the one being read is the one held: reading the first again produces it again
+    // rather than answering from a cache that had let it go.
+    mock.reset();
+    let again = fs.read_window(&first, None).await.unwrap();
+    assert_eq!(again.len(), a.len());
+    assert!(
+        mock.asked_for("/documents/D1"),
+        "the dropped document was produced again, not served stale"
     );
 }
 
