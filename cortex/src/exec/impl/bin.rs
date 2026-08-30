@@ -243,6 +243,10 @@ impl BinExecutable {
     /// ]);
     /// // A name that means one mode of a multi-call binary — one registration per name.
     /// BinExecutable::new(["busybox", "ls"]);
+    ///
+    /// BinExecutable::new([
+    ///     "mem"
+    /// ]);
     /// ```
     ///
     /// The chain resolves the way it reads: `env` is what this spawns and what the environment
