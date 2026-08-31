@@ -182,20 +182,6 @@ const READ_SPAN: u64 = 64 * 1024 * 1024;
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
 /// Cap on remembered probe results — one per file ever sized in this mount.
-/// How many bytes of produced documents are held at once.
-///
-/// The same number as the accessor's per-document ceiling, deliberately: the two are one
-/// rule, which is that the document *being read* is always held and nothing more is
-/// promised. A reader works through one file at a time — `cat`, `grep` and `cp` all do —
-/// so a `grep -r` reads one, keeps it while its chunks arrive, and loses it to the next.
-/// Re-reading one that was dropped costs a second, which is what producing it cost.
-///
-/// Equal rather than larger because a larger number only helps a reader that goes back
-/// to a document it left, and none of the tools that walk a tree do that. It cannot be
-/// *smaller*: a document at the ceiling would then never fit, and a chunked read of it
-/// would produce it again per chunk.
-const RENDERED_BUDGET: u64 = MAX_DOCUMENT_BYTES;
-
 const MAX_REMEMBERED_LENGTHS: usize = 50_000;
 
 /// Safety ceiling on one folder's listing (10 pages). Beyond this the listing
@@ -297,8 +283,6 @@ type CachedListing = (Instant, Arc<Vec<Child>>);
 
 /// One document's JSON as the cache holds it: shared, so a read borrows the bytes
 /// rather than copying a megabyte per chunk.
-type CachedRender = (Instant, Arc<Vec<u8>>);
-
 /// A document's served length beside the `modifiedTime` it was measured at, which is what
 /// makes the entry expire on the document changing rather than on a clock.
 type RememberedLength = (Option<std::time::SystemTime>, u64);
@@ -327,21 +311,20 @@ pub struct GdriveFs {
     /// parent listings, so one cached listing answers readdir, stat and the lookup
     /// a read starts with; fetching the bytes themselves still costs a request.
     dir_cache: Mutex<HashMap<String, CachedListing>>,
-    /// A document's JSON, once produced (file id → bytes).
-    ///
-    /// A document has no windows: its API answers with the whole thing or nothing, so a
-    /// read of one produces all of it however few bytes were asked for. A kernel asks in
-    /// chunks, so without this a 1 MB document read at 128 KiB a time is eight renders of
-    /// the same document — and a render is about a second. Held as an `Arc` because a
-    /// read borrows it rather than copying a megabyte per chunk.
-    rendered: Mutex<HashMap<String, CachedRender>>,
-    /// The last span of a blob read, and where in which file it came from.
+    /// The last content read, and where in which file it came from.
     ///
     /// One slot rather than a map, because a reader works through one file at a time —
-    /// `cat`, `grep` and `cp` all do — so what the next window needs is what the last
-    /// one had. A map would hold [`READ_SPAN`] per file ever touched until the TTL ran
-    /// out; this holds it once.
-    blob: Mutex<Option<HeldSpan>>,
+    /// `cat`, `grep` and `cp` all do — so what the next window needs is what the last one
+    /// had. A map would hold [`READ_SPAN`] per file ever touched until the TTL ran out;
+    /// this holds it once.
+    ///
+    /// A document lands here too, as the span it is: a whole file at offset 0. Its API has
+    /// no ranges, so a read of any window produces all of it, and the next window has to
+    /// find it here or produce it again — 3.4 MB read at 64 KiB a time is 52 windows and
+    /// would be 52 renders at about 1.8 s each. Held apart from a blob's span at first,
+    /// under a byte budget of its own; the two turned out to be the same slot with the
+    /// same reason under it, and one of them can hold what the reader is reading.
+    held: Mutex<Option<HeldSpan>>,
 }
 
 impl GdriveFs {
@@ -350,8 +333,7 @@ impl GdriveFs {
             accessor: GdriveAccessor::new(config)?,
             lengths: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
-            rendered: Mutex::new(HashMap::new()),
-            blob: Mutex::new(None),
+            held: Mutex::new(None),
         })
     }
 
@@ -375,8 +357,8 @@ impl GdriveFs {
     /// answered whole rather than truncated.
     async fn span(&self, id: &str, start: u64, want: u64) -> io::Result<(u64, Arc<Vec<u8>>)> {
         let walking = {
-            let held = self.blob.lock().await;
-            match held.as_ref() {
+            let slot = self.held.lock().await;
+            match slot.as_ref() {
                 Some(held) if held.id == id && held.when.elapsed() < DIR_TTL => {
                     if held.at <= start
                         && (start.saturating_add(want)
@@ -402,7 +384,7 @@ impl GdriveFs {
             .map_err(not_found_or_backend)?;
         let to_eof = (bytes.len() as u64) < len;
         let bytes = Arc::new(bytes);
-        *self.blob.lock().await = Some(HeldSpan {
+        *self.held.lock().await = Some(HeldSpan {
             id: id.to_string(),
             at: start,
             to_eof,
@@ -412,30 +394,30 @@ impl GdriveFs {
         Ok((start, bytes))
     }
 
-    /// A document's JSON, from the cache when one is fresh and from its own API
-    /// otherwise.
+    /// A document's JSON, from the slot when it is the document being read and from its
+    /// own API otherwise.
     ///
-    /// On [`DIR_TTL`] rather than a number of its own, for the reason that constant
-    /// already gives: two TTLs mean a span in which `ls` answers from one snapshot while
-    /// a read of the same document answers from another, and the listing is what named
-    /// the document in the first place.
+    /// Stored as what it is: a span of the whole file at offset 0, in the same slot a
+    /// blob's span goes in. The two were separate caches with the same sentence under
+    /// each — whatever is being read is held and nothing more is promised — and a map
+    /// under a byte budget was buying what one slot already gives, at the cost of an
+    /// eviction loop and a second [`READ_SPAN`]-sized ceiling to hold at once.
     ///
-    /// Bounded twice. The sweep `dir_cache` uses drops what has aged out on the way in,
-    /// and then [`RENDERED_BUDGET`] drops the oldest of what is left until the arriving
-    /// document fits.
-    ///
-    /// The TTL alone did not bound this. A document over the accessor's ceiling never
-    /// arrives, so no single entry is unbounded — but the map holds everything read in
-    /// the last five minutes, and reading is exactly what this tree is for. A `grep -r`
-    /// over a folder of documents produces every one of them and, without a budget,
-    /// keeps every one: measured on this corpus, 42 documents against JSON of 7 KB to
-    /// 2.5 MB apiece.
+    /// `to_eof`, because there is no more of it: the API answers with the whole document
+    /// or nothing, which is also why this has to exist at all. Without it a 3.4 MB
+    /// document read at 64 KiB a time is 52 renders of the same document.
     async fn rendered_json(&self, child: &Child, api: NativeApi) -> io::Result<Arc<Vec<u8>>> {
         let id = child.id.as_str();
-        if let Some((at, bytes)) = self.rendered.lock().await.get(id)
-            && at.elapsed() < DIR_TTL
         {
-            return Ok(bytes.clone());
+            let slot = self.held.lock().await;
+            if let Some(held) = slot.as_ref()
+                && held.id == id
+                && held.at == 0
+                && held.to_eof
+                && held.when.elapsed() < DIR_TTL
+            {
+                return Ok(held.bytes.clone());
+            }
         }
         let bytes = match api {
             NativeApi::Sheet => self.spreadsheet_bytes(id).await,
@@ -444,27 +426,13 @@ impl GdriveFs {
         }
         .map_err(not_found_or_backend)?;
         let bytes = Arc::new(bytes);
-        let mut cache = self.rendered.lock().await;
-        cache.retain(|_, (at, _)| at.elapsed() < DIR_TTL);
-        // Then oldest-first until this one fits. `>` and not `>=`: a document exactly at
-        // the ceiling empties the map and goes in, which is what makes the budget mean
-        // "whatever is being read is held" rather than "sometimes it is".
-        let arriving = bytes.len() as u64;
-        let mut held: u64 = cache.values().map(|(_, b)| b.len() as u64).sum();
-        while held + arriving > RENDERED_BUDGET {
-            let Some(oldest) = cache
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
-            if let Some((_, b)) = cache.remove(&oldest) {
-                held -= b.len() as u64;
-            }
-        }
-        cache.insert(id.to_string(), (Instant::now(), bytes.clone()));
-        drop(cache);
+        *self.held.lock().await = Some(HeldSpan {
+            id: id.to_string(),
+            at: 0,
+            to_eof: true,
+            when: Instant::now(),
+            bytes: bytes.clone(),
+        });
         // Outlives the bytes above, so a listing after they age out still knows the length.
         self.remember_len(child, bytes.len() as u64).await;
         Ok(bytes)
@@ -671,15 +639,15 @@ impl GdriveFs {
     async fn remembered_len(&self, child: &Child) -> Option<u64> {
         // The bytes first, while they are still held: `stat` and a read of the same
         // document answer from the same place or they disagree about where it ends.
-        let held = {
-            let rendered = self.rendered.lock().await;
-            rendered
-                .get(&child.id)
-                .filter(|(at, _)| at.elapsed() < DIR_TTL)
-                .map(|(_, bytes)| bytes.len() as u64)
+        let in_hand = {
+            let slot = self.held.lock().await;
+            slot.as_ref()
+                .filter(|h| h.id == child.id && h.at == 0 && h.to_eof)
+                .filter(|h| h.when.elapsed() < DIR_TTL)
+                .map(|h| h.bytes.len() as u64)
         };
-        if held.is_some() {
-            return held;
+        if in_hand.is_some() {
+            return in_hand;
         }
         self.lengths
             .lock()
@@ -705,22 +673,21 @@ impl GdriveFs {
         self.dir_cache.lock().await.len()
     }
 
-    /// How many bytes of produced documents are retained, and across how many. Tests
-    /// only: a budget nothing can see is a budget nothing keeps.
+    /// What the one slot is holding: the Drive id and how many bytes. Tests only — a
+    /// slot nothing can see is a slot nothing keeps. Which *kind* it is cannot be read
+    /// off the span (a small blob read from 0 is also `at: 0, to_eof`), so the id is what
+    /// a caller compares, exactly as `rendered_json` and `remembered_len` do.
     #[cfg(test)]
-    pub(crate) async fn rendered_held(&self) -> (usize, u64) {
-        let cache = self.rendered.lock().await;
-        (
-            cache.len(),
-            cache.values().map(|(_, b)| b.len() as u64).sum(),
-        )
+    pub(crate) async fn held_slot(&self) -> Option<(String, u64)> {
+        let slot = self.held.lock().await;
+        slot.as_ref().map(|h| (h.id.clone(), h.bytes.len() as u64))
     }
 
     /// Drop the produced bytes while keeping what was learned from them. Tests only —
     /// it is the state a document reaches on its own, by the byte budget or the TTL.
     #[cfg(test)]
     pub(crate) async fn forget_rendered_for_test(&self) {
-        self.rendered.lock().await.clear();
+        *self.held.lock().await = None;
     }
 
     /// How many document lengths are remembered. Tests only.

@@ -1278,7 +1278,7 @@ async fn a_documents_length_outlives_the_bytes_it_came_from() {
 
     // The bytes go — the budget or the TTL takes them — and the length stays.
     fs.forget_rendered_for_test().await;
-    assert_eq!(fs.rendered_held().await.0, 0, "the JSON is gone");
+    assert!(fs.held_slot().await.is_none(), "the JSON is gone");
     assert_eq!(
         fs.stat(&path).await.unwrap().size,
         real,
@@ -1793,62 +1793,83 @@ async fn a_listing_cache_does_not_grow_without_bound() {
     );
 }
 
-/// The document cache is a budget, not a high-water mark.
+/// One slot holds what is being read, whatever it is.
 ///
-/// The TTL alone did not bound it. Nothing over the accessor's ceiling arrives, so no
-/// single entry is unbounded — but the map held everything read in the last five
-/// minutes, and reading is what this tree is for. A `grep -r` over a folder of documents
-/// produces every one of them, and without a budget keeps every one.
+/// A document and a blob's span were two caches with the same sentence under each, and a
+/// map under a byte budget was buying what one slot already gives — a reader works through
+/// one file at a time, so what the next window needs is what the last one had. The budget
+/// cost an eviction loop and a second ceiling's worth of memory to hold at once.
 ///
-/// The budget is the per-document ceiling, so the rule is one sentence: whatever is
-/// being read is held, and nothing more is promised. Two documents that cannot both fit
-/// are the case that says so.
+/// So the second document displaces the first, and a blob's span displaces a document.
+/// Going back costs producing it again, which is what it cost to produce the first time.
 #[tokio::test]
-async fn the_document_cache_drops_the_oldest_to_fit_the_newest() {
-    // Two documents, each over half the budget, so the second cannot join the first.
-    const PAD: usize = 40 * 1024 * 1024;
+async fn one_slot_holds_whatever_is_being_read() {
+    const PAD: usize = 200 * 1024;
+    let blob = vec![b'z'; 4 * 1024 * 1024];
     let mock = start_with_document(
         json!([
             row("first", "D1", "application/vnd.google-apps.document", None),
             row("second", "D2", "application/vnd.google-apps.document", None),
+            row(
+                "big.pdf",
+                "P1",
+                "application/pdf",
+                Some(&blob.len().to_string())
+            ),
         ]),
-        HashMap::new(),
+        HashMap::from([("P1".to_string(), blob)]),
         Some(PAD),
     )
     .await;
     let fs = mounted(&mock.config());
     let dir = Path::new("/My Drive");
     fs.list(dir).await.unwrap();
-
     let first = dir.join("first.gdoc.json");
     let second = dir.join("second.gdoc.json");
+    let pdf = dir.join("big.pdf");
 
     let a = fs.read_window(&first, None).await.unwrap();
-    assert!(
-        a.len() as u64 > MAX_DOCUMENT_BYTES / 2,
-        "one that cannot share"
+    assert_eq!(
+        fs.held_slot().await,
+        Some(("D1".to_string(), a.len() as u64)),
+        "the one just read"
     );
-    let (n, held) = fs.rendered_held().await;
-    assert_eq!(n, 1, "the one just read");
-    assert!(held <= RENDERED_BUDGET);
 
+    // Chunks of the same document come out of the slot rather than a second render.
+    mock.reset();
+    for at in [0u64, 64 * 1024, 128 * 1024] {
+        fs.read_window(&first, Some(at..at + 64 * 1024))
+            .await
+            .unwrap();
+    }
+    assert!(
+        !mock.asked_for("/documents/D1"),
+        "a chunked read of one document is one render"
+    );
+
+    // A second document displaces the first.
     let b = fs.read_window(&second, None).await.unwrap();
-    assert_eq!(b.len(), a.len(), "the mock pads both the same");
-    let (n, held) = fs.rendered_held().await;
-    assert_eq!(n, 1, "the first was dropped rather than joined");
-    assert!(
-        held <= RENDERED_BUDGET,
-        "{held} bytes held against a {RENDERED_BUDGET} budget"
+    assert_eq!(
+        fs.held_slot().await,
+        Some(("D2".to_string(), b.len() as u64)),
+        "the second displaced the first"
     );
 
-    // And the one being read is the one held: reading the first again produces it again
-    // rather than answering from a cache that had let it go.
+    // And a blob's span displaces a document, which is the same slot doing the same job.
+    fs.read_window(&pdf, Some(0..64 * 1024)).await.unwrap();
+    assert_eq!(
+        fs.held_slot().await.map(|(id, _)| id),
+        Some("P1".to_string()),
+        "a blob's span took the slot from the document"
+    );
+
+    // Going back produces it again rather than serving something stale.
     mock.reset();
     let again = fs.read_window(&first, None).await.unwrap();
-    assert_eq!(again.len(), a.len());
+    assert_eq!(again, a);
     assert!(
         mock.asked_for("/documents/D1"),
-        "the dropped document was produced again, not served stale"
+        "the displaced document was produced again"
     );
 }
 
