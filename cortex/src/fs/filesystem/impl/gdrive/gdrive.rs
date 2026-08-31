@@ -129,8 +129,8 @@ const MAX_TABS: usize = 64;
 /// This is a placeholder, not a measurement — `find -size` and `ls -l` see it until
 /// something reads the file. Making it exact up front costs one render per
 /// document: measured 2.4s for a six-document folder listing, 6.3s when the
-/// kernel's per-entry `getattr` serialises them. See
-/// [`GdriveFs::resolve_size_on_stat`].
+/// kernel's per-entry `getattr` serialises them — and `stat` runs once per name, because
+/// FUSE-T serves over NFS and an NFS client fills an attribute for every entry it lists.
 const UNKNOWN_LENGTH_SIZE: u64 = MAX_DOCUMENT_BYTES;
 
 /// How long a line the padding past a document's JSON is broken into.
@@ -876,11 +876,11 @@ impl FileSystem for GdriveFs {
             // Short. For a blob that is the true end and the whole story, because Drive
             // sizes those exactly. For a document it is instead the read running past the
             // end of the JSON and into the span [`UNKNOWN_LENGTH_SIZE`] claimed — and
-            // something is going to fill that span either way. Filling it here with
-            // newlines rather than leaving the kernel to fill it with `0x00` is what makes
-            // the over-estimate cost what its doc comment says it costs: JSON is defined to
-            // absorb trailing whitespace, so the document still parses, where the zero
-            // padding made every parser throw at the seam.
+            // something is going to fill that span either way. Filling it here rather than
+            // leaving the kernel to fill it with `0x00` is what makes the over-estimate
+            // cost what its doc comment says it costs: JSON is defined to absorb trailing
+            // whitespace, so the document still parses, where the zero padding made every
+            // parser throw at the seam.
             //
             // Spaces, broken by a newline every [`PAD_LINE`] bytes. This was newlines
             // throughout, on the reasoning that empty lines keep `grep` cheap where one
