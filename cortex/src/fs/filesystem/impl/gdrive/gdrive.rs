@@ -475,15 +475,20 @@ impl GdriveFs {
         }
         let complete = listed.is_ok();
         if let Ok(drives) = listed {
-            let mut existing: HashSet<String> =
-                children.iter().map(|c| c.vfs_name.clone()).collect();
+            // Composed, because that is what `resolve` compares by. Two shared drives
+            // spelled the same name two ways would otherwise both keep it, and one of
+            // them would be unreachable from the root.
+            let mut existing: HashSet<String> = children
+                .iter()
+                .map(|c| c.vfs_name.nfc().collect())
+                .collect();
             for d in &drives {
                 if let (Some(id), Some(name)) = (
                     d.get("id").and_then(|x| x.as_str()),
                     d.get("name").and_then(|x| x.as_str()),
                 ) {
                     let vfs_name = unique_name(&sanitize_name(name), &existing);
-                    existing.insert(vfs_name.clone());
+                    existing.insert(vfs_name.nfc().collect());
                     children.push(section(
                         &vfs_name,
                         id,
@@ -1166,17 +1171,35 @@ fn sanitize_name(name: &str) -> String {
 /// kept the name unique but took the entry out of every glob a reader would use to
 /// find it — measured against a real account, two of 33 spreadsheets were invisible
 /// to `**/*.gsheet.json`.
+///
+/// Two rules, both of which cost a silently wrong file when broken.
+///
+/// Counted by composition, not by bytes, because [`same_name`] resolves by composition.
+/// Drive stores whichever spelling the uploading client sent, so one folder holds both —
+/// measured, ten composed names beside four decomposed. Counting bytes leaves a
+/// canonically equal pair *both* unnumbered, and `resolve` then answers every lookup with
+/// whichever came first: one file becomes unopenable and `cat` on it serves the other
+/// one's contents, with no error anywhere.
+///
+/// Numbered by Drive id, not by arrival order, because the listing arrives
+/// `modifiedTime desc` — and `modifiedTime` has no defined tiebreak. Numbering as they
+/// arrive means editing either of two `report.pdf` swaps which one is `report (2).pdf` at
+/// the next listing. The path still resolves and still succeeds; it just opens the other
+/// document. An id never changes, so the numbering does not either.
 fn disambiguate(children: &mut [Child]) {
+    let mut order: Vec<usize> = (0..children.len()).collect();
+    order.sort_by(|&a, &b| children[a].id.cmp(&children[b].id));
     let mut seen: HashSet<String> = HashSet::new();
-    for c in children.iter_mut() {
-        if seen.insert(c.vfs_name.clone()) {
+    for i in order {
+        let c = &mut children[i];
+        if seen.insert(c.vfs_name.nfc().collect()) {
             continue;
         }
         let (stem, ext) = split_extension(&c.vfs_name, c.serves);
         let mut n = 2;
         loop {
             let cand = format!("{stem} ({n}){ext}");
-            if seen.insert(cand.clone()) {
+            if seen.insert(cand.nfc().collect::<String>()) {
                 c.vfs_name = cand;
                 break;
             }
@@ -1218,13 +1241,18 @@ fn split_extension(name: &str, serves: Serves) -> (&str, &str) {
 }
 
 /// Disambiguate a shared-drive name that collides with a root section.
+///
+/// `existing` holds composed names and is asked in the composed form, for the reason
+/// [`disambiguate`] gives: a set that compares bytes leaves a canonically equal pair both
+/// unnumbered, and [`same_name`] then answers every lookup with whichever came first.
 fn unique_name(name: &str, existing: &HashSet<String>) -> String {
-    if !existing.contains(name) {
+    let taken = |n: &str| existing.contains(&n.nfc().collect::<String>());
+    if !taken(name) {
         return name.to_string();
     }
     let mut candidate = format!("{name} [Shared Drive]");
     let mut suffix = 2;
-    while existing.contains(&candidate) {
+    while taken(&candidate) {
         candidate = format!("{name} [Shared Drive {suffix}]");
         suffix += 1;
     }
@@ -1252,8 +1280,15 @@ fn unique_name(name: &str, existing: &HashSet<String>) -> String {
 ///
 /// Bytes first, because that is the answer for every ASCII name and most others; the
 /// composition runs only when a byte comparison has already failed.
+///
+/// Nothing else guards it. An earlier version skipped the composition when exactly one
+/// side was ASCII, on the reasoning that a pair spanning that boundary cannot compose to
+/// the same thing. It can: `NFC("\u{212A}")` — the Kelvin sign — is `"K"`, and
+/// `NFC("\u{037E}")` — the Greek question mark — is `";"`. A file listed as
+/// `2\u{212A} readings.txt` answered `ENOENT` to the spelling a reader would type, which
+/// is the failure this function exists to prevent.
 fn same_name(a: &str, b: &str) -> bool {
-    a == b || (a.is_ascii() == b.is_ascii() && !a.is_ascii() && a.nfc().eq(b.nfc()))
+    a == b || a.nfc().eq(b.nfc())
 }
 
 /// A `&Path` in the form the resolver works in: `/` for the root, `/a/b` under it.

@@ -246,6 +246,116 @@ fn a_tabs_cost_is_measured_as_it_will_be_written() {
     );
 }
 
+/// The composition rule `resolve` actually needs, tested where it lives.
+///
+/// It had no test at all: reducing it to `a == b` left the whole suite green, while the
+/// regression its doc comment records — seven of eight Korean-named files opening under
+/// only one spelling — came straight back.
+#[test]
+fn same_name_is_the_directory_s_idea_of_the_same_name() {
+    let composed = "한글.txt";
+    let decomposed: String = composed.nfd().collect();
+    assert_ne!(
+        composed.as_bytes(),
+        decomposed.as_bytes(),
+        "the fixture has to be two spellings, or it tests nothing"
+    );
+    assert!(same_name(composed, &decomposed), "one name, two spellings");
+    assert!(same_name(composed, composed));
+
+    // Different names stay different — the rule must not collapse a directory.
+    assert!(!same_name("한글.txt", "한국.txt"));
+    assert!(!same_name("report.pdf", "report (2).pdf"));
+
+    // The pair that spans the ASCII boundary. An `is_ascii()` guard used to short-circuit
+    // to a byte comparison here, on the reasoning that one ASCII side means no shared
+    // composition — but `NFC("\u{212A}")` is `"K"` and `NFC("\u{037E}")` is `";"`, so the
+    // file listed under the first spelling answered ENOENT to the second.
+    assert_eq!("\u{212A}".nfc().collect::<String>(), "K");
+    assert!(same_name("2\u{212A} readings.txt", "2K readings.txt"));
+    assert!(same_name("a\u{037E}b", "a;b"));
+}
+
+/// Two files whose names differ only by composition are two files.
+///
+/// `disambiguate` counted collisions by bytes while `resolve` matched by composition, so
+/// a canonically equal pair got neither a number nor an error: both kept the same name,
+/// and every lookup — in either spelling — was answered by whichever came first. One file
+/// was unopenable and `cat` on it served the other one's bytes.
+#[test]
+fn a_composed_and_a_decomposed_name_are_two_files() {
+    let composed = "보고서.pdf".to_string();
+    let decomposed: String = composed.nfd().collect();
+    let mk = |n: &str, id: &str| Child {
+        vfs_name: n.to_string(),
+        id: id.into(),
+        drive_id: None,
+        kind: GKind::File,
+        mtime: None,
+        created: None,
+        serves: Serves::Original,
+        size: None,
+    };
+    let mut children = vec![mk(&composed, "a"), mk(&decomposed, "b")];
+    disambiguate(&mut children);
+
+    assert!(
+        !same_name(&children[0].vfs_name, &children[1].vfs_name),
+        "both were left as {:?} / {:?}, so one of them cannot be opened",
+        children[0].vfs_name,
+        children[1].vfs_name
+    );
+    // And the number lands where it does for any other collision.
+    let numbered = children
+        .iter()
+        .find(|c| c.vfs_name.contains("(2)"))
+        .expect("one of the two is numbered");
+    assert!(
+        numbered.vfs_name.ends_with(".pdf"),
+        "still findable by glob"
+    );
+}
+
+/// A collision number follows the Drive id, not the order the listing arrived in.
+///
+/// Rows arrive `modifiedTime desc`, and `modifiedTime` has no defined tiebreak. Numbering
+/// as they arrive meant editing either of two `report.pdf` swapped which one was
+/// `report (2).pdf` at the next listing — the saved path still resolved and still
+/// succeeded, and opened the other document.
+#[test]
+fn a_collision_number_follows_the_id_and_not_the_listing_order() {
+    let mk = |id: &str| Child {
+        vfs_name: "report.pdf".to_string(),
+        id: id.into(),
+        drive_id: None,
+        kind: GKind::File,
+        mtime: None,
+        created: None,
+        serves: Serves::Original,
+        size: None,
+    };
+    let assign = |ids: [&str; 3]| {
+        let mut children: Vec<Child> = ids.iter().map(|i| mk(i)).collect();
+        disambiguate(&mut children);
+        let mut by_id: Vec<(String, String)> =
+            children.into_iter().map(|c| (c.id, c.vfs_name)).collect();
+        by_id.sort();
+        by_id
+    };
+    // The same three files, listed in three different orders — as three edits would.
+    let a = assign(["x1", "x2", "x3"]);
+    assert_eq!(a, assign(["x3", "x1", "x2"]), "an edit must not renumber");
+    assert_eq!(a, assign(["x2", "x3", "x1"]), "an edit must not renumber");
+    assert_eq!(
+        a,
+        vec![
+            ("x1".to_string(), "report.pdf".to_string()),
+            ("x2".to_string(), "report (2).pdf".to_string()),
+            ("x3".to_string(), "report (3).pdf".to_string()),
+        ]
+    );
+}
+
 /// A search reports what the index found, including the types this mount cannot
 /// serve — a Form has no readable form, but "the phrase is in this Form" is still
 /// the answer to the question.
