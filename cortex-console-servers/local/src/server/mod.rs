@@ -130,8 +130,8 @@ use bin_dir::SessionScratch;
 use bson::Bson;
 use cortex::console::{
     Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, InitResult, MAX_PAYLOAD, Message,
-    Notification, Outcome, Progress, Read, ReadResult, RequestId, Server, WorkFsMount,
-    WorkFsSource, Write, WriteResult, stdio::StdioServer,
+    NetworkAccess, Notification, Outcome, Progress, Read, ReadResult, RequestId, Server,
+    WorkFsMount, WorkFsSource, Write, WriteResult, stdio::StdioServer,
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
@@ -329,6 +329,7 @@ impl Session {
     fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
         base(config.image.as_ref())?;
+        reach(config.network.as_ref())?;
 
         // Through `release` rather than nulling the field: what a boot has to give back
         // grows, and a re-`init` while a session is live has exactly as much reason to go
@@ -354,6 +355,9 @@ impl Session {
             // Nothing to name. A command here runs on this host's own filesystem, which is
             // not an image and has no reference — see [`base`].
             image: None,
+            // Whatever this host reaches, which is the only answer this backend has — see
+            // [`reach`].
+            network: Some(NetworkAccess::full()),
         })
     }
 
@@ -590,6 +594,40 @@ fn base(asked: Option<&ImageSource>) -> Result<(), Outcome> {
 }
 
 /// differently.
+/// Refuse any reach but `full`, which is the only one a host-local session has.
+///
+/// A command here is a process on this host, sharing this host's network with everything else
+/// on it. There is no device to leave off and no policy to enforce — so `none`, `host` and
+/// `public` are not narrower sessions this backend could offer, they are promises it cannot
+/// keep, and the honest answer is
+/// [`UNSUPPORTED_NETWORK`](Error::UNSUPPORTED_NETWORK) rather than a session that reaches
+/// everything after being asked for less.
+///
+/// Which makes this the one place in this build where a *capability* decides a refusal rather
+/// than a provider. A client that needs the narrower thing needs a backend whose commands run
+/// somewhere it can be taken away — `cortex-uvm-console`, whose guest has an interface only if
+/// one was attached.
+///
+/// Asking for nothing is not asking for less: an `init` with no network gets the session it
+/// always got, answered with what it actually has.
+fn reach(asked: Option<&NetworkAccess>) -> Result<(), Outcome> {
+    let Some(asked) = asked else {
+        return Ok(());
+    };
+    if asked.reach == NetworkAccess::full().reach {
+        return Ok(());
+    }
+
+    Err(refused(
+        Error::UNSUPPORTED_NETWORK,
+        format!(
+            "{}: commands here run on this host and share its network, so only `full` can be \
+             answered — a narrower reach needs a backend that runs them somewhere else",
+            asked.reach
+        ),
+    ))
+}
+
 fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Outcome> {
     let Some(path) = workfs.file_path() else {
         return Err(refused(

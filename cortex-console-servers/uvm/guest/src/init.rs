@@ -93,6 +93,11 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
         copy_self()?;
     }
 
+    // After the pivot, because `/etc/resolv.conf` has to land on the root the commands will
+    // see rather than on the one about to be detached. Does nothing when the boot attached no
+    // network, which is the default.
+    crate::net::configure()?;
+
     // Where a command runs is the session's, and the agent sets it per command — but this
     // process has to stand somewhere, and a session with no tree stands here. The tree when
     // there is one; otherwise where the image expects a process to be, and `/` when it said

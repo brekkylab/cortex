@@ -57,7 +57,7 @@ use tokio::{
 
 use crate::{
     assets::{self, BootRoot, SessionImage},
-    contract::{BootArgs, HANDSHAKE},
+    contract::{BootArgs, HANDSHAKE, Network},
     helper::boot_helper,
 };
 
@@ -82,12 +82,6 @@ fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
 /// reaches userspace, where the alternative is a console that hangs on its first `exec`
 /// with nothing to report.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// The role argument the boot child is started under.
-///
-/// Not a subcommand anybody types. The child is a copy of this binary at a path in a cache
-/// directory, so `argv[0]` cannot say what it is and `argv[1]` does.
-pub const BOOT_ARG: &str = "--boot";
 
 /// A guest that is up, and everything whose lifetime is that guest's.
 pub struct Guest {
@@ -115,7 +109,12 @@ impl Guest {
     /// `workfs` is a directory on this host, or `None` for a session with no tree. It is
     /// shared into the guest **at its own path** — see [`boot`](crate::boot), which is where
     /// that decision is argued.
-    pub async fn boot(workfs: Option<&Path>, image: Option<&str>) -> anyhow::Result<Guest> {
+    pub async fn boot(
+        workfs: Option<&Path>,
+        image: Option<&str>,
+        network: Network,
+        host_ports: &[u16],
+    ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
@@ -136,6 +135,8 @@ impl Guest {
             base: base.path,
             base_format: base.format,
             session: session.path().to_path_buf(),
+            network,
+            host_ports: host_ports.to_vec(),
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),
@@ -145,7 +146,6 @@ impl Guest {
 
         let mut command = Command::new(&helper);
         command
-            .arg(BOOT_ARG)
             .args(args.to_args())
             .stdin(Stdio::null())
             // The guest's console — kernel messages, and anything a command's output
