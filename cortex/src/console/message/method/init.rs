@@ -33,6 +33,82 @@ pub struct Init {
     /// every later path in this protocol a path both ends can spell. See [`InitResult`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workfs: Option<WorkFsSource>,
+
+    /// The base a session's commands run in, named as an OCI image. `None` leaves it to the
+    /// server.
+    ///
+    /// **Said once, for the same reason the tree is.** What a command finds on the filesystem
+    /// around it is a property of the environment it runs in, not of the command, and on a
+    /// backend with a guest it is a disk attached before a kernel comes up.
+    ///
+    /// Answered in [`InitResult::image`] when what is in force can be named. A backend whose
+    /// commands run on the server's own filesystem has no base to swap and refuses this with
+    /// [`UNSUPPORTED_IMAGE`](crate::console::Error::UNSUPPORTED_IMAGE).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSource>,
+}
+
+/// The base a session's commands run in, named as an OCI image.
+///
+/// # A reference, and nothing around it
+///
+/// ```
+/// # use cortex::console::ImageSource;
+/// ImageSource::from("python:3.13-slim");
+/// ImageSource::new("ghcr.io/org/tool@sha256:2f0e…");
+/// ```
+///
+/// A reference converts, so a caller with nothing to say beyond the name passes the name:
+/// `.image("python:3.13-slim")`.
+///
+/// The grammar is the registries' own: an optional host, a repository, and a tag or a digest.
+/// No scheme is put in front of it, because a reference already says where it comes from and
+/// `oci://` in front of a string everybody already types would be friction buying nothing.
+///
+/// # What is asked for is what is given
+///
+/// A server provides this base or refuses the session, the same way it treats a
+/// [`NetworkAccess`](crate::console::NetworkAccess) or a [`WorkFsSource`]. A reference it can
+/// parse but not fetch is a different matter: pulling an image is slow enough that it belongs
+/// to a boot rather than to `init`, so a name that resolves to nothing is heard from the first
+/// call that needs a guest. A client that wants it sooner calls
+/// [`Console::start`](crate::console::Console::start).
+///
+/// # Why an object holding one member
+///
+/// The same reason [`WorkFsSource`] is one. A platform, a pull policy, a place to put
+/// credentials: each is a thing that could be said about an image, and each belongs beside the
+/// reference rather than encoded into it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageSource {
+    /// The OCI reference, as the registries spell one.
+    pub reference: String,
+}
+
+impl ImageSource {
+    pub fn new(reference: impl Into<String>) -> Self {
+        ImageSource {
+            reference: reference.into(),
+        }
+    }
+}
+
+/// So a caller who has a reference and nothing to say about it writes the reference.
+///
+/// Nothing is checked here, which is the same as [`new`](ImageSource::new) and for the same
+/// reason: whether a string is a reference is the server's to answer, and there is one place
+/// that answers it. A convenience that validated would be a second one, disagreeing with the
+/// first the day a registry's grammar moves.
+impl From<&str> for ImageSource {
+    fn from(reference: &str) -> Self {
+        ImageSource::new(reference)
+    }
+}
+
+impl From<String> for ImageSource {
+    fn from(reference: String) -> Self {
+        ImageSource::new(reference)
+    }
 }
 
 /// The tree a session works in, named by URL.
@@ -134,6 +210,18 @@ pub struct InitResult {
     /// cannot show where a relative one would land.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+
+    /// The base in force, when it is one that can be named.
+    ///
+    /// The [`Init::image`] that was asked for, in the server's own spelling of it: a reference
+    /// with no registry named is a reference to a default registry, and this is where a client
+    /// learns which one that was. What makes it worth answering is the case where nothing was
+    /// asked, since the base is then the server's own choice.
+    ///
+    /// Absent is a base with no reference to give: a server that will not say, or one running
+    /// on something that is not an OCI image at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSource>,
 }
 
 /// Where a workfs is, in the server's filesystem.
@@ -208,6 +296,7 @@ mod tests {
         let init = Init {
             delegated: Vec::new(),
             workfs: Some(WorkFsSource::new("file:///srv/project")),
+            image: None,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -224,6 +313,7 @@ mod tests {
                 path: "/mnt/workfs".into(),
             }),
             cwd: Some("/mnt/workfs/work".into()),
+            image: None,
         };
         let doc = bson::serialize_to_document(&answered).unwrap();
         assert_eq!(
@@ -248,7 +338,68 @@ mod tests {
                     path: "/mnt/workfs".into(),
                 }),
                 cwd: None,
+                image: None,
             },
+        );
+    }
+
+    /// A base is a reference, both ways, and absent on both sides is the shape every session
+    /// had before there was one to name.
+    #[test]
+    fn an_image_is_a_reference_and_the_answer_is_the_one_in_force() {
+        let init = Init {
+            delegated: Vec::new(),
+            workfs: None,
+            image: Some(ImageSource::new("python:3.13-slim")),
+        };
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(
+            doc,
+            doc! {"delegated": [], "image": {"reference": "python:3.13-slim"}}
+        );
+        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
+
+        // **The answer is the server's spelling and not an echo.** A reference naming no
+        // registry names a default one, and which default that was is the thing a client could
+        // not have worked out for itself.
+        let answered = InitResult {
+            workfs: None,
+            cwd: None,
+            image: Some(ImageSource::new("docker.io/library/python:3.13-slim")),
+        };
+        let doc = bson::serialize_to_document(&answered).unwrap();
+        assert_eq!(
+            doc,
+            doc! {"image": {"reference": "docker.io/library/python:3.13-slim"}}
+        );
+        assert_eq!(
+            bson::deserialize_from_document::<InitResult>(doc).unwrap(),
+            answered,
+        );
+
+        // A reference is enough on its own, and converting is the same as spelling it out.
+        assert_eq!(
+            ImageSource::from("python:3.13-slim"),
+            ImageSource::new("python:3.13-slim"),
+        );
+        assert_eq!(
+            ImageSource::from("python:3.13-slim".to_string()),
+            ImageSource::new("python:3.13-slim"),
+        );
+
+        // A session that says nothing about a base still serializes to what it always did.
+        let quiet = Init {
+            delegated: vec!["report".into()],
+            workfs: None,
+            image: None,
+        };
+        assert_eq!(
+            bson::serialize_to_document(&quiet).unwrap(),
+            doc! {"delegated": ["report"]},
+        );
+        assert_eq!(
+            bson::deserialize_from_document::<Init>(doc! {"delegated": ["report"]}).unwrap(),
+            quiet,
         );
     }
 

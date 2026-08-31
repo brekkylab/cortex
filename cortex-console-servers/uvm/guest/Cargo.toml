@@ -31,6 +31,10 @@ cortex = { path = "../../../cortex", default-features = false }
 # `mount(2)`, `pivot_root`, `dup`. Every one of them is a syscall with no std
 # spelling, which is the whole reason the guest side is its own binary.
 libc = "0.2"
+# Deriving `contract::ImageSpec`, the one thing the host hands this end as a file
+# rather than as an environment value. Already in the tree via `bson`; named here
+# because the derive macro has to be.
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = [
     "fs",
     "io-util",

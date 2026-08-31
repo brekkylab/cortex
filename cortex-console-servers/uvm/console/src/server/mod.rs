@@ -64,9 +64,12 @@ mod guest;
 use std::path::PathBuf;
 
 use cortex::console::{
-    Call, Error, Init, InitResult, Message, Notification, Outcome, RequestId, Server, WorkFsMount,
-    WorkFsSource, stdio::StdioServer,
+    Call, Error, ImageSource, Init, InitResult, Message, Notification, Outcome, RequestId, Server,
+    WorkFsMount, WorkFsSource, stdio::StdioServer,
 };
+use microsandbox_image::Reference;
+
+use crate::assets;
 pub use guest::BOOT_ARG;
 use guest::Guest;
 
@@ -182,6 +185,14 @@ struct Session {
     /// boot shares it, and the answer to `init` was spelled from it.
     workfs: Option<PathBuf>,
 
+    /// The base this session's guest overlays, as a reference this server has parsed, and
+    /// `None` for a session that left the choice here.
+    ///
+    /// Held apart from `config` for the same reason `workfs` is: it was checked at `init` and
+    /// the boot is handed the result. **Not fetched here** — pulling an image is a boot's work,
+    /// and this is only the name of one.
+    image: Option<Reference>,
+
     /// `None` until something boots one: a `start`, or the first call that needs it.
     guest: Option<Guest>,
 }
@@ -199,9 +210,11 @@ impl Session {
     /// Nothing is mounted or booted by saying so: the share happens when a guest does.
     fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+        let image = base(config.image.as_ref())?;
 
         self.guest = None;
         self.workfs = workfs;
+        self.image = image;
         self.config = config;
 
         let path = self
@@ -214,6 +227,14 @@ impl Session {
             // which is what `init::prepare` puts the agent in. Either way this is the same
             // answer the agent will give when the session is replayed into it.
             cwd: Some(path.unwrap_or_else(|| "/".to_string())),
+            // The base in force, in this server's spelling of it — which is the registry a
+            // bare reference turned out to name, and the one thing about it the client could
+            // not have worked out. `None` is a session running on the pinned rootfs, which is
+            // not an image and has no reference to give.
+            image: self
+                .image
+                .as_ref()
+                .map(|reference| ImageSource::new(reference.to_string())),
         })
     }
 
@@ -256,7 +277,8 @@ impl Session {
                 }
             }
 
-            let mut guest = Guest::boot(self.workfs.as_deref())
+            let image = self.image.as_ref().map(Reference::to_string);
+            let mut guest = Guest::boot(self.workfs.as_deref(), image.as_deref())
                 .await
                 .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
 
@@ -279,6 +301,34 @@ impl Session {
         }
         Ok(self.guest.as_mut().expect("just booted"))
     }
+}
+
+/// The base a session asked for, parsed, or `None` for one that left the choice here.
+///
+/// **Parsed and not fetched.** A reference that is not one is a client's mistake and is worth
+/// the frame it takes to say so; a reference that resolves to nothing is a registry's answer,
+/// and getting it takes a pull. Pulling at `init` would put a cold registry between a client
+/// and a console that has not started doing anything yet, so it belongs to the boot that needs
+/// the image — and a client that wants to pay for it early has [`Console::start`] for that.
+///
+/// A session that asked for nothing gets this server's own setting, which is read here so that
+/// the answer to `init` can name it. **The one place the environment is consulted**: what a
+/// session runs on is settled before a boot rather than discovered by one.
+fn base(asked: Option<&ImageSource>) -> Result<Option<Reference>, Outcome> {
+    let reference = match asked {
+        Some(asked) => asked.reference.clone(),
+        None => match std::env::var(assets::IMAGE_ENV) {
+            Ok(reference) if !reference.is_empty() => reference,
+            // Neither said, so the base is the pinned rootfs: not an image, and nothing this
+            // can name.
+            _ => return Ok(None),
+        },
+    };
+
+    reference
+        .parse()
+        .map(Some)
+        .map_err(|e| refused(Error::INVALID_PARAMS, format!("{reference}: {e}")))
 }
 
 /// The host directory a workfs URL names, or why it names none this backend can use.

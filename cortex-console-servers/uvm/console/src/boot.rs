@@ -16,13 +16,18 @@
 //! virtio-fs  root         the boot root, holding the guest binary and nothing else
 //! virtio-fs  cortexws     a cortex WorkFs, served straight out of this process
 //! virtio-blk /dev/vda     the session's ext4 image — the overlay's upper
-//! virtio-blk /dev/vdb     the base EROFS image, read-only — the overlay's lower
+//! virtio-blk /dev/vdb     the base image, read-only — the overlay's lower
 //! virtio-con cortex-…     the console session, the other end of it a socket on the host
 //! ```
 //!
 //! The two disks are attached in that order because attach order is what fixes the guest
 //! names, and the guest is told which is which by name — see
 //! [`GUEST_UPPER_DEV`](crate::contract::GUEST_UPPER_DEV).
+//!
+//! The base is attached in the format the server said ([`base_format`]): raw for an image
+//! encoded from a tarball, VMDK for a registry pull's, whose descriptor stitches one disk out
+//! of a layer per file. The guest mounts either as `erofs` — the stitching is a host-side
+//! detail that stops at the block layer.
 //!
 //! The tree is a **host directory**, shared over virtio-fs like any other. Whatever it is
 //! made of — a cortex `WorkFs` of several stores, a plain project directory — was realized
@@ -46,15 +51,14 @@
 use std::{
     convert::Infallible,
     os::{fd::AsRawFd, unix::net::UnixStream},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use msb_krun::{DiskImageFormat, VmBuilder};
 
 use crate::contract::{
-    BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV,
-    KERNEL_ENV, LOWER_ENV, MEMORY_ENV, PORT_NAME, SESSION_IMAGE_ENV, SHARE_ENV, UPPER_ENV,
-    VCPUS_ENV, WORKFS_ENV, WORKFS_TAG,
+    BaseFormat, BootArgs, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, PORT_NAME,
+    SHARE_ENV, UPPER_ENV, WORKFS_TAG,
 };
 
 /// Guest vCPUs when nothing says otherwise. Two rather than one because a command that
@@ -67,29 +71,31 @@ const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEMORY_MIB: u32 = 2048;
 
 /// Build the VM this process was started to be, and enter it.
-pub fn run() -> anyhow::Result<Infallible> {
-    let kernel = required(KERNEL_ENV)?;
-    let boot_root = required(BOOT_ROOT_ENV)?;
-    let upper = required(SESSION_IMAGE_ENV)?;
-    let lower = required(BASE_IMAGE_ENV)?;
-    let channel = required(CHANNEL_ENV)?;
-
+///
+/// Everything comes off the command line, which this crate's own [`BootArgs`] spells. Nothing
+/// is decided here that the server did not already decide — this role exists to hold a
+/// hypervisor, not to have opinions.
+pub fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // The console port is a descriptor, and this is where it comes from: one connection
     // back to the server that spawned us. Held for the length of this function, which is
     // the length of the process — `enter` below does not return.
-    let channel = UnixStream::connect(&channel)
+    let channel = UnixStream::connect(&args.channel)
         .map_err(|e| anyhow::anyhow!("connecting to the console channel: {e}"))?;
     let port = channel.as_raw_fd();
 
+    let lower_format = match args.base_format {
+        BaseFormat::Raw => DiskImageFormat::Raw,
+        BaseFormat::Vmdk => DiskImageFormat::Vmdk,
+    };
     let mut builder = VmBuilder::new()
         .machine(|m| {
-            m.vcpus(number(VCPUS_ENV).unwrap_or(DEFAULT_VCPUS))
-                .memory_mib(number(MEMORY_ENV).unwrap_or(DEFAULT_MEMORY_MIB) as usize)
+            m.vcpus(args.vcpus.unwrap_or(DEFAULT_VCPUS))
+                .memory_mib(args.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB) as usize)
         })
-        .kernel(|k| k.krunfw_path(&kernel))
-        .fs(|fs| fs.root(&boot_root))
-        .disk(|d| d.path(&upper).format(DiskImageFormat::Raw))
-        .disk(|d| d.path(&lower).read_only(true).format(DiskImageFormat::Raw))
+        .kernel(|k| k.krunfw_path(&args.kernel))
+        .fs(|fs| fs.root(&args.boot_root))
+        .disk(|d| d.path(&args.session).format(DiskImageFormat::Raw))
+        .disk(|d| d.path(&args.base).read_only(true).format(lower_format))
         // The same descriptor both ways: a socket is bidirectional, and the port the
         // guest opens is one thing rather than a pair.
         .console(|c| c.port(PORT_NAME, port, port));
@@ -98,7 +104,7 @@ pub fn run() -> anyhow::Result<Infallible> {
     // places: a device configuration and a `mount -t virtiofs`. The path is the second
     // agreement, and it is the host's own — see the module docs on why the guest mounts it
     // where this host has it.
-    let share = match workfs()? {
+    let share = match workfs(args.workfs.as_deref())? {
         Some(path) => {
             builder = builder.fs(|fs| fs.tag(WORKFS_TAG).path(&path));
             Some(format!("{WORKFS_TAG}:{path}"))
@@ -126,29 +132,19 @@ pub fn run() -> anyhow::Result<Infallible> {
 ///
 /// UTF-8 because it has to be written into [`SHARE_ENV`] as `tag:path` and read back by the
 /// guest — a directory with no string form is one the two ends could not agree on, and this
-/// is the last place that can say so.
-fn workfs() -> anyhow::Result<Option<String>> {
-    let Some(path) = std::env::var_os(WORKFS_ENV) else {
+/// is the last place that can say so. Which is why it is checked here and not in
+/// [`BootArgs::parse`]: everything else there is a path this process only ever opens.
+fn workfs(path: Option<&Path>) -> anyhow::Result<Option<String>> {
+    let Some(path) = path else {
         return Ok(None);
     };
-    let path = path.into_string().map_err(|path| {
-        anyhow::anyhow!("{WORKFS_ENV} is not utf-8: {}", Path::new(&path).display())
-    })?;
     anyhow::ensure!(
-        Path::new(&path).is_absolute(),
-        "{WORKFS_ENV} has to be an absolute path, and is {path}"
+        path.is_absolute(),
+        "--workfs has to be an absolute path, and is {}",
+        path.display()
     );
-    Ok(Some(path))
-}
-
-fn required(key: &str) -> anyhow::Result<PathBuf> {
-    std::env::var_os(key)
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("{key} is unset — a boot is started by a console server"))
-}
-
-/// An override read out of the environment, ignoring anything that is not a number: a
-/// caller who typed nonsense gets the default and a guest that boots.
-fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
-    std::env::var(key).ok()?.parse().ok()
+    let path = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("--workfs is not utf-8: {}", path.display()))?;
+    Ok(Some(path.to_string()))
 }

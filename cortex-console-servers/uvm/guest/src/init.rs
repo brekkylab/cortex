@@ -42,6 +42,10 @@
 //! something to point at. So [`copy_self`] writes the running image back out onto the new
 //! root, read through `/proc/self/exe`, which the kernel keeps resolvable to the inode
 //! whatever happened to the name.
+//!
+//! The boot root's other file, the [`ImageSpec`] the host left there, has the same problem and
+//! the cheaper answer: [`image_spec`] reads it into memory before the pivot, because nothing
+//! after this needs it as a file.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -49,7 +53,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use crate::contract::{GUEST_BIN_PATH, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV};
+use crate::contract::{
+    GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV,
+};
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
 /// this code is mounting, so it is normally there already; the wait is for the boot where
@@ -60,7 +66,9 @@ const PORT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// Build the root, mount what the session was given, and open the channel the host is
 /// waiting on.
 ///
-/// Returns the port, which is the only thing the agent needs from here.
+/// Returns the port and what the base image said about running things in it — the two things
+/// the agent needs from here and cannot get for itself, the second because it is a file in a
+/// root that no longer exists by the time the agent runs.
 ///
 /// Where the tree landed is **not** returned, and that is the point: the agent hears it in
 /// the `init` the host replays, as a `file://` URL naming the same absolute path the host
@@ -69,10 +77,13 @@ const PORT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// directory.
 ///
 /// The order is the only one that works: pseudo-filesystems first because `/proc` is how
-/// this binary finds itself and `/dev` is where the block devices are, the overlay next
-/// because it replaces everything mounted so far, then the share, then the port.
-pub fn prepare() -> anyhow::Result<File> {
+/// this binary finds itself and `/dev` is where the block devices are, the spec next because
+/// the overlay is about to replace the root it is in, then the overlay, then the share, then
+/// the port.
+pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
     mount_pseudo();
+
+    let image = image_spec()?;
 
     if let (Ok(lower), Ok(upper)) = (std::env::var(LOWER_ENV), std::env::var(UPPER_ENV)) {
         mount_root(&lower, &upper)?;
@@ -83,14 +94,38 @@ pub fn prepare() -> anyhow::Result<File> {
     }
 
     // Where a command runs is the session's, and the agent sets it per command — but this
-    // process has to stand somewhere, and a session with no tree stands here. The tree
-    // when there is one, `/` when there is not.
+    // process has to stand somewhere, and a session with no tree stands here. The tree when
+    // there is one; otherwise where the image expects a process to be, and `/` when it said
+    // nothing or named a directory it never created.
     match share()? {
         Some(root) => set_cwd(&root)?,
-        None => set_cwd(Path::new("/"))?,
+        None => match image.working_dir.as_deref().map(Path::new) {
+            Some(stated) if set_cwd(stated).is_ok() => {}
+            _ => set_cwd(Path::new("/"))?,
+        },
     }
 
-    open_port()
+    Ok((open_port()?, image))
+}
+
+/// What the base image expects, as the host left it in the boot root.
+///
+/// An absent file is the default rather than a failure. The only way to have one is to drive
+/// the boot role by hand — a console server writes it on every boot, and the guest binary is
+/// embedded in that same server, so the two cannot be different builds — and the default is
+/// exactly the behaviour this end had before there was a spec to read.
+///
+/// A file that *is* there and does not decode is the other case, and that one is reported: it
+/// means the two `contract` modules have drifted, which nothing else would catch.
+fn image_spec() -> anyhow::Result<ImageSpec> {
+    let encoded = match std::fs::read(IMAGE_SPEC_PATH) {
+        Ok(encoded) => encoded,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ImageSpec::default()),
+        Err(e) => anyhow::bail!("reading {IMAGE_SPEC_PATH}: {e}"),
+    };
+
+    bson::deserialize_from_slice(&encoded)
+        .map_err(|e| anyhow::anyhow!("decoding {IMAGE_SPEC_PATH}: {e}"))
 }
 
 /// `mount(2)`, creating the target first.

@@ -86,8 +86,8 @@ fn main() -> ExitCode {
         Role::Shim(name) => runtime().block_on(shim::run(&name)),
 
         Role::Agent => {
-            let port = match init::prepare() {
-                Ok(port) => port,
+            let (port, image) = match init::prepare() {
+                Ok(prepared) => prepared,
                 Err(e) => {
                     eprintln!("cortex-uvm-guest: {e}");
                     return ExitCode::from(NOT_EXECUTABLE);
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
             };
             // A session's own answers travel inside its responses, so this code says
             // only whether the session itself worked.
-            match runtime().block_on(agent::run(port)) {
+            match runtime().block_on(agent::run(port, image)) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("cortex-uvm-guest: {e}");

@@ -106,7 +106,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 
-use crate::contract::{GUEST_PATH, HANDSHAKE};
+use crate::contract::{GUEST_PATH, HANDSHAKE, ImageSpec};
 use crate::ipc::SOCK_ENV;
 use bin_dir::BinDir;
 
@@ -130,7 +130,11 @@ const MAX_DATA: u64 = MAX_PAYLOAD as u64 - 1024;
 /// `port` is the virtio-console port, open read-write. It becomes two halves here, from
 /// one `dup`: the driver refuses a second opener, and the framing wants to read and write
 /// through borrows that do not have to take turns.
-pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
+///
+/// `image` is what the base image stated, read by [`init`](crate::init) while its file was
+/// still reachable. It is the session's for the whole process because it describes the root
+/// every session in here runs on, which no `init` can change.
+pub async fn run(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
     // SAFETY: `dup` hands back a fresh descriptor for the same open file, and the
     // `File` built from it is the only owner of that number.
     let duplicate = unsafe { libc::dup(port.as_raw_fd()) };
@@ -163,7 +167,7 @@ pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
 
     // Whatever it holds is dropped on `stop` and on the way out of this function
     // whichever way it leaves, which takes the symlinks with it every time.
-    let mut session = Session::default();
+    let mut session = Session::new(image);
 
     while let Some(message) = server.recv().await? {
         match message {
@@ -295,11 +299,23 @@ struct Session {
     /// path in a file call resolves against.
     cwd: Option<PathBuf>,
 
+    /// What the base image stated. A property of the root rather than of the session, so an
+    /// `init` neither sets it nor clears it.
+    image: ImageSpec,
+
     /// `None` until something boots it: a `start`, or the first call that needs one.
     linked: Option<BinDir>,
 }
 
 impl Session {
+    /// A session on the root the image describes, with nothing configured yet.
+    fn new(image: ImageSpec) -> Session {
+        Session {
+            image,
+            ..Session::default()
+        }
+    }
+
     /// Take a new shape, answering what the client has to know about it.
     ///
     /// The URL is read before anything is let go of, so a session this agent cannot take is
@@ -320,6 +336,9 @@ impl Session {
                 path: path.to_string_lossy().into_owned(),
             }),
             cwd: self.named_cwd(),
+            // Nothing to say: this agent is running *inside* the base and never heard which
+            // one it is. The answer the client sees is the console server's, one boot up.
+            image: None,
         })
     }
 
@@ -682,29 +701,47 @@ async fn delegate(
     Ok(Some(id))
 }
 
-/// The environment variables an execution is given: the way home for a shim, and a `PATH`
-/// with the delegated names on it.
+/// The environment variables an execution is given: whatever the image stated, the way home
+/// for a shim, and a `PATH` with the delegated names on it.
 ///
-/// `PATH` is composed rather than inherited. libkrun hands the guest's first process only
-/// what the boot named, so there is no ambient `PATH` here to add to — see
-/// [`GUEST_PATH`], which is what a login shell in this image would have had.
+/// Nothing is inherited. libkrun hands the guest's first process only what the boot named, so
+/// there is no ambient environment here to add to — which is why the image's own `ENV` has to
+/// be replayed rather than assumed present. It is where a Debian-based Python image puts its
+/// `PATH` and its `LANG`, and a command that runs without them runs somewhere the image was
+/// never built to be.
+///
+/// The layering is image first, ours over the top. A variable the image set is a default; the
+/// two we set are not — [`SOCK_ENV`] is how a shim finds its way back to this process, and
+/// `PWD` has to agree with where the command is actually standing.
 ///
 /// Per command rather than per process, for the same reason a host-local console does it
 /// that way: `std::env::set_var` is unsound with any other thread running, and this
 /// program has one.
 fn environment(session: &Session, shims: &Shims) -> Vec<(OsString, OsString)> {
-    // Appended, not prepended: these names are meant to add commands, not to quietly
-    // shadow a real `git` or `python` the image ships.
-    let mut path = OsString::from(GUEST_PATH);
+    // Anything without a `=` is not a variable. The list comes out of an image's config, so
+    // it is somebody else's data and the one malformed entry should not cost the rest.
+    let mut env: Vec<(OsString, OsString)> = session
+        .image
+        .env
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect();
+
+    // The image's `PATH` when it gave one, ours when it did not — see [`GUEST_PATH`]. Either
+    // way the delegated names are appended and not prepended: they are meant to add commands,
+    // not to quietly shadow a real `git` or `python` the image ships.
+    let mut path = match env.iter().position(|(name, _)| name == "PATH") {
+        Some(stated) => env.remove(stated).1,
+        None => OsString::from(GUEST_PATH),
+    };
     if let Some(linked) = session.linked() {
         path.push(":");
         path.push(linked.bin());
     }
 
-    let mut env = vec![
-        (SOCK_ENV.into(), shims.sock.clone().into_os_string()),
-        ("PATH".into(), path),
-    ];
+    env.push((SOCK_ENV.into(), shims.sock.clone().into_os_string()));
+    env.push(("PATH".into(), path));
 
     // `PWD` is what a shell reads to answer `pwd`, and a command spawned in the session's
     // directory would otherwise be told it was standing wherever this process is. Set to
