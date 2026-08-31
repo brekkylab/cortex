@@ -129,9 +129,9 @@ use std::{
 use bin_dir::SessionScratch;
 use bson::Bson;
 use cortex::console::{
-    Call, Error, Exec, ExecCmd, ExecResult, Init, InitResult, MAX_PAYLOAD, Message, Notification,
-    Outcome, Progress, Read, ReadResult, RequestId, Server, WorkFsMount, WorkFsSource, Write,
-    WriteResult, stdio::StdioServer,
+    Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, InitResult, MAX_PAYLOAD, Message,
+    Notification, Outcome, Progress, Read, ReadResult, RequestId, Server, WorkFsMount,
+    WorkFsSource, Write, WriteResult, stdio::StdioServer,
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
@@ -328,6 +328,7 @@ impl Session {
     /// just arrived.
     fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+        base(config.image.as_ref())?;
 
         // Through `release` rather than nulling the field: what a boot has to give back
         // grows, and a re-`init` while a session is live has exactly as much reason to go
@@ -350,6 +351,9 @@ impl Session {
             // it is left unsaid rather than sent lossily — the rule a `cwd` follows
             // everywhere in this protocol.
             cwd: self.named_cwd(),
+            // Nothing to name. A command here runs on this host's own filesystem, which is
+            // not an image and has no reference — see [`base`].
+            image: None,
         })
     }
 
@@ -561,6 +565,30 @@ fn cd_target(exec: &Exec) -> Option<&[String]> {
 /// string the same way. What is left here is the two refusals, which are this build's: a
 /// scheme it has no provider for, and a path that is not absolute — `file://srv/x`, whose
 /// authority is not something this can honour and whose path two ends would resolve
+/// A base a session named, refused, because there is nothing here to be one.
+///
+/// A command on this backend is a process on this host, running against the filesystem this
+/// server can see. There is no root to swap and no overlay to put one under, so an image is not
+/// a narrower session this could give: it is a different backend.
+///
+/// Which makes this the second place in this build where a *capability* decides a refusal
+/// rather than a provider, the first being the reach a session asks for. Asking for nothing is
+/// not asking for less: an `init` with no image gets the session it always got.
+fn base(asked: Option<&ImageSource>) -> Result<(), Outcome> {
+    let Some(asked) = asked else {
+        return Ok(());
+    };
+
+    Err(refused(
+        Error::UNSUPPORTED_IMAGE,
+        format!(
+            "{}: commands here run on this host's own filesystem, so there is no base to put \
+             under them — an image needs a backend that runs them somewhere else",
+            asked.reference
+        ),
+    ))
+}
+
 /// differently.
 fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Outcome> {
     let Some(path) = workfs.file_path() else {

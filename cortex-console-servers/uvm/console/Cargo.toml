@@ -22,8 +22,12 @@ libc = { workspace = true }
 # build that boots anything.
 msb_krun = { workspace = true, features = ["blk"] }
 # The image tooling: `ext4` formats the session's writable upper, `tar` and `tree` turn a
-# rootfs tarball into a file tree, and `erofs` writes that tree as the read-only base.
+# rootfs tarball into a file tree, `erofs` writes that tree as the read-only base, and
+# `registry` pulls an OCI image to be one instead.
 microsandbox-image = { workspace = true }
+# Deriving `ImageSpec`, the one thing a boot hands the guest as a file rather than as an
+# environment value — see `contract::IMAGE_SPEC_PATH`.
+serde = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [
