@@ -69,8 +69,8 @@ use crate::{
     console::{
         base::{Client, Failure},
         message::{
-            Call, Error, Exec, ExecCmd, ExecResult, Init, Notification, Outcome, Progress, Read,
-            ReadResult, RequestId, WorkFsSource, Write, WriteResult,
+            Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, NetworkAccess, Notification,
+            Outcome, Progress, Read, ReadResult, RequestId, WorkFsSource, Write, WriteResult,
         },
         stdio::StdioClient,
     },
@@ -110,6 +110,13 @@ pub struct ConsoleBuilder {
     /// has no path for a delegated name to open. What that means for the names is
     /// [`Executable::exec`](crate::exec::Executable::exec)'s to say.
     mount: Option<Box<dyn Mount>>,
+
+    /// The base the session's commands run in, and `None` to leave it to the server.
+    image: Option<ImageSource>,
+
+    /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
+    /// and what every caller wanted before this existed.
+    network: Option<NetworkAccess>,
 }
 
 impl ConsoleBuilder {
@@ -192,6 +199,65 @@ impl ConsoleBuilder {
     /// Leaving it out is a console with nothing mounted; see the field this fills.
     pub fn mount(mut self, mount: impl Mount + 'static) -> Self {
         self.mount = Some(Box::new(mount));
+        self
+    }
+
+    /// The base the session's commands run in, named as an OCI image.
+    ///
+    /// ```no_run
+    /// # use cortex::console::Console;
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .image("python:3.13-slim")
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// **What a command finds around it is the image's**, which is what makes this worth
+    /// saying at all: its interpreter, its libraries, and the environment it declares. A
+    /// backend that has no base to swap answers
+    /// [`UNSUPPORTED_IMAGE`](crate::console::Error::UNSUPPORTED_IMAGE) from
+    /// [`build`](Self::build), which is every backend whose commands run on the server's own
+    /// filesystem.
+    ///
+    /// A reference this server can parse but not fetch is **not** refused here. Pulling is
+    /// slow enough to belong to a boot, so a name that resolves to nothing is heard from the
+    /// first call that needs a guest, or from [`Console::start`] if one is made.
+    ///
+    /// Leaving it out leaves the choice to the server, and [`Console::image`] is then how to
+    /// find out what it chose.
+    pub fn image(mut self, image: impl Into<ImageSource>) -> Self {
+        self.image = Some(image.into());
+        self
+    }
+
+    /// How much of a network the session's commands get.
+    ///
+    /// ```no_run
+    /// # use cortex::console::{Console, NetworkAccess};
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .network(NetworkAccess::public())
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// **A server gives what is named here or refuses to open the session**, which is what
+    /// makes this worth saying rather than checking afterwards: a console that exists is one
+    /// whose commands reach what was asked for and no more. A reach the far end cannot provide
+    /// arrives as [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) from
+    /// [`build`](Self::build) — including from a server whose commands run on this host, which
+    /// cannot take the network away from them and so answers only
+    /// [`full`](NetworkAccess::full).
+    ///
+    /// Leaving it out leaves the choice to the server, and [`Console::network`] is then how to
+    /// find out what it chose.
+    pub fn network(mut self, network: NetworkAccess) -> Self {
+        self.network = Some(network);
         self
     }
 
@@ -281,6 +347,13 @@ pub struct Console {
     /// second answer to a question that already has one — wrong from the first `cd`
     /// somebody else's execution ran.
     server_path: Option<PathBuf>,
+
+    /// The base in force, as the server answered at `init`.
+    image: Option<ImageSource>,
+
+    /// What the session's commands can reach, as the server answered at `init` — `None` from a
+    /// server that would not say.
+    network: Option<NetworkAccess>,
 }
 
 impl Console {
@@ -315,6 +388,8 @@ impl Console {
             client_factory,
             execs,
             mount,
+            image,
+            network,
         } = builder;
 
         let client_factory =
@@ -339,6 +414,8 @@ impl Console {
             .init(Init {
                 delegated: execs.names().map(str::to_string).collect(),
                 workfs,
+                image,
+                network,
             })
             .await?;
 
@@ -358,6 +435,8 @@ impl Console {
             execs,
             mount,
             server_path,
+            image: answered.image,
+            network: answered.network,
         })
     }
 
@@ -370,6 +449,29 @@ impl Console {
     /// rather than assumed.
     pub fn workfs_path(&self) -> Option<&Path> {
         self.server_path.as_deref()
+    }
+
+    /// The base this session's commands run in, as the server answered.
+    ///
+    /// The [`ConsoleBuilder::image`] that was asked for, in the server's own spelling: a
+    /// reference naming no registry names a default one, and this is where a client sees which.
+    /// Worth reading when nothing was asked, since the base is then the server's own choice.
+    ///
+    /// `None` is a base with no reference to give — a server that will not say, or one whose
+    /// commands do not run in an image at all.
+    pub fn image(&self) -> Option<&ImageSource> {
+        self.image.as_ref()
+    }
+
+    /// What this session's commands can reach, as the server answered.
+    ///
+    /// The reach [`ConsoleBuilder::network`] asked for, when it asked — a server gives that or
+    /// refuses, so a console that exists is one that got it. Worth reading when nothing was
+    /// asked: the reach is then the server's own choice, and this is where it says which.
+    ///
+    /// `None` is a server that would not say, which is every server built before it could.
+    pub fn network(&self) -> Option<&NetworkAccess> {
+        self.network.as_ref()
     }
 
     /// Boot the far end now, to hide the cold start.
@@ -459,6 +561,8 @@ impl Console {
             execs,
             mount,
             server_path,
+            image: _,
+            network: _,
         } = self;
 
         // The id of the request the *next* answer will be to, which is what carrying on

@@ -111,6 +111,7 @@ dependencies = [
  "bson",
  "cortex",
  "libc",
+ "serde",
  "tokio",
 ]
 

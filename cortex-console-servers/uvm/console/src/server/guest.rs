@@ -57,12 +57,22 @@ use tokio::{
 
 use crate::{
     assets::{self, BootRoot, SessionImage},
-    contract::{
-        BASE_IMAGE_ENV, BOOT_ROOT_ENV, CHANNEL_ENV, HANDSHAKE, KERNEL_ENV, SESSION_IMAGE_ENV,
-        WORKFS_ENV,
-    },
+    contract::{BootArgs, HANDSHAKE, Network},
     helper::boot_helper,
 };
+
+/// Guest vCPUs and memory, if this server was told to override the boot's own defaults.
+///
+/// Read here and passed on, rather than left for the child to find in the environment it
+/// inherits: a value the boot is given is a value the server can be asked what it sent.
+const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
+const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
+
+/// An override read out of this server's environment, ignoring anything that is not a
+/// number: a caller who typed nonsense gets the boot's default and a guest that boots.
+fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key).ok()?.parse().ok()
+}
 
 /// How long a boot may take before it is called a failure.
 ///
@@ -72,12 +82,6 @@ use crate::{
 /// reaches userspace, where the alternative is a console that hangs on its first `exec`
 /// with nothing to report.
 const BOOT_TIMEOUT: Duration = Duration::from_secs(90);
-
-/// The role argument the boot child is started under.
-///
-/// Not a subcommand anybody types. The child is a copy of this binary at a path in a cache
-/// directory, so `argv[0]` cannot say what it is and `argv[1]` does.
-pub const BOOT_ARG: &str = "--boot";
 
 /// A guest that is up, and everything whose lifetime is that guest's.
 pub struct Guest {
@@ -105,9 +109,14 @@ impl Guest {
     /// `workfs` is a directory on this host, or `None` for a session with no tree. It is
     /// shared into the guest **at its own path** — see [`boot`](crate::boot), which is where
     /// that decision is argued.
-    pub async fn boot(workfs: Option<&Path>) -> anyhow::Result<Guest> {
+    pub async fn boot(
+        workfs: Option<&Path>,
+        image: Option<&str>,
+        network: Network,
+        host_ports: &[u16],
+    ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
-        let base = assets::base_image().await?;
+        let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
 
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
@@ -115,30 +124,35 @@ impl Guest {
         let session = tokio::task::spawn_blocking(SessionImage::create)
             .await
             .map_err(|e| anyhow::anyhow!("formatting the session image: {e}"))??;
-        let boot_root = BootRoot::create()?;
+        let boot_root = BootRoot::create(&base.spec)?;
 
         let socket = Socket::bind()?;
 
+        let args = BootArgs {
+            kernel,
+            boot_root: boot_root.path().to_path_buf(),
+            channel: socket.path.clone(),
+            base: base.path,
+            base_format: base.format,
+            session: session.path().to_path_buf(),
+            network,
+            host_ports: host_ports.to_vec(),
+            // Told rather than left to the child's inherited environment, which is what made
+            // one of these names mean two things once already.
+            workfs: workfs.map(Path::to_path_buf),
+            vcpus: number(VCPUS_ENV),
+            memory_mib: number(MEMORY_ENV),
+        };
+
         let mut command = Command::new(&helper);
         command
-            .arg(BOOT_ARG)
-            .env(KERNEL_ENV, &kernel)
-            .env(BASE_IMAGE_ENV, &base)
-            .env(SESSION_IMAGE_ENV, session.path())
-            .env(BOOT_ROOT_ENV, boot_root.path())
-            .env(CHANNEL_ENV, &socket.path)
+            .args(args.to_args())
             .stdin(Stdio::null())
             // The guest's console — kernel messages, and anything a command's output
             // escapes onto — goes where this process's diagnostics go. Not stdout:
             // that is the protocol's, and a boot message on it corrupts a frame.
             .stdout(Stdio::from(stderr()?))
             .stderr(Stdio::inherit());
-
-        // Unset when there is no tree, which is how the boot child is told so — it reads
-        // the variable's absence rather than an empty value.
-        if let Some(workfs) = workfs {
-            command.env(WORKFS_ENV, workfs);
-        }
 
         let vmm = Vmm(command
             .spawn()

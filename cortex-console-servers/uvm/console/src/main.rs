@@ -17,20 +17,17 @@
 //! they buy is *who waits* and *what is occupied while nothing runs*, and on this backend
 //! both are worth a message.
 //!
-//! # Two roles, one binary
+//! # This binary does not boot anything
 //!
-//! `msb_krun`'s `enter` never returns: when the guest shuts down the VMM calls `_exit` and
-//! the process is gone. A console server has a session to keep answering, so it cannot be
-//! the process that boots — and this binary is therefore reached two ways, told apart by
-//! [`Role`]:
+//! `msb_krun`'s `enter` never returns: when the guest shuts down the VMM calls `_exit` and the
+//! process is gone. A console server has a session to keep answering, so it cannot be the
+//! process that boots — and creating a VM needs an entitlement `cargo build` does not produce,
+//! so whatever boots has to be written out and signed anyway.
 //!
-//! - with no arguments — **server**: answer the session, and boot children as it needs them
-//!   (see [`server`]).
-//! - with `--boot` — **boot child**: assemble the VM described by the environment and enter
-//!   it (see [`boot`]).
-//!
-//! On macOS the child is not this file but a signed copy of it, because creating a VM needs
-//! an entitlement that `cargo build` does not produce — see [`helper`].
+//! Both of those are answered by `cortex-uvm-boot`, a separate binary this one carries inside
+//! it: [`helper`] writes it to a cache, signs it, and [`server`] starts it once per session.
+//! Which is also what keeps the hypervisor out of this process — the two agree on a handful of
+//! environment variables and nothing else.
 //!
 //! # What the guest is
 //!
@@ -43,6 +40,12 @@
 //! Writes anywhere in the guest land on the session's upper and stay there for as long as
 //! the guest is up; they are gone when it is released, because the image is deleted with
 //! it. The base image is shared, never written, and provisioned once — see [`assets`].
+//!
+//! What that base *is* comes from the environment: an OCI reference
+//! ([`IMAGE_ENV`](assets::IMAGE_ENV)) is pulled from a registry, and a caller who names none
+//! gets the pinned rootfs the crate falls back to. Either way it reaches the guest as one
+//! read-only disk, and what the image says about running a process in it reaches the commands
+//! — see [`ImageSpec`](contract::ImageSpec).
 //!
 //! The tree is optional and comes from the client, not the environment: an `init` names it
 //! as a `file://` URL, and what that names is a directory on this host — mounted there by
@@ -71,10 +74,13 @@
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
 mod assets;
-mod boot;
-mod contract;
 mod helper;
 mod server;
+
+// The strings this server and the boot process it starts agree on. Aliased at the crate root
+// so every module below can say `crate::contract::…` — the name they read as, and the name it
+// had when it was a module here.
+use cortex_uvm_boot as contract;
 
 use std::process::ExitCode;
 
@@ -82,51 +88,16 @@ use std::process::ExitCode;
 /// it".
 const NOT_EXECUTABLE: u8 = 126;
 
-/// Which of the two jobs this process was started to do.
-enum Role {
-    /// Answer the session.
-    Server,
-    /// Become a micro-VM.
-    Boot,
-}
-
-/// Decide the role from the arguments.
-///
-/// The boot child is a copy of this binary at a cache path, so `argv[0]` says nothing
-/// useful about which role it is — unlike a shim, whose whole identity is the name it was
-/// invoked under. An explicit argument is what is left, and it is one nobody types: a boot
-/// is started by [`server`] and by nothing else.
-fn role() -> Role {
-    match std::env::args().nth(1) {
-        Some(arg) if arg == server::BOOT_ARG => Role::Boot,
-        _ => Role::Server,
-    }
-}
-
-/// A server waits on a pipe, a socket and a guest, so it is async. A boot child is not: it
-/// assembles a VM and hands the process to the VMM, and everything it waits for after that
-/// it waits for by not existing.
+/// A server waits on a pipe, a socket and a guest, so it is async.
 fn main() -> ExitCode {
-    match role() {
-        Role::Boot => match boot::run() {
-            // `enter` only returns on success by not returning at all: the `Ok` holds an
-            // `Infallible`, and the empty match is what says so.
-            Ok(never) => match never {},
-            Err(e) => {
-                eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));
-                ExitCode::from(NOT_EXECUTABLE)
-            }
-        },
-
-        // Each command's code travels back inside its own answer, so this one only says
-        // whether the session itself worked.
-        Role::Server => match runtime().block_on(server::run()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));
-                ExitCode::from(NOT_EXECUTABLE)
-            }
-        },
+    // Each command's code travels back inside its own answer, so this one only says whether
+    // the session itself worked.
+    match runtime().block_on(server::run()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));
+            ExitCode::from(NOT_EXECUTABLE)
+        }
     }
 }
 

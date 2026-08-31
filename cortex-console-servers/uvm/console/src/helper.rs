@@ -1,29 +1,32 @@
-//! The executable a boot actually runs, which on macOS is not this one.
+//! The executable a boot actually runs, which is never this one.
 //!
-//! Creating a VM through Hypervisor.framework needs the `com.apple.security.hypervisor`
-//! entitlement, and libkrun `dlopen`s libkrunfw, which needs library validation off. Both
-//! are carried by a code signature — and `cargo build` produces an unsigned binary, and
-//! relinking drops whatever was there before, so a console server cannot simply be the
-//! process that boots.
+//! A boot is `cortex-uvm-boot`, embedded in this binary by the build script and written out
+//! to a cache the first time a session needs it. Two reasons it is a file rather than a
+//! process this one becomes:
 //!
-//! So it is not. A boot runs a **copy of this binary**, signed once and cached, in the
-//! [`Boot`](crate::Role::Boot) role. The copy is keyed by the content of the original, so
-//! a rebuild produces a different key and therefore a fresh copy, and two consoles built
-//! from the same binary share one.
+//! - **It has to be signed.** Creating a VM through Hypervisor.framework needs the
+//!   `com.apple.security.hypervisor` entitlement, and libkrun `dlopen`s libkrunfw, which needs
+//!   library validation off. Both are carried by a code signature — and `cargo build` produces
+//!   an unsigned binary, and relinking drops whatever was there before. Something has to be
+//!   written and signed on the way to a boot no matter how this is arranged.
+//! - **It is not this binary.** Which is what makes the signed artifact small, and keeps the
+//!   VMM and the network stack behind it out of the process that only answers a session.
 //!
-//! On anything but macOS there is nothing to sign and no reason to copy, so a boot runs
-//! this binary where it already is.
+//! The copy is keyed by the content of the embedded bytes, so a rebuild produces a different
+//! key and therefore a fresh copy, and two servers built from the same source share one.
 //!
-//! # Why signing a copy rather than asking the caller to sign
+//! # Why signing here rather than asking the caller to sign
 //!
 //! Because the caller would have to sign *their* binary. A console server is started by
 //! whoever wants a console — a test, an agent runtime, a CLI — and the entitlement is a
-//! property of the process that calls `hv_vm_create`, not of the product. Putting the
-//! requirement on this crate's own artifact keeps it out of everyone else's build.
+//! property of the process that calls `hv_vm_create`, not of the product. Keeping the
+//! requirement on an artifact this crate carries keeps it out of everyone else's build.
 
-#[cfg(target_os = "macos")]
-use std::io;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// The boot half, built for this host and embedded by `build.rs`.
+const BOOT_BIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cortex-uvm-boot"));
 
 /// The entitlements the boot process needs, and only those.
 #[cfg(target_os = "macos")]
@@ -41,71 +44,76 @@ const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 </plist>
 "#;
 
-/// The program a boot child runs.
-#[cfg(not(target_os = "macos"))]
-pub fn boot_helper() -> anyhow::Result<PathBuf> {
-    Ok(std::env::current_exe()?)
-}
-
-/// The program a boot child runs: a signed copy of this binary, made once per build.
-#[cfg(target_os = "macos")]
+/// The program a boot runs, written out and — on macOS — signed, once per build.
 pub fn boot_helper() -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
-    let exe = std::env::current_exe()?;
     let cache = crate::assets::home()?.join("boot-helper");
     std::fs::create_dir_all(&cache)?;
 
-    let dest = cache.join(format!("boot-{}", key(&exe)?));
+    let dest = cache.join(format!("boot-{}", key()));
     if dest.exists() {
         return Ok(dest);
     }
 
     // Written, made executable and signed at a path nothing else will pick, then renamed
-    // into place. Two boots racing here both do the work and the rename decides which
-    // copy survives — where sharing one temporary path would mean one of them signing a
-    // file the other was still writing.
-    let tmp = cache.join(format!("boot-{}.{}.tmp", key(&exe)?, std::process::id()));
-    std::fs::copy(&exe, &tmp)?;
+    // into place. Two boots racing here both do the work and the rename decides which copy
+    // survives — where sharing one temporary path would mean one of them signing a file the
+    // other was still writing.
+    let tmp = cache.join(format!(
+        "boot-{}.{}.{}.tmp",
+        key(),
+        std::process::id(),
+        seq()
+    ));
+    std::fs::write(&tmp, BOOT_BIN)?;
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
 
-    let plist = cache.join("entitlements.plist");
-    std::fs::write(&plist, ENTITLEMENTS)?;
-    let status = std::process::Command::new("codesign")
-        .args(["-s", "-", "--force", "--entitlements"])
-        .arg(&plist)
-        .arg(&tmp)
-        .status()?;
-    if !status.success() {
+    #[cfg(target_os = "macos")]
+    if let Err(e) = sign(&cache, &tmp) {
         let _ = std::fs::remove_file(&tmp);
-        anyhow::bail!(
-            "codesign of the boot helper failed ({status}) — without the hypervisor \
-             entitlement a boot cannot create a VM"
-        );
+        return Err(e);
     }
 
     std::fs::rename(&tmp, &dest)?;
     Ok(dest)
 }
 
-/// A cache key that changes when the binary does: its content hash and its length.
-///
-/// Computed once per process, because it reads the whole executable and every boot after
-/// the first would get the same answer.
 #[cfg(target_os = "macos")]
-fn key(exe: &std::path::Path) -> io::Result<&'static str> {
-    use std::sync::OnceLock;
+fn sign(cache: &std::path::Path, binary: &std::path::Path) -> anyhow::Result<()> {
+    let plist = cache.join("entitlements.plist");
+    std::fs::write(&plist, ENTITLEMENTS)?;
+
+    let status = std::process::Command::new("codesign")
+        .args(["-s", "-", "--force", "--entitlements"])
+        .arg(&plist)
+        .arg(binary)
+        .status()?;
+
+    anyhow::ensure!(
+        status.success(),
+        "codesign of the boot helper failed ({status}) — without the hypervisor entitlement a \
+         boot cannot create a VM"
+    );
+    Ok(())
+}
+
+/// A cache key that changes when the embedded binary does: its content hash and its length.
+///
+/// Computed once per process. The bytes are a compile-time constant, so every call after the
+/// first would hash the same input to the same answer.
+fn key() -> &'static str {
     static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        use sha2::{Digest as _, Sha256};
+        let hash = format!("{:x}", Sha256::digest(BOOT_BIN));
+        format!("{}-{}", &hash[..16], BOOT_BIN.len())
+    })
+}
 
-    if let Some(key) = KEY.get() {
-        return Ok(key);
-    }
-
-    use sha2::{Digest as _, Sha256};
-    let mut file = std::fs::File::open(exe)?;
-    let mut hasher = Sha256::new();
-    let len = io::copy(&mut file, &mut hasher)?;
-    let hash = format!("{:x}", hasher.finalize());
-
-    Ok(KEY.get_or_init(|| format!("{}-{len}", &hash[..16])))
+/// Distinguishes two boots of one process, which share a pid and a key.
+fn seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }

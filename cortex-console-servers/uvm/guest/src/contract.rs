@@ -15,6 +15,8 @@
 //! files — arrives on [`PORT_NAME`] as protocol frames, which is what makes this list
 //! stay short.
 
+use serde::{Deserialize, Serialize};
+
 /// Where the host writes this binary in the boot root, and therefore the path libkrun
 /// execs. Also where [`init`](crate::init) puts a copy of it on the new root after the
 /// pivot, so the shim symlinks have a file to point at.
@@ -47,9 +49,62 @@ pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 /// which is a session.
 pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
 
-/// `PATH` for everything an execution spawns, before the delegated names are appended.
+/// `PATH` for everything an execution spawns when the base image did not say — see
+/// [`ImageSpec::env`].
 ///
 /// Set here rather than inherited, because there is nothing to inherit it from: libkrun
 /// hands the guest's first process the environment the boot named and nothing else, so a
 /// guest without this line is one where `sh` cannot find `ls`.
 pub const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Where the host left [`ImageSpec`], in the boot root — so it is readable only until the
+/// pivot detaches that root, which is why [`init`](crate::init) reads it on the way past.
+pub const IMAGE_SPEC_PATH: &str = "/.cortex-image";
+
+/// What the base image says about running a process in it, as the host encoded it at
+/// [`IMAGE_SPEC_PATH`].
+///
+/// The other end is `cortex-uvm-console`'s `contract::ImageSpec`, and **the two files are one
+/// definition in two crates**: neither can depend on the other, so a field added on one side
+/// and not the other is a silent absence rather than a compile error.
+///
+/// Its whole job is to stop this end from inventing what the image already stated. An OCI
+/// image's `ENV` is where a Debian-based Python image says its `PATH` and its `LANG`, and a
+/// guest that ignored it would run commands in an environment the image was never built for.
+///
+/// Everything here is a *default*: the session's own values win, because a command that
+/// arrives with somewhere to be is not asking the image where to stand.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ImageSpec {
+    /// `KEY=VALUE`, as the image spelled them. Entries with no `=` are not variables and are
+    /// dropped by [`agent`](crate::agent).
+    pub env: Vec<String>,
+
+    /// Where the image expects a process to stand. Used only by a session with no tree — one
+    /// that has a tree stands in it, which is the whole reason it named one.
+    pub working_dir: Option<String>,
+}
+
+/// The interface the boot attached, as `iface=<name>,mac=<addr>,mtu=<n>`. Absent for a guest
+/// with no network, which is the default.
+///
+/// **Not this project's spelling.** These are `microsandbox-network`'s own variable names, and
+/// they arrive from the stack that assigned the values — passed through by the boot rather than
+/// translated, so there is one description of the network and not two. Its guest agent reads
+/// the same names to do the same job, which is what makes this the shape to match rather than
+/// invent.
+///
+/// The `mac=` field is the one that is not description: it is how [`net`](crate::net) tells the
+/// attached interface from the others the kernel brought up on its own.
+pub const NET_ENV: &str = "MSB_NET";
+
+/// The addresses on that interface, as `addr=<ip>/<prefix>,gw=<ip>,dns=<ip>`.
+///
+/// A separate variable from [`NET_ENV`] because a stack with no IPv4 route to offer sends no
+/// IPv4 — and one that has both sends `MSB_NET_IPV6` beside it, which this end does not read
+/// yet.
+pub const NET_IPV4_ENV: &str = "MSB_NET_IPV4";
+
+/// Where a resolver is named on any system a base image was built for.
+pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+
