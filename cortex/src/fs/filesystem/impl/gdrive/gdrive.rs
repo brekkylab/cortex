@@ -196,7 +196,7 @@ const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 /// would produce it again per chunk.
 const RENDERED_BUDGET: u64 = MAX_DOCUMENT_BYTES;
 
-const MAX_PROBED_LENGTHS: usize = 50_000;
+const MAX_REMEMBERED_LENGTHS: usize = 50_000;
 
 /// Safety ceiling on one folder's listing (10 pages). Beyond this the listing
 /// truncates (the accessor logs it) — a >10k-child folder is pathological to
@@ -299,6 +299,10 @@ type CachedListing = (Instant, Arc<Vec<Child>>);
 /// rather than copying a megabyte per chunk.
 type CachedRender = (Instant, Arc<Vec<u8>>);
 
+/// A document's served length beside the `modifiedTime` it was measured at, which is what
+/// makes the entry expire on the document changing rather than on a clock.
+type RememberedLength = (Option<std::time::SystemTime>, u64);
+
 /// The one span of one blob this holds.
 struct HeldSpan {
     id: String,
@@ -318,7 +322,7 @@ pub struct GdriveFs {
     /// Lengths learned by probing (file id → bytes), for the rows Drive listed
     /// without a `size`. One probe per file per session: `stat` is asked once per
     /// entry after every listing, and a probe is a request.
-    probed: Mutex<HashMap<String, u64>>,
+    lengths: Mutex<HashMap<String, RememberedLength>>,
     /// Per-directory listing cache (folder path → children). Path resolution walks
     /// parent listings, so one cached listing answers readdir, stat and the lookup
     /// a read starts with; fetching the bytes themselves still costs a request.
@@ -344,7 +348,7 @@ impl GdriveFs {
     pub fn new(config: &GdriveConfig) -> anyhow::Result<Self> {
         Ok(Self {
             accessor: GdriveAccessor::new(config)?,
-            probed: Mutex::new(HashMap::new()),
+            lengths: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
             rendered: Mutex::new(HashMap::new()),
             blob: Mutex::new(None),
@@ -426,7 +430,8 @@ impl GdriveFs {
     /// over a folder of documents produces every one of them and, without a budget,
     /// keeps every one: measured on this corpus, 42 documents against JSON of 7 KB to
     /// 2.5 MB apiece.
-    async fn rendered_json(&self, id: &str, api: NativeApi) -> io::Result<Arc<Vec<u8>>> {
+    async fn rendered_json(&self, child: &Child, api: NativeApi) -> io::Result<Arc<Vec<u8>>> {
+        let id = child.id.as_str();
         if let Some((at, bytes)) = self.rendered.lock().await.get(id)
             && at.elapsed() < DIR_TTL
         {
@@ -459,6 +464,9 @@ impl GdriveFs {
             }
         }
         cache.insert(id.to_string(), (Instant::now(), bytes.clone()));
+        drop(cache);
+        // Outlives the bytes above, so a listing after they age out still knows the length.
+        self.remember_len(child, bytes.len() as u64).await;
         Ok(bytes)
     }
 
@@ -641,32 +649,53 @@ impl GdriveFs {
         pretty(&v)
     }
 
-    /// The probed length of `id`, remembered so the kernel's per-entry `getattr`
-    /// storm costs one request, not one per stat. `None` when the probe fails —
-    /// the placeholder stands rather than a wrong number.
-    async fn probed_len(&self, id: &str) -> Option<u64> {
-        if let Some(n) = self.probed.lock().await.get(id) {
-            return Some(*n);
+    /// The length `stat` reports for a document, and the memory that keeps it from going
+    /// back to the placeholder.
+    ///
+    /// Held apart from the bytes on purpose. The two are worth very different amounts —
+    /// the JSON is megabytes and expires on [`DIR_TTL`] under a byte budget, the length is
+    /// eight bytes and has no reason to expire at all — so keeping them together meant a
+    /// document read six minutes ago listed at the placeholder again. Against a live
+    /// account that is `ls -l` saying 3.4 MB and then saying 64 MiB for the same unchanged
+    /// file.
+    ///
+    /// Keyed by `modifiedTime` rather than aged by a clock, which is both more accurate
+    /// and cheaper. A document that has not changed keeps its length indefinitely, and one
+    /// that has loses it the moment a listing says so. A TTL would do the opposite of each:
+    /// discard a length that is still right, and serve one that is already wrong until it
+    /// lapses.
+    ///
+    /// Losing an entry costs a listing's accuracy and never correctness, which is what
+    /// lets the bound be a flat cap and a clear rather than bookkeeping — the next read
+    /// puts it back, and a read produces the JSON either way.
+    async fn remembered_len(&self, child: &Child) -> Option<u64> {
+        // The bytes first, while they are still held: `stat` and a read of the same
+        // document answer from the same place or they disagree about where it ends.
+        let held = {
+            let rendered = self.rendered.lock().await;
+            rendered
+                .get(&child.id)
+                .filter(|(at, _)| at.elapsed() < DIR_TTL)
+                .map(|(_, bytes)| bytes.len() as u64)
+        };
+        if held.is_some() {
+            return held;
         }
-        match self.accessor.probe_len(id).await {
-            Ok(n) => {
-                let mut probed = self.probed.lock().await;
-                // A learned length is an optimisation, so losing one costs a request
-                // rather than correctness — which is what lets this be a flat cap
-                // instead of bookkeeping.
-                if probed.len() >= MAX_PROBED_LENGTHS {
-                    probed.clear();
-                }
-                probed.insert(id.to_string(), n);
-                Some(n)
-            }
-            // `None`, and nothing said. A probe runs per file, so a folder whose whole
-            // listing fails would put one line on stderr per entry — worse than the
-            // silence, at ten thousand children. What the caller does with `None` is
-            // report the placeholder, which is the same thing it reports for a file
-            // nobody has probed yet: the size says "not measured" either way.
-            Err(_) => None,
+        self.lengths
+            .lock()
+            .await
+            .get(&child.id)
+            .filter(|(mtime, _)| *mtime == child.mtime)
+            .map(|(_, len)| *len)
+    }
+
+    /// Remember what a document was served as, against the `modifiedTime` it had then.
+    async fn remember_len(&self, child: &Child, len: u64) {
+        let mut lengths = self.lengths.lock().await;
+        if lengths.len() >= MAX_REMEMBERED_LENGTHS {
+            lengths.clear();
         }
+        lengths.insert(child.id.clone(), (child.mtime, len));
     }
 
     /// How many listings are retained. Tests only: growth here is invisible from
@@ -685,6 +714,19 @@ impl GdriveFs {
             cache.len(),
             cache.values().map(|(_, b)| b.len() as u64).sum(),
         )
+    }
+
+    /// Drop the produced bytes while keeping what was learned from them. Tests only —
+    /// it is the state a document reaches on its own, by the byte budget or the TTL.
+    #[cfg(test)]
+    pub(crate) async fn forget_rendered_for_test(&self) {
+        self.rendered.lock().await.clear();
+    }
+
+    /// How many document lengths are remembered. Tests only.
+    #[cfg(test)]
+    pub(crate) async fn lengths_remembered(&self) -> usize {
+        self.lengths.lock().await.len()
     }
 
     /// Age every retained listing past its TTL. Tests only.
@@ -775,7 +817,7 @@ impl GdriveFs {
             // A document from its own API, produced once and then held: its API has no
             // notion of a range, so the window is ours to cut out of the whole thing.
             Serves::Native(api) => {
-                let bytes = self.rendered_json(&child.id, api).await?;
+                let bytes = self.rendered_json(&child, api).await?;
                 Ok(slice(&bytes, range))
             }
             // Only a directory serves nothing, and directories were rejected
@@ -793,32 +835,20 @@ impl FileSystem for GdriveFs {
                 return Ok(Stat::new(DirentKind::Dir, 0));
             }
             let child = self.resolve(&path).await?;
-            // A file Drive listed without a size: learn the real one from one ranged
-            // response header rather than leaving the placeholder, which would make
-            // `ls -l` lie and a reader truncate the body at 8 MiB.
             let size = match (&child.serves, child.size) {
-                (Serves::Original, None) => self.probed_len(&child.id).await,
                 // A document reports the length of the JSON it is served as, once
-                // something has produced that JSON. This costs no request: producing it
-                // is what a read does anyway, and the bytes are still held.
+                // something has produced that JSON — and goes on reporting it after the
+                // bytes are gone, because the length is remembered separately against the
+                // `modifiedTime` it was measured at. This costs no request either way:
+                // producing it is what a read does anyway.
                 //
-                // Before that it is the placeholder, and there is no cheap way to do
-                // better. The API answers `HEAD` with `400`, so the length cannot be had
-                // without the body, and the body is the whole document. Asking for one
-                // per entry is what a listing would then cost — `stat` runs once per name
+                // Before anything has read it, the placeholder, and there is no cheap way
+                // to do better. The API answers `HEAD` with `400`, so the length cannot be
+                // had without the body, and the body is the whole document. Asking for one
+                // per entry is what a listing would then cost — `stat` runs once per name,
                 // because FUSE-T serves over NFS and an NFS client fills an attribute for
-                // every entry it lists — which is a second per document, forever.
-                //
-                // Reporting it high rather than low is the deliberate half. JSON is read
-                // front to back, so a reader that trusts the placeholder runs past the
-                // end into zeros, which it can skip; a number that fell short would hide
-                // content instead, with nothing to recover it from.
-                (Serves::Native(..), _) => {
-                    let held = self.rendered.lock().await;
-                    held.get(&child.id)
-                        .filter(|(at, _)| at.elapsed() < DIR_TTL)
-                        .map(|(_, bytes)| bytes.len() as u64)
-                }
+                // every entry it lists — a second per document, forever.
+                (Serves::Native(..), _) => self.remembered_len(&child).await,
                 _ => None,
             };
             Ok(Stat {
@@ -923,7 +953,12 @@ fn entry_size(c: &Child) -> u64 {
     match (c.kind.is_dir(), c.size) {
         (true, _) => 0,
         (_, Some(n)) => n,
-        // A document nobody has read yet: see UNKNOWN_LENGTH_SIZE.
+        // A document nobody has read yet: see UNKNOWN_LENGTH_SIZE. A *blob* reaches this
+        // arm only if Drive listed it without a `size`, which it does not do — measured
+        // across one account's 182 non-native files, every one carried it. If that ever
+        // changes the placeholder is the wrong answer for a blob, since `read_at` pads
+        // only JSON and the kernel fills the rest of a binary with `0x00`; refusing the
+        // file would be better than a length that corrupts it.
         (_, None) => UNKNOWN_LENGTH_SIZE,
     }
 }

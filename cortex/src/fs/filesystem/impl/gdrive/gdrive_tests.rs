@@ -1242,20 +1242,119 @@ fn row(name: &str, id: &str, mime: &str, size: Option<&str>) -> Value {
     v
 }
 
-/// A file Drive listed without a `size`, read the way every caller reads: list the
-/// folder, then read windows of it.
+/// A document's length outlives the bytes it was measured from.
 ///
-/// The listing can only offer a placeholder, and the danger is that the placeholder is
-/// believed — `stat` has to resolve it, from one ranged byte rather than a download, or
-/// `ls -l` lies and a reader stops at 8 MiB. The windows after it then come out of one
-/// span, which is the point of the span: 80 MB moved to deliver 1 MB before any of this
-/// was in place.
+/// The length used to live inside the render cache, so it went away with the JSON — on the
+/// `DIR_TTL`, or the moment the byte budget dropped that document to fit another. A
+/// listing after that reported the placeholder again for a file nothing had changed:
+/// against a live account, 3.4 MB and then 64 MiB and then 3.4 MB, on nothing but cache
+/// state. Keeping the number apart from the megabytes it describes is the whole fix, and
+/// it costs a `u64` and a timestamp.
 #[tokio::test]
-async fn an_unsized_file_is_measured_then_read_by_spans() {
+async fn a_documents_length_outlives_the_bytes_it_came_from() {
+    let mock = start_with_document(
+        json!([row(
+            "notes",
+            "D1",
+            "application/vnd.google-apps.document",
+            None
+        )]),
+        HashMap::new(),
+        Some(40_000),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let dir = Path::new("/My Drive");
+    let path = dir.join("notes.gdoc.json");
+    fs.list(dir).await.unwrap();
+
+    // Nothing has read it, so there is nothing to report but the placeholder.
+    assert_eq!(fs.stat(&path).await.unwrap().size, UNKNOWN_LENGTH_SIZE);
+    assert_eq!(fs.lengths_remembered().await, 0);
+
+    let real = fs.read_window(&path, None).await.unwrap().len() as u64;
+    assert!(real < UNKNOWN_LENGTH_SIZE);
+    assert_eq!(fs.stat(&path).await.unwrap().size, real, "read, so known");
+
+    // The bytes go — the budget or the TTL takes them — and the length stays.
+    fs.forget_rendered_for_test().await;
+    assert_eq!(fs.rendered_held().await.0, 0, "the JSON is gone");
+    assert_eq!(
+        fs.stat(&path).await.unwrap().size,
+        real,
+        "and the length is still the length"
+    );
+
+    // Without producing it again: the remembered number costs no request.
+    mock.reset();
+    assert_eq!(fs.stat(&path).await.unwrap().size, real);
+    assert!(
+        !mock.asked_for("/documents/D1"),
+        "a remembered length is not a second render"
+    );
+}
+
+/// What the length is remembered *against*: the `modifiedTime` the listing carried.
+///
+/// A clock would be wrong in both directions — it drops a length that is still right, and
+/// serves one that is already wrong until it lapses. The listing already states when the
+/// document last changed, so the entry can expire on exactly that and nothing else.
+#[tokio::test]
+async fn a_remembered_length_belongs_to_the_version_it_was_measured_from() {
+    let mock = start(json!([]), HashMap::new()).await;
+    let fs = mounted(&mock.config());
+    let at = |secs: u64| Some(std::time::UNIX_EPOCH + Duration::from_secs(secs));
+    let child = |mtime| Child {
+        vfs_name: "notes.gdoc.json".into(),
+        id: "D1".into(),
+        drive_id: None,
+        kind: GKind::File,
+        mtime,
+        created: None,
+        serves: Serves::Native(NativeApi::Doc),
+        size: None,
+    };
+
+    fs.remember_len(&child(at(1000)), 4242).await;
+    assert_eq!(
+        fs.remembered_len(&child(at(1000))).await,
+        Some(4242),
+        "the same version keeps its length"
+    );
+    assert_eq!(
+        fs.remembered_len(&child(at(2000))).await,
+        None,
+        "an edited document does not keep the old one"
+    );
+    assert_eq!(
+        fs.remembered_len(&child(None)).await,
+        None,
+        "and a row with no modifiedTime states nothing to match"
+    );
+}
+
+/// A blob is stated from the listing and then read out of one span.
+///
+/// `stat` sends nothing: Drive states a `size` for every non-native file — measured across
+/// one account's 182 of them, every one carried it — so there is nothing to resolve and no
+/// request to make. The windows after it come out of one span, which is the point of the
+/// span: 80 MB moved to deliver 1 MB before any of this was in place.
+///
+/// The branch that used to probe a ranged byte for a row Drive listed *without* a size is
+/// gone with the cache that held the answer. Nothing in a real account reaches it, and a
+/// blob is the one thing a wrong length cannot be recovered from — `read_at` pads only
+/// JSON, so the kernel fills the rest of a binary with `0x00`.
+#[tokio::test]
+async fn a_blob_is_stated_from_the_listing_and_read_by_spans() {
     const REAL: usize = 20 * 1024 * 1024;
     const CHUNK: u64 = 256 * 1024;
     let mock = start(
-        json!([row("big.pdf", "P1", "application/pdf", None)]),
+        json!([row(
+            "big.pdf",
+            "P1",
+            "application/pdf",
+            Some(&REAL.to_string())
+        )]),
         HashMap::from([("P1".to_string(), vec![b'a'; REAL])]),
     )
     .await;
@@ -1264,23 +1363,18 @@ async fn an_unsized_file_is_measured_then_read_by_spans() {
     let file = Path::new("/My Drive/big.pdf");
 
     let listed = fs.list(dir).await.unwrap();
-    // The placeholder, because Drive listed no size. A `Stat` has no field for saying
-    // the number is a placeholder rather than a length, so the number itself is the
-    // whole of what a listing can report — see `dirent_for`.
     assert_eq!(
         size_of(&listed[0]),
-        UNKNOWN_LENGTH_SIZE,
-        "a listing that cannot know the length reports the placeholder"
+        REAL as u64,
+        "the listing carries Drive's own size"
     );
 
-    // The stat behind the listing resolves it — one ranged byte, not a download.
     mock.reset();
     let st = fs.stat(file).await.unwrap();
-    assert_eq!(st.size, REAL as u64, "stat answers the real length");
-    assert_eq!(
-        mock.media_ranges(),
-        vec![Some("bytes=0-0".to_string())],
-        "measured by asking for one byte"
+    assert_eq!(st.size, REAL as u64, "stat answers the same length");
+    assert!(
+        mock.media_ranges().is_empty(),
+        "and spends no request to do it"
     );
 
     // And the windows after it come out of one span rather than one request each.

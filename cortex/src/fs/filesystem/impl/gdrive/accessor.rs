@@ -439,40 +439,6 @@ impl GdriveAccessor {
             .await
     }
 
-    /// A file's exact length, without downloading it: ask for one byte and read the
-    /// total out of `Content-Range` (`bytes 0-0/119265498`).
-    ///
-    /// For the rare row Drive lists without a `size`. Measured on a 119 MB PDF: one
-    /// byte, 0.68s. The alternative — reading the object to find out how long it is
-    /// — is the thing every other guard here exists to avoid.
-    pub async fn probe_len(&self, id: &str) -> anyhow::Result<u64> {
-        let url = format!(
-            "{}/files/{id}?alt=media&supportsAllDrives=true",
-            self.urls.drive
-        );
-        let resp = self
-            .send_with_refresh(|t| {
-                self.client
-                    .get(&url)
-                    .bearer_auth(t)
-                    .header("Range", "bytes=0-0")
-            })
-            .await?
-            .error_for_status()?;
-        let total = resp
-            .headers()
-            .get(reqwest::header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                v.rsplit_once('/')
-                    .map(|(_, total)| total.trim().to_string())
-            })
-            .ok_or_else(|| anyhow::anyhow!("gdrive probe {id}: no Content-Range in a 206"))?;
-        total
-            .parse::<u64>()
-            .map_err(|e| anyhow::anyhow!("gdrive probe {id}: bad total {total:?}: {e}"))
-    }
-
     /// Files whose *contents* match `phrase`, via Drive's own index
     /// (`q=fullText contains`).
     ///
