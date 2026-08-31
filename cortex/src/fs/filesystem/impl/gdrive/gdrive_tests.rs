@@ -356,6 +356,53 @@ fn a_collision_number_follows_the_id_and_not_the_listing_order() {
     );
 }
 
+/// A shared drive scopes every listing under it, not just its own root.
+///
+/// The mock answered `/drives` with an empty array on every success path, so no runnable
+/// test ever produced a `GKind::SharedDrive` child and nothing covered `driveId` at all —
+/// deleting the propagation left the suite green. Against a real account it makes every
+/// folder inside a shared drive list empty from the second level down.
+#[tokio::test]
+async fn a_shared_drive_scopes_the_listings_below_it() {
+    let mock = start_with_drives(
+        json!([
+            row("Sub", "F1", FOLDER_MIME, None),
+            row("memo.txt", "B1", "text/plain", Some("12")),
+        ]),
+        json!({"drives": [{"id": "DRV", "name": "Team"}]}),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+
+    let root: Vec<String> = fs
+        .list(Path::new("/"))
+        .await
+        .unwrap()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert!(
+        root.contains(&"Team".to_string()),
+        "the drive is a section: {root:?}"
+    );
+
+    // The drive's own root, and then a folder inside it: both have to be asked for
+    // within the drive, or Drive answers from My Drive and the folder lists empty.
+    fs.list(Path::new("/Team")).await.unwrap();
+    assert!(
+        mock.asked_for("driveId=DRV"),
+        "the drive's root was listed without scoping it to the drive"
+    );
+    assert!(mock.asked_for("corpora=drive"));
+
+    mock.reset();
+    fs.list(Path::new("/Team/Sub")).await.unwrap();
+    assert!(
+        mock.asked_for("driveId=DRV"),
+        "the id did not reach a folder one level down, which is where it stops mattering"
+    );
+}
+
 /// A search reports what the index found, including the types this mount cannot
 /// serve — a Form has no readable form, but "the phrase is in this Form" is still
 /// the answer to the question.
@@ -981,15 +1028,34 @@ async fn start_inner(
     blobs: HashMap<String, Vec<u8>>,
     document_pad: Option<usize>,
 ) -> Mock {
-    start_full(listing, blobs, document_pad, None).await
+    start_full(listing, blobs, document_pad, None, None).await
 }
 
-/// `drives_status` answers `/drives` with that status instead of a listing.
+/// Serve a shared drive from `/drives`, so a test can reach one. The mock answered that
+/// route with an empty array on every success path before this, which left `driveId`
+/// propagation with no runnable test at all.
+async fn start_with_drives(listing: Value, drives: Value) -> Mock {
+    start_full(listing, HashMap::new(), None, None, Some(drives)).await
+}
+
+/// The four-argument form kept for the one test that scripts a `/drives` failure.
+async fn start_full_scripted(
+    listing: Value,
+    blobs: HashMap<String, Vec<u8>>,
+    document_pad: Option<usize>,
+    drives_status: Option<u16>,
+) -> Mock {
+    start_full(listing, blobs, document_pad, drives_status, None).await
+}
+
+/// `drives_status` answers `/drives` with that status instead of a listing; `drives`
+/// replaces the empty listing it answers with otherwise.
 async fn start_full(
     listing: Value,
     blobs: HashMap<String, Vec<u8>>,
     document_pad: Option<usize>,
     drives_status: Option<u16>,
+    drives: Option<Value>,
 ) -> Mock {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("http://{}", listener.local_addr().unwrap());
@@ -999,15 +1065,17 @@ async fn start_full(
     let listing = Arc::new(listing);
     let document_pad = Arc::new(document_pad);
     let drives_status = Arc::new(drives_status);
+    let drives = Arc::new(drives);
     tokio::spawn(async move {
         while let Ok((mut sock, _)) = listener.accept().await {
-            let (log, written, blobs, listing, document_pad, drives_status) = (
+            let (log, written, blobs, listing, document_pad, drives_status, drives) = (
                 log.clone(),
                 written.clone(),
                 blobs.clone(),
                 listing.clone(),
                 document_pad.clone(),
                 drives_status.clone(),
+                drives.clone(),
             );
             tokio::spawn(async move {
                 let mut buf = Vec::new();
@@ -1102,7 +1170,16 @@ async fn start_full(
                 } else if path.ends_with("/drives") {
                     match *drives_status {
                         Some(st) => reply(st, br#"{"error":"scripted"}"#.to_vec(), None),
-                        None => reply(200, json!({"drives": []}).to_string().into_bytes(), None),
+                        None => reply(
+                            200,
+                            drives
+                                .as_ref()
+                                .clone()
+                                .unwrap_or_else(|| json!({"drives": []}))
+                                .to_string()
+                                .into_bytes(),
+                            None,
+                        ),
                     }
                 } else if path.ends_with("/drive/v3/files") {
                     reply(
@@ -1433,7 +1510,7 @@ async fn an_oversized_document_stops_being_read() {
 /// ladder, which put half a minute of backoff in front of the first `ls` of a mount.
 #[tokio::test]
 async fn a_failed_shared_drive_listing_is_not_cached_as_an_answer() {
-    let mock = start_full(
+    let mock = start_full_scripted(
         json!([row("a.txt", "F1", "text/plain", Some("3"))]),
         HashMap::new(),
         None,
