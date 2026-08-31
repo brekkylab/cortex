@@ -142,7 +142,7 @@ fn an_unknown_size_is_a_placeholder_never_zero() {
     // per-object limit, so the first read of a document replaces the
     // placeholder with its exact length for every later listing.
     const _: () = assert!(UNKNOWN_LENGTH_SIZE > 0);
-    const _: () = assert!(UNKNOWN_LENGTH_SIZE <= 8 * 1024 * 1024);
+    const _: () = assert!(UNKNOWN_LENGTH_SIZE <= MAX_DOCUMENT_BYTES);
 }
 
 #[test]
@@ -1440,6 +1440,22 @@ async fn the_padding_is_lines_of_spaces_and_not_a_run_of_newlines() {
     let mut joined = a;
     joined.extend_from_slice(&b);
     assert_eq!(joined, buf, "the seam does not move a newline");
+}
+
+/// The placeholder is the accessor's own ceiling, which is what makes a document
+/// impossible to under-state rather than merely unlikely to be.
+///
+/// An under-estimate has no recovery: the reader stops where it was told, every window
+/// full, so nothing reports a short read and the JSON ends mid-token. At the old 8 MiB a
+/// 12,582,929-byte document read back as exactly 8,388,608 bytes that do not parse.
+/// `get_pretty` bounds the raw body at `MAX_DOCUMENT_BYTES` and Google already returns
+/// 2-space pretty JSON, so a document that would exceed this is refused by `body_within`
+/// rather than served short.
+#[test]
+fn the_placeholder_is_not_smaller_than_a_document_can_be() {
+    const _: () = assert!(UNKNOWN_LENGTH_SIZE >= MAX_DOCUMENT_BYTES);
+    // And the grid budget has to leave room inside it for the workbook around the values.
+    const _: () = assert!(GRID_BYTES_BUDGET < UNKNOWN_LENGTH_SIZE);
 }
 
 /// The span the placeholder claims but the JSON does not fill gets whitespace, so a

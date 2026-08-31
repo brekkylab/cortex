@@ -103,24 +103,35 @@ const MAX_TABS: usize = 64;
 /// clamp reads to nothing — and a search tool skips a file it is told is empty.
 ///
 /// An over-estimate does *not* mean `cat` stops at the true end: the client bounds a
-/// read by the length it was told, so it asks for the whole 8 MiB and takes back 8 MiB.
-/// [`FileSystem::read_at`] fills the part past the JSON for that reason. Before it did,
-/// the kernel filled it with `0x00` and every JSON parser threw at the seam — measured on
-/// a live mount, a 1,574,113-byte deck read as 8,388,608 bytes of which 6,814,495 were
-/// zeros, and `json.load` raised rather than skipped.
+/// read by the length it was told, so it asks for the whole span and takes back the whole
+/// span. [`FileSystem::read_at`] fills the part past the JSON for that reason. Before it
+/// did, the kernel filled it with `0x00` and every JSON parser threw at the seam —
+/// measured on a live mount, a 1,574,113-byte deck read as 8,388,608 bytes of which
+/// 6,814,495 were zeros, and `json.load` raised rather than skipped.
 ///
-/// 8 MiB. A document reports its exact length from the moment something first reads it,
-/// so this is what an *unread* document shows and not what a document shows. Measured
-/// JSON lengths were 7 KB to 3.4 MB, so the placeholder is generous and one-sided — a
-/// reader that trusts it reads past the end into whitespace rather than stopping short
-/// of content, and JSON is defined to ignore what follows it.
+/// [`MAX_DOCUMENT_BYTES`], and equal to it on purpose rather than by coincidence. An
+/// *under*-estimate is the failure with no recovery: the reader stops where it was told
+/// to, every window full, so nothing reports a short read and the JSON simply ends
+/// mid-token. Reproduced against the mock at the old 8 MiB — a 12,582,929-byte document
+/// read back as exactly 8,388,608 bytes that do not parse, while a second read inside the
+/// TTL succeeded because the cache then knew the real length.
+///
+/// Tying it to the accessor's ceiling is what makes that unreachable rather than
+/// unlikely. `get_pretty` bounds the *raw* body at that number and Google already returns
+/// 2-space pretty JSON — measured, raw 2,491,712 against 2,491,642 re-serialized — so the
+/// served bytes cannot exceed it. A document that would has no length to under-state,
+/// because `body_within` refuses it and the read fails loudly instead.
+///
+/// A document reports its exact length from the moment something first reads it, so this
+/// is what an *unread* document shows and not what a document shows. Measured JSON
+/// lengths across the corpus were 7 KB to 3.4 MB.
 ///
 /// This is a placeholder, not a measurement — `find -size` and `ls -l` see it until
 /// something reads the file. Making it exact up front costs one render per
 /// document: measured 2.4s for a six-document folder listing, 6.3s when the
 /// kernel's per-entry `getattr` serialises them. See
 /// [`GdriveFs::resolve_size_on_stat`].
-const UNKNOWN_LENGTH_SIZE: u64 = 8 * 1024 * 1024;
+const UNKNOWN_LENGTH_SIZE: u64 = MAX_DOCUMENT_BYTES;
 
 /// How long a line the padding past a document's JSON is broken into.
 ///
