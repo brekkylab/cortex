@@ -28,9 +28,9 @@
 
 use std::collections::HashMap;
 
+use super::messenger::MessengerFs;
 use super::paths::chat_path;
 use super::source::{Conversation, MessengerSource, render_line};
-use super::messenger::MessengerFs;
 use crate::BoxFuture;
 use crate::fs::{Hit, SearchResult, Searchable};
 
@@ -44,7 +44,10 @@ impl<S: MessengerSource> Searchable for MessengerFs<S> {
                 .source_searchable()
                 .ok_or_else(|| String::from("this source has no index"))?;
 
-            let found = index.search(query, count).await.map_err(|e| e.to_string())?;
+            let found = index
+                .search(query, count)
+                .await
+                .map_err(|e| e.to_string())?;
             if found.is_empty() {
                 // Before the two fetches below, deliberately: nothing to name is nothing to
                 // spend a roster on, and an empty answer is the common one for a narrow query.
@@ -96,7 +99,7 @@ impl<S: MessengerSource> Searchable for MessengerFs<S> {
                     }
                     Hit {
                         path: chat_path(conv, &msg, day),
-                        record: render_line(&msg),
+                        record: Some(render_line(&msg)),
                     }
                 })
                 .collect())

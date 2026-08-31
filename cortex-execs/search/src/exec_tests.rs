@@ -91,7 +91,7 @@ impl Searchable for Fake {
                     .iter()
                     .map(|(path, record)| Hit {
                         path: (*path).to_string(),
-                        record: format!("{record}\n").into_bytes(),
+                        record: Some(format!("{record}\n").into_bytes()),
                     })
                     .collect()),
             }
@@ -349,8 +349,14 @@ async fn a_record_that_does_not_end_its_line_still_gets_one() {
         fn search<'a>(&'a self, _q: &'a str, _n: usize) -> BoxFuture<'a, SearchResult> {
             Box::pin(async move {
                 Ok(vec![
-                    Hit { path: "a".into(), record: b"{\"t\":1}".to_vec() },
-                    Hit { path: "b".into(), record: b"{\"t\":2}".to_vec() },
+                    Hit {
+                        path: "a".into(),
+                        record: Some(b"{\"t\":1}".to_vec()),
+                    },
+                    Hit {
+                        path: "b".into(),
+                        record: Some(b"{\"t\":2}".to_vec()),
+                    },
                 ])
             })
         }
@@ -366,6 +372,56 @@ async fn a_record_that_does_not_end_its_line_still_gets_one() {
     // And the first field of each line is still a path a reader can open.
     let first: Vec<&str> = text.lines().filter_map(|l| l.split('\t').next()).collect();
     assert_eq!(first, ["chat/slack/a", "chat/slack/b"], "{text:?}");
+}
+
+/// An index with nothing of the match to show answers a path, and the pipeline is the same one.
+///
+/// Drive's search returns which files matched and no excerpt at all, so a record there could
+/// only be metadata a reader did not ask for or a preview bought with the request this command
+/// exists to save. `None` says that, and the line it produces has no trailing tab to strip: a
+/// reader mixing such a store with one that does show its matches writes `cut -f1` once.
+#[tokio::test]
+async fn a_hit_with_nothing_to_show_is_a_path_on_its_own_line() {
+    struct Bare;
+    impl FileSystem for Bare {
+        fn stat<'a>(&'a self, _p: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
+            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+        }
+        fn list<'a>(&'a self, _p: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
+            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+        }
+        fn read_at<'a>(
+            &'a self,
+            _p: &'a Path,
+            _b: &'a mut [u8],
+            _o: u64,
+        ) -> BoxFuture<'a, io::Result<usize>> {
+            Box::pin(async { Err(io::ErrorKind::NotFound.into()) })
+        }
+        fn searchable(&self) -> Option<&dyn Searchable> {
+            Some(self)
+        }
+    }
+    impl Searchable for Bare {
+        fn search<'a>(&'a self, _q: &'a str, _n: usize) -> BoxFuture<'a, SearchResult> {
+            Box::pin(async move {
+                Ok(vec![Hit {
+                    path: "My Drive/2026 회계.gsheet.json".into(),
+                    record: None,
+                }])
+            })
+        }
+    }
+
+    let r = run(Work::new().with("gdrive", Bare), &["회계"]).await;
+    let text = out(&r);
+    assert_eq!(
+        text, "gdrive/My Drive/2026 회계.gsheet.json\n",
+        "a path, a newline, and no tab in between: {text:?}"
+    );
+    // The half a reader pipes is the same half, whether or not there was anything to show.
+    let first: Vec<&str> = text.lines().filter_map(|l| l.split('\t').next()).collect();
+    assert_eq!(first, ["gdrive/My Drive/2026 회계.gsheet.json"], "{text:?}");
 }
 
 /// A query with no content in it is not a search. Both spellings reach the parser as at least
@@ -439,8 +495,15 @@ async fn no_index_is_not_a_failure() {
     )
     .await;
 
-    assert_eq!(r.exit_code, 1, "everything that could answer did, and none had it");
-    assert!(said(&r).contains("files/s3  not searchable"), "{}", said(&r));
+    assert_eq!(
+        r.exit_code, 1,
+        "everything that could answer did, and none had it"
+    );
+    assert!(
+        said(&r).contains("files/s3  not searchable"),
+        "{}",
+        said(&r)
+    );
 }
 
 /// A scope that reaches only stores with no index is not an empty result: nothing was read, so
@@ -459,7 +522,10 @@ async fn a_scope_with_no_index_in_it_is_an_error_and_points_at_grep() {
     let said = said(&r);
     assert!(said.contains("files/s3  not searchable"), "{said}");
     assert!(said.contains("nothing in scope is searchable"), "{said}");
-    assert!(said.contains("grep"), "it has to say what does work: {said}");
+    assert!(
+        said.contains("grep"),
+        "it has to say what does work: {said}"
+    );
 }
 
 /// A prefix nobody mounted is still the older error, and it names what *is* mounted — including
@@ -485,7 +551,10 @@ async fn a_scope_nobody_mounted_names_what_is_mounted() {
 #[tokio::test]
 async fn the_prefix_is_the_path_the_store_was_mounted_at() {
     let r = run(
-        Work::new().with("chat/acme", Fake::with(&[("channels/x__C1/2026/08/2026-08-03.jsonl", "{}")])),
+        Work::new().with(
+            "chat/acme",
+            Fake::with(&[("channels/x__C1/2026/08/2026-08-03.jsonl", "{}")]),
+        ),
         &["가격"],
     )
     .await;

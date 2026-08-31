@@ -33,15 +33,22 @@ pub struct Hit {
     pub path: String,
     /// The hit as the file at `path` spells it — one line of it, for a line-oriented file.
     ///
+    /// `None` when the index answered with no content to show. That is a real answer and not a
+    /// gap to paper over: Drive's search returns which files matched and no excerpt at all, so a
+    /// record there could only be metadata a reader did not ask for, or a preview invented by
+    /// fetching the file — which spends the request this whole command exists to save. A store
+    /// that has nothing of the match to show says so, and a reader gets a path, which is what it
+    /// had to offer.
+    ///
     /// Bytes and not a string: this is copied out of a file's own format, and a consumer that
     /// decoded it would have to guess at an encoding nobody asked it about.
     ///
-    /// It has to end with a newline. A fan-out prints `<path>\t<record>` and readers pull the
-    /// first field back out with `cut -f1`, so a record that does not terminate its own line
+    /// `Some` has to end with a newline. A fan-out prints `<path>\t<record>` and readers pull
+    /// the first field back out with `cut -f1`, so a record that does not terminate its own line
     /// runs the next hit's path onto it and every hit after the first is lost to the pipeline —
     /// silently, and with nothing in an exit code to say so. A store whose format is not
-    /// line-oriented has to choose a line for this.
-    pub record: Vec<u8>,
+    /// line-oriented has to choose a line for this, or answer `None`.
+    pub record: Option<Vec<u8>>,
 }
 
 /// What an index answers with: the hits, or why it could not look.
@@ -98,7 +105,7 @@ pub type SearchResult = Result<Vec<Hit>, String>;
 ///             // spelled by *your* tree, because you are the one who laid that tree out.
 ///             Ok(vec![Hit {
 ///                 path: format!("open/{query}.json"),
-///                 record: b"{\"id\":\"T-1\"}\n".to_vec(),
+///                 record: Some(b"{\"id\":\"T-1\"}\n".to_vec()),
 ///             }])
 ///         })
 ///     }

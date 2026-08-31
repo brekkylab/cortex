@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::super::error::{SourceError, SourceResult};
-use super::super::source::{
-    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, MessengerSearch, MessengerSource,
-    Message, MsgId, SearchHit, Thread, User, Window,
-};
 use super::super::messenger::MessengerFs;
+use super::super::source::{
+    Author, Capabilities, ConvId, ConvKind, Conversation, FileRef, Message, MessengerSearch,
+    MessengerSource, MsgId, SearchHit, Thread, User, Window,
+};
 use crate::BoxFuture;
 use crate::fs::{FileSystem, Hit, Searchable};
 
@@ -153,7 +153,13 @@ async fn hits(fake: Fake) -> Result<Vec<Hit>, String> {
 fn one(hits: &[Hit]) -> (&str, String) {
     (
         hits[0].path.as_str(),
-        String::from_utf8(hits[0].record.clone()).unwrap(),
+        String::from_utf8(
+            hits[0]
+                .record
+                .clone()
+                .expect("a chat hit shows the message"),
+        )
+        .unwrap(),
     )
 }
 
@@ -334,12 +340,19 @@ async fn searches_share_the_stores_cache() {
 
     // A directory listing first, because that is the order a reader arrives in: they were
     // reading the tree and then asked it a question.
-    store.list(std::path::Path::new("channels")).await.expect("listed");
+    store
+        .list(std::path::Path::new("channels"))
+        .await
+        .expect("listed");
     for _ in 0..3 {
         store.search("가격", 20).await.expect("searched");
     }
 
     let seen = |c: &AtomicUsize| c.load(Ordering::SeqCst);
-    assert_eq!(seen(&asked.convs), 1, "a listing and three searches, one listing fetch");
+    assert_eq!(
+        seen(&asked.convs),
+        1,
+        "a listing and three searches, one listing fetch"
+    );
     assert_eq!(seen(&asked.users), 1, "three searches, one roster");
 }

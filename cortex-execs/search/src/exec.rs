@@ -299,13 +299,21 @@ impl Search {
                     );
                     for hit in found {
                         hits.extend_from_slice(line(store, &hit).as_bytes());
-                        hits.extend_from_slice(&hit.record);
-                        // A record is required to end its own line and the shipped backend does.
-                        // Terminated here anyway, because the alternative when one does not is
-                        // two hits on one line — which `cut -f1` reads as one, losing the rest
-                        // with no error and a zero exit. Not a check a caller could make either:
-                        // the damage is in bytes it never sees.
-                        if !hit.record.ends_with(b"\n") {
+                        // No record is a path on a line of its own, tab and all left off — which
+                        // `cut -f1` reads the same way, so a pipeline mixing an index that shows
+                        // its matches with one that cannot needs no branch of its own.
+                        if let Some(record) = &hit.record {
+                            hits.push(b'\t');
+                            hits.extend_from_slice(record);
+                            // A record is required to end its own line and the shipped backend
+                            // does. Terminated here anyway, because the alternative when one does
+                            // not is two hits on one line — which `cut -f1` reads as one, losing
+                            // the rest with no error and a zero exit. Not a check a caller could
+                            // make either: the damage is in bytes it never sees.
+                            if !record.ends_with(b"\n") {
+                                hits.push(b'\n');
+                            }
+                        } else {
                             hits.push(b'\n');
                         }
                     }
@@ -346,9 +354,9 @@ impl Search {
 /// `<mount>/<path>\t` — the half of the line that says where to read the rest.
 fn line(store: &Store, hit: &Hit) -> String {
     if store.at.is_empty() {
-        format!("{}\t", hit.path)
+        hit.path.clone()
     } else {
-        format!("{}/{}\t", store.at, hit.path)
+        format!("{}/{}", store.at, hit.path)
     }
 }
 
