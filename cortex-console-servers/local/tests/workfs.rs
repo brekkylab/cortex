@@ -435,3 +435,59 @@ async fn built_on(image: Option<cortex::console::ImageSource>) -> anyhow::Result
     }
     builder.build().await
 }
+
+/// A host-local session reaches whatever this host does, and says so.
+///
+/// Which is the one thing this backend can answer about a network. There is no device to leave
+/// off and no policy to put over one — a command here is a process on this host — so the honest
+/// answers are `full` and a refusal, and the refusal is what a client hears when it asks for
+/// less rather than a session that quietly reaches everything.
+#[tokio::test]
+async fn a_host_local_session_reaches_what_the_host_does() {
+    use cortex::console::NetworkAccess;
+
+    // Asked for nothing: the session every client had before there was a reach to name, now
+    // answered with what it actually has.
+    let console = built_with(None)
+        .await
+        .expect("a session that asked nothing");
+    assert_eq!(console.network().map(|n| n.reach.as_str()), Some("full"));
+    drop(console);
+
+    // Asking for what it has is fine. Asking for less is refused, and named.
+    for (reach, allowed) in [
+        ("full", true),
+        ("public", false),
+        ("host", false),
+        ("none", false),
+    ] {
+        match built_with(Some(NetworkAccess::new(reach))).await {
+            Ok(_) => assert!(allowed, "{reach} was answered and cannot be"),
+            Err(e) => {
+                assert!(!allowed, "{reach} was refused: {e}");
+                let failure = e
+                    .downcast_ref::<cortex::console::Failure>()
+                    .expect("a protocol failure");
+                assert_eq!(
+                    failure.code(),
+                    Some(Error::UNSUPPORTED_NETWORK),
+                    "{reach} was refused as {failure:?}, which is a different problem"
+                );
+            }
+        }
+    }
+}
+
+/// A console over the real binary with no tree, asking for `reach` or for nothing.
+async fn built_with(reach: Option<cortex::console::NetworkAccess>) -> anyhow::Result<Console> {
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+    server.stderr(Stdio::inherit());
+
+    let mut builder = Console::builder()
+        .client(StdioClient::new(server)?)
+        .executables(ExecutableSet::new());
+    if let Some(reach) = reach {
+        builder = builder.network(reach);
+    }
+    builder.build().await
+}

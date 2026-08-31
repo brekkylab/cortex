@@ -35,7 +35,7 @@ use std::{
 
 use cortex::{
     BoxFuture,
-    console::{Console, ExecResult, ImageSource, ReadResult},
+    console::{Console, ExecResult, ImageSource, NetworkAccess, ReadResult},
     exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
     fs::Mount,
 };
@@ -174,6 +174,26 @@ impl Fixture {
                     .register("rawbytes", "answer bytes that are not text", RawBytes)
                     .register("cat-here", "read a file where the command stood", CatHere),
             )
+            .build()
+            .await?;
+
+        Ok(Fixture { console })
+    }
+
+    /// A fixture whose session asks for `reach` over the channel, the way a client does.
+    ///
+    /// The same shape as [`asking_for`](Self::asking_for) and for the same reason: what a
+    /// client declares in its `init` is what the session gets, and the server's own setting is
+    /// only the answer when nothing was declared.
+    async fn asking_for_reach(reach: NetworkAccess) -> anyhow::Result<Fixture> {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client = cortex::console::stdio::StdioClient::new(server)?;
+
+        let console = Console::builder()
+            .client(client)
+            .network(reach)
+            .executables(ExecutableSet::new())
             .build()
             .await?;
 
@@ -432,6 +452,316 @@ async fn a_reference_that_is_not_one_is_refused_before_a_vm_is_started() {
         err.code(),
         Some(cortex::console::Error::INVALID_PARAMS),
         "answered {err:?} — a malformed reference is not a backend that would not come up"
+    );
+}
+
+/// A listener on this host, and the port it is on.
+///
+/// One canned HTTP response per connection, and as many connections as are asked for — `wget`
+/// is what asks, so it has to be HTTP rather than bytes. The thread is returned so a caller can
+/// hold it for the length of the test; nothing joins it, because a reach that was refused is a
+/// connection that never came.
+fn host_listener() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this host");
+    let port = listener.local_addr().expect("its address").port();
+    let served = std::thread::spawn(move || {
+        while let Ok((mut connection, _)) = listener.accept() {
+            use std::io::Write as _;
+            let _ = connection.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nreached");
+        }
+    });
+    (port, served)
+}
+
+/// The same fetch, by the name the stack answers for the machine it runs beside.
+///
+/// `host.microsandbox.internal` is synthesized by the stack's own resolver rather than looked
+/// up anywhere, which is what spares a command from digging the gateway out of `resolv.conf`:
+/// the addresses are assigned per sandbox slot, so nothing writing a command can know them, and
+/// this name is a constant.
+fn fetch_by_host_name(port: u16) -> String {
+    format!("wget -q -T 5 -O - http://host.microsandbox.internal:{port}/")
+}
+
+/// A guest command that fetches `port` on the gateway — which is this host, one rewrite later.
+///
+/// The address comes out of the guest's own `resolv.conf` because that is where the gateway is
+/// written down: the stack names itself as the resolver, so the nameserver line *is* the
+/// gateway. Nothing in the guest was told this host's real address, and nothing could be.
+fn fetch_from_gateway(port: u16) -> String {
+    format!(
+        "wget -q -T 5 -O - \
+         http://$(awk '/^nameserver/{{print $2; exit}}' /etc/resolv.conf):{port}/"
+    )
+}
+
+/// A session that asked for nothing has no interface to configure, which is the default and the
+/// thing most worth keeping true.
+///
+/// Not "the interface is down" — there is no device, so there is nothing to bring up. What the
+/// guest does have is a loopback and the `dummy0` its kernel makes on its own, and neither goes
+/// anywhere: what this looks for is a default route, which is what a configured device would
+/// have left behind.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
+async fn a_session_is_air_gapped_unless_a_network_was_asked_for() {
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "none")]).await;
+
+    let routes = fx.output("cat /proc/net/route").await.stdout;
+    let routes = String::from_utf8(routes).expect("a route table that is text");
+    assert!(
+        !routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "a session that asked for no network has a default route:\n{routes}"
+    );
+
+    // And nothing wrote a resolver, so a name has nowhere to be looked up either.
+    assert_eq!(fx.output("cat /etc/resolv.conf").await.code, 1);
+}
+
+/// The default posture: names resolve, granted doors open, everything else refused.
+///
+/// Four claims about one device. The interface came up and a lookup was answered — by the stack
+/// in the console server process, since there is nothing else on that network to answer it. A
+/// listener on *this host* is reached, which is what makes `host` a reach rather than an error
+/// message. **A second listener on this host is not**, which is the property the grant exists
+/// for: a door is a port and never the machine. And a public address is refused.
+///
+/// Both listeners are plain loopback on the test's own side. Nothing tells the guest where they
+/// are: it dials the gateway, and the stack rewrites that to the host's loopback when it dials
+/// out — the mechanism under test as much as the rules are.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_host_session_reaches_the_doors_it_was_granted() {
+    let (granted, _open) = host_listener();
+    let (ungranted, _shut) = host_listener();
+
+    let mut fx = Fixture::asking_for_reach(NetworkAccess::host().with_host_ports([granted]))
+        .await
+        .expect("a session with a granted port");
+
+    // What the server says it gave, which is both halves of the answer.
+    let answered = fx.console.network().expect("a server that says").clone();
+    assert_eq!(answered.reach, "host");
+    assert_eq!(answered.host_ports, [granted]);
+
+    // The interface the stack assigned, configured by the guest with no `ip` binary in sight.
+    let routes = fx.output("cat /proc/net/route").await.stdout;
+    let routes = String::from_utf8(routes).expect("a route table that is text");
+    assert!(
+        routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "no default route, so the interface was never configured:\n{routes}"
+    );
+    assert!(
+        fx.output("cat /etc/resolv.conf")
+            .await
+            .stdout
+            .starts_with(b"nameserver "),
+        "no resolver was written"
+    );
+
+    // `getent hosts` rather than a ping: ICMP is a different permission from a name, and what
+    // is under test here is the resolver.
+    let out = fx.output("getent hosts example.com").await;
+    assert_eq!(
+        out.code,
+        0,
+        "a name did not resolve: {:?} {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The door that was granted.
+    let out = fx.output(&fetch_from_gateway(granted)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reached",
+        "the granted port was not reached: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the one beside it, which was not. The whole reason ports are named one at a time.
+    let out = fx.output(&fetch_from_gateway(ungranted)).await;
+    assert_ne!(
+        out.code,
+        0,
+        "a port nobody granted was reached, so the grant is the machine and not a door: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The same door by name, which is how a command would actually be written: the gateway's
+    // address is assigned per sandbox and this is the constant that stands for it.
+    let out = fx.output(&fetch_by_host_name(granted)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reached",
+        "the granted port was not reachable by name: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // **Resolving the name grants nothing.** It answers for every port on this machine and the
+    // policy is still what decides which of them reply.
+    let out = fx.output(&fetch_by_host_name(ungranted)).await;
+    assert_ne!(
+        out.code, 0,
+        "the name reached a port nobody granted, so resolving it is a grant: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // …and that is all it gets. `wget` is busybox's here and exits non-zero on a refusal; what
+    // matters is that it does not succeed.
+    let out = fx
+        .output("wget -q -T 5 -O /dev/null http://example.com/")
+        .await;
+    assert_ne!(
+        out.code, 0,
+        "the default posture reached the internet, which is what it exists not to do"
+    );
+}
+
+/// `public` reaches the internet, and *not* this machine's ports.
+///
+/// The second half is the one worth a boot: **widening what a session reaches outside must not
+/// widen what it reaches in here.** A session that asked for the internet to fetch a package did
+/// not thereby ask to talk to whatever else this host is listening on, and the only thing that
+/// opens those is a grant it did not make.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_public_session_reaches_the_internet_and_not_this_hosts_ports() {
+    let (ungranted, _shut) = host_listener();
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "public")]).await;
+
+    let out = fx.output(&fetch_from_gateway(ungranted)).await;
+    assert_ne!(
+        out.code,
+        0,
+        "the internet came with a door onto this host: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = fx
+        .output("wget -q -T 10 -O /dev/null http://example.com/")
+        .await;
+    assert_eq!(
+        out.code,
+        0,
+        "a session that asked for the internet could not reach it: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And over TLS, which is a different path through the stack: a stream it does not read.
+    let out = fx
+        .output("wget -q -T 10 -O /dev/null https://example.com/")
+        .await;
+    assert_eq!(
+        out.code,
+        0,
+        "plain HTTP reached the internet and HTTPS did not: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A door onto a machine the guest cannot send a packet to is two settings that cannot both
+/// have been meant, and is said at `init` like any other.
+///
+/// **Not** `#[ignore]`d: nothing boots, which is the property being asserted.
+#[tokio::test]
+async fn a_granted_port_without_a_network_is_refused_before_a_vm_is_started() {
+    let asked = NetworkAccess::none().with_host_ports([8080]);
+    let err = match Fixture::asking_for_reach(asked).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened with doors onto a network it does not have"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::INVALID_PARAMS),
+        "answered {err:?} — a contradiction is not a name nobody defined"
+    );
+}
+
+/// A reach nobody defined is refused at `init`, before a VM is worth starting.
+///
+/// **Not** `#[ignore]`d, because nothing here boots — which is the property being asserted. A
+/// name the server cannot answer is knowable from the frame, so a client hears about it while
+/// it can still ask for something else.
+#[tokio::test]
+async fn a_reach_that_is_not_a_reach_is_refused_before_a_vm_is_started() {
+    let err = match Fixture::asking_for_reach(NetworkAccess::new("sort-of")).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened with a reach nobody defined"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::UNSUPPORTED_NETWORK),
+        "answered {err:?} — a name nobody defined is not a backend that would not come up"
+    );
+}
+
+/// What the client asks for is what the session gets, and the server says so.
+///
+/// The `init` declaration is the whole subject here: nothing sets `CORTEX_UVM_NETWORK`, so a
+/// guest that reaches the internet reached it because the client asked over the channel.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_client_asks_for_its_reach_over_the_channel() {
+    // Asked for nothing, so the answer is the server's own — which is `host` by default, and
+    // the only way a client could have learnt that.
+    let quiet = Fixture::new().await;
+    assert_eq!(
+        quiet.console.network().map(|n| n.reach.as_str()),
+        Some("host"),
+        "a server that chose the reach did not say which"
+    );
+    drop(quiet);
+
+    // Asked for none: no device, so no default route for the guest to have.
+    let mut off = Fixture::asking_for_reach(NetworkAccess::none())
+        .await
+        .expect("a session with no network");
+    assert_eq!(
+        off.console.network().map(|n| n.reach.as_str()),
+        Some("none")
+    );
+    let routes = String::from_utf8(off.output("cat /proc/net/route").await.stdout)
+        .expect("a route table that is text");
+    assert!(
+        !routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "a session that asked for no network has a default route:\n{routes}"
+    );
+    drop(off);
+
+    // And asked for the internet: reached, with nothing in the server's environment saying so.
+    let mut open = Fixture::asking_for_reach(NetworkAccess::public())
+        .await
+        .expect("a session with the internet");
+    assert_eq!(
+        open.console.network().map(|n| n.reach.as_str()),
+        Some("public")
+    );
+    let out = open
+        .output("wget -q -T 10 -O /dev/null http://example.com/")
+        .await;
+    assert_eq!(
+        out.code,
+        0,
+        "a session that asked for the internet could not reach it: {:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 

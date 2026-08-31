@@ -6,6 +6,7 @@ members = [
     "cortex-execs/mem",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
+    "cortex-console-servers/uvm/boot",
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
@@ -29,6 +30,9 @@ async-trait = "0.1"
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
+# The boot process, and — as its library half — the strings a console server starts one with.
+# A server takes it without the `vm` feature and so links no VMM; see its own manifest.
+cortex-uvm-boot = { path = "cortex-console-servers/uvm/boot", default-features = false }
 futures-core = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -65,6 +69,14 @@ msb_krun = "0.1"
 # hypervisor — so the tree it drags in is charged to the one consumer that boots
 # a guest at all.
 microsandbox-image = "0.6.7"
+
+# The userspace network stack a session with a network gets: smoltcp behind a policy engine,
+# in this process rather than in a helper anyone has to install. Only `cortex-uvm-boot`'s `vm`
+# feature takes it — the stack lives with the VM it serves.
+#
+# **The pin matters.** It requires an exact `msb_krun`, so the two versions here have to agree
+# or a build ends up with two `NetBackend` traits and no way to hand one to the other.
+microsandbox-network = "=0.6.12"
 
 # Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl`
 # on `Posix` itself rather than a wrapper holding one — the same shape `fuse-t` takes,

@@ -339,6 +339,10 @@ impl Session {
             // Nothing to say: this agent is running *inside* the base and never heard which
             // one it is. The answer the client sees is the console server's, one boot up.
             image: None,
+            // Not this end's to say. What it has is an interface or no interface; which reach
+            // that interface is behind is a policy on the far side of the device, and the host
+            // is what answers the client about it.
+            network: None,
         })
     }
 
