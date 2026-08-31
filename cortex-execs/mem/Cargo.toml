@@ -62,7 +62,6 @@ rusqlite = { workspace = true }
 # than walking a `Value`.
 serde = { workspace = true }
 serde_json = { workspace = true }
-sqlite-vec = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 # Memory identity. Ids leave this process — they are what `mem delete` and
 # `mem history` are given back — so they cannot be rowids that a re-import renumbers.
