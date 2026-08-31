@@ -104,14 +104,14 @@ const MAX_TABS: usize = 64;
 ///
 /// An over-estimate does *not* mean `cat` stops at the true end: the client bounds a
 /// read by the length it was told, so it asks for the whole 8 MiB and takes back 8 MiB.
-/// [`FileSystem::read_at`] fills the part past the JSON with newlines for that reason.
-/// Before it did, the kernel filled it with `0x00` and every JSON parser threw at the
-/// seam — measured on a live mount, a 1,574,113-byte deck read as 8,388,608 bytes of
-/// which 6,814,495 were zeros, and `json.load` raised rather than skipped.
+/// [`FileSystem::read_at`] fills the part past the JSON for that reason. Before it did,
+/// the kernel filled it with `0x00` and every JSON parser threw at the seam — measured on
+/// a live mount, a 1,574,113-byte deck read as 8,388,608 bytes of which 6,814,495 were
+/// zeros, and `json.load` raised rather than skipped.
 ///
 /// 8 MiB. A document reports its exact length from the moment something first reads it,
 /// so this is what an *unread* document shows and not what a document shows. Measured
-/// JSON lengths were 7 KB to 2.5 MB, so the placeholder is generous and one-sided — a
+/// JSON lengths were 7 KB to 3.4 MB, so the placeholder is generous and one-sided — a
 /// reader that trusts it reads past the end into whitespace rather than stopping short
 /// of content, and JSON is defined to ignore what follows it.
 ///
@@ -121,6 +121,13 @@ const MAX_TABS: usize = 64;
 /// kernel's per-entry `getattr` serialises them. See
 /// [`GdriveFs::resolve_size_on_stat`].
 const UNKNOWN_LENGTH_SIZE: u64 = 8 * 1024 * 1024;
+
+/// How long a line the padding past a document's JSON is broken into.
+///
+/// The padding is whitespace either way — JSON ignores what follows a value — so this only
+/// decides what shape the tail has for the tools that read it. See [`FileSystem::read_at`]
+/// for the measurement that picked spaces over newlines, and this over all spaces.
+const PAD_LINE: u64 = 4096;
 
 /// How much a blob read fetches once it is clear the reader is walking the file, so a
 /// walk pays a round trip per span of this size rather than one per window.
@@ -864,8 +871,21 @@ impl FileSystem for GdriveFs {
             // absorb trailing whitespace, so the document still parses, where the zero
             // padding made every parser throw at the seam.
             //
-            // Newline rather than space so that a 6.8 MB tail is empty lines instead of one
-            // enormous line, which keeps `grep` and friends cheap on the real content.
+            // Spaces, broken by a newline every [`PAD_LINE`] bytes. This was newlines
+            // throughout, on the reasoning that empty lines keep `grep` cheap where one
+            // enormous line would not. Measured, that is backwards — a line-oriented tool
+            // pays per line, and a 64 MiB tail of newlines is 67 million of them:
+            //
+            //     tail                  jq      grep      sed      awk
+            //      8 MiB  newlines      1.42s    0.49s        -        -
+            //      8 MiB  spaces        0.06s    0.02s        -        -
+            //     64 MiB  newlines     10.98s    3.95s    6.18s    4.59s
+            //     64 MiB  spaces        0.53s    0.15s    0.03s    1.21s
+            //
+            // The periodic newline is what the all-spaces form gives up: it keeps the tail
+            // from being one 64 MB line, which a `readline` hands over as one 64 MB string.
+            // At 4 KiB it costs nothing measurable (jq 0.52s, grep 0.14s) and leaves
+            // `wc -l` a number a reader can look at.
             //
             // Asked only when the window came back short, so a walk does not pay a second
             // `resolve` per window: a blob is short once, at its end, and a document only
@@ -875,7 +895,14 @@ impl FileSystem for GdriveFs {
                 return Ok(n);
             }
             let pad = ((UNKNOWN_LENGTH_SIZE - end) as usize).min(buf.len() - n);
-            buf[n..n + pad].fill(b'\n');
+            buf[n..n + pad].fill(b' ');
+            // Placed by absolute offset, not by offset into this window, so the seam
+            // between two windows neither doubles a newline nor drops one.
+            let mut at = end + (PAD_LINE - 1 - end % PAD_LINE);
+            while at < end + pad as u64 {
+                buf[n + (at - end) as usize] = b'\n';
+                at += PAD_LINE;
+            }
             Ok(n + pad)
         })
     }

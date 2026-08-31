@@ -1385,7 +1385,64 @@ async fn a_document_stats_as_the_placeholder_until_it_is_read() {
     );
 }
 
-/// The span the placeholder claims but the JSON does not fill gets newlines, so a
+/// The padding is spaces broken into lines, because a line-oriented tool pays per line.
+///
+/// It was newlines throughout, on the reasoning that empty lines keep `grep` cheap where
+/// one enormous line would not. Measured on a 64 MiB tail, that is backwards by an order
+/// of magnitude — jq 10.98s against 0.53s, grep 3.95s against 0.15s, sed 6.18s against
+/// 0.03s. What the all-spaces form gives up is the shape of the tail: one 64 MB line,
+/// which a `readline` hands over as one 64 MB string. A newline every `PAD_LINE` bytes
+/// keeps the speed and the shape both.
+#[tokio::test]
+async fn the_padding_is_lines_of_spaces_and_not_a_run_of_newlines() {
+    const PAD: usize = 4096;
+    let mock = start_with_document(
+        json!([row(
+            "notes",
+            "D1",
+            "application/vnd.google-apps.document",
+            None
+        )]),
+        HashMap::new(),
+        Some(PAD),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let path = Path::new("/My Drive/notes.gdoc.json");
+
+    // One window well past the JSON, read the way the kernel reads: a fixed buffer at an
+    // offset that does not divide the line length, so a seam falls inside it.
+    let at = 1_000_003u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    let n = fs.read_at(path, &mut buf, at).await.unwrap();
+    assert_eq!(n, buf.len(), "well inside the claimed length");
+
+    let newlines = buf.iter().filter(|b| **b == b'\n').count();
+    let spaces = buf.iter().filter(|b| **b == b' ').count();
+    assert_eq!(
+        newlines + spaces,
+        buf.len(),
+        "the tail is whitespace and nothing else"
+    );
+    // Not a run of newlines: that is the shape whose cost was measured.
+    assert_eq!(
+        newlines,
+        buf.len() / PAD_LINE as usize,
+        "one newline per line, no more"
+    );
+
+    // Placed by absolute offset, so two windows meeting mid-line neither double a
+    // newline nor drop one. Read the same span again in two halves and compare.
+    let mut a = vec![0u8; 40_000];
+    let mut b = vec![0u8; 25_536];
+    fs.read_at(path, &mut a, at).await.unwrap();
+    fs.read_at(path, &mut b, at + 40_000).await.unwrap();
+    let mut joined = a;
+    joined.extend_from_slice(&b);
+    assert_eq!(joined, buf, "the seam does not move a newline");
+}
+
+/// The span the placeholder claims but the JSON does not fill gets whitespace, so a
 /// document that is read in one go is still a document.
 ///
 /// This is the whole point of padding it here rather than leaving the byte to the
@@ -1427,15 +1484,21 @@ async fn a_document_is_padded_out_with_whitespace_and_not_with_zeros() {
 
     let json_len = serde_json::from_slice::<Value>(&whole[..])
         .map(|_| ())
-        .map(|()| whole.iter().rposition(|b| *b != b'\n').unwrap() + 1)
+        .map(|()| {
+            whole
+                .iter()
+                .rposition(|b| !b.is_ascii_whitespace())
+                .unwrap()
+                + 1
+        })
         .expect("the whole claimed length parses as one JSON document");
     assert!(
         json_len < claimed as usize,
         "the JSON is shorter than the claim"
     );
     assert!(
-        whole[json_len..].iter().all(|b| *b == b'\n'),
-        "everything past the JSON is newline, and none of it is zero"
+        whole[json_len..].iter().all(|b| b.is_ascii_whitespace()),
+        "everything past the JSON is whitespace, and none of it is zero"
     );
 }
 
