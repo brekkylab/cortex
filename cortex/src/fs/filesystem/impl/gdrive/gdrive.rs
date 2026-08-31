@@ -283,8 +283,9 @@ type CachedListing = (Instant, Arc<Vec<Child>>);
 
 /// One document's JSON as the cache holds it: shared, so a read borrows the bytes
 /// rather than copying a megabyte per chunk.
-/// A document's served length beside the `modifiedTime` it was measured at, which is what
-/// makes the entry expire on the document changing rather than on a clock.
+/// A document's served length beside the `modifiedTime` it was measured at. Stored with
+/// the length rather than folded into the key: the map holds one row per document, and an
+/// edit replaces that row instead of leaving the old one behind unreadable.
 type RememberedLength = (Option<std::time::SystemTime>, u64);
 
 /// The one span of one blob this holds.
@@ -627,11 +628,16 @@ impl GdriveFs {
     /// account that is `ls -l` saying 3.4 MB and then saying 64 MiB for the same unchanged
     /// file.
     ///
-    /// Keyed by `modifiedTime` rather than aged by a clock, which is both more accurate
-    /// and cheaper. A document that has not changed keeps its length indefinitely, and one
-    /// that has loses it the moment a listing says so. A TTL would do the opposite of each:
-    /// discard a length that is still right, and serve one that is already wrong until it
-    /// lapses.
+    /// Stamped with `modifiedTime` rather than aged by a clock, which is both more
+    /// accurate and cheaper. A document that has not changed keeps its length
+    /// indefinitely, and one that has loses it the moment a listing says so. A TTL would
+    /// do the opposite of each: discard a length that is still right, and serve one that
+    /// is already wrong until it lapses.
+    ///
+    /// The stamp rides in the value and the *id* is the key, so an edit replaces the entry
+    /// rather than adding one. Keying the pair would leave a row per version behind — a
+    /// document edited often would fill the map by itself — and none of the old rows could
+    /// ever be read again.
     ///
     /// Losing an entry costs a listing's accuracy and never correctness, which is what
     /// lets the bound be a flat cap and a clear rather than bookkeeping — the next read
@@ -658,7 +664,19 @@ impl GdriveFs {
     }
 
     /// Remember what a document was served as, against the `modifiedTime` it had then.
+    ///
+    /// A row that states no `modifiedTime` is not remembered at all. Storing one would
+    /// stamp it `None`, and `None` matches `None` — the entry would then be valid forever
+    /// with nothing able to retire it, and there is no TTL underneath to catch that. A
+    /// length that outlives the document it measured is short as soon as the document
+    /// grows, and a short length is the one kind `read_at` cannot pad around: the reader
+    /// stops where it was told, which is the failure [`UNKNOWN_LENGTH_SIZE`] is tied to
+    /// the accessor's ceiling to prevent. Better to answer the placeholder, which is the
+    /// honest answer for a length nothing can date.
     async fn remember_len(&self, child: &Child, len: u64) {
+        if child.mtime.is_none() {
+            return;
+        }
         let mut lengths = self.lengths.lock().await;
         if lengths.len() >= MAX_REMEMBERED_LENGTHS {
             lengths.clear();

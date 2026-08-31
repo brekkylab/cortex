@@ -1331,6 +1331,22 @@ async fn a_remembered_length_belongs_to_the_version_it_was_measured_from() {
         None,
         "and a row with no modifiedTime states nothing to match"
     );
+
+    // Nor is such a row remembered in the first place. `None` matches `None`, so an entry
+    // stamped with nothing is valid forever and no TTL underneath would retire it — and a
+    // length that outlives its document is short the moment the document grows, which is
+    // the one shape `read_at` cannot pad around.
+    fs.remember_len(&child(None), 4242).await;
+    assert_eq!(
+        fs.remembered_len(&child(None)).await,
+        None,
+        "an undatable length is not kept"
+    );
+    assert_eq!(
+        fs.lengths_remembered().await,
+        1,
+        "and nothing was stored for it"
+    );
 }
 
 /// A blob is stated from the listing and then read out of one span.
