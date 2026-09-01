@@ -27,8 +27,8 @@ pub async fn keep(
     commit: &Commit,
     scratch: &Path,
     base: &[LayerId],
-    layers: &LayerStore,
-    built: &BuiltStore,
+    layers: LayerStore,
+    built: BuiltStore,
 ) -> anyhow::Result<CommitResult> {
     let id = LayerId::parse(&commit.id)?;
     let tar = scratch.join(crate::contract::LAYER_TAR);
@@ -38,8 +38,13 @@ pub async fn keep(
         tar.display()
     );
 
+    // The tar is the session's scratch and not the store's, and it is gone either way: read
+    // whole it is a layer, and left behind after a failure it is what the *next* commit in
+    // this session would find and keep under a new name.
+    let tar = Consumed(tar);
+
     let tree = microsandbox_image::tar::ingest_tar(
-        tokio::fs::File::open(&tar).await?,
+        tokio::fs::File::open(tar.path()).await?,
         &microsandbox_image::tree::ResourceLimits::default(),
         None,
     )
@@ -48,23 +53,68 @@ pub async fn keep(
 
     // Named by the digest of the tar, which is what OCI calls a diff id — so two sessions that
     // wrote the same thing share one layer even under two image names.
-    let layer_id = LayerId::of(&std::fs::read(&tar)?);
-    let written = layers.put(&layer_id, &tree)?;
+    //
+    // Streamed rather than read: a session's diff is as big as what it wrote, and there is no
+    // reason for all of it to be resident at once to be hashed.
+    let layer_id = digest_of(tar.path()).await?;
 
-    let mut over: Vec<Layer> = Vec::with_capacity(base.len() + 1);
-    for existing in base {
-        over.push(layers.get(existing)?);
-    }
-    over.push(written);
+    // Writing the layer as an EROFS and stitching the image are both file work the size of
+    // what the session wrote, so they go where the rest of this crate puts that kind of work
+    // rather than on the runtime's own thread.
+    let (base, env, working_dir) = (
+        base.to_vec(),
+        commit.env.clone(),
+        commit.working_dir.clone(),
+    );
+    let kept = id.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let written = layers.put(&layer_id, &tree)?;
 
-    built.keep(&id, &over, commit.env.clone(), commit.working_dir.clone())?;
+        let mut over: Vec<Layer> = Vec::with_capacity(base.len() + 1);
+        for existing in &base {
+            over.push(layers.get(existing)?);
+        }
+        over.push(written);
 
-    // The tar has been read and is the session's scratch, not the store's. Removed now rather
-    // than left for the scratch's own cleanup, so a second commit in one session does not find
-    // the first one's.
-    let _ = std::fs::remove_file(&tar);
+        built.keep(&kept, &over, env, working_dir)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("keeping this session's layer: {e}"))??;
 
     Ok(CommitResult {
         image: ImageSource::new(format!("{LOCAL_HOST}built@{id}")),
     })
+}
+
+/// A file that is read once and then gone, whichever way this returns.
+struct Consumed(std::path::PathBuf);
+
+impl Consumed {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Consumed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The digest of a file, a block at a time.
+async fn digest_of(path: &Path) -> anyhow::Result<LayerId> {
+    use sha2::{Digest as _, Sha256};
+    use tokio::io::AsyncReadExt as _;
+
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    LayerId::parse(&format!("sha256:{:x}", hasher.finalize()))
 }

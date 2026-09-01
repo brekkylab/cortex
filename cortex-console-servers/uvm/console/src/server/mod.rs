@@ -379,19 +379,15 @@ impl Session {
                 "the guest wrote a layer and this session has nowhere it could have put it",
             );
         };
-        let base: Vec<_> = guest
-            .base_layers
-            .iter()
-            .map(|layer| layer.id.clone())
-            .collect();
+        let base = guest.base_layers.clone();
 
         let made = async {
             crate::commit::keep(
                 &commit,
                 &scratch,
                 &base,
-                &crate::base::store()?,
-                &crate::base::built_store()?,
+                crate::base::store()?,
+                crate::base::built_store()?,
             )
             .await
         }
@@ -519,10 +515,17 @@ fn already_built(asked: Option<&ImageSource>) -> Result<(), Outcome> {
         return Ok(());
     };
 
-    let known = built::digest_of(rest)
-        .and_then(|id| Ok(crate::base::built_store()?.has(&id)))
-        .unwrap_or(false);
-    if known {
+    // A name this host cannot even read is not an image it is missing. Told apart, because
+    // the two ask the client for opposite things: "go and build it" is useless advice to
+    // somebody who spelled the reference wrong, and no spelling would ever have worked.
+    let id = built::digest_of(rest)
+        .map_err(|e| refused(Error::INVALID_PARAMS, format!("{LOCAL_HOST}{rest}: {e}")))?;
+
+    // And a store this server cannot open is this host's fault rather than the client's.
+    let built = crate::base::built_store()
+        .map_err(|e| refused(Error::IO_FAILED, format!("opening the built images: {e}")))?;
+
+    if built.has(&id) {
         return Ok(());
     }
     Err(refused(

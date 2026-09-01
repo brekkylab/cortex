@@ -47,7 +47,7 @@ use cortex::console::{
     Call, Message, Outcome, RequestId,
     stdio::{read, write},
 };
-use cortex_uvm_console::layer::{Layer, LayerStore};
+use cortex_uvm_console::layer::{LayerId, LayerStore};
 use tokio::{
     io::{AsyncReadExt as _, BufReader},
     net::{
@@ -106,11 +106,15 @@ pub struct Guest {
     _session: SessionImage,
     _boot_root: BootRoot,
 
-    /// The layers the base this guest booted on is made of, bottom first.
+    /// The layers the base this guest booted on is made of, bottom first, as ids.
     ///
     /// Kept because a `commit` stitches onto them, and because asking again would mean
     /// resolving the base a second time — which for a pulled image is a registry round trip.
-    pub base_layers: Vec<Layer>,
+    ///
+    /// Ids and not layers: a `Layer` carries its whole data map, one entry per file in it, and
+    /// a commit reads nothing from these but the names. The store is the way from a name back
+    /// to the layer, and it is walked once at the commit rather than held until the quit.
+    pub base_layers: Vec<LayerId>,
 
     /// Where this guest writes a commit's layer, for a session that may make one.
     ///

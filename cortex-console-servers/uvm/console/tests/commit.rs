@@ -4,10 +4,34 @@
 //! cargo test -p cortex-uvm-console --test commit -- --ignored --test-threads=1
 //! ```
 
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use cortex::console::{Console, ExecResult, ImageSource};
 use tokio::process::Command;
+
+/// Where this host keeps what sessions share.
+fn home() -> PathBuf {
+    std::env::var_os("CORTEX_UVM_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".cortex/uvm"))
+}
+
+/// An image this test made, removed whichever way the test ends.
+///
+/// A value and not a call: a call at the end of a test is one a failing assertion skips, and
+/// what it would have skipped is an image left in the host's real store under a fixed id —
+/// which the next run's `already_built` accepts and boots instead of making its own.
+struct Kept(String);
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        let stem = self.0.trim_start_matches("sha256:");
+        for suffix in ["vmdk", "fsmeta.erofs", "manifest"] {
+            let _ = std::fs::remove_file(home().join("built").join(format!("{stem}.{suffix}")));
+        }
+    }
+}
 
 async fn session(image: Option<ImageSource>, committable: bool) -> Console {
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
@@ -107,6 +131,7 @@ const ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots two micro-VMs"]
 async fn what_a_session_wrote_is_what_the_next_one_boots() {
+    let _kept = Kept(ID.to_string());
     let mut first = session(None, true).await;
 
     assert_eq!(
@@ -203,6 +228,7 @@ async fn a_commit_keeps_only_what_the_session_wrote() {
     use cortex_uvm_console::layer::{LayerId, LayerStore, tree};
 
     let id = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    let _kept = Kept(id.to_string());
     let mut first = session(None, true).await;
     assert_eq!(
         say(&out(&mut first, "echo x > /only-this; echo $?").await),
@@ -214,13 +240,8 @@ async fn a_commit_keeps_only_what_the_session_wrote() {
         .expect("committing");
     drop(first);
 
-    let home = std::env::var_os("CORTEX_UVM_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cortex/uvm")
-        });
-    let built = BuiltStore::open(&home.join("built")).unwrap();
-    let layers = LayerStore::open(&home.join("layers")).unwrap();
+    let built = BuiltStore::open(&home().join("built")).unwrap();
+    let layers = LayerStore::open(&home().join("layers")).unwrap();
     let id = LayerId::parse(id).unwrap();
 
     let listed = built.layers(&id, &layers).expect("the image's layers");

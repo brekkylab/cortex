@@ -254,8 +254,22 @@ pub async fn run(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
                 }
 
                 Call::Commit(_) => {
+                    // On a blocking thread: walking the upperdir and archiving it is as big
+                    // as what the session wrote, and doing it here would stop this task
+                    // reading the channel — so an `exec` already in flight could not be
+                    // answered and a `stop` could not even arrive.
                     let outcome = match session.boot() {
-                        Ok(()) => write_layer(&session),
+                        Ok(()) => {
+                            let plan = commit_plan(&session);
+                            tokio::task::spawn_blocking(move || plan.run())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    refused(
+                                        Error::IO_FAILED,
+                                        format!("writing this session's layer: {e}"),
+                                    )
+                                })
+                        }
                         Err(outcome) => outcome,
                     };
                     server.respond(id, outcome).await?;
@@ -1000,20 +1014,55 @@ fn file_error(e: io::Error, path: &str) -> Outcome {
     refused(code, format!("{path}: {e}"))
 }
 
-/// Write this session's layer where the host can read it.
+/// Everything a commit needs to know, worked out while the session is still in hand.
 ///
-/// The answer carries no image, because this end has no idea what one is: it has written a tar
-/// and that is the whole of what it knows. The console server turns it into one.
+/// Separated from the writing so that the writing can be handed to a thread: what it takes is
+/// a few paths, where a [`Session`] is neither `Send` nor something to hold across one.
+enum CommitPlan {
+    /// Nothing was arranged for this at boot, so there is nothing to do but say so.
+    NotCommittable,
+    Write {
+        into: PathBuf,
+        excluded: Vec<PathBuf>,
+        mount_points: Vec<PathBuf>,
+    },
+}
+
+impl CommitPlan {
+    /// Write this session's layer where the host can read it.
+    ///
+    /// The answer carries no image, because this end has no idea what one is: it has written a
+    /// tar and that is the whole of what it knows. The console server turns it into one.
+    fn run(self) -> Outcome {
+        let CommitPlan::Write {
+            into,
+            excluded,
+            mount_points,
+        } = self
+        else {
+            return refused(
+                Error::INVALID_REQUEST,
+                "this session was not booted able to commit",
+            );
+        };
+        match commit::write_layer(Path::new(UPPER_DIR), &into, &excluded, &mount_points) {
+            Ok(size) => encoded(bson::serialize_to_bson(&GuestCommit { size })),
+            Err(e) => refused(
+                Error::IO_FAILED,
+                format!("writing this session's layer: {e}"),
+            ),
+        }
+    }
+}
+
+/// What this session would commit, and where.
 ///
 /// A commit needs two things arranged while booting — the root holding this overlay's upper,
 /// and somewhere to write the result — and a session that did not say it might commit has
 /// neither. It cannot be given them now, so it is told rather than half-answered.
-fn write_layer(session: &Session) -> Outcome {
+fn commit_plan(session: &Session) -> CommitPlan {
     let Ok(scratch) = std::env::var(COMMIT_ENV) else {
-        return refused(
-            Error::INVALID_REQUEST,
-            "this session was not booted able to commit",
-        );
+        return CommitPlan::NotCommittable;
     };
 
     // Everything the console server and this agent put in the session's own filesystem. None
@@ -1024,7 +1073,11 @@ fn write_layer(session: &Session) -> Outcome {
         .collect();
     // Written into the session while it was up, by the network setup rather than by anything
     // the session did. Docker leaves this file out of a commit too, and for the same reason.
-    excluded.push(PathBuf::from("etc/resolv.conf"));
+    //
+    // Named by the constant the writer uses rather than spelled again: two spellings of one
+    // path are two that drift, and the way this one would drift is silently — a committed
+    // image carrying a nameserver that belonged to a VM which no longer exists.
+    excluded.push(inside_upper(Path::new(crate::contract::RESOLV_CONF)));
     if let Some(linked) = session.linked() {
         excluded.push(inside_upper(linked.root()));
     }
@@ -1037,13 +1090,10 @@ fn write_layer(session: &Session) -> Outcome {
         .map(|path| vec![inside_upper(path)])
         .unwrap_or_default();
 
-    let into = Path::new(&scratch).join(LAYER_TAR);
-    match commit::write_layer(Path::new(UPPER_DIR), &into, &excluded, &mount_points) {
-        Ok(size) => encoded(bson::serialize_to_bson(&GuestCommit { size })),
-        Err(e) => refused(
-            Error::IO_FAILED,
-            format!("writing this session's layer: {e}"),
-        ),
+    CommitPlan::Write {
+        into: Path::new(&scratch).join(LAYER_TAR),
+        excluded,
+        mount_points,
     }
 }
 
