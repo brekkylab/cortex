@@ -29,6 +29,11 @@ uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
+# The digest a built image is named by. Small and pure Rust, and already in this
+# workspace's lockfile — `cortex-uvm-console` hashes layers with it. Unconditional
+# rather than behind a feature, because `rootfs` is a public API and an API that is
+# off by default is one callers have to discover twice.
+sha2 = { workspace = true }
 # `macros` for `try_join!`, which is how `BinExecutable` drains a child's two pipes while
 # awaiting its exit: one future, so dropping the call drops every part of it at once.
 tokio = { workspace = true, features = [
@@ -41,9 +46,8 @@ tokio = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-# A directory standing in for a mounted tree: what `BinExecutable`'s tests exercise is what a
-# spawned program is given for a path a mount reported, and a plain directory reports one the
-# same way.
+# A directory standing in for a mounted tree, and the build contexts the `rootfs` tests hash:
+# both want a real directory somewhere, and neither wants to leave one behind.
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 

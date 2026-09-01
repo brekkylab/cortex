@@ -105,6 +105,7 @@ pub mod console;
 pub mod exec;
 pub mod fs;
 mod lock;
+pub mod rootfs;
 
 /// What every method that waits hands back — a [`Client`], a [`Server`], an
 /// [`Executable`].
