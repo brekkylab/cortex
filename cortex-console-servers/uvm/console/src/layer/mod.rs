@@ -22,9 +22,11 @@
 pub mod atomic;
 mod id;
 pub mod map;
+pub mod stitch;
 pub mod store;
 pub mod tree;
 pub mod vmdk;
 
 pub use id::LayerId;
+pub use stitch::stitch;
 pub use store::{Layer, LayerStore};
