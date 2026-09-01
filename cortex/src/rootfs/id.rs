@@ -59,8 +59,6 @@ impl fmt::Display for BuildId {
 
 /// Everything a [`BuildId`] is computed from, gathered so that computing one is a function
 /// and not a method — which is what lets the digest be tested without a builder.
-// Read by the builder, which is the next thing written.
-#[allow(dead_code)]
 pub(crate) struct Recipe<'a> {
     pub base: &'a str,
     pub steps: &'a [Step],
@@ -73,8 +71,6 @@ pub(crate) struct Recipe<'a> {
 /// Fails only for a `COPY` source it could not read. Inventing a digest for one would let two
 /// different builds share a cache entry, which is the one mistake a content-addressed cache
 /// must not make.
-// Read by the builder, which is the next thing written.
-#[allow(dead_code)]
 pub(crate) fn digest(recipe: Recipe<'_>) -> anyhow::Result<BuildId> {
     let mut hasher = Sha256::new();
     feed(&mut hasher, HASH_VERSION.as_bytes());

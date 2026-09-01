@@ -7,10 +7,11 @@
 //! nothing else.
 
 mod id;
+mod rootfs;
 mod step;
 
 pub use id::BuildId;
+pub use rootfs::{Rootfs, Warning};
 pub use step::Step;
 
-#[allow(unused_imports)]
 pub(crate) use id::{Recipe, digest};
