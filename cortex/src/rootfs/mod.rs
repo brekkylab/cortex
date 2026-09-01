@@ -5,6 +5,30 @@
 //! an image a later session can name. Nothing here knows what an image *is* — that is the
 //! console server's, and this module drives a [`Console`](crate::console::Console) and
 //! nothing else.
+//!
+//! ```no_run
+//! use cortex::console::{Console, ConsoleBuilder, NetworkAccess};
+//! use cortex::rootfs::Rootfs;
+//!
+//! # async fn f() -> anyhow::Result<()> {
+//! let built = Rootfs::from_image("python:3.13-slim")
+//!     // Said out loud, because leaving it out is not the internet — see
+//!     // [`Rootfs::network`].
+//!     .network(NetworkAccess::public())
+//!     .run("pip install --no-cache-dir pandas")
+//!     .env("TZ", "UTC")
+//!     .workdir("/srv/app")
+//!     .build(|| ConsoleBuilder::new().stdio_client(&["cortex-uvm-console"]))
+//!     .await?;
+//!
+//! // And a session on what it made, which is where the build stops mattering.
+//! let console = Console::builder()
+//!     .stdio_client(&["cortex-uvm-console"])
+//!     .image(&built)
+//!     .build()
+//!     .await?;
+//! # Ok(()) }
+//! ```
 
 mod dockerfile;
 mod id;

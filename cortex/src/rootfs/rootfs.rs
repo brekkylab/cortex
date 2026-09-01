@@ -130,6 +130,14 @@ impl Rootfs {
 
     /// How much of a network the build's commands get.
     ///
+    /// **Leaving it out is not the internet.** The choice falls to the server, and a
+    /// micro-VM one defaults to reaching the host and nothing beyond it — so a `RUN` that
+    /// installs a package fails at a refused connection unless this asks for
+    /// [`public`](NetworkAccess::public). That is the same default an ordinary session
+    /// gets, deliberately: a build is a session, and nothing about being one makes egress
+    /// safer. An operator who wants it everywhere sets the server's own default instead of
+    /// every caller saying it.
+    ///
     /// Not part of the id: this is how the build was made rather than what it is, and a
     /// build that failed for want of a network commits nothing, so no wrong entry can be
     /// cached by it.
