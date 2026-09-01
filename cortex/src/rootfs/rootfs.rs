@@ -7,7 +7,10 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::console::{ExecResult, NetworkAccess};
+use anyhow::Context as _;
+
+use crate::console::{ConsoleBuilder, Error, ExecResult, Failure, ImageSource, NetworkAccess};
+use crate::fs::Mount;
 
 use super::{BuildId, Recipe, Step, digest};
 
@@ -32,8 +35,6 @@ pub struct Rootfs {
     /// its own type and this struct has no business being generic over it — a `Rootfs` is
     /// passed around and stored, and a type parameter for an observer would spread to
     /// everything holding one.
-    // Read by `build`, which is the next thing written.
-    #[allow(dead_code)]
     on_step: Option<Observer>,
 }
 
@@ -186,8 +187,6 @@ impl Rootfs {
     ///
     /// Computed from the steps rather than observed from a session, so the answer is the
     /// same whether the build ran or was found in the cache.
-    // Read by `build`, which is the next thing written.
-    #[allow(dead_code)]
     pub(crate) fn stated(&self) -> (Vec<String>, Option<String>) {
         let mut env: Vec<(&str, &str)> = Vec::new();
         let mut working_dir = None;
@@ -216,9 +215,656 @@ impl Rootfs {
     }
 }
 
+/// The host a built image is named under.
+///
+/// `.local` is reserved by RFC 6762 and can never be a registry, so this is real OCI
+/// reference grammar that no registry will ever claim. A console server checks the host
+/// before anything else and serves from its own store.
+pub(crate) const LOCAL_HOST: &str = "cortex.local/";
+
+/// What a built image is called on the wire.
+pub(crate) fn reference(id: &BuildId) -> String {
+    format!("{LOCAL_HOST}built@{id}")
+}
+
+/// The build context, as something a console can be given.
+///
+/// A directory and nothing else. [`Mount`]'s contract is about a tree that goes away when the
+/// value does; this one is the caller's own directory and outlives the build, which is
+/// exactly what a build context should do.
+struct Context(PathBuf);
+
+impl Mount for Context {
+    fn mountpoint(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// An image a build made.
+///
+/// Hand it to [`ConsoleBuilder::image`] — `From<&BuiltImage>` is why `.image(&built)` works —
+/// and the next session starts where the build left off.
+#[derive(Clone, Debug)]
+pub struct BuiltImage {
+    id: BuildId,
+    image: ImageSource,
+    env: Vec<String>,
+    working_dir: Option<String>,
+}
+
+impl BuiltImage {
+    /// The digest of the recipe that made it.
+    pub fn id(&self) -> &BuildId {
+        &self.id
+    }
+
+    /// How to name it to a console server.
+    pub fn image(&self) -> &ImageSource {
+        &self.image
+    }
+
+    /// What it states about running a process in it, as `KEY=VALUE`.
+    pub fn env(&self) -> &[String] {
+        &self.env
+    }
+
+    /// Where a process in it starts.
+    pub fn working_dir(&self) -> Option<&str> {
+        self.working_dir.as_deref()
+    }
+}
+
+impl From<&BuiltImage> for ImageSource {
+    fn from(built: &BuiltImage) -> ImageSource {
+        built.image.clone()
+    }
+}
+
+/// A step that did not succeed, with everything needed to see why.
+///
+/// A distinct type rather than a formatted message, so a caller can show the output its own
+/// way — `anyhow::Error::downcast_ref::<StepFailed>()` is how to get at it.
+#[derive(Debug)]
+pub struct StepFailed {
+    /// The step as the caller declared it.
+    pub step: Step,
+    /// What actually went on the wire, which is not the same thing — a `RUN` carries the
+    /// accumulated environment in front of it.
+    pub argv: Vec<String>,
+    pub result: ExecResult,
+}
+
+impl fmt::Display for StepFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} exited {}\n  argv: {:?}\n  stdout: {}\n  stderr: {}",
+            self.step,
+            self.result.code,
+            self.argv,
+            String::from_utf8_lossy(&self.result.stdout),
+            String::from_utf8_lossy(&self.result.stderr),
+        )
+    }
+}
+
+impl std::error::Error for StepFailed {}
+
+impl Rootfs {
+    /// Build it, and answer the image.
+    ///
+    /// # Why a factory and not a builder
+    ///
+    /// This may open two consoles — one to ask whether the image already exists, one to
+    /// build it — and a [`ConsoleBuilder`]'s client factory is `FnOnce`, so one builder
+    /// cannot serve both. Taking a server command instead would read better and would stop a
+    /// test from supplying its own [`Client`](crate::console::Client).
+    ///
+    /// `image`, `network`, `mount` and `committable` are set on whatever the factory
+    /// returns; anything the caller set for those is overwritten.
+    pub async fn build(
+        mut self,
+        console: impl Fn() -> ConsoleBuilder,
+    ) -> anyhow::Result<BuiltImage> {
+        let id = self.id()?;
+        let (env, working_dir) = self.stated();
+
+        if let Some(image) = already_built(&id, &console).await? {
+            // Nothing was booted to find this out: `init` answered from a file test, and the
+            // console it answered on has been dropped.
+            return Ok(BuiltImage {
+                id,
+                image,
+                env,
+                working_dir,
+            });
+        }
+
+        // Absolute, because a mount is named to the server as a `file://` URL and a relative
+        // path after `file://` reads as a host. Done here rather than in `context` so that a
+        // caller can name a directory that does not exist yet and be told at build time.
+        let context = std::path::absolute(&self.context).with_context(|| {
+            format!("resolving the build context at {}", self.context.display())
+        })?;
+
+        let mut builder = console()
+            .image(self.base.clone())
+            .mount(Context(context))
+            .committable();
+        if let Some(network) = self.network.clone() {
+            builder = builder.network(network);
+        }
+        let mut session = builder.build().await?;
+
+        let workfs = session
+            .workfs_path()
+            .context("the console server took the build context and did not say where")?
+            .to_path_buf();
+
+        let mut running: Vec<(String, String)> = Vec::new();
+        for step in &self.steps {
+            let argv = match step {
+                Step::Env { key, value } => {
+                    match running.iter_mut().find(|(k, _)| k == key) {
+                        Some(existing) => existing.1 = value.clone(),
+                        None => running.push((key.clone(), value.clone())),
+                    }
+                    // Nothing on the wire: there is no session-level environment, so this
+                    // rides on every later command instead.
+                    continue;
+                }
+                Step::Run(command) => {
+                    // `env` in front rather than a shell assignment, because the argv is
+                    // already split and no shell is consulted to build it — so no value
+                    // needs quoting and a value with a space in it cannot become two words.
+                    let mut argv = vec!["env".to_string()];
+                    argv.extend(running.iter().map(|(k, v)| format!("{k}={v}")));
+                    argv.push("sh".into());
+                    argv.push("-lc".into());
+                    argv.push(command.clone());
+                    argv
+                }
+                Step::Copy { src, dst } => {
+                    anyhow::ensure!(
+                        src.is_relative(),
+                        "a COPY source is relative to the build context, and {} is not",
+                        src.display()
+                    );
+                    let from = workfs.join(src);
+                    vec![
+                        "cp".to_string(),
+                        "-a".to_string(),
+                        from.to_str()
+                            .with_context(|| {
+                                format!(
+                                    "{} is not a UTF-8 path to name to a server",
+                                    from.display()
+                                )
+                            })?
+                            .to_string(),
+                        dst.clone(),
+                    ]
+                }
+                // `cd` is a protocol builtin and moves the session, so it persists across the
+                // steps after it rather than ending with the command.
+                Step::Workdir(dir) => vec!["cd".to_string(), dir.clone()],
+            };
+
+            let result = session.exec(&argv, None).await?;
+            if let Some(on_step) = self.on_step.as_mut() {
+                on_step(step, &result);
+            }
+            if result.code != 0 {
+                // Nothing is committed, so nothing is cached and the next attempt starts
+                // over. Dropping the session here is what releases the guest.
+                return Err(anyhow::Error::new(StepFailed {
+                    step: step.clone(),
+                    argv,
+                    result,
+                }));
+            }
+        }
+
+        let image = session
+            .commit(id.to_string(), env.clone(), working_dir.clone())
+            .await?;
+
+        Ok(BuiltImage {
+            id,
+            image,
+            env,
+            working_dir,
+        })
+    }
+}
+
+/// Whether a console server already has the image `id` names.
+///
+/// # Why there is no method for this
+///
+/// Opening a session on the image *is* the question. `init` either provides the base asked
+/// for or refuses the session, which is a contract the protocol already has — so the probe
+/// costs one server process and no boot, and adding a method would have meant a second way
+/// to ask the same thing.
+///
+/// That a *built* image's existence is answered at `init` while an *OCI reference*'s is
+/// deferred to boot is deliberate: the first is a local file test, the second is a network
+/// round trip that belongs to a boot.
+async fn already_built(
+    id: &BuildId,
+    console: &impl Fn() -> ConsoleBuilder,
+) -> anyhow::Result<Option<ImageSource>> {
+    let image = ImageSource::new(reference(id));
+    match console().image(image.clone()).build().await {
+        // Taken, so it is there. The console goes out of scope here, which says `quit`.
+        Ok(_) => Ok(Some(image)),
+        Err(e) => match e.downcast_ref::<Failure>().and_then(Failure::code) {
+            Some(Error::UNKNOWN_IMAGE) => Ok(None),
+            // Anything else is the caller's to hear: a server that can swap no base at all, a
+            // channel that broke, a server that would not start. Building anyway would fail
+            // the same way and more slowly.
+            _ => Err(e),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::{Arc, Mutex};
+
+    use crate::BoxFuture;
+    use crate::console::{
+        Call, Client, CommitResult, ConsoleBuilder, Error, ExecCmd, Failure, ImageSource,
+        InitResult, Notification, Outcome, Progress, RequestId, WorkFsMount,
+    };
+
+    /// Every call a build made, in order.
+    type Log = Arc<Mutex<Vec<Call>>>;
+
+    /// A client over canned answers, recording every call it was handed.
+    struct Recorder {
+        answers: Vec<Outcome>,
+        next_id: RequestId,
+        log: Log,
+    }
+
+    impl Client for Recorder {
+        fn call(&mut self, call: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.log.lock().unwrap().push(call);
+            let answer = if self.answers.is_empty() {
+                Err(Failure::Refused(Error {
+                    code: Error::INTERNAL_ERROR,
+                    message: "the test ran out of answers".into(),
+                    data: None,
+                }))
+            } else {
+                Ok(self.answers.remove(0))
+            };
+            Box::pin(async move { (id, answer) })
+        }
+
+        fn notify(&mut self, _: Notification) -> BoxFuture<'_, Result<(), Failure>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn outcome<T: serde::Serialize>(value: &T) -> Outcome {
+        Outcome::Result(bson::serialize_to_bson(value).unwrap())
+    }
+
+    /// A session taken, with the workfs put where the build said it was.
+    fn took_the_session(at: &Path) -> Outcome {
+        outcome(&InitResult {
+            workfs: Some(WorkFsMount {
+                path: at.to_str().unwrap().to_string(),
+            }),
+            ..InitResult::default()
+        })
+    }
+
+    fn ran(code: i32) -> Outcome {
+        outcome(&Progress::Done(ExecResult {
+            code,
+            ..ExecResult::default()
+        }))
+    }
+
+    fn committed(reference: &str) -> Outcome {
+        outcome(&CommitResult {
+            image: ImageSource::new(reference),
+        })
+    }
+
+    /// The argv of every `exec` in a log, in order.
+    fn argvs(log: &Log) -> Vec<Vec<String>> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Exec(exec) => match &exec.cmd {
+                    ExecCmd::New(argv) => Some(argv.clone()),
+                    ExecCmd::Resume { .. } => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two consoles, in order: the first is asked for the built image, the second builds it.
+    ///
+    /// One helper for both because `build` may open either one console or two, and a test
+    /// that had to know which would be asserting the shape of the code rather than what it
+    /// sent.
+    fn two(first: Vec<Outcome>, second: Vec<Outcome>) -> (impl Fn() -> ConsoleBuilder, Log) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let queued = Arc::new(Mutex::new(vec![second, first]));
+        let shared = log.clone();
+        let make = move || {
+            let answers = queued.lock().unwrap().pop().expect("a third console");
+            ConsoleBuilder::new().client(Recorder {
+                answers,
+                next_id: 0,
+                log: shared.clone(),
+            })
+        };
+        (make, log)
+    }
+
+    /// The one answer that means the image is not there and the build should run.
+    fn unknown_image() -> Outcome {
+        Outcome::Error(Error {
+            code: Error::UNKNOWN_IMAGE,
+            message: "no such built image".into(),
+            data: None,
+        })
+    }
+
+    /// An image that already exists is answered without building it. The probe is one
+    /// `init` — no boot, no steps, no commit.
+    #[tokio::test]
+    async fn an_image_that_exists_is_not_built_again() {
+        let context = tempfile::tempdir().unwrap();
+        let rootfs = Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .env("TZ", "UTC")
+            .run("true");
+        let id = rootfs.id().unwrap();
+
+        let (make, log) = two(vec![outcome(&InitResult::default())], Vec::new());
+        let built = rootfs.build(make).await.expect("the cached image");
+
+        assert_eq!(built.id(), &id);
+        assert_eq!(
+            built.image().reference,
+            format!("cortex.local/built@{id}"),
+            "the cached image is not named the way a built one is"
+        );
+        // What the image states is the recipe's, not a session's — so it is the same whether
+        // the build ran or was found.
+        assert_eq!(built.env(), ["TZ=UTC"]);
+
+        assert!(argvs(&log).is_empty(), "a cache hit ran a step");
+        assert_eq!(
+            log.lock().unwrap().len(),
+            1,
+            "a cache hit did more than ask"
+        );
+    }
+
+    /// The probe names the built image and asks for nothing else — a session that is not a
+    /// build, so it is not committable and mounts nothing.
+    #[tokio::test]
+    async fn the_probe_asks_only_whether_the_image_is_there() {
+        let context = tempfile::tempdir().unwrap();
+        let rootfs = Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .run("true");
+        let id = rootfs.id().unwrap();
+
+        let (make, log) = two(vec![outcome(&InitResult::default())], Vec::new());
+        rootfs.build(make).await.expect("the cached image");
+
+        let calls = log.lock().unwrap();
+        let Call::Init(init) = &calls[0] else {
+            panic!("the probe was not an init");
+        };
+        assert_eq!(
+            init.image.as_ref().unwrap().reference,
+            format!("cortex.local/built@{id}")
+        );
+        assert!(!init.committable, "the probe asked to be committable");
+        assert!(init.workfs.is_none(), "the probe mounted the context");
+    }
+
+    /// An image nobody has built is built. `UNKNOWN_IMAGE` is the answer that says so, and
+    /// it is the only one that means "carry on".
+    #[tokio::test]
+    async fn an_image_nobody_has_built_is_built() {
+        let context = tempfile::tempdir().unwrap();
+        let (make, log) = two(
+            vec![unknown_image()],
+            vec![
+                took_the_session(context.path()),
+                ran(0),
+                committed("cortex.local/built@sha256:whatever"),
+            ],
+        );
+
+        Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .run("true")
+            .build(make)
+            .await
+            .expect("building");
+
+        assert_eq!(argvs(&log), [vec!["env", "sh", "-lc", "true"]]);
+    }
+
+    /// Any other refusal is the caller's to hear. A server that cannot swap a base at all
+    /// answers `UNSUPPORTED_IMAGE`, and building anyway would just fail again more slowly.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_about_the_cache_is_reported() {
+        let context = tempfile::tempdir().unwrap();
+        let (make, _) = two(
+            vec![Outcome::Error(Error {
+                code: Error::UNSUPPORTED_IMAGE,
+                message: "commands here run on this host's own filesystem".into(),
+                data: None,
+            })],
+            Vec::new(),
+        );
+
+        let refused = Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .run("true")
+            .build(make)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("host's own filesystem"),
+            "the server's refusal was swallowed: {refused:#}"
+        );
+    }
+
+    /// The whole mapping, in one build: the `env` prefix on a `RUN`, `cp -a` for a `COPY`,
+    /// `cd` for a `WORKDIR`, and a `commit` last.
+    #[tokio::test]
+    async fn each_step_goes_on_the_wire_as_the_design_says() {
+        let context = tempfile::tempdir().unwrap();
+        std::fs::write(context.path().join("app.py"), b"x").unwrap();
+        let workfs = context.path().to_path_buf();
+
+        let (make, log) = two(
+            vec![unknown_image()],
+            vec![
+                took_the_session(&workfs),
+                ran(0), // RUN
+                ran(0), // COPY
+                ran(0), // WORKDIR
+                committed("cortex.local/built@sha256:whatever"),
+            ],
+        );
+
+        let built = Rootfs::from_image("alpine:3.20")
+            .context(context.path().to_path_buf())
+            .env("TZ", "UTC")
+            .run("apk add jq")
+            .copy("app.py", "/srv/app.py")
+            .workdir("/srv")
+            .build(make)
+            .await
+            .expect("building");
+
+        assert_eq!(
+            argvs(&log),
+            [
+                vec!["env", "TZ=UTC", "sh", "-lc", "apk add jq"],
+                vec![
+                    "cp",
+                    "-a",
+                    workfs.join("app.py").to_str().unwrap(),
+                    "/srv/app.py"
+                ],
+                vec!["cd", "/srv"],
+            ]
+        );
+        assert_eq!(built.env(), ["TZ=UTC"]);
+        assert_eq!(built.working_dir(), Some("/srv"));
+    }
+
+    /// A build session says what it is at `init`: committable, with the context as its
+    /// workfs, on the base the caller named, and delegating nothing — a build does not use
+    /// delegation.
+    #[tokio::test]
+    async fn a_build_session_declares_itself() {
+        let context = tempfile::tempdir().unwrap();
+        let (make, log) = two(
+            vec![unknown_image()],
+            vec![
+                took_the_session(context.path()),
+                ran(0),
+                committed("cortex.local/built@sha256:whatever"),
+            ],
+        );
+
+        Rootfs::from_image("alpine:3.20")
+            .context(context.path().to_path_buf())
+            .run("true")
+            .build(make)
+            .await
+            .expect("building");
+
+        let calls = log.lock().unwrap();
+        let Call::Init(init) = &calls[1] else {
+            panic!("the build session did not begin with an init");
+        };
+        assert!(init.committable, "a build session cannot commit");
+        assert!(init.delegated.is_empty(), "a build delegated something");
+        assert_eq!(init.image.as_ref().unwrap().reference, "alpine:3.20");
+        assert!(init.workfs.is_some(), "the context was not mounted");
+    }
+
+    /// The commit says the id the recipe computed, and what the image should state.
+    #[tokio::test]
+    async fn the_commit_says_the_id_and_what_the_image_states() {
+        let context = tempfile::tempdir().unwrap();
+        let (make, log) = two(
+            vec![unknown_image()],
+            vec![
+                took_the_session(context.path()),
+                ran(0),
+                committed("cortex.local/built@sha256:whatever"),
+            ],
+        );
+
+        let rootfs = Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .env("TZ", "UTC")
+            .workdir("/srv");
+        let expected = rootfs.id().unwrap();
+        rootfs.build(make).await.expect("building");
+
+        let calls = log.lock().unwrap();
+        let Call::Commit(commit) = calls.last().unwrap() else {
+            panic!("the last call was not a commit");
+        };
+        assert_eq!(commit.id, expected.to_string());
+        assert_eq!(commit.env, ["TZ=UTC"]);
+        assert_eq!(commit.working_dir.as_deref(), Some("/srv"));
+    }
+
+    /// A step that fails stops the build, and nothing is committed — so nothing is cached
+    /// and the next attempt starts over.
+    #[tokio::test]
+    async fn a_failed_step_stops_the_build_and_commits_nothing() {
+        let context = tempfile::tempdir().unwrap();
+        let (make, log) = two(
+            vec![unknown_image()],
+            vec![took_the_session(context.path()), ran(3)],
+        );
+
+        let refused = Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .run("false")
+            .run("never reached")
+            .build(make)
+            .await
+            .unwrap_err();
+
+        let failed = refused
+            .downcast_ref::<StepFailed>()
+            .expect("a step failure the caller can inspect");
+        assert_eq!(failed.result.code, 3);
+        assert_eq!(failed.step, Step::Run("false".into()));
+        assert!(
+            failed.argv.iter().any(|a| a == "false"),
+            "the argv is not reported: {:?}",
+            failed.argv
+        );
+
+        assert_eq!(argvs(&log).len(), 1, "the build carried on past a failure");
+        assert!(
+            !log.lock()
+                .unwrap()
+                .iter()
+                .any(|call| matches!(call, Call::Commit(_))),
+            "a failed build committed"
+        );
+    }
+
+    /// `on_step` sees every step that reached the server, and only those — an `ENV` sends
+    /// nothing and so has nothing to report.
+    #[tokio::test]
+    async fn on_step_sees_the_steps_that_ran() {
+        let context = tempfile::tempdir().unwrap();
+        let (make, _) = two(
+            vec![unknown_image()],
+            vec![
+                took_the_session(context.path()),
+                ran(0),
+                ran(0),
+                committed("cortex.local/built@sha256:whatever"),
+            ],
+        );
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .env("TZ", "UTC")
+            .run("true")
+            .workdir("/srv")
+            .on_step(move |step, _| recorded.lock().unwrap().push(step.to_string()))
+            .build(make)
+            .await
+            .expect("building");
+
+        assert_eq!(*seen.lock().unwrap(), ["RUN true", "WORKDIR /srv"]);
+    }
 
     /// The calls accumulate in the order they were made, which is the order they will run.
     #[test]

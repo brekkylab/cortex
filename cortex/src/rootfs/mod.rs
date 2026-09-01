@@ -12,7 +12,7 @@ mod rootfs;
 mod step;
 
 pub use id::BuildId;
-pub use rootfs::{Rootfs, Warning};
+pub use rootfs::{BuiltImage, Rootfs, StepFailed, Warning};
 pub use step::Step;
 
 pub(crate) use id::{Recipe, digest};
