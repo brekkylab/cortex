@@ -248,6 +248,17 @@ pub async fn run(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
                     };
                     server.respond(id, outcome).await?;
                 }
+
+                // A commit needs two things arranged while booting: the root holding this
+                // overlay's upper, and somewhere to write the result. A session that did not
+                // say it might commit has neither, and cannot be given them now.
+                Call::Commit(_) => {
+                    let outcome = refused(
+                        Error::INVALID_REQUEST,
+                        "this session was not booted able to commit",
+                    );
+                    server.respond(id, outcome).await?;
+                }
             },
 
             // A response answers a request, and this end makes none.

@@ -252,6 +252,20 @@ pub async fn run() -> anyhow::Result<()> {
                     };
                     server.respond(id, outcome).await?;
                 }
+
+                // Nothing to keep. Commands here run on this host's own filesystem, so a
+                // session writes into whatever was already there rather than over a base —
+                // there is no difference to hand back, and pretending otherwise would mean
+                // committing the host. The same refusal an image gets, for the same reason.
+                Call::Commit(_) => {
+                    let outcome = refused(
+                        Error::UNSUPPORTED_IMAGE,
+                        "commands here run on this host's own filesystem, so a session writes \
+                         over nothing and has nothing to keep — committing needs a backend that \
+                         runs them somewhere else",
+                    );
+                    server.respond(id, outcome).await?;
+                }
             },
 
             // A response answers a request, and this end makes none.

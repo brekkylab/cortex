@@ -47,7 +47,7 @@ use cortex::console::{
     Call, Message, Outcome, RequestId,
     stdio::{read, write},
 };
-use cortex_uvm_console::layer::LayerStore;
+use cortex_uvm_console::layer::{Layer, LayerStore};
 use tokio::{
     io::{AsyncReadExt as _, BufReader},
     net::{
@@ -105,6 +105,15 @@ pub struct Guest {
     _socket: Socket,
     _session: SessionImage,
     _boot_root: BootRoot,
+
+    /// The layers the base this guest booted on is made of, bottom first.
+    ///
+    /// Kept because a `commit` stitches onto them, and because asking again would mean
+    /// resolving the base a second time — which for a pulled image is a registry round trip.
+    // Read by `commit`, which is not written yet. Held here rather than fetched later because
+    // this is the moment the base was resolved.
+    #[allow(dead_code)]
+    pub base_layers: Vec<Layer>,
 }
 
 impl Guest {
@@ -123,7 +132,9 @@ impl Guest {
         host_ports: &[u16],
     ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
-        let base = assets::base_image(image).await?;
+        // The layers come back with the disk because the session keeps them: a `commit`
+        // stitches onto what its base was made of, and asking again would mean pulling twice.
+        let (base, base_layers) = crate::base::image(image).await?;
         let helper = boot_helper()?;
 
         // `/abin` is the same disk for every session — cortex's own executables and no
@@ -216,6 +227,7 @@ impl Guest {
             _socket: socket,
             _session: session,
             _boot_root: boot_root,
+            base_layers,
         })
     }
 

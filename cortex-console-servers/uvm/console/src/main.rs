@@ -75,6 +75,7 @@
 
 mod abin;
 mod assets;
+mod base;
 mod helper;
 mod server;
 

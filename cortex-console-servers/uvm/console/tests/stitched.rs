@@ -21,7 +21,8 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use cortex::console::{Console, ExecResult, ImageSource};
-use cortex_uvm_console::layer::{LayerId, LayerStore, stitch};
+use cortex_uvm_console::built::BuiltStore;
+use cortex_uvm_console::layer::{LayerId, LayerStore};
 use microsandbox_image::tree::{
     DeviceNode, DirectoryNode, FileData, FileTree, InodeMetadata, RegularFileId, RegularFileNode,
     TreeNode, Xattr,
@@ -176,13 +177,12 @@ async fn a_stitched_image_boots_and_is_the_merged_filesystem() {
         .expect("storing the upper layer");
 
     let id = LayerId::of(b"cortex test: a stitched two-layer image");
-    let descriptor = stitch(
-        &[base, over],
-        &cortex_uvm_console_built_dir().join(id.file_stem()),
-    )
-    .expect("stitching");
-    let _built = Built::of(&descriptor, Some(upper_id));
-    assert!(descriptor.is_file());
+    let built = BuiltStore::open(&cortex_uvm_console_built_dir()).expect("a built store");
+    built
+        .keep(&id, &[base, over], Vec::new(), None)
+        .expect("keeping the image");
+    let _kept = Kept::of(built.disk(&id), Some(upper_id));
+    assert!(built.has(&id), "the image was not written");
 
     let mut console = session_on(&id).await;
 
@@ -221,13 +221,12 @@ async fn a_lone_base_layer_has_none_of_it() {
     let base = base_layer(&store).await;
 
     let id = LayerId::of(b"cortex test: the base layer alone");
-    let descriptor = stitch(
-        &[base],
-        &cortex_uvm_console_built_dir().join(id.file_stem()),
-    )
-    .expect("stitching one layer");
+    let built = BuiltStore::open(&cortex_uvm_console_built_dir()).expect("a built store");
+    built
+        .keep(&id, &[base], Vec::new(), None)
+        .expect("keeping one layer as an image");
     // No upper layer here; the base is the host's and stays.
-    let _built = Built::of(&descriptor, None);
+    let _kept = Kept::of(built.disk(&id), None);
 
     let mut console = session_on(&id).await;
 
@@ -248,8 +247,8 @@ async fn a_lone_base_layer_has_none_of_it() {
     );
 }
 
-/// Where `assets::built_dir` looks. Not imported from the binary, which a test cannot reach
-/// — it is one line, and stating it here is also what checks the two still agree.
+/// Where the server keeps images made here. One line, and stating it here is also what checks
+/// that this and `base::built_store` still agree.
 fn cortex_uvm_console_built_dir() -> PathBuf {
     home().join("built")
 }
@@ -257,29 +256,27 @@ fn cortex_uvm_console_built_dir() -> PathBuf {
 /// Leave nothing behind: these images are the test's, not the host's.
 ///
 /// A value and not a call, because a call at the end of a test is a call a failing assertion
-/// skips — and what it would have skipped is a disk in the host's `built/` that the next run
-/// silently stitches over. Dropping happens either way.
-struct Built {
-    descriptor: PathBuf,
+/// skips — and what it would have skipped is an image in the host's `built/` that the next
+/// run silently writes over. Dropping happens either way.
+struct Kept {
+    disk: PathBuf,
     /// The upper layer, when the test put one. It is this test's alone, so it goes. The base
     /// layer stays either way: it is the pinned rootfs every session on this host already
     /// shares, and re-ingesting it per run would cost more than it saves.
     upper: Option<LayerId>,
 }
 
-impl Built {
-    fn of(descriptor: &std::path::Path, upper: Option<LayerId>) -> Built {
-        Built {
-            descriptor: descriptor.to_path_buf(),
-            upper,
-        }
+impl Kept {
+    fn of(disk: PathBuf, upper: Option<LayerId>) -> Kept {
+        Kept { disk, upper }
     }
 }
 
-impl Drop for Built {
+impl Drop for Kept {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.descriptor);
-        let _ = std::fs::remove_file(self.descriptor.with_extension("fsmeta.erofs"));
+        for suffix in ["vmdk", "fsmeta.erofs", "manifest"] {
+            let _ = std::fs::remove_file(self.disk.with_extension(suffix));
+        }
         let Some(upper) = &self.upper else {
             return;
         };
