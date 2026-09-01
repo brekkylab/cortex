@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// [`Rootfs::from_dockerfile`](super::Rootfs::from_dockerfile).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// A command, run through `sh -lc` with the environment accumulated so far.
+    /// A command, run through `sh -c` with the environment accumulated so far.
     Run(String),
 
     /// A path in the build context, copied into the image.

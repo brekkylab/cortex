@@ -84,7 +84,7 @@ impl Rootfs {
         }
     }
 
-    /// A command, run through `sh -lc` with everything [`env`](Self::env) has said so far.
+    /// A command, run through `sh -c` with everything [`env`](Self::env) has said so far.
     pub fn run(mut self, command: impl Into<String>) -> Self {
         self.steps.push(Step::Run(command.into()));
         self
@@ -123,6 +123,18 @@ impl Rootfs {
     /// Defaults to the current directory. [`from_dockerfile`](Self::from_dockerfile)
     /// defaults it to the Dockerfile's own directory instead, which is what `docker build`
     /// callers expect of a path beside their Dockerfile.
+    ///
+    /// # This directory is writable, and it is the real one
+    ///
+    /// Not a copy. It is shared into the session the way any workfs is — the same directory,
+    /// at the same path, over virtio-fs — so a `RUN rm -rf *` or a `RUN make` deletes and
+    /// writes **the caller's own files**, and what it leaves behind changes the next build's
+    /// [`id`](Self::id). `docker build` uploads a snapshot and cannot do this; nothing here
+    /// makes the same promise, because the share it rides on has no read-only setting for it
+    /// to be made with.
+    ///
+    /// So: name a directory a build may write in. A build that must not touch its input is a
+    /// build whose context is a copy the caller made.
     pub fn context(mut self, dir: impl Into<PathBuf>) -> Self {
         self.context = dir.into();
         self
@@ -235,6 +247,28 @@ pub(crate) fn reference(id: &BuildId) -> String {
     format!("{LOCAL_HOST}built@{id}")
 }
 
+/// Refuse a `COPY` source that names something the build context does not contain.
+///
+/// Absolute is the obvious one. `..` is the other: only the context is mounted into the
+/// session, so a source that climbs out of it names a directory that is empty on that side —
+/// and yet [`Rootfs::id`] hashes it here, where it does exist. Left alone, the two disagree:
+/// editing a file outside the context changes the build's identity, and every build carrying
+/// that step fails at the `cp`. Said once, at the step that declared it.
+pub(crate) fn inside_context(src: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        src.is_relative(),
+        "a COPY source is relative to the build context, and {} is not",
+        src.display()
+    );
+    anyhow::ensure!(
+        !src.components()
+            .any(|part| part == std::path::Component::ParentDir),
+        "a COPY source is inside the build context, and {} climbs out of it",
+        src.display()
+    );
+    Ok(())
+}
+
 /// The build context, as something a console can be given.
 ///
 /// A directory and nothing else. [`Mount`]'s contract is about a tree that goes away when the
@@ -334,7 +368,22 @@ impl Rootfs {
         mut self,
         console: impl Fn() -> ConsoleBuilder,
     ) -> anyhow::Result<BuiltImage> {
-        let id = self.id()?;
+        // On a blocking thread: this reads every file a `COPY` names, which is as big as
+        // whatever the caller builds from. `id` itself stays synchronous, because a caller
+        // asking a build its name outside a runtime is the case that makes it worth having.
+        let id = {
+            let (base, steps) = (self.base.clone(), self.steps.clone());
+            let context = self.context.clone();
+            tokio::task::spawn_blocking(move || {
+                digest(Recipe {
+                    base: &base,
+                    steps: &steps,
+                    context: &context,
+                })
+            })
+            .await
+            .context("computing this build's id")??
+        };
         let (env, working_dir) = self.stated();
 
         if let Some(image) = already_built(&id, &console).await? {
@@ -388,28 +437,38 @@ impl Rootfs {
                     let mut argv = vec!["env".to_string()];
                     argv.extend(running.iter().map(|(k, v)| format!("{k}={v}")));
                     argv.push("sh".into());
-                    argv.push("-lc".into());
+                    // `-c` and not `-lc`. A login shell sources `/etc/profile`, and what
+                    // `/etc/profile` does on every base worth naming is *assign* `PATH` —
+                    // which throws away the one the agent built, `/abin` and the delegated
+                    // names with it. A build would then be unable to run the executables it
+                    // declared, while still hashing them into its own id.
+                    argv.push("-c".into());
                     argv.push(command.clone());
                     argv
                 }
                 Step::Copy { src, dst } => {
-                    anyhow::ensure!(
-                        src.is_relative(),
-                        "a COPY source is relative to the build context, and {} is not",
-                        src.display()
-                    );
+                    inside_context(src)?;
                     let from = workfs.join(src);
+                    let from = from.to_str().with_context(|| {
+                        format!("{} is not a UTF-8 path to name to a server", from.display())
+                    })?;
+                    // The destination's parent is made first, because `COPY app /srv/app`
+                    // with no `/srv` is the ordinary Dockerfile spelling — `docker build`
+                    // creates the path and a bare `cp -a` does not, which would fail an
+                    // instruction this adapter had already accepted.
+                    //
+                    // One `sh -c` rather than two steps, so a caller watching `on_step` sees
+                    // the one instruction it declared.
                     vec![
-                        "cp".to_string(),
-                        "-a".to_string(),
-                        from.to_str()
-                            .with_context(|| {
-                                format!(
-                                    "{} is not a UTF-8 path to name to a server",
-                                    from.display()
-                                )
-                            })?
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        "mkdir -p -- \"$(dirname -- \"$2\")\" && cp -a -- \"$1\" \"$2\""
                             .to_string(),
+                        // `sh -c … name arg1 arg2`: the paths travel as arguments rather
+                        // than inside the script, so nothing in either is ever word-split or
+                        // read as a shell operator.
+                        "cp".to_string(),
+                        from.to_string(),
                         dst.clone(),
                     ]
                 }
@@ -669,7 +728,7 @@ mod tests {
             .await
             .expect("building");
 
-        assert_eq!(argvs(&log), [vec!["env", "sh", "-lc", "true"]]);
+        assert_eq!(argvs(&log), [vec!["env", "sh", "-c", "true"]]);
     }
 
     /// Any other refusal is the caller's to hear. A server that cannot swap a base at all
@@ -730,10 +789,14 @@ mod tests {
         assert_eq!(
             argvs(&log),
             [
-                vec!["env", "TZ=UTC", "sh", "-lc", "apk add jq"],
+                vec!["env", "TZ=UTC", "sh", "-c", "apk add jq"],
+                // The destination's parent is made first, and both paths travel as arguments
+                // to the script rather than inside it.
                 vec![
+                    "sh",
+                    "-c",
+                    "mkdir -p -- \"$(dirname -- \"$2\")\" && cp -a -- \"$1\" \"$2\"",
                     "cp",
-                    "-a",
                     workfs.join("app.py").to_str().unwrap(),
                     "/srv/app.py"
                 ],

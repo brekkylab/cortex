@@ -23,7 +23,7 @@
 //! - **`USER`** decides who the steps after it run as, and therefore what owns the files
 //!   they write. Skipping it runs them as root.
 //! - **`ARG`** declares a variable later instructions interpolate. This adapter does no
-//!   substitution at all, so a `${FOO}` in a later `RUN` reaches `sh -lc` and expands to
+//!   substitution at all, so a `${FOO}` in a later `RUN` reaches `sh -c` and expands to
 //!   nothing.
 //!
 //! Their warnings say that. Adding substitution, or a `USER` the protocol could honour, are
@@ -213,7 +213,14 @@ pub(crate) fn parse(text: &str) -> anyhow::Result<Parsed> {
                 "Dockerfile:{line}: {instruction} before any FROM — a build has to start \
                  from a base"
             ),
-            "RUN" => steps.push(Step::Run(rest.to_string())),
+            "RUN" => {
+                // Checked like `FROM` and `WORKDIR` are. An empty one goes out as `sh -c ""`
+                // and exits 0, so it would take a place in the build's id without doing
+                // anything — and the way a Dockerfile grows one is an edited continuation,
+                // which is precisely the case worth being told about.
+                anyhow::ensure!(!rest.is_empty(), "Dockerfile:{line}: RUN names no command");
+                steps.push(Step::Run(rest.to_string()));
+            }
             "COPY" => steps.push(copy(line, rest)?),
             "ENV" => steps.extend(env(line, rest)?),
             "WORKDIR" => {
@@ -259,10 +266,16 @@ fn copy(line: usize, rest: &str) -> anyhow::Result<Step> {
 ///
 /// Both spellings, because Dockerfiles in the wild use both and refusing one would make the
 /// adapter's claim — that it translates a Dockerfile — false for a large share of them.
+///
+/// Which spelling it is comes from the **first word only**. Looking for an `=` anywhere in
+/// the line reads `ENV JAVA_OPTS -Dfoo=bar` — the bare form, whose value happens to contain
+/// one — as the pair form, and then refuses it for naming no key.
 fn env(line: usize, rest: &str) -> anyhow::Result<Vec<Step>> {
-    if rest.contains('=') {
-        return rest
-            .split_whitespace()
+    let first = rest.split_whitespace().next().unwrap_or_default();
+    if first.contains('=') {
+        let pairs = split_quoted(rest);
+        return pairs
+            .iter()
             .map(|pair| {
                 let (key, value) = pair.split_once('=').with_context(|| {
                     format!(
@@ -274,7 +287,7 @@ fn env(line: usize, rest: &str) -> anyhow::Result<Vec<Step>> {
                     key: key.to_string(),
                     // A quoted value, unquoted. `ENV TZ="Asia/Seoul"` is one value and not a
                     // value with quotes in it.
-                    value: value.trim_matches('"').to_string(),
+                    value: unquoted(value),
                 })
             })
             .collect();
@@ -287,6 +300,59 @@ fn env(line: usize, rest: &str) -> anyhow::Result<Vec<Step>> {
         key: key.to_string(),
         value: value.trim().to_string(),
     }])
+}
+
+/// Split on whitespace, except inside quotes.
+///
+/// `ENV MESSAGE="hello world"` is one pair and not two words, so a split that did not know
+/// about the quotes would hand `world"` to the pair reader and have it refused as a bare
+/// word — for a spelling the Dockerfile did not use.
+/// The quotes stay in the token: what a quote *means* is [`unquoted`]'s to say, and two
+/// places deciding it separately is how they come to disagree.
+fn split_quoted(rest: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for c in rest.chars() {
+        match quote {
+            Some(open) if c == open => {
+                quote = None;
+                current.push(c);
+            }
+            Some(_) => current.push(c),
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                current.push(c);
+            }
+            None if c.is_whitespace() => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// A value with one matching pair of surrounding quotes taken off.
+///
+/// One pair, not every quote: `trim_matches` would turn `""x""` into `x` and an empty
+/// `ENV A="` into nothing at all.
+fn unquoted(value: &str) -> String {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|v| v.strip_suffix(quote))
+        {
+            return inner.to_string();
+        }
+    }
+    value.to_string()
 }
 
 #[cfg(test)]
@@ -487,5 +553,68 @@ mod tests {
         let without = parse("FROM alpine\nRUN true\n").unwrap();
         assert_eq!(with.steps, without.steps);
         assert_eq!(with.base, without.base);
+    }
+
+    /// A quoted value is one value. Splitting on whitespace before looking at the quotes
+    /// tears it in half and then blames the Dockerfile for a spelling it did not use.
+    #[test]
+    fn a_quoted_env_value_may_hold_a_space() {
+        let parsed = parse("FROM alpine\nENV MESSAGE=\"hello world\"\n").unwrap();
+        assert_eq!(
+            parsed.steps,
+            [Step::Env {
+                key: "MESSAGE".into(),
+                value: "hello world".into()
+            }]
+        );
+
+        let several = parse("FROM alpine\nENV A=1 B=\"x y\" C='p q'\n").unwrap();
+        assert_eq!(
+            several.steps,
+            [
+                Step::Env {
+                    key: "A".into(),
+                    value: "1".into()
+                },
+                Step::Env {
+                    key: "B".into(),
+                    value: "x y".into()
+                },
+                Step::Env {
+                    key: "C".into(),
+                    value: "p q".into()
+                },
+            ]
+        );
+    }
+
+    /// Which spelling an `ENV` is comes from its first word. An `=` in the *value* of the
+    /// bare form does not make it the pair form.
+    #[test]
+    fn an_env_value_may_hold_an_equals_in_the_bare_form() {
+        let parsed = parse("FROM alpine\nENV JAVA_OPTS -Dfoo=bar\n").unwrap();
+        assert_eq!(
+            parsed.steps,
+            [Step::Env {
+                key: "JAVA_OPTS".into(),
+                value: "-Dfoo=bar".into()
+            }]
+        );
+    }
+
+    /// One pair of quotes comes off, not every quote there is.
+    #[test]
+    fn only_the_surrounding_quotes_are_taken_off() {
+        assert_eq!(unquoted("\"x\""), "x");
+        assert_eq!(unquoted("\"\"x\"\""), "\"x\"");
+        assert_eq!(unquoted("\""), "\"", "a lone quote is a value, not a pair");
+        assert_eq!(unquoted("a\"b"), "a\"b");
+    }
+
+    /// `RUN` is checked for a command, like `FROM` and `WORKDIR` are for their arguments.
+    #[test]
+    fn a_run_with_no_command_is_refused() {
+        let refused = parse("FROM alpine\nRUN\n").unwrap_err().to_string();
+        assert!(refused.contains("RUN names no command"), "{refused}");
     }
 }

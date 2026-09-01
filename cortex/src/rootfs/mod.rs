@@ -40,3 +40,4 @@ pub use rootfs::{BuiltImage, Rootfs, StepFailed, Warning};
 pub use step::Step;
 
 pub(crate) use id::{Recipe, digest};
+pub(crate) use rootfs::inside_context;

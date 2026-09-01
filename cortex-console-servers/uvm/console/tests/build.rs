@@ -196,3 +196,64 @@ async fn a_failed_build_leaves_nothing_behind() {
         "a failed build was cached"
     );
 }
+
+/// A `COPY` makes its destination's parent, because that is what the `COPY` this adapter
+/// translates does — and a `RUN` keeps the `PATH` the agent built rather than the one a
+/// login shell would assign over the top of it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "boots a micro-VM"]
+async fn a_copy_makes_its_parent_and_a_run_keeps_its_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let context = context(&salt("parents-and-path"));
+    let abin = tempfile::tempdir().expect("an abin");
+    let tool = abin.path().join("mytool");
+    std::fs::write(&tool, b"#!/bin/sh\necho ran-mytool\n").expect("writing the tool");
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // The build's own executables have to be on the server, which is where `/abin` is
+    // assembled from — the client says which directories it adds, not what cortex provides.
+    let with_abin = || {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        server.env("CORTEX_ABIN_DIR", abin.path());
+        ConsoleBuilder::new()
+            .client(cortex::console::stdio::StdioClient::new(server).expect("a server"))
+    };
+
+    let built = Rootfs::from_image("alpine:3.20")
+        .context(context.path().to_path_buf())
+        // No `mkdir -p /deep/er` in front of it: making the parent is the copy's job.
+        .copy("marker.txt", "/deep/er/marker.txt")
+        // And what cortex provides is runnable from a step, which it is not if the shell
+        // re-reads `/etc/profile` and assigns `PATH` over the agent's.
+        .run("mytool > /ran-from-abin")
+        .build(with_abin)
+        .await
+        .expect("building");
+
+    let mut session = Console::builder()
+        .client(
+            cortex::console::stdio::StdioClient::new({
+                let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+                server.stderr(Stdio::inherit());
+                server
+            })
+            .expect("a server"),
+        )
+        .image(&built)
+        .build()
+        .await
+        .expect("a session on what the build made");
+
+    assert_eq!(
+        out(&mut session, "cat /deep/er/marker.txt").await,
+        salt("parents-and-path"),
+        "the copy did not make its destination's parent"
+    );
+    assert_eq!(
+        out(&mut session, "cat /ran-from-abin").await,
+        "ran-mytool",
+        "a step could not run an executable the build declared"
+    );
+}

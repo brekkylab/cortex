@@ -83,6 +83,11 @@ pub(crate) fn digest(recipe: Recipe<'_>) -> anyhow::Result<BuildId> {
                 feed(&mut hasher, command.as_bytes());
             }
             Step::Copy { src, dst } => {
+                // Checked here as well as where the step goes on the wire, because this is
+                // the earlier of the two and the answers have to agree: a source outside the
+                // context exists on this side and not in the session, so hashing it would
+                // give an id to a build that can never succeed.
+                super::inside_context(src)?;
                 feed(&mut hasher, b"copy");
                 feed(&mut hasher, path_bytes(src));
                 feed(&mut hasher, dst.as_bytes());
@@ -126,6 +131,16 @@ fn path_bytes(path: &Path) -> &[u8] {
 /// The mode goes in because `cp -a` carries it: a file that gained its executable bit is a
 /// different image, and a digest that missed that would serve the old one.
 fn tree(hasher: &mut Sha256, root: &Path, relative: &Path) -> anyhow::Result<()> {
+    // A build context is a directory somebody points at, and this walk is a recursion over
+    // it. Past the bound it is a sentence rather than a stack overflow, which is not an
+    // error anyone can report — the process is simply gone, inside the call a caller was
+    // told is the cheap one.
+    anyhow::ensure!(
+        relative.components().count() <= MAX_DEPTH,
+        "{} is more than {MAX_DEPTH} directories into this build's context",
+        relative.display()
+    );
+
     let full = root.join(relative);
     let metadata = full
         .symlink_metadata()
@@ -156,15 +171,30 @@ fn tree(hasher: &mut Sha256, root: &Path, relative: &Path) -> anyhow::Result<()>
         feed(hasher, b"link");
         feed(hasher, path_bytes(&std::fs::read_link(&full)?));
     } else {
+        // Streamed, not read. A build context holds whatever the caller builds from — a
+        // release binary, a model, a tarball — and a digest is no reason for any of it to be
+        // resident at once.
         feed(hasher, b"file");
-        feed(
-            hasher,
-            &std::fs::read(&full)
-                .with_context(|| format!("reading {} for this build's id", full.display()))?,
+        let mut file = std::fs::File::open(&full)
+            .with_context(|| format!("reading {} for this build's id", full.display()))?;
+        let length = metadata.len();
+        hasher.update(length.to_le_bytes());
+        let copied = std::io::copy(&mut file, hasher)
+            .with_context(|| format!("reading {} for this build's id", full.display()))?;
+        // The length went into the hash before the bytes, so a file that changed size while
+        // it was being read would otherwise be hashed as though it were the size it started.
+        anyhow::ensure!(
+            copied == length,
+            "{} changed while this build's id was being computed",
+            full.display()
         );
     }
     Ok(())
 }
+
+/// How far into a build context the walk will go. Far past any real tree, and far short of
+/// what the stack can take.
+const MAX_DEPTH: usize = 256;
 
 #[cfg(test)]
 mod tests {
@@ -311,5 +341,21 @@ mod tests {
             refused.to_string().contains("absent"),
             "the error does not name the missing path: {refused}"
         );
+    }
+
+    /// A source that climbs out of the context is refused here rather than hashed. Only the
+    /// context is mounted into the session, so such a file exists on this side and not on
+    /// that one — hashing it would give an id to a build that can never succeed.
+    #[test]
+    fn a_copy_source_outside_the_context_is_refused() {
+        let context = tempfile::tempdir().unwrap();
+        let steps = [Step::Copy {
+            src: "../secrets.env".into(),
+            dst: "/secrets.env".into(),
+        }];
+        let refused = digest(recipe("alpine", &steps, context.path()))
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("climbs out of it"), "{refused}");
     }
 }
