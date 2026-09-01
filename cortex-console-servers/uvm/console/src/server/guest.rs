@@ -110,17 +110,12 @@ pub struct Guest {
     ///
     /// Kept because a `commit` stitches onto them, and because asking again would mean
     /// resolving the base a second time — which for a pulled image is a registry round trip.
-    // Read by `commit`, which is not written yet. Held here rather than fetched later because
-    // this is the moment the base was resolved.
-    #[allow(dead_code)]
     pub base_layers: Vec<Layer>,
 
     /// Where this guest writes a commit's layer, for a session that may make one.
     ///
     /// Held so that it outlives the guest that writes into it and no longer: the directory
     /// goes when the session does.
-    // Read by `commit`, which is not written yet.
-    #[allow(dead_code)]
     pub commit: Option<CommitScratch>,
 }
 

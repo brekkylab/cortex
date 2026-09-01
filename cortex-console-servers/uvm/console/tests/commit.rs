@@ -99,3 +99,153 @@ async fn an_ordinary_session_has_neither() {
         "ran"
     );
 }
+
+/// An id the client chose, which is what the protocol says it is.
+const ID: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+/// The whole of it: a session writes, commits, and a second session boots what the first left.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "boots two micro-VMs"]
+async fn what_a_session_wrote_is_what_the_next_one_boots() {
+    let mut first = session(None, true).await;
+
+    assert_eq!(
+        say(&out(&mut first, "echo kept > /marker; cat /marker").await),
+        "kept"
+    );
+    assert_eq!(say(&out(&mut first, "rm -f /etc/motd; echo $?").await), "0");
+    assert_eq!(
+        say(&out(&mut first, "rm -rf /media && mkdir /media; echo $?").await),
+        "0"
+    );
+
+    let image = first
+        .commit(ID, vec!["BUILT_BY=cortex".into()], Some("/".into()))
+        .await
+        .expect("committing");
+    assert_eq!(image.reference, format!("cortex.local/built@{ID}"));
+    drop(first);
+
+    let mut second = session(Some(image), false).await;
+
+    // What the first session wrote, added and replaced.
+    assert_eq!(say(&out(&mut second, "cat /marker").await), "kept");
+    // What it deleted — the whiteout that travelled as a `0:0` character device.
+    assert_eq!(
+        say(&out(&mut second, "test -e /etc/motd; echo $?").await),
+        "1",
+        "the deletion did not survive the round trip"
+    );
+    // What it emptied — the one thing that had to be rewritten as a marker.
+    assert_eq!(
+        say(&out(&mut second, "ls -A /media | wc -l").await),
+        "0",
+        "the emptied directory came back full: the opaque marker was lost"
+    );
+
+    // The base is intact behind it and still runs.
+    assert!(
+        say(&out(&mut second, "cat /etc/alpine-release").await).starts_with("3."),
+        "the base layer is gone"
+    );
+    assert_eq!(
+        say(&out(&mut second, "busybox true && echo ran").await),
+        "ran"
+    );
+
+    // And what the commit stated reaches a command.
+    assert_eq!(
+        say(&out(&mut second, r#"printf '%s' "$BUILT_BY""#).await),
+        "cortex"
+    );
+}
+
+/// A session that did not say it might commit cannot.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "boots a micro-VM"]
+async fn a_session_that_did_not_say_so_cannot_commit() {
+    let mut console = session(None, false).await;
+    assert_eq!(say(&out(&mut console, "echo x > /marker").await), "");
+    assert!(
+        console.commit(ID, Vec::new(), None).await.is_err(),
+        "a session that never said it might commit did"
+    );
+}
+
+/// An image nobody made is said at `init`, before anything boots.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "starts a server"]
+async fn an_image_that_was_never_built_is_refused_at_init() {
+    let absent = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+    server.stderr(Stdio::inherit());
+    let client = cortex::console::stdio::StdioClient::new(server).unwrap();
+    let refused = Console::builder()
+        .client(client)
+        .image(ImageSource::new(format!("cortex.local/built@{absent}")))
+        .build()
+        .await;
+    assert!(
+        refused.is_err(),
+        "a session started on an image nobody made"
+    );
+}
+
+/// The machinery a session carries must not be in the image it commits.
+///
+/// **This cannot be asserted from inside a guest.** Every boot writes `/.cortex-guest` again
+/// and a committable one recreates `/oldroot`, so a guest looking for them finds them whatever
+/// the image holds. It is asserted against the layer instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "boots a micro-VM"]
+async fn a_commit_keeps_only_what_the_session_wrote() {
+    use cortex_uvm_console::built::BuiltStore;
+    use cortex_uvm_console::layer::{LayerId, LayerStore, tree};
+
+    let id = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    let mut first = session(None, true).await;
+    assert_eq!(
+        say(&out(&mut first, "echo x > /only-this; echo $?").await),
+        "0"
+    );
+    first
+        .commit(id, Vec::new(), None)
+        .await
+        .expect("committing");
+    drop(first);
+
+    let home = std::env::var_os("CORTEX_UVM_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".cortex/uvm")
+        });
+    let built = BuiltStore::open(&home.join("built")).unwrap();
+    let layers = LayerStore::open(&home.join("layers")).unwrap();
+    let id = LayerId::parse(id).unwrap();
+
+    let listed = built.layers(&id, &layers).expect("the image's layers");
+    assert!(listed.len() >= 2, "a commit should have added a layer");
+
+    let committed = listed
+        .last()
+        .unwrap()
+        .tree(tree::Contents::Skip)
+        .expect("the layer this session wrote");
+
+    assert!(
+        committed.get(b"only-this").is_some(),
+        "the session\'s own file is not in the layer it committed"
+    );
+    for machinery in [
+        &b".cortex-guest"[..],
+        b"oldroot",
+        b"abin",
+        b".cortex-commit",
+    ] {
+        assert!(
+            committed.get(machinery).is_none(),
+            "{:?} was committed",
+            String::from_utf8_lossy(machinery)
+        );
+    }
+}
