@@ -14,6 +14,7 @@
 //! paragraph each is not a file each, and what they have to say is mostly about one
 //! another.
 
+mod commit;
 mod exec;
 mod init;
 mod notifications;
@@ -23,6 +24,7 @@ mod write;
 use std::fmt;
 
 use bson::Bson;
+pub use commit::*;
 pub use exec::*;
 pub use init::*;
 pub use notifications::*;
@@ -42,6 +44,7 @@ pub enum Method {
     Exec,
     Read,
     Write,
+    Commit,
     Start,
     Stop,
     Quit,
@@ -55,6 +58,7 @@ impl Method {
             Method::Exec => "exec",
             Method::Read => "read",
             Method::Write => "write",
+            Method::Commit => "commit",
             Method::Start => "start",
             Method::Stop => "stop",
             Method::Quit => "quit",
@@ -67,6 +71,7 @@ impl Method {
             "exec" => Method::Exec,
             "read" => Method::Read,
             "write" => Method::Write,
+            "commit" => Method::Commit,
             "start" => Method::Start,
             "stop" => Method::Stop,
             "quit" => Method::Quit,
@@ -117,6 +122,14 @@ pub enum Call {
 
     /// Put these bytes in a file.
     Write(Write),
+
+    /// Keep what this session has written, as a base a later session can name.
+    ///
+    /// The one method that produces something outliving the session. Everything else here is
+    /// about work inside one — running a command, reading a file — and is gone with it; this
+    /// leaves an image behind, which is why it is the only one whose result names a thing
+    /// rather than describing what just happened.
+    Commit(Commit),
 }
 
 impl Call {
@@ -126,6 +139,7 @@ impl Call {
             Call::Exec(_) => Method::Exec,
             Call::Read(_) => Method::Read,
             Call::Write(_) => Method::Write,
+            Call::Commit(_) => Method::Commit,
         }
     }
 
@@ -142,6 +156,7 @@ impl Call {
             Call::Exec(exec) => map.serialize_entry("params", exec),
             Call::Read(read) => map.serialize_entry("params", read),
             Call::Write(write) => map.serialize_entry("params", write),
+            Call::Commit(commit) => map.serialize_entry("params", commit),
         }
     }
 
@@ -156,6 +171,7 @@ impl Call {
             Method::Exec => Call::Exec(typed_params(method, params)?),
             Method::Read => Call::Read(typed_params(method, params)?),
             Method::Write => Call::Write(typed_params(method, params)?),
+            Method::Commit => Call::Commit(typed_params(method, params)?),
             Method::Start | Method::Stop | Method::Quit => {
                 return Err(E::custom(format!(
                     "{method} is a notification and cannot carry an id"

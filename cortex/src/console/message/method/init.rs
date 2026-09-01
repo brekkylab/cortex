@@ -59,6 +59,18 @@ pub struct Init {
     /// choice", and a server that runs commands on the host has no choice to make.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkAccess>,
+
+    /// Whether this session may [`commit`](super::Commit) what it writes.
+    ///
+    /// **Said here and not on `commit` because a backend may have to arrange for it while
+    /// booting.** A micro-VM one keeps the root that holds its overlay's upper, which is
+    /// decided before the first command runs and cannot be decided again after — by the time
+    /// a `commit` arrived, the thing it needs would have been gone for the whole session.
+    ///
+    /// False by default, so a session that will never commit pays nothing for a facility it
+    /// does not use, and a `commit` on one is refused rather than answered wrongly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub committable: bool,
 }
 
 /// The base a session's commands run in, named as an OCI image.
@@ -437,6 +449,7 @@ mod tests {
             workfs: Some(WorkFsSource::new("file:///srv/project")),
             image: None,
             network: None,
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -494,6 +507,7 @@ mod tests {
             workfs: None,
             image: Some(ImageSource::new("python:3.13-slim")),
             network: None,
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -537,6 +551,7 @@ mod tests {
             workfs: None,
             image: None,
             network: None,
+            committable: false,
         };
         assert_eq!(
             bson::serialize_to_document(&quiet).unwrap(),
@@ -557,6 +572,7 @@ mod tests {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::public()),
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(doc, doc! {"delegated": [], "network": {"reach": "public"}});
@@ -583,6 +599,7 @@ mod tests {
             workfs: None,
             image: None,
             network: None,
+            committable: false,
         };
         assert_eq!(
             bson::serialize_to_document(&quiet).unwrap(),
@@ -607,6 +624,7 @@ mod tests {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::host().with_host_ports([8080, 3000])),
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -663,6 +681,35 @@ mod tests {
         assert_eq!(
             WorkFsSource::new("file://srv/project").file_path(),
             Some(Path::new("srv/project"))
+        );
+    }
+
+    /// False says nothing, so a session that will never commit costs nothing to describe —
+    /// and a server that predates the member reads one correctly.
+    #[test]
+    fn a_session_that_will_not_commit_says_nothing() {
+        let init = Init::default();
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(doc.get("committable"), None);
+        assert!(
+            !bson::deserialize_from_document::<Init>(doc)
+                .unwrap()
+                .committable
+        );
+    }
+
+    #[test]
+    fn a_session_that_might_commit_says_so() {
+        let init = Init {
+            committable: true,
+            ..Init::default()
+        };
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(doc.get("committable"), Some(&bson::Bson::Boolean(true)));
+        assert!(
+            bson::deserialize_from_document::<Init>(doc)
+                .unwrap()
+                .committable
         );
     }
 }

@@ -69,8 +69,9 @@ use crate::{
     console::{
         base::{Client, Failure},
         message::{
-            Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, NetworkAccess, Notification,
-            Outcome, Progress, Read, ReadResult, RequestId, WorkFsSource, Write, WriteResult,
+            Call, Commit, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, NetworkAccess,
+            Notification, Outcome, Progress, Read, ReadResult, RequestId, WorkFsSource, Write,
+            WriteResult,
         },
         stdio::StdioClient,
     },
@@ -117,6 +118,10 @@ pub struct ConsoleBuilder {
     /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
     network: Option<NetworkAccess>,
+
+    /// Whether this session may keep what it writes. False is what every caller wanted
+    /// before this existed.
+    committable: bool,
 }
 
 impl ConsoleBuilder {
@@ -261,6 +266,17 @@ impl ConsoleBuilder {
         self
     }
 
+    /// Let this session [`commit`](Console::commit) what it writes.
+    ///
+    /// Asked for rather than always on, because it costs something on a backend that has to
+    /// arrange for it: a micro-VM one keeps a root it would otherwise let go of, and is given
+    /// a scratch directory to write the result into. A session that will never commit should
+    /// not carry either.
+    pub fn committable(mut self) -> Self {
+        self.committable = true;
+        self
+    }
+
     /// Fails for the one part that has no default — something to ask — for whatever having
     /// a channel took (over stdio, a server process that would not start), and for the
     /// `init` this then sends.
@@ -390,6 +406,7 @@ impl Console {
             mount,
             image,
             network,
+            committable,
         } = builder;
 
         let client_factory =
@@ -416,6 +433,7 @@ impl Console {
                 workfs,
                 image,
                 network,
+                committable,
             })
             .await?;
 
@@ -654,6 +672,32 @@ impl Console {
             offset,
         };
         self.client.write(write).await
+    }
+
+    /// Keep what this session has written, under `id`, and hear what image it made.
+    ///
+    /// `env` and `working_dir` are what the image should say about running a process in it.
+    /// They are stated rather than observed: a session's own environment holds things that
+    /// belong to the session, and only the caller knows which of them it meant to keep.
+    ///
+    /// Refused unless the console was built [`committable`](ConsoleBuilder::committable), and
+    /// refused outright by a backend with nothing to keep — one whose commands run on the
+    /// server's own filesystem has no base to have written over.
+    ///
+    /// What comes back is namable: hand it to [`ConsoleBuilder::image`] and the next session
+    /// starts where this one left off.
+    pub async fn commit(
+        &mut self,
+        id: impl Into<String>,
+        env: Vec<String>,
+        working_dir: Option<String>,
+    ) -> Result<ImageSource, Failure> {
+        let commit = Commit {
+            id: id.into(),
+            env,
+            working_dir,
+        };
+        Ok(self.client.commit(commit).await?.image)
     }
 }
 

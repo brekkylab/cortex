@@ -51,8 +51,8 @@ use std::io;
 use futures_core::future::BoxFuture;
 
 use crate::console::{
-    Call, Error, Exec, Init, InitResult, Message, Notification, Outcome, Progress, Read,
-    ReadResult, RequestId, Write, WriteResult,
+    Call, Commit, CommitResult, Error, Exec, Init, InitResult, Message, Notification, Outcome,
+    Progress, Read, ReadResult, RequestId, Write, WriteResult,
 };
 
 /// Why a call produced no result.
@@ -189,6 +189,15 @@ pub trait Client: Send {
     /// afterwards.
     fn write(&mut self, write: Write) -> BoxFuture<'_, Result<WriteResult, Failure>> {
         Box::pin(async move { answered(self.call(Call::Write(write)).await).1 })
+    }
+
+    /// Keep what this session has written, as a base a later session can name.
+    ///
+    /// The one call whose answer outlives the session: everything else here is about work
+    /// inside one. A server with nothing to keep — one whose commands run on its own
+    /// filesystem — refuses it, and so does a session that did not say it might.
+    fn commit(&mut self, commit: Commit) -> BoxFuture<'_, Result<CommitResult, Failure>> {
+        Box::pin(async move { answered(self.call(Call::Commit(commit)).await).1 })
     }
 
     /// Boot now, to hide the cold start.
