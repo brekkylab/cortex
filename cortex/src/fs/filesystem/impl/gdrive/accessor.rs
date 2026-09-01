@@ -115,7 +115,7 @@ const FILE_FIELDS: &[&str] = &[
     // Shared-drive scoping: children of a shared drive must be listed with it.
     "driveId",
     // Drive's own size: populated for binary files *and* Docs-editors files,
-    // absent for folders and shortcuts. (enterprise-mock omits it on native
+    // absent for folders and shortcuts. (backlot omits it on native
     // docs — a divergence from Google, so don't rely on either shape.)
     //
     // Never the entry's own length. For a blob it is exact, but a document is served as
@@ -444,9 +444,10 @@ impl GdriveAccessor {
                 ("pageSize", "1000".to_string()),
                 // Ask Drive to order, rather than leaving it unspecified: two
                 // `ls` of one folder should not disagree, and newest-first is
-                // what a person scanning a Drive folder expects. (The mock
+                // what a person scanning a Drive folder expects. (backlot
                 // ignored `orderBy` until enterprise-mock#28 fixed it, which is
-                // why this was done locally before.)
+                // why this was done locally before — and why a mock of our own
+                // cannot be the only thing this is checked against.)
                 ("orderBy", "modifiedTime desc".to_string()),
             ];
             if let Some(d) = drive_id {
