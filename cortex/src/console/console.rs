@@ -69,8 +69,9 @@ use crate::{
     console::{
         base::{Client, Failure},
         message::{
-            Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, NetworkAccess, Notification,
-            Outcome, Progress, Read, ReadResult, RequestId, WorkFsSource, Write, WriteResult,
+            AbinSource, Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, NetworkAccess,
+            Notification, Outcome, Progress, Read, ReadResult, RequestId, WorkFsSource, Write,
+            WriteResult,
         },
         stdio::StdioClient,
     },
@@ -117,6 +118,10 @@ pub struct ConsoleBuilder {
     /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
     network: Option<NetworkAccess>,
+
+    /// Directories of native executables this session adds, in the order they were named.
+    /// Empty is what every caller wanted before this existed.
+    abin: Vec<AbinSource>,
 }
 
 impl ConsoleBuilder {
@@ -261,6 +266,21 @@ impl ConsoleBuilder {
         self
     }
 
+    /// A directory of native executables this session may run, beyond whatever the server
+    /// already provides.
+    ///
+    /// Callable more than once, and the order of the calls is the order they are layered in.
+    /// A name two of them both carry — or one that shadows something the server provides —
+    /// is refused rather than resolved, so a caller adding a `git` of its own hears about it
+    /// instead of finding out which one ran.
+    ///
+    /// What goes in one is the caller's to build: these run wherever the server runs
+    /// commands, which on a micro-VM backend is inside the guest and not on this host.
+    pub fn abin(mut self, dir: impl AsRef<Path>) -> Self {
+        self.abin.push(AbinSource::from(dir.as_ref()));
+        self
+    }
+
     /// Fails for the one part that has no default — something to ask — for whatever having
     /// a channel took (over stdio, a server process that would not start), and for the
     /// `init` this then sends.
@@ -390,6 +410,7 @@ impl Console {
             mount,
             image,
             network,
+            abin,
         } = builder;
 
         let client_factory =
@@ -416,6 +437,7 @@ impl Console {
                 workfs,
                 image,
                 network,
+                abin,
             })
             .await?;
 
