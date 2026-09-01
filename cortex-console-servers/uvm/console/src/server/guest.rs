@@ -58,7 +58,7 @@ use tokio::{
 
 use crate::{
     abin,
-    assets::{self, BootRoot, SessionImage},
+    assets::{self, BootRoot, CommitScratch, SessionImage},
     contract::{BootArgs, HANDSHAKE, Network},
     helper::boot_helper,
 };
@@ -114,6 +114,14 @@ pub struct Guest {
     // this is the moment the base was resolved.
     #[allow(dead_code)]
     pub base_layers: Vec<Layer>,
+
+    /// Where this guest writes a commit's layer, for a session that may make one.
+    ///
+    /// Held so that it outlives the guest that writes into it and no longer: the directory
+    /// goes when the session does.
+    // Read by `commit`, which is not written yet.
+    #[allow(dead_code)]
+    pub commit: Option<CommitScratch>,
 }
 
 impl Guest {
@@ -130,6 +138,7 @@ impl Guest {
         image: Option<&str>,
         network: Network,
         host_ports: &[u16],
+        committable: bool,
     ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         // The layers come back with the disk because the session keeps them: a `commit`
@@ -169,6 +178,10 @@ impl Guest {
             .map_err(|e| anyhow::anyhow!("formatting the session image: {e}"))??;
         let boot_root = BootRoot::create(&base.spec)?;
 
+        // Made only for a session that said it might commit: it is a directory the guest can
+        // write into, and a session that will never write a layer should not be handed one.
+        let commit = committable.then(CommitScratch::create).transpose()?;
+
         let socket = Socket::bind()?;
 
         let args = BootArgs {
@@ -183,6 +196,8 @@ impl Guest {
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),
+            committable,
+            commit_out: commit.as_ref().map(|scratch| scratch.path().to_path_buf()),
             abin,
             vcpus: number(VCPUS_ENV),
             memory_mib: number(MEMORY_ENV),
@@ -228,6 +243,7 @@ impl Guest {
             _session: session,
             _boot_root: boot_root,
             base_layers,
+            commit,
         })
     }
 

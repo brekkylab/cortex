@@ -315,6 +315,35 @@ impl Drop for BootRoot {
     }
 }
 
+/// Where a committable session's guest writes the layer a `commit` produces.
+///
+/// One session's, and owned outright: dropping this removes the directory and whatever the
+/// guest left in it. A layer can be hundreds of megabytes, so leaving one behind would be a
+/// real cost — and the sweep that catches a killed server's leavings finds this too, because
+/// it is named the same way everything else here is.
+pub struct CommitScratch {
+    path: PathBuf,
+}
+
+impl CommitScratch {
+    pub fn create() -> anyhow::Result<CommitScratch> {
+        let path = unique(std::env::temp_dir(), "commit");
+        std::fs::create_dir_all(&path)
+            .map_err(|e| anyhow::anyhow!("making {}: {e}", path.display()))?;
+        Ok(CommitScratch { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CommitScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Marks a path as a console server's and carries the owning pid, so a later run can tell
 /// what was abandoned from what is in use. See [`sweep_abandoned`].
 pub const PREFIX: &str = "cortex-uvm-";

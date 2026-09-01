@@ -55,6 +55,27 @@ pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
 /// Where it is mounted, and what goes first on `PATH`.
 pub const ABIN_PATH: &str = "/abin";
 
+/// The virtio-fs tag a committable session's scratch directory is shared under.
+pub const COMMIT_TAG: &str = "cortexcommit";
+
+/// Where that scratch is mounted, and where a commit writes its layer.
+pub const COMMIT_PATH: &str = "/.cortex-commit";
+
+/// Set when there is one to mount. Its value is [`COMMIT_PATH`].
+pub const COMMIT_ENV: &str = "CORTEX_UVM_COMMIT";
+
+/// Set when this session may commit at all.
+///
+/// Read before `pivot_root`, which is why it is separate from [`COMMIT_ENV`]: it decides
+/// whether the old root is kept, and that cannot be decided again afterwards.
+pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
+
+/// The upperdir of the overlay this guest stands on, for a boot that kept its old root.
+///
+/// The only way a commit sees what a session wrote: the host cannot read that ext4, and the
+/// overlay offers its upper under no other name.
+pub const UPPER_DIR: &str = "/oldroot/mnt/upper/upper";
+
 /// `PATH` for everything an execution spawns when the base image did not say — see
 /// [`ImageSpec::env`].
 ///

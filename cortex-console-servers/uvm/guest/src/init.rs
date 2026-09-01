@@ -54,8 +54,8 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use crate::contract::{
-    ABIN_ENV, ABIN_PATH, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME,
-    SHARE_ENV, UPPER_ENV,
+    ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, GUEST_BIN_PATH,
+    IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
@@ -99,6 +99,13 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
     if let Ok(device) = std::env::var(ABIN_ENV) {
         mount(&device, ABIN_PATH, "erofs", libc::MS_RDONLY)
             .map_err(|e| anyhow::anyhow!("mounting {device} at {ABIN_PATH}: {e}"))?;
+    }
+
+    // Somewhere for a commit to write its layer. Writable, unlike `/abin`: it is this
+    // session's own scratch, made by the server and thrown away with the session.
+    if let Ok(at) = std::env::var(COMMIT_ENV) {
+        mount(COMMIT_TAG, &at, "virtiofs", 0)
+            .map_err(|e| anyhow::anyhow!("mounting the commit scratch at {at}: {e}"))?;
     }
 
     // After the pivot, because `/etc/resolv.conf` has to land on the root the commands will
@@ -257,6 +264,17 @@ fn pivot(new_root: &str) -> anyhow::Result<()> {
     }
     if unsafe { libc::chdir(cstr("/").as_ptr()) } != 0 {
         anyhow::bail!("returning to /: {}", io::Error::last_os_error());
+    }
+
+    // A committable session keeps it. `/oldroot/mnt/upper/upper` is then the upperdir of the
+    // overlay this process is standing on, and that is the only way a commit can see what the
+    // session wrote — the host cannot read the ext4 itself, and the overlay offers its upper
+    // under no other name.
+    //
+    // Kept only when it was asked for. Leaving a detached root reachable in every session
+    // would be a surface added for the sessions that will never look at it.
+    if std::env::var_os(COMMITTABLE_ENV).is_some() {
+        return Ok(());
     }
 
     // Lazily, because the overlay holds its lower, upper and work directories through

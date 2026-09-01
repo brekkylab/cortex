@@ -297,6 +297,7 @@ impl Session {
                 image.as_deref(),
                 self.network,
                 &self.host_ports,
+                self.config.committable,
             )
             .await
             .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
