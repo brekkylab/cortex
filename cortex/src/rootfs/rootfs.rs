@@ -210,8 +210,6 @@ impl Rootfs {
     }
 
     /// Where the warnings live, for the adapter to fill in.
-    // Read by the Dockerfile adapter, which is the next thing written.
-    #[allow(dead_code)]
     pub(crate) fn warned(mut self, warnings: Vec<Warning>) -> Self {
         self.warnings = warnings;
         self

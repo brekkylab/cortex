@@ -6,6 +6,7 @@
 //! console server's, and this module drives a [`Console`](crate::console::Console) and
 //! nothing else.
 
+mod dockerfile;
 mod id;
 mod rootfs;
 mod step;
