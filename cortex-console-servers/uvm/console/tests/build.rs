@@ -86,10 +86,11 @@ async fn what_a_build_makes_is_what_the_next_session_boots() {
 
     // Every step that reached the server, and none that did not: four `RUN`s, one `COPY`
     // and one `WORKDIR`. The `ENV` sends nothing.
-    let steps = seen.lock().unwrap();
+    // Taken rather than borrowed: the guard would otherwise be alive across every `await`
+    // below, and nothing writes to it after the build has returned anyway.
+    let steps = std::mem::take(&mut *seen.lock().unwrap());
     assert_eq!(steps.len(), 6, "on_step saw {steps:?}");
     assert!(steps.iter().all(|(_, code)| *code == 0), "{steps:?}");
-    drop(steps);
 
     let mut second = Console::builder()
         .client(
