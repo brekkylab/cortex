@@ -20,6 +20,16 @@
 //!
 //! The layers stay where they are. A stitch is a way of reading them, not a copy of them,
 //! which is what makes two images built on one base cost one copy of it.
+//!
+//! # The one thing that has to be checked
+//!
+//! Two accounts of where a layer's bytes are have to agree. `write_fsmeta` places layer *n*
+//! at `fsmeta_blocks + Σ total_blocks[0..n]`, taking each count from the layer's map; the
+//! descriptor places it after however many blocks the files before it actually hold. A layer
+//! whose file has stopped matching its map desynchronizes the two, and the failure is silent
+//! — the guest mounts, reads at the wrong offset, and gets another layer's bytes with no
+//! error anywhere. So [`checked`] compares the map against the file before any of it is
+//! written. It is one `stat` per layer against a disk nothing can otherwise catch.
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +48,7 @@ pub fn stitch(layers: &[Layer], into: &Path) -> anyhow::Result<PathBuf> {
 
     let mut trees = Vec::with_capacity(layers.len());
     for layer in layers {
+        checked(layer)?;
         trees.push(
             layer
                 .tree(Contents::Skip)
@@ -72,6 +83,31 @@ pub fn stitch(layers: &[Layer], into: &Path) -> anyhow::Result<PathBuf> {
     let descriptor = with_suffix(into, "vmdk");
     vmdk::write_descriptor(&descriptor, &extents)?;
     Ok(descriptor)
+}
+
+/// An EROFS block. Stated here because `microsandbox-image` keeps its own copy `pub(crate)`,
+/// and it is a constant of the format rather than of that crate.
+const BLOCK: u64 = 4096;
+
+/// Refuse a layer whose image is no longer the size its map says it is.
+///
+/// A stale pair is not something a working store produces — a layer is named by a digest and
+/// both halves are written together — but a killed write, a half-restored backup or a hand
+/// edit all make one, and every one of them ends as a guest reading the wrong bytes rather
+/// than as an error. Cheap to rule out, and impossible to notice later.
+fn checked(layer: &Layer) -> anyhow::Result<()> {
+    let size = std::fs::metadata(&layer.erofs)
+        .map_err(|e| anyhow::anyhow!("stat {}: {e}", layer.erofs.display()))?
+        .len();
+    let expected = layer.map.total_blocks as u64 * BLOCK;
+    anyhow::ensure!(
+        size == expected,
+        "layer {} is {size} bytes but its map accounts for {expected} \
+         ({} blocks of {BLOCK}) — the two no longer describe the same layer",
+        layer.id,
+        layer.map.total_blocks,
+    );
+    Ok(())
 }
 
 /// `into` with `suffix` after a dot: `built/abc` and `vmdk` give `built/abc.vmdk`.
@@ -255,5 +291,34 @@ mod tests {
     fn stitching_nothing_is_refused() {
         let dir_ = tempfile::tempdir().unwrap();
         assert!(stitch(&[], &dir_.path().join("none")).is_err());
+    }
+
+    /// The silent one: a layer and its map that no longer agree would stitch into a disk the
+    /// guest reads at the wrong offset, and nothing downstream can tell.
+    #[test]
+    fn a_layer_that_does_not_match_its_map_is_refused() {
+        use std::io::Write as _;
+
+        let dir_ = tempfile::tempdir().unwrap();
+        let store = LayerStore::open(&dir_.path().join("layers")).unwrap();
+        let lower = store.put(&LayerId::of(b"base"), &base()).unwrap();
+        let over = store.put(&LayerId::of(b"upper"), &upper()).unwrap();
+
+        // One block more than the map accounts for. Everything stacked behind this layer in
+        // the descriptor now sits a block further along than the device table says.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&lower.erofs)
+            .unwrap();
+        file.write_all(&[0u8; BLOCK as usize]).unwrap();
+        drop(file);
+
+        let into = dir_.path().join("built/image");
+        let err = stitch(&[lower, over], &into).unwrap_err().to_string();
+        assert!(err.contains("no longer describe the same layer"), "{err}");
+        assert!(
+            !with_suffix(&into, "vmdk").exists(),
+            "a disk was written anyway"
+        );
     }
 }

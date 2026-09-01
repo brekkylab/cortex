@@ -209,10 +209,23 @@ fn built(rest: &str) -> anyhow::Result<BaseImage> {
         .ok_or_else(|| anyhow::anyhow!("{LOCAL_HOST}{rest} names no digest"))?;
     let id = LayerId::parse(digest)?;
 
-    let path = built_dir()?.join(format!("{}.vmdk", id.file_stem()));
+    let built = built_dir()?;
+    let path = built.join(format!("{}.vmdk", id.file_stem()));
     anyhow::ensure!(
         path.exists(),
         "no image {id} was built here — it was never built, or the cache has been cleared"
+    );
+    // The descriptor is a list of files and not a disk, and the first of them is the merged
+    // metadata without which the rest is unreadable. Checked here, because a descriptor
+    // whose extents are gone fails inside the VMM with nothing to say about which one — and
+    // saying which is the whole job of this function.
+    let fsmeta = built.join(format!("{}.fsmeta.erofs", id.file_stem()));
+    anyhow::ensure!(
+        fsmeta.exists(),
+        "image {id} has a descriptor at {} but its metadata at {} is gone — \
+         the cache was cleared part-way, and the image has to be built again",
+        path.display(),
+        fsmeta.display()
     );
 
     Ok(BaseImage {

@@ -13,6 +13,37 @@ use microsandbox_image::tree::FileTree;
 use super::tree::{self, Contents};
 use super::{LayerId, atomic, map};
 
+/// A temporary that removes itself unless it reached its destination.
+///
+/// A `?` anywhere between the write and the rename is an early return, and an early return
+/// that had to remember to clean up is one that eventually will not. This runs on every path
+/// out; the one path that succeeds calls [`Partial::placed`] first, because by then the file
+/// is under its real name and removing it would remove the layer.
+struct Partial(Option<PathBuf>);
+
+impl Partial {
+    fn new(path: PathBuf) -> Partial {
+        Partial(Some(path))
+    }
+
+    fn path(&self) -> &Path {
+        self.0.as_deref().expect("a temporary that is still one")
+    }
+
+    /// It is under its real name now. Nothing left to take back.
+    fn placed(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 /// Where layers live.
 pub struct LayerStore {
     root: PathBuf,
@@ -47,9 +78,14 @@ impl std::fmt::Debug for Layer {
 
 impl LayerStore {
     /// Open the store under `root`, making it if it is not there.
+    ///
+    /// Sweeps what consoles that were killed left behind, on the way in. Here rather than on
+    /// the way out for the reason `assets::sweep_abandoned` gives: a process that was killed
+    /// is not one that gets to clean up, and the next one is the first thing that can.
     pub fn open(root: &Path) -> anyhow::Result<LayerStore> {
         std::fs::create_dir_all(root)
             .map_err(|e| anyhow::anyhow!("making the layer store at {}: {e}", root.display()))?;
+        atomic::sweep(root);
         Ok(LayerStore {
             root: root.to_path_buf(),
         })
@@ -70,19 +106,19 @@ impl LayerStore {
             return self.get(id);
         }
 
-        let temporary = atomic::unique(&self.root, id.file_stem());
-        let map = write_erofs(tree, &temporary).map_err(|e| {
-            let _ = std::fs::remove_file(&temporary);
-            anyhow::anyhow!("writing layer {id}: {e:?}")
-        })?;
+        // Every failure below has to take the temporary with it. It is a whole layer — a
+        // rootfs is tens of megabytes and an image layer can be hundreds — and only a later
+        // `open` would ever come back for it, once this process is gone.
+        let mut temporary = Partial::new(atomic::unique(&self.root, id.file_stem()));
+        let map = write_erofs(tree, temporary.path())
+            .map_err(|e| anyhow::anyhow!("writing layer {id}: {e:?}"))?;
 
         // The map first, and the image last. An image with no map beside it is not a layer,
         // so the other order would leave a window in which `has` says yes and `get` fails.
         map::write(&map, &self.map_path(id))?;
-        std::fs::rename(&temporary, self.image_path(id)).map_err(|e| {
-            let _ = std::fs::remove_file(&temporary);
-            anyhow::anyhow!("placing layer {id}: {e}")
-        })?;
+        std::fs::rename(temporary.path(), self.image_path(id))
+            .map_err(|e| anyhow::anyhow!("placing layer {id}: {e}"))?;
+        temporary.placed();
 
         Ok(Layer {
             id: id.clone(),
@@ -220,6 +256,28 @@ mod tests {
         assert!(
             names.iter().all(|name| !name.contains("partial")),
             "{names:?}"
+        );
+    }
+
+    /// Nor when the put fails part-way, which is the case that leaves a whole layer behind.
+    #[test]
+    fn nothing_partial_is_left_behind_by_a_put_that_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LayerStore::open(dir.path()).unwrap();
+        let id = LayerId::of(b"sample");
+        // A directory where the map has to go: the rename that places it cannot succeed, so
+        // the put fails after the image has been written in full.
+        std::fs::create_dir(dir.path().join(format!("{}.map", id.file_stem()))).unwrap();
+
+        assert!(store.put(&id, &sample()).is_err());
+
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.contains("partial")),
+            "a whole layer was left behind: {names:?}"
         );
     }
 

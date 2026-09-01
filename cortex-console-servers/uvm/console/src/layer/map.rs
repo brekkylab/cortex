@@ -18,6 +18,7 @@
 //! layer that could not be stored.
 
 use std::collections::HashMap;
+use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 
 use microsandbox_image::erofs::ErofsDataMap;
@@ -45,7 +46,7 @@ pub fn write(map: &ErofsDataMap, path: &Path) -> anyhow::Result<()> {
         .file_blocks
         .iter()
         .map(|(path, (start_block, size))| StoredFile {
-            path: path.as_os_str().as_encoded_bytes().to_vec(),
+            path: path.as_os_str().as_bytes().to_vec(),
             start_block: *start_block,
             size: *size,
         })
@@ -73,10 +74,13 @@ pub fn read(path: &Path) -> anyhow::Result<ErofsDataMap> {
 
     let mut file_blocks = HashMap::with_capacity(stored.files.len());
     for file in stored.files {
-        // SAFETY: these bytes came from `OsStr::as_encoded_bytes` in `write`, which is the
-        // documented precondition — the encoding is self-consistent and unchanged in between.
-        let path =
-            PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(file.path) });
+        // On a Unix filesystem a path *is* its bytes, so this is a cast and not a decoding,
+        // and it needs no `unsafe`. `OsString::from_encoded_bytes_unchecked` would be the
+        // portable spelling, but its precondition is that the bytes came from
+        // `as_encoded_bytes` — which is a claim about a file on disk that nothing reading it
+        // back can check, and a corrupt sidecar would make it undefined behaviour rather
+        // than an error. This is the same conversion with the claim removed.
+        let path = PathBuf::from(std::ffi::OsString::from_vec(file.path));
         file_blocks.insert(path, (file.start_block, file.size));
     }
     Ok(ErofsDataMap {
@@ -127,7 +131,6 @@ mod tests {
     #[test]
     fn a_path_that_is_not_text_survives() {
         use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt as _;
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("odd.map");

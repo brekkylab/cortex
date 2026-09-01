@@ -41,13 +41,24 @@ pub fn write_descriptor(output: &Path, extents: &[&Path]) -> anyhow::Result<()> 
         // Absolute, because a descriptor is read from wherever the VMM happens to stand.
         let absolute = std::fs::canonicalize(path)
             .map_err(|e| anyhow::anyhow!("resolving {}: {e}", path.display()))?;
-        let absolute = absolute.display().to_string();
-        // The format quotes the path and offers no escape for a quote inside one. Refused
-        // rather than written, because what would be written is a descriptor that parses
-        // into some other file.
+        // Not `Path::display`, which replaces whatever is not UTF-8 with `U+FFFD` and hands
+        // back a name that opens some other file or none. A path on this host is bytes and
+        // may not be text — the same reason a layer's data map keeps its paths as bytes —
+        // and a descriptor has nowhere to put one that is not, so this says so.
+        let absolute = absolute.to_str().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} is not valid UTF-8, which a descriptor cannot spell",
+                absolute.display()
+            )
+        })?;
+        // The format puts one extent on one line and quotes the path, and offers no escape
+        // for either delimiter. Refused rather than written, because what would be written
+        // is a descriptor that parses into some other file: a quote ends the name early, and
+        // a newline ends the extent line and starts one the caller never asked for.
         anyhow::ensure!(
-            !absolute.contains('"'),
-            "{absolute} has a quote in its name, which a descriptor cannot spell"
+            !absolute.contains(['"', '\n', '\r']),
+            "{absolute} has a quote or a line break in its name, \
+             which a descriptor cannot spell"
         );
 
         let sectors = size / 512;
@@ -177,5 +188,22 @@ mod tests {
     fn a_disk_of_nothing_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         assert!(write_descriptor(&dir.path().join("disk.vmdk"), &[]).is_err());
+    }
+
+    /// A line break is the quote's twin: one ends the name early, the other ends the extent
+    /// and begins one nobody asked for.
+    #[test]
+    fn a_name_that_would_forge_an_extent_line_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("disk.vmdk");
+        // One component each: a `/` would make these nested paths rather than odd names.
+        for forged in ["a\nRW 8 FLAT \"passwd\" 0", "a\rb", "a\"b"] {
+            let path = dir.path().join(forged);
+            std::fs::write(&path, vec![0u8; 512]).unwrap();
+            let err = write_descriptor(&out, &[&path]).unwrap_err().to_string();
+            assert!(err.contains("cannot spell"), "{forged:?} gave {err}");
+            assert!(!out.exists(), "a descriptor was written for {forged:?}");
+            std::fs::remove_file(&path).unwrap();
+        }
     }
 }

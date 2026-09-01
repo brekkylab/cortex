@@ -34,6 +34,11 @@ pub enum Contents {
     Read,
 }
 
+/// How much of a file's declared size is worth preallocating before reading it.
+///
+/// A number out of the image, so it is only a hint until the read agrees with it.
+const SIZE_HINT_CAP: u64 = 16 << 20;
+
 /// Read `image` back as a tree.
 pub fn from_erofs(image: &Path, contents: Contents) -> anyhow::Result<FileTree> {
     let file = std::fs::File::open(image)
@@ -72,7 +77,13 @@ pub fn from_erofs(image: &Path, contents: Contents) -> anyhow::Result<FileTree> 
                 let data = match contents {
                     Contents::Skip => Vec::new(),
                     Contents::Read => {
-                        let mut buf = Vec::with_capacity(entry.size as usize);
+                        // The hint is capped, because `entry.size` is a number in the image
+                        // and a corrupt one would decide an allocation: `with_capacity` on a
+                        // wild size dies before a byte has been read, and dies as a panic
+                        // rather than as the error a bad layer deserves. `read_to_end` grows
+                        // to whatever is really there.
+                        let hint = entry.size.min(SIZE_HINT_CAP) as usize;
+                        let mut buf = Vec::with_capacity(hint);
                         reader
                             .file_data_reader(entry.nid)
                             .map_err(|e| anyhow::anyhow!("opening {}: {e}", entry.path.display()))?
@@ -135,14 +146,33 @@ pub fn from_erofs(image: &Path, contents: Contents) -> anyhow::Result<FileTree> 
 /// Entries are visited in name order, so the same directory gives the same tree and
 /// therefore the same image. That is what makes a directory something the store can address
 /// by content.
+///
+/// Deeper than [`MAX_DEPTH`] is refused. The walk is a recursion and the directory is the
+/// caller's, and a stack overflow is not an error anyone can report — the process is simply
+/// gone. A bound turns the one case that could do that into a sentence.
 pub fn from_dir(root: &Path) -> anyhow::Result<FileTree> {
     let mut tree = FileTree::new();
-    walk_dir(root, &mut Vec::new(), &mut tree)?;
+    walk_dir(root, &mut Vec::new(), &mut tree, 0)?;
     Ok(tree)
 }
 
-fn walk_dir(dir: &Path, prefix: &mut Vec<u8>, tree: &mut FileTree) -> anyhow::Result<()> {
+/// How far down `from_dir` will go. Far past anything a rootfs or an `/abin` has, and far
+/// short of what the stack can take.
+const MAX_DEPTH: u32 = 256;
+
+fn walk_dir(
+    dir: &Path,
+    prefix: &mut Vec<u8>,
+    tree: &mut FileTree,
+    depth: u32,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
+
+    anyhow::ensure!(
+        depth <= MAX_DEPTH,
+        "{} is more than {MAX_DEPTH} directories deep",
+        dir.display()
+    );
 
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .map_err(|e| anyhow::anyhow!("reading {}: {e}", dir.display()))?
@@ -190,7 +220,7 @@ fn walk_dir(dir: &Path, prefix: &mut Vec<u8>, tree: &mut FileTree) -> anyhow::Re
         } else if found.is_dir() {
             tree.insert(prefix, TreeNode::Directory(DirectoryNode::new(metadata)))
                 .map_err(|e| anyhow::anyhow!("adding {}: {e:?}", entry.path().display()))?;
-            walk_dir(&entry.path(), prefix, tree)?;
+            walk_dir(&entry.path(), prefix, tree, depth + 1)?;
         } else if found.is_file() {
             let data = std::fs::read(entry.path())
                 .map_err(|e| anyhow::anyhow!("reading {}: {e}", entry.path().display()))?;
@@ -456,6 +486,24 @@ mod tests {
     fn an_empty_directory_is_an_empty_tree() {
         let dir = tempfile::tempdir().unwrap();
         assert!(from_dir(dir.path()).unwrap().root.entries.is_empty());
+    }
+
+    /// Said rather than crashed: past the bound this is an error, not a stack overflow.
+    #[test]
+    fn a_directory_too_deep_to_walk_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut deep = dir.path().to_path_buf();
+        for _ in 0..MAX_DEPTH + 2 {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+
+        // `FileTree` has no `Debug`, so the `Ok` side cannot be unwrapped through.
+        let err = match from_dir(dir.path()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a directory past the bound was walked"),
+        };
+        assert!(err.contains("directories deep"), "{err}");
     }
 
     /// What makes a directory content-addressable: read it twice, get the same image.

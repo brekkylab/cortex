@@ -170,8 +170,9 @@ fn say(result: &ExecResult) -> String {
 async fn a_stitched_image_boots_and_is_the_merged_filesystem() {
     let store = LayerStore::open(&home().join("layers")).expect("a layer store");
     let base = base_layer(&store).await;
+    let upper_id = LayerId::of(MARKER.as_bytes());
     let over = store
-        .put(&LayerId::of(MARKER.as_bytes()), &upper())
+        .put(&upper_id, &upper())
         .expect("storing the upper layer");
 
     let id = LayerId::of(b"cortex test: a stitched two-layer image");
@@ -180,6 +181,7 @@ async fn a_stitched_image_boots_and_is_the_merged_filesystem() {
         &cortex_uvm_console_built_dir().join(id.file_stem()),
     )
     .expect("stitching");
+    let _built = Built::of(&descriptor, Some(upper_id));
     assert!(descriptor.is_file());
 
     let mut console = session_on(&id).await;
@@ -208,8 +210,6 @@ async fn a_stitched_image_boots_and_is_the_merged_filesystem() {
         say(&out(&mut console, "echo hi > /tmp/w && cat /tmp/w").await),
         "hi"
     );
-
-    remove(&descriptor);
 }
 
 /// The control. Without the upper layer none of the above can hold, and if it does the
@@ -226,6 +226,8 @@ async fn a_lone_base_layer_has_none_of_it() {
         &cortex_uvm_console_built_dir().join(id.file_stem()),
     )
     .expect("stitching one layer");
+    // No upper layer here; the base is the host's and stays.
+    let _built = Built::of(&descriptor, None);
 
     let mut console = session_on(&id).await;
 
@@ -244,8 +246,6 @@ async fn a_lone_base_layer_has_none_of_it() {
         "0",
         "/media is empty without the opaque directory that empties it"
     );
-
-    remove(&descriptor);
 }
 
 /// Where `assets::built_dir` looks. Not imported from the binary, which a test cannot reach
@@ -255,7 +255,40 @@ fn cortex_uvm_console_built_dir() -> PathBuf {
 }
 
 /// Leave nothing behind: these images are the test's, not the host's.
-fn remove(descriptor: &std::path::Path) {
-    let _ = std::fs::remove_file(descriptor);
-    let _ = std::fs::remove_file(descriptor.with_extension("fsmeta.erofs"));
+///
+/// A value and not a call, because a call at the end of a test is a call a failing assertion
+/// skips — and what it would have skipped is a disk in the host's `built/` that the next run
+/// silently stitches over. Dropping happens either way.
+struct Built {
+    descriptor: PathBuf,
+    /// The upper layer, when the test put one. It is this test's alone, so it goes. The base
+    /// layer stays either way: it is the pinned rootfs every session on this host already
+    /// shares, and re-ingesting it per run would cost more than it saves.
+    upper: Option<LayerId>,
+}
+
+impl Built {
+    fn of(descriptor: &std::path::Path, upper: Option<LayerId>) -> Built {
+        Built {
+            descriptor: descriptor.to_path_buf(),
+            upper,
+        }
+    }
+}
+
+impl Drop for Built {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.descriptor);
+        let _ = std::fs::remove_file(self.descriptor.with_extension("fsmeta.erofs"));
+        let Some(upper) = &self.upper else {
+            return;
+        };
+        for suffix in ["erofs", "map"] {
+            let _ = std::fs::remove_file(
+                home()
+                    .join("layers")
+                    .join(format!("{}.{suffix}", upper.file_stem())),
+            );
+        }
+    }
 }
