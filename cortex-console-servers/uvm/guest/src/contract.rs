@@ -70,6 +70,20 @@ pub const COMMIT_ENV: &str = "CORTEX_UVM_COMMIT";
 /// whether the old root is kept, and that cannot be decided again afterwards.
 pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
 
+/// What a guest answers a `commit` with: the layer is written, and this big.
+///
+/// Not a [`CommitResult`](cortex::console::CommitResult), which names an image — something
+/// only the host can make, and only after reading what this wrote. The console server replaces
+/// this with one before the client sees anything, which is what it already does with `init`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuestCommit {
+    /// The tar's size, so the host can tell an empty layer from a missing one.
+    pub size: u64,
+}
+
+/// What a commit's layer is called inside the scratch. One name, said once.
+pub const LAYER_TAR: &str = "layer.tar";
+
 /// The upperdir of the overlay this guest stands on, for a boot that kept its old root.
 ///
 /// The only way a commit sees what a session wrote: the host cannot read that ext4, and the
@@ -134,4 +148,3 @@ pub const NET_IPV4_ENV: &str = "MSB_NET_IPV4";
 
 /// Where a resolver is named on any system a base image was built for.
 pub const RESOLV_CONF: &str = "/etc/resolv.conf";
-

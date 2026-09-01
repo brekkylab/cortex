@@ -99,6 +99,9 @@ pub const COMMIT_ENV: &str = "CORTEX_UVM_COMMIT";
 /// would have somewhere to put a layer and no way to see one.
 pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
 
+/// What a commit's layer is called inside the scratch. One name, said once.
+pub const LAYER_TAR: &str = "layer.tar";
+
 /// Where a guest that kept its old root can reach the upperdir of the overlay it stands on.
 ///
 /// The host cannot read that ext4 itself and the overlay offers the upper under no other

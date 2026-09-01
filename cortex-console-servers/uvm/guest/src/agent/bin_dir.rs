@@ -30,7 +30,7 @@
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, symlink};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::contract::GUEST_BIN_PATH;
 
@@ -70,6 +70,14 @@ impl BinDir {
     /// The directory to put on `PATH`.
     pub fn bin(&self) -> PathBuf {
         self.root.join("bin")
+    }
+
+    /// The whole directory, which is what a commit has to leave out.
+    ///
+    /// `bin()` is only part of it, and the part is not what a session should be committing:
+    /// none of this is its work.
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 }
 

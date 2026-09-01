@@ -54,8 +54,8 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use crate::contract::{
-    ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, GUEST_BIN_PATH,
-    IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV,
+    ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, GUEST_BIN_PATH, IMAGE_SPEC_PATH,
+    ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while

@@ -87,6 +87,7 @@
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
 mod bin_dir;
+mod commit;
 
 use std::ffi::OsString;
 use std::io::{self, SeekFrom};
@@ -106,7 +107,10 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 
-use crate::contract::{ABIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec};
+use crate::contract::{
+    ABIN_PATH, COMMIT_ENV, COMMIT_PATH, GUEST_BIN_PATH, GUEST_PATH, GuestCommit, HANDSHAKE,
+    ImageSpec, LAYER_TAR, UPPER_DIR,
+};
 use crate::ipc::SOCK_ENV;
 use bin_dir::BinDir;
 
@@ -249,14 +253,11 @@ pub async fn run(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
                     server.respond(id, outcome).await?;
                 }
 
-                // A commit needs two things arranged while booting: the root holding this
-                // overlay's upper, and somewhere to write the result. A session that did not
-                // say it might commit has neither, and cannot be given them now.
                 Call::Commit(_) => {
-                    let outcome = refused(
-                        Error::INVALID_REQUEST,
-                        "this session was not booted able to commit",
-                    );
+                    let outcome = match session.boot() {
+                        Ok(()) => write_layer(&session),
+                        Err(outcome) => outcome,
+                    };
                     server.respond(id, outcome).await?;
                 }
             },
@@ -997,6 +998,58 @@ fn file_error(e: io::Error, path: &str) -> Outcome {
         _ => Error::IO_FAILED,
     };
     refused(code, format!("{path}: {e}"))
+}
+
+/// Write this session's layer where the host can read it.
+///
+/// The answer carries no image, because this end has no idea what one is: it has written a tar
+/// and that is the whole of what it knows. The console server turns it into one.
+///
+/// A commit needs two things arranged while booting — the root holding this overlay's upper,
+/// and somewhere to write the result — and a session that did not say it might commit has
+/// neither. It cannot be given them now, so it is told rather than half-answered.
+fn write_layer(session: &Session) -> Outcome {
+    let Ok(scratch) = std::env::var(COMMIT_ENV) else {
+        return refused(
+            Error::INVALID_REQUEST,
+            "this session was not booted able to commit",
+        );
+    };
+
+    // Everything the console server and this agent put in the session's own filesystem. None
+    // of it is the session's work, and one of them is this binary.
+    let mut excluded: Vec<PathBuf> = [GUEST_BIN_PATH, "/oldroot", ABIN_PATH, COMMIT_PATH]
+        .iter()
+        .map(|path| PathBuf::from(path.trim_start_matches('/')))
+        .collect();
+    // Written into the session while it was up, by the network setup rather than by anything
+    // the session did. Docker leaves this file out of a commit too, and for the same reason.
+    excluded.push(PathBuf::from("etc/resolv.conf"));
+    if let Some(linked) = session.linked() {
+        excluded.push(inside_upper(linked.root()));
+    }
+
+    // A mount point rather than a plain exclusion: the directories on the way to one exist
+    // only to reach it, and go with it.
+    let mount_points: Vec<PathBuf> = session
+        .workfs
+        .as_deref()
+        .map(|path| vec![inside_upper(path)])
+        .unwrap_or_default();
+
+    let into = Path::new(&scratch).join(LAYER_TAR);
+    match commit::write_layer(Path::new(UPPER_DIR), &into, &excluded, &mount_points) {
+        Ok(size) => encoded(bson::serialize_to_bson(&GuestCommit { size })),
+        Err(e) => refused(
+            Error::IO_FAILED,
+            format!("writing this session's layer: {e}"),
+        ),
+    }
+}
+
+/// An absolute path in the guest, as the path it has inside the upperdir.
+fn inside_upper(path: &Path) -> PathBuf {
+    path.strip_prefix("/").unwrap_or(path).to_path_buf()
 }
 
 fn result(progress: Progress) -> Outcome {
