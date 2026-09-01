@@ -44,9 +44,10 @@ use std::{
 };
 
 use cortex::console::{
-    Call, Message, Outcome, RequestId,
+    AbinSource, Call, Message, Outcome, RequestId,
     stdio::{read, write},
 };
+use cortex_uvm_console::layer::LayerStore;
 use tokio::{
     io::{AsyncReadExt as _, BufReader},
     net::{
@@ -56,10 +57,16 @@ use tokio::{
 };
 
 use crate::{
+    abin,
     assets::{self, BootRoot, SessionImage},
     contract::{BootArgs, HANDSHAKE, Network},
     helper::boot_helper,
 };
+
+/// Where layers live, shared by everything on this host that makes one.
+fn layer_store() -> anyhow::Result<LayerStore> {
+    LayerStore::open(&assets::home()?.join("layers"))
+}
 
 /// Guest vCPUs and memory, if this server was told to override the boot's own defaults.
 ///
@@ -114,10 +121,27 @@ impl Guest {
         image: Option<&str>,
         network: Network,
         host_ports: &[u16],
+        abin: &[AbinSource],
     ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
+
+        // `/abin`, which is cheap when a session adds nothing of its own: the layer cortex
+        // provides is attached as it is and nothing is stitched.
+        //
+        // A failure here is a session without an `/abin` rather than a session that will not
+        // start. Until cortex publishes its executables there is nothing to fetch, so the
+        // strict reading — no executables, no boot — would mean no session boots at all.
+        // Said on the way past so it is not a silent absence.
+        let abin = match abin::assemble(abin, &layer_store()?, &assets::home()?.join("abin")).await
+        {
+            Ok(assembled) => Some(assembled),
+            Err(e) => {
+                eprintln!("cortex-uvm-console: this session gets no /abin: {e}");
+                None
+            }
+        };
 
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
         // still not something to do on the runtime's own thread.
@@ -140,6 +164,11 @@ impl Guest {
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),
+            abin: abin.as_ref().map(|assembled| assembled.disk.clone()),
+            abin_format: abin
+                .as_ref()
+                .map(|assembled| assembled.format)
+                .unwrap_or_default(),
             vcpus: number(VCPUS_ENV),
             memory_mib: number(MEMORY_ENV),
         };

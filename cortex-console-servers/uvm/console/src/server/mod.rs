@@ -64,8 +64,8 @@ mod guest;
 use std::path::PathBuf;
 
 use cortex::console::{
-    Call, Error, ImageSource, Init, InitResult, Message, NetworkAccess, Notification, Outcome,
-    RequestId, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
+    AbinSource, Call, Error, ImageSource, Init, InitResult, Message, NetworkAccess, Notification,
+    Outcome, RequestId, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
 };
 use microsandbox_image::Reference;
 
@@ -220,6 +220,7 @@ impl Session {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
         let image = base(config.image.as_ref())?;
         let (network, host_ports) = reach(config.network.as_ref())?;
+        executables(&config.abin)?;
 
         self.guest = None;
         self.workfs = workfs;
@@ -297,6 +298,7 @@ impl Session {
                 image.as_deref(),
                 self.network,
                 &self.host_ports,
+                &self.config.abin,
             )
             .await
             .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
@@ -376,6 +378,27 @@ fn parse_host_ports(value: Option<&str>) -> anyhow::Result<Vec<u16>> {
 ///
 /// Every name the protocol defines is one this backend can answer, so the only refusals here are
 /// a name nobody defined and a grant that cannot mean anything. Both are worth making at `init`
+/// Refuse a session whose executables are named by a scheme this build cannot read.
+///
+/// Only the spelling is checked here. Whether the directory holds a name that collides with
+/// another is a question that needs the directories read and cortex's own executables in
+/// hand, which is a boot's work — so that one is answered on the way to a guest and not
+/// here. What this catches is the mistake a client can fix without having booted anything.
+fn executables(asked: &[AbinSource]) -> Result<(), Outcome> {
+    for source in asked {
+        if source.file_path().is_none() {
+            return Err(refused(
+                Error::UNSUPPORTED_ABIN,
+                format!(
+                    "{}: this server reads `file://` and no other scheme",
+                    source.url
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// rather than later, because a reach decides whether a virtio-net device is attached and a
 /// device is attached before a kernel comes up. A client told now can ask for something else;
 /// one told at its first command has already paid for a boot it cannot use.

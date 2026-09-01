@@ -53,6 +53,12 @@ pub const HANDSHAKE: &[u8; 8] = b"CORTEXUV";
 /// this is a promise `cortex-uvm-boot` keeps rather than something either end computes.
 pub const GUEST_LOWER_DEV: &str = "/dev/vdb";
 
+/// The read-only `/abin` disk, when a session has one.
+///
+/// Third, because the session's own image is `/dev/vda` and the base is `/dev/vdb` — the
+/// order a boot attaches disks in is the order the guest names them.
+pub const GUEST_ABIN_DEV: &str = "/dev/vdc";
+
 /// The overlay's upper, as the guest sees it.
 pub const GUEST_UPPER_DEV: &str = "/dev/vda";
 
@@ -64,6 +70,10 @@ pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 
 /// Told to the guest as `CORTEX_UVM_SHARE`, spelled `tag:/guest/path`.
 pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
+
+/// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
+/// which is a guest with no `/abin` at all rather than an empty one.
+pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
 
 /// The virtio-fs tag the tree is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
@@ -106,6 +116,14 @@ pub struct BootArgs {
 
     /// The session's writable image, as a host path.
     pub session: PathBuf,
+
+    /// A read-only image of native executables to mount at `/abin`, and how to attach it.
+    ///
+    /// `None` is a session that gets none. The two travel together for the same reason
+    /// [`base`](Self::base) and [`base_format`](Self::base_format) do: they are one fact
+    /// about what the server assembled.
+    pub abin: Option<PathBuf>,
+    pub abin_format: BaseFormat,
 
     /// The host directory to put in front of the guest, and `None` for a session that declared
     /// no tree. Mounted in the guest at **this same path** — see [`SHARE_ENV`].
@@ -165,6 +183,10 @@ impl BootArgs {
         if let Some(workfs) = &self.workfs {
             put("--workfs", workfs.as_os_str());
         }
+        if let Some(abin) = &self.abin {
+            put("--abin", abin.as_os_str());
+            put("--abin-format", OsStr::new(self.abin_format.as_str()));
+        }
         if let Some(vcpus) = self.vcpus {
             put("--vcpus", OsStr::new(&vcpus.to_string()));
         }
@@ -189,6 +211,8 @@ impl BootArgs {
         let mut network = None;
         let mut host_ports = Vec::new();
         let mut workfs = None;
+        let mut abin = None;
+        let mut abin_format = None;
         let mut vcpus = None;
         let mut memory_mib = None;
 
@@ -211,6 +235,8 @@ impl BootArgs {
                 "--network" => network = Some(text(&flag, value()?)?),
                 "--host-port" => host_ports.push(number(&flag, value()?)?),
                 "--workfs" => workfs = Some(PathBuf::from(value()?)),
+                "--abin" => abin = Some(PathBuf::from(value()?)),
+                "--abin-format" => abin_format = Some(text(&flag, value()?)?),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
                 other => anyhow::bail!("{other} is not an argument a boot takes"),
@@ -237,6 +263,13 @@ impl BootArgs {
             },
             host_ports,
             workfs,
+            abin,
+            // Defaulted rather than required, because a session with no `/abin` says nothing
+            // about its format and there is nothing for it to be.
+            abin_format: match abin_format {
+                Some(spelling) => BaseFormat::parse(&spelling)?,
+                None => BaseFormat::Raw,
+            },
             vcpus,
             memory_mib,
         })
@@ -408,9 +441,33 @@ mod tests {
             network: Network::Public,
             host_ports: vec![8080, 3000],
             workfs: Some("/Users/someone/project".into()),
+            abin: Some("/cache/abin/sha256_2b91c4.vmdk".into()),
+            abin_format: BaseFormat::Vmdk,
             vcpus: Some(4),
             memory_mib: Some(8192),
         }
+    }
+
+    /// A session with no `/abin` says nothing about one, and reads back as having none.
+    ///
+    /// The pair matters: `--abin-format` without `--abin` would be a format for a disk that
+    /// is not there, and a default format for a disk that *is* there would attach it wrongly.
+    #[test]
+    fn a_session_with_no_abin_says_nothing_about_one() {
+        let bare = BootArgs {
+            abin: None,
+            abin_format: BaseFormat::Raw,
+            ..args()
+        };
+        let written = bare.to_args();
+        assert!(
+            !written
+                .iter()
+                .any(|arg| arg == "--abin" || arg == "--abin-format"),
+            "{written:?}"
+        );
+        let back = BootArgs::parse(written).unwrap();
+        assert_eq!(back.abin, None);
     }
 
     /// Everything this writes is something it reads. Both ends are this type, so the compiler

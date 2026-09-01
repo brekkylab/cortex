@@ -106,7 +106,7 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 
-use crate::contract::{GUEST_PATH, HANDSHAKE, ImageSpec};
+use crate::contract::{ABIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec};
 use crate::ipc::SOCK_ENV;
 use bin_dir::BinDir;
 
@@ -742,6 +742,15 @@ fn environment(session: &Session, shims: &Shims) -> Vec<(OsString, OsString)> {
     if let Some(linked) = session.linked() {
         path.push(":");
         path.push(linked.bin());
+    }
+    // Prepended, unlike the delegated names above. A delegated name is one the client chose
+    // and the image should win a clash; `/abin` is what cortex undertakes to provide, and an
+    // image shadowing it would make that undertaking untrue.
+    if std::path::Path::new(ABIN_PATH).is_dir() {
+        let mut with_abin = OsString::from(ABIN_PATH);
+        with_abin.push(":");
+        with_abin.push(&path);
+        path = with_abin;
     }
 
     env.push((SOCK_ENV.into(), shims.sock.clone().into_os_string()));
