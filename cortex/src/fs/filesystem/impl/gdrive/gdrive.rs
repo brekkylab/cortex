@@ -29,18 +29,6 @@ const MY_DRIVE_ID: &str = "root";
 const MY_DRIVE_NAME: &str = "My Drive";
 const SHARED_WITH_ME_NAME: &str = "Shared with me";
 
-/// Whether a listing entry is a document's JSON rather than a file's own bytes.
-///
-/// By the suffix rather than by a mime: [`Stat`] carries no content type, and it would
-/// be a second copy of what the name already says. [`NATIVE_KINDS`] is the one place
-/// the pairing lives, so a type added there is answered here without being added twice.
-#[cfg(test)]
-fn is_native_json(e: &Dirent) -> bool {
-    NATIVE_KINDS
-        .iter()
-        .any(|(_, _, suffix)| e.name.ends_with(suffix))
-}
-
 /// How each Docs-editors type is served: the API that answers for it, and the
 /// suffix its entry carries.
 ///

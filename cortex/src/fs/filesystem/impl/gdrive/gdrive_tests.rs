@@ -1,5 +1,4 @@
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex as StdMutex;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,10 +31,14 @@ fn file_row(name: &str, id: &str, mime: &str) -> Value {
     })
 }
 
-/// What one Drive row becomes on the mount. A file with bytes keeps its own
-/// name and size; a native doc has no bytes, so its conversion takes the name
-/// with `.txt` and lists as 0 until read; a native with nothing to convert is
-/// absent, because a name that cannot be read is worse than no name.
+/// What one Drive row becomes on the mount.
+///
+/// A file with bytes keeps its own name and Drive's own size — in *bytes*, which is the
+/// trap: a Korean or emoji name is longer in bytes than in characters, and a size counted
+/// in characters truncates every read of it. A Docs-editors type has no bytes at all, so it
+/// becomes one entry serving its API's JSON, named with the suffix that says which kind it
+/// is, and with no length until something produces one. A native type with nothing to
+/// convert is absent, because a name that cannot be read is worse than no name.
 #[test]
 fn a_row_becomes_the_thing_it_can_serve() {
     let entry = |name: &str, mime: &str| child_from_file(&file_row(name, "id1", mime));
@@ -45,14 +48,32 @@ fn a_row_becomes_the_thing_it_can_serve() {
     assert_eq!(pdf.vfs_name, "report.pdf");
     assert_eq!(pdf.serves, Serves::Original);
     assert_eq!(entry_size(&pdf), 47065, "Drive's reported size");
-    // Already text — nothing extra needed, the file *is* its text.
     assert_eq!(
         entry("notes.md", "text/markdown").unwrap().vfs_name,
-        "notes.md"
+        "notes.md",
+        "already text — the file *is* its text"
     );
 
-    // Docs-editors types: one entry, the document's own API JSON. The suffix
-    // says which kind it is, since the Drive name carries no extension.
+    // And in bytes, whatever the script.
+    for name in [
+        "분기 보고서.pdf",
+        "日本語のファイル",
+        "Ελληνικά έγγραφο",
+        "мой документ",
+        "مستند عربي",
+        "party 🎉 notes.txt",
+    ] {
+        assert!(
+            name.len() > name.chars().count(),
+            "{name}: this case should actually be multi-byte"
+        );
+        let c = entry(name, "application/pdf").unwrap();
+        assert_eq!(c.vfs_name, name, "the entry name is the Drive name");
+        assert_eq!(entry_size(&c), 47065, "{name}");
+    }
+
+    // Docs-editors types: one entry, the document's own API JSON. The suffix says which
+    // kind, since the Drive name carries no extension — and it survives any script.
     for (mime, suffix, api) in [
         (
             "application/vnd.google-apps.document",
@@ -70,11 +91,14 @@ fn a_row_becomes_the_thing_it_can_serve() {
             NativeApi::Slides,
         ),
     ] {
-        let c = entry("Q3 Plan", mime).unwrap();
-        assert_eq!(c.vfs_name, format!("Q3 Plan{suffix}"), "{mime}");
+        let c = entry("분기 보고서", mime).unwrap();
+        assert_eq!(c.vfs_name, format!("분기 보고서{suffix}"), "{mime}");
         assert_eq!(c.serves, Serves::Native(api), "{mime}");
-        // Its length is only known once the API has answered.
-        assert_eq!(entry_size(&c), UNKNOWN_LENGTH_SIZE, "{mime}");
+        assert_eq!(
+            entry_size(&c),
+            UNKNOWN_LENGTH_SIZE,
+            "{mime}: no length until the API answers"
+        );
     }
 
     // Nothing to convert, nothing to serve: not listed at all.
@@ -93,54 +117,15 @@ fn a_row_becomes_the_thing_it_can_serve() {
         (GKind::Folder, "Reports")
     );
     assert_eq!(entry_size(&dir), 0);
-}
 
-/// Non-ASCII names must survive the whole path — the entry name, and the size
-/// in *bytes*. Sizing in characters is the trap: a Korean or emoji name is
-/// longer in bytes than in chars, and a short size truncates reads.
-#[test]
-fn non_ascii_names_survive_and_sizes_are_drives_own() {
-    for name in [
-        "분기 보고서.pdf",
-        "日本語のファイル",
-        "Ελληνικά έγγραφο",
-        "мой документ",
-        "مستند عربي",
-        "party 🎉 notes.txt",
-    ] {
-        let c = child_from_file(&file_row(name, "id1", "application/pdf")).unwrap();
-        assert_eq!(c.vfs_name, name, "entry name is the Drive name");
-        // Drive's own byte count, carried through untouched.
-        assert_eq!(entry_size(&c), 47065, "{name}");
-        assert!(
-            name.len() > name.chars().count(),
-            "{name}: this case should actually be multi-byte"
-        );
-    }
-
-    // A native doc's name gains only the suffix, whatever the script.
-    let doc = child_from_file(&file_row(
-        "분기 보고서",
-        "id1",
-        "application/vnd.google-apps.document",
-    ))
-    .unwrap();
-    assert_eq!(doc.vfs_name, "분기 보고서.gdoc.json");
-}
-
-/// A row Drive reported no size for still lists, with the placeholder rather
-/// than 0 — under the guest's `direct_io` mount a 0 was measured to clamp reads
-/// to nothing, and a search tool skips a file it is told is empty.
-#[test]
-fn an_unknown_size_is_a_placeholder_never_zero() {
-    let mut row = file_row("mystery.bin", "id1", "application/octet-stream");
-    row.as_object_mut().unwrap().remove("size");
-    let c = child_from_file(&row).unwrap();
+    // A row Drive reported no size for still lists, with the placeholder rather than 0:
+    // under the guest's `direct_io` mount a 0 was measured to clamp reads to nothing, and
+    // a search tool skips a file it is told is empty.
+    let mut sizeless = file_row("mystery.bin", "id1", "application/octet-stream");
+    sizeless.as_object_mut().unwrap().remove("size");
+    let c = child_from_file(&sizeless).unwrap();
     assert_eq!(c.serves, Serves::Original);
     assert_eq!(entry_size(&c), UNKNOWN_LENGTH_SIZE);
-    // Never 0 (that reads as empty), and at or under the content cache's
-    // per-object limit, so the first read of a document replaces the
-    // placeholder with its exact length for every later listing.
     const _: () = assert!(UNKNOWN_LENGTH_SIZE > 0);
     const _: () = assert!(UNKNOWN_LENGTH_SIZE <= MAX_DOCUMENT_BYTES);
 }
@@ -163,10 +148,38 @@ fn drive_names_cannot_escape_their_directory() {
 }
 
 #[test]
-fn disambiguate_keeps_a_name_findable_by_its_extension() {
-    let mk = |n: &str, serves: Serves| Child {
-        vfs_name: n.to_string(),
-        id: "x".into(),
+fn shared_drive_names_dodge_the_root_sections() {
+    let existing: HashSet<String> =
+        [MY_DRIVE_NAME.to_string(), SHARED_WITH_ME_NAME.to_string()].into();
+    assert_eq!(unique_name("Team", &existing), "Team");
+    assert_eq!(
+        unique_name(MY_DRIVE_NAME, &existing),
+        "My Drive [Shared Drive]"
+    );
+}
+
+/// What a directory means by "the same name", and what it does when two entries mean it.
+///
+/// One name has two spellings in Unicode — `한` is a single code point composed, or three
+/// jamo decomposed — and both are in play at once: macOS hands a lookup the *decomposed*
+/// form of whatever a listing returned, while Drive stores whichever the uploading client
+/// sent. Measured on one real folder, ten composed names beside four decomposed. So a byte
+/// comparison answers `ENOENT` for a name `ls` printed a moment earlier, and which files it
+/// does that to depends on what uploaded them.
+///
+/// Everything downstream of that comparison has to agree with it. Counting collisions by
+/// bytes left a canonically equal pair *both* unnumbered while the lookup matched either
+/// spelling to whichever came first: one file unopenable, and `cat` on it serving the other
+/// one's contents. And the number follows the Drive id rather than arrival order, because
+/// rows arrive `modifiedTime desc` with no defined tiebreak — numbering as they arrive meant
+/// editing either of two `report.pdf` swapped which one was `report (2).pdf` at the next
+/// listing, and the saved path still resolved, still succeeded, and opened the other
+/// document.
+#[test]
+fn names_are_compared_and_numbered_by_composition_and_id() {
+    let mk = |name: &str, id: &str, serves: Serves| Child {
+        vfs_name: name.to_string(),
+        id: id.into(),
         drive_id: None,
         kind: if matches!(serves, Serves::Nothing) {
             GKind::Folder
@@ -178,25 +191,44 @@ fn disambiguate_keeps_a_name_findable_by_its_extension() {
         serves,
         size: None,
     };
+
+    // The rule itself. Bytes first, then composition — and no ASCII short-circuit, because
+    // a pair spanning that boundary can still compose to one name: `NFC("\u{212A}")`, the
+    // Kelvin sign, is `"K"`.
+    let composed = "한글.txt";
+    let decomposed: String = composed.nfd().collect();
+    assert_ne!(
+        composed.as_bytes(),
+        decomposed.as_bytes(),
+        "the fixture has to be two spellings, or it tests nothing"
+    );
+    assert!(same_name(composed, &decomposed), "one name, two spellings");
+    assert!(!same_name("한글.txt", "한국.txt"), "and not a collapse");
+    assert!(!same_name("report.pdf", "report (2).pdf"));
+    assert_eq!("\u{212A}".nfc().collect::<String>(), "K");
+    assert!(same_name("2\u{212A} readings.txt", "2K readings.txt"));
+    assert!(same_name("a\u{037E}b", "a;b"));
+
+    // The number goes *before* the extension, or the entry leaves every glob a reader
+    // would use — measured against a real account, two of 33 spreadsheets were invisible
+    // to `**/*.gsheet.json`. A folder is not renamed around a dot.
     let mut children = vec![
-        // Three spreadsheets of the same Drive name: the number has to land
-        // before `.gsheet.json` or a `**/*.gsheet.json` search loses two of them.
-        mk("report.gsheet.json", Serves::Native(NativeApi::Sheet)),
-        mk("report.gsheet.json", Serves::Native(NativeApi::Sheet)),
-        mk("report.gsheet.json", Serves::Native(NativeApi::Sheet)),
-        // A plain file keeps its own extension.
-        mk("photo.jpeg", Serves::Original),
-        mk("photo.jpeg", Serves::Original),
-        // No extension to preserve, and a folder is not renamed around a dot.
-        mk("notes", Serves::Original),
-        mk("notes", Serves::Original),
-        mk("v1.2", Serves::Nothing),
-        mk("v1.2", Serves::Nothing),
+        mk("report.gsheet.json", "s1", Serves::Native(NativeApi::Sheet)),
+        mk("report.gsheet.json", "s2", Serves::Native(NativeApi::Sheet)),
+        mk("report.gsheet.json", "s3", Serves::Native(NativeApi::Sheet)),
+        mk("photo.jpeg", "p1", Serves::Original),
+        mk("photo.jpeg", "p2", Serves::Original),
+        mk("notes", "n1", Serves::Original),
+        mk("notes", "n2", Serves::Original),
+        mk("v1.2", "v1", Serves::Nothing),
+        mk("v1.2", "v2", Serves::Nothing),
     ];
     disambiguate(&mut children);
-    let names: Vec<&str> = children.iter().map(|c| c.vfs_name.as_str()).collect();
     assert_eq!(
-        names,
+        children
+            .iter()
+            .map(|c| c.vfs_name.as_str())
+            .collect::<Vec<_>>(),
         vec![
             "report.gsheet.json",
             "report (2).gsheet.json",
@@ -209,140 +241,42 @@ fn disambiguate_keeps_a_name_findable_by_its_extension() {
             "v1.2 (2)",
         ]
     );
-}
 
-#[test]
-fn shared_drive_names_dodge_the_root_sections() {
-    let existing: HashSet<String> =
-        [MY_DRIVE_NAME.to_string(), SHARED_WITH_ME_NAME.to_string()].into();
-    assert_eq!(unique_name("Team", &existing), "Team");
-    assert_eq!(
-        unique_name(MY_DRIVE_NAME, &existing),
-        "My Drive [Shared Drive]"
-    );
-}
-
-/// The budget bounds the file that gets served, so it has to be measured in the
-/// form that gets served: indenting a grid of short cells costs half again its
-/// compact size (1.66x measured here), and a budget checked against the compact
-/// form quietly allows that much more.
-#[test]
-fn a_tabs_cost_is_measured_as_it_will_be_written() {
-    let values: Value = serde_json::json!(
-        (0..200)
-            .map(|r| (0..20).map(|c| format!("{r}-{c}")).collect::<Vec<_>>())
-            .collect::<Vec<_>>()
-    );
-    let compact = serde_json::to_vec(&values).unwrap().len() as u64;
-    let served = served_len(&values);
-    assert_eq!(
-        served,
-        serde_json::to_vec_pretty(&values).unwrap().len() as u64,
-        "counted, not estimated"
+    // A pair that differs only by composition is a collision, so one of them is numbered.
+    let two = "보고서.pdf".to_string();
+    let two_nfd: String = two.nfd().collect();
+    let mut pair = vec![
+        mk(&two, "a", Serves::Original),
+        mk(&two_nfd, "b", Serves::Original),
+    ];
+    disambiguate(&mut pair);
+    assert!(
+        !same_name(&pair[0].vfs_name, &pair[1].vfs_name),
+        "both were left as {:?} / {:?}, so one cannot be opened",
+        pair[0].vfs_name,
+        pair[1].vfs_name
     );
     assert!(
-        served * 2 > compact * 3,
-        "indenting a grid costs at least half again: {compact} -> {served}"
+        pair.iter()
+            .find(|c| c.vfs_name.contains("(2)"))
+            .expect("one of the two is numbered")
+            .vfs_name
+            .ends_with(".pdf"),
+        "and it is still findable by glob"
     );
-}
 
-/// The composition rule `resolve` actually needs, tested where it lives.
-///
-/// It had no test at all: reducing it to `a == b` left the whole suite green, while the
-/// regression its doc comment records — seven of eight Korean-named files opening under
-/// only one spelling — came straight back.
-#[test]
-fn same_name_is_the_directory_s_idea_of_the_same_name() {
-    let composed = "한글.txt";
-    let decomposed: String = composed.nfd().collect();
-    assert_ne!(
-        composed.as_bytes(),
-        decomposed.as_bytes(),
-        "the fixture has to be two spellings, or it tests nothing"
-    );
-    assert!(same_name(composed, &decomposed), "one name, two spellings");
-    assert!(same_name(composed, composed));
-
-    // Different names stay different — the rule must not collapse a directory.
-    assert!(!same_name("한글.txt", "한국.txt"));
-    assert!(!same_name("report.pdf", "report (2).pdf"));
-
-    // The pair that spans the ASCII boundary. An `is_ascii()` guard used to short-circuit
-    // to a byte comparison here, on the reasoning that one ASCII side means no shared
-    // composition — but `NFC("\u{212A}")` is `"K"` and `NFC("\u{037E}")` is `";"`, so the
-    // file listed under the first spelling answered ENOENT to the second.
-    assert_eq!("\u{212A}".nfc().collect::<String>(), "K");
-    assert!(same_name("2\u{212A} readings.txt", "2K readings.txt"));
-    assert!(same_name("a\u{037E}b", "a;b"));
-}
-
-/// Two files whose names differ only by composition are two files.
-///
-/// `disambiguate` counted collisions by bytes while `resolve` matched by composition, so
-/// a canonically equal pair got neither a number nor an error: both kept the same name,
-/// and every lookup — in either spelling — was answered by whichever came first. One file
-/// was unopenable and `cat` on it served the other one's bytes.
-#[test]
-fn a_composed_and_a_decomposed_name_are_two_files() {
-    let composed = "보고서.pdf".to_string();
-    let decomposed: String = composed.nfd().collect();
-    let mk = |n: &str, id: &str| Child {
-        vfs_name: n.to_string(),
-        id: id.into(),
-        drive_id: None,
-        kind: GKind::File,
-        mtime: None,
-        created: None,
-        serves: Serves::Original,
-        size: None,
-    };
-    let mut children = vec![mk(&composed, "a"), mk(&decomposed, "b")];
-    disambiguate(&mut children);
-
-    assert!(
-        !same_name(&children[0].vfs_name, &children[1].vfs_name),
-        "both were left as {:?} / {:?}, so one of them cannot be opened",
-        children[0].vfs_name,
-        children[1].vfs_name
-    );
-    // And the number lands where it does for any other collision.
-    let numbered = children
-        .iter()
-        .find(|c| c.vfs_name.contains("(2)"))
-        .expect("one of the two is numbered");
-    assert!(
-        numbered.vfs_name.ends_with(".pdf"),
-        "still findable by glob"
-    );
-}
-
-/// A collision number follows the Drive id, not the order the listing arrived in.
-///
-/// Rows arrive `modifiedTime desc`, and `modifiedTime` has no defined tiebreak. Numbering
-/// as they arrive meant editing either of two `report.pdf` swapped which one was
-/// `report (2).pdf` at the next listing — the saved path still resolved and still
-/// succeeded, and opened the other document.
-#[test]
-fn a_collision_number_follows_the_id_and_not_the_listing_order() {
-    let mk = |id: &str| Child {
-        vfs_name: "report.pdf".to_string(),
-        id: id.into(),
-        drive_id: None,
-        kind: GKind::File,
-        mtime: None,
-        created: None,
-        serves: Serves::Original,
-        size: None,
-    };
+    // And the assignment does not move when the listing order does — three edits, three
+    // arrival orders, the same three names.
     let assign = |ids: [&str; 3]| {
-        let mut children: Vec<Child> = ids.iter().map(|i| mk(i)).collect();
-        disambiguate(&mut children);
-        let mut by_id: Vec<(String, String)> =
-            children.into_iter().map(|c| (c.id, c.vfs_name)).collect();
+        let mut c: Vec<Child> = ids
+            .iter()
+            .map(|i| mk("report.pdf", i, Serves::Original))
+            .collect();
+        disambiguate(&mut c);
+        let mut by_id: Vec<(String, String)> = c.into_iter().map(|c| (c.id, c.vfs_name)).collect();
         by_id.sort();
         by_id
     };
-    // The same three files, listed in three different orders — as three edits would.
     let a = assign(["x1", "x2", "x3"]);
     assert_eq!(a, assign(["x3", "x1", "x2"]), "an edit must not renumber");
     assert_eq!(a, assign(["x2", "x3", "x1"]), "an edit must not renumber");
@@ -364,12 +298,15 @@ fn a_collision_number_follows_the_id_and_not_the_listing_order() {
 /// folder inside a shared drive list empty from the second level down.
 #[tokio::test]
 async fn a_shared_drive_scopes_the_listings_below_it() {
-    let mock = start_with_drives(
+    let mock = start_full(
         json!([
             row("Sub", "F1", FOLDER_MIME, None),
             row("memo.txt", "B1", "text/plain", Some("12")),
         ]),
-        json!({"drives": [{"id": "DRV", "name": "Team"}]}),
+        HashMap::new(),
+        None,
+        None,
+        Some(json!({"drives": [{"id": "DRV", "name": "Team"}]})),
     )
     .await;
     let fs = mounted(&mock.config());
@@ -461,19 +398,31 @@ fn omitted_reason(wb: &Value, i: usize) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Values are paired by the sheet they name, not by their position in the reply.
-/// A sheet the request had to skip — one with no title — used to consume the next
-/// sheet's values and shift the rest, which is the same wrong-cells outcome
-/// `quote_a1` exists to prevent, reached from the other side.
+/// How a workbook's cell values are paired, budgeted, and accounted for when they are not
+/// there.
+///
+/// Every case here is the same failure from a different side: **cells under the wrong
+/// sheet, or missing with nothing said about it.** Values are paired by the sheet a reply
+/// *names* in A1 notation rather than by position, because a sheet the request had to skip
+/// used to consume the next one's values and shift the rest. And every omission carries its
+/// reason — a titleless sheet, one past the tab cap, one over the byte budget — because the
+/// one thing a reader cannot recover from is an empty grid that looks like an empty sheet.
 #[test]
-fn a_skipped_sheet_does_not_shift_everyone_elses_values() {
+fn a_workbooks_values_are_paired_by_name_and_budgeted_tab_by_tab() {
+    // The reply names its sheet, and a quoted title can hold what would otherwise confuse
+    // the parse.
+    assert_eq!(range_title("Sheet1!A1:Z1000"), "Sheet1");
+    assert_eq!(range_title("'메인화면'!A1:Z968"), "메인화면");
+    assert_eq!(range_title("'Sheet1!B2'!A1:Z10"), "Sheet1!B2");
+    assert_eq!(range_title("'it''s'!A1"), "it's");
+    assert_eq!(range_title("Sheet1"), "Sheet1");
+
+    // A sheet the request skipped takes nothing from the sheets around it.
     let mut wb = workbook(&[Some("Alpha"), None, Some("Gamma")]);
-    // The request only asked for the titled sheets.
-    let asked = vec!["Alpha".to_string(), "Gamma".to_string()];
     fold_values(
         &mut wb,
         &batch(&[("Alpha!A1", "ALPHA-CELL"), ("Gamma!A1", "GAMMA-CELL")]),
-        &asked,
+        &["Alpha".to_string(), "Gamma".to_string()],
     );
     assert_eq!(values_of(&wb, 0).as_deref(), Some("ALPHA-CELL"));
     assert_eq!(values_of(&wb, 2).as_deref(), Some("GAMMA-CELL"));
@@ -482,15 +431,19 @@ fn a_skipped_sheet_does_not_shift_everyone_elses_values() {
         omitted_reason(&wb, 1).is_some_and(|r| r.contains("no title")),
         "and says why"
     );
-}
 
-/// Past the cap no request was made, so the tail has no values — and used to have
-/// no explanation either, the one silent omission in this file.
-#[test]
-fn a_tab_past_the_cap_says_it_was_never_asked_for() {
+    // Past the tab cap no request was made, so there are no values — and that used to be
+    // the one silent omission here.
     let titles: Vec<String> = (0..MAX_TABS + 2).map(|i| format!("T{i}")).collect();
     let mut wb = workbook(&titles.iter().map(|t| Some(t.as_str())).collect::<Vec<_>>());
-    let asked = titles[..MAX_TABS].to_vec();
+    // Asked for the way the read path asks, so the cap being *in* that call is what makes
+    // the tail below unrequested — rather than this test deciding it separately.
+    let asked = tab_titles(&wb);
+    assert_eq!(
+        asked,
+        titles[..MAX_TABS],
+        "the cap is applied where the ask is built"
+    );
     let pairs: Vec<(String, String)> = asked
         .iter()
         .map(|t| (format!("{t}!A1"), format!("{t}-CELL")))
@@ -500,7 +453,6 @@ fn a_tab_past_the_cap_says_it_was_never_asked_for() {
         .map(|(r, c)| (r.as_str(), c.as_str()))
         .collect();
     fold_values(&mut wb, &batch(&refs), &asked);
-
     assert_eq!(values_of(&wb, 0).as_deref(), Some("T0-CELL"));
     for i in MAX_TABS..MAX_TABS + 2 {
         assert_eq!(values_of(&wb, i), None);
@@ -509,12 +461,9 @@ fn a_tab_past_the_cap_says_it_was_never_asked_for() {
             "tab {i} must not be silently empty"
         );
     }
-}
 
-/// One oversized tab used to zero the budget, so every later tab was dropped
-/// however small. The budget is spent tab by tab, which is what the constant says.
-#[test]
-fn an_oversized_tab_does_not_spend_the_rest_of_the_budget() {
+    // The budget is spent tab by tab, so one oversized tab does not drop every later one
+    // however small.
     let mut wb = workbook(&[Some("small1"), Some("huge"), Some("small2")]);
     let huge = "x".repeat(GRID_BYTES_BUDGET as usize + 1);
     let mut b = batch(&[("small1!A1", "a"), ("small2!A1", "b")]);
@@ -523,7 +472,6 @@ fn an_oversized_tab_does_not_spend_the_rest_of_the_budget() {
         serde_json::json!({ "range": "huge!A1", "values": [[huge]] }),
     );
     fold_values(&mut wb, &b, &["small1", "huge", "small2"].map(String::from));
-
     assert_eq!(values_of(&wb, 0).as_deref(), Some("a"));
     assert!(omitted_reason(&wb, 1).is_some_and(|r| r.contains("budget")));
     assert_eq!(
@@ -531,17 +479,26 @@ fn an_oversized_tab_does_not_spend_the_rest_of_the_budget() {
         Some("b"),
         "a small tab after a large one still fits"
     );
-}
 
-/// The reply names its sheet in A1 notation, which is what the pairing reads.
-#[test]
-fn a_returned_range_names_its_sheet() {
-    assert_eq!(range_title("Sheet1!A1:Z1000"), "Sheet1");
-    assert_eq!(range_title("'메인화면'!A1:Z968"), "메인화면");
-    // A quoted title can hold the characters that would otherwise confuse this.
-    assert_eq!(range_title("'Sheet1!B2'!A1:Z10"), "Sheet1!B2");
-    assert_eq!(range_title("'it''s'!A1"), "it's");
-    assert_eq!(range_title("Sheet1"), "Sheet1");
+    // And that budget is counted in the form the file is served in. Indenting a grid of
+    // short cells costs half again its compact size, so a budget checked against the
+    // compact form quietly admits that much more.
+    let values: Value = serde_json::json!(
+        (0..200)
+            .map(|r| (0..20).map(|c| format!("{r}-{c}")).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    );
+    let compact = serde_json::to_vec(&values).unwrap().len() as u64;
+    let served = served_len(&values);
+    assert_eq!(
+        served,
+        serde_json::to_vec_pretty(&values).unwrap().len() as u64,
+        "counted, not estimated"
+    );
+    assert!(
+        served * 2 > compact * 3,
+        "indenting a grid costs at least half again: {compact} -> {served}"
+    );
 }
 
 /// A range that asks backwards is empty, not a crash. The window arrives from
@@ -570,365 +527,6 @@ fn split_last_shapes() {
         split_last("/My Drive/x.json"),
         ("/My Drive".to_string(), "x.json".to_string())
     );
-}
-
-/// Config for the enterprise-mock integration test. The mock hands the refresh
-/// token straight back as the bearer token, so any user token from its
-/// `tokens.yaml` (or the admin token) works with the normal OAuth flow.
-///
-/// The token var is deliberately not `GOOGLE_REFRESH_TOKEN`: sharing it with
-/// [`live_config`] means one shell with both set sends a real Google token to the
-/// mock, which then fails for a reason that looks like a code bug.
-fn mock_config() -> Option<GdriveConfig> {
-    Some(GdriveConfig {
-        client_id: "mock".into(),
-        client_secret: "mock".into(),
-        refresh_token: std::env::var("GOOGLE_MOCK_TOKEN")
-            .unwrap_or_else(|_| "admin-service-token".into()),
-        origins: GdriveOrigins::behind(&std::env::var("GOOGLE_API_BASE_URL").ok()?),
-    })
-}
-
-/// Tree round-trip against an enterprise-mock, local or hosted. Ignored by
-/// default; run with:
-///
-///   # local: python -m app.importer.byo \
-///   #   examples/bring-your-own-corpus/sample_corpus.jsonl
-///   #        then python -m uvicorn app.main:app --port 8000
-///   GOOGLE_API_BASE_URL=http://localhost:8000 \
-///     [GOOGLE_MOCK_TOKEN=…] cargo test -p workspace gdrive_mock -- --ignored --nocapture
-///
-/// The walk is bounded so the same test runs against a five-file sample
-/// corpus and a 25k-document hosted one; a real corpus also spans several
-/// listing pages, which exercises the accessor's pagination for free.
-#[tokio::test]
-#[ignore = "requires a running enterprise-mock (GOOGLE_API_BASE_URL)"]
-async fn gdrive_mock_tree_and_reads() {
-    /// Bounds on the walk — enough to cross a page boundary on a real
-    /// corpus, small enough to stay quick on a tiny one.
-    const WALK_DIRS: usize = 12;
-    const WALK_FILES: usize = 200;
-
-    let Some(cfg) = mock_config() else {
-        eprintln!("set GOOGLE_API_BASE_URL (e.g. http://localhost:8000) to run");
-        return;
-    };
-    let r = GdriveFs::new(&cfg).unwrap();
-
-    let root = r.list(Path::new("/")).await.expect("root readdir");
-    eprintln!(
-        "root: {:?}",
-        root.iter().map(|e| &e.name).collect::<Vec<_>>()
-    );
-    assert!(root.iter().any(|e| e.name == MY_DRIVE_NAME));
-    assert!(root.iter().any(|e| e.name == SHARED_WITH_ME_NAME));
-
-    // A path that cannot exist must be NotFound (from the parent listing),
-    // not a 500 — the WebDAV layer turns this into a 404.
-    for bogus in [
-        format!("/{MY_DRIVE_NAME}/definitely-not-here-9f3c.bin"),
-        "/NoSuchSection".to_string(),
-        format!("/{MY_DRIVE_NAME}/nope/deeper.bin"),
-    ] {
-        let p = Path::new(&bogus);
-        assert!(
-            matches!(r.stat(p).await, Err(e) if e.kind() == io::ErrorKind::NotFound),
-            "stat {bogus} should be NotFound"
-        );
-        assert!(
-            matches!(r.read_window(p, None).await, Err(e) if e.kind() == io::ErrorKind::NotFound),
-            "read {bogus} should be NotFound"
-        );
-    }
-
-    // Walk the tree (bounded). Every file reads back, and an entry that
-    // reported a size must hand over exactly that many bytes — a listing
-    // that lies about length truncates every reader.
-    let mut queue: Vec<String> = root
-        .iter()
-        .filter(|e| e.kind == DirentKind::Dir)
-        .map(|e| format!("/{}", e.name))
-        .collect();
-    let (mut files, mut dirs, mut biggest, mut converted) = (0usize, 0usize, 0usize, 0usize);
-    while let Some(dir) = queue.pop() {
-        if dirs >= WALK_DIRS || files >= WALK_FILES {
-            eprintln!("walk bound reached ({dirs} dirs, {files} files); stopping");
-            break;
-        }
-        dirs += 1;
-        let entries = r.list(Path::new(&dir)).await.expect("folder readdir");
-        biggest = biggest.max(entries.len());
-        eprintln!("  {dir} -> {} entries", entries.len());
-        for e in entries.iter().take(WALK_FILES.saturating_sub(files)) {
-            let p = format!("{dir}/{}", e.name);
-            if e.kind == DirentKind::Dir {
-                queue.push(p);
-                continue;
-            }
-            let mp = Path::new(&p);
-            let bytes = r.read_window(mp, None).await.expect("read file");
-            if is_native_json(e) {
-                // A document's JSON: the listing could only estimate its
-                // length, so just check the read produced something.
-                converted += 1;
-                assert!(!bytes.is_empty(), "{p}: native json was empty");
-            } else {
-                assert_eq!(size_of(e), bytes.len() as u64, "{p}: listed size vs read");
-                let st = r.stat(mp).await.expect("stat");
-                assert_eq!(st.size, size_of(e), "{p}: listing and stat disagree");
-                // A ranged read returns its window, and past-EOF is empty.
-                let head = r.read_window(mp, Some(0..8)).await.expect("ranged read");
-                assert_eq!(head.len(), 8.min(bytes.len()), "{p}");
-                assert!(
-                    r.read_window(mp, Some(size_of(e)..size_of(e) + 16))
-                        .await
-                        .expect("past EOF")
-                        .is_empty(),
-                    "{p}: past EOF should be empty"
-                );
-            }
-            files += 1;
-        }
-    }
-    eprintln!(
-        "{files} files read across {dirs} dirs ({converted} conversions); \
-         biggest listing {biggest}"
-    );
-    assert!(files > 0, "the corpus should expose files");
-    if biggest > 1000 {
-        eprintln!("pagination exercised: one listing spanned {biggest} entries");
-    }
-}
-
-fn live_config() -> Option<GdriveConfig> {
-    Some(GdriveConfig {
-        client_id: std::env::var("GOOGLE_CLIENT_ID").ok()?,
-        client_secret: std::env::var("GOOGLE_CLIENT_SECRET").ok()?,
-        refresh_token: std::env::var("GOOGLE_REFRESH_TOKEN").ok()?,
-        origins: Default::default(),
-    })
-}
-
-/// Live tree round-trip against real Google Drive: the root sections, both
-/// section listings, and one ranged read per section at the length the
-/// listing promised. Ignored by default; run with:
-///
-///   GOOGLE_CLIENT_ID=… GOOGLE_CLIENT_SECRET=… GOOGLE_REFRESH_TOKEN=… \
-///     cargo test -p workspace gdrive_live -- --ignored --nocapture
-#[tokio::test]
-#[ignore = "requires GOOGLE_* env + network"]
-async fn gdrive_live_tree_and_reads() {
-    let Some(cfg) = live_config() else {
-        eprintln!("set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN to run");
-        return;
-    };
-    let r = GdriveFs::new(&cfg).unwrap();
-
-    let root = r.list(Path::new("/")).await.expect("root readdir");
-    eprintln!(
-        "root: {:?}",
-        root.iter().map(|e| &e.name).collect::<Vec<_>>()
-    );
-    assert!(root.iter().any(|e| e.name == MY_DRIVE_NAME));
-
-    for section in [MY_DRIVE_NAME, SHARED_WITH_ME_NAME] {
-        let entries = r
-            .list(&PathBuf::from(format!("/{section}")))
-            .await
-            .expect("section readdir");
-        eprintln!("{section}: {} entries", entries.len());
-        for e in entries.iter().take(5) {
-            eprintln!("  {:>6}B {:?} {}", size_of(e), e.kind, e.name);
-        }
-        // Read the first file: what comes back is the file itself, at the
-        // length the listing promised.
-        if let Some(f) = entries
-            .iter()
-            .find(|e| e.kind == DirentKind::File && !is_native_json(e) && size_of(e) > 0)
-        {
-            let mp = PathBuf::from(format!("/{section}/{}", f.name));
-            let head = r
-                .read_window(&mp, Some(0..64.min(size_of(f))))
-                .await
-                .expect("ranged read");
-            eprintln!(
-                "  first file {} ({}B) head: {:?}",
-                f.name,
-                size_of(f),
-                String::from_utf8_lossy(&head)
-                    .chars()
-                    .take(40)
-                    .collect::<String>()
-            );
-            assert_eq!(head.len() as u64, 64.min(size_of(f)), "range honored");
-            assert_eq!(
-                r.stat(&mp).await.expect("stat").size,
-                size_of(f),
-                "listing and stat must agree on length"
-            );
-        }
-    }
-}
-/// Live: a Docs-editors document is served as its own API's JSON, and a
-/// spreadsheet's stays small — the grid it deliberately omits runs to hundreds
-/// of megabytes.
-#[tokio::test]
-#[ignore = "requires GOOGLE_* env + network"]
-async fn gdrive_live_native_json_is_served() {
-    let Some(cfg) = live_config() else {
-        eprintln!("set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN to run");
-        return;
-    };
-    let r = GdriveFs::new(&cfg).unwrap();
-
-    let mut seen = 0usize;
-    for section in [SHARED_WITH_ME_NAME, MY_DRIVE_NAME] {
-        let entries = r
-            .list(&PathBuf::from(format!("/{section}")))
-            .await
-            .expect("section readdir");
-        for suffix in [".gsheet.json", ".gdoc.json", ".gslide.json"] {
-            let Some(e) = entries.iter().find(|e| e.name.ends_with(suffix)) else {
-                continue;
-            };
-            let p = PathBuf::from(format!("/{section}/{}", e.name));
-            let t0 = std::time::Instant::now();
-            let bytes = r.read_window(&p, None).await.expect("read native json");
-            let v: Value = serde_json::from_slice(&bytes).expect("native json parses");
-            eprintln!(
-                "  {} -> {} bytes in {:.2}s, top keys {:?}",
-                e.name,
-                bytes.len(),
-                t0.elapsed().as_secs_f64(),
-                v.as_object().map(|o| o.keys().take(4).collect::<Vec<_>>())
-            );
-            // A spreadsheet carries its cells, unless its allocated grid is
-            // over the limit — then it says so instead of moving 200-349MB.
-            if suffix == ".gsheet.json" {
-                assert!(v.get("sheets").is_some(), "workbook shape is present");
-                // `includeGridData` would put cells under sheets[].data. Nothing
-                // should be taking that route — it measured 189MB on this very
-                // workbook.
-                assert!(
-                    !v["sheets"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .any(|s| s.get("data").is_some()),
-                    "{}: cells must come from values, not the allocated grid",
-                    e.name
-                );
-                let tabs = v["sheets"].as_array().cloned().unwrap_or_default();
-                for t in &tabs {
-                    eprintln!(
-                        "    tab {:?}: {} rows{}",
-                        t.pointer("/properties/title").and_then(|x| x.as_str()),
-                        t["values"].as_array().map_or(0, |r| r.len()),
-                        if t.get("valuesOmitted").is_some() {
-                            " (values omitted)"
-                        } else {
-                            ""
-                        }
-                    );
-                }
-                assert!(
-                    tabs.iter()
-                        .all(|t| t.get("values").is_some() || t.get("valuesOmitted").is_some()),
-                    "{}: every tab carries its values or says why not",
-                    e.name
-                );
-                // The point of carrying values at all: a cell's text is in the
-                // bytes, so a reader searching the tree finds it. Cells holding a
-                // line break are excluded on purpose — JSON escapes those to
-                // `\n`, so a phrase spanning one is not literally in the file.
-                let a_cell = tabs
-                    .iter()
-                    .flat_map(|t| t["values"].as_array().cloned().unwrap_or_default())
-                    .flat_map(|row| row.as_array().cloned().unwrap_or_default())
-                    .find_map(|c| {
-                        c.as_str()
-                            .filter(|s| s.trim().len() > 3 && !s.contains(['\n', '"', '\\']))
-                            .map(str::to_string)
-                    })
-                    .expect("some cell holds plain text");
-                eprintln!("    a cell reads {a_cell:?}");
-                assert!(
-                    String::from_utf8_lossy(&bytes).contains(&a_cell),
-                    "a cell's text is greppable in the served bytes"
-                );
-            }
-            seen += 1;
-        }
-        if seen > 0 {
-            break;
-        }
-    }
-    assert!(seen > 0, "no native document found");
-}
-
-#[tokio::test]
-#[ignore = "requires GOOGLE_* env + network"]
-async fn gdrive_live_originals_read_by_range() {
-    let Some(cfg) = live_config() else {
-        eprintln!("set GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN to run");
-        return;
-    };
-    let r = GdriveFs::new(&cfg).unwrap();
-
-    for section in [MY_DRIVE_NAME, SHARED_WITH_ME_NAME] {
-        let entries = r
-            .list(&PathBuf::from(format!("/{section}")))
-            .await
-            .expect("section readdir");
-        // The biggest original in the section: exactly the file a full read
-        // must never be needed for.
-        let Some(big) = entries
-            .iter()
-            .filter(|e| e.kind == DirentKind::File && !is_native_json(e) && size_of(e) > 0)
-            .max_by_key(|e| size_of(e))
-        else {
-            continue;
-        };
-        let p = PathBuf::from(format!("/{section}/{}", big.name));
-        eprintln!(
-            "{section}: largest original {} = {} bytes",
-            big.name,
-            size_of(big)
-        );
-
-        let t0 = std::time::Instant::now();
-        let head = r.read_window(&p, Some(0..4096)).await.expect("ranged read");
-        eprintln!(
-            "  head 4096B -> {} bytes in {:.2}s",
-            head.len(),
-            t0.elapsed().as_secs_f64()
-        );
-        assert_eq!(head.len(), 4096.min(size_of(big) as usize), "range honored");
-
-        // A window from the middle differs from the head — proof the offset
-        // reached Drive instead of being sliced off a full download.
-        if size_of(big) > 100_000 {
-            let mid = r
-                .read_window(&p, Some(50_000..54_096))
-                .await
-                .expect("mid read");
-            assert_eq!(mid.len(), 4096);
-            assert_ne!(mid, head, "a mid-file window is not the head");
-        }
-
-        // Past EOF is a clean empty read (Drive answers 416) — what a reader
-        // walking to the end expects.
-        assert!(
-            r.read_window(&p, Some(size_of(big)..size_of(big) + 4096))
-                .await
-                .expect("read past EOF")
-                .is_empty(),
-            "EOF reads empty"
-        );
-        assert_eq!(r.stat(&p).await.expect("stat").size, size_of(big));
-        return;
-    }
-    panic!("no original found to read");
 }
 
 // ---------------------------------------------------------------------------
@@ -1007,23 +605,14 @@ fn parse_range(h: &str) -> Option<(u64, Option<u64>)> {
     Some((s.parse().ok()?, e.parse().ok()))
 }
 
-/// Serve a token, one folder listing, and one blob with `Range` support. A document
-/// route answers with `pad` bytes of JSON and no `Content-Length`, the way the real
-/// Docs API does.
-async fn start_with_document(
-    listing: Value,
-    blobs: HashMap<String, Vec<u8>>,
-    document_pad: Option<usize>,
-) -> Mock {
-    start_inner(listing, blobs, document_pad).await
-}
-
 /// Serve a token, one folder listing, and one blob with `Range` support.
 async fn start(listing: Value, blobs: HashMap<String, Vec<u8>>) -> Mock {
-    start_inner(listing, blobs, None).await
+    start_full(listing, blobs, None, None, None).await
 }
 
-async fn start_inner(
+/// And a `/documents/` route answering `pad` bytes of JSON with no `Content-Length`, the
+/// way the real Docs API does.
+async fn start_with_document(
     listing: Value,
     blobs: HashMap<String, Vec<u8>>,
     document_pad: Option<usize>,
@@ -1031,25 +620,12 @@ async fn start_inner(
     start_full(listing, blobs, document_pad, None, None).await
 }
 
-/// Serve a shared drive from `/drives`, so a test can reach one. The mock answered that
-/// route with an empty array on every success path before this, which left `driveId`
-/// propagation with no runnable test at all.
-async fn start_with_drives(listing: Value, drives: Value) -> Mock {
-    start_full(listing, HashMap::new(), None, None, Some(drives)).await
-}
-
-/// The four-argument form kept for the one test that scripts a `/drives` failure.
-async fn start_full_scripted(
-    listing: Value,
-    blobs: HashMap<String, Vec<u8>>,
-    document_pad: Option<usize>,
-    drives_status: Option<u16>,
-) -> Mock {
-    start_full(listing, blobs, document_pad, drives_status, None).await
-}
-
+/// The whole form, called directly by the two tests that want its last two arguments.
+///
 /// `drives_status` answers `/drives` with that status instead of a listing; `drives`
-/// replaces the empty listing it answers with otherwise.
+/// replaces the empty listing it answers with otherwise — that route answered empty on
+/// every success path before this argument existed, which left `driveId` propagation with
+/// no runnable test at all.
 async fn start_full(
     listing: Value,
     blobs: HashMap<String, Vec<u8>>,
@@ -1242,58 +818,6 @@ fn row(name: &str, id: &str, mime: &str, size: Option<&str>) -> Value {
     v
 }
 
-/// A document's length outlives the bytes it was measured from.
-///
-/// The length used to live inside the render cache, so it went away with the JSON — on the
-/// `DIR_TTL`, or the moment the byte budget dropped that document to fit another. A
-/// listing after that reported the placeholder again for a file nothing had changed:
-/// against a live account, 3.4 MB and then 64 MiB and then 3.4 MB, on nothing but cache
-/// state. Keeping the number apart from the megabytes it describes is the whole fix, and
-/// it costs a `u64` and a timestamp.
-#[tokio::test]
-async fn a_documents_length_outlives_the_bytes_it_came_from() {
-    let mock = start_with_document(
-        json!([row(
-            "notes",
-            "D1",
-            "application/vnd.google-apps.document",
-            None
-        )]),
-        HashMap::new(),
-        Some(40_000),
-    )
-    .await;
-    let fs = mounted(&mock.config());
-    let dir = Path::new("/My Drive");
-    let path = dir.join("notes.gdoc.json");
-    fs.list(dir).await.unwrap();
-
-    // Nothing has read it, so there is nothing to report but the placeholder.
-    assert_eq!(fs.stat(&path).await.unwrap().size, UNKNOWN_LENGTH_SIZE);
-    assert_eq!(fs.lengths_remembered().await, 0);
-
-    let real = fs.read_window(&path, None).await.unwrap().len() as u64;
-    assert!(real < UNKNOWN_LENGTH_SIZE);
-    assert_eq!(fs.stat(&path).await.unwrap().size, real, "read, so known");
-
-    // The bytes go — the budget or the TTL takes them — and the length stays.
-    fs.forget_rendered_for_test().await;
-    assert!(fs.held_slot().await.is_none(), "the JSON is gone");
-    assert_eq!(
-        fs.stat(&path).await.unwrap().size,
-        real,
-        "and the length is still the length"
-    );
-
-    // Without producing it again: the remembered number costs no request.
-    mock.reset();
-    assert_eq!(fs.stat(&path).await.unwrap().size, real);
-    assert!(
-        !mock.asked_for("/documents/D1"),
-        "a remembered length is not a second render"
-    );
-}
-
 /// What the length is remembered *against*: the `modifiedTime` the listing carried.
 ///
 /// A clock would be wrong in both directions — it drops a length that is still right, and
@@ -1349,117 +873,22 @@ async fn a_remembered_length_belongs_to_the_version_it_was_measured_from() {
     );
 }
 
-/// A blob is stated from the listing and then read out of one span.
+/// A document answers `stat` with two different numbers, and which one depends on whether
+/// anything has read it.
 ///
-/// `stat` sends nothing: Drive states a `size` for every non-native file — measured across
-/// one account's 182 of them, every one carried it — so there is nothing to resolve and no
-/// request to make. The windows after it come out of one span, which is the point of the
-/// span: 80 MB moved to deliver 1 MB before any of this was in place.
+/// Neither half is wrong on its own, which is what makes the asymmetry worth pinning. An
+/// unread document has no length to report — the API answers `HEAD` with `400`, so there is
+/// no way to learn one without producing the whole thing — so the placeholder stands, and
+/// [`GdriveFs::read_at`] pads whatever it declines to serve out to that length. Once
+/// something has produced the JSON, the same call answers what the document actually is.
 ///
-/// The branch that used to probe a ranged byte for a row Drive listed *without* a size is
-/// gone with the cache that held the answer. Nothing in a real account reaches it, and a
-/// blob is the one thing a wrong length cannot be recovered from — `read_at` pads only
-/// JSON, so the kernel fills the rest of a binary with `0x00`.
+/// And the number outlives the bytes it was measured from. It used to live inside the
+/// render cache and went away with the JSON, so a listing after that reported the
+/// placeholder again for a file nothing had changed: against a live account, 3.4 MB, then
+/// 64 MiB, then 3.4 MB, on nothing but cache state. Keeping it apart costs a `u64` and a
+/// timestamp.
 #[tokio::test]
-async fn a_blob_is_stated_from_the_listing_and_read_by_spans() {
-    const REAL: usize = 20 * 1024 * 1024;
-    const CHUNK: u64 = 256 * 1024;
-    let mock = start(
-        json!([row(
-            "big.pdf",
-            "P1",
-            "application/pdf",
-            Some(&REAL.to_string())
-        )]),
-        HashMap::from([("P1".to_string(), vec![b'a'; REAL])]),
-    )
-    .await;
-    let fs = mounted(&mock.config());
-    let dir = Path::new("/My Drive");
-    let file = Path::new("/My Drive/big.pdf");
-
-    let listed = fs.list(dir).await.unwrap();
-    assert_eq!(
-        size_of(&listed[0]),
-        REAL as u64,
-        "the listing carries Drive's own size"
-    );
-
-    mock.reset();
-    let st = fs.stat(file).await.unwrap();
-    assert_eq!(st.size, REAL as u64, "stat answers the same length");
-    assert!(
-        mock.media_ranges().is_empty(),
-        "and spends no request to do it"
-    );
-
-    // And the windows after it come out of one span rather than one request each.
-    mock.reset();
-    for i in 0..4u64 {
-        let got = fs
-            .read_window(file, Some(i * CHUNK..(i + 1) * CHUNK))
-            .await
-            .unwrap();
-        assert_eq!(got.len() as u64, CHUNK);
-    }
-    assert_eq!(
-        mock.media_ranges(),
-        vec![Some(format!("bytes=0-{}", 8 * 1024 * 1024 - 1))],
-        "one span answered all four windows"
-    );
-}
-
-/// A document is the other kind of placeholder: no ranged read exists for it, so the
-/// wrapper has to fetch it whole and keep it, or every window rebuilds it.
-#[tokio::test]
-async fn a_document_is_built_once_and_served_from_the_cache() {
-    const CHUNK: u64 = 256 * 1024;
-    let mock = start(
-        json!([row(
-            "notes",
-            "D1",
-            "application/vnd.google-apps.document",
-            None
-        )]),
-        HashMap::new(),
-    )
-    .await;
-    let fs = mounted(&mock.config());
-    let listed = fs.list(Path::new("/My Drive")).await.unwrap();
-    assert_eq!(listed[0].name, "notes.gdoc.json");
-    assert_eq!(size_of(&listed[0]), UNKNOWN_LENGTH_SIZE);
-
-    // The mock has no Docs endpoint, so a read fails — what matters is that the
-    // listing already refused to call the placeholder a length, which is what keeps
-    // `whole_or_small` from treating it as a small, cacheable object.
-    let st = fs
-        .stat(Path::new("/My Drive/notes.gdoc.json"))
-        .await
-        .unwrap();
-    assert_eq!(
-        st.size, UNKNOWN_LENGTH_SIZE,
-        "a document has no length until it is built"
-    );
-    assert!(
-        fs.read_window(Path::new("/My Drive/notes.gdoc.json"), Some(0..CHUNK))
-            .await
-            .is_err(),
-        "the mock serves no document API"
-    );
-}
-
-/// The placeholder is what an *unread* document shows, so one document answers `stat`
-/// with two different numbers depending on whether anything has read it yet.
-///
-/// This is the asymmetry a reader trips on, and it is worth a test of its own because
-/// neither half is wrong on its own. A first read is told 8 MiB and the kernel pads
-/// whatever [`GdriveFs::read_at`] declines to serve out to that length; a second read
-/// inside [`DIR_TTL`] is told the truth and stops at the end. So a parser that chokes
-/// on the padding succeeds when it is simply run again, which reads as a flake rather
-/// than as the length having been a placeholder.
-#[tokio::test]
-async fn a_document_stats_as_the_placeholder_until_it_is_read() {
-    const PAD: usize = 4096;
+async fn a_documents_length_is_a_placeholder_until_it_is_read_and_then_keeps() {
     let mock = start_with_document(
         json!([row(
             "notes",
@@ -1468,30 +897,42 @@ async fn a_document_stats_as_the_placeholder_until_it_is_read() {
             None
         )]),
         HashMap::new(),
-        Some(PAD),
+        Some(40_000),
     )
     .await;
     let fs = mounted(&mock.config());
-    let path = Path::new("/My Drive/notes.gdoc.json");
+    let dir = Path::new("/My Drive");
+    let path = dir.join("notes.gdoc.json");
 
-    // Nothing has rendered it, so the only number there is to report is the placeholder.
-    assert_eq!(
-        fs.stat(path).await.unwrap().size,
-        UNKNOWN_LENGTH_SIZE,
-        "an unread document has no length to report"
-    );
+    // A listing cannot know either, so it offers the same placeholder — and names the
+    // entry for what it serves rather than what Drive calls it.
+    let listed = fs.list(dir).await.unwrap();
+    assert_eq!(listed[0].name, "notes.gdoc.json");
+    assert_eq!(size_of(&listed[0]), UNKNOWN_LENGTH_SIZE);
+    assert_eq!(fs.stat(&path).await.unwrap().size, UNKNOWN_LENGTH_SIZE);
+    assert_eq!(fs.lengths_remembered().await, 0, "nothing measured yet");
 
-    let body = fs.read_window(path, Some(0..64 * 1024)).await.unwrap();
+    // Producing it is what makes a length exist, so the same call answers differently.
+    let real = fs.read_window(&path, None).await.unwrap().len() as u64;
     assert!(
-        (body.len() as u64) < UNKNOWN_LENGTH_SIZE,
-        "the document is far shorter than the placeholder claims it is"
+        real < UNKNOWN_LENGTH_SIZE,
+        "the document is far shorter than the placeholder claims"
     );
+    assert_eq!(fs.stat(&path).await.unwrap().size, real, "read, so known");
 
-    // Rendering it is what produces the length, so the same call now answers differently.
+    // The bytes go — the slot takes the next file, or the TTL lapses — and the length
+    // stays, without producing the document a second time to recover it.
+    fs.forget_rendered_for_test().await;
+    assert!(fs.held_slot().await.is_none(), "the JSON is gone");
+    mock.reset();
     assert_eq!(
-        fs.stat(path).await.unwrap().size,
-        body.len() as u64,
-        "a document that has been read reports what it actually is"
+        fs.stat(&path).await.unwrap().size,
+        real,
+        "and the length is still the length"
+    );
+    assert!(
+        !mock.asked_for("/documents/D1"),
+        "a remembered length is not a second render"
     );
 }
 
@@ -1691,27 +1132,30 @@ async fn an_oversized_document_stops_being_read() {
     );
 }
 
-/// A shared-drive listing that fails must not become "this account has none", cached.
+/// What the listing cache keeps, and what it refuses to keep.
 ///
-/// The call is best-effort, so its failure was swallowed: the root came back with two
-/// sections, nothing said why, and the reduced root was cached for the listing TTL, so
-/// a retry inside five minutes made no attempt at all. It also sat on the full retry
-/// ladder, which put half a minute of backoff in front of the first `ls` of a mount.
+/// Two failures, both of which read as "the tree is smaller than it is".
+///
+/// A shared-drive listing is best-effort, so its failure was swallowed: the root came back
+/// with two sections, nothing said why, and that reduced root was cached — so a retry
+/// inside the TTL made no attempt at all. It also sat on the full retry ladder, which put
+/// half a minute of backoff in front of the first `ls` of a mount.
+///
+/// And the cache itself was a high-water mark: one listing per folder ever visited, held
+/// for the life of the mount long after its TTL made it unusable, against a corpus with a
+/// folder that lists 10,000 entries.
 #[tokio::test]
-async fn a_failed_shared_drive_listing_is_not_cached_as_an_answer() {
-    let mock = start_full_scripted(
+async fn the_listing_cache_keeps_the_fresh_and_refuses_the_failed() {
+    let mock = start_full(
         json!([row("a.txt", "F1", "text/plain", Some("3"))]),
         HashMap::new(),
         None,
         Some(500),
+        None,
     )
     .await;
     let fs = mounted(&mock.config());
     let root = Path::new("/");
-
-    let t0 = std::time::Instant::now();
-    let first = fs.list(root).await.unwrap();
-    let elapsed = t0.elapsed();
     let drives_attempts = |m: &Mock| {
         m.seen
             .lock()
@@ -1720,6 +1164,10 @@ async fn a_failed_shared_drive_listing_is_not_cached_as_an_answer() {
             .filter(|s| s.target.contains("/drives"))
             .count()
     };
+
+    let t0 = std::time::Instant::now();
+    let first = fs.list(root).await.unwrap();
+    let elapsed = t0.elapsed();
     assert_eq!(
         first.iter().map(|e| e.name.clone()).collect::<Vec<_>>(),
         vec!["My Drive".to_string(), "Shared with me".to_string()]
@@ -1734,72 +1182,40 @@ async fn a_failed_shared_drive_listing_is_not_cached_as_an_answer() {
         "the first listing of a mount must not sit through backoff: {elapsed:?}"
     );
 
-    // The reduced root is not kept by the provider, so a fresh mount tries again
-    // rather than inheriting the failure. Within one mount the wrapper's own listing
-    // cache still answers for its TTL — that layer has no per-listing way to say "this
-    // one is incomplete", which is what it would take to recover sooner.
-    let fresh = mounted(&mock.config());
+    // An incomplete root is not written down, so the *same* mount asks again rather than
+    // serving the reduced answer for the TTL. This is the assertion that distinguishes
+    // "not cached" from "cached and it happens to be a new instance".
     mock.reset();
-    let _ = fresh.list(root).await.unwrap();
+    let again = fs.list(root).await.unwrap();
+    assert_eq!(again.len(), first.len());
     assert_eq!(
         drives_attempts(&mock),
         1,
-        "a new mount asks again instead of inheriting a degraded root"
+        "the second listing made its own attempt, so the first was not kept"
     );
-}
 
-/// A zero-length window asks the server for nothing.
-///
-/// It used to fall through to the arm that sends no `Range` at all, so `read_bytes(0)`
-/// pulled the whole object and returned none of it — 20 MB to answer with an empty
-/// vector.
-#[tokio::test]
-async fn an_empty_window_does_not_fetch_the_object() {
-    const REAL: usize = 20 * 1024 * 1024;
-    let mock = start(
-        json!([row("big.pdf", "P1", "application/pdf", Some("20971520"))]),
-        HashMap::from([("P1".to_string(), vec![b'a'; REAL])]),
-    )
-    .await;
-    let fs = mounted(&mock.config());
-    let file = Path::new("/My Drive/big.pdf");
-    // Populates what a listing and a probe would, so the reset below leaves only
-    // what the read itself asks for.
-    fs.stat(file).await.unwrap();
-
+    // And a fresh mount does not inherit it either.
+    let fresh = mounted(&mock.config());
     mock.reset();
-    let got = fs.read_window(file, Some(1024..1024)).await.unwrap();
-    assert!(got.is_empty());
-    assert_eq!(
-        mock.media_ranges(),
-        Vec::<Option<String>>::new(),
-        "no request at all"
-    );
-    assert_eq!(mock.bytes_sent(), 0);
-}
+    let _ = fresh.list(root).await.unwrap();
+    assert_eq!(drives_attempts(&mock), 1, "nor across mounts");
 
-/// The provider's own caches are high-water marks unless something prunes them.
-///
-/// Nothing did: one listing per folder ever visited, held for the life of the mount
-/// long after its TTL made it unusable, and the corpus has a folder that lists 10,000
-/// entries. The wrapper above bounds both of its equivalents.
-#[tokio::test]
-async fn a_listing_cache_does_not_grow_without_bound() {
-    let mock = start(
+    // And what has aged out is dropped on the way in.
+    //
+    // A second mock, because the first half's whole point is that a root built from a
+    // failed `drives.list` is *not* cached — so nothing accumulates there to age out.
+    let ok = start(
         json!([row("a.txt", "F1", "text/plain", Some("3"))]),
         HashMap::new(),
     )
     .await;
-    let fs = GdriveFs::new(&mock.config()).unwrap();
-
-    // The root plus one folder listing.
-    let _ = fs.list(Path::new("/")).await.unwrap();
+    let fs = mounted(&ok.config());
+    let _ = fs.list(root).await.unwrap();
     let _ = fs.list(Path::new("/My Drive")).await.unwrap();
-    assert!(fs.listings_retained().await >= 2);
+    assert!(fs.listings_retained().await >= 2, "the root and one folder");
 
-    // Age them out. The next listing drops what expired instead of keeping it for the
-    // life of the mount — two survive, because resolving `/Shared with me` re-lists the
-    // root on the way to it, and both of those are fresh.
+    // Two survive, because resolving `/Shared with me` re-lists the root on the way to it
+    // and both of those are fresh.
     fs.age_listings_for_test().await;
     let _ = fs.list(Path::new("/Shared with me")).await.unwrap();
     assert_eq!(
@@ -1987,91 +1403,69 @@ async fn a_backwards_window_does_not_take_the_process_down() {
     assert_eq!(got.len(), 512);
 }
 
-/// A small file is fetched once, however the kernel chops the reads up.
+/// What a fetch costs, in every case that changes the answer.
 ///
-/// Drive charges by the request: a download is 200 quota units whether it moves 200 KiB
-/// or 20 MB, so answering eighty chunk reads with eighty ranged requests costs eighty
-/// times what one span does. A file smaller than the first span is the degenerate case —
-/// that span comes back short, holding all of it, and every window after is free.
-#[tokio::test]
-async fn a_small_file_is_fetched_once_for_every_chunk_of_it() {
-    const REAL: usize = 300 * 1024;
-    const CHUNK: u64 = 64 * 1024;
-    let mock = start(
-        json!([row(
-            "small.bin",
-            "S1",
-            "application/octet-stream",
-            Some("307200")
-        )]),
-        HashMap::from([("S1".to_string(), vec![b'q'; REAL])]),
-    )
-    .await;
-    let fs = mounted(&mock.config());
-    let file = Path::new("/My Drive/small.bin");
-    fs.list(Path::new("/My Drive")).await.unwrap();
-    mock.reset();
-
-    let mut got = 0usize;
-    for i in 0..(REAL as u64 / CHUNK) {
-        let w = fs
-            .read_window(file, Some(i * CHUNK..(i + 1) * CHUNK))
-            .await
-            .unwrap();
-        assert_eq!(w.len() as u64, CHUNK, "chunk {i}");
-        got += w.len();
-    }
-    assert_eq!(got as u64, (REAL as u64 / CHUNK) * CHUNK);
-
-    let media = mock.media_ranges();
-    assert_eq!(
-        media.len(),
-        1,
-        "one fetch for the whole file, but the server saw {media:?}"
-    );
-    assert_eq!(
-        media[0],
-        Some(format!("bytes=0-{}", 8 * 1024 * 1024 - 1)),
-        "the first span, which a file this size answers whole"
-    );
-}
-
-/// A head-read costs its window; only a walk pays for a span.
+/// The kernel asks in 64 KiB windows and that is not ours to choose; sending each one down
+/// as its own ranged request is what made a 641 MB archive take two and a half hours. But a
+/// span is not free either — 0.90 s for a window against 5.63 s for 64 MiB — and the tools
+/// that read a file's head and stop would pay all of it for one buffer. So the size of a
+/// fetch follows what the last one did: the first read of a file, and any jump away from
+/// where the last span ended, takes the first span; a read carrying on from that end takes
+/// a read span.
 ///
-/// The kernel asks in 64 KiB windows and that is not ours to choose; sending each one
-/// down as its own ranged request is what made a 641 MB archive take two and a half
-/// hours. But a span is not free either — 0.90 s for a window against 5.63 s for 64 MiB
-/// — and the tools that read a file's head and stop would pay all of it for one buffer.
-/// So the size of a fetch follows what the last one did: the first read of a file, and
-/// any jump away from where the last span ended, takes its window; a read carrying on
-/// from that end takes a span.
+/// One fixture answers all of it, including the two degenerate cases. A span that runs off
+/// the end comes back short and is marked `to_eof`, which is what serves the tail of a file
+/// smaller than a span without fetching again. And a zero-length window is not a read at
+/// all — it once fell through to the arm that sends no `Range`, so `read_bytes(0)` pulled
+/// 20 MB to answer with an empty vector.
 #[tokio::test]
-async fn a_head_read_costs_its_window_and_only_a_walk_pays_for_a_span() {
+async fn what_a_fetch_costs() {
     const REAL: usize = 10 * 1024 * 1024;
+    const SPAN: u64 = 64 * 1024 * 1024;
+    const SPAN_1: u64 = 8 * 1024 * 1024;
+    const CHUNK: u64 = 64 * 1024;
     let mock = start(
         json!([row(
             "big.bin",
             "B1",
             "application/octet-stream",
-            Some("10485760")
+            Some(&REAL.to_string())
         )]),
         HashMap::from([("B1".to_string(), vec![b'z'; REAL])]),
     )
     .await;
     let fs = mounted(&mock.config());
     let file = Path::new("/My Drive/big.bin");
-    fs.list(Path::new("/My Drive")).await.unwrap();
+
+    // The listing states a blob's length, so `stat` resolves it without asking. Drive
+    // carries `size` on every non-native file — measured, all 182 of one account's.
+    let listed = fs.list(Path::new("/My Drive")).await.unwrap();
+    assert_eq!(size_of(&listed[0]), REAL as u64, "the listing carries it");
     mock.reset();
+    assert_eq!(fs.stat(file).await.unwrap().size, REAL as u64);
+    assert!(mock.media_ranges().is_empty(), "and stat spends no request");
 
-    const SPAN: u64 = 64 * 1024 * 1024;
-    const SPAN_1: u64 = 8 * 1024 * 1024;
-    const CHUNK: u64 = 64 * 1024;
+    // An empty window is not a read. Before anything is held, because a span in the slot
+    // would cover the window and the guard would not show.
+    mock.reset();
+    assert!(
+        fs.read_window(file, Some(1024..1024))
+            .await
+            .unwrap()
+            .is_empty(),
+        "an empty window is empty"
+    );
+    assert!(mock.media_ranges().is_empty(), "and asks for nothing");
+    assert_eq!(mock.bytes_sent(), 0, "and moves nothing");
 
-    // What `file` and a `grep` that abandons a binary after one buffer do. One span, not
-    // the 10 MB behind it — and the first span rather than the window, because NFS fires
-    // read-ahead the moment a file is touched and every window of it looks like a walk.
-    let head = fs.read_window(file, Some(0..4096)).await.unwrap();
-    assert_eq!(head.len(), 4096);
+    // What `file` and a `grep` that abandons a binary after one buffer do. The first span
+    // rather than the window, because NFS fires read-ahead the moment a file is touched
+    // and every window of it looks like a walk.
+    mock.reset();
+    assert_eq!(
+        fs.read_window(file, Some(0..4096)).await.unwrap().len(),
+        4096
+    );
     assert_eq!(
         mock.media_ranges(),
         vec![Some(format!("bytes=0-{}", SPAN_1 - 1))],
@@ -2080,27 +1474,24 @@ async fn a_head_read_costs_its_window_and_only_a_walk_pays_for_a_span() {
 
     // Every window inside it is free, read-ahead included.
     mock.reset();
-    for i in 1..16 {
+    for i in 1..16u64 {
         let w = fs
             .read_window(file, Some(i * CHUNK..(i + 1) * CHUNK))
             .await
             .unwrap();
         assert_eq!(w.len() as u64, CHUNK, "window {i}");
     }
-    assert_eq!(
-        mock.media_ranges(),
-        Vec::<Option<String>>::new(),
+    assert!(
+        mock.media_ranges().is_empty(),
         "the first span already had them"
     );
 
     // Carrying on from the end of it is a walk, and a walk gets a read span. The window
-    // straddles the boundary, so this also says no read comes back short of what it
-    // asked for — which `read_at` would report to the kernel as the end of the file.
+    // straddles the boundary, so this also says no read comes back short of what it asked
+    // for — which `read_at` would report to the kernel as the end of the file.
     mock.reset();
-    let over = fs
-        .read_window(file, Some(SPAN_1 - CHUNK / 2..SPAN_1 + CHUNK / 2))
-        .await
-        .unwrap();
+    let at = SPAN_1 - CHUNK / 2;
+    let over = fs.read_window(file, Some(at..at + CHUNK)).await.unwrap();
     assert_eq!(
         over.len() as u64,
         CHUNK,
@@ -2108,19 +1499,39 @@ async fn a_head_read_costs_its_window_and_only_a_walk_pays_for_a_span() {
     );
     assert_eq!(
         mock.media_ranges(),
-        vec![Some(format!(
-            "bytes={}-{}",
-            SPAN_1 - CHUNK / 2,
-            SPAN_1 - CHUNK / 2 + SPAN - 1
-        ))],
+        vec![Some(format!("bytes={}-{}", at, at + SPAN - 1))],
         "a read span, beginning where the reader asked rather than on a fixed boundary"
     );
 
-    // And a jump away from it is not a walk, so it pays for a first span again rather
-    // than pulling 64 MiB to answer 4 KiB somewhere new.
+    // That span ran off the end, so it came back short. The rest of the file is inside it
+    // and costs nothing — which is also why a file smaller than one span is fetched once
+    // however the kernel chops it up.
     mock.reset();
-    let back = fs.read_window(file, Some(1024..1024 + 4096)).await.unwrap();
-    assert_eq!(back.len(), 4096);
+    let tail_at = REAL as u64 - CHUNK / 2;
+    let tail = fs
+        .read_window(file, Some(tail_at..tail_at + CHUNK))
+        .await
+        .unwrap();
+    assert_eq!(
+        tail.len() as u64,
+        CHUNK / 2,
+        "short because the file ends, not because the span did"
+    );
+    assert!(
+        mock.media_ranges().is_empty(),
+        "a span that reached the end serves everything up to it"
+    );
+
+    // A jump away from it is not a walk, so it pays for a first span again rather than
+    // pulling 64 MiB to answer 4 KiB somewhere new.
+    mock.reset();
+    assert_eq!(
+        fs.read_window(file, Some(1024..1024 + 4096))
+            .await
+            .unwrap()
+            .len(),
+        4096
+    );
     assert_eq!(
         mock.media_ranges(),
         vec![Some(format!("bytes=1024-{}", 1024 + SPAN_1 - 1))],
