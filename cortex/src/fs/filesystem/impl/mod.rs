@@ -8,6 +8,8 @@
 mod inmem;
 #[cfg(feature = "notion")]
 mod notion;
+#[cfg(feature = "onedrive")]
+mod onedrive;
 mod passthrough;
 #[cfg(feature = "s3")]
 mod s3;
@@ -15,6 +17,8 @@ mod s3;
 pub use inmem::*;
 #[cfg(feature = "notion")]
 pub use notion::*;
+#[cfg(feature = "onedrive")]
+pub use onedrive::*;
 pub use passthrough::*;
 #[cfg(feature = "s3")]
 pub use s3::*;

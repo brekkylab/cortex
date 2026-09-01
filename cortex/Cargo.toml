@@ -29,6 +29,7 @@ uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
+unicode-normalization = { workspace = true, optional = true }
 # `macros` for `try_join!`, which is how `BinExecutable` drains a child's two pipes while
 # awaiting its exit: one future, so dropping the call drops every part of it at once.
 tokio = { workspace = true, features = [
@@ -76,8 +77,9 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 #   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
 #   for f in "" "--features fuse" "--features fuse-t" \
 #            "--features fuse-no-mount" "--features s3" "--features notion" \
+#            "--features onedrive" \
 #            "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,s3,notion"; do cargo test -p cortex $f --all-targets; done
+#            "--features fuse,fuse-t,s3,notion,onedrive"; do cargo test -p cortex $f --all-targets; done
 #
 # Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
 # unquoted expansion — under zsh pass the flags as separate arguments.
@@ -123,4 +125,17 @@ notion = [
     "dep:serde_json",
     "tokio/net",
     "tokio/rt-multi-thread",
+]
+# A OneDrive account as a read-only tree, over Microsoft Graph. `tokio/sync` because the
+# token cache is held across the `.await` that mints one, which `std::sync::Mutex` cannot
+# be; `unicode-normalization` because macOS looks a name up in a spelling the listing did
+# not necessarily use.
+onedrive = [
+    "dep:reqwest",
+    "dep:chrono",
+    "dep:serde_json",
+    "dep:unicode-normalization",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/sync",
 ]

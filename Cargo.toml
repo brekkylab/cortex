@@ -96,9 +96,17 @@ reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
     "query",
+    # Microsoft's token endpoint takes the refresh grant as a form body, and 0.13 made
+    # the encoder optional.
+    "form",
 ] }
 uuid = "1"
 chrono = "0.4"
+# macOS hands a lookup the *decomposed* spelling of whatever a listing returned, while a
+# service stores whichever form the uploading client sent. Comparing the bytes answers
+# `ENOENT` for a name the listing printed a moment earlier, so a name comparison has to
+# compose first.
+unicode-normalization = "0.1"
 # Notion answers in JSON and `page.json` is rendered back to it, so the backend
 # holds pages as `Value` rather than a mirror of a schema it does not own.
 serde_json = "1"
