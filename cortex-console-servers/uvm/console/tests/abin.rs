@@ -108,8 +108,8 @@ async fn a_callers_executables_arrive_beside_cortexs() {
 }
 
 /// A name cortex provides cannot be quietly replaced. The collision is found while the disk
-/// is being assembled, which is on the way to a boot — so the session exists and simply has
-/// no `/abin`, rather than running the wrong `mem`.
+/// is being assembled, which is on the way to a boot — and comes back as a refusal naming
+/// the name, rather than as a session that silently has no `/abin` at all.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots a micro-VM"]
 async fn a_name_cortex_provides_is_not_shadowed() {
@@ -117,13 +117,30 @@ async fn a_name_cortex_provides_is_not_shadowed() {
     let caller = dir_of(&["mem"]);
     let mut console = session(builtin.path(), &[caller.path()])
         .await
-        .expect("a session — the collision is found at boot, not at init");
+        .expect("a session — the collision is found at the boot, not at init");
 
-    let found = say(&out(&mut console, "command -v mem; echo rc=$?").await);
+    // The first command is what boots, so it is where the refusal arrives.
+    let refused = console.exec(["true"], None).await.unwrap_err().to_string();
+    assert!(refused.contains("mem"), "{refused}");
     assert!(
-        found.contains("rc=1"),
-        "a shadowed mem was runnable: {found:?}"
+        refused.contains("two of this session's executable directories"),
+        "{refused}"
     );
+}
+
+/// And a relative directory is refused at `init`, before anything is booted for it — the
+/// same answer a relative workfs gets, because the server would otherwise read it against
+/// its own working directory rather than the caller's.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "starts a server"]
+async fn a_relative_directory_is_refused_at_init() {
+    let builtin = dir_of(&["mem"]);
+    // `Console` has no `Debug`, so the `Ok` side cannot be unwrapped through.
+    let refused = match session(builtin.path(), &[Path::new("target/release")]).await {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("a relative directory was accepted"),
+    };
+    assert!(refused.contains("absolute"), "{refused}");
 }
 
 /// The control for the two above: without the override there is no `/abin` at all, so

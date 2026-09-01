@@ -263,13 +263,22 @@ impl BootArgs {
             },
             host_ports,
             workfs,
-            abin,
-            // Defaulted rather than required, because a session with no `/abin` says nothing
-            // about its format and there is nothing for it to be.
-            abin_format: match abin_format {
-                Some(spelling) => BaseFormat::parse(&spelling)?,
-                None => BaseFormat::Raw,
+            // The two travel together or not at all. A session with no `/abin` says nothing
+            // about a format because there is nothing for it to be; a session that *has* one
+            // and left the format out would take the default and attach a VMDK descriptor —
+            // a few hundred bytes of text — as a raw disk, which the guest meets as an
+            // unmountable device rather than as the mistake it is.
+            abin_format: match (&abin, abin_format) {
+                (Some(_), Some(spelling)) => BaseFormat::parse(&spelling)?,
+                (None, None) => BaseFormat::Raw,
+                (Some(path), None) => {
+                    anyhow::bail!("--abin {} was given without --abin-format", path.display())
+                }
+                (None, Some(spelling)) => {
+                    anyhow::bail!("--abin-format {spelling} was given without --abin")
+                }
             },
+            abin,
             vcpus,
             memory_mib,
         })
@@ -468,6 +477,29 @@ mod tests {
         );
         let back = BootArgs::parse(written).unwrap();
         assert_eq!(back.abin, None);
+    }
+
+    /// And the pair is enforced rather than assumed, in both directions.
+    #[test]
+    fn an_abin_without_its_format_is_refused() {
+        let without_abin: Vec<OsString> = BootArgs {
+            abin: None,
+            abin_format: BaseFormat::Raw,
+            ..args()
+        }
+        .to_args();
+
+        let mut only_disk = without_abin.clone();
+        only_disk.push("--abin".into());
+        only_disk.push("/cache/abin/set.vmdk".into());
+        let err = BootArgs::parse(only_disk).unwrap_err().to_string();
+        assert!(err.contains("without --abin-format"), "{err}");
+
+        let mut only_format = without_abin;
+        only_format.push("--abin-format".into());
+        only_format.push("vmdk".into());
+        let err = BootArgs::parse(only_format).unwrap_err().to_string();
+        assert!(err.contains("without --abin"), "{err}");
     }
 
     /// Everything this writes is something it reads. Both ends are this type, so the compiler

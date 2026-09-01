@@ -122,6 +122,15 @@ pub struct ConsoleBuilder {
     /// Directories of native executables this session adds, in the order they were named.
     /// Empty is what every caller wanted before this existed.
     abin: Vec<AbinSource>,
+
+    /// The first directory named that no URL can hold, kept for [`build`](Self::build) to
+    /// refuse with.
+    ///
+    /// A builder method answers `Self` and has nowhere to put an error, and the alternatives
+    /// are both worse than carrying it: a panic makes a library decide a caller's mistake is
+    /// fatal, and dropping the directory silently would start a session missing the very
+    /// executables it was told to carry.
+    rejected_abin: Option<PathBuf>,
 }
 
 impl ConsoleBuilder {
@@ -276,8 +285,19 @@ impl ConsoleBuilder {
     ///
     /// What goes in one is the caller's to build: these run wherever the server runs
     /// commands, which on a micro-VM backend is inside the guest and not on this host.
+    ///
+    /// A directory whose name is not UTF-8 has no spelling as a URL, and is refused by
+    /// [`build`](Self::build) rather than here — see [`AbinSource::of_path`].
     pub fn abin(mut self, dir: impl AsRef<Path>) -> Self {
-        self.abin.push(AbinSource::from(dir.as_ref()));
+        let dir = dir.as_ref();
+        match AbinSource::of_path(dir) {
+            Some(source) => self.abin.push(source),
+            // The first one, because that is the one the caller will fix; the rest are
+            // whatever follows from having got this far.
+            None => {
+                self.rejected_abin.get_or_insert_with(|| dir.to_path_buf());
+            }
+        }
         self
     }
 
@@ -411,7 +431,17 @@ impl Console {
             image,
             network,
             abin,
+            rejected_abin,
         } = builder;
+
+        // Before the channel, so a name that can never be sent costs no process and no
+        // handshake — the same order the rest of this constructor settles things in.
+        if let Some(dir) = rejected_abin {
+            anyhow::bail!(
+                "{} is not valid UTF-8, and a directory of executables is named by a URL",
+                dir.display()
+            );
+        }
 
         let client_factory =
             client_factory.context("a console needs a client to drive its server")?;

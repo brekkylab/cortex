@@ -130,13 +130,31 @@ impl Guest {
         // `/abin`, which is cheap when a session adds nothing of its own: the layer cortex
         // provides is attached as it is and nothing is stitched.
         //
-        // A failure here is a session without an `/abin` rather than a session that will not
-        // start. Until cortex publishes its executables there is nothing to fetch, so the
-        // strict reading — no executables, no boot — would mean no session boots at all.
-        // Said on the way past so it is not a silent absence.
-        let abin = match abin::assemble(abin, &layer_store()?, &assets::home()?.join("abin")).await
-        {
+        // On a blocking thread, because when a session *does* add something this reads every
+        // executable in the named directories and writes them back out as an EROFS — the
+        // same reason `SessionImage::create` below is not on the runtime's own thread, at a
+        // size that is megabytes rather than milliseconds.
+        let named = abin.to_vec();
+        let store = layer_store()?;
+        let into = assets::home()?.join("abin");
+        // **The one place this variable is read.** Here rather than inside `assemble`, where
+        // the rest of this server's configuration is read, and so that assembling is a
+        // function of its arguments and a test can call it twice.
+        let builtin = std::env::var_os(abin::DIR_ENV).map(PathBuf::from);
+        let assembled = tokio::task::spawn_blocking(move || {
+            abin::assemble(&named, builtin.as_deref(), &store, &into)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("assembling /abin: {e}"))?;
+
+        // Two failures, and they are not the same. A name the session named twice is
+        // something the client said and can say differently, so it goes back as a refusal.
+        // Anything else is this host's gap — cortex has published no executables yet, so the
+        // strict reading would mean no session boots at all — and costs the session its
+        // `/abin` rather than its existence. Said on the way past so it is not silent.
+        let abin = match assembled {
             Ok(assembled) => Some(assembled),
+            Err(e) if e.downcast_ref::<abin::Duplicate>().is_some() => return Err(e),
             Err(e) => {
                 eprintln!("cortex-uvm-console: this session gets no /abin: {e}");
                 None

@@ -375,15 +375,21 @@ impl AbinSource {
     pub fn file_path(&self) -> Option<&Path> {
         self.url.strip_prefix("file://").map(Path::new)
     }
-}
 
-/// A directory, as the URL naming it.
-///
-/// Here so that a caller with a path — which is every caller of this, since `file://` is the
-/// only kind — does not have to spell a URL to say the obvious thing.
-impl From<&Path> for AbinSource {
-    fn from(path: &Path) -> Self {
-        AbinSource::new(format!("file://{}", path.display()))
+    /// A directory, as the URL naming it — or `None` for a path a URL cannot hold.
+    ///
+    /// Here so that a caller with a path — which is every caller of this, since `file://` is
+    /// the only kind — does not have to spell a URL to say the obvious thing.
+    ///
+    /// A URL here is a `String`, so a path that is not UTF-8 has no spelling in one. Said as
+    /// `None` rather than written through [`Path::display`], which would replace the bytes
+    /// it could not read with `U+FFFD` and hand back a URL naming a *different* directory or
+    /// none at all — a wrong answer where this is a missing one. There is no `From<&Path>`
+    /// for that reason: the conversion can fail, and one that could not say so would be a
+    /// panic in a library or a lie on the wire.
+    pub fn of_path(path: &Path) -> Option<AbinSource> {
+        path.to_str()
+            .map(|path| AbinSource::new(format!("file://{path}")))
     }
 }
 
@@ -773,9 +779,20 @@ mod tests {
     #[test]
     fn a_path_says_itself_as_a_url() {
         assert_eq!(
-            AbinSource::from(Path::new("/opt/tools")),
-            AbinSource::new("file:///opt/tools")
+            AbinSource::of_path(Path::new("/opt/tools")),
+            Some(AbinSource::new("file:///opt/tools"))
         );
+    }
+
+    /// A URL is text, so a path that is not says so rather than being written through
+    /// `display` and coming out naming somewhere else.
+    #[test]
+    fn a_path_that_is_not_text_names_no_url() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let odd = std::path::PathBuf::from(OsStr::from_bytes(b"/opt/\xff\xfetools"));
+        assert_eq!(AbinSource::of_path(&odd), None);
     }
 
     /// A session that adds none carries no member, the way the rest of this type works.

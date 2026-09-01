@@ -69,29 +69,33 @@ impl Builtin {
         }
     }
 
-    /// This release as a layer, putting it in `store` if it is not already there.
+    /// This release as a layer and the tree it was made from, putting it in `store` if it is
+    /// not already there.
     ///
-    /// [`DIR_ENV`] short-circuits the whole of it, which is the only way this works today.
-    pub async fn layer(&self, store: &LayerStore) -> anyhow::Result<Layer> {
-        if let Some(dir) = std::env::var_os(DIR_ENV) {
-            let dir = PathBuf::from(dir);
+    /// `override_dir` — [`DIR_ENV`], read by the caller — short-circuits the whole of it,
+    /// which is the only way this works today.
+    pub fn layer(
+        &self,
+        override_dir: Option<&Path>,
+        store: &LayerStore,
+    ) -> anyhow::Result<(Layer, FileTree)> {
+        if let Some(dir) = override_dir {
             anyhow::ensure!(
                 dir.is_dir(),
                 "{DIR_ENV} is {}, which is not a directory",
                 dir.display()
             );
-            return layer_of(&dir, store);
+            return layer_of(dir, store);
         }
-
-        let tarball = self.fetch().await?;
-        anyhow::bail!(
-            "unpacking {} is not implemented — there is no release to unpack yet",
-            tarball.display()
-        )
+        Err(self.unpublished())
     }
 
-    async fn fetch(&self) -> anyhow::Result<PathBuf> {
-        anyhow::bail!(
+    /// What there is to say instead of a release.
+    ///
+    /// When there is one, fetching it is the caller's to await *before* handing a directory
+    /// in — which is what `override_dir` already is, so nothing here becomes async for it.
+    fn unpublished(&self) -> anyhow::Error {
+        anyhow::anyhow!(
             "cortex ships no executables yet: {} is not published, so there is nothing at {} \
              to verify against {}. Set {DIR_ENV} to a directory of guest-native executables \
              — statically linked for the guest, not for this host.",
@@ -102,7 +106,29 @@ impl Builtin {
     }
 }
 
-/// Assemble `/abin` out of cortex's own executables and whatever `sources` name.
+/// A name two of this session's executable directories both answer to.
+///
+/// Its own type rather than a message, because the two ways an assembly fails deserve
+/// opposite answers. That cortex has published nothing yet is this host's gap and costs the
+/// session an `/abin`; a collision is something the caller said, is fixable by saying
+/// something else, and travels back as
+/// [`DUPLICATE_EXECUTABLE`](cortex::console::Error::DUPLICATE_EXECUTABLE).
+#[derive(Debug)]
+pub struct Duplicate(pub String);
+
+impl std::fmt::Display for Duplicate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Duplicate {}
+
+/// Assemble `/abin` out of `builtin` — cortex's own executables — and whatever `sources` name.
+///
+/// `builtin` is [`DIR_ENV`] when it is set, and read by the caller rather than here: what a
+/// server is configured with is read where the rest of its configuration is read, and a
+/// function that reached for it itself would be one no test could call twice.
 ///
 /// `dir` is where assembled disks live, not one disk's path: the name inside it is the
 /// digest of the layer set, so two sessions whose executables differ get two disks rather
@@ -110,12 +136,17 @@ impl Builtin {
 ///
 /// With no `sources` the builtin layer is handed over as it is — a base layer is a valid
 /// image on its own, so the common case costs no stitch at all.
-pub async fn assemble(
+///
+/// **Blocking, and says so by not being `async`.** Reading a directory of executables and
+/// writing it back out as an EROFS is file work from end to end; a caller on a runtime owes
+/// this a thread of its own.
+pub fn assemble(
     sources: &[AbinSource],
+    builtin: Option<&Path>,
     store: &LayerStore,
     dir: &Path,
 ) -> anyhow::Result<Assembled> {
-    let builtin = Builtin::host().layer(store).await?;
+    let (builtin, builtin_tree) = Builtin::host().layer(builtin, store)?;
 
     if sources.is_empty() {
         return Ok(Assembled {
@@ -125,6 +156,10 @@ pub async fn assemble(
     }
 
     let mut layers = vec![builtin];
+    // Kept beside the layers, because the collision check wants exactly these and reading
+    // them back out of the images they were just written to would be a second pass over
+    // every executable in the session.
+    let mut trees = vec![builtin_tree];
     for source in sources {
         let named = source.file_path().ok_or_else(|| {
             anyhow::anyhow!(
@@ -138,10 +173,12 @@ pub async fn assemble(
             "{} is not a directory on this host",
             named.display()
         );
-        layers.push(layer_of(named, store)?);
+        let (layer, tree) = layer_of(named, store)?;
+        layers.push(layer);
+        trees.push(tree);
     }
 
-    refuse_collisions(&layers)?;
+    refuse_collisions(&trees)?;
 
     let set = LayerId::of(
         layers
@@ -152,23 +189,65 @@ pub async fn assemble(
             .as_bytes(),
     );
     let disk = stitch(&layers, &dir.join(set.file_stem()))?;
+    reclaim(dir, set.file_stem());
     Ok(Assembled {
         disk,
         format: BaseFormat::Vmdk,
     })
 }
 
-/// One directory as a layer, named by what is in it.
+/// How long an assembled disk nobody has asked for again is kept.
+///
+/// Generous, because the cost of keeping one is a descriptor and a metadata EROFS while the
+/// cost of removing one early is nothing at all — a stitch is derived and is rewritten on
+/// every assembly anyway. Long enough that it is only ever a disk from another day.
+const KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Drop the assembled disks in `dir` that nothing has asked for in a day, except `keep`.
+///
+/// A caller rebuilding a `target/release` names a new layer set on every build, so without
+/// this the directory grows by one descriptor and one fsmeta per build and never shrinks.
+/// Nothing tracks which sets are in use, so age stands in for it — and safely: a guest that
+/// is running already holds these open, and an unlinked file a process has open stays whole
+/// until it lets go.
+///
+/// Best effort throughout, like the layer store's own sweep. A directory that could not be
+/// tidied is still a directory that works.
+fn reclaim(dir: &Path, keep: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let is_ours = name.ends_with(".vmdk") || name.ends_with(".fsmeta.erofs");
+        if !is_ours || name.starts_with(keep) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|when| when.elapsed().unwrap_or_default() > KEEP)
+            .unwrap_or(false);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// One directory as a layer, named by what is in it — and the tree it was named from.
 ///
 /// Content-addressed rather than named for the path, so that a directory somebody is
 /// rebuilding gets a new layer each time its contents change and the same one when they do
 /// not. The tree is read once and hashed from what was read, rather than walking the
-/// directory twice.
-fn layer_of(dir: &Path, store: &LayerStore) -> anyhow::Result<Layer> {
+/// directory twice — and handed back for the same reason, since the caller needs the names
+/// in it and reading them out of the image would be a third pass.
+fn layer_of(dir: &Path, store: &LayerStore) -> anyhow::Result<(Layer, FileTree)> {
     let tree =
         tree::from_dir(dir).map_err(|e| anyhow::anyhow!("reading {}: {e}", dir.display()))?;
     let id = digest(&tree)?;
-    store.put(&id, &tree)
+    let layer = store.put(&id, &tree)?;
+    Ok((layer, tree))
 }
 
 /// A tree's identity: everything in it, in one order.
@@ -249,14 +328,16 @@ fn digest(tree: &FileTree) -> anyhow::Result<LayerId> {
 /// Only the top level is compared, because that is what `/abin` is: a flat directory of
 /// commands, and two of them answering to one name is the collision. A subdirectory two
 /// layers both have is not one.
-fn refuse_collisions(layers: &[Layer]) -> anyhow::Result<()> {
+///
+/// A [`Duplicate`] and not a message, so that the client hears this one rather than a
+/// server-side note about a session it thinks it configured.
+fn refuse_collisions(trees: &[FileTree]) -> anyhow::Result<()> {
     use std::collections::HashMap;
 
-    let mut seen: HashMap<std::ffi::OsString, usize> = HashMap::new();
-    for (index, layer) in layers.iter().enumerate() {
-        let tree = layer.tree(tree::Contents::Skip)?;
+    let mut seen: HashMap<&std::ffi::OsStr, usize> = HashMap::new();
+    for (index, tree) in trees.iter().enumerate() {
         for name in tree.root.entries.keys() {
-            if let Some(first) = seen.insert(name.clone(), index) {
+            if let Some(first) = seen.insert(name, index) {
                 let which = |n: usize| {
                     if n == 0 {
                         "the ones cortex provides".to_string()
@@ -264,13 +345,14 @@ fn refuse_collisions(layers: &[Layer]) -> anyhow::Result<()> {
                         format!("directory {n}")
                     }
                 };
-                anyhow::bail!(
+                return Err(Duplicate(format!(
                     "{:?} is in two of this session's executable directories — in {} and in \
                      {}. Rename one, or replace cortex's own with {DIR_ENV}.",
                     name,
                     which(first),
                     which(index)
-                );
+                ))
+                .into());
             }
         }
     }
@@ -281,12 +363,6 @@ fn refuse_collisions(layers: &[Layer]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap()
-    }
-
     fn dir_of(names: &[&str]) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -296,23 +372,6 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         dir
-    }
-
-    /// The override is process-wide, so the tests that use it take a lock rather than a
-    /// chance. `cargo test` runs them on several threads in one process.
-    fn builtin_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn with_builtin<T>(dir: &Path, f: impl FnOnce() -> T) -> T {
-        let _held = builtin_lock();
-        // SAFETY: the lock above is the only way this variable is set or read in these
-        // tests, so nothing else in this process observes it changing.
-        unsafe { std::env::set_var(DIR_ENV, dir) };
-        let out = f();
-        unsafe { std::env::remove_var(DIR_ENV) };
-        out
     }
 
     fn store_in(dir: &Path) -> LayerStore {
@@ -336,13 +395,11 @@ mod tests {
     fn without_a_release_or_an_override_it_says_what_to_do() {
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
-        let _held = builtin_lock();
-        // SAFETY: as above.
-        unsafe { std::env::remove_var(DIR_ENV) };
-        let err = runtime()
-            .block_on(Builtin::host().layer(&store))
-            .unwrap_err()
-            .to_string();
+        // `FileTree` has no `Debug`, so the `Ok` side cannot be unwrapped through.
+        let err = match Builtin::host().layer(None, &store) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a layer came from nowhere"),
+        };
         assert!(err.contains(DIR_ENV), "{err}");
     }
 
@@ -352,9 +409,7 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let layer = with_builtin(builtin.path(), || {
-            runtime().block_on(Builtin::host().layer(&store)).unwrap()
-        });
+        let (layer, _) = Builtin::host().layer(Some(builtin.path()), &store).unwrap();
 
         let tree = layer.tree(tree::Contents::Skip).unwrap();
         assert!(tree.get(b"mem").is_some(), "the override was not used");
@@ -369,12 +424,12 @@ mod tests {
         let store = store_in(work.path());
 
         let first = dir_of(&["mem"]);
-        let same = layer_of(first.path(), &store).unwrap().id;
-        assert_eq!(layer_of(first.path(), &store).unwrap().id, same);
+        let same = layer_of(first.path(), &store).unwrap().0.id;
+        assert_eq!(layer_of(first.path(), &store).unwrap().0.id, same);
 
         std::fs::write(first.path().join("mem"), b"#!/bin/sh\necho changed\n").unwrap();
         assert_ne!(
-            layer_of(first.path(), &store).unwrap().id,
+            layer_of(first.path(), &store).unwrap().0.id,
             same,
             "a changed executable named the same layer"
         );
@@ -386,11 +441,8 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let assembled = with_builtin(builtin.path(), || {
-            runtime()
-                .block_on(assemble(&[], &store, &work.path().join("abin")))
-                .unwrap()
-        });
+        let assembled =
+            assemble(&[], Some(builtin.path()), &store, &work.path().join("abin")).unwrap();
 
         assert_eq!(assembled.format, BaseFormat::Raw);
         assert_eq!(
@@ -407,15 +459,13 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let assembled = with_builtin(builtin.path(), || {
-            runtime()
-                .block_on(assemble(
-                    &[AbinSource::from(caller.path())],
-                    &store,
-                    &work.path().join("abin"),
-                ))
-                .unwrap()
-        });
+        let assembled = assemble(
+            &[AbinSource::of_path(caller.path()).unwrap()],
+            Some(builtin.path()),
+            &store,
+            &work.path().join("abin"),
+        )
+        .unwrap();
 
         assert_eq!(assembled.format, BaseFormat::Vmdk);
         let merged = tree::from_erofs(
@@ -443,17 +493,17 @@ mod tests {
         let store = store_in(work.path());
         let into = work.path().join("abin");
 
-        let (a, b) = with_builtin(builtin.path(), || {
-            let rt = runtime();
-            (
-                rt.block_on(assemble(&[AbinSource::from(one.path())], &store, &into))
-                    .unwrap()
-                    .disk,
-                rt.block_on(assemble(&[AbinSource::from(two.path())], &store, &into))
-                    .unwrap()
-                    .disk,
+        let disk = |source: &Path| {
+            assemble(
+                &[AbinSource::of_path(source).unwrap()],
+                Some(builtin.path()),
+                &store,
+                &into,
             )
-        });
+            .unwrap()
+            .disk
+        };
+        let (a, b) = (disk(one.path()), disk(two.path()));
         assert_ne!(a, b, "one disk was written twice");
         assert!(a.is_file() && b.is_file());
     }
@@ -465,18 +515,33 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let err = with_builtin(builtin.path(), || {
-            runtime()
-                .block_on(assemble(
-                    &[AbinSource::from(caller.path())],
-                    &store,
-                    &work.path().join("abin"),
-                ))
-                .unwrap_err()
-                .to_string()
-        });
-        assert!(err.contains("mem"), "{err}");
-        assert!(err.contains("cortex"), "{err}");
+        let error = assemble(
+            &[AbinSource::of_path(caller.path()).unwrap()],
+            Some(builtin.path()),
+            &store,
+            &work.path().join("abin"),
+        )
+        .unwrap_err();
+
+        let said = error.to_string();
+        assert!(said.contains("mem"), "{said}");
+        assert!(said.contains("cortex"), "{said}");
+        // And as itself, not just as a message: this is the one assembly failure the client
+        // hears about, and `Guest::boot` tells the two apart by downcasting to exactly this.
+        assert!(
+            error.downcast_ref::<Duplicate>().is_some(),
+            "a collision was not a `Duplicate`, so the client would never be told"
+        );
+    }
+
+    /// The other side of it: a failure that is this host's gap and not the caller's mistake
+    /// must *not* come back as a collision, or a session would be refused for it.
+    #[test]
+    fn nothing_else_is_read_as_a_collision() {
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path());
+        let error = assemble(&[], None, &store, &work.path().join("abin")).unwrap_err();
+        assert!(error.downcast_ref::<Duplicate>().is_none(), "{error}");
     }
 
     #[test]
@@ -485,16 +550,14 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let err = with_builtin(builtin.path(), || {
-            runtime()
-                .block_on(assemble(
-                    &[AbinSource::new("https://example.com/bin")],
-                    &store,
-                    &work.path().join("abin"),
-                ))
-                .unwrap_err()
-                .to_string()
-        });
+        let err = assemble(
+            &[AbinSource::new("https://example.com/bin")],
+            Some(builtin.path()),
+            &store,
+            &work.path().join("abin"),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("https"), "{err}");
     }
 }
