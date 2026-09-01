@@ -8,6 +8,12 @@
 //! `/pages` lists only top-level (workspace) pages; the `<page-id>` is the part
 //! after the last `__`. `page.json` is rendered on read.
 //!
+//! One path level per page, whatever the block depth: Notion's own two-column
+//! layouts put a page's sub-pages inside a `column`, two blocks below the page,
+//! and those get a directory directly under their page like any other. Databases
+//! are not projected — a `child_database` block is rendered as a marker and its
+//! rows stay behind the API.
+//!
 //! The Notion API is async (reqwest) and so is this store — each operation `.await`s the
 //! client directly; no runtime lives here. A `page.json`'s bytes are rendered once and cached
 //! briefly, so the `stat` that reports a size and the reads that follow it cost one render
@@ -62,10 +68,18 @@ impl std::fmt::Debug for NotionConfig {
     }
 }
 
-/// A rendered `page.json`: its bytes plus the page's timestamps.
+/// A rendered `page.json`: its bytes, the page's timestamps, and the sub-page
+/// directories that go beside it.
+///
+/// The directories come from the same tree the bytes do, which is what keeps the
+/// two from disagreeing: a `child_page` block renders as a marker on the grounds
+/// that its own directory carries the content, so the directory has to exist for
+/// exactly the blocks the render marked.
 #[derive(Clone)]
 struct Rendered {
     bytes: Arc<Vec<u8>>,
+    /// `<sanitized-title>__<id>` per `child_page` block, at whatever depth it sat.
+    child_dirs: Arc<Vec<String>>,
     mtime: Option<SystemTime>,
     ctime: Option<SystemTime>,
 }
@@ -212,8 +226,9 @@ impl NotionFs {
     }
 
     /// Block children recursively, embedding nested blocks under a `children`
-    /// key. `child_page`/`child_database` blocks are not descended into (they
-    /// surface as subdirectories). Recursion stops at [`MAX_BLOCK_DEPTH`].
+    /// key. A `child_page` is not descended into — its own directory is where its
+    /// blocks are read — and neither is a `child_database`, whose rows are a query
+    /// this backend does not make. Recursion stops at [`MAX_BLOCK_DEPTH`].
     fn list_block_tree<'a>(
         &'a self,
         id: String,
@@ -259,10 +274,13 @@ impl NotionFs {
         }
         let page = self.get_page(page_id).await?;
         let blocks = self.list_block_tree(page_id.to_string(), 0).await?;
+        let mut child_dirs = Vec::new();
+        collect_child_pages(&blocks, &mut child_dirs);
         let normalized = normalize_page(&page, &blocks);
         let bytes = serde_json::to_vec_pretty(&normalized).map_err(io_other)?;
         let rendered = Rendered {
             bytes: Arc::new(bytes),
+            child_dirs: Arc::new(child_dirs),
             mtime: page_time(&page, "last_edited_time"),
             ctime: page_time(&page, "created_time"),
         };
@@ -289,24 +307,21 @@ impl NotionFs {
     }
 
     /// Contents of a page dir: `page.json` plus a subdir per `child_page` block.
+    ///
+    /// Served from the render, not from one level of blocks: a child page sits
+    /// wherever the page's layout puts it, and the immediate children of a
+    /// two-column page are the columns. Reading the render costs the fetch a
+    /// `stat` of `page.json` would have paid anyway, and the cache means an `ls`
+    /// and the read after it share it.
     async fn page_dir_entries(&self, page_id: &str) -> io::Result<Vec<Dirent>> {
-        let blocks = self.list_children(page_id).await?;
+        let rendered = self.render_cached(page_id).await?;
         let mut out = vec![Dirent::new("page.json", DirentKind::File)];
-        for b in &blocks {
-            if b.get("type").and_then(|t| t.as_str()) != Some("child_page") {
-                continue;
-            }
-            let child_title = b
-                .get("child_page")
-                .and_then(|c| c.get("title"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("untitled");
-            let child_id = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
-            out.push(Dirent::new(
-                format!("{}__{}", sanitize_name(child_title), child_id),
-                DirentKind::Dir,
-            ));
-        }
+        out.extend(
+            rendered
+                .child_dirs
+                .iter()
+                .map(|name| Dirent::new(name.clone(), DirentKind::Dir)),
+        );
         Ok(out)
     }
 }
@@ -458,6 +473,34 @@ fn page_id(dir_name: &str) -> String {
         .to_string()
 }
 
+/// Every `child_page` block in a tree, at whatever depth, as a directory name.
+///
+/// Depth is the whole point: a page whose sub-pages live in a two-column layout
+/// has columns as its immediate children and not one child page among them.
+/// A `child_page` is never descended into, so it has no `children` to walk.
+fn collect_child_pages(blocks: &[Value], out: &mut Vec<String>) {
+    for b in blocks {
+        if b.get("type").and_then(|t| t.as_str()) == Some("child_page") {
+            let title = child_title(b.get("child_page").unwrap_or(&Value::Null));
+            let id = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            out.push(format!("{}__{}", sanitize_name(&title), id));
+            continue;
+        }
+        if let Some(kids) = b.get("children").and_then(|c| c.as_array()) {
+            collect_child_pages(kids, out);
+        }
+    }
+}
+
+/// The `title` a `child_page`/`child_database` block's payload carries.
+fn child_title(content: &Value) -> String {
+    content
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("untitled")
+        .to_string()
+}
+
 /// Directory name for a page: `<sanitized-title>__<id>`.
 fn page_dirname(page: &Value) -> String {
     let title = extract_title(page);
@@ -511,14 +554,6 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
         .get(parent_type)
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let content_blocks: Vec<Value> = blocks
-        .iter()
-        .filter(|b| {
-            let t = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            t != "child_page" && t != "child_database"
-        })
-        .cloned()
-        .collect();
     json!({
         "page_id": page.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "title": extract_title(page),
@@ -528,8 +563,8 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
         "parent_type": parent_type,
         "parent_id": parent_id,
         "archived": page.get("archived").and_then(|v| v.as_bool()).unwrap_or(false),
-        "markdown": blocks_to_markdown(&content_blocks),
-        "blocks": content_blocks,
+        "markdown": blocks_to_markdown(blocks),
+        "blocks": blocks,
     })
 }
 
@@ -686,7 +721,11 @@ fn block_to_md(block: &Value, indent: usize) -> String {
             format!("$${expr}$$")
         }
         "table_of_contents" => "[TOC]".to_string(),
-        "child_page" | "child_database" => String::new(),
+        // The content is not here — a child page's is in its own directory, a
+        // database's stays behind a query this backend does not make — so the
+        // line says where it went rather than reading as a gap in the page.
+        "child_page" => format!("{prefix}[page: {}]", child_title(&content)),
+        "child_database" => format!("{prefix}[database: {}]", child_title(&content)),
         _ => {
             if text.is_empty() {
                 String::new()
