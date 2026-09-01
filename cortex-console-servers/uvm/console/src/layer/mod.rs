@@ -22,5 +22,6 @@
 pub mod atomic;
 mod id;
 pub mod map;
+pub mod tree;
 
 pub use id::LayerId;
