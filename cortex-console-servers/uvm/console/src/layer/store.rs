@@ -128,11 +128,8 @@ mod tests {
             mtime: 0,
             mtime_nsec: 0,
         };
-        tree.insert(
-            b"etc",
-            TreeNode::Directory(DirectoryNode::new(meta(0o755))),
-        )
-        .unwrap();
+        tree.insert(b"etc", TreeNode::Directory(DirectoryNode::new(meta(0o755))))
+            .unwrap();
         tree.insert(
             b"etc/hello",
             TreeNode::RegularFile(RegularFileNode {
@@ -180,7 +177,10 @@ mod tests {
         let stamp = std::fs::metadata(&first.erofs).unwrap().modified().unwrap();
         let second = store.put(&id, &sample()).unwrap();
         assert_eq!(
-            std::fs::metadata(&second.erofs).unwrap().modified().unwrap(),
+            std::fs::metadata(&second.erofs)
+                .unwrap()
+                .modified()
+                .unwrap(),
             stamp,
             "the layer was written again"
         );
@@ -190,10 +190,7 @@ mod tests {
     fn getting_what_was_never_put_says_so() {
         let dir = tempfile::tempdir().unwrap();
         let store = LayerStore::open(dir.path()).unwrap();
-        let err = store
-            .get(&LayerId::of(b"absent"))
-            .unwrap_err()
-            .to_string();
+        let err = store.get(&LayerId::of(b"absent")).unwrap_err().to_string();
         assert!(err.contains("no layer"), "{err}");
     }
 
@@ -256,7 +253,10 @@ mod tests {
 
         assert_ne!(one.erofs, two.erofs);
         assert!(
-            one.tree(Contents::Skip).unwrap().get(b"etc/second").is_none(),
+            one.tree(Contents::Skip)
+                .unwrap()
+                .get(b"etc/second")
+                .is_none(),
             "the second layer's file appeared in the first"
         );
         assert!(

@@ -75,9 +75,8 @@ pub fn read(path: &Path) -> anyhow::Result<ErofsDataMap> {
     for file in stored.files {
         // SAFETY: these bytes came from `OsStr::as_encoded_bytes` in `write`, which is the
         // documented precondition — the encoding is self-consistent and unchanged in between.
-        let path = PathBuf::from(unsafe {
-            std::ffi::OsString::from_encoded_bytes_unchecked(file.path)
-        });
+        let path =
+            PathBuf::from(unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(file.path) });
         file_blocks.insert(path, (file.start_block, file.size));
     }
     Ok(ErofsDataMap {

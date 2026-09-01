@@ -97,7 +97,9 @@ mod tests {
     }
 
     fn extent_lines(text: &str) -> Vec<&str> {
-        text.lines().filter(|line| line.starts_with("RW ")).collect()
+        text.lines()
+            .filter(|line| line.starts_with("RW "))
+            .collect()
     }
 
     #[test]

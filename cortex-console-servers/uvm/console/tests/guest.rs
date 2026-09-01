@@ -608,7 +608,8 @@ async fn a_host_session_reaches_the_doors_it_was_granted() {
     // policy is still what decides which of them reply.
     let out = fx.output(&fetch_by_host_name(ungranted)).await;
     assert_ne!(
-        out.code, 0,
+        out.code,
+        0,
         "the name reached a port nobody granted, so resolving it is a grant: {:?}",
         String::from_utf8_lossy(&out.stdout)
     );

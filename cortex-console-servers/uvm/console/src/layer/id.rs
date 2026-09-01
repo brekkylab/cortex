@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn an_id_round_trips_through_its_spelling() {
         let id = LayerId::of(b"hello");
-        assert_eq!(LayerId::parse(&id.to_string()).unwrap(), id);
+        assert_eq!(LayerId::parse(id.as_ref()).unwrap(), id);
         assert_eq!(id.file_stem(), &id.to_string()["sha256:".len()..]);
     }
 

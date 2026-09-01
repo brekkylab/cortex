@@ -75,9 +75,7 @@ pub fn from_erofs(image: &Path, contents: Contents) -> anyhow::Result<FileTree> 
                         let mut buf = Vec::with_capacity(entry.size as usize);
                         reader
                             .file_data_reader(entry.nid)
-                            .map_err(|e| {
-                                anyhow::anyhow!("opening {}: {e}", entry.path.display())
-                            })?
+                            .map_err(|e| anyhow::anyhow!("opening {}: {e}", entry.path.display()))?
                             .read_to_end(&mut buf)
                             .map_err(|e| {
                                 anyhow::anyhow!("reading {}: {e}", entry.path.display())
@@ -86,7 +84,7 @@ pub fn from_erofs(image: &Path, contents: Contents) -> anyhow::Result<FileTree> 
                     }
                 };
                 TreeNode::RegularFile(RegularFileNode {
-                    id: *ids.entry(entry.nid).or_insert_with(RegularFileId::new),
+                    id: *ids.entry(entry.nid).or_default(),
                     metadata: entry.metadata.clone(),
                     xattrs: entry.xattrs,
                     data: FileData::Memory(data),
@@ -176,9 +174,8 @@ fn walk_dir(dir: &Path, prefix: &mut Vec<u8>, tree: &mut FileTree) -> anyhow::Re
         };
 
         if found.file_type().is_symlink() {
-            let target = std::fs::read_link(entry.path()).map_err(|e| {
-                anyhow::anyhow!("reading the link {}: {e}", entry.path().display())
-            })?;
+            let target = std::fs::read_link(entry.path())
+                .map_err(|e| anyhow::anyhow!("reading the link {}: {e}", entry.path().display()))?;
             tree.insert(
                 prefix,
                 TreeNode::Symlink(SymlinkNode {
@@ -449,7 +446,10 @@ mod tests {
             matches!(tree.get(b"link"), Some(TreeNode::Symlink(_))),
             "the link was walked"
         );
-        assert!(tree.get(b"link/inside").is_none(), "the link was walked into");
+        assert!(
+            tree.get(b"link/inside").is_none(),
+            "the link was walked into"
+        );
     }
 
     #[test]

@@ -43,6 +43,8 @@ use microsandbox_image::{
     tree::ResourceLimits,
 };
 
+use cortex_uvm_console::layer::LayerId;
+
 use crate::contract::{BaseFormat, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec};
 
 /// The guest half, cross-compiled and embedded by `build.rs`. Written into every boot
@@ -148,19 +150,30 @@ pub const IMAGE_ENV: &str = "CORTEX_UVM_IMAGE";
 /// [`IMAGE_ENV`]. A session that survives the console, for whoever wants one.
 pub const SESSION_IMAGE_ENV: &str = "CORTEX_UVM_SESSION_IMAGE";
 
+/// The reserved host a locally built image is named under.
+///
+/// `.local` is reserved by RFC 6762, so this can never be a registry somebody reaches, and
+/// the whole reference is still real OCI grammar — which matters, because the server turns
+/// what `init` named into a [`Reference`] before anything else happens. A local image that
+/// could not be parsed as one would have needed a second way to say what a base is.
+pub const LOCAL_HOST: &str = "cortex.local/";
+
 /// The read-only base image every session overlays, provisioning it once if it is not
 /// cached.
 ///
-/// Three sources, in the order a client's own answer beats a server's:
+/// Three sources, and which one it is was settled at `init`:
 ///
-/// Two sources, and the choice between them was made at `init`:
-///
-/// - `reference` — an OCI image, pulled and materialized (see [`pull`]). What the session named,
-///   or what [`IMAGE_ENV`] named for a session that named nothing; the server settled which
-///   before calling here.
+/// - a `cortex.local/…` reference — an image built here, [`built`] out of the layer store.
+///   Resolved and never fetched: the point of the spelling is that it names no place to
+///   fetch from.
+/// - any other `reference` — an OCI image, pulled and materialized (see [`pull`]). What the
+///   session named, or what [`IMAGE_ENV`] named for a session that named nothing.
 /// - `None` — the pinned rootfs tarball, encoded to an EROFS (see [`Rootfs`]).
 pub async fn base_image(reference: Option<&str>) -> anyhow::Result<BaseImage> {
     if let Some(reference) = reference {
+        if let Some(rest) = reference.strip_prefix(LOCAL_HOST) {
+            return built(rest);
+        }
         return pull(reference).await;
     }
 
@@ -174,6 +187,39 @@ pub async fn base_image(reference: Option<&str>) -> anyhow::Result<BaseImage> {
     Ok(BaseImage {
         path: image,
         format: BaseFormat::Raw,
+        spec: ImageSpec::default(),
+    })
+}
+
+/// Where images stitched here live.
+pub fn built_dir() -> anyhow::Result<PathBuf> {
+    Ok(home()?.join("built"))
+}
+
+/// An image stitched here, named by the `built@sha256:…` part of its reference.
+///
+/// Not fetched, not provisioned, and not built on demand: a built image is something a
+/// `commit` left behind, and a session naming one that is not here is naming something that
+/// was never made or has been cleared away. Saying so is the whole of what this can do
+/// about it.
+fn built(rest: &str) -> anyhow::Result<BaseImage> {
+    let digest = rest
+        .split_once('@')
+        .map(|(_repository, digest)| digest)
+        .ok_or_else(|| anyhow::anyhow!("{LOCAL_HOST}{rest} names no digest"))?;
+    let id = LayerId::parse(digest)?;
+
+    let path = built_dir()?.join(format!("{}.vmdk", id.file_stem()));
+    anyhow::ensure!(
+        path.exists(),
+        "no image {id} was built here — it was never built, or the cache has been cleared"
+    );
+
+    Ok(BaseImage {
+        path,
+        format: BaseFormat::Vmdk,
+        // A stitched image states nothing about running a process in it. What a build meant
+        // to say travels beside the image, and reading it is `commit`'s to add.
         spec: ImageSpec::default(),
     })
 }

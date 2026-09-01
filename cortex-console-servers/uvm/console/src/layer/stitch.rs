@@ -172,7 +172,11 @@ mod tests {
         assert_eq!(descriptor.extension().unwrap(), "vmdk");
 
         let fsmeta = dir_.path().join("built/image.fsmeta.erofs");
-        assert!(fsmeta.is_file(), "no fsmeta beside {}", descriptor.display());
+        assert!(
+            fsmeta.is_file(),
+            "no fsmeta beside {}",
+            descriptor.display()
+        );
         let merged = tree::from_erofs(&fsmeta, Contents::Skip).unwrap();
 
         assert!(
