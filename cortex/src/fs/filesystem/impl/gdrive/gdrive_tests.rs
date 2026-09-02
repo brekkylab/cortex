@@ -202,14 +202,15 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
     );
     assert!(same_name(composed, &decomposed), "one name, two spellings");
     assert!(!same_name("한글.txt", "한국.txt"), "and not a collapse");
-    assert!(!same_name("report.pdf", "report (2).pdf"));
+    assert!(!same_name("report.pdf", "report_1BxiMVs0.pdf"));
     assert_eq!("\u{212A}".nfc().collect::<String>(), "K");
     assert!(same_name("2\u{212A} readings.txt", "2K readings.txt"));
     assert!(same_name("a\u{037E}b", "a;b"));
 
-    // The number goes *before* the extension, or the entry leaves every glob a reader
+    // The tag goes *before* the extension, or the entry leaves every glob a reader
     // would use — measured against a real account, two of 33 spreadsheets were invisible
-    // to `**/*.gsheet.json`. A folder is not renamed around a dot.
+    // to `**/*.gsheet.json`. A folder is not renamed around a dot. A name only one child
+    // holds is not touched at all.
     let mut children = vec![
         mk("report.gsheet.json", "s1", Serves::Native(NativeApi::Sheet)),
         mk("report.gsheet.json", "s2", Serves::Native(NativeApi::Sheet)),
@@ -220,6 +221,7 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         mk("notes", "n2", Serves::Original),
         mk("v1.2", "v1", Serves::Nothing),
         mk("v1.2", "v2", Serves::Nothing),
+        mk("alone.txt", "u1", Serves::Original),
     ];
     disambiguate(&mut children);
     assert_eq!(
@@ -228,15 +230,16 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
             .map(|c| c.vfs_name.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "report.gsheet.json",
-            "report (2).gsheet.json",
-            "report (3).gsheet.json",
-            "photo.jpeg",
-            "photo (2).jpeg",
-            "notes",
-            "notes (2)",
-            "v1.2",
-            "v1.2 (2)",
+            "report_s1.gsheet.json",
+            "report_s2.gsheet.json",
+            "report_s3.gsheet.json",
+            "photo_p1.jpeg",
+            "photo_p2.jpeg",
+            "notes_n1",
+            "notes_n2",
+            "v1.2_v1",
+            "v1.2_v2",
+            "alone.txt",
         ]
     );
 
@@ -254,18 +257,30 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         pair[0].vfs_name,
         pair[1].vfs_name
     );
+    // Tagged, not numbered. Grouping by bytes would put the two spellings in separate
+    // groups of one, leave both untagged, and reach the safety net below — which does
+    // stop the shadowing, but by rank, which is the property this change exists to
+    // remove. So the names themselves are what gets asserted.
+    assert_eq!(
+        (pair[0].vfs_name.as_str(), pair[1].vfs_name.as_str()),
+        (
+            format!("{}_a.pdf", two.strip_suffix(".pdf").unwrap()).as_str(),
+            format!("{}_b.pdf", two_nfd.strip_suffix(".pdf").unwrap()).as_str()
+        ),
+        "a pair equal only by composition is one collision, and both take an id"
+    );
     assert!(
-        pair.iter()
-            .find(|c| c.vfs_name.contains("(2)"))
-            .expect("one of the two is numbered")
-            .vfs_name
-            .ends_with(".pdf"),
-        "and it is still findable by glob"
+        pair.iter().all(|c| c.vfs_name.ends_with(".pdf")),
+        "and both are still findable by glob"
     );
 
-    // And the assignment does not move when the listing order does — three edits, three
-    // arrival orders, the same three names.
-    let assign = |ids: [&str; 3]| {
+    // A name is the file's, not the set's. Reordering must not move it — the listing
+    // arrives `modifiedTime desc`, so an edit reorders — and neither must adding or
+    // removing a sibling, which is what numbering by rank could not manage: a new
+    // `report.pdf` sorting between two existing ones took `(2)` from its holder and
+    // pushed it to `(3)`, so a path recorded from one listing opened another file after
+    // the next. Nothing errors on that; it just reads the wrong document.
+    let assign = |ids: &[&str]| {
         let mut c: Vec<Child> = ids
             .iter()
             .map(|i| mk("report.pdf", i, Serves::Original))
@@ -275,16 +290,101 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         by_id.sort();
         by_id
     };
-    let a = assign(["x1", "x2", "x3"]);
-    assert_eq!(a, assign(["x3", "x1", "x2"]), "an edit must not renumber");
-    assert_eq!(a, assign(["x2", "x3", "x1"]), "an edit must not renumber");
+    let two = assign(&["B", "C"]);
     assert_eq!(
-        a,
+        two,
         vec![
-            ("x1".to_string(), "report.pdf".to_string()),
-            ("x2".to_string(), "report (2).pdf".to_string()),
-            ("x3".to_string(), "report (3).pdf".to_string()),
-        ]
+            ("B".to_string(), "report_B.pdf".to_string()),
+            ("C".to_string(), "report_C.pdf".to_string()),
+        ],
+        "both are tagged, so neither holds a name the other could take"
+    );
+
+    let three = assign(&["B", "B5", "C"]);
+    assert_eq!(three, assign(&["C", "B", "B5"]), "an edit must not rename");
+    assert_eq!(three, assign(&["B5", "C", "B"]), "an edit must not rename");
+    let name_of =
+        |v: &Vec<(String, String)>, id: &str| v.iter().find(|(i, _)| i == id).unwrap().1.clone();
+    // The reported case: a third file whose id sorts between the two.
+    for id in ["B", "C"] {
+        assert_eq!(
+            name_of(&two, id),
+            name_of(&three, id),
+            "{id} must not be renamed by a sibling arriving"
+        );
+    }
+    // And the same going the other way, which is a file moved out or deleted.
+    for id in ["B", "B5", "C"] {
+        assert_eq!(
+            name_of(&three, id),
+            name_of(&assign(&["B", "B5", "C", "D"]), id),
+            "{id} must not be renamed by a fourth arriving"
+        );
+    }
+    assert_eq!(
+        name_of(&three, "B5"),
+        name_of(&assign(&["B5", "C"]), "B5"),
+        "nor by one leaving"
+    );
+
+    // The tag comes off the *end*: the older Drive id scheme shares a long prefix —
+    // measured, six files in one account under `0BxO-Nrmd-kR7` — so a leading slice is
+    // where collisions actually happen and a trailing one is where they do not.
+    assert_eq!(
+        id_tag("0BxO-Nrmd-kR7UXE1cTIyWERKbkU"),
+        "yWERKbkU",
+        "the tail, not the head"
+    );
+    assert_eq!(
+        id_tag("short"),
+        "short",
+        "an id under the tag length is itself"
+    );
+
+    // Two ids ending alike inside one collision take whole ids, so a tag and a number
+    // never appear on the same name — and only that group does, so one folder's unlucky
+    // pair does not lengthen anybody else's. The `b.txt` ids are longer than the tag on
+    // purpose: with ids of eight characters or fewer the short form and the whole id are
+    // the same string, and the assertion would hold whichever the code used.
+    let shared = "z".repeat(ID_TAG_LEN);
+    let (p, q) = (format!("AAA{shared}"), format!("BBB{shared}"));
+    assert_eq!(id_tag(&p), id_tag(&q), "the fixture has to collide");
+    let (r, s) = ("bbbbbbbbb11111111", "bbbbbbbbb22222222");
+    assert!(r.len() > ID_TAG_LEN, "or the short tag is the whole id");
+    let mut clash = vec![
+        mk("a.txt", &p, Serves::Original),
+        mk("a.txt", &q, Serves::Original),
+        mk("b.txt", r, Serves::Original),
+        mk("b.txt", s, Serves::Original),
+    ];
+    disambiguate(&mut clash);
+    assert_eq!(clash[0].vfs_name, format!("a_{p}.txt"));
+    assert_eq!(clash[1].vfs_name, format!("a_{q}.txt"));
+    assert!(
+        clash.iter().all(|c| !c.vfs_name.contains(" (")),
+        "no name carries both a tag and a number"
+    );
+    assert_eq!(
+        (clash[2].vfs_name.as_str(), clash[3].vfs_name.as_str()),
+        ("b_11111111.txt", "b_22222222.txt"),
+        "a different collision keeps the short tag rather than the whole id"
+    );
+
+    // And the net under both, which needs a coincidence to reach: a folder that already
+    // holds a file named the way tagging is about to name another one. Numbering is
+    // set-dependent, which is why it is last — but two entries under one name is worse.
+    let mut planted = vec![
+        mk("c.txt", "ccccccccc99999999", Serves::Original),
+        mk("c.txt", "ccccccccc88888888", Serves::Original),
+        mk("c_99999999.txt", "ddddddddddddddddd", Serves::Original),
+    ];
+    disambiguate(&mut planted);
+    let mut got: Vec<&str> = planted.iter().map(|c| c.vfs_name.as_str()).collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec!["c_88888888.txt", "c_99999999 (2).txt", "c_99999999.txt"],
+        "the planted name and the tagged one are told apart, extension intact"
     );
 }
 
