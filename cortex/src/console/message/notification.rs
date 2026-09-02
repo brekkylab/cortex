@@ -1,9 +1,11 @@
 //! The methods nothing answers, all three of them.
 //!
-//! One file rather than three, because each of these is a name and a paragraph and
-//! nothing else — there is no `params` type to grow, no `result` to pair it with. What
-//! they have to say is mostly about *each other*: [`Start`] and [`Stop`] are two ends of
-//! the same trade, and [`Quit`] is the one that is not that trade at all.
+//! [`Notification`] is which one a message names, and the three types below say what
+//! each carries. One file rather than four, because each of these is a name and a
+//! paragraph and nothing else — there is no `params` type to grow, no `result` to pair
+//! it with. What they have to say is mostly about *each other*: [`Start`] and [`Stop`]
+//! are two ends of the same trade, and [`Quit`] is the one that is not that trade at
+//! all.
 //!
 //! [`Start`] and [`Stop`] are **the protocol's resource management, and only that**.
 //! Neither changes what a session can do — a call that needs a booted session boots one,
@@ -17,7 +19,66 @@
 //! one place where what it carries is written down, and giving one a parameter later is
 //! a field and not a shape that did not exist.
 
-use serde::{Deserialize, Serialize};
+use bson::Bson;
+use serde::{Deserialize, Serialize, de, ser::SerializeMap};
+
+use super::Method;
+
+/// A method that is not answered.
+///
+/// A notification is a method with no `id`, and so no response, no error and no result
+/// — which makes it the right shape for exactly one kind of thing: what is true whether
+/// or not the other end acknowledges it. All three here are that, and [`Start`],
+/// [`Stop`] and [`Quit`] below argue each of them.
+///
+/// Which side a method is on is what JSON-RPC's `id` decides, so it is a decision a
+/// method has to make rather than inherit: [`Call`](super::Call) is the other one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Notification {
+    /// **client → server.** Boot now, so that no command has to. See [`Start`].
+    Start,
+
+    /// **client → server.** Release what booting took. See [`Stop`].
+    Stop,
+
+    /// **client → server, last.** The session is over; exit. See [`Quit`].
+    Quit,
+}
+
+impl Notification {
+    pub fn method(&self) -> Method {
+        match self {
+            Notification::Start => Method::Start,
+            Notification::Stop => Method::Stop,
+            Notification::Quit => Method::Quit,
+        }
+    }
+
+    /// Writes this notification's `params` into the object being serialized.
+    ///
+    /// Nothing carries any today, and the match is what makes that a decision
+    /// rather than an omission: a notification added later cannot compile without
+    /// saying what it sends.
+    pub(super) fn serialize_params<M: SerializeMap>(&self, _map: &mut M) -> Result<(), M::Error> {
+        match self {
+            Notification::Start | Notification::Stop | Notification::Quit => Ok(()),
+        }
+    }
+
+    /// The notification a `method` and its `params` name.
+    ///
+    /// Reached only for a message that carried no `id`, which is what says nothing
+    /// will answer it — so a request's method arriving here is a peer that has
+    /// asked for something and left no way to be told.
+    pub(super) fn from_params<E: de::Error>(method: Method, _params: Bson) -> Result<Self, E> {
+        match method {
+            Method::Start => Ok(Notification::Start),
+            Method::Stop => Ok(Notification::Stop),
+            Method::Quit => Ok(Notification::Quit),
+            _ => Err(E::custom(format!("{method} is a request and needs an id"))),
+        }
+    }
+}
 
 /// Boot now, so that no command has to. The `params` of `start`, which are none.
 ///

@@ -27,24 +27,37 @@
 //! It is also now redundant, because a BSON document's first four bytes are its own
 //! length; [`stdio`](super::stdio) has what retiring the header would take.
 //!
-//! The split inside here is the envelope, the methods, and the two things that are
-//! neither:
+//! The split inside here is the envelope, the three things a message can be, and what
+//! is common to all of them:
 //!
 //! - `message` — the envelope every object shares: [`Message`] and its three
 //!   shapes, the [`RequestId`] that pairs a response with its request, and the serde
 //!   impls that put all of it on the wire.
-//! - `method` — the methods and what each of them carries, one file apiece ([`InitCall`],
-//!   [`ExecCall`] and its [`ExecResp`], the file plane's [`ReadCall`] and [`WriteCall`], the three that
-//!   carry nothing). [`Method`] names them; [`Call`] is the four that are answered and
-//!   [`Notification`] the three that are not.
-//! - `error` — why a request could not be answered: [`Error`] and its codes. The other
-//!   half of a response is whatever the method returns, which needs no type here.
+//! - `call` — the asking half: [`Call`], and what each of the four methods sends —
+//!   [`InitCall`] and the vocabulary a session is described in, [`ExecCall`],
+//!   [`ReadCall`], [`WriteCall`].
+//! - `response` — the answering half: [`Response`], and what each of the four answers
+//!   with — [`InitResp`], [`ExecResp`], [`ReadResp`], [`WriteResp`] — or the [`Error`]
+//!   that stands where a result would have been.
+//! - `notification` — [`Notification`], the three that are not answered, and the type
+//!   apiece that says what each of them carries — which today is nothing.
+//! - `method` — [`Method`], the name a method goes by on the wire.
+//! - `error` — why a request could not be answered: [`Error`] and its codes.
+//! - `utils` — what the wire needs that is nobody's method: `bytes`, how a byte payload
+//!   reaches the wire, and `flatten`, how a value writes its own members into an object
+//!   somebody else opened.
 //!
-//! A `Call` and a `Notification` each write and read their own `params`, so adding
-//! a method means touching the side it belongs to and not the envelope. Which of the
-//! two a method is, is the whole of what JSON-RPC's `id` decides, and it is why those
-//! are the types the envelope names — while *what* each method carries is one file of
-//! its own, so that changing a method is one place to look.
+//! A [`Call`] declares its own `params`, a [`Response`] its own `result`, and a
+//! [`Notification`] writes its own — so adding a method means touching the sides it
+//! belongs to and not the envelope. Which of the two shapes a method is, is the whole of
+//! what JSON-RPC's `id` decides, and it is why those are the types the envelope names.
+//!
+//! **The files are split by direction and not by method**, because that is the division a
+//! reader of this protocol has: a client writes calls and reads responses, a server does
+//! the reverse, and neither is ever holding both halves of a method at once. It is also
+//! the division the envelope names, so a file holds exactly what one of those enums can
+//! be — and the two halves of a method stay in step because the answer is written in the
+//! call's own vocabulary, an [`ImageSource`] asked for being an [`ImageSource`] confirmed.
 //!
 //! # What the protocol is
 //!
@@ -130,8 +143,8 @@
 //! ## Why the `bytes` helper does not ask the codec
 //!
 //! [`is_human_readable`](serde::Serializer::is_human_readable) is the obvious way for
-//! one helper to serve a textual codec and a binary one, and `method`'s `bytes` module
-//! has why it cannot be used: `params` and `result` pass through a `Bson` value before
+//! one helper to serve a textual codec and a binary one, and the `bytes` module has why
+//! it cannot be used: `params` and `result` pass through a `Bson` value before
 //! they reach the wire, and `bson`'s value-level serializer reports itself
 //! human-readable, so the branch would quietly restore base64 at the one place the byte
 //! type was the point.
@@ -212,10 +225,17 @@
 //! 1.0×. Getting that is why the codec is BSON and not JSON, which has no byte type and
 //! would have made them base64 at best (1.37×) or `[104,105,10]` at worst (4×).
 
+mod call;
 mod error;
 mod message;
 mod method;
+mod notification;
+mod response;
+mod utils;
 
+pub use call::*;
 pub use error::*;
 pub use message::*;
 pub use method::*;
+pub use notification::*;
+pub use response::*;

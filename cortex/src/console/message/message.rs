@@ -7,7 +7,7 @@
 //! it.
 //!
 //! What a particular method carries is [`Call`]'s and [`Response`]'s — the request half
-//! and the answering half — and each writes and reads its own members, so adding a method
+//! and the answering half — and each says what its own members are, so adding a method
 //! means touching the side it belongs to and not the envelope.
 
 use std::fmt;
@@ -19,7 +19,8 @@ use serde::{
     ser::SerializeMap,
 };
 
-use crate::console::{Call, Error, Method, Notification, Response};
+use super::utils::flatten::FlatMapSerializer;
+use crate::console::{Call, Method, Notification, Response};
 
 /// The only `jsonrpc` member this protocol accepts.
 pub const VERSION: &str = "2.0";
@@ -102,12 +103,13 @@ impl Message {
 // `params` and `result` are typed by the method rather than by position, and a
 // notification is a request with a member missing. Deriving would mean choosing a
 // tagging scheme the spec does not use, so the mapping is written out instead —
-// which is also where `jsonrpc` gets checked and `result` xor `error` gets
-// enforced, rather than being someone's job later.
+// which is also where `jsonrpc` gets checked, rather than being someone's job later.
 //
-// What a method's `params` are is not decided here: a `Call` writes and reads its
-// own, and so does a `Notification`. This half only knows which of the three shapes
-// it is looking at.
+// What a method carries is not decided here: a `Call` declares its own `params`, a
+// `Notification` writes its own, and a `Response` says which of `result` and `error` it
+// is. This half only knows which of the three shapes it is looking at, and — for a
+// request or a response — hands that half an object already open so that its members
+// land in this one. See [`flatten`](super::utils::flatten).
 impl Serialize for Message {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         // 4 is the largest a JSON-RPC object gets: jsonrpc, id, method, params.
@@ -117,8 +119,9 @@ impl Serialize for Message {
         match self {
             Message::Request { id, call } => {
                 map.serialize_entry("id", id)?;
-                map.serialize_entry("method", call.method().as_str())?;
-                call.serialize_params(&mut map)?;
+                // `method` and `params` are the call's own, and it writes them here
+                // rather than under a member of its own — see [`flatten`](super::utils::flatten).
+                call.serialize(FlatMapSerializer(&mut map))?;
             }
 
             Message::Notification(notification) => {
@@ -129,8 +132,10 @@ impl Serialize for Message {
             Message::Response { id, result } => {
                 map.serialize_entry("id", id)?;
                 // Which members those are — `method` and `result`, or `error` — is the
-                // response's own business, the way a call's `params` is a call's.
-                result.serialize_into(&mut map)?;
+                // response's own business, the way a call's are, and they land here
+                // rather than under a member of their own for the same reason — see
+                // [`flatten`](super::utils::flatten).
+                result.serialize(FlatMapSerializer(&mut map))?;
             }
         }
 
@@ -157,11 +162,12 @@ impl<'de> Visitor<'de> for MessageVisitor {
         let mut jsonrpc: Option<String> = None;
         let mut id: Option<RequestId> = None;
         let mut method: Option<String> = None;
-        // `params` and `result` are held as values because member order is not
-        // guaranteed: `method` may arrive after the `params` it types.
+        // `params`, `result` and `error` are held as values because member order is
+        // not guaranteed: `method` may arrive after the `params` it types, and which
+        // shape a message is cannot be known until every member has been seen.
         let mut params: Option<Bson> = None;
         let mut result: Option<Bson> = None;
-        let mut error: Option<Error> = None;
+        let mut error: Option<Bson> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -210,21 +216,11 @@ impl<'de> Visitor<'de> for MessageVisitor {
                      a request nor a response",
                 ));
             }
-            let result = match (result, error) {
-                // A `result` is typed by the method the response echoed, and a response
-                // that names none is one nothing can read.
-                (Some(value), None) => {
-                    let method = method
-                        .ok_or_else(|| de::Error::custom("a result needs the method it answers"))?;
-                    Response::from_result(method, value)?
-                }
-                (None, Some(error)) => Response::Error(error),
-                (Some(_), Some(_)) => {
-                    return Err(de::Error::custom("both a result and an error"));
-                }
-                (None, None) => unreachable!("one of the two is there"),
-            };
             let id = id.ok_or_else(|| de::Error::custom("a response needs an id"))?;
+            // Which of `result` and `error` is there, and whether the one that is can be
+            // read, is the response's own business — the way a call's `params` is a
+            // call's. The three members go back to it as they arrived.
+            let result = Response::from_members(method, result, error)?;
             return Ok(Message::Response { id, result });
         }
 
@@ -254,7 +250,9 @@ mod tests {
     use bson::{Document, doc};
 
     use super::{
-        super::{ExecCall, ExecResp, InitCall, InitResp, ReadCall, ReadResp, WriteCall, WriteResp},
+        super::{
+            Error, ExecCall, ExecResp, InitCall, InitResp, ReadCall, ReadResp, WriteCall, WriteResp,
+        },
         *,
     };
 
