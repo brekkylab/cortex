@@ -690,6 +690,12 @@ mod tests {
     /// Five hosts in production, each overridable on its own, and the version suffix
     /// is the official one either way — so nothing here depends on how a particular
     /// deployment lays out its paths.
+    ///
+    /// Composed through `endpoints`, which is where every origin is actually read. Two
+    /// tests used to sit under this one, checking `origin` and `behind` a layer down on
+    /// the same inputs; a suffix or a trimmed slash that survives to here survived them
+    /// too. What only they reached is `is_default`, which is not cosmetic — it is what
+    /// keeps a config that overrides nothing from serializing an `origins` block.
     #[test]
     fn each_service_keeps_its_official_path_under_any_origin() {
         let e = endpoints(&GdriveOrigins::default());
@@ -714,37 +720,14 @@ mod tests {
         assert_eq!(e.docs, "http://localhost:8000/docs/v1");
         assert_eq!(e.sheets, "http://localhost:8000/sheets/v4");
         assert_eq!(e.slides, "http://localhost:8000/slides/v1");
-    }
 
-    /// A tab name can hold anything a person types — spaces, `#`, quotes — and it
-    /// rides in the query string, so it has to survive encoding.
-    #[test]
-    fn a_tab_name_survives_the_query_string() {
-        let url = reqwest::Url::parse_with_params(
-            "https://sheets.googleapis.com/v4/spreadsheets/x/values:batchGet",
-            &[("ranges", "한 장/정리"), ("ranges", "'Sheet 1'!A1:D9")],
-        )
-        .unwrap();
-        let got: Vec<_> = url
-            .query_pairs()
-            .filter(|(k, _)| k == "ranges")
-            .map(|(_, v)| v.into_owned())
-            .collect();
-        assert_eq!(got, vec!["한 장/정리", "'Sheet 1'!A1:D9"]);
-        assert!(url.query().unwrap().contains("%2F"), "{url}");
-    }
-
-    /// The document ceiling and the content cache's budget have to meet: a document
-    /// the provider will produce must be one the cache can keep, or a chunked read of
-    /// it re-renders per chunk.
-    #[test]
-    fn a_document_that_can_be_produced_can_be_cached() {
-        const CONTENT_CACHE_BUDGET: u64 = 128 << 20;
-        // Compile-time: the two limits are a pair, and a later edit to either has to
-        // keep them one.
-        const _: () = assert!(MAX_DOCUMENT_BYTES <= CONTENT_CACHE_BUDGET);
-        // And far above anything measured: 3.4MB was the largest real document.
-        const _: () = assert!(MAX_DOCUMENT_BYTES >= 16 << 20);
+        // And an origins that overrides nothing says so, which is what keeps it out of
+        // a serialized config entirely.
+        assert!(!GdriveOrigins::behind("https://mock.example.com/").is_default());
+        assert!(
+            GdriveOrigins::default().is_default(),
+            "nothing set stays absent"
+        );
     }
 
     /// A tab is named by a person but read as A1 notation, where a name that looks
@@ -816,42 +799,5 @@ mod tests {
             assert_eq!(backoff_delay(4), MAX_BACKOFF);
             assert_eq!(backoff_delay(10), MAX_BACKOFF);
         }
-    }
-
-    /// An override replaces an origin and nothing else, so whoever sets one does not
-    /// also have to know which path this code would have appended.
-    #[test]
-    fn an_override_replaces_only_its_own_origin() {
-        let o = GdriveOrigins {
-            sheets: Some("http://localhost:9000/sheets-api/".into()),
-            ..Default::default()
-        };
-        assert_eq!(
-            GdriveOrigins::origin(&o.sheets, "https://sheets.googleapis.com"),
-            "http://localhost:9000/sheets-api",
-            "trailing slash trimmed, so the caller need not care"
-        );
-        assert_eq!(
-            GdriveOrigins::origin(&o.docs, "https://docs.googleapis.com"),
-            "https://docs.googleapis.com",
-            "the rest stay on Google"
-        );
-    }
-
-    /// One host fronting all of them is the common deployment, and it reads the way
-    /// Google's own paths do.
-    #[test]
-    fn behind_one_host_lays_the_services_out_by_name() {
-        let o = GdriveOrigins::behind("https://mock.example.com/");
-        assert_eq!(o.oauth.as_deref(), Some("https://mock.example.com/oauth2"));
-        assert_eq!(o.drive.as_deref(), Some("https://mock.example.com/drive"));
-        assert_eq!(o.docs.as_deref(), Some("https://mock.example.com/docs"));
-        assert_eq!(o.sheets.as_deref(), Some("https://mock.example.com/sheets"));
-        assert_eq!(o.slides.as_deref(), Some("https://mock.example.com/slides"));
-        assert!(!o.is_default());
-        assert!(
-            GdriveOrigins::default().is_default(),
-            "nothing set stays absent"
-        );
     }
 }

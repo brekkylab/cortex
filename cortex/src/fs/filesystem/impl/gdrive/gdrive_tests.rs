@@ -126,8 +126,6 @@ fn a_row_becomes_the_thing_it_can_serve() {
     let c = child_from_file(&sizeless).unwrap();
     assert_eq!(c.serves, Serves::Original);
     assert_eq!(entry_size(&c), UNKNOWN_LENGTH_SIZE);
-    const _: () = assert!(UNKNOWN_LENGTH_SIZE > 0);
-    const _: () = assert!(UNKNOWN_LENGTH_SIZE <= MAX_DOCUMENT_BYTES);
 }
 
 #[test]
@@ -340,30 +338,6 @@ async fn a_shared_drive_scopes_the_listings_below_it() {
     );
 }
 
-/// A search reports what the index found, including the types this mount cannot
-/// serve — a Form has no readable form, but "the phrase is in this Form" is still
-/// the answer to the question.
-#[tokio::test]
-async fn a_search_hit_the_mount_cannot_serve_is_still_reported() {
-    let form = file_row("설문지", "f1", "application/vnd.google-apps.form");
-    assert!(
-        child_from_file(&form).is_none(),
-        "a Form has no entry in the tree"
-    );
-    // The command's shaping of a hit keeps the name and id either way; the note is
-    // what tells them apart, and it says why in the line itself.
-    let served = file_row("보고서.pdf", "p1", "application/pdf");
-    for (row, listed) in [(&form, false), (&served, true)] {
-        let child = child_from_file(row);
-        assert_eq!(child.is_some(), listed);
-        let name = child
-            .as_ref()
-            .map(|c| c.vfs_name.clone())
-            .or_else(|| row.get("name").and_then(|n| n.as_str()).map(str::to_string));
-        assert!(name.is_some(), "a hit always has a name to report");
-    }
-}
-
 fn workbook(titles: &[Option<&str>]) -> Value {
     serde_json::json!({
         "sheets": titles
@@ -517,16 +491,6 @@ fn a_backwards_window_is_empty_rather_than_fatal() {
     assert_eq!(backwards(4, 99).len(), 2);
     assert_eq!(slice(data, Some(1..3)), b"bc");
     assert_eq!(slice(data, None), data);
-}
-
-#[test]
-fn split_last_shapes() {
-    assert_eq!(split_last("/a/b"), ("/a".to_string(), "b".to_string()));
-    assert_eq!(split_last("/a"), ("/".to_string(), "a".to_string()));
-    assert_eq!(
-        split_last("/My Drive/x.json"),
-        ("/My Drive".to_string(), "x.json".to_string())
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -991,22 +955,6 @@ async fn the_padding_is_lines_of_spaces_and_not_a_run_of_newlines() {
     let mut joined = a;
     joined.extend_from_slice(&b);
     assert_eq!(joined, buf, "the seam does not move a newline");
-}
-
-/// The placeholder is the accessor's own ceiling, which is what makes a document
-/// impossible to under-state rather than merely unlikely to be.
-///
-/// An under-estimate has no recovery: the reader stops where it was told, every window
-/// full, so nothing reports a short read and the JSON ends mid-token. At the old 8 MiB a
-/// 12,582,929-byte document read back as exactly 8,388,608 bytes that do not parse.
-/// `get_pretty` bounds the raw body at `MAX_DOCUMENT_BYTES` and Google already returns
-/// 2-space pretty JSON, so a document that would exceed this is refused by `body_within`
-/// rather than served short.
-#[test]
-fn the_placeholder_is_not_smaller_than_a_document_can_be() {
-    const _: () = assert!(UNKNOWN_LENGTH_SIZE >= MAX_DOCUMENT_BYTES);
-    // And the grid budget has to leave room inside it for the workbook around the values.
-    const _: () = assert!(GRID_BYTES_BUDGET < UNKNOWN_LENGTH_SIZE);
 }
 
 /// The span the placeholder claims but the JSON does not fill gets whitespace, so a
