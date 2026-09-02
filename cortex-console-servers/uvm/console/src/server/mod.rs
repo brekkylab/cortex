@@ -64,8 +64,8 @@ mod guest;
 use std::path::PathBuf;
 
 use cortex::console::{
-    AbinSource, Call, Error, ImageSource, Init, InitResult, Message, NetworkAccess, Notification,
-    Outcome, RequestId, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
+    Call, Error, ImageSource, Init, InitResult, Message, NetworkAccess, Notification, Outcome,
+    RequestId, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
 };
 use microsandbox_image::Reference;
 
@@ -220,7 +220,6 @@ impl Session {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
         let image = base(config.image.as_ref())?;
         let (network, host_ports) = reach(config.network.as_ref())?;
-        executables(&config.abin)?;
 
         self.guest = None;
         self.workfs = workfs;
@@ -298,16 +297,9 @@ impl Session {
                 image.as_deref(),
                 self.network,
                 &self.host_ports,
-                &self.config.abin,
             )
             .await
-            // A name the session named twice is the one boot failure that is the client's
-            // own and fixable by saying something else, so it comes back as itself rather
-            // than as a boot that did not happen.
-            .map_err(|e| match e.downcast_ref::<crate::abin::Duplicate>() {
-                Some(duplicate) => refused(Error::DUPLICATE_EXECUTABLE, duplicate.to_string()),
-                None => refused(Error::BOOT_FAILED, format!("booting a guest: {e}")),
-            })?;
+            .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
 
             // The tree **does** go in the replay, and it is the same URL the client sent:
             // the guest mounted that host directory at that host path, so what the agent is
@@ -423,45 +415,6 @@ fn reach(asked: Option<&NetworkAccess>) -> Result<(Network, Vec<u16>), Outcome> 
     }
 
     Ok((network, asked.host_ports.clone()))
-}
-
-/// Refuse a session whose executables are named by something this backend cannot read.
-///
-/// The two refusals [`directory_url`] makes about a workfs URL, and deliberately the same
-/// two: both members name a host directory, and a client that had to remember which of them
-/// checks what would be a client this protocol had failed.
-///
-/// Only the spelling is checked here. Whether two directories both carry a name is a
-/// question that needs them read and cortex's own executables in hand, which is a boot's
-/// work — so that one is answered on the way to a guest and comes back as
-/// [`Error::DUPLICATE_EXECUTABLE`]. What this catches is the mistake a client can fix
-/// without having booted anything.
-fn executables(asked: &[AbinSource]) -> Result<(), Outcome> {
-    for source in asked {
-        let Some(path) = source.file_path() else {
-            return Err(refused(
-                Error::UNSUPPORTED_ABIN,
-                format!(
-                    "{}: this server reads `file://` and no other scheme",
-                    source.url
-                ),
-            ));
-        };
-        // A relative name would be read against *this server's* working directory, which is
-        // not the client's and is nothing the client can see. Refused rather than resolved:
-        // where such a name does happen to exist here, the session would quietly get
-        // whatever is sitting there.
-        if !path.is_absolute() {
-            return Err(refused(
-                Error::INVALID_PARAMS,
-                format!(
-                    "{}: a file:// directory of executables needs an absolute path",
-                    source.url
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// The host directory a workfs URL names, or why it names none this backend can use.

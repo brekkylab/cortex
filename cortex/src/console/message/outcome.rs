@@ -154,23 +154,6 @@ impl Error {
     /// filesystem. Said at `init`, while the client can still ask for something else.
     pub const UNSUPPORTED_IMAGE: i64 = -32011;
 
-    /// A session named its own executables by a scheme this build has no provider for.
-    ///
-    /// The treatment [`UNSUPPORTED_WORKFS`](Self::UNSUPPORTED_WORKFS) gets and for the same
-    /// reason: a peer that has never heard of a scheme still parses the frame, and refuses it
-    /// for the reason it actually has. Said at `init`, while the client can still ask for
-    /// something else.
-    pub const UNSUPPORTED_ABIN: i64 = -32012;
-
-    /// Two of the things this session may run answer to one name.
-    ///
-    /// Refused rather than resolved by precedence. What a server provides goes first on the
-    /// executor's `PATH` so that it cannot be shadowed, and a caller's own directory quietly
-    /// shadowing it would make that ordering pointless — while the other order would hide
-    /// something somebody deliberately supplied. Which one was meant is not a thing to guess
-    /// at, so the name is said back instead.
-    pub const DUPLICATE_EXECUTABLE: i64 = -32013;
-
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
@@ -303,6 +286,10 @@ impl<'de> Visitor<'de> for OutcomeVisitor {
 
 #[cfg(test)]
 mod tests {
+    use bson::{Document, doc};
+
+    use super::{super::ExecResult, *};
+
     /// Every code is its own. Two that collided would be two failures a client could not
     /// tell apart, and the compiler has nothing to say about it.
     #[test]
@@ -319,8 +306,6 @@ mod tests {
             ("MOUNT_FAILED", Error::MOUNT_FAILED),
             ("UNSUPPORTED_NETWORK", Error::UNSUPPORTED_NETWORK),
             ("UNSUPPORTED_IMAGE", Error::UNSUPPORTED_IMAGE),
-            ("UNSUPPORTED_ABIN", Error::UNSUPPORTED_ABIN),
-            ("DUPLICATE_EXECUTABLE", Error::DUPLICATE_EXECUTABLE),
             ("INVALID_REQUEST", Error::INVALID_REQUEST),
             ("METHOD_NOT_FOUND", Error::METHOD_NOT_FOUND),
             ("INVALID_PARAMS", Error::INVALID_PARAMS),
@@ -333,9 +318,6 @@ mod tests {
             }
         }
     }
-    use bson::{Document, doc};
-
-    use super::{super::ExecResult, *};
 
     /// Read an outcome off the bytes a document makes, which is what a peer would
     /// actually have sent — the whole point of going through the wire rather than

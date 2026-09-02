@@ -59,25 +59,6 @@ pub struct Init {
     /// choice", and a server that runs commands on the host has no choice to make.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkAccess>,
-
-    /// Where this session's own native executables come from, layered over the ones the
-    /// server already provides. Empty is a session that adds none, which is most of them.
-    ///
-    /// **Said once, like the tree and the reach, and for the same reason.** What a session
-    /// can run is a property of the environment it runs in — on some backends a device that
-    /// has to be attached before a kernel comes up — so it cannot be decided per `exec`
-    /// without meaning a different session for every command.
-    ///
-    /// The order is the order they are layered in, later over earlier. A name two of them
-    /// both carry is refused rather than resolved: which one the caller meant is not
-    /// something to guess at, and a session that quietly ran the other one is the failure
-    /// that would be hardest to see.
-    ///
-    /// What these *are* is not this protocol's business beyond being things the executor can
-    /// run. On a backend that runs commands in a guest they have to be built for that guest,
-    /// which is the caller's to get right and the guest's to complain about.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub abin: Vec<AbinSource>,
 }
 
 /// The base a session's commands run in, named as an OCI image.
@@ -325,74 +306,6 @@ impl WorkFsSource {
     }
 }
 
-/// Where a session's own native executables come from — a [`WorkFsSource`] in shape, and for
-/// the same reasons.
-///
-/// # The scheme is the kind
-///
-/// | scheme | is |
-/// |---|---|
-/// | `file:///home/me/target/…` | a directory on the server's own filesystem |
-///
-/// A scheme this build has no provider for is refused at `init` with
-/// [`UNSUPPORTED_ABIN`](crate::console::Error::UNSUPPORTED_ABIN) naming it — the same
-/// treatment an unknown workfs scheme gets, and for the same reason: a peer that has never
-/// heard of a scheme still parses the frame, and refuses it for the reason it actually has.
-///
-/// # A directory and not a list of files
-///
-/// So that adding an executable is putting one there, rather than a change to what the
-/// session says. It is also what a build produces: a `target/…/release` is already a
-/// directory of exactly these.
-///
-/// # Why an object holding one member
-///
-/// The same reason [`WorkFsSource`] is one. A kind that has to be *reached* rather than
-/// opened needs more than a name for it, and whatever authorizes that belongs beside the URL
-/// rather than inside it. `file://` needs none, which is why there is none here yet.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AbinSource {
-    /// `file:///home/me/target/aarch64-unknown-linux-musl/release`.
-    pub url: String,
-}
-
-impl AbinSource {
-    pub fn new(url: impl Into<String>) -> Self {
-        AbinSource { url: url.into() }
-    }
-
-    /// The scheme, which is the kind — or the whole URL when it has no `://` in it and so
-    /// names no kind at all.
-    pub fn scheme(&self) -> &str {
-        self.url.split_once("://").map_or(&self.url, |(s, _)| s)
-    }
-
-    /// The directory a `file://` URL names, or `None` for any other scheme.
-    ///
-    /// Read exactly as [`WorkFsSource::file_path`] reads one, and deliberately so: two
-    /// members that both name a host directory and disagreed about how would be two things
-    /// for a server to get right instead of one.
-    pub fn file_path(&self) -> Option<&Path> {
-        self.url.strip_prefix("file://").map(Path::new)
-    }
-
-    /// A directory, as the URL naming it — or `None` for a path a URL cannot hold.
-    ///
-    /// Here so that a caller with a path — which is every caller of this, since `file://` is
-    /// the only kind — does not have to spell a URL to say the obvious thing.
-    ///
-    /// A URL here is a `String`, so a path that is not UTF-8 has no spelling in one. Said as
-    /// `None` rather than written through [`Path::display`], which would replace the bytes
-    /// it could not read with `U+FFFD` and hand back a URL naming a *different* directory or
-    /// none at all — a wrong answer where this is a missing one. There is no `From<&Path>`
-    /// for that reason: the conversion can fail, and one that could not say so would be a
-    /// panic in a library or a lie on the wire.
-    pub fn of_path(path: &Path) -> Option<AbinSource> {
-        path.to_str()
-            .map(|path| AbinSource::new(format!("file://{path}")))
-    }
-}
-
 /// What the server made of the session. The `result` of `init`.
 ///
 /// Answered rather than left to a notification because this is the one thing about a
@@ -524,7 +437,6 @@ mod tests {
             workfs: Some(WorkFsSource::new("file:///srv/project")),
             image: None,
             network: None,
-            abin: Vec::new(),
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -582,7 +494,6 @@ mod tests {
             workfs: None,
             image: Some(ImageSource::new("python:3.13-slim")),
             network: None,
-            abin: Vec::new(),
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -626,7 +537,6 @@ mod tests {
             workfs: None,
             image: None,
             network: None,
-            abin: Vec::new(),
         };
         assert_eq!(
             bson::serialize_to_document(&quiet).unwrap(),
@@ -647,7 +557,6 @@ mod tests {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::public()),
-            abin: Vec::new(),
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(doc, doc! {"delegated": [], "network": {"reach": "public"}});
@@ -674,7 +583,6 @@ mod tests {
             workfs: None,
             image: None,
             network: None,
-            abin: Vec::new(),
         };
         assert_eq!(
             bson::serialize_to_document(&quiet).unwrap(),
@@ -699,7 +607,6 @@ mod tests {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::host().with_host_ports([8080, 3000])),
-            abin: Vec::new(),
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -757,64 +664,5 @@ mod tests {
             WorkFsSource::new("file://srv/project").file_path(),
             Some(Path::new("srv/project"))
         );
-    }
-
-    #[test]
-    fn an_abin_source_names_a_directory_by_url() {
-        let source = AbinSource::new("file:///home/me/target/release");
-        assert_eq!(source.scheme(), "file");
-        assert_eq!(
-            source.file_path(),
-            Some(Path::new("/home/me/target/release"))
-        );
-    }
-
-    #[test]
-    fn an_abin_source_of_another_kind_names_no_directory() {
-        let source = AbinSource::new("https://example.com/bin");
-        assert_eq!(source.scheme(), "https");
-        assert_eq!(source.file_path(), None);
-    }
-
-    #[test]
-    fn a_path_says_itself_as_a_url() {
-        assert_eq!(
-            AbinSource::of_path(Path::new("/opt/tools")),
-            Some(AbinSource::new("file:///opt/tools"))
-        );
-    }
-
-    /// A URL is text, so a path that is not says so rather than being written through
-    /// `display` and coming out naming somewhere else.
-    #[test]
-    fn a_path_that_is_not_text_names_no_url() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let odd = std::path::PathBuf::from(OsStr::from_bytes(b"/opt/\xff\xfetools"));
-        assert_eq!(AbinSource::of_path(&odd), None);
-    }
-
-    /// A session that adds none carries no member, the way the rest of this type works.
-    #[test]
-    fn a_session_that_adds_no_executables_says_nothing() {
-        let init = Init::default();
-        let doc = bson::serialize_to_document(&init).unwrap();
-        assert_eq!(doc.get("abin"), None);
-        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
-    }
-
-    #[test]
-    fn the_sources_travel_in_the_order_they_were_given() {
-        let init = Init {
-            abin: vec![
-                AbinSource::new("file:///one"),
-                AbinSource::new("file:///two"),
-            ],
-            ..Init::default()
-        };
-        let doc = bson::serialize_to_document(&init).unwrap();
-        let back = bson::deserialize_from_document::<Init>(doc).unwrap();
-        assert_eq!(back.abin, init.abin, "the order is the layer order");
     }
 }

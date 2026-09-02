@@ -108,12 +108,11 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // reason it is a disk and not a share: a virtio-fs share has no such option, and the
     // guest is root inside itself, so a guest-side mount flag would be a guard rail rather
     // than a boundary.
+    //
+    // Raw, always: `/abin` is cortex's own executables and no others, which is one layer of
+    // the store attached as it stands rather than anything stitched into a descriptor.
     if let Some(abin) = &args.abin {
-        let format = match args.abin_format {
-            BaseFormat::Raw => DiskImageFormat::Raw,
-            BaseFormat::Vmdk => DiskImageFormat::Vmdk,
-        };
-        builder = builder.disk(|d| d.path(abin).read_only(true).format(format));
+        builder = builder.disk(|d| d.path(abin).read_only(true).format(DiskImageFormat::Raw));
     }
 
     // The network, when the session asked for one. Everything about it lives in this process:

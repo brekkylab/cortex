@@ -117,13 +117,12 @@ pub struct BootArgs {
     /// The session's writable image, as a host path.
     pub session: PathBuf,
 
-    /// A read-only image of native executables to mount at `/abin`, and how to attach it.
+    /// A read-only image of native executables to mount at `/abin`.
     ///
-    /// `None` is a session that gets none. The two travel together for the same reason
-    /// [`base`](Self::base) and [`base_format`](Self::base_format) do: they are one fact
-    /// about what the server assembled.
+    /// `None` is a session that gets none. Always a raw EROFS and never a descriptor, so
+    /// there is no format to say alongside it: `/abin` is cortex's own executables and no
+    /// others, which is one layer attached as it stands rather than anything stitched.
     pub abin: Option<PathBuf>,
-    pub abin_format: BaseFormat,
 
     /// The host directory to put in front of the guest, and `None` for a session that declared
     /// no tree. Mounted in the guest at **this same path** — see [`SHARE_ENV`].
@@ -185,7 +184,6 @@ impl BootArgs {
         }
         if let Some(abin) = &self.abin {
             put("--abin", abin.as_os_str());
-            put("--abin-format", OsStr::new(self.abin_format.as_str()));
         }
         if let Some(vcpus) = self.vcpus {
             put("--vcpus", OsStr::new(&vcpus.to_string()));
@@ -212,7 +210,6 @@ impl BootArgs {
         let mut host_ports = Vec::new();
         let mut workfs = None;
         let mut abin = None;
-        let mut abin_format = None;
         let mut vcpus = None;
         let mut memory_mib = None;
 
@@ -236,7 +233,6 @@ impl BootArgs {
                 "--host-port" => host_ports.push(number(&flag, value()?)?),
                 "--workfs" => workfs = Some(PathBuf::from(value()?)),
                 "--abin" => abin = Some(PathBuf::from(value()?)),
-                "--abin-format" => abin_format = Some(text(&flag, value()?)?),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
                 other => anyhow::bail!("{other} is not an argument a boot takes"),
@@ -263,21 +259,6 @@ impl BootArgs {
             },
             host_ports,
             workfs,
-            // The two travel together or not at all. A session with no `/abin` says nothing
-            // about a format because there is nothing for it to be; a session that *has* one
-            // and left the format out would take the default and attach a VMDK descriptor —
-            // a few hundred bytes of text — as a raw disk, which the guest meets as an
-            // unmountable device rather than as the mistake it is.
-            abin_format: match (&abin, abin_format) {
-                (Some(_), Some(spelling)) => BaseFormat::parse(&spelling)?,
-                (None, None) => BaseFormat::Raw,
-                (Some(path), None) => {
-                    anyhow::bail!("--abin {} was given without --abin-format", path.display())
-                }
-                (None, Some(spelling)) => {
-                    anyhow::bail!("--abin-format {spelling} was given without --abin")
-                }
-            },
             abin,
             vcpus,
             memory_mib,
@@ -450,56 +431,23 @@ mod tests {
             network: Network::Public,
             host_ports: vec![8080, 3000],
             workfs: Some("/Users/someone/project".into()),
-            abin: Some("/cache/abin/sha256_2b91c4.vmdk".into()),
-            abin_format: BaseFormat::Vmdk,
+            abin: Some("/cache/layers/sha256_2b91c4.erofs".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
         }
     }
 
     /// A session with no `/abin` says nothing about one, and reads back as having none.
-    ///
-    /// The pair matters: `--abin-format` without `--abin` would be a format for a disk that
-    /// is not there, and a default format for a disk that *is* there would attach it wrongly.
     #[test]
     fn a_session_with_no_abin_says_nothing_about_one() {
         let bare = BootArgs {
             abin: None,
-            abin_format: BaseFormat::Raw,
             ..args()
         };
         let written = bare.to_args();
-        assert!(
-            !written
-                .iter()
-                .any(|arg| arg == "--abin" || arg == "--abin-format"),
-            "{written:?}"
-        );
+        assert!(!written.iter().any(|arg| arg == "--abin"), "{written:?}");
         let back = BootArgs::parse(written).unwrap();
         assert_eq!(back.abin, None);
-    }
-
-    /// And the pair is enforced rather than assumed, in both directions.
-    #[test]
-    fn an_abin_without_its_format_is_refused() {
-        let without_abin: Vec<OsString> = BootArgs {
-            abin: None,
-            abin_format: BaseFormat::Raw,
-            ..args()
-        }
-        .to_args();
-
-        let mut only_disk = without_abin.clone();
-        only_disk.push("--abin".into());
-        only_disk.push("/cache/abin/set.vmdk".into());
-        let err = BootArgs::parse(only_disk).unwrap_err().to_string();
-        assert!(err.contains("without --abin-format"), "{err}");
-
-        let mut only_format = without_abin;
-        only_format.push("--abin-format".into());
-        only_format.push("vmdk".into());
-        let err = BootArgs::parse(only_format).unwrap_err().to_string();
-        assert!(err.contains("without --abin"), "{err}");
     }
 
     /// Everything this writes is something it reads. Both ends are this type, so the compiler

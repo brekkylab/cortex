@@ -44,7 +44,7 @@ use std::{
 };
 
 use cortex::console::{
-    AbinSource, Call, Message, Outcome, RequestId,
+    Call, Message, Outcome, RequestId,
     stdio::{read, write},
 };
 use cortex_uvm_console::layer::LayerStore;
@@ -121,40 +121,30 @@ impl Guest {
         image: Option<&str>,
         network: Network,
         host_ports: &[u16],
-        abin: &[AbinSource],
     ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
         let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
 
-        // `/abin`, which is cheap when a session adds nothing of its own: the layer cortex
-        // provides is attached as it is and nothing is stitched.
-        //
-        // On a blocking thread, because when a session *does* add something this reads every
-        // executable in the named directories and writes them back out as an EROFS — the
-        // same reason `SessionImage::create` below is not on the runtime's own thread, at a
-        // size that is megabytes rather than milliseconds.
-        let named = abin.to_vec();
+        // `/abin` is the same disk for every session — cortex's own executables and no
+        // others — so this is a store lookup that finds it already there after the first
+        // session on this host. On a blocking thread all the same: the first one reads every
+        // executable and writes them back out as an EROFS, which is the same reason
+        // `SessionImage::create` below is not on the runtime's own thread.
         let store = layer_store()?;
-        let into = assets::home()?.join("abin");
-        // **The one place this variable is read.** Here rather than inside `assemble`, where
-        // the rest of this server's configuration is read, and so that assembling is a
+        // **The one place this variable is read.** Here rather than inside `disk`, where the
+        // rest of this server's configuration is read, and so that building the disk is a
         // function of its arguments and a test can call it twice.
         let builtin = std::env::var_os(abin::DIR_ENV).map(PathBuf::from);
-        let assembled = tokio::task::spawn_blocking(move || {
-            abin::assemble(&named, builtin.as_deref(), &store, &into)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("assembling /abin: {e}"))?;
+        let found = tokio::task::spawn_blocking(move || abin::disk(builtin.as_deref(), &store))
+            .await
+            .map_err(|e| anyhow::anyhow!("preparing /abin: {e}"))?;
 
-        // Two failures, and they are not the same. A name the session named twice is
-        // something the client said and can say differently, so it goes back as a refusal.
-        // Anything else is this host's gap — cortex has published no executables yet, so the
-        // strict reading would mean no session boots at all — and costs the session its
-        // `/abin` rather than its existence. Said on the way past so it is not silent.
-        let abin = match assembled {
-            Ok(assembled) => Some(assembled),
-            Err(e) if e.downcast_ref::<abin::Duplicate>().is_some() => return Err(e),
+        // Cortex has published no executables yet, so the strict reading would mean no
+        // session boots at all. A session without them costs its `/abin` and not its
+        // existence — said on the way past so it is not silent.
+        let abin = match found {
+            Ok(disk) => Some(disk),
             Err(e) => {
                 eprintln!("cortex-uvm-console: this session gets no /abin: {e}");
                 None
@@ -182,11 +172,7 @@ impl Guest {
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),
-            abin: abin.as_ref().map(|assembled| assembled.disk.clone()),
-            abin_format: abin
-                .as_ref()
-                .map(|assembled| assembled.format)
-                .unwrap_or_default(),
+            abin,
             vcpus: number(VCPUS_ENV),
             memory_mib: number(MEMORY_ENV),
         };

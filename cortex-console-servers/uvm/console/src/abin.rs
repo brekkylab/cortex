@@ -1,8 +1,9 @@
 //! `/abin`: the native executables a session can run.
 //!
-//! Two sources, layered bottom-up. Cortex's own come first and are the same for every
-//! session; whatever the caller named in `init` goes over them, in the order it named them.
-//! What comes out is one read-only disk the boot attaches and the guest mounts.
+//! Cortex's own, and only those. A session does not name executables and cannot add any, so
+//! the set is the same for every session — which makes `/abin` **one read-only disk shared
+//! by all of them**, held in the layer store like any other layer and attached as it stands.
+//! There is nothing to assemble per session and nothing to stitch.
 //!
 //! # Why cortex's own are a pinned tarball
 //!
@@ -22,11 +23,8 @@
 
 use std::path::{Path, PathBuf};
 
-use cortex::console::AbinSource;
-use cortex_uvm_console::layer::{Layer, LayerId, LayerStore, stitch, tree};
+use cortex_uvm_console::layer::{Layer, LayerId, LayerStore};
 use microsandbox_image::tree::{FileTree, TreeNode};
-
-use crate::contract::BaseFormat;
 
 /// A directory of executables to use instead of the release, as a host path.
 ///
@@ -34,13 +32,6 @@ use crate::contract::BaseFormat;
 /// `CORTEX_UVM_IMAGE`. No download and no digest check: what it names is whatever the person
 /// running this just built.
 pub const DIR_ENV: &str = "CORTEX_ABIN_DIR";
-
-/// The disk `/abin` is, and how a boot has to attach it.
-#[derive(Debug)]
-pub struct Assembled {
-    pub disk: PathBuf,
-    pub format: BaseFormat,
-}
 
 /// Cortex's own executables, by URL and by the digest they have to hash to.
 pub struct Builtin {
@@ -69,16 +60,11 @@ impl Builtin {
         }
     }
 
-    /// This release as a layer and the tree it was made from, putting it in `store` if it is
-    /// not already there.
+    /// This release as a layer, putting it in `store` if it is not already there.
     ///
     /// `override_dir` — [`DIR_ENV`], read by the caller — short-circuits the whole of it,
     /// which is the only way this works today.
-    pub fn layer(
-        &self,
-        override_dir: Option<&Path>,
-        store: &LayerStore,
-    ) -> anyhow::Result<(Layer, FileTree)> {
+    pub fn layer(&self, override_dir: Option<&Path>, store: &LayerStore) -> anyhow::Result<Layer> {
         if let Some(dir) = override_dir {
             anyhow::ensure!(
                 dir.is_dir(),
@@ -106,148 +92,34 @@ impl Builtin {
     }
 }
 
-/// A name two of this session's executable directories both answer to.
-///
-/// Its own type rather than a message, because the two ways an assembly fails deserve
-/// opposite answers. That cortex has published nothing yet is this host's gap and costs the
-/// session an `/abin`; a collision is something the caller said, is fixable by saying
-/// something else, and travels back as
-/// [`DUPLICATE_EXECUTABLE`](cortex::console::Error::DUPLICATE_EXECUTABLE).
-#[derive(Debug)]
-pub struct Duplicate(pub String);
-
-impl std::fmt::Display for Duplicate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for Duplicate {}
-
-/// Assemble `/abin` out of `builtin` — cortex's own executables — and whatever `sources` name.
+/// The disk `/abin` is: cortex's own executables, as one layer.
 ///
 /// `builtin` is [`DIR_ENV`] when it is set, and read by the caller rather than here: what a
 /// server is configured with is read where the rest of its configuration is read, and a
 /// function that reached for it itself would be one no test could call twice.
 ///
-/// `dir` is where assembled disks live, not one disk's path: the name inside it is the
-/// digest of the layer set, so two sessions whose executables differ get two disks rather
-/// than writing over each other.
-///
-/// With no `sources` the builtin layer is handed over as it is — a base layer is a valid
-/// image on its own, so the common case costs no stitch at all.
+/// The layer is handed over as it stands, which is why there is no stitch and no assembled
+/// disk anywhere — a base layer carries no whiteouts, so it is already a valid image, and
+/// the store already keeps one copy of it however many sessions ask.
 ///
 /// **Blocking, and says so by not being `async`.** Reading a directory of executables and
 /// writing it back out as an EROFS is file work from end to end; a caller on a runtime owes
 /// this a thread of its own.
-pub fn assemble(
-    sources: &[AbinSource],
-    builtin: Option<&Path>,
-    store: &LayerStore,
-    dir: &Path,
-) -> anyhow::Result<Assembled> {
-    let (builtin, builtin_tree) = Builtin::host().layer(builtin, store)?;
-
-    if sources.is_empty() {
-        return Ok(Assembled {
-            disk: builtin.erofs,
-            format: BaseFormat::Raw,
-        });
-    }
-
-    let mut layers = vec![builtin];
-    // Kept beside the layers, because the collision check wants exactly these and reading
-    // them back out of the images they were just written to would be a second pass over
-    // every executable in the session.
-    let mut trees = vec![builtin_tree];
-    for source in sources {
-        let named = source.file_path().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} names its executables by `{}`, which this server has no provider for",
-                source.url,
-                source.scheme()
-            )
-        })?;
-        anyhow::ensure!(
-            named.is_dir(),
-            "{} is not a directory on this host",
-            named.display()
-        );
-        let (layer, tree) = layer_of(named, store)?;
-        layers.push(layer);
-        trees.push(tree);
-    }
-
-    refuse_collisions(&trees)?;
-
-    let set = LayerId::of(
-        layers
-            .iter()
-            .map(|layer| layer.id.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .as_bytes(),
-    );
-    let disk = stitch(&layers, &dir.join(set.file_stem()))?;
-    reclaim(dir, set.file_stem());
-    Ok(Assembled {
-        disk,
-        format: BaseFormat::Vmdk,
-    })
+pub fn disk(builtin: Option<&Path>, store: &LayerStore) -> anyhow::Result<PathBuf> {
+    Ok(Builtin::host().layer(builtin, store)?.erofs)
 }
 
-/// How long an assembled disk nobody has asked for again is kept.
-///
-/// Generous, because the cost of keeping one is a descriptor and a metadata EROFS while the
-/// cost of removing one early is nothing at all — a stitch is derived and is rewritten on
-/// every assembly anyway. Long enough that it is only ever a disk from another day.
-const KEEP: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
-
-/// Drop the assembled disks in `dir` that nothing has asked for in a day, except `keep`.
-///
-/// A caller rebuilding a `target/release` names a new layer set on every build, so without
-/// this the directory grows by one descriptor and one fsmeta per build and never shrinks.
-/// Nothing tracks which sets are in use, so age stands in for it — and safely: a guest that
-/// is running already holds these open, and an unlinked file a process has open stays whole
-/// until it lets go.
-///
-/// Best effort throughout, like the layer store's own sweep. A directory that could not be
-/// tidied is still a directory that works.
-fn reclaim(dir: &Path, keep: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let is_ours = name.ends_with(".vmdk") || name.ends_with(".fsmeta.erofs");
-        if !is_ours || name.starts_with(keep) {
-            continue;
-        }
-        let old = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .map(|when| when.elapsed().unwrap_or_default() > KEEP)
-            .unwrap_or(false);
-        if old {
-            let _ = std::fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// One directory as a layer, named by what is in it — and the tree it was named from.
+/// One directory as a layer, named by what is in it.
 ///
 /// Content-addressed rather than named for the path, so that a directory somebody is
 /// rebuilding gets a new layer each time its contents change and the same one when they do
 /// not. The tree is read once and hashed from what was read, rather than walking the
-/// directory twice — and handed back for the same reason, since the caller needs the names
-/// in it and reading them out of the image would be a third pass.
-fn layer_of(dir: &Path, store: &LayerStore) -> anyhow::Result<(Layer, FileTree)> {
-    let tree =
-        tree::from_dir(dir).map_err(|e| anyhow::anyhow!("reading {}: {e}", dir.display()))?;
+/// directory twice.
+fn layer_of(dir: &Path, store: &LayerStore) -> anyhow::Result<Layer> {
+    let tree = cortex_uvm_console::layer::tree::from_dir(dir)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", dir.display()))?;
     let id = digest(&tree)?;
-    let layer = store.put(&id, &tree)?;
-    Ok((layer, tree))
+    store.put(&id, &tree)
 }
 
 /// A tree's identity: everything in it, in one order.
@@ -317,48 +189,6 @@ fn digest(tree: &FileTree) -> anyhow::Result<LayerId> {
     LayerId::parse(&format!("sha256:{:x}", hasher.finalize()))
 }
 
-/// Refuse a name two layers both answer to.
-///
-/// Never resolved by precedence. `/abin` goes first on `PATH` so that what cortex undertakes
-/// to provide is not shadowed, and a caller's layer silently shadowing it would make that
-/// ordering pointless — while the other order would hide work somebody deliberately
-/// supplied. Somebody who really means to replace a shipped executable replaces the whole
-/// bottom layer with [`DIR_ENV`].
-///
-/// Only the top level is compared, because that is what `/abin` is: a flat directory of
-/// commands, and two of them answering to one name is the collision. A subdirectory two
-/// layers both have is not one.
-///
-/// A [`Duplicate`] and not a message, so that the client hears this one rather than a
-/// server-side note about a session it thinks it configured.
-fn refuse_collisions(trees: &[FileTree]) -> anyhow::Result<()> {
-    use std::collections::HashMap;
-
-    let mut seen: HashMap<&std::ffi::OsStr, usize> = HashMap::new();
-    for (index, tree) in trees.iter().enumerate() {
-        for name in tree.root.entries.keys() {
-            if let Some(first) = seen.insert(name, index) {
-                let which = |n: usize| {
-                    if n == 0 {
-                        "the ones cortex provides".to_string()
-                    } else {
-                        format!("directory {n}")
-                    }
-                };
-                return Err(Duplicate(format!(
-                    "{:?} is in two of this session's executable directories — in {} and in \
-                     {}. Rename one, or replace cortex's own with {DIR_ENV}.",
-                    name,
-                    which(first),
-                    which(index)
-                ))
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,9 +239,11 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let (layer, _) = Builtin::host().layer(Some(builtin.path()), &store).unwrap();
+        let layer = Builtin::host().layer(Some(builtin.path()), &store).unwrap();
 
-        let tree = layer.tree(tree::Contents::Skip).unwrap();
+        let tree = layer
+            .tree(cortex_uvm_console::layer::tree::Contents::Skip)
+            .unwrap();
         assert!(tree.get(b"mem").is_some(), "the override was not used");
         assert!(tree.get(b"index").is_some());
     }
@@ -424,140 +256,44 @@ mod tests {
         let store = store_in(work.path());
 
         let first = dir_of(&["mem"]);
-        let same = layer_of(first.path(), &store).unwrap().0.id;
-        assert_eq!(layer_of(first.path(), &store).unwrap().0.id, same);
+        let same = layer_of(first.path(), &store).unwrap().id;
+        assert_eq!(layer_of(first.path(), &store).unwrap().id, same);
 
         std::fs::write(first.path().join("mem"), b"#!/bin/sh\necho changed\n").unwrap();
         assert_ne!(
-            layer_of(first.path(), &store).unwrap().0.id,
+            layer_of(first.path(), &store).unwrap().id,
             same,
             "a changed executable named the same layer"
         );
     }
 
+    /// The disk is the layer as it stands — an EROFS out of the store, not a descriptor.
+    /// A session runs cortex's own executables and no others, so there is nothing to stitch.
     #[test]
-    fn with_no_named_directories_the_builtin_layer_is_attached_as_it_is() {
+    fn the_disk_is_the_builtin_layer_itself() {
         let builtin = dir_of(&["mem"]);
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let assembled =
-            assemble(&[], Some(builtin.path()), &store, &work.path().join("abin")).unwrap();
-
-        assert_eq!(assembled.format, BaseFormat::Raw);
+        let disk = disk(Some(builtin.path()), &store).unwrap();
+        assert_eq!(disk.extension().unwrap(), "erofs");
         assert_eq!(
-            assembled.disk.extension().unwrap(),
-            "erofs",
-            "the common case should not have been stitched"
+            disk,
+            layer_of(builtin.path(), &store).unwrap().erofs,
+            "the disk is not the layer the store holds"
         );
     }
 
+    /// And so every session on this host gets the same file, rather than one assembled apiece.
     #[test]
-    fn a_named_directory_is_layered_over_cortexs_own() {
+    fn every_session_gets_the_same_disk() {
         let builtin = dir_of(&["mem", "index"]);
-        let caller = dir_of(&["mytool"]);
         let work = tempfile::tempdir().unwrap();
         let store = store_in(work.path());
 
-        let assembled = assemble(
-            &[AbinSource::of_path(caller.path()).unwrap()],
-            Some(builtin.path()),
-            &store,
-            &work.path().join("abin"),
-        )
-        .unwrap();
-
-        assert_eq!(assembled.format, BaseFormat::Vmdk);
-        let merged = tree::from_erofs(
-            &assembled.disk.with_extension("fsmeta.erofs"),
-            tree::Contents::Skip,
-        )
-        .unwrap();
-        for name in [&b"mem"[..], b"index", b"mytool"] {
-            assert!(
-                merged.get(name).is_some(),
-                "{:?} is missing",
-                String::from_utf8_lossy(name)
-            );
-        }
-    }
-
-    /// Two sessions whose executables differ must get two disks, or a running guest would be
-    /// reading a file somebody else was replacing.
-    #[test]
-    fn two_different_sets_are_two_disks() {
-        let builtin = dir_of(&["mem"]);
-        let one = dir_of(&["one"]);
-        let two = dir_of(&["two"]);
-        let work = tempfile::tempdir().unwrap();
-        let store = store_in(work.path());
-        let into = work.path().join("abin");
-
-        let disk = |source: &Path| {
-            assemble(
-                &[AbinSource::of_path(source).unwrap()],
-                Some(builtin.path()),
-                &store,
-                &into,
-            )
-            .unwrap()
-            .disk
-        };
-        let (a, b) = (disk(one.path()), disk(two.path()));
-        assert_ne!(a, b, "one disk was written twice");
-        assert!(a.is_file() && b.is_file());
-    }
-
-    #[test]
-    fn a_name_in_two_places_is_refused_by_name() {
-        let builtin = dir_of(&["mem"]);
-        let caller = dir_of(&["mem"]);
-        let work = tempfile::tempdir().unwrap();
-        let store = store_in(work.path());
-
-        let error = assemble(
-            &[AbinSource::of_path(caller.path()).unwrap()],
-            Some(builtin.path()),
-            &store,
-            &work.path().join("abin"),
-        )
-        .unwrap_err();
-
-        let said = error.to_string();
-        assert!(said.contains("mem"), "{said}");
-        assert!(said.contains("cortex"), "{said}");
-        // And as itself, not just as a message: this is the one assembly failure the client
-        // hears about, and `Guest::boot` tells the two apart by downcasting to exactly this.
-        assert!(
-            error.downcast_ref::<Duplicate>().is_some(),
-            "a collision was not a `Duplicate`, so the client would never be told"
+        assert_eq!(
+            disk(Some(builtin.path()), &store).unwrap(),
+            disk(Some(builtin.path()), &store).unwrap()
         );
-    }
-
-    /// The other side of it: a failure that is this host's gap and not the caller's mistake
-    /// must *not* come back as a collision, or a session would be refused for it.
-    #[test]
-    fn nothing_else_is_read_as_a_collision() {
-        let work = tempfile::tempdir().unwrap();
-        let store = store_in(work.path());
-        let error = assemble(&[], None, &store, &work.path().join("abin")).unwrap_err();
-        assert!(error.downcast_ref::<Duplicate>().is_none(), "{error}");
-    }
-
-    #[test]
-    fn a_scheme_with_no_provider_is_refused_by_name() {
-        let builtin = dir_of(&["mem"]);
-        let work = tempfile::tempdir().unwrap();
-        let store = store_in(work.path());
-
-        let err = assemble(
-            &[AbinSource::new("https://example.com/bin")],
-            Some(builtin.path()),
-            &store,
-            &work.path().join("abin"),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("https"), "{err}");
     }
 }

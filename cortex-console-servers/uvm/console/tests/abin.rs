@@ -1,5 +1,8 @@
-//! `/abin` in a running guest: are the executables there, do they run, is the disk really
-//! read-only, and is it first on `PATH`?
+//! `/abin` in a running guest: are cortex's executables there, do they run, is the disk
+//! really read-only, and is it first on `PATH`?
+//!
+//! A session neither names executables nor adds any — `/abin` is what cortex ships and
+//! nothing else — so everything here is about delivering one fixed set.
 //!
 //! **The executables here are shell scripts.** What this tests is the delivery — the disk,
 //! the mount, the ordering, the refusals — and a script exercises all of it without making
@@ -32,22 +35,18 @@ fn dir_of(names: &[&str]) -> tempfile::TempDir {
     dir
 }
 
-/// A session whose cortex-provided executables are `builtin`, plus whatever `named` adds.
+/// A session whose cortex-provided executables are `builtin`.
 ///
 /// The override goes to the **server's** environment and not this process's: a console
-/// server is configured by its environment, which is the one thing about it a client does not
-/// say over the channel.
-async fn session(builtin: &Path, named: &[&Path]) -> anyhow::Result<Console> {
+/// server is configured by its environment, and what a session runs is not something the
+/// client says over the channel at all.
+async fn session(builtin: &Path) -> anyhow::Result<Console> {
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
     server.stderr(Stdio::inherit());
     server.env("CORTEX_ABIN_DIR", builtin);
     let client = cortex::console::stdio::StdioClient::new(server)?;
 
-    let mut builder = Console::builder().client(client);
-    for dir in named {
-        builder = builder.abin(dir);
-    }
-    builder.build().await
+    Console::builder().client(client).build().await
 }
 
 async fn out(console: &mut Console, script: &str) -> ExecResult {
@@ -65,7 +64,7 @@ fn say(result: &ExecResult) -> String {
 #[ignore = "boots a micro-VM"]
 async fn abin_is_a_read_only_disk_first_on_path() {
     let builtin = dir_of(&["mem", "index"]);
-    let mut console = session(builtin.path(), &[]).await.expect("a session");
+    let mut console = session(builtin.path()).await.expect("a session");
 
     assert_eq!(say(&out(&mut console, "ls /abin").await), "index\nmem");
     assert_eq!(say(&out(&mut console, "mem").await), "ran-mem");
@@ -94,57 +93,8 @@ async fn abin_is_a_read_only_disk_first_on_path() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "boots a micro-VM"]
-async fn a_callers_executables_arrive_beside_cortexs() {
-    let builtin = dir_of(&["mem"]);
-    let caller = dir_of(&["mytool"]);
-    let mut console = session(builtin.path(), &[caller.path()])
-        .await
-        .expect("a session");
-
-    assert_eq!(say(&out(&mut console, "mytool").await), "ran-mytool");
-    assert_eq!(say(&out(&mut console, "mem").await), "ran-mem");
-}
-
-/// A name cortex provides cannot be quietly replaced. The collision is found while the disk
-/// is being assembled, which is on the way to a boot — and comes back as a refusal naming
-/// the name, rather than as a session that silently has no `/abin` at all.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "boots a micro-VM"]
-async fn a_name_cortex_provides_is_not_shadowed() {
-    let builtin = dir_of(&["mem"]);
-    let caller = dir_of(&["mem"]);
-    let mut console = session(builtin.path(), &[caller.path()])
-        .await
-        .expect("a session — the collision is found at the boot, not at init");
-
-    // The first command is what boots, so it is where the refusal arrives.
-    let refused = console.exec(["true"], None).await.unwrap_err().to_string();
-    assert!(refused.contains("mem"), "{refused}");
-    assert!(
-        refused.contains("two of this session's executable directories"),
-        "{refused}"
-    );
-}
-
-/// And a relative directory is refused at `init`, before anything is booted for it — the
-/// same answer a relative workfs gets, because the server would otherwise read it against
-/// its own working directory rather than the caller's.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "starts a server"]
-async fn a_relative_directory_is_refused_at_init() {
-    let builtin = dir_of(&["mem"]);
-    // `Console` has no `Debug`, so the `Ok` side cannot be unwrapped through.
-    let refused = match session(builtin.path(), &[Path::new("target/release")]).await {
-        Err(e) => e.to_string(),
-        Ok(_) => panic!("a relative directory was accepted"),
-    };
-    assert!(refused.contains("absolute"), "{refused}");
-}
-
-/// The control for the two above: without the override there is no `/abin` at all, so
-/// finding one is finding something the test put there.
+/// The control: without the override there is no `/abin` at all, so finding one anywhere
+/// above is finding something the test put there.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots a micro-VM"]
 async fn without_executables_there_is_no_abin() {
@@ -176,7 +126,7 @@ async fn without_executables_there_is_no_abin() {
 #[ignore = "boots a micro-VM"]
 async fn an_image_keeps_its_own_commands() {
     let builtin = dir_of(&["mem"]);
-    let mut console = session(builtin.path(), &[]).await.expect("a session");
+    let mut console = session(builtin.path()).await.expect("a session");
     assert_eq!(
         say(&out(&mut console, "busybox true && echo ran").await),
         "ran"
