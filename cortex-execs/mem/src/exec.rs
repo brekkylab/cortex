@@ -1,767 +1,941 @@
 //! `mem` as a command: arguments in, lines out.
 
-use std::{io, sync::Arc};
-
+use clap::{Parser as _, error::ErrorKind};
 use cortex::{
+    BoxFuture,
     exec::{ExecCall, ExecResult, Executable},
     fs::Mount,
 };
-use futures_core::future::BoxFuture;
+use futures::FutureExt;
 
-use crate::{
-    Embedder, Inference, Memory,
-    store::{Applied, Entry, Hit, Record, Scope},
-};
+use crate::extractor;
 
-/// What `mem` prints when it is asked, and when it is misused.
-pub const USAGE: &str = "\
-mem — a memory store that is one file in this tree
-
-usage:
-  mem insert  <store> <text>   remember what is worth remembering in <text>
-  mem search  <store> <query>  the memories nearest <query>, nearest first
-  mem list    <store>          every memory, oldest first
-  mem get     <store> <id>     one memory, by the id it was written under
-  mem delete  <store> <id>     forget one memory
-  mem history <store> <id>     everything that has happened to one memory
-
-options:
-  --user <id>         whose memories these are
-  --agent <id>        which agent they belong to
-  --run <id>          which run of that agent
-  --metadata <json>   a JSON object to attach to what is inserted
-  --limit <n>         how many to answer with (search, list)
-  --json              answer as JSON rather than as lines
-  --                  everything after this is text, not options
-  -h, --help          this
-
-<store> is a path in this tree, resolved like any other argument. `insert` creates it;
-every other command expects it to be there already.
-";
-
-/// How many memories `search` answers with unless told otherwise.
-const SEARCH_LIMIT: usize = 10;
-
-/// How many `list` answers with unless told otherwise. Larger, because listing is a question
-/// about the store rather than about a query, and the answer nobody wants is a truncated one.
-const LIST_LIMIT: usize = 100;
-
-/// The `mem` command, as an [`Executable`](cortex::exec::Executable).
+/// The command line, as declarations — what `mem` accepts and what it says about it.
 ///
-/// # Why a store is an argument and not a setting
-///
-/// Every command names its store, because a store is a document: a session works on a tree, and
-/// which memories belong to what it is doing is the caller's business, not a path configured
-/// once for the process. Two stores side by side in the same directory are the normal case.
-///
-/// That is also what makes the mount necessary rather than convenient. `notes.sqlite` is a name
-/// in the *workspace*, and SQLite opens files by host path — so the name is resolved against
-/// where the calling command stood ([`ExecCall::resolve`]) and then through the mount
-/// ([`Mount::host_path`]), which is the same file the caller would have seen. With nothing
-/// mounted there is no such file and no honest substitute for one, so the command refuses.
-///
-/// # What it carries
-///
-/// The two providers, shared: one `mem` is registered on a console and every call goes through
-/// it, so they are behind [`Arc`]s and used from whatever task is running. Which embedder is
-/// held is not a detail — it is half of the identity of every store this writes, and a store
-/// opened under a different one is refused rather than searched wrongly. See [`Embedder`].
-pub struct Mem {
-    embedder: Arc<dyn Embedder>,
-    inference: Arc<dyn Inference>,
+/// Only shapes and their help live here; the reading of a line happens where the line is acted
+/// on. `mem` runs in-process, so clap's usual job — read `argv`, print, exit — is exactly
+/// what must not happen: the words come from an [`ExecCall`] and the answer goes back as bytes
+/// and a code, on a session that has other work to do. What is being borrowed from clap is the
+/// parsing and the help, which is to say the conventions a person expects of a command line —
+/// `--flag=value`, `--`, a suggestion when they mistype an option — and not the driving.
+mod args {
+    use std::path::{Path, PathBuf};
+
+    use ailoy::message::Message;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    #[command(
+        name = "mem",
+        about = "mem — a memory store that is one file in this tree",
+        after_help = "<store> is a path in this tree, resolved like any other argument. `init` creates it; every other command expects it to be there already.",
+        // The doc comments in this module are for whoever reads the module. What a caller of the
+        // command sees is `about` and the first line of each item's; nothing below argues clap's
+        // design decisions at somebody who typed `--help`.
+        long_about = None,
+        // Bare `mem` is a line that asked for nothing, and the help is the useful answer to it.
+        arg_required_else_help = true,
+        // `mem help insert` as well as `mem insert --help` is a second spelling of one thing.
+        disable_help_subcommand = true,
+        // Nothing here is versioned on its own: this ships as part of a console, not as a program
+        // somebody installed and might hold an old copy of.
+        disable_version_flag = true
+    )]
+    pub struct Cli {
+        #[command(subcommand)]
+        pub command: Command,
+    }
+
+    /// What a command line asked for.
+    ///
+    /// No equality: one of these holds a conversation, and what it would mean for two
+    /// conversations to be equal is a question this crate never asks. A derive kept for the
+    /// look of it would have to be answered — by comparing serialised JSON, say — and that is
+    /// a definition of sameness invented for a caller that does not exist.
+    #[derive(Clone, Debug, clap::Subcommand)]
+    pub enum Command {
+        /// make a store at <store>
+        ///
+        /// The one command that brings a store into being. Every other one is about memories
+        /// and expects the file to be there, which is what keeps a mistyped name from becoming
+        /// an empty store that answers every search with nothing.
+        #[command(long_about = None)]
+        Init(Init),
+
+        /// remember what is worth remembering in <messages>
+        ///
+        /// The store is named per command rather than configured once for the process because a
+        /// store is a document: which memories belong to what a session is doing is the caller's
+        /// business, and two stores side by side in one directory is the normal case.
+        #[command(visible_alias = "add", long_about = None)]
+        Insert(Insert),
+
+        /// the memories nearest <query>, nearest first
+        #[command(long_about = None)]
+        Search(Search),
+    }
+
+    impl Command {
+        /// The store this line names, whichever command named it.
+        ///
+        /// Every command takes one, so asking for it is a question about the line rather than
+        /// about which command was written — and the arm-per-variant that answers it belongs
+        /// next to the variants, where a command added below is a compile error here and not a
+        /// store quietly resolved somewhere else. What each command then *does* to the store is
+        /// the difference between them, and stays where they part ways.
+        pub fn get_store_path(&self) -> &Path {
+            match self {
+                Self::Init(init) => &init.store,
+                Self::Insert(insert) => &insert.store,
+                Self::Search(search) => &search.store,
+            }
+        }
+    }
+
+    /// `mem init <store>` — a store where there was no file.
+    #[derive(Clone, Debug, clap::Args)]
+    pub struct Init {
+        /// the store to make, as a path in this tree
+        ///
+        /// A path and not a name: what this ends up as is a file, and typing it as one is what
+        /// keeps a caller from being handed a `String` that has to be remembered to be a path
+        /// three functions later.
+        #[arg(long_help = None)]
+        pub store: PathBuf,
+    }
+
+    /// `mem insert <store> <messages>` — a conversation, read for what is worth keeping.
+    #[derive(Clone, Debug, clap::Args)]
+    pub struct Insert {
+        /// the store to write to, as a path in this tree
+        ///
+        /// A path and not a name: what this ends up as is a file, and typing it as one is what
+        /// keeps a caller from being handed a `String` that has to be remembered to be a path
+        /// three functions later.
+        #[arg(long_help = None)]
+        pub store: PathBuf,
+
+        /// the conversation to remember: one JSON message per argument
+        ///
+        /// A conversation and not a sentence, because that is where memories actually are: the
+        /// fact is in one turn, the date it happened in the turn before, and the pronoun naming
+        /// it in the turn after. Whatever arrives is data — nothing here shortens or tidies it,
+        /// since deciding what matters is the extraction's job and not the parser's.
+        ///
+        /// A turn per argument, rather than one argument holding a JSON list of them. A command
+        /// line is already a list of strings, and `ExecCall::args` hands it over as one — so
+        /// spelling the turns as separate arguments lets argv carry the list, where a JSON array
+        /// inside a single argument would be a second list nested in the first. It also keeps
+        /// each turn separately quoted, which is the difference between a shell line a person can
+        /// read and one enormous argument.
+        #[arg(long_help = None, value_parser = |text: &str| serde_json::from_str::<Message>(text)
+            .map_err(|e| format!("cannot parse to a message: {e}")))]
+        pub messages: Vec<Message>,
+    }
+
+    /// `mem search <store> <query>` — the memories in one store nearest what was asked.
+    #[derive(Clone, Debug, clap::Args)]
+    pub struct Search {
+        /// the store to search, as a path in this tree
+        #[arg(long_help = None)]
+        pub store: PathBuf,
+
+        /// what to look for
+        ///
+        /// A question or a phrase rather than a pattern: what comes back is what is *near* this,
+        /// so there is nothing here to match and nothing to escape.
+        #[arg(long_help = None)]
+        pub query: String,
+
+        /// how many memories to answer with
+        ///
+        /// A search that answered with everything it could rank would be answering with the
+        /// store: the memories are ordered by how near they are, and past the first few that
+        /// nearness is a formality — a memory sharing one common word with the question is on
+        /// the list. So the bound is part of what makes the answer an answer, and the flag is
+        /// for the caller who wants a longer one rather than a way to switch a limit on.
+        ///
+        /// Ten because both readers of this want about that many: a person reads a screen, and
+        /// an `insert` offering the neighbourhood to an extraction pays per memory it offers.
+        #[arg(short = 'n', long, default_value_t = 10, long_help = None)]
+        pub limit: usize,
+    }
 }
 
+/// How many held memories an `insert` shows the extraction.
+///
+/// Not a bound on an answer — nobody reads these — but on what one call is willing to spend on
+/// not repeating itself. The two costs are asymmetric, which is what settles the number: a
+/// memory left out of the neighbourhood is offered as new and becomes a duplicate row that
+/// nothing later retires, where a memory included needlessly is a sentence of prompt on one
+/// call. So this errs high, and higher than the ten a person is shown by `search`.
+///
+/// It is a constant and not a flag because the caller it would be a flag for does not exist: an
+/// `insert` is issued by a session that has just finished talking, and how many memories the
+/// extraction needs to see in order not to repeat one is a fact about the extraction.
+const NEIGHBOURHOOD: usize = 20;
+
+/// The `mem` command, as an [`Executable`](cortex::exec::Executable).
+#[derive(Debug, Clone, Default)]
+pub struct Mem {}
+
 impl Mem {
-    /// `mem` backed by `embedder` and `inference`.
-    pub fn new(embedder: Arc<dyn Embedder>, inference: Arc<dyn Inference>) -> Mem {
-        Mem {
-            embedder,
-            inference,
-        }
-    }
-
-    /// One line for [`ExecutableSet::register`](cortex::exec::ExecutableSet::register).
-    pub fn summary() -> &'static str {
-        "remember and recall facts, in a store that is one file of this tree"
-    }
-
-    /// The whole command, with everything that can go wrong in one place.
-    async fn run(&self, call: &ExecCall, mount: Option<&dyn Mount>) -> Result<Vec<u8>, Failure> {
-        let args = match Args::parse(&call.args)? {
-            Parsed::Help => return Ok(USAGE.into()),
-            Parsed::Run(args) => args,
-        };
-
-        let Some(mount) = mount else {
-            return Err(Failure {
-                code: 1,
-                message: "mem: nothing is mounted, so there is no store to open".into(),
-            });
-        };
-        let workspace_path = call.resolve(&args.store).map_err(|e| Failure {
-            code: 1,
-            message: format!("mem: {}: {e}", args.store),
-        })?;
-        let path = mount.host_path(&workspace_path);
-
-        let embedder = Arc::clone(&self.embedder);
-        let inference = Arc::clone(&self.inference);
-        let memory = match args.command.access() {
-            Access::Create => Memory::create(&path, embedder, inference).await,
-            Access::Write => Memory::open(&path, embedder, inference).await,
-            Access::Read => Memory::read(&path, embedder, inference).await,
-        }
-        // The name the caller used, not the one SQLite was given: the host path is on the far
-        // side of a mount the caller cannot see, and naming it says nothing about which store
-        // was meant.
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::NotFound => Failure {
-                code: 1,
-                message: format!("mem: no store at {}", args.store),
-            },
-            _ => Failure::from(e),
-        })?;
-
-        match args.command {
-            Command::Insert => {
-                let applied = memory
-                    .add(&args.rest[0], &args.scope, &args.metadata)
-                    .await?;
-                Ok(changes(&applied, args.json))
-            }
-
-            Command::Search => {
-                let hits = memory
-                    .search(
-                        &args.rest[0],
-                        &args.scope,
-                        args.limit.unwrap_or(SEARCH_LIMIT),
-                    )
-                    .await?;
-                Ok(if args.json {
-                    json(hits.iter().map(hit_json).collect())
-                } else {
-                    lines(hits.iter().map(|h| {
-                        format!(
-                            "{:.3}\t{}\t{}",
-                            h.score,
-                            h.record.id,
-                            one_line(&h.record.memory)
-                        )
-                    }))
-                })
-            }
-
-            Command::List => {
-                let records = memory
-                    .all(&args.scope, args.limit.unwrap_or(LIST_LIMIT))
-                    .await?;
-                Ok(memories(&records, args.json))
-            }
-
-            Command::Get => {
-                let found = memory.get(&args.rest[0]).await?.ok_or_else(|| Failure {
-                    code: 1,
-                    message: format!("mem: no memory {}", args.rest[0]),
-                })?;
-                Ok(memories(std::slice::from_ref(&found), args.json))
-            }
-
-            Command::Delete => {
-                let applied = memory.delete(&args.rest[0]).await?;
-                if applied.is_empty() {
-                    return Err(Failure {
-                        code: 1,
-                        message: format!("mem: no memory {}", args.rest[0]),
-                    });
-                }
-                Ok(changes(&applied, args.json))
-            }
-
-            Command::History => {
-                let entries = memory.history(&args.rest[0]).await?;
-                Ok(if args.json {
-                    json(entries.iter().map(entry_json).collect())
-                } else {
-                    lines(entries.iter().map(|e| {
-                        format!(
-                            "{}\t{}\t{}",
-                            e.at,
-                            e.event,
-                            one_line(e.after.as_deref().or(e.before.as_deref()).unwrap_or(""))
-                        )
-                    }))
-                })
-            }
-        }
+    pub fn new() -> Self {
+        Self {}
     }
 }
 
 /// Delegated `mem`, answering on stdout and stderr like the program it stands in for.
+///
+/// The whole command is here, in the one method the trait has: a line is read, the store it names
+/// is found, and the work is done, in that order and in that order only. Every way it can end is
+/// an [`ExecResult`] written where it is decided, because what a reader wants to know about an
+/// exit code is which line produced it.
 impl Executable for Mem {
     fn exec<'a>(
         &'a self,
         call: &'a ExecCall,
         mount: Option<&'a dyn Mount>,
     ) -> BoxFuture<'a, ExecResult> {
-        Box::pin(async move {
-            match self.run(call, mount).await {
-                Ok(stdout) => ExecResult::ok(stdout),
-                // Newline-terminated like every other line this writes: a reason that runs into
-                // the next thing on the terminal reads as part of it.
-                Err(failure) => {
-                    ExecResult::failed(failure.code, format!("{}\n", failure.message.trim_end()))
+        async move {
+            // The name back on the front: clap reads `argv`, whose first word is the program, and
+            // what arrives here is what a caller wrote *after* it. Prepending `mem` rather than
+            // suppressing the name is what puts it in front of every usage line clap renders.
+            let argv = std::iter::once("mem").chain(call.args.iter().map(String::as_str));
+
+            let command = match args::Cli::try_parse_from(argv) {
+                Ok(cli) => cli.command,
+                // Help is what was asked for, so it is an answer and not a refusal: stdout, and a
+                // zero exit for the caller that piped it somewhere.
+                Err(e) if e.kind() == ErrorKind::DisplayHelp => {
+                    return ExecResult::ok(e.to_string());
                 }
-            }
-        })
-    }
-}
-
-/// A command that did not happen, and what to exit with.
-///
-/// Two codes, because a caller can act on the difference: `2` is a command that was not
-/// understood and can be reissued differently, `1` is one that was understood and did not
-/// work. Both put their reason on stderr and nothing on stdout, so a caller reading output
-/// never reads an explanation as data.
-struct Failure {
-    code: i32,
-    message: String,
-}
-
-impl From<io::Error> for Failure {
-    fn from(e: io::Error) -> Failure {
-        Failure {
-            code: 1,
-            message: format!("mem: {e}"),
-        }
-    }
-}
-
-/// A misuse, answered with the reason and the usage under it.
-fn misuse(what: impl std::fmt::Display) -> Failure {
-    Failure {
-        code: 2,
-        message: format!("mem: {what}\n\n{USAGE}"),
-    }
-}
-
-/// What a command needs of the file it names.
-///
-/// The distinction the store draws, decided per command rather than per call: only `insert`
-/// brings a store into being, only `insert` and `delete` write to one, and everything else
-/// opens a file it will not modify. A `search` that created an empty store, or a `list` that
-/// took a write lock on a mount that has none to give, would each be doing something nobody
-/// asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Access {
-    Create,
-    Write,
-    Read,
-}
-
-/// Which of the six.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Command {
-    Insert,
-    Search,
-    List,
-    Get,
-    Delete,
-    History,
-}
-
-impl Command {
-    /// The name, and how many positionals follow the store.
-    fn parse(word: &str) -> Option<(Command, usize)> {
-        Some(match word {
-            // `add` as well as `insert`: the same operation is spelled the first way by mem0's
-            // own API, and a caller that knows one should not have to learn the other.
-            "insert" | "add" => (Command::Insert, 1),
-            "search" => (Command::Search, 1),
-            "list" => (Command::List, 0),
-            "get" => (Command::Get, 1),
-            "delete" => (Command::Delete, 1),
-            "history" => (Command::History, 1),
-            _ => return None,
-        })
-    }
-
-    /// What this needs of the store it names.
-    fn access(self) -> Access {
-        match self {
-            Command::Insert => Access::Create,
-            Command::Delete => Access::Write,
-            Command::Search | Command::List | Command::Get | Command::History => Access::Read,
-        }
-    }
-}
-
-/// What a command line asked for.
-enum Parsed {
-    /// `--help` anywhere, which is a request in its own right rather than a flag on a command:
-    /// somebody who has to ask does not also have to get the rest of the line right.
-    Help,
-    Run(Args),
-}
-
-/// A parsed command line.
-struct Args {
-    command: Command,
-    store: String,
-    /// The positionals after the store: a text, a query, an id, or nothing.
-    rest: Vec<String>,
-    scope: Scope,
-    metadata: String,
-    limit: Option<usize>,
-    json: bool,
-}
-
-impl Args {
-    /// Parse `args` — everything after the name the command was invoked by.
-    ///
-    /// Options may appear anywhere, including after the positionals, because that is where a
-    /// person writing a long `insert` puts them. `--` ends them, which is how a text that
-    /// starts with a dash is passed at all.
-    fn parse(args: &[String]) -> Result<Parsed, Failure> {
-        let mut positional: Vec<String> = Vec::new();
-        let mut scope = Scope::default();
-        let mut metadata = String::from("{}");
-        let mut limit = None;
-        let mut json = false;
-        let mut help = false;
-        let mut options = true;
-
-        let mut it = args.iter();
-        while let Some(arg) = it.next() {
-            let mut value = |flag: &str| -> Result<String, Failure> {
-                it.next()
-                    .cloned()
-                    .ok_or_else(|| misuse(format!("{flag} wants a value")))
+                // `2` and not `1`, because a caller can act on the difference: this is a line that
+                // was not understood and can be reissued differently, where `1` is one that was
+                // understood and did not work. Both say why on stderr and put nothing on stdout,
+                // so a caller reading output never reads an explanation as data.
+                Err(e) => return ExecResult::failed(2, e.to_string()),
             };
-            match arg.as_str() {
-                "--" if options => options = false,
-                "-h" | "--help" if options => help = true,
-                "--user" if options => scope.user = value("--user")?,
-                "--agent" if options => scope.agent = value("--agent")?,
-                "--run" if options => scope.run = value("--run")?,
-                "--metadata" if options => metadata = value("--metadata")?,
-                "--json" if options => json = true,
-                "--limit" if options => {
-                    let n = value("--limit")?;
-                    limit = Some(
-                        n.parse()
-                            .map_err(|_| misuse(format!("--limit wants a number, not {n}")))?,
-                    );
+
+            // What makes the mount necessary rather than convenient: `notes.sqlite` is a name in
+            // the *workspace*, and a store is opened by host path — so the name is resolved
+            // against where the calling command stood and then through the mount, which is the
+            // same file the caller would have seen. With nothing mounted there is no such file and
+            // no honest substitute for one, so the command refuses.
+            let Some(mount) = mount else {
+                return ExecResult::failed(
+                    1,
+                    "mem: nothing is mounted, so there is no store to open\n",
+                );
+            };
+
+            // Every command names a store, so finding it happens once, before they part ways:
+            // what differs between them is what they then do to it. Owned, because the command
+            // is taken apart below and this name outlives it: it is what every message about the
+            // store says, including the ones the work itself produces.
+            let store_path = command.get_store_path().to_path_buf();
+
+            // The `expect` is the argument's own history, not an assumption about paths: a
+            // call carries its words as `ExecCall::args`, which is `Vec<String>`, so
+            // every byte in this path was UTF-8 before clap ever spelled it as one. A workspace
+            // path is text at both ends — `cwd` is a `String`, and so is what `resolve` reads —
+            // and the only reason it is a `PathBuf` in between is that a path is what it names.
+            let store = match call.resolve(
+                store_path
+                    .to_str()
+                    .expect("a store named on a command line came from a `String`"),
+            ) {
+                Ok(path) => mount.host_path(&path),
+                // Named as the caller named it: the host path is on the far side of a mount they
+                // cannot see, and would not tell them which store was meant.
+                Err(e) => {
+                    return ExecResult::failed(1, format!("mem: {}: {e}\n", store_path.display()));
                 }
-                other if options && other.starts_with('-') && other.len() > 1 => {
-                    return Err(misuse(format!("no such option: {other}")));
+            };
+
+            match command {
+                args::Command::Init(_) => {
+                    // The host path, because that is where a file is actually made — and the
+                    // caller's name for it in everything said about it, since the host path is
+                    // on the far side of a mount they cannot see.
+                    match crate::store::Store::try_new(&store) {
+                        // The store, named as it was asked for, and nothing else: a line a
+                        // script can read as the path it now has. What went right needs no
+                        // sentence — the file is the answer.
+                        Ok(_) => ExecResult::ok(format!("{}\n", store_path.display())),
+                        // The one failure worth a sentence of its own. `File exists` is true and
+                        // says nothing about what to do, where the caller is either looking at a
+                        // store they already have — and wanted the command that writes to one —
+                        // or at a name they did not mean to type.
+                        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            ExecResult::failed(
+                                1,
+                                format!(
+                                    "mem: {}: there is already a file here; \
+                                     `mem insert` writes to a store that exists\n",
+                                    store_path.display()
+                                ),
+                            )
+                        }
+                        Err(e) => {
+                            ExecResult::failed(1, format!("mem: {}: {e}\n", store_path.display()))
+                        }
+                    }
                 }
-                other => positional.push(other.to_string()),
+                args::Command::Insert(insert) => {
+                    // The store first, and before the model: `insert` writes to a store that
+                    // exists, and a caller who named the wrong file should learn it from the
+                    // file and not from a provider they have already paid. Held open across the
+                    // extraction rather than reopened after it — a connection is not a lock, and
+                    // what the write needs is the file that was checked and not another one that
+                    // has the same name by the time the model answers.
+                    let store = match crate::store::Store::try_from_file(&store) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            return ExecResult::failed(
+                                1,
+                                format!("mem: {}: {e}\n", store_path.display()),
+                            );
+                        }
+                    };
+
+                    // What the store already holds near this conversation, so that the
+                    // extraction can decline to restate it. Nothing here reconciles anything —
+                    // the neighbourhood is shown and never written back — but without it every
+                    // insert offers every fact it finds as new, and a store told the same thing
+                    // twice holds it twice with nothing to tell the copies apart. That is the
+                    // one kind of damage this command can do that no later command undoes.
+                    //
+                    // Failing rather than carrying on with an empty neighbourhood: a store that
+                    // cannot be read is about to be written to, and the honest thing to do about
+                    // a half-working store is not to add rows to it.
+                    let existing =
+                        match store.search(&extractor::as_query(&insert.messages), NEIGHBOURHOOD) {
+                            Ok(existing) => existing,
+                            Err(e) => {
+                                return ExecResult::failed(
+                                    1,
+                                    format!("mem: {}: {e}\n", store_path.display()),
+                                );
+                            }
+                        };
+
+                    // `call.env` and not this process's: what pays for the call is the key the
+                    // calling session had.
+                    let memories =
+                        match extractor::extract_memories(&insert.messages, &existing, &call.env)
+                            .await
+                        {
+                            Ok(memories) => memories,
+                            // `1`: the line was understood and the work did not happen. `{e:#}` for
+                            // the whole chain — which variable was unset, which model was asked,
+                            // what came back — because the last link alone rarely says what to do.
+                            Err(e) => return ExecResult::failed(1, format!("mem: {e:#}\n")),
+                        };
+
+                    // Written before anything is said about them, so that what a caller reads on
+                    // stdout is what the store holds and not what a model answered: a write that
+                    // fails after the lines were printed would have told them the opposite of
+                    // what happened.
+                    if let Err(e) = store.insert(&memories) {
+                        return ExecResult::failed(
+                            1,
+                            format!("mem: {}: {e}\n", store_path.display()),
+                        );
+                    }
+
+                    // One memory per line, which is what a memory being a statement makes
+                    // possible: nothing here has to say which turn it came from or when,
+                    // because a memory that needed either would not have been written. Nothing
+                    // worth remembering is therefore no output at all — the honest answer for a
+                    // conversation that carried none, and the one a script reading lines wants.
+                    let mut said = String::new();
+                    for memory in &memories {
+                        said.push_str(&memory.text);
+                        said.push('\n');
+                    }
+                    ExecResult::ok(said)
+                }
+                args::Command::Search(search) => {
+                    let store = match crate::store::Store::try_from_file(&store) {
+                        Ok(store) => store,
+                        Err(e) => {
+                            return ExecResult::failed(
+                                1,
+                                format!("mem: {}: {e}\n", store_path.display()),
+                            );
+                        }
+                    };
+
+                    let found = match store.search(&search.query, search.limit) {
+                        Ok(found) => found,
+                        Err(e) => {
+                            return ExecResult::failed(
+                                1,
+                                format!("mem: {}: {e}\n", store_path.display()),
+                            );
+                        }
+                    };
+
+                    // One memory per line, nearest first, and the same lines `insert` prints —
+                    // what a search answers with is memories, and a memory is the statement.
+                    // Nothing near the query is no lines and a zero: the store was read and it
+                    // holds nothing near this, which is an answer and not a failure. A caller
+                    // that wants to act on emptiness reads no lines, which is the same test they
+                    // would make of any command that lists things.
+                    let mut said = String::new();
+                    for text in &found {
+                        said.push_str(text);
+                        said.push('\n');
+                    }
+                    ExecResult::ok(said)
+                }
             }
         }
-
-        // Answered before anything else is required, so `mem --help` and `mem insert --help`
-        // both say what the options are rather than complaining about what is missing.
-        if help {
-            return Ok(Parsed::Help);
-        }
-
-        let Some(word) = positional.first() else {
-            return Err(misuse("no command"));
-        };
-        let Some((command, wanted)) = Command::parse(word) else {
-            return Err(misuse(format!("no such command: {word}")));
-        };
-
-        let rest: Vec<String> = positional[1..].to_vec();
-        let Some((store, rest)) = rest.split_first() else {
-            return Err(misuse(format!("{word} wants a store to work on")));
-        };
-        if rest.len() != wanted {
-            return Err(misuse(format!(
-                "{word} wants {wanted} argument(s) after the store, and was given {}",
-                rest.len()
-            )));
-        }
-
-        if metadata != "{}"
-            && !serde_json::from_str::<serde_json::Value>(&metadata).is_ok_and(|v| v.is_object())
-        {
-            return Err(misuse("--metadata wants a JSON object"));
-        }
-
-        Ok(Parsed::Run(Args {
-            command,
-            store: store.clone(),
-            rest: rest.to_vec(),
-            scope,
-            metadata,
-            limit,
-            json,
-        }))
+        .boxed()
     }
-}
-
-/// What was written to the store: one line each, `event`, id and memory.
-///
-/// `insert` and `delete` answer in the same shape because they are the same answer — a list of
-/// changes — and a caller that reads one should not have to learn a second format for the
-/// other.
-fn changes(applied: &[Applied], as_json: bool) -> Vec<u8> {
-    if as_json {
-        json(applied.iter().map(applied_json).collect())
-    } else {
-        lines(
-            applied
-                .iter()
-                .map(|a| format!("{}\t{}\t{}", a.event, a.id, one_line(&a.memory))),
-        )
-    }
-}
-
-/// Memories the store holds: one line each, id and memory.
-fn memories(records: &[Record], as_json: bool) -> Vec<u8> {
-    if as_json {
-        json(records.iter().map(record_json).collect())
-    } else {
-        lines(
-            records
-                .iter()
-                .map(|r| format!("{}\t{}", r.id, one_line(&r.memory))),
-        )
-    }
-}
-
-/// Lines on stdout, each ending in a newline. No lines is no bytes, which is what a caller
-/// counting results reads as none.
-fn lines(lines: impl IntoIterator<Item = String>) -> Vec<u8> {
-    let mut out = String::new();
-    for line in lines {
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out.into_bytes()
-}
-
-/// A memory as one line: whatever it is, it takes up one, because the line format is what a
-/// caller splits on.
-fn one_line(text: &str) -> String {
-    text.replace(['\n', '\r', '\t'], " ")
-}
-
-/// A JSON array, one line, newline-terminated.
-fn json(values: Vec<serde_json::Value>) -> Vec<u8> {
-    let mut out = serde_json::Value::Array(values).to_string();
-    out.push('\n');
-    out.into_bytes()
-}
-
-/// Whatever was attached to a memory, as JSON — and as a string if it somehow is not.
-fn metadata_json(metadata: &str) -> serde_json::Value {
-    serde_json::from_str(metadata).unwrap_or_else(|_| serde_json::Value::String(metadata.into()))
-}
-
-fn record_json(record: &Record) -> serde_json::Value {
-    serde_json::json!({
-        "id": record.id,
-        "memory": record.memory,
-        "user_id": record.scope.user,
-        "agent_id": record.scope.agent,
-        "run_id": record.scope.run,
-        "metadata": metadata_json(&record.metadata),
-        "created_at": record.created_at,
-        "updated_at": record.updated_at,
-    })
-}
-
-fn hit_json(hit: &Hit) -> serde_json::Value {
-    let mut value = record_json(&hit.record);
-    value["score"] = serde_json::json!(hit.score);
-    value
-}
-
-fn applied_json(applied: &Applied) -> serde_json::Value {
-    serde_json::json!({
-        "id": applied.id,
-        "event": applied.event.as_str(),
-        "memory": applied.memory,
-    })
-}
-
-fn entry_json(entry: &Entry) -> serde_json::Value {
-    serde_json::json!({
-        "id": entry.id,
-        "event": entry.event.as_str(),
-        "old_memory": entry.before,
-        "new_memory": entry.after,
-        "created_at": entry.at,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use clap::{Parser as _, error::ErrorKind};
+
     use super::*;
-    use crate::{HashEmbedder, Verbatim};
 
-    /// A directory standing in for a mounted tree. Putting a real mount up needs a binding, a
-    /// libfuse provider and a kernel; what is under test here is what `mem` does with the path
-    /// a mount gives it, and a plain directory answers one the same way.
-    struct Mounted(PathBuf);
+    fn parse(line: &[&str]) -> Result<args::Command, clap::Error> {
+        args::Cli::try_parse_from(std::iter::once("mem").chain(line.iter().copied()))
+            .map(|cli| cli.command)
+    }
 
-    impl Mount for Mounted {
-        fn mountpoint(&self) -> &Path {
-            &self.0
+    /// The whole path with a model actually asked. The key comes from `.env`, searched from
+    /// this package upward; anything already exported wins over the file.
+    ///
+    /// ```text
+    /// cargo test -p cortex-exec-mem-v2 memory_can_be_extracted -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "asks a real provider: needs a key, a network, and spends money"]
+    async fn memory_can_be_extracted() {
+        dotenvy::dotenv().ok();
+
+        // Through the command line, so this covers what a caller types. The store is named and
+        // unused: the extraction never looks at it.
+        //
+        // Korean, and deliberately carrying no name, title or quoted phrase — those are kept as
+        // they were written, so a conversation with one in it could not tell a memory written in
+        // English from a memory written in Korean.
+        let command = parse(&[
+            "insert",
+            "unused.sqlite",
+            r#"{"role":"user","contents":[{"type":"text","text":
+               "아몬드 알레르기가 생겨서 아몬드 우유에서 오트 우유로 바꿨어요."}]}"#,
+            r#"{"role":"assistant","contents":[{"type":"text","text":
+               "알겠습니다 — 레시피를 추천할 때 참고하겠습니다."}]}"#,
+        ])
+        .expect("the conversation parses");
+        let args::Command::Insert(insert) = command else {
+            panic!("insert was asked for");
+        };
+
+        // What a call is handed as `call.env`; here the program's own environment,
+        // which is where `.env` just landed.
+        let env = std::env::vars().collect();
+        let memories = extractor::extract_memories(&insert.messages, &[], &env)
+            .await
+            .expect("the extraction answers");
+
+        for memory in &memories {
+            println!("{}", memory.text);
         }
-    }
 
-    fn mem() -> Mem {
-        Mem::new(Arc::new(HashEmbedder::default()), Arc::new(Verbatim))
-    }
-
-    fn call(args: &[&str]) -> ExecCall {
-        ExecCall {
-            name: "mem".into(),
-            args: args.iter().map(|a| a.to_string()).collect(),
-            // At the root of the tree, which is where a relative store name resolves from.
-            cwd: Some(String::new()),
-            env: Default::default(),
-        }
-    }
-
-    async fn run(mount: &Mounted, args: &[&str]) -> ExecResult {
-        mem().exec(&call(args), Some(mount)).await
-    }
-
-    /// stdout as text, having asserted the command succeeded.
-    async fn out(mount: &Mounted, args: &[&str]) -> String {
-        let result = run(mount, args).await;
-        assert_eq!(
-            result.exit_code,
-            0,
-            "{args:?} failed: {}",
-            String::from_utf8_lossy(&result.stderr)
+        // What can honestly be asserted about text a model wrote: that it is there, and that
+        // the one unmissable fact in the conversation survived.
+        assert!(!memories.is_empty(), "the conversation carries a fact");
+        assert!(
+            memories.iter().all(|m| !m.text.trim().is_empty()),
+            "an empty memory is not a memory"
         );
-        String::from_utf8(result.stdout).expect("mem writes text")
-    }
-
-    fn mounted() -> (tempfile::TempDir, Mounted) {
-        let dir = tempfile::tempdir().unwrap();
-        let mount = Mounted(dir.path().to_path_buf());
-        (dir, mount)
-    }
-
-    #[tokio::test]
-    async fn what_was_inserted_is_what_search_finds() {
-        let (_dir, mount) = mounted();
-        let inserted = out(&mount, &["insert", "m.sqlite", "the user drinks tea"]).await;
-        assert!(inserted.starts_with("ADD\t"), "{inserted:?}");
-
-        let found = out(&mount, &["search", "m.sqlite", "what does the user drink"]).await;
-        assert!(found.contains("the user drinks tea"), "{found:?}");
-    }
-
-    /// The chain the mount exists for: a name in the workspace, resolved against where the
-    /// caller stood, is a file on this host — and the store lands there and nowhere else.
-    #[tokio::test]
-    async fn the_store_is_a_file_where_the_tree_says_it_is() {
-        let (dir, mount) = mounted();
-        std::fs::create_dir(dir.path().join("notes")).unwrap();
-        let call = ExecCall {
-            name: "mem".into(),
-            args: ["insert", "m.sqlite", "the user drinks tea"]
+        assert!(
+            memories
                 .iter()
-                .map(|a| a.to_string())
-                .collect(),
-            cwd: Some("notes".into()),
+                .any(|m| m.text.to_lowercase().contains("oat")),
+            "the switch to oat milk is what this conversation is about: {memories:#?}"
+        );
+        let hangul = |text: &str| {
+            text.chars().any(|c| {
+                matches!(c, '\u{AC00}'..='\u{D7A3}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}')
+            })
+        };
+        assert!(
+            !memories.iter().any(|m| hangul(&m.text)),
+            "the conversation is Korean and the memories are English: {memories:#?}"
+        );
+    }
+
+    /// The same conversation twice, through the whole command both times. The second `insert`
+    /// is shown what the first wrote and has nothing left to add — which is the only way to see
+    /// that the neighbourhood reaches the extraction at all, since everything between the
+    /// search and the answer happens inside a model.
+    ///
+    /// Ignored for the reason the test above is, and worth running whenever anything on the
+    /// path between [`Store::search`](crate::store::Store::search) and the prompt changes: a
+    /// store that quietly stopped offering what it holds looks exactly like one that works,
+    /// until it has two copies of everything.
+    ///
+    /// ```text
+    /// cargo test -p cortex-exec-mem a_conversation_inserted_twice -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "asks a real provider: needs a key, a network, and spends money"]
+    async fn a_conversation_inserted_twice_is_not_remembered_twice() {
+        dotenvy::dotenv().ok();
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+        let here = Here(dir.path().to_path_buf());
+
+        let env: std::collections::BTreeMap<_, _> = std::env::vars().collect();
+        let call = |args: &[&str]| ExecCall {
+            name: "mem".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: Some(String::new()),
+            env: env.clone(),
+        };
+
+        let made = Mem::new()
+            .exec(&call(&["init", "notes.sqlite"]), Some(&here))
+            .await;
+        assert_eq!(
+            made.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let conversation = [
+            "insert",
+            "notes.sqlite",
+            r#"{"role":"user","contents":[{"type":"text","text":
+               "I switched from almond milk to oat milk because I developed an almond allergy."}]}"#,
+            r#"{"role":"assistant","contents":[{"type":"text","text":
+               "Noted — I will keep that in mind when suggesting recipes."}]}"#,
+        ];
+
+        let first = Mem::new().exec(&call(&conversation), Some(&here)).await;
+        assert_eq!(
+            first.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+        let first = String::from_utf8_lossy(&first.stdout);
+        println!("--- first insert ---\n{first}");
+        assert!(!first.trim().is_empty(), "the conversation carries a fact");
+
+        let again = Mem::new().exec(&call(&conversation), Some(&here)).await;
+        assert_eq!(
+            again.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&again.stderr)
+        );
+        let again = String::from_utf8_lossy(&again.stdout);
+        println!("--- second insert ---\n{again}");
+
+        // What can honestly be asserted about a model's judgement: not that it writes nothing,
+        // but that it does not write the store over again. A fact phrased a second way is one
+        // line; a store that was never shown its own contents answers with all of them.
+        let lines = |said: &str| said.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(
+            lines(&again) < lines(&first),
+            "the second reading was shown what the first wrote:\n{again}"
+        );
+    }
+
+    /// A store is all `init` needs to be told.
+    #[test]
+    fn a_store_is_made_by_naming_it() {
+        let args::Command::Init(init) =
+            parse(&["init", "notes.sqlite"]).expect("a store is all init needs to be told")
+        else {
+            panic!("init was asked for");
+        };
+        assert_eq!(init.store, Path::new("notes.sqlite"));
+    }
+
+    /// End to end, as a caller would: a file where there was none, and the second attempt at the
+    /// same name refused rather than quietly handed the store that is already there.
+    #[tokio::test]
+    async fn init_makes_a_store_and_will_not_make_it_twice() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+
+        // The tree as the `mem` binary supplies it: a directory on this host, with nothing
+        // mounted over it.
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+        let here = Here(dir.path().to_path_buf());
+
+        let call = |args: &[&str]| ExecCall {
+            name: "mem".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: Some(String::new()),
             env: Default::default(),
         };
 
-        let result = mem().exec(&call, Some(&mount)).await;
-        assert_eq!(result.exit_code, 0);
-        assert!(dir.path().join("notes/m.sqlite").exists());
-        assert!(!dir.path().join("m.sqlite").exists());
+        let made = Mem::new()
+            .exec(&call(&["init", "notes.sqlite"]), Some(&here))
+            .await;
+        assert_eq!(
+            made.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&made.stdout), "notes.sqlite\n");
+        assert!(dir.path().join("notes.sqlite").is_file());
+
+        let again = Mem::new()
+            .exec(&call(&["init", "notes.sqlite"]), Some(&here))
+            .await;
+        assert_eq!(again.exit_code, 1);
+        assert!(again.stdout.is_empty(), "nothing to read as a store's path");
+        let said = String::from_utf8_lossy(&again.stderr);
+        assert!(
+            said.contains("notes.sqlite"),
+            "the store is named as the caller named it: {said}"
+        );
     }
 
-    /// Nothing mounted is no file to open and no honest substitute for one.
+    /// A store that is not there ends the line before a provider is asked anything — which is
+    /// also why this test needs no key and no network.
     #[tokio::test]
-    async fn with_nothing_mounted_the_command_refuses() {
-        let result = mem()
-            .exec(&call(&["insert", "m.sqlite", "hello"]), None)
+    async fn insert_into_a_store_that_is_not_there_asks_no_model() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        let call = ExecCall {
+            name: "mem".into(),
+            args: [
+                "insert",
+                "missing.sqlite",
+                r#"{"role":"user","contents":[{"type":"text","text":"I switched to oat milk"}]}"#,
+            ]
+            .iter()
+            .map(|a| (*a).to_string())
+            .collect(),
+            cwd: Some(String::new()),
+            // No key in it, so a line that reached the extraction would fail saying so. That
+            // this one does not is the whole assertion.
+            env: Default::default(),
+        };
+
+        let result = Mem::new()
+            .exec(&call, Some(&Here(dir.path().to_path_buf())))
             .await;
         assert_eq!(result.exit_code, 1);
+        let said = String::from_utf8_lossy(&result.stderr);
+        assert!(said.contains("missing.sqlite"), "{said}");
         assert!(
-            String::from_utf8_lossy(&result.stderr).contains("nothing is mounted"),
-            "{:?}",
+            !said.contains("API_KEY"),
+            "the store was the answer, and no model was asked: {said}"
+        );
+    }
+
+    /// The whole line with the model taken out of it: a store that exists, a conversation with
+    /// nothing readable in it, and therefore nothing to write. It is the one path through
+    /// `insert` that reaches the store without asking a provider anything, which is what makes
+    /// it the test that the two halves are wired together at all — a zero exit here says the
+    /// store was opened and written to, since either failing is a `1`.
+    #[tokio::test]
+    async fn insert_writes_to_the_store_it_was_given() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+        let here = Here(dir.path().to_path_buf());
+
+        let made = Mem::new()
+            .exec(
+                &ExecCall {
+                    name: "mem".into(),
+                    args: ["init", "notes.sqlite"].map(String::from).into(),
+                    cwd: Some(String::new()),
+                    env: Default::default(),
+                },
+                Some(&here),
+            )
+            .await;
+        assert_eq!(made.exit_code, 0);
+
+        // A system turn is nobody speaking, so there is nothing here for an extraction to read
+        // and no model is asked — which is also why this test needs no key.
+        let result = Mem::new()
+            .exec(
+                &ExecCall {
+                    name: "mem".into(),
+                    args: [
+                        "insert",
+                        "notes.sqlite",
+                        r#"{"role":"system","contents":[{"type":"text","text":"Be helpful."}]}"#,
+                    ]
+                    .map(String::from)
+                    .into(),
+                    cwd: Some(String::new()),
+                    env: Default::default(),
+                },
+                Some(&here),
+            )
+            .await;
+
+        assert_eq!(
+            result.exit_code,
+            0,
+            "{}",
             String::from_utf8_lossy(&result.stderr)
         );
-        assert!(result.stdout.is_empty());
-    }
-
-    /// Reading is not a reason to create a store, and the answer says which file was missing
-    /// rather than pretending there were no memories in it.
-    ///
-    /// Named as the caller named it: the host path is on the far side of a mount they cannot
-    /// see, and would not tell them which store was meant.
-    #[tokio::test]
-    async fn searching_a_store_that_is_not_there_fails_without_making_one() {
-        let (dir, mount) = mounted();
-        let result = run(&mount, &["search", "absent.sqlite", "tea"]).await;
-        assert_eq!(result.exit_code, 1);
-        assert!(!dir.path().join("absent.sqlite").exists());
-
-        let said = String::from_utf8(result.stderr).unwrap();
-        assert_eq!(said, "mem: no store at absent.sqlite\n");
-    }
-
-    /// Every reason ends its line, whatever produced it — one that ran into the next thing on
-    /// the terminal would read as part of it.
-    #[tokio::test]
-    async fn a_reason_is_one_terminated_line() {
-        let (_dir, mount) = mounted();
-        for args in [
-            vec!["search", "absent.sqlite", "tea"],
-            vec!["insert", "../outside.sqlite", "tea"],
-            vec!["nonsense"],
-        ] {
-            let stderr = String::from_utf8(run(&mount, &args).await.stderr).unwrap();
-            assert!(
-                stderr.ends_with('\n') && !stderr.ends_with("\n\n"),
-                "{stderr:?}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn a_scope_is_what_a_search_is_confined_to() {
-        let (_dir, mount) = mounted();
-        out(
-            &mount,
-            &["insert", "m.sqlite", "drinks tea", "--user", "ana"],
-        )
-        .await;
-        out(
-            &mount,
-            &["insert", "m.sqlite", "drinks coffee", "--user", "bo"],
-        )
-        .await;
-
-        let ana = out(&mount, &["search", "m.sqlite", "drinks", "--user", "ana"]).await;
-        assert!(ana.contains("drinks tea"), "{ana:?}");
-        assert!(!ana.contains("drinks coffee"), "{ana:?}");
-
-        let everyone = out(&mount, &["search", "m.sqlite", "drinks"]).await;
-        assert!(everyone.contains("drinks tea") && everyone.contains("drinks coffee"));
-    }
-
-    #[tokio::test]
-    async fn a_memory_can_be_listed_read_forgotten_and_accounted_for() {
-        let (_dir, mount) = mounted();
-        let inserted = out(&mount, &["insert", "m.sqlite", "the user drinks tea"]).await;
-        let id = inserted.split('\t').nth(1).unwrap().to_string();
-
-        let listed = out(&mount, &["list", "m.sqlite"]).await;
-        assert_eq!(listed, format!("{id}\tthe user drinks tea\n"));
-
-        let got = out(&mount, &["get", "m.sqlite", &id]).await;
-        assert!(got.contains("the user drinks tea"));
-
-        let forgotten = out(&mount, &["delete", "m.sqlite", &id]).await;
-        assert!(forgotten.starts_with("DELETE\t"), "{forgotten:?}");
-        assert_eq!(out(&mount, &["list", "m.sqlite"]).await, "");
-
-        let history = out(&mount, &["history", "m.sqlite", &id]).await;
-        assert_eq!(history.lines().count(), 2);
-        assert!(history.contains("\tADD\t") && history.contains("\tDELETE\t"));
-    }
-
-    /// A limit is a count of answers, and the nearest are the ones kept.
-    #[tokio::test]
-    async fn a_limit_bounds_what_comes_back() {
-        let (_dir, mount) = mounted();
-        for text in ["drinks tea", "drinks coffee", "drinks water"] {
-            out(&mount, &["insert", "m.sqlite", text]).await;
-        }
-        let found = out(&mount, &["search", "m.sqlite", "drinks", "--limit", "2"]).await;
-        assert_eq!(found.lines().count(), 2);
-    }
-
-    #[tokio::test]
-    async fn json_answers_carry_what_the_lines_leave_out() {
-        let (_dir, mount) = mounted();
-        out(
-            &mount,
-            &[
-                "insert",
-                "m.sqlite",
-                "drinks tea",
-                "--user",
-                "ana",
-                "--metadata",
-                r#"{"source":"chat"}"#,
-            ],
-        )
-        .await;
-
-        let found = out(&mount, &["search", "m.sqlite", "tea", "--json"]).await;
-        let value: serde_json::Value = serde_json::from_str(&found).expect("--json answers JSON");
-        assert_eq!(value[0]["memory"], "drinks tea");
-        assert_eq!(value[0]["user_id"], "ana");
-        assert_eq!(value[0]["metadata"]["source"], "chat");
-        assert!(value[0]["score"].is_number());
-    }
-
-    /// A memory written across several lines is still one line of output — the format is what
-    /// a caller splits on, so nothing in a memory may look like a record boundary.
-    #[tokio::test]
-    async fn a_multi_line_memory_stays_on_one_line() {
-        let (_dir, mount) = mounted();
-        out(&mount, &["insert", "m.sqlite", "drinks tea\nand coffee"]).await;
-        let listed = out(&mount, &["list", "m.sqlite"]).await;
-        assert_eq!(listed.lines().count(), 1);
-        assert!(listed.contains("drinks tea and coffee"));
-    }
-
-    /// Usage errors exit `2`, distinct from a command that was understood and failed.
-    #[tokio::test]
-    async fn a_command_that_makes_no_sense_exits_two_with_the_usage() {
-        let (_dir, mount) = mounted();
-        for args in [
-            vec!["remember", "m.sqlite", "tea"],
-            vec!["insert"],
-            vec!["insert", "m.sqlite"],
-            vec!["insert", "m.sqlite", "one", "two"],
-            vec!["search", "m.sqlite", "tea", "--limit", "many"],
-            vec!["search", "m.sqlite", "tea", "--nope"],
-            vec!["insert", "m.sqlite", "tea", "--metadata", "[1,2]"],
-            vec![],
-        ] {
-            let result = run(&mount, &args).await;
-            assert_eq!(result.exit_code, 2, "{args:?} did not read as a misuse");
-            assert!(String::from_utf8_lossy(&result.stderr).contains("usage:"));
-        }
-    }
-
-    /// `--` is how a memory that starts with a dash is written at all.
-    #[tokio::test]
-    async fn everything_after_a_bare_dash_dash_is_text() {
-        let (_dir, mount) = mounted();
-        let inserted = out(
-            &mount,
-            &["insert", "m.sqlite", "--", "--user is not a flag here"],
-        )
-        .await;
         assert!(
-            inserted.contains("--user is not a flag here"),
-            "{inserted:?}"
+            result.stdout.is_empty(),
+            "nothing was remembered, so there is no line saying one was: {}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(
+            result.stderr.is_empty(),
+            "and nothing to explain: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
     }
 
+    /// `search` end to end, as a caller types it: memories in a store, a question asked of it,
+    /// and the answer on stdout nearest first. The store is written through [`crate::store`]
+    /// rather than through `mem insert`, because what a memory *is* is settled by then — going
+    /// through the extraction would put a model in the middle of a test about lines of output.
     #[tokio::test]
-    async fn help_is_answered_on_stdout_and_succeeds() {
-        let (_dir, mount) = mounted();
-        assert_eq!(out(&mount, &["--help"]).await, USAGE);
-        assert_eq!(out(&mount, &["insert", "--help"]).await, USAGE);
+    async fn search_answers_with_the_memories_nearest_the_question() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+        let here = Here(dir.path().to_path_buf());
+
+        let store = crate::store::Store::try_new(dir.path().join("notes.sqlite"))
+            .expect("a store can be made");
+        store
+            .insert(&[
+                crate::memory::Memory {
+                    text: "User drinks tea".into(),
+                },
+                crate::memory::Memory {
+                    text: "User switched to oat milk".into(),
+                },
+            ])
+            .expect("the memories are written");
+        drop(store);
+
+        let ask = |args: &[&str]| ExecCall {
+            name: "mem".into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: Some(String::new()),
+            env: Default::default(),
+        };
+
+        let answered = Mem::new()
+            .exec(&ask(&["search", "notes.sqlite", "oat milk"]), Some(&here))
+            .await;
+        assert_eq!(
+            answered.exit_code,
+            0,
+            "{}",
+            String::from_utf8_lossy(&answered.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&answered.stdout),
+            "User switched to oat milk\n"
+        );
+
+        // The bound reaches the store: two memories are near "user", and one line comes back.
+        let one = Mem::new()
+            .exec(
+                &ask(&["search", "notes.sqlite", "user", "-n", "1"]),
+                Some(&here),
+            )
+            .await;
+        assert_eq!(one.exit_code, 0);
+        assert_eq!(one.stdout.iter().filter(|b| **b == b'\n').count(), 1);
+
+        // Nothing near the question is no lines and a zero: the store was read, and it holds
+        // nothing near this.
+        let nothing = Mem::new()
+            .exec(&ask(&["search", "notes.sqlite", "almond"]), Some(&here))
+            .await;
+        assert_eq!(nothing.exit_code, 0);
+        assert!(nothing.stdout.is_empty());
+        assert!(nothing.stderr.is_empty());
+    }
+
+    /// A store that is not there is the answer, and the same one `insert` gives: a search that
+    /// made an empty store would answer every question with nothing, forever.
+    #[tokio::test]
+    async fn searching_a_store_that_is_not_there_says_so() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        struct Here(PathBuf);
+        impl Mount for Here {
+            fn mountpoint(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        let result = Mem::new()
+            .exec(
+                &ExecCall {
+                    name: "mem".into(),
+                    args: ["search", "missing.sqlite", "oat milk"]
+                        .map(String::from)
+                        .into(),
+                    cwd: Some(String::new()),
+                    env: Default::default(),
+                },
+                Some(&Here(dir.path().to_path_buf())),
+            )
+            .await;
+
+        assert_eq!(result.exit_code, 1);
+        assert!(result.stdout.is_empty(), "nothing to read as a memory");
+        let said = String::from_utf8_lossy(&result.stderr);
+        assert!(said.contains("missing.sqlite"), "{said}");
+        assert!(
+            !dir.path().join("missing.sqlite").exists(),
+            "searching made nothing"
+        );
+    }
+
+    /// A search is a store and a question, and the count is the caller's to raise.
+    #[test]
+    fn a_search_is_bounded_whether_or_not_the_caller_says_so() {
+        let args::Command::Search(search) =
+            parse(&["search", "notes.sqlite", "oat milk"]).expect("a store and a question")
+        else {
+            panic!("search was asked for");
+        };
+        assert_eq!(search.query, "oat milk");
+        assert_eq!(search.limit, 10);
+
+        let args::Command::Search(search) =
+            parse(&["search", "notes.sqlite", "oat milk", "-n", "3"]).expect("a shorter answer")
+        else {
+            panic!("search was asked for");
+        };
+        assert_eq!(search.limit, 3);
+    }
+
+    /// A turn per argument, in the order they were written: argv carries the list.
+    #[test]
+    fn a_conversation_arrives_as_messages() {
+        let command = parse(&[
+            "insert",
+            "notes.sqlite",
+            r#"{"role":"user","contents":[{"type":"text","text":"I switched to oat milk"}]}"#,
+            r#"{"role":"assistant","contents":[{"type":"text","text":"Noted."}]}"#,
+        ])
+        .expect("a turn per argument is what insert takes");
+
+        let args::Command::Insert(insert) = command else {
+            panic!("insert was asked for");
+        };
+        let messages = &insert.messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, ailoy::message::Role::User);
+        assert_eq!(
+            messages[0].contents[0].as_text(),
+            Some("I switched to oat milk")
+        );
+        assert_eq!(messages[1].role, ailoy::message::Role::Assistant);
+    }
+
+    /// The whole reason the parse lives in clap: a turn that will not parse is a line that was
+    /// *not understood*, and [`Executable::exec`] leaves with `2` for those and `1` for a line
+    /// it understood and could not carry out. Reading the text later would have made this the
+    /// second kind — and would have made a caller resolve a mount first, on behalf of an
+    /// argument that was never usable.
+    #[test]
+    fn a_turn_that_will_not_parse_is_a_misunderstood_line() {
+        let e =
+            parse(&["insert", "notes.sqlite", "not json at all"]).expect_err("prose is not a turn");
+        assert_eq!(e.kind(), ErrorKind::ValueValidation);
+
+        // What a caller needs off this line, rather than the sentence it is currently said in:
+        // which argument was wrong, and where in it. Pinning the wording would make every
+        // rephrasing a failing test, and the wording is not what anybody depends on.
+        let said = e.to_string();
+        assert!(
+            said.contains("MESSAGES"),
+            "clap names the argument that was wrong, which a parse done later could not: {said}"
+        );
+        assert!(
+            said.contains("line 1 column"),
+            "serde's half says where in the value it gave up: {said}"
+        );
+    }
+
+    /// JSON of the wrong shape is the same failure as no JSON at all — the argument's type is
+    /// [`Message`](ailoy::message::Message), not "some JSON".
+    #[test]
+    fn json_that_is_not_a_message_is_not_a_turn() {
+        let e = parse(&["insert", "notes.sqlite", r#"{"role":"user"}"#])
+            .expect_err("a role with nothing said is not a message");
+        assert_eq!(e.kind(), ErrorKind::ValueValidation);
+
+        let e = parse(&["insert", "notes.sqlite", r#""hello""#])
+            .expect_err("a string is not a message");
+        assert_eq!(e.kind(), ErrorKind::ValueValidation);
+    }
+
+    /// One bad turn fails the line, rather than being dropped from a conversation that then
+    /// looks complete: a store written from what was left would be missing a turn nobody was
+    /// told about.
+    #[test]
+    fn one_unreadable_turn_fails_the_whole_line() {
+        let e = parse(&[
+            "insert",
+            "notes.sqlite",
+            r#"{"role":"user","contents":[{"type":"text","text":"hello"}]}"#,
+            "{ not a message }",
+        ])
+        .expect_err("the second turn does not parse");
+        assert_eq!(e.kind(), ErrorKind::ValueValidation);
+    }
+
+    /// Nothing said is a conversation too, and one this command is willing to be handed: that
+    /// it holds no memories is for the extraction to answer, not the parser. A script that
+    /// happens to have no turns to offer gets a no-op and a zero, where a required argument
+    /// would make it special-case the empty case itself.
+    #[test]
+    fn a_conversation_with_no_turns_still_parses() {
+        let command = parse(&["insert", "notes.sqlite"]).expect("no turns is a conversation");
+        let args::Command::Insert(insert) = command else {
+            panic!("insert was asked for");
+        };
+        assert!(insert.messages.is_empty());
     }
 }
