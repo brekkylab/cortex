@@ -475,24 +475,6 @@ fn a_workbooks_values_are_paired_by_name_and_budgeted_tab_by_tab() {
     );
 }
 
-/// A range that asks backwards is empty, not a crash. The window arrives from
-/// whatever a client asked for, and `data[4..2]` aborts the process rather than
-/// erroring — which makes this the provider's job, not the caller's.
-#[test]
-fn a_backwards_window_is_empty_rather_than_fatal() {
-    let data = b"abcdef";
-    // Built from values: a literal `4..2` is a lint, but a range arriving from a
-    // client is just two numbers.
-    let backwards = |start: u64, end: u64| slice(data, Some(start..end));
-    assert!(backwards(4, 2).is_empty());
-    assert!(backwards(9, 3).is_empty());
-    assert!(backwards(6, 6).is_empty());
-    // Past the end clamps to the end; the ordinary cases keep working.
-    assert_eq!(backwards(4, 99).len(), 2);
-    assert_eq!(slice(data, Some(1..3)), b"bc");
-    assert_eq!(slice(data, None), data);
-}
-
 // ---------------------------------------------------------------------------
 // Drive behind a loopback mock.
 //
@@ -1312,43 +1294,6 @@ async fn one_service_can_move_without_moving_the_others() {
         0,
         "nor A for Sheets: one origin moving does not move the rest"
     );
-}
-
-/// The same window, asked backwards, through the pair a mount actually uses.
-///
-/// It has to be a large file: a small one is cached whole and sliced by the wrapper,
-/// whose own slicing clamps. Past the cacheable limit the range goes down to the
-/// provider, where the arithmetic deciding whether to slice ran `end - start` on it
-/// (underflow) and the slice indexed `data[4..2]`. Neither errors; both abort the
-/// process, and a filesystem read is where a client's range arrives.
-#[tokio::test]
-async fn a_backwards_window_does_not_take_the_process_down() {
-    const REAL: usize = 10 * 1024 * 1024;
-    let mock = start(
-        json!([row(
-            "big.bin",
-            "B1",
-            "application/octet-stream",
-            Some("10485760")
-        )]),
-        HashMap::from([("B1".to_string(), vec![b'z'; REAL])]),
-    )
-    .await;
-    let fs = mounted(&mock.config());
-    let file = Path::new("/My Drive/big.bin");
-
-    // Built from values, since a literal backwards range is a lint — but one arriving
-    // from a client is just two numbers.
-    for (start, end) in [(3_000_000u64, 1_000_000u64), (99_999_999, 10), (4096, 4096)] {
-        let got = fs
-            .read_window(file, Some(start..end))
-            .await
-            .expect("a backwards window answers instead of panicking");
-        assert!(got.is_empty(), "{start}..{end} should read nothing");
-    }
-    // And a forwards one still works.
-    let got = fs.read_window(file, Some(0..512)).await.unwrap();
-    assert_eq!(got.len(), 512);
 }
 
 /// What a fetch costs, in every case that changes the answer.

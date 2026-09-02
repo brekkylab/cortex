@@ -773,12 +773,18 @@ impl GdriveFs {
                         .await
                         .map_err(not_found_or_backend);
                 };
-                // Saturating, because `end - start` on a backwards range underflows and
-                // takes the process with it.
+                // Saturating, and not as a guard against a client: `read_at` is the only
+                // caller and builds `offset..offset + buf.len()`, so this cannot go
+                // backwards. It is that the zero check below has to be here anyway — that
+                // `offset + buf.len()` saturates, so an offset at the top of the range
+                // gives an empty window — and saturating here is the free way to land a
+                // degenerate range in a branch that already exists. Plain `-` would wrap
+                // in release, and `want` near `u64::MAX` asks Drive for everything from
+                // `start` to the end of the file to answer with an empty vector.
                 let want = r.end.saturating_sub(r.start);
                 // An empty window is not a read. `accessor::download` turns one away by
                 // itself, but a span asks for a span's worth around it and would sail
-                // straight past that — 8 MiB fetched to answer with an empty vector.
+                // straight past that — 8 MiB fetched to answer with nothing.
                 if want == 0 {
                     return Ok(Vec::new());
                 }
@@ -1376,14 +1382,20 @@ fn split_last(path: &str) -> (String, String) {
 
 /// The requested window of `data`, clamped to what exists.
 ///
-/// Both ends are clamped and the end is never allowed below the start: a range that
-/// asks backwards is empty, not a panic. The caller is a filesystem read, so the range
-/// arrives from whatever a client asked for, and `data[4..2]` aborts the process.
+/// Both ends are clamped, because a reader may seek past the end and a window may
+/// straddle it. Neither end is reordered: `read_window` is the only caller and its own
+/// only caller is [`FileSystem::read_at`], which builds `offset..offset + buf.len()`, so
+/// `r.end >= r.start` holds by construction. Guarding it here as well was defence against
+/// this crate rather than against a client — `read_window` is private and there is no
+/// other way in.
 fn slice(data: &[u8], range: Option<std::ops::Range<u64>>) -> Vec<u8> {
     match range {
         Some(r) => {
+            debug_assert!(r.end >= r.start, "callers hand this a forward range");
             let start = (r.start as usize).min(data.len());
-            let end = (r.end as usize).min(data.len()).max(start);
+            // No `.max(start)`: with `r.end >= r.start` above, clamping both to the same
+            // length keeps them in order.
+            let end = (r.end as usize).min(data.len());
             data[start..end].to_vec()
         }
         None => data.to_vec(),
