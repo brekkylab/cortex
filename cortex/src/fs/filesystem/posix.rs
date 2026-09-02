@@ -67,6 +67,12 @@ use crate::{
 /// [`validate`](Self::validate). `O_RDONLY | O_CREAT` is ordinary POSIX and stays
 /// legal.
 ///
+/// There is deliberately no `append`. A kernel resolves `O_APPEND` itself and sends the
+/// absolute end offset, so a backend that writes only where it is told already appends;
+/// carrying the flag would oblige every store to reproduce "find the end and write there"
+/// as one atomic step, which no consumer has asked for. A caller that wants it seeks to
+/// the end first, as one does with a [`File`](std::fs::File) opened without the flag.
+///
 /// One is built the way `open(2)` is called: an access mode, then the flags that
 /// modify it. The fields stay public because a backend has to read them, and
 /// `#[non_exhaustive]` is what keeps a caller outside the crate from writing
@@ -76,10 +82,6 @@ use crate::{
 pub struct OpenOptions {
     pub read: bool,
     pub write: bool,
-    /// Writes land at the end regardless of the offset given. Mostly inert under
-    /// FUSE (the kernel resolves `O_APPEND` and sends absolute offsets), but a
-    /// library caller means it, so a handle must honour rather than ignore it.
-    pub append: bool,
     pub truncate: bool,
     /// Create the file if it is absent. The parent directory is never created.
     pub create: bool,
@@ -144,13 +146,6 @@ impl OpenOptions {
         OpenOptions { write: yes, ..self }
     }
 
-    pub fn append(self, yes: bool) -> Self {
-        OpenOptions {
-            append: yes,
-            ..self
-        }
-    }
-
     pub fn truncate(self, yes: bool) -> Self {
         OpenOptions {
             truncate: yes,
@@ -168,7 +163,7 @@ impl OpenOptions {
     /// What a read-only backend refuses on. `create` counts: it writes no bytes
     /// to the file, but modifies its parent.
     pub fn intends_write(&self) -> bool {
-        self.write || self.append || self.truncate || self.create || self.create_new
+        self.write || self.truncate || self.create || self.create_new
     }
 
     /// Reject the one self-contradictory combination.
@@ -391,12 +386,11 @@ pub(in crate::fs) fn unix_time(time: SystemTime) -> (i64, i64) {
     }
 }
 
-/// The numeric values a binding's kernel uses for the four non-portable open flags.
+/// The numeric values a binding's kernel uses for the three non-portable open flags.
 /// `O_TRUNC` alone is `0o1000` on Linux and `0o2000` on macOS, so each binding supplies
 /// its own — same split as the errno tables. The access mode is portable and decoded
 /// once below.
 pub(in crate::fs) struct OpenFlagBits {
-    pub append: i32,
     pub truncate: i32,
     pub create: i32,
     pub create_new: i32,
@@ -424,7 +418,6 @@ pub(in crate::fs) fn decode_open_flags(flags: i32, bits: &OpenFlagBits) -> io::R
     Ok(OpenOptions {
         read,
         write,
-        append: flags & bits.append != 0,
         truncate: flags & bits.truncate != 0,
         create: flags & bits.create != 0,
         create_new: flags & bits.create_new != 0,
@@ -573,9 +566,9 @@ impl<T: FileSystem> Posix<T> {
     /// them a whole-buffer variant of its own — and spares the two from disagreeing
     /// about which one a consumer calls.
     ///
-    /// `O_APPEND` is not resolved here. A kernel resolves it before the request arrives,
-    /// sending the absolute offset it decided on; the flag is kept only because it is
-    /// permission to write, which the check below reads.
+    /// `O_APPEND` never reaches here: a kernel resolves it before the request arrives and
+    /// sends the absolute offset it decided on, which is why [`OpenOptions`] carries no
+    /// flag for it. Permission to write is the access mode alone.
     pub(in crate::fs) async fn write_handle(
         &self,
         fh: u64,
@@ -583,7 +576,7 @@ impl<T: FileSystem> Posix<T> {
         data: &[u8],
     ) -> io::Result<usize> {
         let (path, options) = self.open_of(fh)?;
-        if !options.write && !options.append {
+        if !options.write {
             return Err(bad_handle());
         }
         let mut written = 0usize;
@@ -1175,5 +1168,45 @@ impl OpenTable {
     /// How many handles are open — the invariant a `release` is supposed to keep.
     fn len(&self) -> usize {
         self.open.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A binding's numbering is a binding's business — these three are simply the ones
+    /// the table names, so any host's values serve here.
+    const BITS: OpenFlagBits = OpenFlagBits {
+        truncate: 0o1000,
+        create: 0o100,
+        create_new: 0o200,
+    };
+
+    /// `O_APPEND` is the flag this contract deliberately does not name, and not naming
+    /// it must not amount to granting write: `O_RDONLY | O_APPEND` is a read-only
+    /// descriptor, and it is [`Posix::write_handle`] that reads the difference.
+    #[test]
+    fn an_append_style_open_is_not_permission_to_write() {
+        const O_APPEND: i32 = 0o2000;
+        let options = decode_open_flags(O_APPEND, &BITS).expect("`O_RDONLY` is an access mode");
+        assert!(options.read && !options.write);
+        assert!(!options.intends_write());
+    }
+
+    /// What a read-only backend refuses on. Each flag answers for itself, so a dropped
+    /// term would otherwise go unnoticed — nothing else in the crate calls this.
+    #[test]
+    fn every_flag_but_read_means_modification() {
+        let ro = OpenOptions::read_only();
+        assert!(!ro.intends_write(), "reading modifies nothing");
+        for (flag, options) in [
+            ("write", ro.write(true)),
+            ("truncate", ro.truncate(true)),
+            ("create", ro.create(true)),
+            ("create_new", OpenOptions::create_new()),
+        ] {
+            assert!(options.intends_write(), "{flag}");
+        }
     }
 }
