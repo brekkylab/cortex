@@ -5,32 +5,17 @@ use serde::{Deserialize, Serialize};
 /// What a session is. The `params` of `init`.
 ///
 /// What is here outlives any one execution, which is what it is doing here rather than on
-/// an [`Exec`](super::Exec): the delegated names have to be in place before a command that
-/// invokes one runs, and the tree has to be somewhere before a path can name a file in it,
-/// so each is said once instead of on every command.
+/// an [`ExecCall`](super::ExecCall): the tree has to be somewhere before a path can name a file in
+/// it, and the base and the reach are the environment a command runs in rather than
+/// anything a command says — so each is said once instead of on every command.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Init {
-    /// Empty is not an error — a client with nothing to delegate is still a client.
-    ///
-    /// Meant to be sorted and free of duplicates, and **nothing checks either**. A client
-    /// that repeats a name gets a session that will not boot: a backend makes one entry per
-    /// name and the second collides, which arrives as `BOOT_FAILED` describing a symlink
-    /// rather than the name that was said twice. It costs that client its own session and
-    /// nobody else's, which is why this is written down rather than enforced — but a
-    /// backend that wants to say something useful about it should check before it builds.
-    ///
-    /// What running one *means* is not here and cannot be: the behaviour lives in
-    /// the client's [`ExecutableSet`](crate::exec::ExecutableSet), so a
-    /// server only arranges for something that runs the name to reach the client —
-    /// on a channel of its own, as an `exec` like any other.
-    pub delegated: Vec<String>,
-
+pub struct InitCall {
     /// The tree this session works in, named by URL. `None` is a session with nothing
     /// mounted, which is still a session — a command then sees whatever the executor's own
     /// filesystem holds and nothing this protocol described.
     ///
     /// Answered by a [`WorkFsMount`] saying where the server put it, which is what makes
-    /// every later path in this protocol a path both ends can spell. See [`InitResult`].
+    /// every later path in this protocol a path both ends can spell. See [`InitResp`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workfs: Option<WorkFsSource>,
 
@@ -41,7 +26,7 @@ pub struct Init {
     /// around it is a property of the environment it runs in, not of the command, and on a
     /// backend with a guest it is a disk attached before a kernel comes up.
     ///
-    /// Answered in [`InitResult::image`] when what is in force can be named. A backend whose
+    /// Answered in [`InitResp::image`] when what is in force can be named. A backend whose
     /// commands run on the server's own filesystem has no base to swap and refuses this with
     /// [`UNSUPPORTED_IMAGE`](crate::console::Error::UNSUPPORTED_IMAGE).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,7 +39,7 @@ pub struct Init {
     /// before a kernel comes up — so it cannot be decided per `exec` without meaning a
     /// different session for every command.
     ///
-    /// Answered in [`InitResult::network`] with what is actually in force, which is the only
+    /// Answered in [`InitResp::network`] with what is actually in force, which is the only
     /// way a client learns what it got: `None` here is not "no network" but "the server's own
     /// choice", and a server that runs commands on the host has no choice to make.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,10 +297,10 @@ impl WorkFsSource {
 /// session a client can hear before it asks for work — that there is a server on the far
 /// end, that it read the frame, that it speaks this protocol, and that it has taken what it
 /// was told. It is also *where*: a session with a workfs has a path in it, and that path is
-/// what every later `read`, `write` and reported [`cwd`](super::Exec::cwd) is spelled in.
+/// what every later `read` and `write` is spelled in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InitResult {
-    /// Where the workfs [`Init::workfs`] named went, or `None` when none was named.
+pub struct InitResp {
+    /// Where the workfs [`InitCall::workfs`] named went, or `None` when none was named.
     ///
     /// A client that asked for one and is answered without this has been told nothing it
     /// can use: every path it would send afterwards would be a guess. That is a broken
@@ -327,20 +312,25 @@ pub struct InitResult {
     /// [`workfs`](Self::workfs) mount point, and never required to be.
     ///
     /// **A session has a current directory, and the server is what keeps it.** That is why
-    /// an [`Exec`](super::Exec) asking for a command says nothing about where to run it:
-    /// there is one answer at any moment, the far end holds it, and an execution that moves
-    /// it says so in its [`ExecResult::cwd`](super::ExecResult::cwd). This is where that
-    /// state starts, and the only reading of it a client gets before running anything.
+    /// an [`ExecCall`](super::ExecCall) asking for a command says nothing about where to run it:
+    /// there is one answer at any moment and the far end holds it.
     ///
-    /// Absent is a server that will not say. A client is then no worse off than it was
-    /// before the field existed — every path it sends is one it built itself, and it simply
-    /// cannot show where a relative one would land.
+    /// **To begin with**, and nothing here says otherwise afterwards. A command can move
+    /// the session — `cd` is a shell builtin, so a backend that offers it at all answers it
+    /// itself — and no result reports that it did. A client that wants to know where it
+    /// stands runs `pwd`, the way a person at a terminal does; see
+    /// [`ExecResp`](super::ExecResp) for why that is the trade rather than a gap.
+    ///
+    /// So what this is worth is the *first* answer: before a client has run anything, this
+    /// is the only way it can say where a relative path would land. Absent is a server that
+    /// will not say, and a client is then no worse off than it was before the field existed
+    /// — every path it sends is one it built itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 
     /// The base in force, when it is one that can be named.
     ///
-    /// The [`Init::image`] that was asked for, in the server's own spelling of it: a reference
+    /// The [`InitCall::image`] that was asked for, in the server's own spelling of it: a reference
     /// with no registry named is a reference to a default registry, and this is where a client
     /// learns which one that was. What makes it worth answering is the case where nothing was
     /// asked, since the base is then the server's own choice.
@@ -352,7 +342,7 @@ pub struct InitResult {
 
     /// What the session's commands can actually reach.
     ///
-    /// The [`Init::network`] that was asked for, when one was — a server provides that reach or
+    /// The [`InitCall::network`] that was asked for, when one was — a server provides that reach or
     /// refuses, so this confirms rather than negotiates. What makes it worth answering is the
     /// case where nothing was asked: the reach is then the server's own, and this is the only
     /// place a client can learn which.
@@ -367,11 +357,10 @@ pub struct InitResult {
 ///
 /// # Why the server says the path instead of both ends agreeing on a namespace
 ///
-/// A delegated executable runs in the client and has to open the file the command meant,
-/// which needs one name that means one file to both ends. Two ends realizing the same
-/// description separately is one way to get that, and it costs a tree on each side, a mount
-/// on each side, and a rewriting step on every path that crosses — all to reconstruct
-/// something one end already has.
+/// A `read` and a command have to name one file, which needs one name that means one file to
+/// both ends. Two ends realizing the same description separately is one way to get that, and
+/// it costs a tree on each side, a mount on each side, and a rewriting step on every path
+/// that crosses — all to reconstruct something one end already has.
 ///
 /// So the server realizes it once and says where. Everything after this is that path: a
 /// `read` names a file under it, an execution's reported directory is a directory under it,
@@ -387,10 +376,9 @@ pub struct InitResult {
 ///
 /// `init` mounts nothing, the way it boots nothing: the mount happens when the session
 /// boots, at the path already answered here. So this is fixed for the session, and a kernel
-/// answers at it only while something is booted — exactly like the `bin/` directory the
-/// delegated names live in, and for the same reason. A client does not open it directly
-/// anyway: `read`, `write` and `exec` each boot a session first, and a delegated executable
-/// runs inside one.
+/// answers at it only while something is booted. Nothing needs it any sooner — `read`,
+/// `write` and `exec` each boot a session first — which is what makes a path answered
+/// before there is a directory at it useful rather than a promise.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkFsMount {
     /// Absolute, and in the server's filesystem — `"/mnt/workfs"`.
@@ -409,21 +397,25 @@ mod tests {
     /// A session with nothing to mount says nothing about mounting, in either direction:
     /// the member is absent rather than null, which is what leaves room for it to mean
     /// exactly one thing when it is there.
+    ///
+    /// Which leaves an `init` that describes a session by saying nothing about it, and that
+    /// is a session — one whose commands see the executor's own filesystem, with this
+    /// protocol having described none of it.
     #[test]
     fn a_session_with_no_workfs_carries_no_workfs() {
-        let init = Init {
-            delegated: vec!["fetch".into()],
-            ..Init::default()
-        };
+        let init = InitCall::default();
         let doc = bson::serialize_to_document(&init).unwrap();
-        assert_eq!(doc, doc! {"delegated": ["fetch"]});
-        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
+        assert_eq!(doc, doc! {});
+        assert_eq!(
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
+        );
 
-        let answered = InitResult::default();
+        let answered = InitResp::default();
         let doc = bson::serialize_to_document(&answered).unwrap();
         assert_eq!(doc, doc! {});
         assert_eq!(
-            bson::deserialize_from_document::<InitResult>(doc).unwrap(),
+            bson::deserialize_from_document::<InitResp>(doc).unwrap(),
             answered
         );
     }
@@ -432,23 +424,22 @@ mod tests {
     /// ends have to agree on about files.
     #[test]
     fn a_workfs_is_a_url_and_the_answer_is_where_it_went() {
-        let init = Init {
-            delegated: Vec::new(),
+        let init = InitCall {
             workfs: Some(WorkFsSource::new("file:///srv/project")),
             image: None,
             network: None,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(doc, doc! {"workfs": {"url": "file:///srv/project"}},);
         assert_eq!(
-            doc,
-            doc! {"delegated": [], "workfs": {"url": "file:///srv/project"}},
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
         );
-        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
 
         // The answer is where the tree went and where the session stands in it — the second
         // conventionally the first, which is what the two members being apart allows to not
         // be the case.
-        let answered = InitResult {
+        let answered = InitResp {
             workfs: Some(WorkFsMount {
                 path: "/mnt/workfs".into(),
             }),
@@ -462,7 +453,7 @@ mod tests {
             doc! {"workfs": {"path": "/mnt/workfs"}, "cwd": "/mnt/workfs/work"},
         );
         assert_eq!(
-            bson::deserialize_from_document::<InitResult>(doc).unwrap(),
+            bson::deserialize_from_document::<InitResp>(doc).unwrap(),
             answered,
         );
 
@@ -470,11 +461,11 @@ mod tests {
         // about what it mounted than this reads — and a server that will not say where the
         // session stands is answered without that member rather than with a guess.
         assert_eq!(
-            bson::deserialize_from_document::<InitResult>(
+            bson::deserialize_from_document::<InitResp>(
                 doc! {"workfs": {"path": "/mnt/workfs", "kind": "local"}}
             )
             .unwrap(),
-            InitResult {
+            InitResp {
                 workfs: Some(WorkFsMount {
                     path: "/mnt/workfs".into(),
                 }),
@@ -489,23 +480,22 @@ mod tests {
     /// had before there was one to name.
     #[test]
     fn an_image_is_a_reference_and_the_answer_is_the_one_in_force() {
-        let init = Init {
-            delegated: Vec::new(),
+        let init = InitCall {
             workfs: None,
             image: Some(ImageSource::new("python:3.13-slim")),
             network: None,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(doc, doc! {"image": {"reference": "python:3.13-slim"}});
         assert_eq!(
-            doc,
-            doc! {"delegated": [], "image": {"reference": "python:3.13-slim"}}
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
         );
-        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
 
         // **The answer is the server's spelling and not an echo.** A reference naming no
         // registry names a default one, and which default that was is the thing a client could
         // not have worked out for itself.
-        let answered = InitResult {
+        let answered = InitResp {
             workfs: None,
             cwd: None,
             image: Some(ImageSource::new("docker.io/library/python:3.13-slim")),
@@ -517,7 +507,7 @@ mod tests {
             doc! {"image": {"reference": "docker.io/library/python:3.13-slim"}}
         );
         assert_eq!(
-            bson::deserialize_from_document::<InitResult>(doc).unwrap(),
+            bson::deserialize_from_document::<InitResp>(doc).unwrap(),
             answered,
         );
 
@@ -532,18 +522,14 @@ mod tests {
         );
 
         // A session that says nothing about a base still serializes to what it always did.
-        let quiet = Init {
-            delegated: vec!["report".into()],
+        let quiet = InitCall {
             workfs: None,
             image: None,
             network: None,
         };
+        assert_eq!(bson::serialize_to_document(&quiet).unwrap(), doc! {},);
         assert_eq!(
-            bson::serialize_to_document(&quiet).unwrap(),
-            doc! {"delegated": ["report"]},
-        );
-        assert_eq!(
-            bson::deserialize_from_document::<Init>(doc! {"delegated": ["report"]}).unwrap(),
+            bson::deserialize_from_document::<InitCall>(doc! {}).unwrap(),
             quiet,
         );
     }
@@ -552,17 +538,19 @@ mod tests {
     /// before there was one to name.
     #[test]
     fn a_network_is_a_name_and_the_answer_is_the_one_in_force() {
-        let init = Init {
-            delegated: Vec::new(),
+        let init = InitCall {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::public()),
         };
         let doc = bson::serialize_to_document(&init).unwrap();
-        assert_eq!(doc, doc! {"delegated": [], "network": {"reach": "public"}});
-        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
+        assert_eq!(doc, doc! {"network": {"reach": "public"}});
+        assert_eq!(
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
+        );
 
-        let answered = InitResult {
+        let answered = InitResp {
             workfs: None,
             cwd: None,
             image: None,
@@ -571,30 +559,26 @@ mod tests {
         let doc = bson::serialize_to_document(&answered).unwrap();
         assert_eq!(doc, doc! {"network": {"reach": "host"}});
         assert_eq!(
-            bson::deserialize_from_document::<InitResult>(doc).unwrap(),
+            bson::deserialize_from_document::<InitResp>(doc).unwrap(),
             answered,
         );
 
         // **A session that says nothing about a network still serializes to what it always
         // did**, which is what lets a client of this build talk to a server that predates the
         // member — and a server of this build answer a client that does.
-        let quiet = Init {
-            delegated: vec!["report".into()],
+        let quiet = InitCall {
             workfs: None,
             image: None,
             network: None,
         };
+        assert_eq!(bson::serialize_to_document(&quiet).unwrap(), doc! {},);
         assert_eq!(
-            bson::serialize_to_document(&quiet).unwrap(),
-            doc! {"delegated": ["report"]},
-        );
-        assert_eq!(
-            bson::deserialize_from_document::<Init>(doc! {"delegated": ["report"]}).unwrap(),
+            bson::deserialize_from_document::<InitCall>(doc! {}).unwrap(),
             quiet,
         );
         assert_eq!(
-            bson::deserialize_from_document::<InitResult>(doc! {}).unwrap(),
-            InitResult::default(),
+            bson::deserialize_from_document::<InitResp>(doc! {}).unwrap(),
+            InitResp::default(),
         );
     }
 
@@ -602,8 +586,7 @@ mod tests {
     /// did — which is what lets this member arrive without every existing peer noticing.
     #[test]
     fn a_host_port_grant_is_said_beside_the_reach() {
-        let init = Init {
-            delegated: Vec::new(),
+        let init = InitCall {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::host().with_host_ports([8080, 3000])),
@@ -611,9 +594,12 @@ mod tests {
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
             doc,
-            doc! {"delegated": [], "network": {"reach": "host", "host_ports": [8080, 3000]}}
+            doc! {"network": {"reach": "host", "host_ports": [8080, 3000]}}
         );
-        assert_eq!(bson::deserialize_from_document::<Init>(doc).unwrap(), init);
+        assert_eq!(
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
+        );
 
         // No grant is no member, not an empty one.
         let doc = bson::serialize_to_document(&NetworkAccess::host()).unwrap();

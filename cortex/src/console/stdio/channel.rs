@@ -65,7 +65,7 @@
 //!
 //! Nothing about a command's own stdio appears here. It is captured wherever the
 //! command runs and travels back inside an
-//! [`ExecResult`](super::ExecResult) — which is what makes one pair of
+//! [`ExecResp`](super::ExecResp) — which is what makes one pair of
 //! descriptors enough, where the old wire needed four.
 //!
 //! # Neither of these is cancel-safe
@@ -98,7 +98,7 @@ use crate::console::{MAX_PAYLOAD, Message};
 /// The length prefix: a big-endian `u32`.
 pub const HEADER: usize = 4;
 
-/// Write one frame and flush it.
+/// WriteCall one frame and flush it.
 ///
 /// Header and payload go out in two calls rather than one, which avoids copying a
 /// payload that may be megabytes only to write it once. That costs one rule: a
@@ -120,7 +120,7 @@ where
     w.flush().await
 }
 
-/// Read one frame. `Ok(None)` is a clean end of channel.
+/// ReadCall one frame. `Ok(None)` is a clean end of channel.
 ///
 /// The length is read first and then exactly that many bytes, so a frame cannot
 /// run into the one after it however the payload is spelled.
@@ -191,39 +191,33 @@ fn bad(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::{Call, Exec, ExecCmd, ExecResult, Init, Notification, Outcome, Progress};
+    use crate::console::{Call, ExecCall, ExecResp, InitCall, InitResp, Notification, Response};
 
     fn messages() -> Vec<Message> {
         vec![
             Message::Request {
                 id: 0,
-                call: Call::Init(Init {
-                    delegated: vec!["foo".into()],
-                    ..Init::default()
-                }),
+                call: Call::Init(InitCall::default()),
             },
             Message::Response {
                 id: 0,
-                outcome: Outcome::Result(bson::Bson::Null),
+                result: Response::Init(InitResp::default()),
             },
             Message::Request {
                 id: 2,
-                call: Call::Exec(Exec {
-                    cmd: ExecCmd::New(vec!["sh".into(), "-c".into(), "echo hi".into()]),
-                    ..Exec::default()
+                call: Call::Exec(ExecCall {
+                    cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
+                    ..ExecCall::default()
                 }),
             },
             Message::Response {
                 id: 2,
-                outcome: Outcome::Result(
-                    bson::serialize_to_bson(&Progress::Done(ExecResult {
-                        // Not utf-8, and contains the byte a newline-delimited
-                        // framing would have had to escape.
-                        stdout: vec![0xff, 0x00, b'\n'],
-                        ..ExecResult::default()
-                    }))
-                    .unwrap(),
-                ),
+                result: Response::Exec(ExecResp {
+                    // Not utf-8, and contains the byte a newline-delimited framing would
+                    // have had to escape.
+                    stdout: vec![0xff, 0x00, b'\n'],
+                    ..ExecResp::default()
+                }),
             },
             Message::Notification(Notification::Quit),
         ]
@@ -283,13 +277,10 @@ mod tests {
     async fn no_payload_byte_is_special() {
         let message = Message::Response {
             id: 2,
-            outcome: Outcome::Result(
-                bson::serialize_to_bson(&Progress::Done(ExecResult {
-                    stdout: (0..=255u8).collect(),
-                    ..ExecResult::default()
-                }))
-                .unwrap(),
-            ),
+            result: Response::Exec(ExecResp {
+                stdout: (0..=255u8).collect(),
+                ..ExecResp::default()
+            }),
         };
         let mut buf = Vec::new();
         write(&mut buf, &message).await.unwrap();

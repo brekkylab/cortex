@@ -2,43 +2,26 @@
 //!
 //! # One channel, one direction of asking
 //!
-//! A console is one conversation. This end asks and the server answers, and that stays
-//! true even for a *delegated* executable — a name whose behaviour lives out here,
-//! called by something running inside the server.
+//! A console is one conversation, and only one end of it ever asks. This end sends a
+//! request and the server answers it; there is no request the server issues, so this end
+//! has no pending table, no listener, and no task waiting on something it also has to
+//! read.
 //!
-//! The server does not ask for one. It *answers* with a
-//! [`Delegated`](Progress::Delegated): a complete response to the `exec` this end is
-//! already waiting on, meaning the execution is not over and here is what it needs. So
-//! this end has no pending table, no listener, no task waiting on something it also
-//! has to read, and no channel per delegated call.
-//!
-//! # What [`exec`](Console::exec) actually does
-//!
-//! It walks that chain. The server's answer is either the execution's [`ExecResult`] or a
-//! delegated call; the second is resolved against the [`ExecutableSet`] and carried back
-//! on an `exec` of its own, until an answer is the first.
-//!
-//! Which is why the loop is here and not in a transport: `Progress` is a
-//! [`Client`]'s and resolving a *name* is an [`ExecutableSet`]'s, and this is the
-//! one type that holds both.
-//!
-//! Delegated calls are therefore served in turn, not together — a command that starts
-//! several (`foo & bar`, `make -j8`) has them run one after another. See
-//! [`Progress`] for why that is latency rather than a deadlock, and what would have to
-//! change for it to stop being so.
+//! What that leaves is a [`Console`] whose methods are round trips: one call out, one
+//! answer back, and the answer is to the call that was just made. [`exec`](Console::exec)
+//! is the largest of them and is still exactly that.
 //!
 //! # Waiting is the point, and a console does none of it in a thread
 //!
 //! Everything here is something to `await`: a command runs for as long as it runs, and a
-//! delegated executable is usually a call out to something slower still. A caller with
-//! several consoles wants all of them going at once, which is what an async API gives
-//! for the price of a task each — where a thread each would have been a thread parked on
-//! a pipe.
+//! backend with a kernel to bring up spends a cold start before the first one does. A
+//! caller with several consoles wants all of them going at once, which is what an async
+//! API gives for the price of a task each — where a thread each would have been a thread
+//! parked on a pipe.
 //!
 //! What is *not* concurrent is one console. Its methods take `&mut self`, because the
-//! protocol is one outstanding request at a time and a delegated execution owes an answer
-//! before anything else may be asked — see [`Client`] for why an exclusive borrow is the
-//! honest way to say that.
+//! protocol is one outstanding request at a time — see [`Client`] for why an exclusive
+//! borrow is the honest way to say that.
 //!
 //! # Ending one
 //!
@@ -69,12 +52,11 @@ use crate::{
     console::{
         base::{Client, Failure},
         message::{
-            Call, Error, Exec, ExecCmd, ExecResult, ImageSource, Init, NetworkAccess, Notification,
-            Outcome, Progress, Read, ReadResult, RequestId, WorkFsSource, Write, WriteResult,
+            Call, ExecCall, ExecResp, ImageSource, InitCall, NetworkAccess, Notification, ReadCall,
+            ReadResp, Response, WorkFsSource, WriteCall, WriteResp,
         },
         stdio::StdioClient,
     },
-    exec::{ExecCall, ExecutableSet, relativize},
     fs::Mount,
 };
 
@@ -103,12 +85,10 @@ pub struct ConsoleBuilder {
     /// it lacked.
     client_factory: Option<ClientFactory>,
 
-    execs: ExecutableSet,
-
     /// `None` is a console with nothing mounted, and stays `None`: a mount is something a
-    /// caller *has* or has not, and there is no empty one to substitute — an unmounted tree
-    /// has no path for a delegated name to open. What that means for the names is
-    /// [`Executable::exec`](crate::exec::Executable::exec)'s to say.
+    /// caller *has* or has not, and there is no empty one to substitute. Such a session's
+    /// commands see whatever the server's own filesystem holds, and this protocol has
+    /// described none of it.
     mount: Option<Box<dyn Mount>>,
 
     /// The base the session's commands run in, and `None` to leave it to the server.
@@ -166,22 +146,11 @@ impl ConsoleBuilder {
         self
     }
 
-    /// The names this console offers, and what each one does.
+    /// Where this console's tree is mounted, which is what the session's workfs is.
     ///
-    /// These are announced to the server as the console is built, and resolved here when
-    /// one comes back as a [`Delegated`](Progress::Delegated). Leaving it out means a
-    /// client with nothing to delegate, which is still a client.
-    pub fn executables(mut self, execs: ExecutableSet) -> Self {
-        self.execs = execs;
-        self
-    }
-
-    /// Where this console's tree is mounted, which is what its delegated executables are
-    /// handed — and what the session's workfs is.
-    ///
-    /// One per console and fixed for the session, because it is what an execution's
-    /// delegated calls are resolved *against*: a name that reads a file is asked about the
-    /// tree the command that called it can see, and it can see it because it is mounted.
+    /// One per console and fixed for the session, because it is what every path in the
+    /// session is spelled against: a `read` names a file under it, and so does the command
+    /// that opens the same file by the same name.
     ///
     /// Mounting is the caller's, not the console's. Which binding puts a tree in front of a
     /// kernel is a build's business, and this is the whole of what the server is then told
@@ -274,7 +243,7 @@ impl ConsoleBuilder {
     }
 }
 
-/// A console: something to run commands in, and the executables it may call back into.
+/// A console: something to run commands in.
 ///
 /// An [`exec`](Self::exec) per command, and dropping it to end the session. That is the
 /// whole of what a caller has to do: what the session *is* was said when the console was
@@ -288,18 +257,15 @@ impl ConsoleBuilder {
 ///
 /// ```no_run
 /// use cortex::console::Console;
-/// use cortex::exec::ExecutableSet;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
 /// // Whichever console server this is: the client starts it and owns it from here.
-/// // Building also says what the session is — the delegated names, and the tree it works
-/// // in if there is one — so a console that exists is one the server has answered.
-/// // Nothing is booted by that; the command below pays for the boot, unless a `start`
-/// // gets there first.
+/// // Building also says what the session is — the tree it works in if there is one — so
+/// // a console that exists is one the server has answered. Nothing is booted by that;
+/// // the command below pays for the boot, unless a `start` gets there first.
 /// let mut console = Console::builder()
 ///     .stdio_client(&["cortex-local-console"])
-///     .executables(ExecutableSet::new())
 ///     .build()
 ///     .await?;
 ///
@@ -319,33 +285,31 @@ pub struct Console {
     /// for it to be *replaced* — see [`Console::drop`](Console#impl-Drop-for-Console).
     client: Box<dyn Client>,
 
-    /// What a delegated name — announced to the server when this console was built —
-    /// resolves to when one comes back as a [`Delegated`](Progress::Delegated).
-    execs: ExecutableSet,
-
-    /// The mount those names are resolved against, handed to each one as it runs — `None`
-    /// when this console has nothing mounted.
+    /// The tree this session works in — `None` when this console has nothing mounted.
     ///
-    /// Held for the session, which is also what keeps the mount up: dropping it unmounts.
+    /// **Never read, and that is the whole job.** Dropping a mount unmounts it (see
+    /// [`Mount`]), so holding one here is what keeps the tree up for as long as the session
+    /// is: a console that let go of it would go on naming paths at a directory the kernel
+    /// no longer answers for. What the protocol is *spelled* in is
+    /// [`server_path`](Self::server_path), which is the server's answer and not this.
+    ///
     /// Whether this is the last holder is the caller's business — what arrives here is
     /// whatever was passed to [`ConsoleBuilder::mount`], an `Arc<..>` included.
+    #[allow(dead_code)]
     mount: Option<Box<dyn Mount>>,
 
     /// Where the server put that same tree, as it answered at `init` — `None` alongside a
     /// `mount` that is `None`, since there was no workfs to put anywhere.
     ///
     /// **The paths this protocol speaks are these.** A [`read`](Self::read) names a file
-    /// under this, and a reported [`cwd`](Exec::cwd) is a directory under it. What a
-    /// delegated executable is handed instead is the same directory named from the root of
-    /// the tree, because that is the form that means the same thing through the mount above
-    /// — usually the very same directory, and nothing requires the two ends to have it at
-    /// one path.
+    /// under this, and so does a [`write`](Self::write). It is the server's answer and not
+    /// the mount point above: the two are usually the same directory, and nothing requires
+    /// them to be.
     ///
     /// Where the session *stands* is not here and is not kept anywhere on this side: the
-    /// current directory is the far end's state machine, `init` says where it starts and
-    /// [`ExecResult::cwd`] says when an execution moved it, so a copy here would be a
-    /// second answer to a question that already has one — wrong from the first `cd`
-    /// somebody else's execution ran.
+    /// current directory is the far end's state machine, `init` says where it starts, and
+    /// after that a caller asks with `pwd` like anyone at a terminal. A copy here would be
+    /// a second answer to a question that already has one — wrong from the first `cd`.
     server_path: Option<PathBuf>,
 
     /// The base in force, as the server answered at `init`.
@@ -364,14 +328,14 @@ impl Console {
     /// Take a channel and announce the session on it.
     ///
     /// `init` is here rather than a method a caller remembers, because a session's shape
-    /// is not something a console is ever without: the delegated names and the tree are
+    /// is not something a console is ever without: the tree, the base and the reach are
     /// what the builder was given, they outlive every execution, and there is no useful
     /// console in between having a channel and having said what is on it. So a `Console`
     /// that exists is one the server has heard from and answered — which is the one thing
     /// about a session a caller can act on before asking for work.
     ///
     /// The answer is not only an acknowledgement: it says where the server put the workfs,
-    /// and that path is what every later `read`, `write` and reported `cwd` is spelled in.
+    /// and that path is what every later `read` and `write` is spelled in.
     /// A server that takes a workfs and says nothing about where it went has left this end
     /// with no way to name a file, so that is a console that does not exist rather than one
     /// that guesses.
@@ -386,7 +350,6 @@ impl Console {
     pub async fn new(builder: ConsoleBuilder) -> anyhow::Result<Self> {
         let ConsoleBuilder {
             client_factory,
-            execs,
             mount,
             image,
             network,
@@ -411,8 +374,7 @@ impl Console {
         };
 
         let answered = client
-            .init(Init {
-                delegated: execs.names().map(str::to_string).collect(),
+            .init(InitCall {
                 workfs,
                 image,
                 network,
@@ -432,7 +394,6 @@ impl Console {
 
         Ok(Console {
             client,
-            execs,
             mount,
             server_path,
             image: answered.image,
@@ -489,7 +450,7 @@ impl Console {
     ///
     /// `Ok` is the message having gone out and not the server having booted: nothing
     /// answers it. A boot that fails is heard by whoever asks for the next thing that
-    /// needed one, as [`BOOT_FAILED`](Error::BOOT_FAILED).
+    /// needed one, as [`BOOT_FAILED`](crate::console::Error::BOOT_FAILED).
     pub async fn start(&mut self) -> Result<(), Failure> {
         self.client.start().await
     }
@@ -514,102 +475,36 @@ impl Console {
 
     /// Run one command, and return everything it produced.
     ///
-    /// Every delegated call the command makes is resolved here, against the
-    /// [`ExecutableSet`] this console was built with, before this returns: the server
-    /// answers with a [`Delegated`](Progress::Delegated) instead of a result, the name
-    /// runs in *this* process, and what it produced goes back as the
-    /// [`Resume`](ExecCmd::Resume) of another `exec`. However many times that happens is
-    /// not something a caller sees.
-    ///
-    /// So a caller waits for one thing and gets one thing, and the delegated calls
-    /// underneath it are served in the order the command made them.
-    ///
     /// The command is an argv — `["echo", "hi"]` — and nothing here consults a shell, so
     /// a caller that wants shell semantics asks for them outright: `["sh", "-c", ".."]`.
     ///
+    /// Where it runs is [where the session stands](Self::workfs_path), which is the far
+    /// end's to keep: this carries no directory, because a second answer to that question
+    /// would disagree with the first the moment a command ran `cd`. A caller that wants one
+    /// command somewhere else says so in the command — `sh -c 'cd there && ..'`.
+    ///
     /// `timeout_ms` bounds this execution, and `None` leaves it to run until it finishes
-    /// — or forever, if it is the kind of command that does not finish. Whichever it is,
-    /// it covers the delegated calls the command made on the way: they are part of the
-    /// execution and not a pause in it.
+    /// — or forever, if it is the kind of command that does not finish.
     ///
     /// Which is the only way to bound one, and the reason the parameter is here rather
-    /// than something a caller arranges outside. The chain is a sequence of round trips on
-    /// one channel, and dropping this future between two of them leaves the server holding
-    /// an execution nobody will carry on — so a caller that wants to stop waiting says so
-    /// to the server, which is the end that can also stop the command.
+    /// than something a caller arranges outside. Dropping this future leaves the server
+    /// running a command nobody is waiting for and a channel with an answer still to come
+    /// on it — so a caller that wants to stop waiting says so to the server, which is the
+    /// end that can also stop the command.
     pub async fn exec(
         &mut self,
         cmd: impl IntoIterator<Item = impl AsRef<str>>,
         timeout_ms: Option<u64>,
-    ) -> Result<ExecResult, Failure> {
-        let exec = Exec {
-            // A command a caller asked for, so it carries on from nothing.
-            cmd: ExecCmd::New(cmd.into_iter().map(|s| s.as_ref().to_string()).collect()),
+    ) -> Result<ExecResp, Failure> {
+        let exec = ExecCall {
+            cmd: cmd.into_iter().map(|s| s.as_ref().to_string()).collect(),
             timeout_ms,
-            // A caller asking for a command names neither of these: where an execution
-            // runs and what it runs with are the session's, kept by the far end. Both
-            // fields report what *did* happen, which only the end that ran it can say.
-            cwd: None,
-            env: Default::default(),
         };
 
-        // Split rather than borrowed through `self`, because the chain holds the client
-        // across every step and consults the set — and the mount it resolves against —
-        // in between.
-        let Console {
-            client,
-            execs,
-            mount,
-            server_path,
-            image: _,
-            network: _,
-        } = self;
-
-        // The id of the request the *next* answer will be to, which is what carrying on
-        // from a delegated call has to quote. Every step of the chain is a request of its
-        // own, so it moves along with the chain.
-        let (mut id, progress) = client.exec(exec).await;
-        let mut progress = progress?;
-
-        loop {
-            match progress {
-                Progress::Done(result) => return Ok(result),
-
-                // The execution owes an answer it has not been given, so nothing else
-                // may be asked until this goes back — as an `exec` of its own, with no
-                // command of its own to run.
-                Progress::Delegated(mut delegated) => {
-                    // The directory the server reported is a path in *its* filesystem, and
-                    // what resolves an executable's arguments is that directory named from
-                    // the root of the tree — the one form that means the same file through
-                    // this end's own mount. A directory outside the tree has no such name,
-                    // and `None` is what says so.
-                    delegated.cwd = match (server_path.as_deref(), delegated.cwd.as_deref()) {
-                        (Some(root), Some(cwd)) => relativize(Path::new(cwd), root),
-                        _ => None,
-                    };
-
-                    let carry_on = Exec {
-                        cmd: ExecCmd::Resume {
-                            id,
-                            outcome: answer(execs, mount.as_deref(), delegated).await,
-                        },
-                        // The execution this belongs to is already running under its own,
-                        // and this is not a second execution to bound.
-                        timeout_ms: None,
-                        // Nor a command to be run anywhere: this carries an answer back.
-                        cwd: None,
-                        env: Default::default(),
-                    };
-
-                    let (next, answered) = client.exec(carry_on).await;
-                    (id, progress) = (next, answered?);
-                }
-            }
-        }
+        self.client.exec(exec).await
     }
 
-    /// Read part of a file where commands run.
+    /// ReadCall part of a file where commands run.
     ///
     /// The path is the server's — under [`workfs_path`](Self::workfs_path), which is what a
     /// caller joins onto — so this names the file a command would open by the same name, and
@@ -617,15 +512,15 @@ impl Console {
     ///
     /// `offset` is where to start, `None` being the beginning; `len` is how much to ask
     /// for, `None` being the rest. Neither is a promise about what comes back — a file
-    /// too large for one message arrives in pieces, and [`ReadResult::size`] against what
+    /// too large for one message arrives in pieces, and [`ReadResp::size`] against what
     /// did arrive is the only thing that says there are more.
     pub async fn read(
         &mut self,
         path: impl AsRef<str>,
         offset: Option<u64>,
         len: Option<u64>,
-    ) -> Result<ReadResult, Failure> {
-        let read = Read {
+    ) -> Result<ReadResp, Failure> {
+        let read = ReadCall {
             path: path.as_ref().to_string(),
             offset,
             len,
@@ -647,8 +542,8 @@ impl Console {
         path: impl AsRef<str>,
         data: impl Into<Vec<u8>>,
         offset: Option<u64>,
-    ) -> Result<WriteResult, Failure> {
-        let write = Write {
+    ) -> Result<WriteResp, Failure> {
+        let write = WriteCall {
             path: path.as_ref().to_string(),
             data: data.into(),
             offset,
@@ -692,10 +587,8 @@ impl Drop for Console {
         struct Spent;
 
         impl Client for Spent {
-            /// Id zero because nothing was numbered: no request went out for this to be
-            /// the id of.
-            fn call(&mut self, _: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
-                Box::pin(async { (0, Err(Failure::broken("the session has ended"))) })
+            fn call(&mut self, _: Call) -> BoxFuture<'_, Result<Response, Failure>> {
+                Box::pin(async { Err(Failure::broken("the session has ended")) })
             }
 
             fn notify(&mut self, _: Notification) -> BoxFuture<'_, Result<(), Failure>> {
@@ -712,57 +605,6 @@ impl Drop for Console {
             });
         }
     }
-}
-
-/// What one delegated call comes to: the outcome of the [`ExecCmd::Resume`] that carries
-/// it back.
-async fn answer(execs: &ExecutableSet, mount: Option<&dyn Mount>, exec: Exec) -> Outcome {
-    let Some((name, args)) = exec.cmd.split() else {
-        return refused(Error::INVALID_PARAMS, "an empty command");
-    };
-
-    let call = ExecCall {
-        name: name.clone(),
-        args: args.to_vec(),
-        // Whatever the command had, as the server reported it. Handed on rather than read:
-        // what a name does with its caller's environment is the name's business.
-        env: exec.env.clone(),
-        // Where the command that invoked this stood, as the server reported it —
-        // workspace-relative, so it means the same thing against this side's own tree.
-        cwd: exec.cwd.clone(),
-    };
-
-    // `None` is the allowlist boundary. Nothing honest reaches it — the only names the
-    // server was given are the ones in this set — so this is a server asking for
-    // something it was never told about.
-    let Some(result) = execs.invoke(&call, mount).await else {
-        return refused(
-            Error::NOT_EXECUTABLE,
-            format!("{}: not a delegated executable", call.name),
-        );
-    };
-
-    if result.timed_out {
-        return refused(Error::TIMED_OUT, format!("{}: timed out", call.name));
-    }
-
-    let result = ExecResult {
-        code: result.exit_code,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        truncated: false,
-        // A name that ran out here did not move the session, and where that session stands
-        // is not something this end knows in the first place.
-        cwd: None,
-    };
-    match bson::serialize_to_bson(&result) {
-        Ok(value) => Outcome::Result(value),
-        Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
-    }
-}
-
-fn refused(code: i64, message: impl Into<String>) -> Outcome {
-    Outcome::Error(Error::new(code, message))
 }
 
 /// The server's answer, as a path this end can join onto.
@@ -787,17 +629,15 @@ mod tests {
     use futures_core::future::BoxFuture;
 
     use super::*;
-    use crate::{
-        console::message::{Call, InitResult, Method, Notification, WorkFsMount},
-        exec::{ExecResult as ExecOutput, Executable},
+    use crate::console::message::{
+        Call, Error, InitResp, Method, Notification, Response, WorkFsMount,
     };
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.
     ///
     /// Two lists because they answer different questions: `methods` is what went out and
     /// in what order, including the `quit`, which is a notification and so never a `Call`;
-    /// `calls` is what those carried, because the delegated calls a console resolves are
-    /// only visible in the `cmd` of the `exec`s that carry them back.
+    /// `calls` is what those carried.
     #[derive(Clone)]
     struct Log {
         methods: Arc<Mutex<Vec<Method>>>,
@@ -817,19 +657,12 @@ mod tests {
 
     /// A client over canned answers, recording everything it was handed.
     struct Recorder {
-        answers: Vec<Outcome>,
-        /// Numbered as a real client numbers: from zero, by one, over calls alone. What
-        /// a console quotes back in a resume comes from here, so it has to be the same
-        /// sequence a transport would have produced.
-        next_id: RequestId,
+        answers: Vec<Response>,
         log: Log,
     }
 
     impl Client for Recorder {
-        fn call(&mut self, call: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
-            let id = self.next_id;
-            self.next_id += 1;
-
+        fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Response, Failure>> {
             self.log.methods.lock().unwrap().push(call.method());
             self.log.calls.lock().unwrap().push(call);
             let answer = if self.answers.is_empty() {
@@ -837,9 +670,12 @@ mod tests {
                 // said all it means to say should not have to answer that too.
                 Err(Failure::broken("nothing left to answer with"))
             } else {
-                Ok(self.answers.remove(0))
+                match self.answers.remove(0) {
+                    Response::Error(error) => Err(Failure::Refused(error)),
+                    answer => Ok(answer),
+                }
             };
-            Box::pin(async move { (id, answer) })
+            Box::pin(async move { answer })
         }
 
         fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>> {
@@ -848,7 +684,7 @@ mod tests {
         }
     }
 
-    fn recorder(answers: Vec<Outcome>) -> (Recorder, Log) {
+    fn recorder(answers: Vec<Response>) -> (Recorder, Log) {
         let log = Log {
             methods: Arc::new(Mutex::new(Vec::new())),
             calls: Arc::new(Mutex::new(Vec::new())),
@@ -856,7 +692,6 @@ mod tests {
         (
             Recorder {
                 answers,
-                next_id: 0,
                 log: log.clone(),
             },
             log,
@@ -865,125 +700,40 @@ mod tests {
 
     /// A session taken with nothing mounted, which is what a server answers a workfs-less
     /// `init` with.
-    fn initialized() -> Outcome {
-        Outcome::Result(bson::serialize_to_bson(&InitResult::default()).unwrap())
+    fn initialized() -> Response {
+        Response::Init(InitResp::default())
     }
 
     /// A session taken, with the workfs put at `path`.
-    fn initialized_at(path: &Path) -> Outcome {
-        Outcome::Result(
-            bson::serialize_to_bson(&InitResult {
-                workfs: Some(WorkFsMount {
-                    path: path.to_str().expect("a test path is UTF-8").to_string(),
-                }),
-                ..InitResult::default()
-            })
-            .unwrap(),
-        )
+    fn initialized_at(path: &Path) -> Response {
+        Response::Init(InitResp {
+            workfs: Some(WorkFsMount {
+                path: path.to_str().expect("a test path is UTF-8").to_string(),
+            }),
+            ..InitResp::default()
+        })
     }
 
-    fn progress(progress: Progress) -> Outcome {
-        Outcome::Result(bson::serialize_to_bson(&progress).unwrap())
-    }
-
-    /// An execution that finished without delegating anything.
-    fn ran(stdout: &[u8]) -> Outcome {
-        progress(Progress::Done(ExecResult {
+    /// An execution that ran and ended.
+    fn ran(stdout: &[u8]) -> Response {
+        Response::Exec(ExecResp {
             code: 0,
             stdout: stdout.to_vec(),
-            ..ExecResult::default()
-        }))
-    }
-
-    /// An execution pausing on a delegated name.
-    fn delegated(cmd: &[&str]) -> Outcome {
-        progress(Progress::Delegated(Exec {
-            cmd: ExecCmd::New(cmd.iter().map(|s| s.to_string()).collect()),
-            ..Exec::default()
-        }))
-    }
-
-    /// An execution pausing on a delegated name, invoked in `cwd`.
-    fn delegated_in(cmd: &[&str], cwd: &str) -> Outcome {
-        progress(Progress::Delegated(Exec {
-            cmd: ExecCmd::New(cmd.iter().map(|s| s.to_string()).collect()),
-            cwd: Some(cwd.to_string()),
-            ..Exec::default()
-        }))
-    }
-
-    /// An execution pausing on a delegated name, with the environment the command had.
-    fn delegated_with_env(cmd: &[&str], env: &[(&str, &str)]) -> Outcome {
-        progress(Progress::Delegated(Exec {
-            cmd: ExecCmd::New(cmd.iter().map(|s| s.to_string()).collect()),
-            env: env
-                .iter()
-                .map(|(name, value)| (name.to_string(), value.to_string()))
-                .collect(),
-            ..Exec::default()
-        }))
+            ..ExecResp::default()
+        })
     }
 
     /// A directory that is already part of a filesystem, standing in for a mounted one.
     ///
     /// Not a mount these tests made: putting one up needs a binding, a libfuse provider and
     /// a kernel, which is what `tests/host_mount.rs` is for. What is under test here is what
-    /// a *console* does with a mount — name it to the server, hand it to the names it
-    /// delegates — and a plain directory answers a path the same way a mount point does.
+    /// a *console* does with a mount — name it to the server, hold it for the session — and
+    /// a plain directory answers a path the same way a mount point does.
     struct Mounted(std::path::PathBuf);
 
     impl Mount for Mounted {
         fn mountpoint(&self) -> &Path {
             &self.0
-        }
-    }
-
-    struct Greeter;
-
-    impl Executable for Greeter {
-        fn exec<'a>(
-            &'a self,
-            call: &'a ExecCall,
-            _mount: Option<&'a dyn Mount>,
-        ) -> BoxFuture<'a, ExecOutput> {
-            Box::pin(async move { ExecOutput::ok(format!("hello {}\n", call.args.join(" "))) })
-        }
-    }
-
-    /// Reports what it was told about where it ran, so a test can see whether anything
-    /// arrived — and, since it resolves an argument, whether the directory is usable.
-    struct Where;
-
-    impl Executable for Where {
-        fn exec<'a>(
-            &'a self,
-            call: &'a ExecCall,
-            _mount: Option<&'a dyn Mount>,
-        ) -> BoxFuture<'a, ExecOutput> {
-            Box::pin(async move {
-                match call.resolve(&call.args[0]) {
-                    Ok(path) => ExecOutput::ok(path.to_string_lossy().into_owned()),
-                    Err(e) => ExecOutput::failed(1, format!("{e}")),
-                }
-            })
-        }
-    }
-
-    /// Answers with a variable out of the environment the command had.
-    struct Getenv;
-
-    impl Executable for Getenv {
-        fn exec<'a>(
-            &'a self,
-            call: &'a ExecCall,
-            _mount: Option<&'a dyn Mount>,
-        ) -> BoxFuture<'a, ExecOutput> {
-            Box::pin(async move {
-                match call.env.get(&call.args[0]) {
-                    Some(value) => ExecOutput::ok(value.clone()),
-                    None => ExecOutput::failed(1, format!("{}: unset", call.args[0])),
-                }
-            })
         }
     }
 
@@ -1035,22 +785,18 @@ mod tests {
         assert!(e.to_string().contains("cannot answer"), "{e}");
     }
 
-    /// Building announces the registered names, and nothing about the session is kept on
-    /// this side afterwards: what a caller asks for goes out as asked, in that order, and
-    /// the answer is the server's.
+    /// Nothing about the session is kept on this side once `init` has gone out: what a
+    /// caller asks for goes out as asked, in that order, and the answer is the server's.
+    ///
+    /// Which is also what makes an execution one round trip. There is no second message
+    /// underneath a command, so the methods below are exactly what the caller asked for.
     #[tokio::test]
     async fn a_session_is_the_servers_to_keep() {
         let (client, log) = recorder(vec![initialized(), ran(b"hi\n")]);
-        let mut console = Console::builder()
-            .client(client)
-            .executables(ExecutableSet::new().register("foo", "greet the arguments", Greeter))
-            .build()
-            .await
-            .unwrap();
+        let mut console = Console::builder().client(client).build().await.unwrap();
 
         // Optional, and unanswered: only the timing of the boot below changes.
         console.start().await.unwrap();
-        // An execution that delegated nothing is one round trip.
         assert_eq!(
             console.exec(["echo", "hi"], None).await.unwrap().stdout,
             b"hi\n"
@@ -1076,26 +822,39 @@ mod tests {
             ]
         );
 
-        // What `init` carried: the registered names. It is the first thing on the
-        // channel, before anything a caller asked for.
+        // `init` is the first thing on the channel, before anything a caller asked for,
+        // and a console with nothing mounted describes a session by saying nothing.
         let Call::Init(init) = log.call(0) else {
             panic!("{:?} is not an init", log.call(0));
         };
-        assert_eq!(init.delegated, ["foo"]);
+        assert_eq!(init, InitCall::default());
+
+        // The command went out as the caller wrote it, carrying nothing else: where it
+        // runs is the far end's, and this end has nothing to add.
+        let Call::Exec(exec) = log.call(1) else {
+            panic!("{:?} is not an exec", log.call(1));
+        };
+        assert_eq!(
+            exec,
+            ExecCall {
+                cmd: vec!["echo".into(), "hi".into()],
+                timeout_ms: None,
+            }
+        );
     }
 
     /// A session the server refuses to have is not a console, so there is nothing for a
     /// caller to hold and nothing to end.
     #[tokio::test]
     async fn a_console_the_server_will_not_have_does_not_exist() {
-        let (client, log) = recorder(vec![Outcome::Error(Error::new(
-            Error::INVALID_PARAMS,
-            "delegated names are not a list",
+        let (client, log) = recorder(vec![Response::Error(Error::new(
+            Error::UNSUPPORTED_WORKFS,
+            "s3: this server realizes file:// and nothing else",
         ))]);
         let Err(e) = Console::builder().client(client).build().await else {
             panic!("a console whose init was refused should not build");
         };
-        assert!(e.to_string().contains("delegated names"), "{e}");
+        assert!(e.to_string().contains("file://"), "{e}");
 
         // And no `quit`: what would owe one is a `Console`, and there is not one.
         tokio::task::yield_now().await;
@@ -1116,252 +875,27 @@ mod tests {
         assert_eq!(log.methods(), [Method::Init, Method::Quit]);
     }
 
-    /// A delegated call is resolved from the set and carried back on an `exec` of its
-    /// own, and the caller sees one result for the one command it asked for.
+    /// The mount this end holds is what `init` names, and where it went is the server's
+    /// answer — which is the path every later call in the session is spelled in, and not
+    /// the mount point that was sent.
     ///
-    /// So the chain is `exec`s all the way down, told apart by the shape of the `cmd` they
-    /// carry: the caller's is a command, and every one after it is an answer to what the
-    /// last response asked for.
+    /// The two are usually the same directory. They are different here so that the
+    /// difference is visible at all: what a caller joins onto is what came back.
     #[tokio::test]
-    async fn a_delegated_call_is_resolved_inside_one_exec() {
-        let (client, log) = recorder(vec![
-            initialized(),
-            // Two in a row, so the chain is a loop and not a single extra step.
-            delegated(&["foo", "world"]),
-            delegated(&["nope"]),
-            ran(b"done\n"),
-        ]);
-        let mut console = Console::builder()
+    async fn a_console_names_its_mount_and_reads_back_where_it_went() {
+        let (client, log) = recorder(vec![initialized_at(Path::new("/srv/served"))]);
+        let console = Console::builder()
             .client(client)
-            .executables(ExecutableSet::new().register("foo", "greet the arguments", Greeter))
-            .build()
-            .await
-            .unwrap();
-
-        assert_eq!(console.exec(["foo"], None).await.unwrap().stdout, b"done\n");
-
-        assert_eq!(
-            log.methods(),
-            [Method::Init, Method::Exec, Method::Exec, Method::Exec]
-        );
-
-        /// The `n`th call, as the resume it must be: which request it carries on from, and
-        /// what it has to say about it.
-        fn resumed(log: &Log, n: usize) -> (RequestId, Outcome) {
-            match log.call(n) {
-                Call::Exec(Exec {
-                    cmd: ExecCmd::Resume { id, outcome },
-                    ..
-                }) => (id, outcome),
-                other => panic!("{other:?} is not an exec carrying on from anything"),
-            }
-        }
-
-        // What the caller asked for: a command, carrying on from nothing.
-        let Call::Exec(asked) = log.call(1) else {
-            panic!("{:?} is not an exec", log.call(1));
-        };
-        assert_eq!(asked.cmd, ExecCmd::New(vec!["foo".into()]));
-
-        // The registered name ran, and its output is what the next `exec` carried — under
-        // the id of the request that asked for it, which is the one above.
-        let (id, outcome) = resumed(&log, 2);
-        assert_eq!(id, 1);
-        let result: ExecResult = outcome.take().unwrap();
-        assert_eq!(result.stdout, b"hello world\n");
-
-        // The unregistered one is refused rather than run — a server asking for a name
-        // it was never given — and an outcome is what makes saying so possible at all.
-        let (id, outcome) = resumed(&log, 3);
-        assert_eq!(id, 2);
-        assert_eq!(outcome.error().map(|e| e.code), Some(Error::NOT_EXECUTABLE));
-    }
-
-    /// A delegated name is handed the console's own mount, so the file it opens is the one
-    /// the session's tree has under that name rather than whatever this process's own
-    /// directory holds.
-    ///
-    /// The whole chain is here, because it is the chain that makes the two ends agree: the
-    /// directory the server reported — a path in *its* filesystem — stripped back to a name
-    /// in the tree, the argument resolved against that, then joined onto the mount point,
-    /// and a real file at the end of it.
-    ///
-    /// The server puts the workfs somewhere of its own here, which is why the strip is
-    /// visible: `/srv/served` and the mount point are the same tree, and only the second is
-    /// a directory this end can open.
-    #[tokio::test]
-    async fn a_delegated_call_reads_the_consoles_mount() {
-        /// Answers with the contents of the file it was asked for, opened where the mount
-        /// says it is.
-        struct Cat;
-
-        impl Executable for Cat {
-            fn exec<'a>(
-                &'a self,
-                call: &'a ExecCall,
-                mount: Option<&'a dyn Mount>,
-            ) -> BoxFuture<'a, ExecOutput> {
-                Box::pin(async move {
-                    let Some(mount) = mount else {
-                        return ExecOutput::failed(1, "nothing is mounted");
-                    };
-                    let path = match call.resolve(&call.args[0]) {
-                        Ok(path) => mount.host_path(&path),
-                        Err(e) => return ExecOutput::failed(1, e.to_string()),
-                    };
-                    match std::fs::read(&path) {
-                        Ok(bytes) => ExecOutput::ok(bytes),
-                        Err(e) => ExecOutput::failed(1, e.to_string()),
-                    }
-                })
-            }
-        }
-
-        let mnt = std::env::temp_dir().join(format!("cortex-console-{}", std::process::id()));
-        std::fs::create_dir_all(&mnt).expect("temp dir is writable");
-        std::fs::write(mnt.join("note.txt"), b"from the mounted tree\n").unwrap();
-
-        let (client, log) = recorder(vec![
-            initialized_at(Path::new("/srv/served")),
-            // The root of the tree, as the server names it — which is what lets a relative
-            // argument resolve at all, once it has been stripped back to a name in the tree.
-            delegated_in(&["cat", "note.txt"], "/srv/served"),
-            ran(b"done\n"),
-        ]);
-        let mut console = Console::builder()
-            .client(client)
-            .executables(ExecutableSet::new().register(
-                "cat",
-                "read a file out of the tree it was handed",
-                Cat,
-            ))
-            .mount(Mounted(mnt.clone()))
-            .build()
-            .await
-            .unwrap();
-
-        // The workfs is this end's mount point, and where it ended up is the server's answer.
-        let Call::Init(init) = log.call(0) else {
-            panic!("{:?} is not an init", log.call(0));
-        };
-        assert_eq!(
-            init.workfs,
-            Some(WorkFsSource::new(format!("file://{}", mnt.display())))
-        );
-        assert_eq!(console.workfs_path(), Some(Path::new("/srv/served")));
-
-        console
-            .exec(["sh", "-c", "cat note.txt"], None)
-            .await
-            .unwrap();
-        std::fs::remove_dir_all(&mnt).ok();
-
-        let Call::Exec(Exec {
-            cmd: ExecCmd::Resume { outcome, .. },
-            ..
-        }) = log.call(2)
-        else {
-            panic!("{:?} is not an exec carrying on from anything", log.call(2));
-        };
-        let result: ExecResult = outcome.take().unwrap();
-        assert_eq!(result.stdout, b"from the mounted tree\n");
-    }
-
-    /// What an executable resolves against is the reported directory named from the root of
-    /// the tree, which is the form that means the same file on both sides of the channel.
-    ///
-    /// The server's own path is what arrives, and stripping it is this end's — so a
-    /// `/srv/served/docs/sub` on the wire is a `docs/sub` on the call.
-    #[tokio::test]
-    async fn a_delegated_call_receives_the_directory_it_ran_in() {
-        let (client, log) = recorder(vec![
-            initialized_at(Path::new("/srv/served")),
-            delegated_in(&["where", "report.md"], "/srv/served/docs/sub"),
-            ran(b"done\n"),
-        ]);
-        let mut console = Console::builder()
-            .client(client)
-            .executables(ExecutableSet::new().register(
-                "where",
-                "resolve an argument where the command ran",
-                Where,
-            ))
             .mount(Mounted("/mnt/here".into()))
             .build()
             .await
             .unwrap();
 
-        console.exec(["sh"], None).await.unwrap();
-
-        // The executable resolved its argument against the directory the server reported,
-        // which is only possible if the field crossed onto the call — as a name in the tree
-        // and not as the server's own path.
-        let Call::Exec(Exec {
-            cmd: ExecCmd::Resume { outcome, .. },
-            ..
-        }) = log.call(2)
-        else {
-            panic!("{:?} is not an exec carrying on from anything", log.call(2));
+        let Call::Init(init) = log.call(0) else {
+            panic!("{:?} is not an init", log.call(0));
         };
-        let result: ExecResult = outcome.take().unwrap();
-        assert_eq!(result.stdout, b"docs/sub/report.md");
-    }
-
-    /// And when nothing said where it ran, the executable is told so rather than handed a
-    /// root that would name a different file.
-    ///
-    /// Three ways to arrive at that same `None`, because all three mean the one thing an
-    /// executable can act on — there is no directory in this tree that the command stood in:
-    /// nothing reported, no tree to name one in, and a directory the tree does not contain.
-    #[tokio::test]
-    async fn a_delegated_call_with_no_directory_says_so() {
-        for (mounted, answer, delegated, why) in [
-            (
-                true,
-                initialized_at(Path::new("/srv/served")),
-                delegated(&["where", "report.md"]),
-                "nothing was reported",
-            ),
-            (
-                false,
-                initialized(),
-                delegated_in(&["where", "report.md"], "/srv/served"),
-                "there is no tree to name it in",
-            ),
-            (
-                true,
-                initialized_at(Path::new("/srv/served")),
-                delegated_in(&["where", "report.md"], "/etc"),
-                "the command stood outside the tree",
-            ),
-        ] {
-            let (client, log) = recorder(vec![answer, delegated, ran(b"done\n")]);
-            let mut builder =
-                Console::builder()
-                    .client(client)
-                    .executables(ExecutableSet::new().register(
-                        "where",
-                        "resolve an argument where the command ran",
-                        Where,
-                    ));
-            if mounted {
-                builder = builder.mount(Mounted("/mnt/here".into()));
-            }
-            let mut console = builder.build().await.unwrap();
-
-            console.exec(["sh"], None).await.unwrap();
-
-            let Call::Exec(Exec {
-                cmd: ExecCmd::Resume { outcome, .. },
-                ..
-            }) = log.call(2)
-            else {
-                panic!("{:?} is not an exec carrying on from anything", log.call(2));
-            };
-            let result: ExecResult = outcome.take().unwrap();
-            assert_eq!(result.code, 1, "a relative path is refused when {why}");
-            assert!(result.stdout.is_empty(), "{why}");
-        }
+        assert_eq!(init.workfs, Some(WorkFsSource::new("file:///mnt/here")));
+        assert_eq!(console.workfs_path(), Some(Path::new("/srv/served")));
     }
 
     /// A session with a workfs needs somewhere to have put it: a path is what every later
@@ -1391,41 +925,5 @@ mod tests {
             panic!("a console whose workfs went to a relative path should not build");
         };
         assert!(e.to_string().contains("not an absolute path"), "{e}");
-    }
-
-    /// The environment on a delegated call crosses onto the [`ExecCall`], which is what
-    /// makes a delegated name usable the way a program on `PATH` is — and it crosses whole,
-    /// so a variable the reporting end never mentioned is one the executable finds unset.
-    #[tokio::test]
-    async fn a_delegated_call_is_handed_the_environment_the_command_had() {
-        for (arg, code, out) in [("FOO", 0, &b"bar"[..]), ("NOPE", 1, &b""[..])] {
-            let (client, log) = recorder(vec![
-                initialized(),
-                delegated_with_env(&["getenv", arg], &[("FOO", "bar")]),
-                ran(b"done\n"),
-            ]);
-            let mut console = Console::builder()
-                .client(client)
-                .executables(ExecutableSet::new().register(
-                    "getenv",
-                    "answer a variable the command had",
-                    Getenv,
-                ))
-                .build()
-                .await
-                .unwrap();
-
-            console.exec(["sh"], None).await.unwrap();
-
-            let Call::Exec(Exec {
-                cmd: ExecCmd::Resume { outcome, .. },
-                ..
-            }) = log.call(2)
-            else {
-                panic!("{:?} is not an exec carrying on from anything", log.call(2));
-            };
-            let result: ExecResult = outcome.take().unwrap();
-            assert_eq!((result.code, result.stdout.as_slice()), (code, out));
-        }
     }
 }

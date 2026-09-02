@@ -6,9 +6,9 @@
 //! shapes the member set makes it — and the serde impls that read and write all of
 //! it.
 //!
-//! What a particular method carries is [`Call`]'s and [`Notification`]'s, and how
-//! something *ended* is [`Outcome`]'s — a shape of its own because a `result` is typed
-//! by the method its `id` was issued for, which this half does not know.
+//! What a particular method carries is [`Call`]'s and [`Response`]'s — the request half
+//! and the answering half — and each writes and reads its own members, so adding a method
+//! means touching the side it belongs to and not the envelope.
 
 use std::fmt;
 
@@ -19,7 +19,7 @@ use serde::{
     ser::SerializeMap,
 };
 
-use crate::console::{Call, Error, Method, Notification, Outcome};
+use crate::console::{Call, Error, Method, Notification, Response};
 
 /// The only `jsonrpc` member this protocol accepts.
 pub const VERSION: &str = "2.0";
@@ -34,12 +34,6 @@ pub const VERSION: &str = "2.0";
 /// nobody issued is a peer that has lost its place, and can be dropped rather than
 /// mistaken for the answer that was due.
 ///
-/// It is also what threads a [`Progress::Delegated`](super::Progress::Delegated)
-/// exchange together. An execution that pauses for a delegated call is answered once per
-/// round trip, and each round trip is an `exec` of its own — so each response carries the
-/// id of the request it is the answer to, and the one the client is carrying on from is
-/// named again in the [`ExecCmd::Resume`](super::ExecCmd::Resume) that carries it on.
-///
 /// JSON-RPC also allows a string or null id. This protocol issues numbers, which
 /// is what an off-the-shelf peer will happily accept; nothing reads any other
 /// meaning into the value.
@@ -52,7 +46,7 @@ pub type RequestId = u64;
 /// ends have to agree on it, or one will accept what the other would not send.
 ///
 /// Since a response carries a whole execution's output, this is also the ceiling
-/// on how much a command may write — see [`truncated`](super::ExecResult::truncated).
+/// on how much a command may write — see [`truncated`](super::ExecResp::truncated).
 pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// One JSON-RPC object.
@@ -71,8 +65,15 @@ pub enum Message {
     /// `{"jsonrpc":"2.0","method":..}` — no `id`, because nothing answers it.
     Notification(Notification),
 
-    /// `{"jsonrpc":"2.0","id":N,"result":..}` or `{..,"error":..}`
-    Response { id: RequestId, outcome: Outcome },
+    /// `{"jsonrpc":"2.0","id":N,"method":..,"result":..}` or `{..,"error":..}`
+    ///
+    /// `result` xor `error`, and both are [`Response`] — a response either is the answer
+    /// or is the reason there is none, which is one question with one type. Nothing here
+    /// wraps it in a second one to say which of the two it turned out to be.
+    ///
+    /// The `result` side is typed, which is what the echoed `method` is for; see
+    /// [`Response`].
+    Response { id: RequestId, result: Response },
 }
 
 impl Message {
@@ -125,12 +126,11 @@ impl Serialize for Message {
                 notification.serialize_params(&mut map)?;
             }
 
-            Message::Response { id, outcome } => {
+            Message::Response { id, result } => {
                 map.serialize_entry("id", id)?;
-                match outcome {
-                    Outcome::Result(value) => map.serialize_entry("result", value)?,
-                    Outcome::Error(error) => map.serialize_entry("error", error)?,
-                }
+                // Which members those are — `method` and `result`, or `error` — is the
+                // response's own business, the way a call's `params` is a call's.
+                result.serialize_into(&mut map)?;
             }
         }
 
@@ -192,39 +192,60 @@ impl<'de> Visitor<'de> for MessageVisitor {
             None => return Err(de::Error::missing_field("jsonrpc")),
         }
 
-        if let Some(name) = method {
-            if result.is_some() || error.is_some() {
+        let method = match method {
+            Some(name) => Some(
+                Method::parse(&name)
+                    .ok_or_else(|| de::Error::custom(format!("unknown method {name:?}")))?,
+            ),
+            None => None,
+        };
+
+        // Which of the three shapes this is, is decided by the members that carry a
+        // *payload* and not by `method`: a request and a response both name one now, and
+        // what tells them apart is `params` against `result` xor `error`.
+        if result.is_some() || error.is_some() {
+            if params.is_some() {
                 return Err(de::Error::custom(
-                    "a message has a method and a result or error, so it is neither \
+                    "a message has params and a result or error, so it is neither \
                      a request nor a response",
                 ));
             }
-            let method = Method::parse(&name)
-                .ok_or_else(|| de::Error::custom(format!("unknown method {name:?}")))?;
-
-            // An `id` is what says which of the two a method is here as, and each
-            // refuses the methods that are not its own. `params` is typed by the
-            // method, which is why it waited.
-            let params = params.unwrap_or(Bson::Null);
-
-            return match id {
-                Some(id) => Ok(Message::Request {
-                    id,
-                    call: Call::from_params(method, params)?,
-                }),
-                None => Ok(Message::Notification(Notification::from_params(
-                    method, params,
-                )?)),
+            let result = match (result, error) {
+                // A `result` is typed by the method the response echoed, and a response
+                // that names none is one nothing can read.
+                (Some(value), None) => {
+                    let method = method
+                        .ok_or_else(|| de::Error::custom("a result needs the method it answers"))?;
+                    Response::from_result(method, value)?
+                }
+                (None, Some(error)) => Response::Error(error),
+                (Some(_), Some(_)) => {
+                    return Err(de::Error::custom("both a result and an error"));
+                }
+                (None, None) => unreachable!("one of the two is there"),
             };
+            let id = id.ok_or_else(|| de::Error::custom("a response needs an id"))?;
+            return Ok(Message::Response { id, result });
         }
 
-        // No method, so a response: an outcome, and an id to say what it answers.
-        // Neither member being there is what makes this none of the three shapes —
-        // there was no `method` either, or we would not have got here.
-        let outcome = Outcome::from_members(result, error)?
-            .ok_or_else(|| de::Error::custom("a message has no method, result or error"))?;
-        let id = id.ok_or_else(|| de::Error::custom("a response needs an id"))?;
-        Ok(Message::Response { id, outcome })
+        // No result and no error, so a request or a notification — and an `id` is what
+        // says which. `params` is typed by the method, which is why it waited.
+        let Some(method) = method else {
+            return Err(de::Error::custom(
+                "a message has no method, result or error",
+            ));
+        };
+        let params = params.unwrap_or(Bson::Null);
+
+        match id {
+            Some(id) => Ok(Message::Request {
+                id,
+                call: Call::from_params(method, params)?,
+            }),
+            None => Ok(Message::Notification(Notification::from_params(
+                method, params,
+            )?)),
+        }
     }
 }
 
@@ -233,7 +254,7 @@ mod tests {
     use bson::{Document, doc};
 
     use super::{
-        super::{Exec, ExecCmd, ExecResult, Init, Progress, Read, ReadResult, Write, WriteResult},
+        super::{ExecCall, ExecResp, InitCall, InitResp, ReadCall, ReadResp, WriteCall, WriteResp},
         *,
     };
 
@@ -250,70 +271,34 @@ mod tests {
         bson::deserialize_from_slice(&bson::serialize_to_vec(&doc).unwrap())
     }
 
-    fn exec() -> Exec {
-        Exec {
+    fn exec() -> ExecCall {
+        ExecCall {
             // A multi-line `sh -c` script is one argument, and argv's last element
             // can be empty — both are ordinary argv.
-            cmd: ExecCmd::New(vec![
-                "sh".into(),
-                "-c".into(),
-                "echo a\necho b".into(),
-                "".into(),
-            ]),
+            cmd: vec!["sh".into(), "-c".into(), "echo a\necho b".into(), "".into()],
             timeout_ms: Some(1_000),
-            cwd: None,
-            env: Default::default(),
         }
     }
 
-    /// How a delegated call went, as the `exec` that carries it back.
+    /// A whole session on one channel, in order: announce it, boot it, run something,
+    /// release it, exit.
     ///
-    /// Nothing to run, because this asks for nothing to be run: the execution it is
-    /// carrying on is already running on the far end, and all this adds is the answer it
-    /// was waiting for.
-    fn carry_on(answering: RequestId, outcome: Outcome) -> Exec {
-        Exec {
-            cmd: ExecCmd::Resume {
-                id: answering,
-                outcome,
-            },
-            ..Exec::default()
-        }
-    }
-
-    /// A delegated call that ran and produced something.
-    fn produced(stdout: &[u8]) -> Outcome {
-        Outcome::Result(
-            bson::serialize_to_bson(&ExecResult {
-                code: 0,
-                stdout: stdout.to_vec(),
-                ..ExecResult::default()
-            })
-            .unwrap(),
-        )
-    }
-
-    /// A whole session on one channel, in order: announce it, boot it, run something
-    /// that delegates twice on the way, release it, exit.
-    ///
-    /// The execution in the middle is the shape worth reading: the first `exec` is
-    /// answered with a `Delegated` rather than a result, each `exec` carrying an
-    /// [`ExecCmd::Resume`] is answered with the next one, and the last of them carries
-    /// the execution's own ending. Every request is the client's and every response the
-    /// server's throughout, and the three notifications go unanswered because nothing
-    /// answers one.
+    /// Every request is the client's and every response the server's throughout, and the
+    /// three notifications go unanswered because nothing answers one. That is the shape
+    /// worth reading: an execution is one request and one response, however long the
+    /// command took.
     fn session() -> Vec<Message> {
         vec![
             Message::Request {
                 id: 0,
-                call: Call::Init(Init {
-                    delegated: vec!["bar".into(), "foo".into()],
-                    ..Init::default()
+                call: Call::Init(InitCall {
+                    workfs: Some(super::super::WorkFsSource::new("file:///srv/project")),
+                    ..InitCall::default()
                 }),
             },
             Message::Response {
                 id: 0,
-                outcome: Outcome::Result(Bson::Null),
+                result: Response::Init(InitResp::default()),
             },
             // Optional, and nothing answers it: booting early rather than inside the
             // execution below.
@@ -322,60 +307,14 @@ mod tests {
                 id: 1,
                 call: Call::Exec(exec()),
             },
-            // Not the execution's result: a name the server cannot run itself, and
-            // no timeout of its own.
             Message::Response {
                 id: 1,
-                outcome: Outcome::Result(
-                    bson::serialize_to_bson(&Progress::Delegated(Exec {
-                        cmd: ExecCmd::New(vec!["foo".into()]),
-                        ..Exec::default()
-                    }))
-                    .unwrap(),
-                ),
-            },
-            // What `foo` produced, carried back as an `exec` of its own — naming the
-            // request whose response asked for it, and asking for nothing new to be run.
-            Message::Request {
-                id: 2,
-                call: Call::Exec(carry_on(1, produced(b"foo said this\n"))),
-            },
-            Message::Response {
-                id: 2,
-                outcome: Outcome::Result(
-                    bson::serialize_to_bson(&Progress::Delegated(Exec {
-                        cmd: ExecCmd::New(vec!["bar".into(), "--twice".into()]),
-                        ..Exec::default()
-                    }))
-                    .unwrap(),
-                ),
-            },
-            // And one that produced nothing at all, which is why a resume carries an
-            // outcome and not a result.
-            Message::Request {
-                id: 3,
-                call: Call::Exec(carry_on(
-                    2,
-                    Outcome::Error(Error::new(
-                        Error::NOT_EXECUTABLE,
-                        "bar: no such executable on the client",
-                    )),
-                )),
-            },
-            Message::Response {
-                id: 3,
-                outcome: Outcome::Result(
-                    bson::serialize_to_bson(&Progress::Done(ExecResult {
-                        code: -1,
-                        stdout: vec![0, 1, 2, 255, b'\n'],
-                        stderr: vec![],
-                        truncated: false,
-                        // The command moved the session, which is a whole session's worth of
-                        // frames only if something survives the round trip.
-                        cwd: Some("/mnt/workfs/work".into()),
-                    }))
-                    .unwrap(),
-                ),
+                result: Response::Exec(ExecResp {
+                    code: -1,
+                    stdout: vec![0, 1, 2, 255, b'\n'],
+                    stderr: vec![],
+                    truncated: false,
+                }),
             },
             Message::Notification(Notification::Stop),
             Message::Notification(Notification::Quit),
@@ -387,30 +326,30 @@ mod tests {
         session()
             .into_iter()
             .chain([
-                // Delegating nothing, and waiting forever, is a client too.
+                // A session that describes nothing, and waits forever, is a session too.
                 Message::Request {
                     id: 6,
-                    call: Call::Init(Init::default()),
+                    call: Call::Init(InitCall::default()),
                 },
                 Message::Response {
                     id: 6,
-                    outcome: Outcome::Result(Bson::Null),
+                    result: Response::Init(InitResp::default()),
                 },
                 // Booting is nothing's own request, so a backend that cannot come up
                 // says so to whatever asked for the thing that needed one.
                 Message::Response {
                     id: 1,
-                    outcome: Outcome::Error(Error::new(Error::BOOT_FAILED, "no kvm")),
+                    result: Response::Error(Error::new(Error::BOOT_FAILED, "no kvm")),
                 },
                 Message::Response {
                     id: 1,
-                    outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
+                    result: Response::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
                 },
                 // The file plane. A read bounded on both ends, whose answer is shorter
                 // than the file it came from.
                 Message::Request {
                     id: 7,
-                    call: Call::Read(Read {
+                    call: Call::Read(ReadCall {
                         path: "out/log.txt".into(),
                         offset: Some(4096),
                         len: Some(1024),
@@ -418,22 +357,19 @@ mod tests {
                 },
                 Message::Response {
                     id: 7,
-                    outcome: Outcome::Result(
-                        bson::serialize_to_bson(&ReadResult {
-                            data: vec![0xff, 0x00, b'\n'],
-                            size: 10_000,
-                        })
-                        .unwrap(),
-                    ),
+                    result: Response::Read(ReadResp {
+                        data: vec![0xff, 0x00, b'\n'],
+                        size: 10_000,
+                    }),
                 },
                 Message::Response {
                     id: 7,
-                    outcome: Outcome::Error(Error::new(Error::NOT_FOUND, "out/log.txt")),
+                    result: Response::Error(Error::new(Error::NOT_FOUND, "out/log.txt")),
                 },
                 // And a whole-file write, which is the offset being absent.
                 Message::Request {
                     id: 8,
-                    call: Call::Write(Write {
+                    call: Call::Write(WriteCall {
                         path: "in/data".into(),
                         data: vec![0, 1, 2, 255],
                         offset: None,
@@ -441,9 +377,7 @@ mod tests {
                 },
                 Message::Response {
                     id: 8,
-                    outcome: Outcome::Result(
-                        bson::serialize_to_bson(&WriteResult { size: 4 }).unwrap(),
-                    ),
+                    result: Response::Write(WriteResp { size: 4 }),
                 },
             ])
             .collect()
@@ -465,9 +399,9 @@ mod tests {
         assert_eq!(
             wire(&Message::Request {
                 id: 2,
-                call: Call::Exec(Exec {
-                    cmd: ExecCmd::New(vec!["ls".into()]),
-                    ..Exec::default()
+                call: Call::Exec(ExecCall {
+                    cmd: vec!["ls".into()],
+                    ..ExecCall::default()
                 }),
             }),
             doc! {"jsonrpc": "2.0", "id": 2i64, "method": "exec", "params": {"cmd": ["ls"]}},
@@ -476,15 +410,7 @@ mod tests {
         assert_eq!(
             wire(&Message::Response {
                 id: 2,
-                outcome: Outcome::Result(doc! {"code": 0i64}.into()),
-            }),
-            doc! {"jsonrpc": "2.0", "id": 2i64, "result": {"code": 0i64}},
-        );
-
-        assert_eq!(
-            wire(&Message::Response {
-                id: 2,
-                outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
+                result: Response::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
             }),
             doc! {
                 "jsonrpc": "2.0",
@@ -493,60 +419,32 @@ mod tests {
             },
         );
 
-        // A `Delegated` is an ordinary `result`, which is the whole point of it: a peer
-        // sees a response and nothing stranger.
+        // An execution's ending is an ordinary `result`: the members of the ending itself,
+        // with nothing wrapping them — beside the `method` that says which method's answer
+        // they are, which is the whole of what a response carries that the spec's does not.
         assert_eq!(
             wire(&Message::Response {
                 id: 2,
-                outcome: Outcome::Result(
-                    bson::serialize_to_bson(&Progress::Delegated(Exec {
-                        cmd: ExecCmd::New(vec!["foo".into()]),
-                        ..Exec::default()
-                    }))
-                    .unwrap()
-                ),
+                result: Response::Exec(ExecResp {
+                    code: 0,
+                    ..ExecResp::default()
+                }),
             }),
             doc! {
                 "jsonrpc": "2.0",
                 "id": 2i64,
-                "result": {"delegated": {"cmd": ["foo"]}},
-            },
-        );
-
-        // And carrying on from a delegated call is an `exec` like any other, whose `cmd`
-        // is an object rather than an argv because it asks for nothing new to be run —
-        // and the outcome in it spells the same two members a response does.
-        assert_eq!(
-            wire(&Message::Request {
-                id: 3,
-                call: Call::Exec(carry_on(2, Outcome::Result(doc! {"code": 0i64}.into()))),
-            }),
-            doc! {
-                "jsonrpc": "2.0",
-                "id": 3i64,
                 "method": "exec",
-                "params": {
-                    "cmd": {"id": 2i64, "outcome": {"result": {"code": 0i64}}},
-                },
-            },
-        );
-        assert_eq!(
-            wire(&Message::Request {
-                id: 3,
-                call: Call::Exec(carry_on(
-                    2,
-                    Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")),
-                )),
-            }),
-            doc! {
-                "jsonrpc": "2.0",
-                "id": 3i64,
-                "method": "exec",
-                "params": {
-                    "cmd": {
-                        "id": 2i64,
-                        "outcome": {"error": {"code": -32000i64, "message": "too slow"}},
-                    },
+                "result": {
+                    "code": 0i32,
+                    "stdout": Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: Vec::new(),
+                    }),
+                    "stderr": Bson::Binary(bson::Binary {
+                        subtype: bson::spec::BinarySubtype::Generic,
+                        bytes: Vec::new(),
+                    }),
+                    "truncated": false,
                 },
             },
         );
@@ -556,7 +454,7 @@ mod tests {
         assert_eq!(
             wire(&Message::Request {
                 id: 5,
-                call: Call::Read(Read {
+                call: Call::Read(ReadCall {
                     path: "out/log.txt".into(),
                     offset: Some(4096),
                     len: Some(1024),
@@ -572,7 +470,7 @@ mod tests {
         assert_eq!(
             wire(&Message::Request {
                 id: 6,
-                call: Call::Write(Write {
+                call: Call::Write(WriteCall {
                     path: "in/data".into(),
                     data: vec![0, 1, 2],
                     offset: None,
@@ -612,16 +510,16 @@ mod tests {
         assert_eq!(
             wire(&Message::Request {
                 id: 0,
-                call: Call::Init(Init {
-                    delegated: vec!["fetch".into()],
-                    ..Init::default()
+                call: Call::Init(InitCall {
+                    workfs: Some(super::super::WorkFsSource::new("file:///srv/project")),
+                    ..InitCall::default()
                 }),
             }),
             doc! {
                 "jsonrpc": "2.0",
                 "id": 0i64,
                 "method": "init",
-                "params": {"delegated": ["fetch"]},
+                "params": {"workfs": {"url": "file:///srv/project"}},
             },
         );
     }
@@ -637,14 +535,11 @@ mod tests {
         let payload = vec![0xff, 0xfe, 0x00, b'\n', 0x00];
         let message = Message::Response {
             id: 1,
-            outcome: Outcome::Result(
-                bson::serialize_to_bson(&Progress::Done(ExecResult {
-                    code: 0,
-                    stdout: payload.clone(),
-                    ..ExecResult::default()
-                }))
-                .unwrap(),
-            ),
+            result: Response::Exec(ExecResp {
+                code: 0,
+                stdout: payload.clone(),
+                ..ExecResp::default()
+            }),
         };
 
         let frame = bson::serialize_to_vec(&wire(&message)).unwrap();
@@ -678,7 +573,7 @@ mod tests {
         else {
             panic!("wrong message")
         };
-        assert_eq!(exec.cmd, ExecCmd::New(vec!["ls".into()]));
+        assert_eq!(exec.cmd, vec!["ls".to_string()]);
     }
 
     /// Nothing a peer could send that is not one of the three shapes gets through
@@ -725,50 +620,43 @@ mod tests {
             doc! {"jsonrpc": "2.0", "id": 1i64},
             "no method, result or error",
         );
+        // A response names the method it answers, so `params` beside a `result` is a
+        // message trying to be both.
+        refused(
+            doc! {
+                "jsonrpc": "2.0",
+                "id": 1i64,
+                "method": "exec",
+                "params": {"cmd": ["ls"]},
+                "result": {"code": 0i32},
+            },
+            "neither a request nor a response",
+        );
+        // A result with nothing to type it is one nothing can read.
+        refused(
+            doc! {"jsonrpc": "2.0", "id": 1i64, "result": {"code": 0i32}},
+            "needs the method it answers",
+        );
+        // A result that is not what the method answers with.
         refused(
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "result": Bson::Null},
-            "neither a request nor a response",
+            "exec result",
+        );
+        // And a method nothing answers cannot be answered.
+        refused(
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "quit", "result": Bson::Null},
+            "is not answered",
         );
         // Params that are not what the method takes.
         refused(
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "params": {"cmd": "ls"}},
             "exec params",
         );
-        // Carrying on from a delegated call is a shape of `exec`'s `cmd` and not a method
-        // of its own, so the name a peer written against the old protocol would send is
-        // not one this speaks.
+        // An `exec`'s `cmd` is an argv and nothing else, so an object there is params
+        // that are not what the method takes rather than a second shape to try.
         refused(
-            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "resume", "params": {}},
-            "unknown method",
-        );
-        // And the outcome a `cmd` carries is an outcome, so the same xor applies to it
-        // as to a response's own two members — nested one level down, which is the only
-        // difference.
-        refused(
-            doc! {
-                "jsonrpc": "2.0",
-                "id": 1i64,
-                "method": "exec",
-                "params": {"cmd": {"id": 0i64, "outcome": {}}},
-            },
-            "no result and no error",
-        );
-        refused(
-            doc! {
-                "jsonrpc": "2.0",
-                "id": 1i64,
-                "method": "exec",
-                "params": {
-                    "cmd": {
-                        "id": 0i64,
-                        "outcome": {
-                            "result": Bson::Null,
-                            "error": {"code": 1i64, "message": "x"},
-                        },
-                    },
-                },
-            },
-            "both a result and an error",
+            doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "params": {"cmd": {}}},
+            "exec params",
         );
     }
 

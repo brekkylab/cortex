@@ -1,6 +1,6 @@
 //! `mem` against a directory on this host.
 //!
-//! The same [`Mem`] a console delegates to, driven from a shell instead: the working directory
+//! The same [`Mem`] a caller registers, driven from a shell instead: the working directory
 //! stands in for the mounted tree, so `mem insert notes.sqlite "..."` writes the store beside
 //! whatever else is in it. Everything else — the parsing, the pipeline, the answers — is the
 //! code that runs under a console, because there is only one of it.
@@ -63,7 +63,7 @@ async fn run() -> ExitCode {
         // The root of the tree, because that is where this was invoked: names resolve against
         // the directory `mem` is standing in, which is the one `Cwd` is rooted at.
         cwd: Some(String::new()),
-        // Run as a program rather than delegated to, so the caller's environment is this
+        // Run as a program rather than called in-process, so the caller's environment is this
         // process's own and there is nothing to carry across.
         env: std::env::vars().collect(),
     };

@@ -46,7 +46,7 @@ const SEARCH_LIMIT: usize = 10;
 /// about the store rather than about a query, and the answer nobody wants is a truncated one.
 const LIST_LIMIT: usize = 100;
 
-/// The `mem` command, as a name a console can delegate.
+/// The `mem` command, as an [`Executable`](cortex::exec::Executable).
 ///
 /// # Why a store is an argument and not a setting
 ///

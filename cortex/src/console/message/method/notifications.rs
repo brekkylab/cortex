@@ -21,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 /// Boot now, so that no command has to. The `params` of `start`, which are none.
 ///
-/// **What it buys is hiding the cold start.** An [`Exec`](super::Exec), a
-/// [`Read`](super::Read) and a [`Write`](super::Write) each need a booted session and
+/// **What it buys is hiding the cold start.** An [`ExecCall`](super::ExecCall), a
+/// [`ReadCall`](super::ReadCall) and a [`WriteCall`](super::WriteCall) each need a booted session and
 /// each boot one if there is none, so nothing here is required and nothing is unlocked
 /// by it. What moves is *who waits*: a backend with a kernel to bring up makes the first
 /// command pay for that in its own latency, and a client that says this as soon as it
@@ -42,14 +42,14 @@ pub struct Start;
 /// Release what booting took. The `params` of `stop`, which are none.
 ///
 /// **What it buys is not occupying anything while nothing is being run.** Much what
-/// stopping a VM is: the guest goes away, the socket and the symlinks go with it, and a
-/// scratch directory is cleaned up by whoever made it rather than left for someone to
-/// find later. Those are memory, descriptors and disk on the far end, held for as long
-/// as the session is booted and useful only while something is running — so a client
-/// that knows it will be idle for a while is worth letting say so.
+/// stopping a VM is: the guest goes away, the tree is unmounted, and a scratch directory
+/// is cleaned up by whoever made it rather than left for someone to find later. Those are
+/// memory, descriptors and disk on the far end, held for as long as the session is booted
+/// and useful only while something is running — so a client that knows it will be idle for
+/// a while is worth letting say so.
 ///
 /// Optional and reversible, like [`Start`] and for the same reason: the next call that
-/// needs a booted session gets one, under the same [`Init`](super::Init). Handing
+/// needs a booted session gets one, under the same [`InitCall`](super::InitCall). Handing
 /// resources back therefore costs a client nothing but the boot it will pay for again —
 /// which is the trade it is making, and the reason this is worth sending when the idle
 /// stretch is long and not when it is two commands apart.
@@ -58,7 +58,7 @@ pub struct Start;
 /// that is merely stopped is still a session.
 ///
 /// Nothing here is about a single execution. To give up on one of those, let its
-/// [`timeout_ms`](super::Exec::timeout_ms) expire.
+/// [`timeout_ms`](super::ExecCall::timeout_ms) expire.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stop;
 

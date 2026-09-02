@@ -4,8 +4,8 @@ use super::bytes;
 
 /// Bytes to put in a file. The `params` of `write`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Write {
-    /// Resolved as [`Read::path`](super::Read::path) is. Any directory above it has to
+pub struct WriteCall {
+    /// Resolved as [`ReadCall::path`](super::ReadCall::path) is. Any directory above it has to
     /// exist already; the file itself does not.
     pub path: String,
 
@@ -27,7 +27,7 @@ pub struct Write {
 
 /// How big the file is now. The `result` of `write`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteResult {
+pub struct WriteResp {
     /// Where a positioned write should carry on from, and confirmation that a
     /// whole-file write left the length it meant to.
     pub size: u64,
@@ -41,7 +41,7 @@ mod tests {
     /// smallest thing the method can say.
     #[test]
     fn a_whole_file_write_carries_no_offset() {
-        let write = Write {
+        let write = WriteCall {
             path: "data".into(),
             data: vec![1, 2, 3],
             offset: None,
@@ -49,7 +49,7 @@ mod tests {
         let doc = bson::serialize_to_document(&write).unwrap();
         assert_eq!(doc.get("offset"), None);
         assert_eq!(
-            bson::deserialize_from_document::<Write>(doc).unwrap(),
+            bson::deserialize_from_document::<WriteCall>(doc).unwrap(),
             write,
         );
     }

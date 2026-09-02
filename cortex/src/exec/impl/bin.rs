@@ -1,4 +1,4 @@
-//! A program on this host, offered as a delegated name.
+//! A program on this host, offered as an [`Executable`](crate::exec::Executable).
 
 use std::{collections::BTreeMap, io, os::unix::process::ExitStatusExt as _, process::Stdio};
 
@@ -17,17 +17,17 @@ use crate::{
 /// difference between a chatty program and an allocation the size of its output.
 ///
 /// Fixed rather than a knob, because it is not a decision a registration has to make. What
-/// crosses here goes on to a console channel and into whatever is reading the output, and this
-/// much of it is already far past anything a delegated call should be answering with. A program
-/// with more than this to say should write it into the tree it was handed and answer with the
-/// path — the tree is mounted, which is the whole reason a delegated name gets one.
+/// crosses here goes on to whatever is reading the output, and this much of it is already far
+/// past anything a call should be answering with. A program with more than this to say should
+/// write it into the tree it was handed and answer with the path — the tree is mounted, which
+/// is the whole reason a call gets one.
 const OUTPUT_LIMIT: usize = 8 << 20;
 
 /// A program that could not be found, which is what a shell reports 127 for.
 const NOT_FOUND: i32 = 127;
 
-/// A program that was found and could not be started — 126, the same code the shim uses for
-/// the same condition one layer up.
+/// A program that was found and could not be started — 126, which is what a shell reports for
+/// the same condition.
 const NOT_EXECUTABLE: i32 = 126;
 
 /// A call that could not be made at all: no tree to run in, or nowhere in it to stand.
@@ -64,10 +64,9 @@ fn refused(code: i32, reason: impl Into<String>) -> ExecResult {
 ///   not work without a `HOME` or a `TMPDIR`, and the caller's answers describe another machine —
 ///   a guest's `/root` is not here, and its `$TMPDIR` is a directory this host never had.
 ///
-///   `PATH` is the one with teeth. A console server puts a directory of shim symlinks on the
-///   `PATH` of everything an execution spawns, so a child given the caller's `PATH` could call a
-///   delegated name — and delegated calls are served one at a time, so that does not contend, it
-///   deadlocks.
+///   `PATH` is the one with teeth. It is a list of directories on the caller's machine, and a
+///   child given it would look for its own program somewhere this host may have nothing, or
+///   something else entirely — so it is answered here rather than passed on.
 ///
 /// * **It decides what code the program runs.** The dynamic loaders: `LD_PRELOAD` and
 ///   `DYLD_INSERT_LIBRARIES` are injection into a process this side spawned with nothing else
@@ -132,14 +131,13 @@ fn environment(caller: &BTreeMap<String, String>, cwd: Option<&str>) -> Vec<(Str
     env.into_iter().collect()
 }
 
-/// A real program, run on this host when a delegated name is called.
+/// A real program, run on this host when a registered name is called.
 ///
 /// The name is registered like any other, and a caller cannot tell the difference: arguments
 /// arrive as `argv`, the program's own stdout and stderr go back as this call's, and its exit
 /// status is the call's. What makes it different from an [`Executable`] written in Rust is that
-/// a second process ends up holding the call's `cwd` and environment, and both of those are
-/// facts about a machine that is not the one the calling command ran on. Reconciling that is
-/// most of what this type does.
+/// a second process ends up holding the call's `cwd` and environment, and neither of those is
+/// necessarily a fact about this machine. Reconciling that is most of what this type does.
 ///
 /// # Why this is not a sandbox, and what that means for registering one
 ///
@@ -151,27 +149,26 @@ fn environment(caller: &BTreeMap<String, String>, cwd: Option<&str>) -> Vec<(Str
 ///
 /// That is worth stating plainly rather than mitigating badly: **registering one of these grants
 /// whoever can call the name the ability to run a program on this host, with this process's
-/// filesystem access.** For the host-local backend that is roughly what the caller already had.
-/// For a backend whose executions run in a micro-VM it is not — a delegated name is the one
-/// thing in that arrangement which runs outside the guest, and this is the kind of delegated
-/// name where that matters. A deployment that needs the child confined confines it with
+/// filesystem access.** Where the caller already had that, this gives away nothing; where it did
+/// not — a caller on the far side of a boundary — this is the one thing that crosses it, and
+/// that is the case to think about. A deployment that needs the child confined confines it with
 /// something built for it (a `sandbox-exec` profile, a Landlock ruleset, a namespace) and not
 /// with argument rewriting.
 ///
 /// What *is* honest about it is the reason to reach for this at all: the program exists on this
-/// host and not in the execution's world. A licensed binary, a model runner, a tool holding
-/// credentials the guest must never see. A program the execution could have run itself is one
-/// it should run itself.
+/// host and not wherever the caller is. A licensed binary, a model runner, a tool holding
+/// credentials that must not travel. A program the caller could have run itself is one it should
+/// run itself.
 ///
 /// # The environment is filtered, not applied
 ///
-/// [`ExecCall::env`] is a report — what the invoking command had, on the executor's machine —
-/// and applying it wholesale would put another machine's `PATH`, `HOME` and dynamic loader
-/// settings on a host process. So the default is to forward, minus two things: the names this
-/// host has to answer itself and the dynamic loaders — [`environment`] is the whole of it.
-/// Forwarding is the default because it is what makes a delegated name behave like a program on
-/// `PATH` rather than almost like one — `FOO=bar` reaches the program, and so does whatever
-/// vocabulary that particular tool has, which no table here could have known to list.
+/// [`ExecCall::env`] is a report — what the invoking command had, wherever it ran — and applying
+/// it wholesale would put another machine's `PATH`, `HOME` and dynamic loader settings on a host
+/// process. So the default is to forward, minus two things: the names this host has to answer
+/// itself and the dynamic loaders — [`environment`] is the whole of it. Forwarding is the
+/// default because it is what makes a registered name behave like a program on `PATH` rather
+/// than almost like one — `FOO=bar` reaches the program, and so does whatever vocabulary that
+/// particular tool has, which no table here could have known to list.
 ///
 /// **What that leaves undecided is most of the space.** A variable that redirects a program
 /// rather than injecting into it is forwarded as it stands: `GIT_SSH_COMMAND`, `NODE_OPTIONS`,
@@ -188,14 +185,12 @@ fn environment(caller: &BTreeMap<String, String>, cwd: Option<&str>) -> Vec<(Str
 ///
 /// # No input, whole output
 ///
-/// stdin is `/dev/null`. The protocol carries no input to a delegated call, and that is load-
-/// bearing rather than unfinished: delegated calls are served one at a time, which is safe
-/// *because* none of them is waiting on another's output. A program that reads stdin sees EOF,
-/// and an interactive one cannot be delegated at all.
+/// stdin is `/dev/null`. An [`ExecCall`] carries no input, so there is nothing to feed a
+/// program that reads: it sees EOF, and an interactive one cannot be registered at all. What a
+/// program is to read goes into the tree it was handed, and its path goes on the command line.
 ///
-/// Output is collected whole and capped at [`OUTPUT_LIMIT`]. Truncation is
-/// reported on stderr, because an [`Executable`] has no other channel for it — the `truncated`
-/// flag on the wire belongs to an execution's own output and is not reachable from here.
+/// Output is collected whole and capped at [`OUTPUT_LIMIT`]. Truncation is reported on stderr,
+/// because an [`ExecResult`] has no other channel for it.
 ///
 /// # What it needs of the runtime
 ///
@@ -229,7 +224,7 @@ pub struct BinExecutable {
 impl BinExecutable {
     /// The program `cmd` names, with the rest of `cmd` as arguments before every call's own.
     ///
-    /// A prefix rather than only a program, because that is how a delegated name is usually a
+    /// A prefix rather than only a program, because that is how a registered name is usually a
     /// *mode* of one: `["python", "-m", "mytool"]`, `["rg", "--json"]`. A call's own arguments
     /// are appended, so a caller cannot displace the prefix.
     ///
@@ -613,8 +608,8 @@ mod tests {
         );
     }
 
-    /// The deadlock case, end to end: a caller's `PATH` names a console server's shim directory,
-    /// and a child given it could re-enter a console that serves delegated calls in turn.
+    /// A caller's `PATH` names directories on the caller's machine, so a child given it would
+    /// look for its own program somewhere this host may have nothing at all.
     #[tokio::test]
     async fn the_childs_path_is_this_hosts_and_not_the_callers() {
         let (_dir, mount) = mounted();
@@ -794,8 +789,8 @@ mod tests {
         assert_eq!(result.stderr, b"err\n");
     }
 
-    /// The protocol carries no input to a delegated call, so a program that reads sees the end
-    /// of it — not this process's stdin, which is whatever the console channel is on.
+    /// An [`ExecCall`] carries no input, so a program that reads sees the end of it — not this
+    /// process's stdin, which belongs to whatever is driving the call.
     #[tokio::test]
     async fn a_program_that_reads_gets_nothing_and_finishes() {
         let (_dir, mount) = mounted();

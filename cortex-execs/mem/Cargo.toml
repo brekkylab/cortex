@@ -14,7 +14,7 @@ path = "src/bin/mem.rs"
 # RFC 3339 timestamps. A memory carries when it was written, and the store is a file
 # other tools read: a sortable, unambiguous spelling is worth a dependency.
 chrono = { workspace = true }
-# `Executable`, `ExecCall`, `Mount` — the delegation surface this crate implements.
+# `Executable`, `ExecCall`, `Mount` — the surface this crate implements.
 cortex = { workspace = true }
 # `BoxFuture`: `Executable` hands one back, and the traits here do the same so a
 # provider that waits on a network can be held behind a `dyn`.
