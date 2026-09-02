@@ -61,7 +61,7 @@ fn a_row_becomes_the_thing_it_can_serve() {
         "Ελληνικά έγγραφο",
         "мой документ",
         "مستند عربي",
-        "party 🎉 notes.txt",
+        "minutes 📎 2026-03.txt",
     ] {
         assert!(
             name.len() > name.chars().count(),
@@ -412,7 +412,7 @@ fn a_workbooks_values_are_paired_by_name_and_budgeted_tab_by_tab() {
     // The reply names its sheet, and a quoted title can hold what would otherwise confuse
     // the parse.
     assert_eq!(range_title("Sheet1!A1:Z1000"), "Sheet1");
-    assert_eq!(range_title("'메인화면'!A1:Z968"), "메인화면");
+    assert_eq!(range_title("'연간 요약'!A1:Z968"), "연간 요약");
     assert_eq!(range_title("'Sheet1!B2'!A1:Z10"), "Sheet1!B2");
     assert_eq!(range_title("'it''s'!A1"), "it's");
     assert_eq!(range_title("Sheet1"), "Sheet1");

@@ -1119,7 +1119,7 @@ fn fold_values(workbook: &mut Value, batch: &Value, requested: &[String]) {
     }
 }
 
-/// The sheet a returned A1 range belongs to: `'메인화면'!A1:Z968` -> `메인화면`.
+/// The sheet a returned A1 range belongs to: `'연간 요약'!A1:Z968` -> `연간 요약`.
 ///
 /// The title is everything before the last `!`, unquoted — a quoted title may itself
 /// contain `!`, and a literal quote inside one arrives doubled.

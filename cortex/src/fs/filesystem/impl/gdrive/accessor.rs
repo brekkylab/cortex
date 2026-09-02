@@ -219,8 +219,8 @@ async fn body_within(
 /// A tab name as an A1 range: quoted, with any literal quote doubled.
 ///
 /// A bare name mostly works and then abruptly doesn't. Measured against a real
-/// spreadsheet: `ranges=메인화면` answered `'메인화면'!A1:Z968`, while `ranges=A1`
-/// answered `'메인화면'!A1` — the *first* sheet's cell, not a sheet of that name, and
+/// spreadsheet: `ranges=연간 요약` answered `'연간 요약'!A1:Z968`, while `ranges=A1`
+/// answered `'연간 요약'!A1` — the *first* sheet's cell, not a sheet of that name, and
 /// `B2` and `A:A` the same way. So a tab named like a cell reference returns someone
 /// else's cells, which the caller then attaches to the wrong tab. Quoting is what A1
 /// notation specifies for a name, and the same measurement shows it changes nothing
@@ -752,8 +752,8 @@ mod tests {
     /// sheet's A1 cell, not the sheet named `A1`).
     #[test]
     fn a_tab_name_is_quoted_so_it_stays_a_name() {
-        assert_eq!(quote_a1("메인화면"), "'메인화면'");
-        assert_eq!(quote_a1("1. 낚시 스킬+매크로"), "'1. 낚시 스킬+매크로'");
+        assert_eq!(quote_a1("연간 요약"), "'연간 요약'");
+        assert_eq!(quote_a1("1. 매출 요약+상세"), "'1. 매출 요약+상세'");
         // Unquoted, each of these addresses cells instead of a sheet.
         assert_eq!(quote_a1("A1"), "'A1'");
         assert_eq!(quote_a1("A:A"), "'A:A'");
