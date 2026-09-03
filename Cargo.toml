@@ -111,6 +111,12 @@ serde_json = "1"
 # failure being avoided.
 rusqlite = { version = "0.40", features = ["bundled"] }
 
+# Bytes in a BSON document. A layer's data map is keyed by paths, and a path in a layer is
+# whatever filesystem it came from allowed rather than necessarily UTF-8 — so it is stored as
+# bytes. Without this, serde hands BSON a `Vec<u8>` as an array of integers, which is both
+# several times larger and a different type coming back.
+serde_bytes = "0.11"
+
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.
 cc = "1"

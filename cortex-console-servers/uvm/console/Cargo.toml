@@ -3,6 +3,14 @@ name = "cortex-uvm-console"
 version.workspace = true
 edition.workspace = true
 
+# A library half, so a test can build the images the binary boots. `cortex-uvm-boot` has the
+# same shape and for a related reason: what two halves agree on has to be nameable from both.
+# The binary keeps `assets`, `helper` and `server` to itself — a console session is not
+# something to call into — and shares only the layer store.
+[lib]
+name = "cortex_uvm_console"
+path = "src/lib.rs"
+
 [build-dependencies]
 anyhow = { workspace = true }
 
@@ -27,6 +35,8 @@ microsandbox-image = { workspace = true }
 # Deriving `ImageSpec`, the one thing a boot hands the guest as a file rather than as an
 # environment value — see `contract::IMAGE_SPEC_PATH`.
 serde = { workspace = true }
+# Path bytes in a layer's data map sidecar — see the workspace manifest.
+serde_bytes = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [
