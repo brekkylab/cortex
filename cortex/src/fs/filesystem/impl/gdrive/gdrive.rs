@@ -555,7 +555,14 @@ impl GdriveFs {
 
         // Two Drive files can share a name; disambiguate so every entry is
         // reachable (readdir shows distinct names, resolve finds each one).
-        disambiguate(&mut children);
+        //
+        // Not at the root. Those three sections are names this store invents rather than
+        // names Drive gave, `unique_name` already keeps them apart, and `Shared with me`
+        // answers to no id at all — tagging it would leave a trailing `_` standing in for
+        // an id that does not exist.
+        if folder != "/" {
+            disambiguate(&mut children);
+        }
 
         let children = Arc::new(children);
         if complete {
@@ -1243,65 +1250,60 @@ fn sanitize_name(name: &str) -> String {
     }
 }
 
-/// Give every child a unique `vfs_name`, so duplicate Drive names don't shadow each
-/// other in readdir/resolve.
+/// Give every child a `vfs_name` that names the file and nothing else about the folder.
 ///
-/// A name only one child holds is left alone. A name two or more hold is a collision,
-/// and **every** member of that collision takes a tag from its own Drive id —
-/// `report_1BxiMVs0.pdf` — rather than one keeping the bare name and the rest being
-/// numbered.
+/// **Every entry carries a tag off its own Drive id** — `report_a1b2c3d4.pdf` — whether or
+/// not anything else in the folder shares its name. The tag goes in front of the
+/// extension, because appending it (`sheet.gsheet.json_1Bxi`) would keep the name unique
+/// and take the entry out of every glob a reader would use to find it: measured against a
+/// real account, two of 33 spreadsheets were invisible to `**/*.gsheet.json`.
 ///
-/// The tag goes *before* the extension. Appending it (`sheet.gsheet.json_1Bxi`) would
-/// keep the name unique but take the entry out of every glob a reader would use to find
-/// it — measured against a real account, two of 33 spreadsheets were invisible to
-/// `**/*.gsheet.json`.
+/// Tagging only on collision was the previous rule and read better — an ordinary folder
+/// looked ordinary. What it cost is the moment a name stops being unique: the file that
+/// held it plainly is renamed, by nothing it did. A path an agent wrote down then stops
+/// resolving, and a path is the thing an agent carries between listing and reading. Under
+/// this rule a name depends on the file and on nothing else in the folder, so no arrival,
+/// departure, rename or move touches anybody else's.
 ///
-/// Three rules, each of which costs a silently wrong file when broken.
+/// The root is not tagged. Its sections are names this store invents rather than names
+/// Drive gave, `unique_name` keeps them apart, and `Shared with me` answers to no id at
+/// all — see the call site.
 ///
-/// **Collisions are counted by composition, not by bytes**, because [`same_name`]
-/// resolves by composition. Drive stores whichever spelling the uploading client sent, so
-/// one folder holds both — measured, ten composed names beside four decomposed. Counting
-/// bytes leaves a canonically equal pair *both* untagged, and `resolve` then answers every
-/// lookup with whichever came first: one file becomes unopenable and `cat` on it serves
-/// the other one's contents, with no error anywhere.
+/// **Counted by composition, not by bytes**, because [`same_name`] resolves by
+/// composition. Drive stores whichever spelling the uploading client sent, so one folder
+/// holds both — measured, ten composed names beside four decomposed. Two spellings of one
+/// name are one collision, and the tail check below has to see it as one.
 ///
 /// **The tag comes from the file, never from its rank.** Numbering — ` (2)`, ` (3)` —
-/// makes a name a function of the whole sibling set rather than of the file, so the set
-/// changing renames files that did not. Ordering that numbering by id rather than by
-/// arrival fixed only half of it: an id never changes, but a file's *position* among the
-/// ids does. Adding a third `report.pdf` whose id sorts between two existing ones used to
-/// hand `report (2).pdf` to the newcomer and push the previous holder to `report (3).pdf`.
-/// Nothing errors — the path still resolves, it just opens a different document, which is
-/// the exact failure this function exists to prevent. Moving a file out, or deleting one,
-/// shifted everything after it the same way. A tag read off the id has none of that:
-/// adding or removing a sibling leaves every other name untouched.
+/// makes a name a function of the whole sibling set, so the set changing renames files
+/// that did not. Ordering that numbering by id rather than by arrival fixed only half of
+/// it: an id never changes, but a file's *position* among the ids does.
 ///
-/// What no scheme can avoid is the boundary itself. A bare `report.pdf` can belong to one
-/// file, so the moment a second file takes that Drive name, one of them has to give it
-/// up. Tagging *both* is what keeps that to a single event — the 1-to-2 transition — with
-/// nothing moving on any later change.
+/// **The tag is the id's last characters**, which is measurement rather than taste. Drive
+/// ids are not uniform along their length: the older 28-char scheme front-loads a shared
+/// prefix, and one account's seventeen of them carried `0BxO-Nrmd-kR7` six times over —
+/// thirteen identical characters, ten distinct leading eights out of seventeen files.
+/// Across that account's 205 ids the first eight collided eight times and the last eight
+/// collided none, 17.1 bits of leading entropy inside the legacy family against 28.0
+/// trailing.
 ///
-/// **Uniqueness is checked after tagging, not assumed.** [`ID_TAG_LEN`] characters
-/// identify a file within a folder unless two ids in one collision end the same way,
-/// which needs a shared Drive name *and* a shared tail — measured across one account's
-/// 205 ids, no two shared a tail against eight pairs sharing a head. Such a group takes
-/// whole ids instead, which keeps a tagged name and a number from appearing together:
-/// numbering is the thing this scheme exists to remove, so it is better as a last resort
-/// nothing normally reaches than as a form a reader meets beside a tag.
-///
-/// Underneath both, a folder that also holds a file literally named like a tagged one
-/// still falls through to numbering. That is set-dependent, as the whole-id step is —
-/// but leaving two entries under one name is worse than renaming one of them.
+/// Two fallbacks sit under it. A group whose ids also end alike takes whole ids, which
+/// keeps a tag and a number off the same name. And the numbering itself remains as a net
+/// nothing should now reach: a Drive name shaped like a tagged one used to collide with
+/// what this code was about to write, and cannot any more, because that name is tagged
+/// too.
 /// What this name costs the mount, which serves decomposed.
 fn served_name_len(name: &str) -> usize {
     name.nfd().map(char::len_utf8).sum()
 }
 
-/// Cut `name` down so that it, an `_`, `tag` and its extension fit [`NAME_BUDGET`].
+/// `name` with `tag` in front of its extension, cut to [`NAME_BUDGET`] if it has to be.
 ///
-/// The stem is what gives: the tag is what makes the name unique and the extension is what
-/// keeps it in a glob, so neither can be the part that goes. Characters come off the end
-/// one at a time rather than by a byte count, because a byte slice can land inside one.
+/// The stem is what gives. The tag is what makes the name unique and the extension is what
+/// keeps it inside a glob, so neither can be the part that goes — and a cut from the right
+/// would take the tag first, which is exactly the part that tells two entries apart.
+/// Characters come off one at a time rather than by a byte count, because a byte slice can
+/// land inside one.
 fn shorten_for_tag(name: &str, serves: Serves, tag: &str) -> String {
     let (stem, ext) = split_extension(name, serves);
     let fixed = served_name_len(ext) + 1 + tag.len();
@@ -1309,24 +1311,10 @@ fn shorten_for_tag(name: &str, serves: Serves, tag: &str) -> String {
     while !stem.is_empty() && served_name_len(&stem) + fixed > NAME_BUDGET {
         stem.pop();
     }
-    format!("{stem}{ext}")
+    format!("{stem}_{tag}{ext}")
 }
 
 fn disambiguate(children: &mut [Child]) {
-    // A name too long to serve is cut here rather than by whatever writes it out, and
-    // cutting forces a tag: two different names can share the prefix that survives, so
-    // what is left is not something this code can call unique. The tag is what makes it
-    // so, which is why the cut leaves room for one.
-    let mut forced: HashSet<usize> = HashSet::new();
-    for (i, c) in children.iter_mut().enumerate() {
-        if served_name_len(&c.vfs_name) <= NAME_BUDGET {
-            continue;
-        }
-        let tag = id_tag(&c.id).to_string();
-        c.vfs_name = shorten_for_tag(&c.vfs_name, c.serves, &tag);
-        forced.insert(i);
-    }
-
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, c) in children.iter().enumerate() {
         groups
@@ -1334,10 +1322,7 @@ fn disambiguate(children: &mut [Child]) {
             .or_default()
             .push(i);
     }
-    for idxs in groups
-        .into_values()
-        .filter(|g| g.len() > 1 || g.iter().any(|i| forced.contains(i)))
-    {
+    for idxs in groups.into_values() {
         // Whole ids for the group if a shortened one would repeat inside it.
         let short: HashSet<&str> = idxs.iter().map(|&i| id_tag(&children[i].id)).collect();
         let whole = short.len() != idxs.len();
@@ -1347,8 +1332,11 @@ fn disambiguate(children: &mut [Child]) {
             } else {
                 id_tag(&children[i].id).to_string()
             };
-            let (stem, ext) = split_extension(&children[i].vfs_name, children[i].serves);
-            let tagged = format!("{stem}_{tag}{ext}");
+            // Cut here rather than before the tag was chosen: a group whose ids end
+            // alike takes whole ids, and reserving room for the short form would leave
+            // that promotion over the budget by the difference — 36 bytes on a 44-char
+            // id. Cut with the tag in hand and the answer fits whichever form it is.
+            let tagged = shorten_for_tag(&children[i].vfs_name, children[i].serves, &tag);
             children[i].vfs_name = tagged;
         }
     }

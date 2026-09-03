@@ -104,9 +104,44 @@ fn a_name_too_long_to_serve_is_cut_and_tagged() {
         "the tag tells apart what the cut left the same"
     );
     assert_eq!(
-        kids[2].vfs_name, "짧은.pdf",
-        "a name inside the budget is not touched"
+        kids[2].vfs_name, "짧은_cccccc33.pdf",
+        "a name inside the budget is tagged and not cut"
     );
+
+    // A group promoted to whole ids has to fit too. Reserving room for the short tag
+    // leaves that promotion over by the difference — 36 bytes on a 44-char id — which is
+    // why the cut happens after the tag is chosen and not before.
+    let tail = "z".repeat(ID_TAG_LEN);
+    let (p, q) = (
+        format!("1{}{tail}", "A".repeat(35)),
+        format!("1{}{tail}", "B".repeat(35)),
+    );
+    assert_eq!(
+        p.len(),
+        44,
+        "a real Drive id length, or the slack hides this"
+    );
+    assert_eq!(id_tag(&p), id_tag(&q), "tails have to collide to promote");
+    let mut promoted: Vec<Child> = [&p, &q]
+        .iter()
+        .map(|id| {
+            child_from_file(&file_row(&format!("{long}.pdf"), id, "application/pdf")).unwrap()
+        })
+        .collect();
+    disambiguate(&mut promoted);
+    for c in &promoted {
+        assert!(
+            c.vfs_name.contains(&format!("_{}", c.id)),
+            "a colliding tail takes the whole id: {}",
+            c.vfs_name
+        );
+        assert!(
+            served_name_len(&c.vfs_name) <= NAME_BUDGET,
+            "the promoted name is over {NAME_BUDGET}: {} bytes",
+            served_name_len(&c.vfs_name)
+        );
+    }
+    assert_ne!(promoted[0].vfs_name, promoted[1].vfs_name);
 
     // Cut and alone, and tagged anyway.
     let lone = &kids[3];
@@ -330,16 +365,27 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
             "notes_n2",
             "v1.2_v1",
             "v1.2_v2",
-            "alone.txt",
+            "alone_u1.txt",
         ]
     );
 
     // A pair that differs only by composition is a collision, so one of them is numbered.
     let two = "보고서.pdf".to_string();
     let two_nfd: String = two.nfd().collect();
+    // Ids that also end alike, so the tail check is what has to see these two as one
+    // group. Grouping by bytes would put the two spellings in separate groups, leave both
+    // on the short tag, and produce one name twice — caught only by the numbering net
+    // underneath, which is the rank this scheme exists to remove.
+    let shared_tail = "z".repeat(ID_TAG_LEN);
+    let (ia, ib) = (format!("AAA{shared_tail}"), format!("BBB{shared_tail}"));
+    assert_eq!(
+        id_tag(&ia),
+        id_tag(&ib),
+        "the fixture has to collide by tail"
+    );
     let mut pair = vec![
-        mk(&two, "a", Serves::Original),
-        mk(&two_nfd, "b", Serves::Original),
+        mk(&two, &ia, Serves::Original),
+        mk(&two_nfd, &ib, Serves::Original),
     ];
     disambiguate(&mut pair);
     assert!(
@@ -348,21 +394,21 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         pair[0].vfs_name,
         pair[1].vfs_name
     );
-    // Tagged, not numbered. Grouping by bytes would put the two spellings in separate
-    // groups of one, leave both untagged, and reach the safety net below — which does
-    // stop the shadowing, but by rank, which is the property this change exists to
-    // remove. So the names themselves are what gets asserted.
     assert_eq!(
         (pair[0].vfs_name.as_str(), pair[1].vfs_name.as_str()),
         (
-            format!("{}_a.pdf", two.strip_suffix(".pdf").unwrap()).as_str(),
-            format!("{}_b.pdf", two_nfd.strip_suffix(".pdf").unwrap()).as_str()
+            format!("{}_{ia}.pdf", two.strip_suffix(".pdf").unwrap()).as_str(),
+            format!("{}_{ib}.pdf", two_nfd.strip_suffix(".pdf").unwrap()).as_str()
         ),
-        "a pair equal only by composition is one collision, and both take an id"
+        "one group, so the tail check hands both the whole id rather than the numbering"
     );
     assert!(
         pair.iter().all(|c| c.vfs_name.ends_with(".pdf")),
         "and both are still findable by glob"
+    );
+    assert!(
+        pair.iter().all(|c| !c.vfs_name.contains(" (")),
+        "nothing reached the numbering"
     );
 
     // A name is the file's, not the set's. Reordering must not move it — the listing
@@ -461,9 +507,9 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         "a different collision keeps the short tag rather than the whole id"
     );
 
-    // And the net under both, which needs a coincidence to reach: a folder that already
-    // holds a file named the way tagging is about to name another one. Numbering is
-    // set-dependent, which is why it is last — but two entries under one name is worse.
+    // A Drive name that already looks like a tagged one used to collide with the tag this
+    // code was about to write, and the numbering under everything else caught it. It
+    // cannot collide any more: that name is tagged too, with an id of its own.
     let mut planted = vec![
         mk("c.txt", "ccccccccc99999999", Serves::Original),
         mk("c.txt", "ccccccccc88888888", Serves::Original),
@@ -474,8 +520,16 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
     got.sort();
     assert_eq!(
         got,
-        vec!["c_88888888.txt", "c_99999999 (2).txt", "c_99999999.txt"],
-        "the planted name and the tagged one are told apart, extension intact"
+        vec![
+            "c_88888888.txt",
+            "c_99999999.txt",
+            "c_99999999_dddddddd.txt"
+        ],
+        "every name carries its own id, so the planted one is not in anybody's way"
+    );
+    assert!(
+        got.iter().all(|n| !n.contains(" (")),
+        "and nothing reaches the numbering: {got:?}"
     );
 }
 
@@ -522,7 +576,7 @@ async fn a_shared_drive_scopes_the_listings_below_it() {
     assert!(mock.asked_for("corpora=drive"));
 
     mock.reset();
-    fs.list(Path::new("/Team/Sub")).await.unwrap();
+    fs.list(Path::new("/Team/Sub_F1")).await.unwrap();
     assert!(
         mock.asked_for("driveId=DRV"),
         "the id did not reach a folder one level down, which is where it stops mattering"
@@ -1039,12 +1093,12 @@ async fn a_documents_length_is_a_placeholder_until_it_is_read_and_then_keeps() {
     .await;
     let fs = mounted(&mock.config());
     let dir = Path::new("/My Drive");
-    let path = dir.join("notes.gdoc.json");
+    let path = dir.join("notes_D1.gdoc.json");
 
     // A listing cannot know either, so it offers the same placeholder — and names the
     // entry for what it serves rather than what Drive calls it.
     let listed = fs.list(dir).await.unwrap();
-    assert_eq!(listed[0].name, "notes.gdoc.json");
+    assert_eq!(listed[0].name, "notes_D1.gdoc.json");
     assert_eq!(size_of(&listed[0]), UNKNOWN_LENGTH_SIZE);
     assert_eq!(fs.stat(&path).await.unwrap().size, UNKNOWN_LENGTH_SIZE);
     assert_eq!(fs.lengths_remembered().await, 0, "nothing measured yet");
@@ -1096,7 +1150,7 @@ async fn the_padding_is_lines_of_spaces_and_not_a_run_of_newlines() {
     )
     .await;
     let fs = mounted(&mock.config());
-    let path = Path::new("/My Drive/notes.gdoc.json");
+    let path = Path::new("/My Drive/notes_D1.gdoc.json");
 
     // One window well past the JSON, read the way the kernel reads: a fixed buffer at an
     // offset that does not divide the line length, so a seam falls inside it.
@@ -1154,7 +1208,7 @@ async fn a_document_is_padded_out_with_whitespace_and_not_with_zeros() {
     )
     .await;
     let fs = mounted(&mock.config());
-    let path = Path::new("/My Drive/notes.gdoc.json");
+    let path = Path::new("/My Drive/notes_D1.gdoc.json");
 
     // Read it the way a reader that trusted `stat` reads it: to the claimed end.
     let claimed = fs.stat(path).await.unwrap().size;
@@ -1202,7 +1256,7 @@ async fn a_blob_is_never_padded() {
     )
     .await;
     let fs = mounted(&mock.config());
-    let path = Path::new("/My Drive/data");
+    let path = Path::new("/My Drive/data_B1");
     assert_eq!(fs.stat(path).await.unwrap().size, LEN as u64);
 
     // A window straddling the end: the real bytes, and then the end, with nothing added.
@@ -1236,7 +1290,7 @@ async fn an_oversized_document_stops_being_read() {
     )
     .await;
     let fs = mounted(&mock.config());
-    let path = Path::new("/My Drive/huge.gdoc.json");
+    let path = Path::new("/My Drive/huge_D1.gdoc.json");
     // A document past the ceiling still stats: nothing renders it to find out.
     fs.stat(path).await.unwrap();
 
@@ -1377,9 +1431,9 @@ async fn one_slot_holds_whatever_is_being_read() {
     let fs = mounted(&mock.config());
     let dir = Path::new("/My Drive");
     fs.list(dir).await.unwrap();
-    let first = dir.join("first.gdoc.json");
-    let second = dir.join("second.gdoc.json");
-    let pdf = dir.join("big.pdf");
+    let first = dir.join("first_D1.gdoc.json");
+    let second = dir.join("second_D2.gdoc.json");
+    let pdf = dir.join("big_P1.pdf");
 
     let a = fs.read_window(&first, None).await.unwrap();
     assert_eq!(
@@ -1458,10 +1512,10 @@ async fn one_service_can_move_without_moving_the_others() {
     });
 
     let listed = fs.list(Path::new("/My Drive")).await.unwrap();
-    assert_eq!(listed[0].name, "budget.gsheet.json");
+    assert_eq!(listed[0].name, "budget_S1.gsheet.json");
 
     // The listing came from A; the workbook has to come from B.
-    let path = Path::new("/My Drive/budget.gsheet.json");
+    let path = Path::new("/My Drive/budget_S1.gsheet.json");
     fs.stat(path).await.unwrap();
     let _ = fs.read_window(path, None).await;
 
@@ -1519,7 +1573,7 @@ async fn what_a_fetch_costs() {
     )
     .await;
     let fs = mounted(&mock.config());
-    let file = Path::new("/My Drive/big.bin");
+    let file = Path::new("/My Drive/big_B1.bin");
 
     // The listing states a blob's length, so `stat` resolves it without asking. Drive
     // carries `size` on every non-native file — measured, all 182 of one account's.
