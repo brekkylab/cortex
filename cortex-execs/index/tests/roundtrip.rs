@@ -1139,7 +1139,7 @@ async fn a_file_that_stopped_being_text_loses_its_document() {
 ///
 /// `TopDocs::with_limit` asserts on `0`, and the limit comes straight from a caller: typed as
 /// `NonZeroUsize` it never reaches the collector, and clap says so in the shape it says
-/// everything else. What this pins is that a delegated call cannot be made to panic inside
+/// everything else. What this pins is that a call cannot be made to panic inside
 /// tantivy by an argument.
 #[tokio::test]
 async fn a_limit_of_zero_is_a_usage_error() {

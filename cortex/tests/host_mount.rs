@@ -75,9 +75,9 @@ fn volume() -> InMemFs {
     let vol = InMemFs::new();
     let rt = tokio::runtime::Runtime::new().expect("build a runtime for volume setup");
     rt.block_on(async {
-        let hello = std::path::Path::new("hello.txt");
-        vol.create(hello).await.expect("fresh store");
-        vol.write_at(hello, b"Hello from cortex!\n", 0)
+        let greeting = std::path::Path::new("greeting.txt");
+        vol.create(greeting).await.expect("fresh store");
+        vol.write_at(greeting, b"Hello from cortex!\n", 0)
             .await
             .expect("write the greeting");
         vol.mkdir(std::path::Path::new("sub")).await.unwrap();
@@ -318,6 +318,36 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
 
     fs::remove_file(mnt.join("new.txt")).unwrap();
     assert!(!mnt.join("new.txt").exists());
+
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
+    fs::remove_dir_all(&mnt).ok();
+}
+
+/// `>>` through a real mount, which the contract has no flag for on purpose: the
+/// kernel resolves `O_APPEND` itself and sends the absolute end offset, so a backend
+/// that only writes where it is told already appends. Every other write in this file
+/// starts from an offset the test chose, so none of them would notice if that stopped
+/// being true.
+#[test]
+#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+fn the_operating_system_can_append_to_a_cortex_mount() {
+    use std::io::Write;
+
+    let mnt = mountpoint("append");
+    let mount = HostMount::try_new(volume(), &mnt).expect("mount");
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(mnt.join("greeting.txt"))
+        .unwrap();
+    file.write_all(b"and again\n").unwrap();
+    drop(file);
+
+    assert_eq!(
+        fs::read_to_string(mnt.join("greeting.txt")).unwrap(),
+        "Hello from cortex!\nand again\n"
+    );
 
     // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);

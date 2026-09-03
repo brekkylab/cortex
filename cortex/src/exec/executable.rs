@@ -2,7 +2,7 @@ use futures_core::future::BoxFuture;
 
 use crate::fs::Mount;
 
-/// What a delegated executable was asked to do.
+/// What an [`Executable`] was asked to do: one command line, and where it was typed.
 #[derive(Clone, Debug)]
 pub struct ExecCall {
     /// The name it was invoked by. The same executable can be registered under
@@ -24,14 +24,14 @@ pub struct ExecCall {
 
     /// The environment the invoking command had — all of it, as the executor reported it.
     ///
-    /// What makes a delegated name behave like a program on `PATH` rather than almost like
-    /// one: `FOO=bar summarize x` reaches here as `FOO`, and so does anything exported
-    /// earlier in the same shell.
+    /// What makes one of these behave like a program rather than almost like one:
+    /// `FOO=bar summarize x` reaches here as `FOO`, and so does anything exported earlier in
+    /// the same shell.
     ///
-    /// **Read, never applied.** This is what the *command* had, not what this process has,
-    /// and the two are different machines' worth of facts — `PATH` names a directory of
-    /// symlinks on the executor, `PWD` and `HOME` are its own. An executable that wants a
-    /// variable looks it up here; one that sets it anywhere has changed the wrong process.
+    /// **Read, never applied.** This is what the *caller* had, not what this process has,
+    /// and the two need not be the same machine's worth of facts — `PWD` and `HOME` are the
+    /// caller's. An executable that wants a variable looks it up here; one that sets it
+    /// anywhere has changed the wrong process.
     ///
     /// Empty when there was nothing to report and when the command genuinely had no
     /// environment, which are the same thing to a lookup.
@@ -45,15 +45,16 @@ impl ExecCall {
     /// would leave the root is refused, as is a relative `arg` with no `cwd` — see
     /// [`resolve_under`](crate::exec::resolve_under).
     ///
-    /// Relative to the workspace root and never to this host, because the two ends of a
-    /// delegated call agree on the first and not the second. What turns it into a file to
-    /// open is the mount the call was handed: [`Mount::host_path`].
+    /// Relative to the workspace root and never to this host, because a workspace path is
+    /// the one spelling that means the same file to whoever composed the command and to
+    /// whatever answers it. What turns it into a file to open is the mount the call was
+    /// handed: [`Mount::host_path`].
     pub fn resolve(&self, arg: &str) -> std::io::Result<std::path::PathBuf> {
         crate::exec::resolve_under(self.cwd.as_deref(), arg)
     }
 }
 
-/// What a delegated executable produced.
+/// What an [`Executable`] produced.
 ///
 /// `Vec<u8>`, not `String`: this is program output on its way to a caller's pipe,
 /// and a caller that feeds it to something byte-oriented has to get back exactly
@@ -88,49 +89,47 @@ impl ExecResult {
     }
 }
 
-/// Something a shell can call that is not a program on disk.
+/// A command implemented in this process: an argv in, output and a code out.
 ///
-/// Implementations live wherever the client does — the whole point is that a
-/// console server can put the name on a `PATH` it controls without knowing, or
-/// being able to know, what running it means.
+/// The same shape a program on disk has, minus the disk — which is the whole point.
+/// Something that reaches a service, asks a model or looks a fact up is a few lines of
+/// Rust and no lines of packaging, and what runs it is handed the same three things a
+/// program is: the name it was invoked by, its arguments, and the tree its path arguments
+/// are about.
 ///
 /// # Why this waits, and why the future is boxed
 ///
-/// A name is worth delegating when what it does is not something the server could
-/// have done itself: reach a service, ask a model, look something up. All of that is
-/// waiting, and an implementation that blocked while it waited would block the task
-/// walking the delegation chain — which is the same task the console channel is
-/// answered on.
+/// What one of these is worth writing for is precisely the work a synchronous function
+/// would be wrong for: a request, an inference, a query. So the method is something to
+/// `await`, and an implementation that blocks while it waits blocks whatever is driving it.
 ///
-/// [`BoxFuture`] rather than an `async fn` because an [`ExecutableSet`] holds these
-/// behind a `dyn`: a name is looked up at run time, so the type behind it cannot be in
-/// anyone's signature. The allocation is one per delegated call, next to a round trip
-/// out to the server and back.
+/// [`BoxFuture`] rather than an `async fn` because an [`ExecutableSet`] holds these behind
+/// a `dyn`: a name is looked up at run time, so the type behind it cannot be in anyone's
+/// signature. The allocation is one per call, next to whatever the call is actually going
+/// off to do.
 ///
 /// # Why the mount is an argument
 ///
-/// A delegated name is called from inside an execution, and the files it is asked about are
-/// the ones that execution can see. Those are reachable because the session's tree is
-/// *mounted*: the command that invoked this name opened them by path, and a delegated name
-/// that is asked about the same file has to be able to open the same path.
+/// The files one of these is asked about are the ones the caller could see, and the caller
+/// could see them because the tree is *mounted*: it opened them by path, and a name asked
+/// about the same file has to be able to open the same path.
 ///
 /// So what arrives is a [`Mount`] and not a store. A store would describe the same tree and
 /// name it differently — no host path, nothing a `std::fs` call or a spawned program could
-/// use — where a mount is the arrangement both ends of the call already share:
-/// [`ExecCall::resolve`] gives the workspace-relative path, [`Mount::host_path`] turns it
-/// into the file, and it is the same file the command meant.
+/// use — where a mount is the arrangement both sides already share: [`ExecCall::resolve`]
+/// gives the workspace-relative path, [`Mount::host_path`] turns it into the file, and it is
+/// the same file the caller meant.
 ///
-/// It cannot be captured instead, either. The mount belongs to the console — one per session
-/// — and the same `Executable` may be registered on several, so each call belongs to
-/// whichever console is asking.
+/// It cannot be captured instead, either. The same `Executable` may be registered against
+/// several trees, so which one a call is about belongs to the call.
 ///
-/// A shared borrow, because taking the mount down is not a delegated name's to do: dropping
-/// it unmounts (see [`Mount`]), which would take the tree out from under the execution still
+/// A shared borrow, because taking the mount down is not an executable's to do: dropping it
+/// unmounts (see [`Mount`]), which would take the tree out from under whatever else is
 /// running against it.
 ///
-/// `None` is a console with nothing mounted. A name that touches no files ignores it; one
-/// that needs a file has no way to reach one and should say so, which is honest where a
-/// substituted path would read something nobody asked about.
+/// `None` is nothing mounted. A name that touches no files ignores it; one that needs a
+/// file has no way to reach one and should say so, which is honest where a substituted path
+/// would read something nobody asked about.
 ///
 /// [`ExecutableSet`]: super::ExecutableSet
 pub trait Executable: Send + Sync {

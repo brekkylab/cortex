@@ -65,9 +65,9 @@ use cortex_uvm_boot::{
     PORT_NAME, SHARE_ENV, UPPER_ENV, WORKFS_TAG,
 };
 
-/// Guest vCPUs when nothing says otherwise. Two rather than one because a command that
-/// delegates has a shim waiting on a socket while the command that ran it is still
-/// running, and one vCPU turns that into a queue.
+/// Guest vCPUs when nothing says otherwise. Two rather than one because a command and the
+/// agent collecting its output are two things wanting the processor at once, and one vCPU
+/// turns that into a queue.
 const DEFAULT_VCPUS: u8 = 2;
 
 /// Guest memory in MiB when nothing says otherwise. Enough for a package install, which

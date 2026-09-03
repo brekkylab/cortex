@@ -18,17 +18,34 @@ bson = { workspace = true }
 # hands back — see `console::base` for why they are boxed rather than `async fn`.
 futures-core = { workspace = true }
 fuser = { workspace = true, optional = true }
-libc = { workspace = true, optional = true }
+# `kill(2)` on a process group, which is how `BinExecutable` takes down a spawned program
+# that forked — `std` has no `killpg`, and killing only the leader leaves its children holding
+# the pipes. Unconditional, unlike the bindings' other dependencies: `tokio/process` already
+# activates it on every unix build, so naming it here adds no crate to anyone's graph.
+libc = { workspace = true }
 object_store = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["io-std", "io-util", "process", "rt", "time"] }
+# `macros` for `try_join!`, which is how `BinExecutable` drains a child's two pipes while
+# awaiting its exit: one future, so dropping the call drops every part of it at once.
+tokio = { workspace = true, features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "time",
+] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# A directory standing in for a mounted tree: what `BinExecutable`'s tests exercise is what a
+# spawned program is given for a path a mount reported, and a plain directory reports one the
+# same way.
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [features]
 # No *binding* by default. The crate's own layers — `FileSystem`, `WorkFs`, the
@@ -84,7 +101,7 @@ default = []
 #   PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig" cargo build -p cortex --features fuse
 #
 # Linux needs no provider — fuser opens /dev/fuse directly.
-fuse = ["dep:fuser", "dep:libc", "tokio/net", "tokio/rt-multi-thread"]
+fuse = ["dep:fuser", "tokio/net", "tokio/rt-multi-thread"]
 # Mount on macOS through FUSE-T, which needs no kernel extension.
 #
 # A separate binding rather than a flavour of `fuse`, because the two differ in
@@ -92,7 +109,7 @@ fuse = ["dep:fuser", "dep:libc", "tokio/net", "tokio/rt-multi-thread"]
 # itself, while FUSE-T hands back a socket to its own helper and expects to drive
 # the filesystem through libfuse-t's loop. Enabling both at once is fine — they
 # are independent call surfaces over the same `Posix`.
-fuse-t = ["dep:libc", "tokio/net", "tokio/rt-multi-thread"]
+fuse-t = ["tokio/net", "tokio/rt-multi-thread"]
 # Compile and unit-test the FUSE adapter with no libfuse provider installed:
 # skips fuser's pkg-config probe, so the adapter builds but cannot mount.
 fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
