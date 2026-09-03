@@ -4,9 +4,10 @@
 //! side: a path any process can `open`. Standing one up for real needs a binding, a libfuse
 //! provider and a kernel, and none of that is what these test.
 //!
-//! These are `cortex-exec-index`'s properties, asked of a different storage engine. Where one
-//! is deliberately not the same — the store is a file in the tree, so every command needs the
-//! mount — the test says so in its own name.
+//! What these pin is the observable contract: what a walk picks up, what a second `ingest`
+//! means, what `sync` removes, and which stream each answer goes to. A test whose property is a
+//! consequence of the store being a file in the tree (every command needs the mount) says so in
+//! its own name.
 
 use std::path::{Path, PathBuf};
 
@@ -22,8 +23,8 @@ impl Mount for Mounted {
     }
 }
 
-/// The set as a consumer registers it. Unlike `index` there is no root to hand over: a store is
-/// a path in the tree, so the executable holds nothing.
+/// The set as a consumer registers it. There is no root to hand over: a store is a path in the
+/// tree, so the executable holds nothing.
 fn registered() -> ExecutableSet {
     ExecutableSet::new().register("docstore", DocStore::SUMMARY, DocStore::new())
 }
@@ -568,9 +569,9 @@ async fn nothing_it_writes_carries_an_escape() {
     }
 }
 
-/// A store is a path in the tree, so there is nothing to reach with nothing mounted — including
-/// for `search` and `purge`, which `cortex-exec-index` could answer without a mount. It is the
-/// price of the store being a document, and it is written down rather than discovered.
+/// A store is a path in the tree, so there is nothing to reach with nothing mounted. That holds
+/// even for `search` and `purge`, which open no file of the corpus: what they need the mount for
+/// is the store itself.
 #[tokio::test]
 async fn every_command_needs_the_mount() {
     for args in [

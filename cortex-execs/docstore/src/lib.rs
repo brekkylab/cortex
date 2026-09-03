@@ -26,12 +26,10 @@
 //! from. That is the whole difference between them as commands — and it is why the answer to a
 //! search here names a path the caller can open, rather than only the text.
 //!
-//! `cortex-exec-index` does the same job on tantivy. This does it on SQLite's FTS5, which is
-//! the engine `memstore` already uses, so a workspace that registers both links one search
-//! engine rather than two. The two are meant to be interchangeable from outside:
-//! same commands, same output shapes, same walk. Where they differ is written down in
-//! [`DocStore`] and in this crate's `store` module — the store is a file in the tree rather
-//! named directory on the host, and everything that follows from that.
+//! The store is SQLite's FTS5, the engine `memstore` uses, so a workspace registering both
+//! links one search engine rather than two. What the two share and where they part is written
+//! down in [`cortex_exec_storebase::sqlite`]: one set of tables, and `meta.kind` to tell a
+//! store of one from a store of the other.
 //!
 //! # Vectors: the schema is ready, and there is nothing in it
 //!

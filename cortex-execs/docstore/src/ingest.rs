@@ -1,9 +1,9 @@
 //! `<name> ingest|sync|purge` — what goes into the store, and what comes back out.
 //!
-//! The walk here is `cortex-exec-index`'s, and deliberately so: which files a directory
-//! argument picks up, how large one may be, what a dangling symlink counts as, and what a
-//! second `ingest` of a path means are decisions that have nothing to do with the storage
-//! engine underneath. Only the writing changed.
+//! Which files a directory argument picks up, how large one may be, what a dangling symlink
+//! counts as, and what a second `ingest` of a path means are all decided here, and none of them
+//! have anything to do with the store underneath: the walk hands over text and a stamp, and what
+//! becomes of those is [`store`](crate::store)'s.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -194,8 +194,8 @@ fn sync_all(
     // `doomed` starts as everything held under these paths and loses each path the walk found,
     // so what is left is exactly what the walk did not produce — whether it never reached the
     // path or reached it and declined it, since a declined file is not among `walk.files`
-    // either. (`cortex-exec-index` follows this with a `seen_removals` pass for the declined
-    // half; with `doomed` built this way that pass can only ever return an empty set.)
+    // either. That covers both halves in one pass: a file the walk never reached and a file it
+    // reached and declined are alike in producing no entry, and neither is removed from `doomed`.
     let mut doomed: std::collections::BTreeMap<&str, i64> =
         by_path.iter().map(|(path, h)| (*path, h.rowid)).collect();
 
@@ -286,8 +286,7 @@ fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
 ///
 /// Every call into the store goes through here. SQLite is synchronous and a walk of a tree is
 /// the slow kind of work, and the task this is called from is whatever the consumer was doing
-/// when it dispatched — so neither may run on it. `cortex-exec-index` does the same for
-/// tantivy, and `memstore` does it for SQLite.
+/// when it dispatched — so neither may run on it, and `memstore` does the same.
 async fn blocking<F>(what: &'static str, work: F) -> ExecResult
 where
     F: FnOnce() -> std::io::Result<String> + Send + 'static,

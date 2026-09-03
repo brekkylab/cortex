@@ -19,11 +19,11 @@ use crate::{ingest, search};
 ///
 /// # A store is a path, not a name
 ///
-/// `cortex-exec-index` keeps its indexes under a root on the host and names them, because
-/// tantivy `mmap`s its segments and holds a lock file, and under FUSE-T a mount is an NFS one
-/// where both are exactly the operations that behave differently. SQLite on the rollback
-/// journal asks for neither, so the store can be what `memstore` already is: **one file of the
-/// tree**, named the way any other file is.
+/// A store is **one file of the tree**, named the way any other file is. That is possible
+/// because SQLite on the rollback journal needs nothing of its host but the ability to create a
+/// sibling file: an engine that `mmap`ed its own data or held a lock file across a session would
+/// have to keep that state off the tree, since under FUSE-T a mount is an NFS one and both are
+/// exactly the operations that behave differently there.
 ///
 /// That decides several things at once. `list` and `drop` still exist but ask about a
 /// directory rather than about a root; there is no `<STORE>` name to validate, because

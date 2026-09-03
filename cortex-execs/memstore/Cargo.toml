@@ -22,8 +22,8 @@ chrono = { workspace = true }
 #
 # That one keeps `color`, which the local declaration used to drop. Colour is turned off at run
 # time instead, by `cortex_exec_storebase::command::as_registered`, which every command here parses
-# through — the same way `cortex-exec-index` does it. Deciding it there rather than in a feature
-# is what makes it one rule instead of one per manifest.
+# through. Deciding it there rather than in a feature is what makes it one rule instead of one
+# per manifest.
 clap = { workspace = true }
 # `Executable`, `ExecCall`, `Mount` — the surface this crate implements, and
 # `BoxFuture`, which is what `exec` hands back.

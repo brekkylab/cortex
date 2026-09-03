@@ -34,8 +34,8 @@ pub(crate) async fn run(store: Arc<Store>, limit: usize, query: &str) -> ExecRes
 /// Score, path, then the snippet indented under it.
 ///
 /// Line-oriented and tab-separated on purpose: this goes to a pipe, so it should survive `cut`
-/// and `grep` as well as being read. The shape is `cortex-exec-index`'s, so that something
-/// driving either reads one kind of output.
+/// and `grep` as well as being read. Two lines per hit rather than one: the snippet is the part
+/// that runs long, and keeping it on its own line leaves the first one cuttable by column.
 fn render(hits: &[Hit]) -> String {
     if hits.is_empty() {
         return "no matches\n".into();

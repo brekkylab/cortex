@@ -7,11 +7,11 @@
 //! lives in a cortex tree, beside whatever else the session works on. Everything the index
 //! needs is therefore in that one file, and copying the file copies the index.
 //!
-//! That is the whole of what `docstore` changes about `cortex-exec-index`, whose store is a
-//! named directory under a host root. It could not have been a file in the tree: tantivy
-//! `mmap`s its segments and holds a lock file, and under FUSE-T a mount is an NFS one, where
-//! both are exactly the operations that behave differently. SQLite on the rollback journal
-//! asks for neither, which is why `memstore` already keeps its stores in the tree.
+//! Being a file in the tree is what SQLite makes possible. A store on the rollback journal needs
+//! nothing of its host but the ability to create a sibling file: no `mmap` of its own data, no
+//! lock file held across a session. Under FUSE-T a mount is an NFS one, where both of those are
+//! exactly the operations that behave differently, so an engine that wanted them would have to
+//! keep its state somewhere off the tree.
 //!
 //! # No write-ahead log
 //!
@@ -62,9 +62,9 @@ const FORGET: &str = include_str!("../queries/forget.sql");
 /// The documents nearest a query, nearest first — `queries/search.sql`.
 ///
 /// `bm25()` ascending is best first: FTS5 scores a better match as a more negative number. It
-/// is negated on the way out so that the column a caller reads keeps the sense the one
-/// `cortex-exec-index` printed had — larger is better — because the same number meaning the
-/// opposite thing in the same position is the kind of change nothing warns about.
+/// is negated on the way out so that the column a caller reads means what a score column
+/// usually means: larger is better. A ranking number that runs the other way is the kind of
+/// thing a reader gets wrong once and never checks again.
 ///
 /// The rowid after it is a tiebreak and not a second opinion about nearness: two documents the
 /// ranking cannot separate would otherwise come back in whatever order the index walked them,
@@ -151,8 +151,7 @@ impl Store {
     ///
     /// **One call and not two, because `sync` does both** and a store between them is a tree
     /// that half-existed: a reader would see the new bytes of one file beside a document for a
-    /// file that is gone. `cortex-exec-index` has the same property by committing its writer
-    /// once for both halves, and it is worth keeping.
+    /// file that is gone.
     ///
     /// All of them or none, for the same reason at a smaller scale. What produced a batch is
     /// one walk of one set of arguments, and a store left holding half of it is one nobody can
@@ -266,7 +265,7 @@ impl Store {
 /// that language would otherwise be a syntax error rather than a search. Quoting says "these
 /// are words"; doubling is FTS5's own escape for a quote inside a quoted string.
 ///
-/// Joined with `OR`, which is what `cortex-exec-index` did before it: every term is a hard
+/// Joined with `OR` and not `AND`: every term is a hard
 /// requirement under `AND`, so a question asked in a sentence — the way a person asks one —
 /// would answer nothing at all the moment one of its words was absent. Under `OR` the document
 /// holding most of them is simply the top line, and `bm25` does the work the filter was doing
