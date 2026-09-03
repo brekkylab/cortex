@@ -11,11 +11,11 @@ name = "index"
 path = "src/bin/index.rs"
 
 [dependencies]
-# The argument parser. A delegated name is a program on a guest's `PATH`, so it answers its
+# The argument parser. A registered name is a command line like any other, so it answers its
 # own `--help` — including on each subcommand, which is the half no runtime interception
 # could have covered. `string` is what lets the usage line carry the name it was invoked by.
 clap = { workspace = true }
-# `Executable`, `ExecCall`, `Mount` — the delegation surface this crate implements.
+# `Executable`, `ExecCall`, `Mount` — the surface this crate implements.
 cortex = { workspace = true }
 # `BoxFuture`: `Executable` hands one back.
 futures-core = { workspace = true }

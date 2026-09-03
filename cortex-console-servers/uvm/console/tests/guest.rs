@@ -34,9 +34,7 @@ use std::{
 };
 
 use cortex::{
-    BoxFuture,
-    console::{Console, ExecResult, ImageSource, NetworkAccess, ReadResult},
-    exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
+    console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp},
     fs::Mount,
 };
 use tokio::process::Command;
@@ -53,64 +51,7 @@ impl Mount for Mounted {
     }
 }
 
-/// Reports everything it was told, so a round trip can be told from a coincidence.
-struct Report;
-
-impl Executable for Report {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        _mount: Option<&'a dyn Mount>,
-    ) -> BoxFuture<'a, ExecOutput> {
-        Box::pin(async move { ExecOutput::ok(format!("{}|{}\n", call.name, call.args.join(","))) })
-    }
-}
-
-/// Answers with the contents of the file it was named, opened through the mount it was
-/// handed — the host's half of one file name meaning one file across a hypervisor.
-///
-/// Byte-for-byte what `cortex-local-console`'s own suite uses, and that is the claim: the
-/// client's half of a delegated call is the same on both backends, because the directory the
-/// guest reports is a path this host can open either way.
-struct CatHere;
-
-impl Executable for CatHere {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        mount: Option<&'a dyn Mount>,
-    ) -> BoxFuture<'a, ExecOutput> {
-        Box::pin(async move {
-            let Some(mount) = mount else {
-                return ExecOutput::failed(1, "nothing is mounted");
-            };
-            let path = match call.resolve(&call.args[0]) {
-                Ok(path) => mount.host_path(&path),
-                Err(e) => return ExecOutput::failed(1, format!("{}: {e}", call.args[0])),
-            };
-            match std::fs::read(&path) {
-                Ok(bytes) => ExecOutput::ok(bytes),
-                Err(e) => ExecOutput::failed(1, format!("{}: {e}", path.display())),
-            }
-        })
-    }
-}
-
-/// A delegated name whose output is not text and not something a shell would survive
-/// re-encoding.
-struct RawBytes;
-
-impl Executable for RawBytes {
-    fn exec<'a>(
-        &'a self,
-        _call: &'a ExecCall,
-        _mount: Option<&'a dyn Mount>,
-    ) -> BoxFuture<'a, ExecOutput> {
-        Box::pin(async move { ExecOutput::ok([0xff, 0xfe, 0x00, b'\n'].as_slice()) })
-    }
-}
-
-/// A console over the real binary, with a session that delegates two names.
+/// A console over the real binary.
 struct Fixture {
     console: Console,
 }
@@ -142,12 +83,6 @@ impl Fixture {
         // answered. Nothing is booted by it — the first command below pays for that.
         let console = Console::builder()
             .client(client)
-            .executables(
-                ExecutableSet::new()
-                    .register("report", "report the call it was made with", Report)
-                    .register("rawbytes", "answer bytes that are not text", RawBytes)
-                    .register("cat-here", "read a file where the command stood", CatHere),
-            )
             .build()
             .await
             .expect("building the console");
@@ -168,12 +103,6 @@ impl Fixture {
         let console = Console::builder()
             .client(client)
             .image(image)
-            .executables(
-                ExecutableSet::new()
-                    .register("report", "report the call it was made with", Report)
-                    .register("rawbytes", "answer bytes that are not text", RawBytes)
-                    .register("cat-here", "read a file where the command stood", CatHere),
-            )
             .build()
             .await?;
 
@@ -193,7 +122,6 @@ impl Fixture {
         let console = Console::builder()
             .client(client)
             .network(reach)
-            .executables(ExecutableSet::new())
             .build()
             .await?;
 
@@ -214,12 +142,6 @@ impl Fixture {
         let console = Console::builder()
             .client(client)
             .mount(Mounted(root.to_path_buf()))
-            .executables(
-                ExecutableSet::new()
-                    .register("report", "report the call it was made with", Report)
-                    .register("rawbytes", "answer bytes that are not text", RawBytes)
-                    .register("cat-here", "read a file where the command stood", CatHere),
-            )
             .build()
             .await
             .expect("building the console");
@@ -227,7 +149,7 @@ impl Fixture {
         Fixture { console }
     }
 
-    async fn output(&mut self, script: &str) -> ExecResult {
+    async fn output(&mut self, script: &str) -> ExecResp {
         self.console
             .exec(["sh", "-c", script], None)
             .await
@@ -242,7 +164,7 @@ impl Fixture {
             .size
     }
 
-    async fn read(&mut self, path: &str) -> ReadResult {
+    async fn read(&mut self, path: &str) -> ReadResp {
         self.console.read(path, None, None).await.expect("reading")
     }
 }
@@ -379,23 +301,15 @@ async fn an_oci_image_is_a_base_and_its_environment_is_the_command_s() {
         String::from_utf8_lossy(&out.stdout)
     );
 
-    // The delegated names went on the end of whatever `PATH` was in force, rather than in place
-    // of it.
+    // And the `PATH` a command runs against is the image's own, which is what makes
+    // `python3` the one the image installed rather than whatever the guest's default path
+    // happened to find first.
     let path = fx.output(r#"printf '%s' "$PATH""#).await.stdout;
     let path = String::from_utf8(path).expect("a PATH that is text");
     assert!(
-        path.contains("/cortex-console-"),
-        "PATH is {path:?} — the delegated names are not on it"
+        path.contains("/usr/local/bin"),
+        "PATH is {path:?} — the image's own did not reach the command"
     );
-
-    // Which is what being on it is for: a name this process answers is callable from inside an
-    // image that knows nothing about it.
-    assert_eq!(
-        fx.output("report one two").await.stdout,
-        b"report|one,two\n"
-    );
-
-    // And `python3` is still the image's, not something the appended directory shadowed.
     assert_eq!(
         fx.output("command -v python3").await.stdout,
         b"/usr/local/bin/python3\n"
@@ -608,7 +522,8 @@ async fn a_host_session_reaches_the_doors_it_was_granted() {
     // policy is still what decides which of them reply.
     let out = fx.output(&fetch_by_host_name(ungranted)).await;
     assert_ne!(
-        out.code, 0,
+        out.code,
+        0,
         "the name reached a port nobody granted, so resolving it is a grant: {:?}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -765,41 +680,6 @@ async fn a_client_asks_for_its_reach_over_the_channel() {
     );
 }
 
-/// The part that is not a remote `exec`: a name whose behaviour lives in *this* process is
-/// runnable by a command inside the guest, and composes with the shell like a program.
-///
-/// Which is four processes, two filesystems and a hypervisor: the guest's `sh` runs a
-/// symlink, the symlink re-enters the guest binary as a shim, the shim dials a socket in
-/// the guest, the agent answers the console request with a `Delegated`, this process runs
-/// the closure, and the bytes come back out of the shim's own stdout.
-#[tokio::test]
-#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
-async fn a_delegated_name_is_answered_on_the_host() {
-    let mut fx = Fixture::new().await;
-
-    let out = fx.output("report one two").await;
-    assert_eq!(out.stdout, b"report|one,two\n");
-    assert_eq!(out.code, 0);
-
-    // A program as far as the shell is concerned.
-    assert_eq!(
-        fx.output("report a | tr a-z A-Z").await.stdout,
-        b"REPORT|A\n"
-    );
-
-    // Twice in one command, so the chain is a loop and not a single extra step.
-    assert_eq!(
-        fx.output("report x; report y").await.stdout,
-        b"report|x\nreport|y\n"
-    );
-
-    // Bytes through all of it: a socket, a virtio port, a pipe and a shell.
-    assert_eq!(
-        fx.output("rawbytes").await.stdout,
-        [0xff, 0xfe, 0x00, b'\n']
-    );
-}
-
 /// A tree the host has, in front of a guest — **at the same path on both sides**.
 ///
 /// Which is the whole of what makes this backend usable through the protocol: the client is
@@ -855,39 +735,20 @@ async fn a_tree_is_the_same_path_on_both_sides() {
     );
 
     // `cd` moves the session, and the next command runs where it left off — the guest
-    // agent's state machine, reported back in the path the client already knows.
+    // agent's state machine, in the path the client already knows. Nothing reports the
+    // move: `pwd` is how it is observed, the way it is at a terminal.
     std::fs::create_dir(root.join("work")).expect("a subdirectory");
-    let moved = fx.console.exec(["cd", "work"], None).await.expect("cd");
-    assert_eq!(moved.cwd.as_deref(), root.join("work").to_str());
+    assert_eq!(
+        fx.console
+            .exec(["cd", "work"], None)
+            .await
+            .expect("cd")
+            .code,
+        0
+    );
     assert_eq!(
         fx.output("pwd").await.stdout,
         format!("{}\n", root.join("work").display()).into_bytes()
-    );
-}
-
-/// The whole point, end to end, across the VM boundary: a delegated executable running on
-/// the **host** opens the same file the guest command meant.
-///
-/// The guest reports the directory it stood in, which is a path this host has because the
-/// tree is shared at its own name; the host's executable resolves the argument against it
-/// and opens the file. Four processes and a hypervisor, and one name meaning one thing
-/// throughout — with nothing in the middle translating.
-#[tokio::test]
-#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
-async fn a_delegated_call_opens_what_the_guest_command_meant() {
-    let dir = tempfile::tempdir().expect("a temp directory");
-    let root = dir.path().canonicalize().expect("a real directory");
-    std::fs::create_dir(root.join("sub")).expect("a subdirectory");
-    std::fs::write(root.join("sub/report.md"), b"# from the tree\n").expect("writing a file");
-
-    let mut fx = Fixture::with_tree(&root).await;
-
-    let out = fx.output("cd sub && cat-here report.md").await;
-    assert_eq!(
-        out.stdout,
-        b"# from the tree\n",
-        "stderr: {:?}",
-        String::from_utf8_lossy(&out.stderr)
     );
 }
 

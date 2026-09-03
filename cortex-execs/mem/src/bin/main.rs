@@ -17,7 +17,7 @@ use cortex_exec_mem::Mem;
 /// known before anything is asked: there is no binding to make, and so nothing for a drop to
 /// take down. The RAII rule holds trivially rather than being broken.
 ///
-/// This is the whole difference between `mem` here and `mem` delegated in a console. There it is
+/// This is the whole difference between `mem` here and `mem` under a console. There it is
 /// handed a mount over a tree it could not otherwise reach; here it is handed this. The
 /// `Executable` is the same one and cannot tell which it got, which is what makes running it as
 /// a program a real test of what the console does.
@@ -64,7 +64,7 @@ async fn main() -> ExitCode {
         // The root of the tree, because that is where this was invoked: names resolve against
         // the directory `mem` is standing in, which is the one `Cwd` is rooted at.
         cwd: Some(String::new()),
-        // Run as a program rather than delegated to, so the caller's environment is this
+        // Run as a program rather than called in-process, so the caller's environment is this
         // process's own and there is nothing to carry across.
         env: std::env::vars().collect(),
     };

@@ -13,7 +13,7 @@ use crate::extractor;
 /// The command line, as declarations — what `mem` accepts and what it says about it.
 ///
 /// Only shapes and their help live here; the reading of a line happens where the line is acted
-/// on. `mem` is delegated in-process, so clap's usual job — read `argv`, print, exit — is exactly
+/// on. `mem` runs in-process, so clap's usual job — read `argv`, print, exit — is exactly
 /// what must not happen: the words come from an [`ExecCall`] and the answer goes back as bytes
 /// and a code, on a session that has other work to do. What is being borrowed from clap is the
 /// parsing and the help, which is to say the conventions a person expects of a command line —
@@ -175,7 +175,7 @@ mod args {
 /// extraction needs to see in order not to repeat one is a fact about the extraction.
 const NEIGHBOURHOOD: usize = 20;
 
-/// The `mem` command, as a name a console can delegate.
+/// The `mem` command, as an [`Executable`](cortex::exec::Executable).
 #[derive(Debug, Clone, Default)]
 pub struct Mem {}
 
@@ -236,7 +236,7 @@ impl Executable for Mem {
             let store_path = command.get_store_path().to_path_buf();
 
             // The `expect` is the argument's own history, not an assumption about paths: a
-            // delegated call carries its words as `ExecCall::args`, which is `Vec<String>`, so
+            // call carries its words as `ExecCall::args`, which is `Vec<String>`, so
             // every byte in this path was UTF-8 before clap ever spelled it as one. A workspace
             // path is text at both ends — `cwd` is a `String`, and so is what `resolve` reads —
             // and the only reason it is a `PathBuf` in between is that a path is what it names.
@@ -439,7 +439,7 @@ mod tests {
             panic!("insert was asked for");
         };
 
-        // What a delegated call is handed as `call.env`; here the program's own environment,
+        // What a call is handed as `call.env`; here the program's own environment,
         // which is where `.env` just landed.
         let env = std::env::vars().collect();
         let memories = extractor::extract_memories(&insert.messages, &[], &env)

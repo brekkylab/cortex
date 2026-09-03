@@ -1,6 +1,6 @@
 //! `index` against a directory on this host.
 //!
-//! The same [`Index`] a console delegates to, driven from a shell instead: the working
+//! The same [`Index`] a caller registers, driven from a shell instead: the working
 //! directory stands in for the mounted tree, so `index ingest notes .` reads what is beside
 //! whatever else is in it. Everything else — the parsing, the walk, the answers — is the code
 //! that runs under a console, because there is only one of it.

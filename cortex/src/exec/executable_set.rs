@@ -5,17 +5,19 @@ use crate::{
     fs::Mount,
 };
 
-/// A named set of [`Executable`]s — the allowlist one console server offers.
+/// A named set of [`Executable`]s, and the allowlist that set is.
 ///
-/// Name -> behaviour and the line describing it, and nothing about how the name
-/// is reached. Surfacing the set is the server's business: the host-local one
-/// links each name into a directory it puts on `PATH`, a micro-VM one projects
-/// them into the guest. Either way the behaviour stays here, in-process, and
-/// [`invoke`] is where a call lands once the server has worked out which name
-/// was asked for.
+/// Name -> behaviour and the line describing it, and nothing about how the name is
+/// *reached*. Offering it is the consumer's business — a command line parsed and
+/// dispatched, an argv arriving from somewhere else — and [`invoke`] is where a call lands
+/// once whoever is dispatching has worked out which name was asked for.
 ///
-/// [`names`](Self::names) is what a server exposes; [`entries`](Self::entries) is
-/// what assembles an agent's list.
+/// Which is also what makes it an allowlist rather than a lookup table: a name that is not
+/// in here is answered `None` rather than run, and the name usually came from outside this
+/// process.
+///
+/// [`names`](Self::names) is what a consumer offers; [`entries`](Self::entries) is what
+/// assembles an agent's list.
 ///
 /// [`invoke`]: Self::invoke
 #[derive(Default)]
@@ -46,7 +48,7 @@ impl ExecutableSet {
         self
     }
 
-    /// The registered names, sorted — the exact set a server should expose.
+    /// The registered names, sorted — the exact set a consumer should offer.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.execs.keys().map(String::as_str)
     }
@@ -65,14 +67,13 @@ impl ExecutableSet {
     /// Run the executable `call` names against `mount`, or `None` if nothing is
     /// registered under it.
     ///
-    /// `mount` is where the tree the execution runs against is mounted, and it is passed
-    /// through rather than held: a set is a name table, and the same one is registered on
-    /// consoles that mount different trees (see [`Executable::exec`], which also says what
-    /// `None` there means).
+    /// `mount` is where the tree the call is about is mounted, and it is passed through
+    /// rather than held: a set is a name table, and the same one serves callers with
+    /// different trees (see [`Executable::exec`], which also says what `None` there means).
     ///
-    /// `None` is the allowlist boundary. A server that only ever exposes the
-    /// names in this set should not reach it — but the name usually arrives
-    /// from outside the process, so it is input, not a guarantee.
+    /// `None` is the allowlist boundary. A caller that only ever offers the names in this
+    /// set should not reach it — but the name usually arrives from outside the process, so
+    /// it is input, not a guarantee.
     ///
     /// Whether the name was registered is settled before anything is awaited, and the
     /// lookup itself is a map read — so a caller that only wants to know whether a name

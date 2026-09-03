@@ -104,7 +104,7 @@ chrono = "0.4"
 serde_json = "1"
 
 # A memory store that is one file in a cortex tree. `bundled` on purpose: the store
-# is a file a delegated executable opens on a mount, and which SQLite answers for it
+# is a file an executable opens on a mount, and which SQLite answers for it
 # must not be whichever one the host happens to ship — the schema is an FTS5 index,
 # and FTS5 is a compile-time option the host's own SQLite is free to have been built
 # without. A store that opened and then answered every search with nothing is the

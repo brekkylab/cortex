@@ -10,9 +10,7 @@ use std::{
 };
 
 use cortex::{
-    BoxFuture,
-    console::{Console, Error, ExecResult, stdio::StdioClient},
-    exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
+    console::{Console, Error, ExecResp, stdio::StdioClient},
     fs::Mount,
 };
 use tempfile::TempDir;
@@ -62,7 +60,7 @@ impl Fixture {
         self.root.join(name)
     }
 
-    async fn output(&mut self, script: &str) -> ExecResult {
+    async fn output(&mut self, script: &str) -> ExecResp {
         self.console
             .exec(["sh", "-c", script], None)
             .await
@@ -70,10 +68,23 @@ impl Fixture {
     }
 
     /// `cd`, which this backend answers itself rather than spawning.
-    async fn cd(&mut self, args: &[&str]) -> ExecResult {
+    async fn cd(&mut self, args: &[&str]) -> ExecResp {
         let mut cmd = vec!["cd"];
         cmd.extend_from_slice(args);
         self.console.exec(cmd, None).await.expect("running cd")
+    }
+
+    /// Where the session stands, asked for the way a person at a terminal asks.
+    ///
+    /// Nothing reports it: a result describes the command, so this is the only reading of
+    /// the session's own directory there is after `init` answered where it started.
+    async fn pwd(&mut self) -> PathBuf {
+        let out = self.output("pwd").await;
+        PathBuf::from(
+            String::from_utf8(out.stdout)
+                .expect("a path that is text")
+                .trim_end(),
+        )
     }
 }
 
@@ -85,39 +96,8 @@ async fn console_over(root: &Path) -> anyhow::Result<Console> {
     Console::builder()
         .client(client)
         .mount(Mounted(root.to_path_buf()))
-        .executables(ExecutableSet::new().register(
-            "cat-here",
-            "read a file out of the tree, where the command stood",
-            CatHere,
-        ))
         .build()
         .await
-}
-
-/// Answers with the contents of the file it was named, opened through the mount it was
-/// handed — the client's half of one file name meaning one file.
-struct CatHere;
-
-impl Executable for CatHere {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        mount: Option<&'a dyn Mount>,
-    ) -> BoxFuture<'a, ExecOutput> {
-        Box::pin(async move {
-            let Some(mount) = mount else {
-                return ExecOutput::failed(1, "nothing is mounted");
-            };
-            let path = match call.resolve(&call.args[0]) {
-                Ok(path) => mount.host_path(&path),
-                Err(e) => return ExecOutput::failed(1, format!("{}: {e}", call.args[0])),
-            };
-            match std::fs::read(&path) {
-                Ok(bytes) => ExecOutput::ok(bytes),
-                Err(e) => ExecOutput::failed(1, format!("{}: {e}", path.display())),
-            }
-        })
-    }
 }
 
 /// `init` names the tree by its mount point and the server answers where it put it — the
@@ -145,11 +125,15 @@ async fn a_session_stands_in_the_tree_it_was_given() {
     );
 }
 
-/// `cd` moves the session and says where to, and the command after it runs there.
+/// `cd` moves the session, and the command after it runs there.
 ///
 /// It is not a program — no `cd` exists on `PATH` — so this is the server answering as the
 /// shell a person would be talking to, which is the only place a console session's
 /// directory could live.
+///
+/// **`pwd` is how the move is observed**, here and everywhere below. A `cd` answers with a
+/// code and nothing else, exactly as a terminal does, so where the session ended up is a
+/// question a client asks rather than something every result repeats.
 #[tokio::test]
 async fn cd_moves_the_session_and_the_next_command_runs_there() {
     let mut fx = Fixture::new().await;
@@ -157,21 +141,18 @@ async fn cd_moves_the_session_and_the_next_command_runs_there() {
 
     let moved = fx.cd(&["work"]).await;
     assert_eq!(moved.code, 0);
-    assert_eq!(moved.cwd.as_deref(), fx.path("work").to_str());
-
-    assert_eq!(
-        fx.output("pwd").await.stdout,
-        format!("{}\n", fx.path("work").display()).into_bytes()
-    );
+    assert!(moved.stdout.is_empty(), "a cd that worked says nothing");
+    assert_eq!(fx.pwd().await, fx.path("work"));
 
     // Relative from where it now stands, and `..` gets back — resolved by the server, so
-    // what comes back is a path with nothing left to resolve.
-    let back = fx.cd(&[".."]).await;
-    assert_eq!(back.cwd.as_deref(), fx.root.to_str());
+    // where it lands is a path with nothing left to resolve.
+    assert_eq!(fx.cd(&[".."]).await.code, 0);
+    assert_eq!(fx.pwd().await, fx.root);
 
     // And `cd` with nothing is the tree, the way a shell's is `$HOME`.
     fx.cd(&["work"]).await;
-    assert_eq!(fx.cd(&[]).await.cwd.as_deref(), fx.root.to_str());
+    fx.cd(&[]).await;
+    assert_eq!(fx.pwd().await, fx.root);
 }
 
 /// An ordinary command leaves the session where it was, however it ends: a `cd` inside one
@@ -187,12 +168,8 @@ async fn a_command_that_cds_inside_itself_moves_nothing() {
         format!("{}\n", fx.path("work").display()).into_bytes(),
         "the command itself did move"
     );
-    assert_eq!(out.cwd, None, "and said nothing about the session");
 
-    assert_eq!(
-        fx.output("pwd").await.stdout,
-        format!("{}\n", fx.root.display()).into_bytes(),
-    );
+    assert_eq!(fx.pwd().await, fx.root, "and the session did not");
 }
 
 /// A `cd` that cannot happen is the builtin failing, not the call: a code and a line on
@@ -208,12 +185,7 @@ async fn a_cd_that_cannot_happen_leaves_the_session_where_it_was() {
         "{:?}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    assert_eq!(refused.cwd, None, "nothing moved, so nothing to report");
-
-    assert_eq!(
-        fx.output("pwd").await.stdout,
-        format!("{}\n", fx.root.display()).into_bytes()
-    );
+    assert_eq!(fx.pwd().await, fx.root, "nothing moved");
 }
 
 /// The file plane stands in the same place: a relative path is resolved where the session
@@ -295,51 +267,17 @@ async fn stopping_does_not_move_the_session() {
     fx.cd(&["work"]).await;
     fx.console.stop().await.expect("stopping");
 
-    assert_eq!(
-        fx.output("pwd").await.stdout,
-        format!("{}\n", fx.path("work").display()).into_bytes()
-    );
+    assert_eq!(fx.pwd().await, fx.path("work"));
 }
 
-/// The whole loop, which is the thing the tree exists for: a command standing somewhere
-/// invokes a delegated name with a relative argument, and the name opens the file the
-/// command meant.
-///
-/// Four hops and two spellings of the same directory — the shim reports the server's own
-/// path, the client strips the tree's root off it, `resolve` joins the argument onto what
-/// is left, and the mount turns that back into a file. A `cd` first, so the directory being
-/// carried is not the root and a bug that substituted one would show.
-#[tokio::test]
-async fn a_delegated_name_opens_the_file_the_command_meant() {
-    let mut fx = Fixture::new().await;
-    std::fs::create_dir(fx.path("work")).unwrap();
-    std::fs::write(fx.path("work/note.txt"), b"from the tree\n").unwrap();
-    std::fs::write(fx.path("note.txt"), b"from the root\n").unwrap();
-
-    fx.cd(&["work"]).await;
-
-    // Relative: resolved against where the command stood, which is the directory the `cd`
-    // moved the session to.
-    assert_eq!(
-        fx.output("cat-here note.txt").await.stdout,
-        b"from the tree\n"
-    );
-
-    // And `..` out of it names the other one, because the directory it pops is one the
-    // command was standing in.
-    assert_eq!(
-        fx.output("cat-here ../note.txt").await.stdout,
-        b"from the root\n"
-    );
-}
-
-/// **Every path the server reports is spelled the way the one it answered at `init` is.**
+/// **Where the session stands is spelled the way the path `init` answered with is.**
 ///
 /// A mount point reached through a symlink is the ordinary case, and the two spellings of
-/// it are not interchangeable to a client: it was told one, and a `cd` or a reported
-/// directory that came back in the other would be a path it has no way to relate to
-/// anything. `getcwd(2)` answers the physical one, so this is something the server has to
-/// put right rather than something that holds by itself.
+/// it are not interchangeable to a client: it was told one, and a directory that turned up
+/// in the other would be a path it has no way to relate to anything. `getcwd(2)` answers
+/// the physical one, so this is something the server has to put right rather than something
+/// that holds by itself — it moves the session logically and hands the command a `PWD` to
+/// match.
 #[tokio::test]
 async fn what_the_server_reports_is_spelled_the_way_init_answered() {
     let mut fx = Fixture::new().await;
@@ -354,40 +292,20 @@ async fn what_the_server_reports_is_spelled_the_way_init_answered() {
     // `init`: what was asked for.
     assert_eq!(fx.console.workfs_path(), Some(fx.root.as_path()));
 
-    // `cd`: normalized on paper, not canonicalized.
-    assert_eq!(
-        fx.cd(&["work"]).await.cwd.as_deref(),
-        fx.path("work").to_str()
-    );
+    // `cd`: normalized on paper, not canonicalized — so `pwd` in the command that follows
+    // answers under the path the client was told, and not under `/private/…`.
+    fx.cd(&["work"]).await;
+    assert_eq!(fx.pwd().await, fx.path("work"));
 
-    // And a delegated call, whose directory came out of `getcwd(2)` in another process —
-    // the client can only strip the root off it because it arrived re-spelled.
+    // And a `read` names a file under it, which is the whole of what the spelling is for:
+    // the path the client builds is the one a command standing there would have opened.
     std::fs::write(fx.path("work/note.txt"), b"resolved\n").unwrap();
-    assert_eq!(fx.output("cat-here note.txt").await.stdout, b"resolved\n");
-}
-
-/// A delegated call carries both halves of its context at once — where the command stood
-/// and what it was running with — and a command that moved itself first is reported where
-/// it actually is rather than where the session stands.
-#[tokio::test]
-async fn a_delegated_call_carries_the_directory_and_the_environment_together() {
-    let mut fx = Fixture::new().await;
-    std::fs::create_dir(fx.path("work")).unwrap();
-    std::fs::write(fx.path("work/note.txt"), b"in work\n").unwrap();
-    std::fs::write(fx.path("note.txt"), b"at the root\n").unwrap();
-
-    // The session stands at the root; the command walks into `work` on its own and the
-    // delegated name is answered from *there*, because the shim reports where it stood and
-    // not where the session does.
-    let out = fx.output("cd work && FOO=bar cat-here note.txt").await;
-    assert_eq!(out.stdout, b"in work\n");
-    assert_eq!(out.cwd, None, "the session did not move");
-
-    // Which is the file the command itself would have opened by the same name.
-    assert_eq!(
-        fx.output("cd work && cat note.txt").await.stdout,
-        b"in work\n"
-    );
+    let read = fx
+        .console
+        .read(fx.path("work/note.txt").to_str().unwrap(), None, None)
+        .await
+        .expect("reading the file the client named");
+    assert_eq!(read.data, b"resolved\n");
 }
 
 /// A base image is refused here, and named.
@@ -427,9 +345,7 @@ async fn built_on(image: Option<cortex::console::ImageSource>) -> anyhow::Result
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
     server.stderr(Stdio::inherit());
 
-    let mut builder = Console::builder()
-        .client(StdioClient::new(server)?)
-        .executables(ExecutableSet::new());
+    let mut builder = Console::builder().client(StdioClient::new(server)?);
     if let Some(image) = image {
         builder = builder.image(image);
     }
@@ -483,11 +399,41 @@ async fn built_with(reach: Option<cortex::console::NetworkAccess>) -> anyhow::Re
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
     server.stderr(Stdio::inherit());
 
-    let mut builder = Console::builder()
-        .client(StdioClient::new(server)?)
-        .executables(ExecutableSet::new());
+    let mut builder = Console::builder().client(StdioClient::new(server)?);
     if let Some(reach) = reach {
         builder = builder.network(reach);
     }
     builder.build().await
+}
+
+/// **A command that writes without limit shortens its own answer and not the session.**
+///
+/// A response travels in one frame under `MAX_PAYLOAD`, so output that would not fit is a
+/// frame this protocol refuses to send — and a server that tried would lose the channel
+/// mid-answer, taking every later call with it. So the streams are cut, `truncated` says
+/// they were, and the session carries on: measured here by asking it something afterwards.
+#[tokio::test]
+async fn a_command_that_writes_too_much_is_cut_and_the_session_survives() {
+    let mut fx = Fixture::new().await;
+
+    // Comfortably over `MAX_PAYLOAD`, so an uncut answer could not have been sent at all.
+    let flood = fx
+        .console
+        .exec(
+            ["sh", "-c", "yes aaaaaaaaaaaaaaaa | head -c 70000000"],
+            None,
+        )
+        .await
+        .expect("an answer rather than a broken channel");
+
+    assert!(flood.truncated, "the cut is reported");
+    assert!(
+        flood.stdout.len() < 64 * 1024 * 1024,
+        "cut to something one frame holds: {} bytes",
+        flood.stdout.len()
+    );
+    assert!(flood.stdout.iter().all(|b| *b == b'a' || *b == b'\n'));
+
+    // The point of the whole thing: the channel is still there.
+    assert_eq!(fx.output("echo alive").await.stdout, b"alive\n");
 }

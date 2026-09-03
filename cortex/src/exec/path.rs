@@ -1,12 +1,14 @@
-//! The path rules a delegated call needs, in one place.
+//! The path rules an [`ExecCall`](super::ExecCall) needs, in one place.
 //!
-//! A delegated executable runs in the client's process; the command that invoked it ran in
-//! the server's. A relative argument means something only if both ends agree on a root, so
-//! one function turns an executor-side directory into a workspace-relative one and the other
-//! resolves an argument against it.
+//! An [`Executable`](super::Executable) is handed a directory and an argument and has to end
+//! up at a file. A relative argument means something only against a root both the caller and
+//! the executable agree on, so [`relativize`] turns a directory on the host into a
+//! workspace-relative one and [`resolve_under`] resolves an argument against that.
 //!
-//! Here rather than in each backend because a backend's `delegate` is written twice, and the
-//! `Some`-vs-`None` rule is what must not drift between the copies.
+//! Here rather than at each caller because the `Some`-vs-`None` rule is the whole of the
+//! safety in it, and a second copy of it is a copy that can drift: a directory that cannot
+//! be named in the tree is `None`, a relative argument with no directory is refused, and
+//! neither is ever guessed at.
 
 use std::{
     io,
@@ -23,18 +25,6 @@ use std::{
 pub fn relativize(cwd: &Path, root: &Path) -> Option<String> {
     let rest = cwd.strip_prefix(root).ok()?;
     rest.to_str().map(str::to_owned)
-}
-
-/// A shim's own working directory, as the client should be told it.
-///
-/// A shim reports an executor-side absolute path, which is not a name the client's tree has;
-/// only the backend knows what root to take it relative to.
-///
-/// `None` covers three things on purpose — nothing reported, no namespace, a directory
-/// outside it — because all three mean the same to a client, and [`resolve_under`] refuses a
-/// relative argument that has no directory. Guessing would be worse than refusing.
-pub fn reported_cwd(shim: Option<&str>, root: Option<&Path>) -> Option<String> {
-    relativize(Path::new(shim?), root?)
 }
 
 /// `arg` resolved against `cwd`, as a root-relative path with no `.` or `..` left in it.
@@ -150,47 +140,19 @@ mod tests {
         assert_eq!(relativize(&cwd, Path::new("/mnt")), None);
     }
 
-    #[test]
-    fn a_reported_directory_inside_the_namespace_is_relative() {
-        assert_eq!(
-            reported_cwd(Some("/workspace/work/sub"), Some(Path::new("/workspace"))).as_deref(),
-            Some("work/sub")
-        );
-    }
-
     /// The root's own name in a workspace, which [`resolve_under`] joins onto correctly. A
     /// command that stood at the root stood somewhere, and `None` would say it stood nowhere.
     #[test]
-    fn a_reported_root_is_the_empty_path_rather_than_nothing() {
+    fn the_root_relativizes_to_the_empty_path_rather_than_to_nothing() {
         assert_eq!(
-            reported_cwd(Some("/workspace"), Some(Path::new("/workspace"))).as_deref(),
+            relativize(Path::new("/workspace"), Path::new("/workspace")).as_deref(),
             Some("")
         );
     }
 
-    /// A path the client's tree has no name for is one it must not be told: there, the same
-    /// string would resolve to something else.
-    #[test]
-    fn a_reported_directory_outside_the_namespace_is_nothing() {
-        assert_eq!(
-            reported_cwd(Some("/etc"), Some(Path::new("/workspace"))),
-            None
-        );
-    }
-
-    #[test]
-    fn a_session_with_no_namespace_reports_nothing() {
-        assert_eq!(reported_cwd(Some("/anywhere"), None), None);
-    }
-
-    #[test]
-    fn a_shim_that_reported_nothing_stays_nothing() {
-        assert_eq!(reported_cwd(None, Some(Path::new("/workspace"))), None);
-    }
-
     /// An absolute `cwd` is refused rather than quietly read as a relative one.
     ///
-    /// Unreachable through the honest path — `reported_cwd` only ever produces a `strip_prefix`
+    /// Unreachable through the honest path — `relativize` only ever produces a `strip_prefix`
     /// result — which is exactly why it is asserted here: the guarantee lives in the caller, and
     /// a containment check that trusts its caller is one that fails silently the day a new
     /// caller is wrong. Before this was refused, `("/etc", "passwd")` answered `etc/passwd`.
@@ -229,7 +191,7 @@ mod tests {
     ///
     /// A kernel looks each component up, so a command running in the same directory cannot open
     /// any of these — `nope` is not there to descend into and come back out of. Resolving them
-    /// on paper would hand the delegated executable a file its own caller could not reach.
+    /// on paper would hand the executable a file its own caller could not reach.
     ///
     /// Measured against the real thing before this was refused: `cat nope/../notes.txt` in a
     /// directory holding `notes.txt` answers `No such file or directory`.

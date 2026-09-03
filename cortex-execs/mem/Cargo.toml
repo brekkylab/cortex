@@ -42,7 +42,7 @@ clap = { version = "4", default-features = false, features = [
     "error-context",
     "suggestions",
 ] }
-# `Executable`, `ExecCall`, `Mount` — the delegation surface this crate implements.
+# `Executable`, `ExecCall`, `Mount` — the surface this crate implements.
 cortex = { workspace = true }
 # `.env`, for the `mem` binary only — see `src/bin/main.rs` for why the library does not touch
 # it. What the extraction needs from the environment is a provider and the key that pays for

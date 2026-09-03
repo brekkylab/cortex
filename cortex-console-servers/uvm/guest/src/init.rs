@@ -34,18 +34,13 @@
 //! neither device runs on the boot root as it is, which is a guest with one file in it —
 //! useful only for finding out why a boot failed.
 //!
-//! # And then this binary is somewhere else
+//! # And then the boot root is gone
 //!
-//! `pivot_root` detaches the old root, so the file this process was loaded from stops
-//! being reachable by any path. The process does not care — it is already in memory — but
-//! the delegated executables do: a shim is a symlink to this binary, and a symlink needs
-//! something to point at. So [`copy_self`] writes the running image back out onto the new
-//! root, read through `/proc/self/exe`, which the kernel keeps resolvable to the inode
-//! whatever happened to the name.
-//!
-//! The boot root's other file, the [`ImageSpec`] the host left there, has the same problem and
-//! the cheaper answer: [`image_spec`] reads it into memory before the pivot, because nothing
-//! after this needs it as a file.
+//! `pivot_root` detaches the old root, so the two files the host left there stop being
+//! reachable by any path. This binary does not care — it is already in memory, and nothing
+//! after the pivot opens it again — but the [`ImageSpec`] beside it would: so
+//! [`image_spec`] reads it before the pivot, and what survives is a value rather than a
+//! file.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -53,9 +48,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use crate::contract::{
-    GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV,
-};
+use crate::contract::{IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV};
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
 /// this code is mounting, so it is normally there already; the wait is for the boot where
@@ -90,7 +83,6 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
         // The overlay's `/proc`, `/dev` and `/sys` are the base image's empty
         // directories: the mounts from before the pivot went with the old root.
         mount_pseudo();
-        copy_self()?;
     }
 
     // After the pivot, because `/etc/resolv.conf` has to land on the root the commands will
@@ -258,21 +250,6 @@ fn pivot(new_root: &str) -> anyhow::Result<()> {
         anyhow::bail!("detaching the boot root: {}", io::Error::last_os_error());
     }
     let _ = std::fs::remove_dir("/oldroot");
-    Ok(())
-}
-
-/// Write this binary back onto the new root, so a delegated name has something to be a
-/// symlink to.
-///
-/// `/proc/self/exe` and not the path we were exec'd from: after the pivot that path names
-/// nothing, where the kernel's link to the running image still resolves.
-fn copy_self() -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::copy("/proc/self/exe", GUEST_BIN_PATH)
-        .map_err(|e| anyhow::anyhow!("copying this binary to {GUEST_BIN_PATH}: {e}"))?;
-    std::fs::set_permissions(GUEST_BIN_PATH, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| anyhow::anyhow!("making {GUEST_BIN_PATH} executable: {e}"))?;
     Ok(())
 }
 

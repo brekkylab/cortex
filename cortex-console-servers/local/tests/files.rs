@@ -8,7 +8,7 @@
 
 use std::process::Stdio;
 
-use cortex::console::{Console, Error, ExecResult, Failure, ReadResult, stdio::StdioClient};
+use cortex::console::{Console, Error, ExecResp, Failure, ReadResp, stdio::StdioClient};
 use tempfile::TempDir;
 use tokio::process::Command;
 
@@ -24,7 +24,7 @@ impl Fixture {
         server.stderr(Stdio::inherit());
         let client = StdioClient::new(server).expect("starting the console server");
 
-        // Building announces the session; nothing here delegates anything, which is a
+        // Building announces the session; nothing here names a tree, which is a
         // session too.
         let console = Console::builder()
             .client(client)
@@ -52,14 +52,14 @@ impl Fixture {
             .size
     }
 
-    async fn read(&mut self, path: &str, offset: Option<u64>, len: Option<u64>) -> ReadResult {
+    async fn read(&mut self, path: &str, offset: Option<u64>, len: Option<u64>) -> ReadResp {
         self.console
             .read(self.path(path), offset, len)
             .await
             .expect("reading")
     }
 
-    async fn output(&mut self, script: &str) -> ExecResult {
+    async fn output(&mut self, script: &str) -> ExecResp {
         self.console
             .exec(["sh", "-c", script], None)
             .await

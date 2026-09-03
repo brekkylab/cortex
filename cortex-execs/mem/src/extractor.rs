@@ -142,7 +142,7 @@ const DEFAULT_PROVIDER: &str = "openai";
 /// `env` is the environment the call was made in —
 /// [`ExecCall::env`](cortex::exec::ExecCall::env) — and not this process's, because the two are
 /// not the same environment. Run as a program they hold the same variables and the distinction
-/// costs nothing; delegated in a console they are, in cortex's own words, "different machines'
+/// costs nothing; under a console they are, in cortex's own words, "different machines'
 /// worth of facts", and the provider and the key that pays for a call belong to the session that
 /// asked for it rather than to whoever started the server that answers.
 pub async fn extract_memories(
@@ -434,7 +434,7 @@ fn asked(env: &BTreeMap<String, String>) -> anyhow::Result<(String, Option<Regis
 /// ailoy resolves a model through process-wide registries, by name — there is no constructor
 /// that takes a provider by value. Its `"default"` entry is built from *this process's*
 /// environment, which is exactly the environment an [`Executable`](cortex::exec::Executable)
-/// must not use: delegated in a console, the key that should pay for the call is the one the
+/// must not use: under a console, the key that should pay for the call is the one the
 /// calling session had, and the one in this process belongs to whoever started the server. So
 /// the key from [`ExecCall::env`](cortex::exec::ExecCall::env) is registered under a name of
 /// this call's own, and the agent is pointed at that name instead of `"default"`.
