@@ -2,8 +2,11 @@
 resolver = "3"
 members = [
     "cortex",
+    "cortex-execs/storebase",
     "cortex-execs/index",
     "cortex-execs/mem",
+    "cortex-execs/memstore",
+    "cortex-execs/docstore",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",
@@ -11,7 +14,6 @@ members = [
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
 # bare `cargo build` — for a target that has no host to run on.
-#
 exclude = ["cortex-console-servers/uvm/guest"]
 
 [workspace.package]
@@ -30,6 +32,9 @@ async-trait = "0.1"
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
+# What the executables in `cortex-execs` had three copies of: opening a store that is a
+# file on a mounted tree, and the two rules they all follow about clap's output.
+cortex-exec-storebase = { path = "cortex-execs/storebase" }
 # The boot process, and — as its library half — the strings a console server starts one with.
 # A server takes it without the `vm` feature and so links no VMM; see its own manifest.
 cortex-uvm-boot = { path = "cortex-console-servers/uvm/boot", default-features = false }

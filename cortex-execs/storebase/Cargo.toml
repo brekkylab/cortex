@@ -1,0 +1,22 @@
+[package]
+name = "cortex-exec-storebase"
+version.workspace = true
+edition.workspace = true
+
+# No `[[bin]]`: this is the substrate the executables in `cortex-execs` are built on, not one
+# of them.
+
+[dependencies]
+# The command line. What is shared here is not a command — each executable has its own — but
+# the two rules every one of them follows about clap's *output*: which stream it goes to and
+# which exit code it carries. `workspace` for the `string` feature, which is what lets a usage
+# line carry the name the call was made under.
+clap = { workspace = true }
+# `ExecCall`, `ExecResult`, `Mount` — the surface every one of these implements.
+cortex = { workspace = true }
+# The store. `bundled` (from the workspace) on purpose: every schema here is an FTS5 index, and
+# FTS5 is a compile-time option the host's own SQLite is free to have been built without.
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
