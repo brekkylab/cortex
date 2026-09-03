@@ -50,6 +50,12 @@ pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 /// which is a session.
 pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
 
+/// Where `/abin` is, as a device. Absent for a session that has none.
+pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
+
+/// Where it is mounted, and what goes first on `PATH`.
+pub const ABIN_PATH: &str = "/abin";
+
 /// `PATH` for everything an execution spawns when the base image did not say — see
 /// [`ImageSpec::env`].
 ///

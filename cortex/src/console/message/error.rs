@@ -151,3 +151,36 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// Every code is its own. Two that collided would be two failures a client could not
+    /// tell apart, and the compiler has nothing to say about it.
+    #[test]
+    fn every_error_code_is_distinct() {
+        let codes = [
+            ("TIMED_OUT", Error::TIMED_OUT),
+            ("NOT_EXECUTABLE", Error::NOT_EXECUTABLE),
+            ("BOOT_FAILED", Error::BOOT_FAILED),
+            ("NOT_FOUND", Error::NOT_FOUND),
+            ("IS_A_DIRECTORY", Error::IS_A_DIRECTORY),
+            ("IO_FAILED", Error::IO_FAILED),
+            ("UNSUPPORTED_WORKFS", Error::UNSUPPORTED_WORKFS),
+            ("MOUNT_FAILED", Error::MOUNT_FAILED),
+            ("UNSUPPORTED_NETWORK", Error::UNSUPPORTED_NETWORK),
+            ("UNSUPPORTED_IMAGE", Error::UNSUPPORTED_IMAGE),
+            ("INVALID_REQUEST", Error::INVALID_REQUEST),
+            ("METHOD_NOT_FOUND", Error::METHOD_NOT_FOUND),
+            ("INVALID_PARAMS", Error::INVALID_PARAMS),
+            ("INTERNAL_ERROR", Error::INTERNAL_ERROR),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, code) in codes {
+            if let Some(taken) = seen.insert(code, name) {
+                panic!("{code} is both {taken} and {name}");
+            }
+        }
+    }
+}

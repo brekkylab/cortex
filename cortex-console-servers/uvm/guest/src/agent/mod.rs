@@ -94,7 +94,7 @@ use cortex::console::{
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 
-use crate::contract::{GUEST_PATH, HANDSHAKE, ImageSpec};
+use crate::contract::{ABIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec};
 
 /// A command we found but could not start, and one we could not find at all.
 ///
@@ -577,6 +577,17 @@ fn environment(session: &Session) -> Vec<(OsString, OsString)> {
 
     if !env.iter().any(|(name, _)| name == "PATH") {
         env.push(("PATH".into(), GUEST_PATH.into()));
+    }
+    // Prepended, not appended: `/abin` is what cortex undertakes to provide, and an image
+    // shadowing one of those names would make that undertaking untrue. Guarded on the
+    // directory, because a session whose host had no executables to give it gets none.
+    if std::path::Path::new(ABIN_PATH).is_dir()
+        && let Some((_, path)) = env.iter_mut().find(|(name, _)| name == "PATH")
+    {
+        let mut with_abin = OsString::from(ABIN_PATH);
+        with_abin.push(":");
+        with_abin.push(&*path);
+        *path = with_abin;
     }
 
     // `PWD` is what a shell reads to answer `pwd`, and a command spawned in the session's

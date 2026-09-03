@@ -73,6 +73,7 @@
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
+mod abin;
 mod assets;
 mod helper;
 mod server;

@@ -47,6 +47,7 @@ use cortex::console::{
     Call, Message, RequestId, Response,
     stdio::{read, write},
 };
+use cortex_uvm_console::layer::LayerStore;
 use tokio::{
     io::{AsyncReadExt as _, BufReader},
     net::{
@@ -56,10 +57,16 @@ use tokio::{
 };
 
 use crate::{
+    abin,
     assets::{self, BootRoot, SessionImage},
     contract::{BootArgs, HANDSHAKE, Network},
     helper::boot_helper,
 };
+
+/// Where layers live, shared by everything on this host that makes one.
+fn layer_store() -> anyhow::Result<LayerStore> {
+    LayerStore::open(&assets::home()?.join("layers"))
+}
 
 /// Guest vCPUs and memory, if this server was told to override the boot's own defaults.
 ///
@@ -119,6 +126,31 @@ impl Guest {
         let base = assets::base_image(image).await?;
         let helper = boot_helper()?;
 
+        // `/abin` is the same disk for every session — cortex's own executables and no
+        // others — so this is a store lookup that finds it already there after the first
+        // session on this host. On a blocking thread all the same: the first one reads every
+        // executable and writes them back out as an EROFS, which is the same reason
+        // `SessionImage::create` below is not on the runtime's own thread.
+        let store = layer_store()?;
+        // **The one place this variable is read.** Here rather than inside `disk`, where the
+        // rest of this server's configuration is read, and so that building the disk is a
+        // function of its arguments and a test can call it twice.
+        let builtin = std::env::var_os(abin::DIR_ENV).map(PathBuf::from);
+        let found = tokio::task::spawn_blocking(move || abin::disk(builtin.as_deref(), &store))
+            .await
+            .map_err(|e| anyhow::anyhow!("preparing /abin: {e}"))?;
+
+        // Cortex has published no executables yet, so the strict reading would mean no
+        // session boots at all. A session without them costs its `/abin` and not its
+        // existence — said on the way past so it is not silent.
+        let abin = match found {
+            Ok(disk) => Some(disk),
+            Err(e) => {
+                eprintln!("cortex-uvm-console: this session gets no /abin: {e}");
+                None
+            }
+        };
+
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
         // still not something to do on the runtime's own thread.
         let session = tokio::task::spawn_blocking(SessionImage::create)
@@ -140,6 +172,7 @@ impl Guest {
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),
+            abin,
             vcpus: number(VCPUS_ENV),
             memory_mib: number(MEMORY_ENV),
         };

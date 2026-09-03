@@ -48,7 +48,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
-use crate::contract::{IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV};
+use crate::contract::{
+    ABIN_ENV, ABIN_PATH, IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV,
+};
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
 /// this code is mounting, so it is normally there already; the wait is for the boot where
@@ -83,6 +85,13 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
         // The overlay's `/proc`, `/dev` and `/sys` are the base image's empty
         // directories: the mounts from before the pivot went with the old root.
         mount_pseudo();
+    }
+
+    // After the pivot, so it lands on the root the commands will see. `MS_RDONLY` here is a
+    // courtesy — the device itself is attached read-only and that is what actually holds.
+    if let Ok(device) = std::env::var(ABIN_ENV) {
+        mount(&device, ABIN_PATH, "erofs", libc::MS_RDONLY)
+            .map_err(|e| anyhow::anyhow!("mounting {device} at {ABIN_PATH}: {e}"))?;
     }
 
     // After the pivot, because `/etc/resolv.conf` has to land on the root the commands will

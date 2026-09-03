@@ -61,8 +61,8 @@ use std::{
 use msb_krun::{DiskImageFormat, VmBuilder};
 
 use cortex_uvm_boot::{
-    BaseFormat, BootArgs, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
-    PORT_NAME, SHARE_ENV, UPPER_ENV, WORKFS_TAG,
+    ABIN_ENV, BaseFormat, BootArgs, GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV,
+    GUEST_UPPER_DEV, LOWER_ENV, Network, PORT_NAME, SHARE_ENV, UPPER_ENV, WORKFS_TAG,
 };
 
 /// Guest vCPUs when nothing says otherwise. Two rather than one because a command and the
@@ -104,6 +104,17 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
         // guest opens is one thing rather than a pair.
         .console(|c| c.port(PORT_NAME, port, port));
 
+    // `/abin`, third and so `/dev/vdc`. Read-only **at the device**, which is the whole
+    // reason it is a disk and not a share: a virtio-fs share has no such option, and the
+    // guest is root inside itself, so a guest-side mount flag would be a guard rail rather
+    // than a boundary.
+    //
+    // Raw, always: `/abin` is cortex's own executables and no others, which is one layer of
+    // the store attached as it stands rather than anything stitched into a descriptor.
+    if let Some(abin) = &args.abin {
+        builder = builder.disk(|d| d.path(abin).read_only(true).format(DiskImageFormat::Raw));
+    }
+
     // The network, when the session asked for one. Everything about it lives in this process:
     // the stack, its runtime, and the policy it enforces — and all three have to outlive
     // `enter` below, which never returns, so the guard is held to the end of the function that
@@ -142,6 +153,10 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
                 .env(UPPER_ENV, GUEST_UPPER_DEV);
             let e = match &share {
                 Some(share) => e.env(SHARE_ENV, share),
+                None => e,
+            };
+            let e = match &args.abin {
+                Some(_) => e.env(ABIN_ENV, GUEST_ABIN_DEV),
                 None => e,
             };
             guest_net
