@@ -58,10 +58,10 @@
 //!
 //! Every subcommand names the index it works on, so a session can keep more than one and say
 //! which it means — and `ingest` makes the one it names, so a caller never has to arrange a
-//! store before using it. Which is the shape `mem` has, for the same reason.
+//! store before using it. Which is the shape `memstore` has, for the same reason.
 //!
 //! Where they differ is *where* the thing lives, and they differ because the two are
-//! different kinds of thing. A `mem` store is a **document**: one file of the tree, which the
+//! different kinds of thing. A `memstore` store is a **document**: one file of the tree, which the
 //! agent may read, copy or commit. An index is **derived state** — nobody reads it directly,
 //! and deleting it costs a re-ingest — so it lives under a root on the host that the caller
 //! was given rather than in the tree. `<STORE>` is one path component, so every index this

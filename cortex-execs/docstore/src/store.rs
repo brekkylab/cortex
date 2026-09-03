@@ -11,7 +11,7 @@
 //! named directory under a host root. It could not have been a file in the tree: tantivy
 //! `mmap`s its segments and holds a lock file, and under FUSE-T a mount is an NFS one, where
 //! both are exactly the operations that behave differently. SQLite on the rollback journal
-//! asks for neither, which is why `mem` and `memstore` already keep their stores in the tree.
+//! asks for neither, which is why `memstore` already keeps its stores in the tree.
 //!
 //! # No write-ahead log
 //!

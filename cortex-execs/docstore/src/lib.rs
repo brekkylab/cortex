@@ -27,8 +27,8 @@
 //! search here names a path the caller can open, rather than only the text.
 //!
 //! `cortex-exec-index` does the same job on tantivy. This does it on SQLite's FTS5, which is
-//! the engine `mem` and `memstore` already use, so a workspace that registers all of them links
-//! one search engine rather than two. The two are meant to be interchangeable from outside:
+//! the engine `memstore` already uses, so a workspace that registers both links one search
+//! engine rather than two. The two are meant to be interchangeable from outside:
 //! same commands, same output shapes, same walk. Where they differ is written down in
 //! [`DocStore`] and in this crate's `store` module — the store is a file in the tree rather
 //! named directory on the host, and everything that follows from that.
@@ -37,7 +37,7 @@
 //!
 //! A store carries a `chunk` table with an `embedding` column, and `meta` has room for the
 //! model and the dimension that produced them. **All of it is empty.** There is no embedder in
-//! this workspace to fill it — ailoy, which `mem` asks for a language model, has no embedding
+//! this workspace to fill it — ailoy, the only language-model runtime here, has no embedding
 //! API — and choosing a chunk size before there is a model to size chunks for would be
 //! deciding on no evidence.
 //!

@@ -21,11 +21,11 @@ use crate::{ingest, search};
 /// # A store is named, and the name is not a path
 ///
 /// Every subcommand names the index it works on, so a session can keep more than one and say
-/// which it means — the same shape `mem` has, for the same reason: an index is a thing a
+/// which it means — the same shape `memstore` has, for the same reason: an index is a thing a
 /// session has several of, not a setting it was configured with.
 ///
-/// What differs from `mem` is *where* that thing lives, and it differs because the two are
-/// different kinds of thing. A `mem` store is a **document**: one file of the tree, which the
+/// What differs from `memstore` is *where* that thing lives, and it differs because the two are
+/// different kinds of thing. A `memstore` store is a **document**: one file of the tree, which the
 /// agent may read, copy or commit. An index is **derived state** — nobody reads it directly
 /// and deleting it costs a re-ingest — so it has no business in the tree, and there is a
 /// harder reason besides: tantivy `mmap`s its segments and takes a lock file, and under

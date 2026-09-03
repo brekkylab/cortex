@@ -115,10 +115,9 @@ mod args {
         /// first, and a memory containing that separator could not be written at all.
         ///
         /// Nothing here shortens, splits or rephrases what it is given. That is the whole
-        /// difference between this command and `mem insert`, which is handed a conversation and
-        /// asks a model what in it is worth keeping — here the caller has already decided, and
-        /// a second opinion applied to their decision would be a store holding something
-        /// nobody wrote.
+        /// difference between this command and one that reads a conversation for what is worth
+        /// keeping — here the caller has already decided, and a second opinion applied to their
+        /// decision would be a store holding something nobody wrote.
         //
         // Trimmed and refused empty at the parser, so that `Memory::text` is non-empty by
         // construction everywhere below. It belongs here and not at the write for the reason
@@ -288,7 +287,7 @@ impl Executable for MemStore {
                     }
 
                     // The memories back, one per line — the same lines `search` prints, and the
-                    // same shape `mem insert` answers in, so that something driving either reads
+                    // same shape `docstore` answers in, so that something driving either reads
                     // one kind of output. What it adds over the arguments the caller already had
                     // is that these are the ones the store now holds. Nothing to write is no
                     // output at all, which is the answer a script producing an empty list wants.
@@ -406,7 +405,7 @@ mod tests {
         );
     }
 
-    /// The whole line, and the property that separates this command from `mem insert`: what the
+    /// The whole line, and the property this command is for: what the
     /// caller wrote is what the store holds, word for word, and it is findable straight after.
     #[tokio::test]
     async fn insert_writes_what_it_was_given() {

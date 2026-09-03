@@ -287,7 +287,7 @@ fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
 /// Every call into the store goes through here. SQLite is synchronous and a walk of a tree is
 /// the slow kind of work, and the task this is called from is whatever the consumer was doing
 /// when it dispatched — so neither may run on it. `cortex-exec-index` does the same for
-/// tantivy; `mem` does not, which is a defect this crate does not inherit.
+/// tantivy, and `memstore` does it for SQLite.
 async fn blocking<F>(what: &'static str, work: F) -> ExecResult
 where
     F: FnOnce() -> std::io::Result<String> + Send + 'static,

@@ -15,8 +15,8 @@ use cortex_exec_memstore::MemStore;
 // awaited here is a store, and a store's blocking work happens in the calling thread. Nothing
 // else in the process waits on anything.
 //
-// No `.env` here, unlike `mem`: nothing in this crate reads a key or reaches a provider, so
-// there is no file of secrets for it to want.
+// No `.env`: nothing in this crate reads a key or reaches a provider, so there is no file of
+// secrets for it to want.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     let call = ExecCall {
