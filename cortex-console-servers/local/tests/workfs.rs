@@ -405,3 +405,35 @@ async fn built_with(reach: Option<cortex::console::NetworkAccess>) -> anyhow::Re
     }
     builder.build().await
 }
+
+/// **A command that writes without limit shortens its own answer and not the session.**
+///
+/// A response travels in one frame under `MAX_PAYLOAD`, so output that would not fit is a
+/// frame this protocol refuses to send — and a server that tried would lose the channel
+/// mid-answer, taking every later call with it. So the streams are cut, `truncated` says
+/// they were, and the session carries on: measured here by asking it something afterwards.
+#[tokio::test]
+async fn a_command_that_writes_too_much_is_cut_and_the_session_survives() {
+    let mut fx = Fixture::new().await;
+
+    // Comfortably over `MAX_PAYLOAD`, so an uncut answer could not have been sent at all.
+    let flood = fx
+        .console
+        .exec(
+            ["sh", "-c", "yes aaaaaaaaaaaaaaaa | head -c 70000000"],
+            None,
+        )
+        .await
+        .expect("an answer rather than a broken channel");
+
+    assert!(flood.truncated, "the cut is reported");
+    assert!(
+        flood.stdout.len() < 64 * 1024 * 1024,
+        "cut to something one frame holds: {} bytes",
+        flood.stdout.len()
+    );
+    assert!(flood.stdout.iter().all(|b| *b == b'a' || *b == b'\n'));
+
+    // The point of the whole thing: the channel is still there.
+    assert_eq!(fx.output("echo alive").await.stdout, b"alive\n");
+}

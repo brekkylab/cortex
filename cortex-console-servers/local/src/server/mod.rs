@@ -111,6 +111,13 @@ const NOT_FOUND: i32 = 127;
 /// kibibyte covers those several times over.
 const MAX_DATA: u64 = MAX_PAYLOAD as u64 - 1024;
 
+/// How much of one of a command's two streams a response may carry.
+///
+/// Half of [`MAX_DATA`] apiece, because an [`ExecResp`] carries both and either one can be
+/// the large one. What is over it is dropped and [`ExecResp::truncated`] says so — see
+/// [`finished`].
+const MAX_STREAM: usize = MAX_DATA as usize / 2;
+
 /// Answer requests until the client says `quit` or closes the channel.
 pub async fn run() -> anyhow::Result<()> {
     let mut server = StdioServer::stdio()?;
@@ -635,11 +642,23 @@ fn finished(output: io::Result<Output>) -> Response {
         }
     };
 
+    // A response travels in one frame under `MAX_PAYLOAD`, so a command that writes
+    // without limit has to be cut off somewhere: an uncut one makes a frame this protocol
+    // refuses to send, which is the whole session lost rather than one answer shortened.
+    // Both streams, halved, because either of them alone can be the large one.
+    let mut stdout = out.stdout;
+    let mut stderr = out.stderr;
+    let truncated = stdout.len() > MAX_STREAM || stderr.len() > MAX_STREAM;
+    stdout.truncate(MAX_STREAM);
+    stderr.truncate(MAX_STREAM);
+
     result(ExecResp {
         code: exit_code(&out.status),
-        stdout: out.stdout,
-        stderr: out.stderr,
-        truncated: false,
+        stdout,
+        stderr,
+        // Saying so is the point: an agent reading output it does not know is partial
+        // draws a conclusion from it, and a wrong answer is worse than a short one.
+        truncated,
     })
 }
 
