@@ -126,9 +126,6 @@ const FILE_FIELDS: &[&str] = &[
     "size",
     "modifiedTime",
     "createdTime",
-    "webViewLink",
-    // Nested sub-selection, so this one entry carries its own punctuation.
-    "owners(displayName,emailAddress)",
 ];
 
 /// Hard cap on listing pages (1000 files/page, 100 drives/page) so a

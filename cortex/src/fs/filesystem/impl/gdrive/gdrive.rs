@@ -169,7 +169,11 @@ const READ_SPAN: u64 = 64 * 1024 * 1024;
 /// next one, which is where the rate tops out.
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
-/// Cap on remembered probe results — one per file ever sized in this mount.
+/// Cap on remembered document lengths — one per Docs-editors file this mount has read.
+///
+/// Cleared wholesale rather than evicted one at a time: losing an entry costs a listing's
+/// accuracy and never correctness, since the next read puts it back and a read produces
+/// the JSON either way.
 const MAX_REMEMBERED_LENGTHS: usize = 50_000;
 
 /// Safety ceiling on one folder's listing (10 pages). Beyond this the listing
@@ -296,9 +300,15 @@ struct HeldSpan {
 
 pub struct GdriveFs {
     accessor: GdriveAccessor,
-    /// Lengths learned by probing (file id → bytes), for the rows Drive listed
-    /// without a `size`. One probe per file per session: `stat` is asked once per
-    /// entry after every listing, and a probe is a request.
+    /// A Docs-editors file's served length (file id → bytes), learned when its JSON was
+    /// produced and kept past the bytes themselves.
+    ///
+    /// A document has no `size` to list and no way to be asked for one — `HEAD` answers
+    /// 400 — so its length exists only once something renders it. Keyed by id and paired
+    /// with the `modifiedTime` it was measured from: an edit replaces the row rather than
+    /// leaving one entry per version, and an entry whose stamp no longer matches is not
+    /// used. A row Drive listed without a stamp is not stored at all, because a length
+    /// nothing can date is a length nothing can retire.
     lengths: Mutex<HashMap<String, RememberedLength>>,
     /// Per-directory listing cache (folder path → children). Path resolution walks
     /// parent listings, so one cached listing answers readdir, stat and the lookup
@@ -963,7 +973,7 @@ fn kind_of(c: &Child) -> DirentKind {
 ///
 /// [`is_estimate`] has nowhere to be said. A `Stat` carries a length and not whether
 /// the length was measured, so a document's placeholder reads as a size like any
-/// other until something opens the file and [`FileSystem::stat`] probes it.
+/// other until something reads the file and the length that read produced is kept.
 fn dirent_for(c: &Child) -> Dirent {
     Dirent::with_stat(
         c.vfs_name.clone(),
