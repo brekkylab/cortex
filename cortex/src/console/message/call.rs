@@ -106,11 +106,18 @@ impl Call {
         }
 
         let mut object = doc! { "method": method.as_str() };
-        // An absent `params` stays absent, so that a method taking none is read as
-        // taking none rather than as taking null.
-        if params != Bson::Null {
-            object.insert("params", params);
-        }
+        // An absent `params` becomes an empty one rather than staying absent: the derive
+        // above is adjacently tagged, so serde wants the member present whatever the
+        // method takes, and a missing one is `missing field \`params\`` and not a method
+        // read as taking none. What an empty object is short of is then the method's own
+        // to refuse — `init` takes it, `exec` wants a `cmd`.
+        object.insert(
+            "params",
+            match params {
+                Bson::Null => Bson::Document(bson::Document::new()),
+                params => params,
+            },
+        );
 
         bson::deserialize_from_bson(Bson::Document(object))
             .map_err(|e| E::custom(format!("{method} params: {e}")))
