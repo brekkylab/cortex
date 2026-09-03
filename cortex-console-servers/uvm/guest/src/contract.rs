@@ -11,16 +11,17 @@
 //! argument vector would work too, but it becomes the guest's kernel command line, which
 //! is size-limited and rejects a newline.
 //!
-//! Nothing that could grow is here. The session — the delegated names, the commands, the
-//! files — arrives on [`PORT_NAME`] as protocol frames, which is what makes this list
-//! stay short.
+//! Nothing that could grow is here. The session — the tree, the commands, the files —
+//! arrives on [`PORT_NAME`] as protocol frames, which is what makes this list stay
+//! short.
+//!
+//! Where the host *writes* this binary in the boot root is not here either, and could not
+//! usefully be: it is the path libkrun execs, so by the time anything in this crate runs it
+//! has already been used, and [`init`](crate::init) detaches the root holding it. The host
+//! keeps that one — `cortex-uvm-boot`'s `GUEST_BIN_PATH` — because the host is the only end
+//! that needs a name for it.
 
 use serde::{Deserialize, Serialize};
-
-/// Where the host writes this binary in the boot root, and therefore the path libkrun
-/// execs. Also where [`init`](crate::init) puts a copy of it on the new root after the
-/// pivot, so the shim symlinks have a file to point at.
-pub const GUEST_BIN_PATH: &str = "/.cortex-guest";
 
 /// The virtio-console port carrying the console session. The host holds a socket at the
 /// other end of it; the guest reaches it as `/dev/virtio-ports/<name>`, or by the device
@@ -113,4 +114,3 @@ pub const NET_IPV4_ENV: &str = "MSB_NET_IPV4";
 
 /// Where a resolver is named on any system a base image was built for.
 pub const RESOLV_CONF: &str = "/etc/resolv.conf";
-

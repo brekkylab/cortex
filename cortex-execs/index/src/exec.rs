@@ -81,7 +81,7 @@ impl Index {
     ///
     /// **`name` is one path component and nothing else.** A separator, a `..` or an absolute
     /// path would reach outside the root, and the root is the whole of what bounds this — a
-    /// delegated name gets to say *which* index, never *where*.
+    /// caller gets to say *which* index, never *where*.
     fn dir_of(&self, name: &str) -> io::Result<PathBuf> {
         // A separator anywhere, before the components are even looked at: `notes/` parses as
         // one component, so a walk of them alone would accept a spelling that is a path.
@@ -191,8 +191,8 @@ impl Index {
 //
 // A real parser and not a `match` on the first argument, because `--help` has to work on
 // every subcommand and not only on the name — which is the whole of what an agent has to go
-// on once it has decided to call this. Nothing here intercepts an argument: a delegated name
-// is a program on the guest's `PATH`, and a program answers its own help.
+// on once it has decided to call this. Nothing here intercepts an argument: this answers a
+// command line, and a command line's help is the command's own.
 //
 // `//` and not `///` throughout this file's clap types: a doc comment here is what `--help`
 // prints, so anything a *caller* would not act on belongs in a comment instead. clap's derive
@@ -203,8 +203,8 @@ impl Index {
     about = Index::SUMMARY,
     subcommand_required = true,
     arg_required_else_help = true,
-    // No `--version`: a delegated name is not a package, and the version a caller could act
-    // on is the console's, not this executable's.
+    // No `--version`: this is not a package a caller installs, and the version it could act
+    // on is the program's that registered it, not this executable's.
     disable_version_flag = true,
 )]
 struct Cli {
@@ -401,7 +401,7 @@ async fn list(index: &Index) -> ExecResult {
 ///
 /// The error is not a failure by itself: `--help` arrives as one, and
 /// [`exit_code`](clap::Error::exit_code) is what already separates it (`0`) from a caller who
-/// got the usage wrong (`2`). Nothing exits the process — a delegated call answers.
+/// got the usage wrong (`2`). Nothing exits the process — a call answers.
 fn parse(index: &Index, call: &ExecCall) -> Result<Cli, ExecResult> {
     let mut command = Cli::command()
         .name(call.name.clone())

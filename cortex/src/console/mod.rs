@@ -16,19 +16,17 @@
 //!   it drives, and [`StdioServer`](stdio::StdioServer), which answers on stdin and
 //!   stdout).
 //! - [`Console`] — the public end, and what a caller normally reaches for: the channel
-//!   that drives a server, and the names a delegated call resolves to.
+//!   that drives a server, and the session it was opened with.
 //!
 //! Everything that waits is a future. A console spends nearly all of its time waiting —
-//! on a pipe, on a command, on a delegated name that is off doing something slower still
-//! — so a caller with several of them drives them all from one runtime, and every method
-//! that could wait is something to `await`. What is *not* concurrent is a single session:
-//! see [`Client`] for the borrow that says so.
+//! on a pipe, on a command, on a backend bringing a kernel up — so a caller with several
+//! of them drives them all from one runtime, and every method that could wait is
+//! something to `await`. What is *not* concurrent is a single session: see [`Client`] for
+//! the borrow that says so.
 //!
-//! Each end of a channel does one job, and a delegated executable does not make that
-//! untrue. A server that needs one run says so in a [`Progress::Delegated`] — a response,
-//! on the request the client is already waiting on — so execution runs both ways over one
-//! channel that is only ever asked on from one side. [`Progress`] has the reasoning, and
-//! what it costs.
+//! Each end of a channel does one job and only that one. There is no request a server
+//! issues, so nothing on either side needs a pending table, a listener, or a reader that
+//! must not block on work only it can unblock.
 //!
 //! [`Message`] has the reasoning for the protocol,
 //! [`read`](stdio::read) and [`write`](stdio::write) for the wire.

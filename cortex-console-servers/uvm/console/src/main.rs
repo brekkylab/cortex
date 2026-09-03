@@ -1,14 +1,14 @@
 //! `cortex-uvm-console` — a console server whose "somewhere" is a micro-VM.
 //!
-//! Answers a console session on stdin and stdout: `init` to say which names the session
-//! delegates, an `exec` per command, `quit` to end. See [`cortex::console`] for the shape
+//! Answers a console session on stdin and stdout: `init` to say which tree the session
+//! works in, an `exec` per command, `quit` to end. See [`cortex::console`] for the shape
 //! of what those descriptors carry. What differs from a host-local console is only where a
 //! command runs — inside a Linux guest, on a filesystem of its own, on a kernel this
 //! process brought up — and everything below follows from that one difference.
 //!
 //! # Booting is a real cost here, which is what `start` and `stop` are for
 //!
-//! On a host-local backend, booting is a directory of symlinks and the pair is a nicety. On
+//! On a host-local backend, booting is finding a directory and the pair is a nicety. On
 //! this one it is a kernel, an overlay of two block devices and a device probe: seconds,
 //! and a few hundred megabytes of the host's memory for as long as the guest is up.
 //!

@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::process::Stdio;
 
-use cortex::console::{Console, ExecResult};
+use cortex::console::{Console, ExecResp};
 use tokio::process::Command;
 
 /// A directory of runnable scripts, each echoing something only it would.
@@ -49,14 +49,14 @@ async fn session(builtin: &Path) -> anyhow::Result<Console> {
     Console::builder().client(client).build().await
 }
 
-async fn out(console: &mut Console, script: &str) -> ExecResult {
+async fn out(console: &mut Console, script: &str) -> ExecResp {
     console
         .exec(["sh", "-c", script], None)
         .await
         .expect("running the command")
 }
 
-fn say(result: &ExecResult) -> String {
+fn say(result: &ExecResp) -> String {
     String::from_utf8_lossy(&result.stdout).trim().to_string()
 }
 

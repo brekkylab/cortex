@@ -11,23 +11,17 @@
 //!            └ the protocol   └ the same protocol, ids and all
 //! ```
 //!
-//! # Delegation needs no code here, and that is the point worth reading
+//! # Relaying needs no protocol knowledge, and that is the point worth reading
 //!
-//! A delegated call is a *response*: the guest answers an `exec` with a
-//! [`Delegated`](cortex::console::Progress::Delegated), and the client carries on with
-//! another `exec` whose `cmd` names the request that response came on. Both directions
-//! are ordinary messages on one channel, in one order, with one outstanding at a time.
+//! Every message on this channel is a request from the client or the response to one, in
+//! one order, with one outstanding at a time. So relaying them is three lines:
+//! [`Guest::relay`] writes a request and reads the answer, and the loop below does that for
+//! every request that arrives.
 //!
-//! So relaying them is relaying anything. [`Guest::relay`] writes a request and reads the
-//! answer, the loop below does that for every request that arrives, and a delegation chain
-//! twenty calls long is twenty passes through the same three lines. Nothing here has a
-//! pending table, knows what a `Delegated` is, or has to be told which execution a resume
-//! belongs to — the ids are passed through untouched, so the two ends that do care are
-//! looking at the same numbers.
-//!
-//! That property is what the protocol bought by making delegation a response instead of a
-//! request from the server. A server that asked would need this relay to be a client and a
-//! server at once, on both channels, with a pending table on each.
+//! Nothing here has a pending table or reads a meaning into anything it carries — the ids
+//! are passed through untouched, so the two ends that do care are looking at the same
+//! numbers. That is what a protocol with one asking end buys: a relay for it is a relay,
+//! and not a client and a server at once with a pending table on each.
 //!
 //! # What this end does own
 //!
@@ -64,8 +58,8 @@ mod guest;
 use std::path::PathBuf;
 
 use cortex::console::{
-    Call, Error, ImageSource, Init, InitResult, Message, NetworkAccess, Notification, Outcome,
-    RequestId, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
+    Call, Error, ImageSource, InitCall, InitResp, Message, NetworkAccess, Notification, RequestId,
+    Response, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
 };
 use microsandbox_image::Reference;
 
@@ -103,10 +97,10 @@ pub async fn run() -> anyhow::Result<()> {
             // Nothing answers this, so a failure is only said here — the next call that
             // needs a guest tries again and tells whoever asked for it.
             //
-            // Which is why this logs the message and not the `Outcome`: the code is for
-            // whoever gets answered, and that is nobody here.
+            // Which is why this logs the message and not the code: a code is for whoever
+            // gets answered, and that is nobody here.
             Message::Notification(Notification::Start) => {
-                if let Err(Outcome::Error(e)) = session.booted().await {
+                if let Err(e) = session.booted().await {
                     eprintln!("{}: booting: {}", env!("CARGO_BIN_NAME"), e.message);
                 }
             }
@@ -120,39 +114,39 @@ pub async fn run() -> anyhow::Result<()> {
                 id,
                 call: Call::Init(init),
             } => {
-                let outcome = match session.configure(init) {
-                    Ok(answer) => match bson::serialize_to_bson(&answer) {
-                        Ok(value) => Outcome::Result(value),
-                        Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
-                    },
-                    Err(outcome) => outcome,
+                let answered = match session.configure(init) {
+                    Ok(answer) => Response::Init(answer),
+                    Err(e) => Response::Error(e),
                 };
-                server.respond(id, outcome).await?;
+                server.respond(id, answered).await?;
             }
 
             // Everything else is the guest's to answer, including an `exec` that carries
             // one on: what a paused execution is owed is known by the end holding it, and
             // that is not this one.
             Message::Request { id, call } => {
-                let outcome = match session.booted().await {
+                let answered = match session.booted().await {
+                    // Whatever the guest said, verbatim. It is already a `Response` — the
+                    // frame names its own method — so relaying is handing it on rather
+                    // than re-typing an answer this end did not compose.
                     Ok(guest) => match guest.relay(id, call).await {
-                        Ok(outcome) => outcome,
+                        Ok(answer) => answer,
                         Err(e) => {
                             // No answer is coming, and none will for anything else on this
                             // channel either. Releasing it is what makes the next call a
                             // fresh boot rather than a second failure.
                             session.release();
-                            refused(
+                            Response::Error(refused(
                                 Error::INTERNAL_ERROR,
                                 format!("the channel into the guest failed: {e}"),
-                            )
+                            ))
                         }
                     },
-                    // Already an answer, and already the right one — `booted` chose the
-                    // code because only it knows which of its failures happened.
-                    Err(outcome) => outcome,
+                    // `booted` chose the code, because only it knows which of its failures
+                    // happened.
+                    Err(e) => Response::Error(e),
                 };
-                server.respond(id, outcome).await?;
+                server.respond(id, answered).await?;
             }
 
             // A response answers a request, and this end makes none of its own on the
@@ -168,15 +162,15 @@ pub async fn run() -> anyhow::Result<()> {
 
 /// What a session is here: what the client announced, and whichever guest is up.
 ///
-/// The two are apart because they are wanted at different moments. What [`Init`] carries is
+/// The two are apart because they are wanted at different moments. What [`InitCall`] carries is
 /// the session's shape and costs nothing to hold; a guest is a process, two images and a
 /// couple of hundred megabytes of the host's memory, and the point of `start` and `stop`
 /// being optional is that it may come and go underneath a session that does not change.
 #[derive(Default)]
 struct Session {
     /// What `init` said, or the defaults for a client that never sent one — which is a
-    /// session with nothing delegated, and that is a session.
-    config: Init,
+    /// session that named no tree, and that is a session.
+    config: InitCall,
 
     /// The host directory a `file://` workfs named, or `None` for a session with no tree.
     ///
@@ -209,14 +203,14 @@ impl Session {
     /// Take a new shape, answering what the client has to know about it.
     ///
     /// The URL is read before anything is let go of, so a session this backend cannot take
-    /// is one it has not taken. Otherwise the guest goes: the delegated names are built into
-    /// what the agent linked when it booted, so a guest from before this is a guest that no
-    /// longer matches the session. Dropping it is enough — the next call that needs one
-    /// boots it again, and hears the `init` that has just arrived.
+    /// is one it has not taken. Otherwise the guest goes: the tree is shared into it when it
+    /// boots and the base is the disk it boots on, so a guest from before this is a guest
+    /// that no longer matches the session. Dropping it is enough — the next call that needs
+    /// one boots it again, and hears the `init` that has just arrived.
     ///
     /// **The path answered here is a host path**, and the guest will stand at the same one.
     /// Nothing is mounted or booted by saying so: the share happens when a guest does.
-    fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
+    fn configure(&mut self, config: InitCall) -> Result<InitResp, Error> {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
         let image = base(config.image.as_ref())?;
         let (network, host_ports) = reach(config.network.as_ref())?;
@@ -232,7 +226,7 @@ impl Session {
             .workfs
             .as_deref()
             .map(|path| path.to_string_lossy().into_owned());
-        Ok(InitResult {
+        Ok(InitResp {
             workfs: path.clone().map(|path| WorkFsMount { path }),
             // Where a session starts is its tree, and a guest with no tree stands at `/` —
             // which is what `init::prepare` puts the agent in. Either way this is the same
@@ -259,14 +253,15 @@ impl Session {
     /// A guest with this session's shape, booting one if nothing has.
     ///
     /// The `init` replay is part of booting and not a step after it: an agent that has not
-    /// heard one has no delegated names, so a guest that is handed back from here is one
-    /// the session has already been announced to. A replay the agent refuses is a boot that
-    /// failed, for the same reason — there is nothing useful to hand back.
+    /// heard one does not know which tree it is standing in, so a guest that is handed back
+    /// from here is one the session has already been announced to. A replay the agent
+    /// refuses is a boot that failed, for the same reason — there is nothing useful to hand
+    /// back.
     ///
-    /// Returns an [`Outcome`] rather than an error, because two of the ways this fails are
+    /// Returns an [`Error`] and not an `anyhow` one, because two of the ways this fails are
     /// things the protocol has codes for and a client can act on. See below for why they
     /// would otherwise be lost.
-    async fn booted(&mut self) -> Result<&mut Guest, Outcome> {
+    async fn booted(&mut self) -> Result<&mut Guest, Error> {
         if self.guest.is_none() {
             // The tree has to be there before a guest is told to mount it: a directory that
             // is not on this host is the environment being wrong for a session that is
@@ -333,7 +328,7 @@ impl Session {
 /// A session that asked for nothing gets this server's own setting, which is read here so that
 /// the answer to `init` can name it. **The one place the environment is consulted**: what a
 /// session runs on is settled before a boot rather than discovered by one.
-fn base(asked: Option<&ImageSource>) -> Result<Option<Reference>, Outcome> {
+fn base(asked: Option<&ImageSource>) -> Result<Option<Reference>, Error> {
     let reference = match asked {
         Some(asked) => asked.reference.clone(),
         None => match std::env::var(assets::IMAGE_ENV) {
@@ -379,7 +374,7 @@ fn parse_host_ports(value: Option<&str>) -> anyhow::Result<Vec<u16>> {
 /// rather than later, because a reach decides whether a virtio-net device is attached and a
 /// device is attached before a kernel comes up. A client told now can ask for something else;
 /// one told at its first command has already paid for a boot it cannot use.
-fn reach(asked: Option<&NetworkAccess>) -> Result<(Network, Vec<u16>), Outcome> {
+fn reach(asked: Option<&NetworkAccess>) -> Result<(Network, Vec<u16>), Error> {
     let Some(asked) = asked else {
         // Nothing asked, so this server's own setting stands — and is answered back, which is
         // how the client finds out what that was.
@@ -428,7 +423,7 @@ fn reach(asked: Option<&NetworkAccess>) -> Result<(Network, Vec<u16>), Outcome> 
 /// tree is shared into a guest as a directory, so a kind that is not one on this host is a
 /// kind there is nothing to share. What realizes an object store as a directory is a mount,
 /// and mounting is the caller's.
-fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Outcome> {
+fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
     let Some(path) = workfs.file_path() else {
         return Err(refused(
             Error::UNSUPPORTED_WORKFS,
@@ -448,6 +443,7 @@ fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Outcome> {
     Ok(path.to_path_buf())
 }
 
-fn refused(code: i64, message: impl Into<String>) -> Outcome {
-    Outcome::Error(Error::new(code, message))
+/// A refusal, as the `error` a response carries instead of a result.
+fn refused(code: i64, message: impl Into<String>) -> Error {
+    Error::new(code, message)
 }

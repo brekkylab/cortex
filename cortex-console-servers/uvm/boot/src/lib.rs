@@ -33,8 +33,11 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 /// Where a boot writes the guest binary in the boot root, and therefore the path libkrun
-/// execs. Also where the guest puts a copy of itself after its pivot, which is what the
-/// delegated names end up symlinked to.
+/// execs.
+///
+/// It names a file on the boot root and nothing else: the guest pivots onto its own root and
+/// detaches this one, so the path stops existing the moment there is a guest, and nothing on
+/// either side looks for it again.
 pub const GUEST_BIN_PATH: &str = "/.cortex-guest";
 
 /// The virtio-console port carrying the console session.

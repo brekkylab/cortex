@@ -1,11 +1,8 @@
 //! The asking end, over a framed channel: one call out, one response back.
 //!
 //! A client only asks. Nothing arrives on this channel but the answers to what it
-//! asked, so this is a send, a read and a match — no tasks, no locks, no pending
-//! table. A delegated executable is *not* an exception: a server that needs one run
-//! says so in the response to the `exec` it was already going to answer
-//! ([`Progress::Delegated`](crate::console::Progress::Delegated)), so what arrives here
-//! is still only ever a response.
+//! asked — there is no request a server issues — so this is a send, a read and a match:
+//! no tasks, no locks, no pending table.
 //!
 //! The protocol's methods come from [`Client`]. What is here is only what the wire adds:
 //! an id per call, and waiting for the response that brings it back.
@@ -26,13 +23,13 @@
 //! offer: collecting a process is an `await`, and nothing may await on the way out.
 //!
 //! Which is why the process is not a [`Console`]'s. What a session *is* — the methods, the
-//! delegated names, walking the delegation chain — is the same wherever a server runs;
-//! something to `wait` for exists only because this transport is a pipe to a child. A
-//! transport into a micro-VM guest is a channel with no process behind it, and a `Console`
-//! over one should not carry a field for a thing that does not exist.
+//! tree they are spelled against — is the same wherever a server runs; something to `wait`
+//! for exists only because this transport is a pipe to a child. A transport into a
+//! micro-VM guest is a channel with no process behind it, and a `Console` over one should
+//! not carry a field for a thing that does not exist.
 //!
-//! [`Console`] is this plus the names a server may call back into, and is what a caller
-//! normally wants.
+//! [`Console`] is this plus the session it was built with, and is what a caller normally
+//! wants.
 //!
 //! [`Console`]: crate::console::Console
 //! [`kill_on_drop`]: tokio::process::Command::kill_on_drop
@@ -46,7 +43,7 @@ use tokio::{
 };
 
 use crate::console::{
-    Call, Client, Failure, Message, Notification, Outcome, RequestId,
+    Call, Client, Failure, Message, Notification, RequestId, Response,
     stdio::{read, write},
 };
 
@@ -155,7 +152,7 @@ impl StdioClient {
     /// Split from [`call`](Client::call) so that the id can be spent before this runs and
     /// handed back whichever way this goes — a `?` in here would otherwise take the
     /// number with it.
-    async fn round_trip(&mut self, id: RequestId, call: Call) -> Result<Outcome, Failure> {
+    async fn round_trip(&mut self, id: RequestId, call: Call) -> Result<Response, Failure> {
         self.send(&Message::Request { id, call }).await?;
 
         loop {
@@ -166,10 +163,20 @@ impl StdioClient {
             };
 
             match message {
+                // An [`Error`](crate::console::Response::Error) becomes a
+                // [`Refused`](Failure::Refused) here rather than travelling on as a
+                // `Response`: a caller of this method wanted the answer, and "there is
+                // none" is the one thing every caller handles the same way, alongside a
+                // channel that broke. Which of the two it was is what `Failure` says.
                 Message::Response {
                     id: answered,
-                    outcome,
-                } if answered == id => return Ok(outcome),
+                    result,
+                } if answered == id => {
+                    return match result {
+                        Response::Error(error) => Err(Failure::Refused(error)),
+                        answer => Ok(answer),
+                    };
+                }
 
                 Message::Response { id: answered, .. } => eprintln!(
                     "console: a response arrived for request {answered}, which nobody made"
@@ -195,15 +202,14 @@ impl Client for StdioClient {
     /// The whole round trip is one future over both descriptors, which is what makes the
     /// pairing sound: nothing else can put a frame on the wire between the request and
     /// the response that answers it, because nothing else holds the borrow.
-    fn call(&mut self, call: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
+    fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Response, Failure>> {
         Box::pin(async move {
             // Spent before the send rather than after the answer, so a call that fails
-            // part way does not leave its id for the next one to reuse — and so that it
-            // is there to report either way.
+            // part way does not leave its id for the next one to reuse.
             let id = self.next_id;
             self.next_id += 1;
 
-            (id, self.round_trip(id, call).await)
+            self.round_trip(id, call).await
         })
     }
 
@@ -267,9 +273,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::console::{
-        Error, Exec, ExecCmd, ExecResult, Init, InitResult, Method, Progress, Read,
-    };
+    use crate::console::{Error, ExecCall, ExecResp, InitCall, InitResp, Method, ReadCall};
 
     /// Everything the client wrote, readable after it has been dropped or not — a
     /// `Vec` cannot be, once the client owns it.
@@ -323,27 +327,15 @@ mod tests {
         (StdioClient::over(Cursor::new(bytes), sent.clone()), sent)
     }
 
-    /// An execution that finished without delegating anything, which is the only shape
-    /// this end can see without something out here resolving a name.
+    /// An execution that ran and ended, which is what a server answers an `exec` with.
     fn ran(id: RequestId, stdout: &[u8]) -> Message {
         Message::Response {
             id,
-            outcome: Outcome::Result(
-                bson::serialize_to_bson(&Progress::Done(ExecResult {
-                    code: 0,
-                    stdout: stdout.to_vec(),
-                    ..ExecResult::default()
-                }))
-                .unwrap(),
-            ),
-        }
-    }
-
-    /// The [`ExecResult`] of a finished execution, or a panic if it was not one.
-    fn done(progress: Progress) -> ExecResult {
-        match progress {
-            Progress::Done(result) => result,
-            Progress::Delegated(exec) => panic!("still delegating {:?}", exec.cmd),
+            result: Response::Exec(ExecResp {
+                code: 0,
+                stdout: stdout.to_vec(),
+                ..ExecResp::default()
+            }),
         }
     }
 
@@ -352,7 +344,7 @@ mod tests {
     fn initialized(id: RequestId) -> Message {
         Message::Response {
             id,
-            outcome: Outcome::Result(bson::serialize_to_bson(&InitResult::default()).unwrap()),
+            result: Response::Init(InitResp::default()),
         }
     }
 
@@ -363,24 +355,17 @@ mod tests {
     async fn a_session_is_init_then_execs() {
         let (mut client, sent) = driving(&[initialized(0), ran(1, b"hi\n")]).await;
 
-        client
-            .init(Init {
-                delegated: vec!["foo".into()],
-                ..Init::default()
-            })
-            .await
-            .unwrap();
+        client.init(InitCall::default()).await.unwrap();
         client.start().await.unwrap();
-        // The id comes back with the answer, and it is the one the request went out
-        // under: `init` took zero, and the two notifications between them take none.
-        let (id, result) = client
-            .exec(Exec {
-                cmd: ExecCmd::New(vec!["sh".into(), "-c".into(), "echo hi".into()]),
-                ..Exec::default()
+        // The `exec` goes out under id 1: `init` took zero, and the two notifications
+        // between them take none.
+        let result = client
+            .exec(ExecCall {
+                cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
+                ..ExecCall::default()
             })
             .await;
-        assert_eq!(id, 1);
-        assert_eq!(done(result.unwrap()).stdout, b"hi\n");
+        assert_eq!(result.unwrap().stdout, b"hi\n");
         client.stop().await.unwrap();
         client.quit().await.unwrap();
 
@@ -401,15 +386,15 @@ mod tests {
     async fn a_refusal_is_an_answer_and_a_closed_channel_is_not() {
         let (mut client, _) = driving(&[Message::Response {
             id: 0,
-            outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
+            result: Response::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
         }])
         .await;
-        let failure = client.exec(Exec::default()).await.1.unwrap_err();
+        let failure = client.exec(ExecCall::default()).await.unwrap_err();
         assert_eq!(failure.code(), Some(Error::TIMED_OUT));
 
         // Nothing at all: the server closed without answering.
         let (mut client, _) = driving(&[]).await;
-        let failure = client.exec(Exec::default()).await.1.unwrap_err();
+        let failure = client.exec(ExecCall::default()).await.unwrap_err();
         assert_eq!(failure.code(), None);
         assert!(
             failure.to_string().contains("before answering request 0"),
@@ -422,15 +407,15 @@ mod tests {
     #[tokio::test]
     async fn a_client_answers_nothing() {
         let (mut client, _) = driving(&[ran(99, b"who asked"), ran(0, b"mine\n")]).await;
-        let result = done(client.exec(Exec::default()).await.1.unwrap());
+        let result = client.exec(ExecCall::default()).await.unwrap();
         assert_eq!(result.stdout, b"mine\n");
 
         let (mut client, _) = driving(&[Message::Request {
             id: 1,
-            call: Call::Exec(Exec::default()),
+            call: Call::Exec(ExecCall::default()),
         }])
         .await;
-        let failure = client.exec(Exec::default()).await.1.unwrap_err();
+        let failure = client.exec(ExecCall::default()).await.unwrap_err();
         assert!(failure.to_string().contains("cannot answer"), "{failure}");
     }
 
@@ -459,18 +444,16 @@ mod tests {
         StdioClient::new(ends_well).unwrap().quit().await.unwrap();
     }
 
-    /// An id is spent whether or not its call worked, so a failed call cannot leave
-    /// its number for the next one to reuse — and it is reported either way, which is
-    /// why it is outside the `Result`.
+    /// An id is spent whether or not its call worked, so a failed call cannot leave its
+    /// number for the next one to reuse — which is visible only on the wire, since a
+    /// caller is handed the answer and not the number.
     #[tokio::test]
     async fn a_failed_call_still_spends_its_id() {
         // Nothing is ever answered, so both calls fail — after their requests have
         // already gone out, which is the part that matters.
         let (mut client, sent) = driving(&[]).await;
-        let (failed, outcome) = client.exec(Exec::default()).await;
-        assert_eq!(failed, 0);
-        assert!(outcome.is_err());
-        assert!(client.read(Read::default()).await.is_err());
+        assert!(client.exec(ExecCall::default()).await.is_err());
+        assert!(client.read(ReadCall::default()).await.is_err());
 
         assert_eq!(
             sent.messages().await,
