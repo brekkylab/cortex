@@ -10,12 +10,11 @@
 //!   `cortex`'s build script cannot supply it for this binary. Measured: adding it there
 //!   leaves this binary with no `LC_RPATH` at all.
 //! - `DYLD_FALLBACK_LIBRARY_PATH` would paper over it, and cannot be relied on: macOS
-//!   strips every `DYLD_*` variable when it executes a system binary, and a console runs
-//!   commands through `/bin/sh`. A delegated name re-executes this binary from there, so
-//!   it is exactly the path that loses the variable.
+//!   strips every `DYLD_*` variable when it executes a system binary, so anything reached
+//!   through `/bin/sh` loses it.
 //!
-//! Without this, a session with a mounted namespace can run commands but cannot serve a
-//! single delegated call: the shim aborts in dyld before it reaches `main`.
+//! Without this, a build with the `fuse-t` feature aborts in dyld before it reaches
+//! `main`.
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");

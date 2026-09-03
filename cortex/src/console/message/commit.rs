@@ -24,7 +24,7 @@ use super::ImageSource;
 /// guest, being *able* to answer this is something arranged while booting — and a boot has
 /// long happened by the time this arrives.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Commit {
+pub struct CommitCall {
     /// What the image will be called by, as the client chose it.
     pub id: String,
 
@@ -43,15 +43,39 @@ pub struct Commit {
 }
 
 /// What the commit made. The `result` of `commit`.
+///
+/// # Why the image is optional
+///
+/// **Two ends fill this in, and neither can fill in the other's half.** On a backend that runs
+/// commands somewhere else, the end that walks the filesystem and writes the layer is inside
+/// that somewhere — and it has no idea what an image *is*. It knows it wrote a tar and how big
+/// the tar was. Naming the image takes a layer store and a stitch, which are the outer end's.
+///
+/// So the inner end answers a [`size`](Self::size) and no image, and the outer end fills the
+/// image in on the way past. One shape for one method, which is what the rest of this protocol
+/// does — and the `Option` says exactly which half is whose rather than leaving a member that
+/// is sometimes a lie.
+///
+/// A client sees this only after the outer end has been through it, so an image it does not
+/// carry is a backend that answered wrongly rather than a case to handle.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommitResult {
+pub struct CommitResp {
+    /// How big the layer this session wrote is, in bytes.
+    ///
+    /// Enough to tell an empty commit from a missing one, which is the difference between a
+    /// session that wrote nothing and a session whose layer never arrived.
+    pub size: u64,
+
     /// The image, spelled the way a later session would name it.
     ///
     /// Answered rather than left for the client to build, for the reason
-    /// [`InitResult`](super::InitResult) answers where the workfs went: how a server spells
+    /// [`InitResp`](super::InitResp) answers where the workfs went: how a server spells
     /// something it made is the server's, and a client assembling the string itself would be
     /// a second place that has to agree.
-    pub image: ImageSource,
+    ///
+    /// `None` only between the two ends — see above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageSource>,
 }
 
 #[cfg(test)]
@@ -62,14 +86,14 @@ mod tests {
 
     #[test]
     fn a_commit_carries_the_name_it_will_be_known_by() {
-        let commit = Commit {
+        let commit = CommitCall {
             id: "sha256:abc".into(),
             env: vec!["TZ=UTC".into()],
             working_dir: Some("/srv".into()),
         };
         let doc = bson::serialize_to_document(&commit).unwrap();
         assert_eq!(
-            bson::deserialize_from_document::<Commit>(doc).unwrap(),
+            bson::deserialize_from_document::<CommitCall>(doc).unwrap(),
             commit
         );
     }
@@ -78,7 +102,7 @@ mod tests {
     /// empty — the rule every other type here follows.
     #[test]
     fn a_commit_that_states_nothing_says_nothing() {
-        let commit = Commit {
+        let commit = CommitCall {
             id: "sha256:abc".into(),
             env: Vec::new(),
             working_dir: None,
@@ -86,20 +110,38 @@ mod tests {
         let written = bson::serialize_to_document(&commit).unwrap();
         assert_eq!(written, doc! {"id": "sha256:abc"});
         assert_eq!(
-            bson::deserialize_from_document::<Commit>(written).unwrap(),
+            bson::deserialize_from_document::<CommitCall>(written).unwrap(),
             commit
         );
     }
 
     #[test]
     fn a_result_names_the_image_that_was_made() {
-        let result = CommitResult {
-            image: ImageSource::new("cortex.local/built@sha256:abc"),
+        let result = CommitResp {
+            size: 4096,
+            image: Some(ImageSource::new("cortex.local/built@sha256:abc")),
         };
         let written = bson::serialize_to_document(&result).unwrap();
         assert_eq!(
-            bson::deserialize_from_document::<CommitResult>(written).unwrap(),
+            bson::deserialize_from_document::<CommitResp>(written).unwrap(),
             result
+        );
+    }
+
+    /// What the inner end answers: a size, and no image, because it has none to give. The
+    /// member is absent rather than null, the way the rest of this protocol leaves out what
+    /// it has nothing to say about.
+    #[test]
+    fn the_end_that_wrote_the_layer_names_no_image() {
+        let wrote = CommitResp {
+            size: 4096,
+            image: None,
+        };
+        let written = bson::serialize_to_document(&wrote).unwrap();
+        assert_eq!(written.get("image"), None);
+        assert_eq!(
+            bson::deserialize_from_document::<CommitResp>(written).unwrap(),
+            wrote
         );
     }
 }

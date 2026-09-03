@@ -20,7 +20,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use cortex::console::{Console, ExecResult, ImageSource};
+use cortex::console::{Console, ExecResp, ImageSource};
 use cortex_uvm_console::built::BuiltStore;
 use cortex_uvm_console::layer::{LayerId, LayerStore};
 use microsandbox_image::tree::{
@@ -155,14 +155,14 @@ async fn session_on(image: &LayerId) -> Console {
         .expect("a session on the stitched image")
 }
 
-async fn out(console: &mut Console, script: &str) -> ExecResult {
+async fn out(console: &mut Console, script: &str) -> ExecResp {
     console
         .exec(["sh", "-c", script], None)
         .await
         .expect("running the command")
 }
 
-fn say(result: &ExecResult) -> String {
+fn say(result: &ExecResp) -> String {
     String::from_utf8_lossy(&result.stdout).trim().to_string()
 }
 

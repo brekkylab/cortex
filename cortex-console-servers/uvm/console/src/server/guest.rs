@@ -44,7 +44,7 @@ use std::{
 };
 
 use cortex::console::{
-    Call, Message, Outcome, RequestId,
+    Call, Message, RequestId, Response,
     stdio::{read, write},
 };
 use cortex_uvm_console::layer::{LayerId, LayerStore};
@@ -249,21 +249,21 @@ impl Guest {
     /// Put one call to the agent and bring its answer back.
     ///
     /// The id is the client's, passed through untouched. Nothing here allocates one and
-    /// nothing here rewrites one: a delegated call is answered by an `exec` naming the
-    /// request the `Delegated` went out on, and that number has to mean the same thing at
-    /// both ends of a relay or it means nothing at all.
+    /// nothing here rewrites one: the client and the agent are the two ends that pair a
+    /// response with its request, and a number rewritten in the middle would be a third
+    /// opinion about which request an answer belongs to.
     ///
     /// Which is also what the check below is for. There is one call outstanding, so an
     /// answer carrying a different id is a peer that has lost its place, and a session
     /// cannot carry on from one.
-    pub async fn relay(&mut self, id: RequestId, call: Call) -> io::Result<Outcome> {
+    pub async fn relay(&mut self, id: RequestId, call: Call) -> io::Result<Response> {
         write(&mut self.outgoing, &Message::Request { id, call }).await?;
 
         match read(&mut self.incoming).await? {
             Some(Message::Response {
                 id: answered,
-                outcome,
-            }) if answered == id => Ok(outcome),
+                result,
+            }) if answered == id => Ok(result),
             Some(Message::Response { id: answered, .. }) => Err(io::Error::other(format!(
                 "the guest answered request {answered}, which is not the {id} it was asked"
             ))),

@@ -8,13 +8,13 @@
 //!
 //! The guest answers a [`GuestCommit`](crate::contract::GuestCommit), which says the tar is
 //! written and how big it is. It cannot answer a
-//! [`CommitResult`](cortex::console::CommitResult), because that names an image and the guest
+//! [`CommitResp`](cortex::console::CommitResp), because that names an image and the guest
 //! has no idea what an image is. So the server replaces the answer on the way past — the same
 //! thing it already does with `init`.
 
 use std::path::Path;
 
-use cortex::console::{Commit, CommitResult, ImageSource};
+use cortex::console::{CommitCall, ImageSource};
 use cortex_uvm_console::built::{BuiltStore, LOCAL_HOST};
 use cortex_uvm_console::layer::{Layer, LayerId, LayerStore};
 
@@ -24,12 +24,12 @@ use cortex_uvm_console::layer::{Layer, LayerId, LayerStore};
 /// the store is the way from an id to the thing — so a caller holding a session does not have
 /// to hold a copy of every layer's data map as well.
 pub async fn keep(
-    commit: &Commit,
+    commit: &CommitCall,
     scratch: &Path,
     base: &[LayerId],
     layers: LayerStore,
     built: BuiltStore,
-) -> anyhow::Result<CommitResult> {
+) -> anyhow::Result<ImageSource> {
     let id = LayerId::parse(&commit.id)?;
     let tar = scratch.join(crate::contract::LAYER_TAR);
     anyhow::ensure!(
@@ -81,9 +81,7 @@ pub async fn keep(
     .await
     .map_err(|e| anyhow::anyhow!("keeping this session's layer: {e}"))??;
 
-    Ok(CommitResult {
-        image: ImageSource::new(format!("{LOCAL_HOST}built@{id}")),
-    })
+    Ok(ImageSource::new(format!("{LOCAL_HOST}built@{id}")))
 }
 
 /// A file that is read once and then gone, whichever way this returns.

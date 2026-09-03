@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use cortex::console::{Console, ExecResult, ImageSource};
+use cortex::console::{Console, ExecResp, ImageSource};
 use tokio::process::Command;
 
 /// Where this host keeps what sessions share.
@@ -48,14 +48,14 @@ async fn session(image: Option<ImageSource>, committable: bool) -> Console {
     builder.build().await.expect("a session")
 }
 
-async fn out(console: &mut Console, script: &str) -> ExecResult {
+async fn out(console: &mut Console, script: &str) -> ExecResp {
     console
         .exec(["sh", "-c", script], None)
         .await
         .expect("running the command")
 }
 
-fn say(result: &ExecResult) -> String {
+fn say(result: &ExecResp) -> String {
     String::from_utf8_lossy(&result.stdout).trim().to_string()
 }
 

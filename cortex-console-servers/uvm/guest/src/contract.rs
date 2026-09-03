@@ -11,15 +11,21 @@
 //! argument vector would work too, but it becomes the guest's kernel command line, which
 //! is size-limited and rejects a newline.
 //!
-//! Nothing that could grow is here. The session — the delegated names, the commands, the
-//! files — arrives on [`PORT_NAME`] as protocol frames, which is what makes this list
-//! stay short.
-
+//! Nothing that could grow is here. The session — the tree, the commands, the files —
+//! arrives on [`PORT_NAME`] as protocol frames, which is what makes this list stay
+//! short.
+//!
 use serde::{Deserialize, Serialize};
 
-/// Where the host writes this binary in the boot root, and therefore the path libkrun
-/// execs. Also where [`init`](crate::init) puts a copy of it on the new root after the
-/// pivot, so the shim symlinks have a file to point at.
+/// Where the host wrote this binary in the boot root.
+///
+/// It is the path libkrun execs, so by the time anything in this crate runs it has already
+/// been used — and an ordinary session detaches the root holding it, which is why this end
+/// long had no name for it.
+///
+/// A **committable** session is the exception, and the reason this is here: it keeps that
+/// root so a commit can reach the overlay's upper through it, which leaves this binary
+/// reachable too. A commit has to leave it out, and cannot leave out what it cannot name.
 pub const GUEST_BIN_PATH: &str = "/.cortex-guest";
 
 /// The virtio-console port carrying the console session. The host holds a socket at the
@@ -72,7 +78,7 @@ pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
 
 /// What a guest answers a `commit` with: the layer is written, and this big.
 ///
-/// Not a [`CommitResult`](cortex::console::CommitResult), which names an image — something
+/// Not a [`CommitResp`](cortex::console::CommitResp), which names an image — something
 /// only the host can make, and only after reading what this wrote. The console server replaces
 /// this with one before the client sees anything, which is what it already does with `init`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

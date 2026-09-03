@@ -103,6 +103,7 @@ dependencies = [
  "bson",
  "cc",
  "futures-core",
+ "libc",
  "pkg-config",
  "serde",
  "tokio",

@@ -27,40 +27,53 @@
 //! It is also now redundant, because a BSON document's first four bytes are its own
 //! length; [`stdio`](super::stdio) has what retiring the header would take.
 //!
-//! The split inside here is the envelope, the methods, and the two things that are
-//! neither:
+//! The split inside here is the envelope, the three things a message can be, and what
+//! is common to all of them:
 //!
 //! - `message` — the envelope every object shares: [`Message`] and its three
 //!   shapes, the [`RequestId`] that pairs a response with its request, and the serde
 //!   impls that put all of it on the wire.
-//! - `method` — the methods and what each of them carries, one file apiece ([`Init`],
-//!   [`Exec`] and [`Progress`], the file plane's [`Read`] and [`Write`], the three that
-//!   carry nothing). [`Method`] names them; [`Call`] is the four that are answered and
-//!   [`Notification`] the three that are not.
-//! - `outcome` — how something ended: [`Outcome`], and the [`Error`] and codes that
-//!   are the second half of it.
+//! - `call` — the asking half: [`Call`], and what each of the four methods sends —
+//!   [`InitCall`] and the vocabulary a session is described in, [`ExecCall`],
+//!   [`ReadCall`], [`WriteCall`].
+//! - `response` — the answering half: [`Response`], and what each of the four answers
+//!   with — [`InitResp`], [`ExecResp`], [`ReadResp`], [`WriteResp`] — or the [`Error`]
+//!   that stands where a result would have been.
+//! - `notification` — [`Notification`], the three that are not answered, and the type
+//!   apiece that says what each of them carries — which today is nothing.
+//! - `method` — [`Method`], the name a method goes by on the wire.
+//! - `error` — why a request could not be answered: [`Error`] and its codes.
+//! - `utils` — what the wire needs that is nobody's method: `bytes`, how a byte payload
+//!   reaches the wire, and `flatten`, how a value writes its own members into an object
+//!   somebody else opened.
 //!
-//! A `Call` and a `Notification` each write and read their own `params`, so adding
-//! a method means touching the side it belongs to and not the envelope. Which of the
-//! two a method is, is the whole of what JSON-RPC's `id` decides, and it is why those
-//! are the types the envelope names — while *what* each method carries is one file of
-//! its own, so that changing a method is one place to look.
+//! A [`Call`] declares its own `params`, a [`Response`] its own `result`, and a
+//! [`Notification`] writes its own — so adding a method means touching the sides it
+//! belongs to and not the envelope. Which of the two shapes a method is, is the whole of
+//! what JSON-RPC's `id` decides, and it is why those are the types the envelope names.
+//!
+//! **The files are split by direction and not by method**, because that is the division a
+//! reader of this protocol has: a client writes calls and reads responses, a server does
+//! the reverse, and neither is ever holding both halves of a method at once. It is also
+//! the division the envelope names, so a file holds exactly what one of those enums can
+//! be — and the two halves of a method stay in step because the answer is written in the
+//! call's own vocabulary, an [`ImageSource`] asked for being an [`ImageSource`] confirmed.
 //!
 //! # What the protocol is
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
-//! | `init` | [`Init`] | [`InitResult`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) |
-//! | `exec` | [`Exec`] | [`Progress`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
-//! | `read` | [`Read`] | [`ReadResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
-//! | `write` | [`Write`] | [`WriteResult`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) |
+//! | `exec` | [`ExecCall`] | [`ExecResp`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `write` | [`WriteCall`] | [`WriteResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `start` | — | *(notification — no response)* | — |
 //! | `stop` | — | *(notification — no response)* | — |
 //! | `quit` | — | *(notification — no response)* | — |
 //!
 //! Every request gets exactly one response, correlated by `id`; the three notifications
 //! have no `id` and nothing answers them. **Every one of them is the client's:** there
-//! is no method a server issues, which is what [`Progress`] is for.
+//! is no method a server issues, and so no direction of asking but the one.
 //!
 //! # Why booting is not a method
 //!
@@ -72,8 +85,8 @@
 //! Neither changes what a session can do; both change what the far end is holding, and
 //! when it paid to hold it:
 //!
-//! - **`stop` gives occupancy back.** What booting took — a guest, a socket, a scratch
-//!   directory — is memory, descriptors and disk on the far end, and it is only worth
+//! - **`stop` gives occupancy back.** What booting took — a guest, a mounted tree, a
+//!   scratch directory — is memory, descriptors and disk on the far end, and it is only worth
 //!   anything while something is running. A client that knows it will be idle hands them
 //!   back and takes them again for the price of one boot when it has work.
 //! - **`start` hides the cold start.** A backend with a kernel to bring up makes the
@@ -87,7 +100,8 @@
 //! asked for that call, as [`BOOT_FAILED`](Error::BOOT_FAILED).
 //!
 //! `init` is the exception and is a call, because it is not about resources. It says what
-//! the session *is* — the delegated names, and the tree it works in — and its response is
+//! the session *is* — the tree it works in, and what its commands run in and may reach —
+//! and its response is
 //! the one thing a client can act on before it has asked for any work: that there is a
 //! server on the far end, that it speaks this protocol, that it has taken what it was told,
 //! and where it will put the tree. That last part is why the answer is read rather than
@@ -102,9 +116,10 @@
 //! *present* — both need a deserializer that can look ahead, which non-self-describing
 //! codecs like postcard and bincode cannot do. A response's `result` type also depends
 //! on the method its `id` was issued for, so reading one means holding it as a value
-//! until the pending request identifies it, which is what [`Outcome`] is.
+//! until the pending request identifies it — a [`Bson`](bson::Bson), which the end that
+//! issued the `id` turns into the type that method returns.
 //!
-//! **A byte type.** An [`ExecResult`]'s output and a file's contents are the bulk of
+//! **A byte type.** An [`ExecResp`]'s output and a file's contents are the bulk of
 //! what this channel carries and neither is text. JSON has no way to say so, which
 //! left base64 — 1.37×, and a spelling that has to be decoded before it is bytes again.
 //! BSON has `Binary`, so they travel as themselves.
@@ -128,8 +143,8 @@
 //! ## Why the `bytes` helper does not ask the codec
 //!
 //! [`is_human_readable`](serde::Serializer::is_human_readable) is the obvious way for
-//! one helper to serve a textual codec and a binary one, and `method`'s `bytes` module
-//! has why it cannot be used: `params` and `result` pass through a `Bson` value before
+//! one helper to serve a textual codec and a binary one, and the `bytes` module has why
+//! it cannot be used: `params` and `result` pass through a `Bson` value before
 //! they reach the wire, and `bson`'s value-level serializer reports itself
 //! human-readable, so the branch would quietly restore base64 at the one place the byte
 //! type was the point.
@@ -139,8 +154,8 @@
 //! An `error` is the only failure channel here, and a numeric `code` is what makes
 //! it usable: a requester branches on the code and shows the `message`. This is
 //! why there is no separate "timed out" or "no such executable" message shape —
-//! they are codes, and adding a fifth outcome shape to say what a number already
-//! says would only be a second thing to keep in sync.
+//! they are codes, and adding a shape to say what a number already says would only be
+//! a second thing to keep in sync.
 //!
 //! It is also what a code is *for* in JSON-RPC, and what the old wire could not
 //! have: 127 for a program that was not there and 126 for one that could not be
@@ -148,38 +163,28 @@
 //! ever proved the failure was the server's. An `error` cannot be mistaken for a
 //! command's own exit status, because it does not carry one.
 //!
-//! # Why execution runs both ways without a request going both ways
+//! # Why an execution is one request and one response
 //!
-//! A delegated executable's behaviour lives in the client, so a command inside the server
-//! that invokes one by name cannot be finished by the server alone. The obvious spelling
-//! is for the server to send an `exec` of its own — and that makes every end of the
-//! channel both a requester and an answerer, with a pending table each and a read loop
-//! that must never block on work only it can unblock.
+//! An `exec` goes out, the command runs wherever the server runs commands, and the answer
+//! to that same request is how it ended. Nothing arrives in between, and nothing on the
+//! answering side is holding a half-finished execution while it waits to be told something.
 //!
-//! [`Progress`] is the spelling that does not. The server *answers* with a
-//! [`Delegated`](Progress::Delegated): a complete, ordinary response to the request the
-//! client is already waiting on, meaning *not finished, and here is what I need*. The
-//! client runs the name and sends another `exec` carrying what it got as an
-//! [`ExecCmd::Resume`], whose answer is the next `Progress`.
+//! That is what leaves every channel here one-directional: the server never issues a
+//! request, so neither end needs a pending table, and neither has a read loop that must
+//! not block on work only it can unblock. It is also why [`Client`](crate::console::Client)
+//! can take `&mut self` honestly — one call outstanding at a time, checked by the borrow
+//! rather than described in a comment.
 //!
-//! Carrying on is a shape of that method's `cmd` and not a `resume` method of its own,
-//! because the two would be the same request under two names: an execution the server is
-//! holding, and the output it was waiting for. What the client has to say is *this is where
-//! the last one got to*, which is what an `exec` is for — and one method fewer is one fewer
-//! place for the two ends to disagree about which of them a response is answering.
-//!
-//! So one channel, one end that asks, one end that answers — and one [`Exec`] type, since
-//! a delegated call is the same shape as any other execution request: a command,
-//! output, a code at the end. One codec for the whole system, and a delegated call
-//! that is not a wire of its own to be translated into this one.
-//!
-//! What it costs is that delegated calls are served one at a time; [`Progress`] has that,
-//! and why it is latency rather than a deadlock.
+//! So the `result` of an `exec` is the execution's ending itself — an [`ExecResp`], with
+//! nothing wrapping it — and what a peer adds to that later is a *member*. Which is the
+//! extension this protocol already handles, since an unknown member is ignored everywhere;
+//! a tagged alternative beside the ending would instead be a shape an older peer could only
+//! fail on.
 //!
 //! # Why a result rather than a stream
 //!
 //! An execution is one request and one answer: everything it wrote arrives at
-//! once, in an [`ExecResult`], when it is over. There are no output chunks and no
+//! once, in an [`ExecResp`], when it is over. There are no output chunks and no
 //! way to watch a command work.
 //!
 //! That is a real capability given up, and it is given up on purpose. The caller
@@ -195,11 +200,11 @@
 //!
 //! - **An execution takes no input.** An exchange — read the prompt, then answer it —
 //!   is not expressible, which is the same trade in the other direction and would be
-//!   incoherent to make differently. An [`Exec`] carries none, so what a command is to
-//!   read goes where it will find it with a [`Write`] beforehand, and what it leaves
-//!   behind comes back with a [`Read`].
+//!   incoherent to make differently. An [`ExecCall`] carries none, so what a command is to
+//!   read goes where it will find it with a [`WriteCall`] beforehand, and what it leaves
+//!   behind comes back with a [`ReadCall`].
 //! - **A command that never ends produces nothing.** `tail -f` has no result to
-//!   send, so [`timeout_ms`](Exec::timeout_ms) is what ends it. Without a timeout
+//!   send, so [`timeout_ms`](ExecCall::timeout_ms) is what ends it. Without a timeout
 //!   such an execution simply never answers, which is why one is worth setting.
 //!
 //! And output is now bounded by [`MAX_PAYLOAD`] rather than unbounded, which for
@@ -207,11 +212,11 @@
 //!
 //! # What is not text
 //!
-//! The output on an [`ExecResult`] and the file contents on a [`Read`] or a [`Write`]
+//! The output on an [`ExecResp`] and the file contents on a [`ReadCall`] or a [`WriteCall`]
 //! are raw `Vec<u8>`, because those are program bytes and nothing may touch them. A
 //! command's name and arguments are required to be UTF-8: they have to become the
 //! `String`s an [`Executable`](crate::exec::Executable) takes, so a name that
-//! could not be one would have nowhere to go. A [`path`](Read::path) is a `String` for
+//! could not be one would have nowhere to go. A [`path`](ReadCall::path) is a `String` for
 //! the practical version of the same reason — the executor turns it into a path for
 //! whatever filesystem it has, and it is the one member of a file call that both ends
 //! have to read rather than carry.
@@ -220,10 +225,19 @@
 //! 1.0×. Getting that is why the codec is BSON and not JSON, which has no byte type and
 //! would have made them base64 at best (1.37×) or `[104,105,10]` at worst (4×).
 
+mod call;
+mod commit;
+mod error;
 mod message;
 mod method;
-mod outcome;
+mod notification;
+mod response;
+mod utils;
 
+pub use call::*;
+pub use commit::*;
+pub use error::*;
 pub use message::*;
 pub use method::*;
-pub use outcome::*;
+pub use notification::*;
+pub use response::*;

@@ -7,9 +7,9 @@
 //! what a message *means* — where a command runs, what a session allows, when something
 //! has booted: none of that is here, and a transport is the last place it should be.
 //!
-//! Each end is only ever the one it is. Delegation does not change that: a server needing
-//! something from the client says so in a [`Progress::Delegated`] — a response, on the
-//! request the client is already waiting on — so nothing here has to be both.
+//! Each end is only ever the one it is. There is no request a server issues, so nothing
+//! here has to be both — no pending table on the answering side, and no listener on the
+//! asking one.
 //!
 //! What is here is only what would otherwise be written once per transport: `init`,
 //! `exec`, `read`, `write`, `start`, `stop` and `quit` follow from `call` and `notify`,
@@ -38,10 +38,9 @@
 //! # One call at a time, and the borrow that says so
 //!
 //! `&mut self` throughout. Nothing here is `&self` with a lock behind it, and that is the
-//! protocol showing through rather than an omission: an id is allocated per call, a
-//! delegated execution owes an answer before anything else may be asked, and a second
-//! caller interleaving a `read` into the middle of that chain would be asking a question
-//! the server has no way to answer.
+//! protocol showing through rather than an omission: there is one call outstanding at a
+//! time, an id is allocated per call, and a second caller interleaving a `read` while a
+//! command runs would be asking a question the server has no way to answer yet.
 //!
 //! An exclusive borrow is how that is said in a signature, and it is checked rather than
 //! documented. A caller wanting concurrency wants a second console.
@@ -51,8 +50,8 @@ use std::io;
 use futures_core::future::BoxFuture;
 
 use crate::console::{
-    Call, Commit, CommitResult, Error, Exec, Init, InitResult, Message, Notification, Outcome,
-    Progress, Read, ReadResult, RequestId, Write, WriteResult,
+    Call, CommitCall, CommitResp, Error, ExecCall, ExecResp, InitCall, InitResp, Message, Method,
+    Notification, ReadCall, ReadResp, RequestId, Response, WriteCall, WriteResp,
 };
 
 /// Why a call produced no result.
@@ -116,79 +115,90 @@ impl From<Error> for Failure {
 /// Two things are a transport's: putting a call on the wire and coming back with the
 /// response that answers *that* call, and putting a notification on the wire. The
 /// rest of the methods below are neither, so they are written once here — which is also
-/// the one place an untyped [`Outcome`] becomes what its method returns.
+/// the one place a [`Response`](crate::console::Response) becomes what its method returns.
 pub trait Client: Send {
-    /// Make one call and wait for its response, and say which id it went out under.
+    /// Make one call and wait for its response.
     ///
     /// Allocating the id and pairing it with what comes back is the transport's, because
-    /// so is anything else that may arrive while it waits. Handing the number back is
-    /// what lets a caller quote a request it has made: a delegated call is answered by
-    /// another `exec` naming the one it carries on from
-    /// ([`ExecCmd::Resume`](crate::console::ExecCmd::Resume)), and the end that resolves a
-    /// delegated name is above the transport that numbered it.
+    /// so is anything else that may arrive while it waits — and the number is a fact about
+    /// the wire and not about the answer, which is why it does not come back out.
     ///
-    /// Outside the `Result`, because an id is spent either way — the request may well be
-    /// on the wire when the answer to it never comes — so it is there to be reported with
-    /// whichever of the two arrives.
+    /// What comes back is a [`Response`](crate::console::Response), typed by the `method`
+    /// the frame echoed — so this end reads an answer without holding a table of what it
+    /// asked. Turning it into the one variant a given method returns is the derived
+    /// methods' below.
+    ///
+    /// An [`Error`](crate::console::Response::Error) arrives as
+    /// [`Refused`](Failure::Refused) rather than as a `Response`, because a caller that got
+    /// no answer has one thing to handle and not two shapes of it — and which of the two
+    /// happened is what `Failure` says.
     ///
     /// Dropping this future part way is dropping the session with it. The call may
     /// already be on the wire, and a transport that owns a descriptor for the length of
     /// a round trip has no way to put back what it half read — so a caller that wants to
-    /// stop waiting stops using the client too. A [`timeout`](Exec::timeout_ms) is what
+    /// stop waiting stops using the client too. A [`timeout`](ExecCall::timeout_ms) is what
     /// bounds an execution; cancelling the wait for one is not.
-    fn call(&mut self, call: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)>;
+    fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Response, Failure>>;
 
     /// Send something nothing answers, so there is nothing to wait for.
     fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>>;
 
-    /// Say what this session is: the names it may call back into, and the tree it works in.
+    /// Say what this session is: the tree it works in, and what its commands run in and
+    /// may reach.
     ///
     /// Nothing is booted or mounted by it. What returning means is that there is a server
     /// on the far end, that it speaks this protocol, and that it has what it was told —
     /// which is the only thing about a session a client can hear before it asks for work.
     ///
-    /// What comes back is where that tree will be: an [`InitResult`], carrying the path
-    /// every later `read`, `write` and reported [`cwd`](Exec::cwd) is spelled in. Whether
-    /// it is the path that was asked for is the server's to decide, which is why it is
-    /// answered rather than assumed.
-    fn init(&mut self, init: Init) -> BoxFuture<'_, Result<InitResult, Failure>> {
-        Box::pin(async move { answered(self.call(Call::Init(init)).await).1 })
+    /// What comes back is where that tree will be: an [`InitResp`], carrying the path
+    /// every later `read` and `write` is spelled in. Whether it is the path that was asked
+    /// for is the server's to decide, which is why it is answered rather than assumed.
+    fn init(&mut self, init: InitCall) -> BoxFuture<'_, Result<InitResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::Init(init)).await? {
+                Response::Init(answer) => Ok(answer),
+                other => Err(mismatched(Method::Init, other)),
+            }
+        })
     }
 
-    /// Run one command, and return how far it got.
+    /// Run one command, and return everything it produced.
     ///
-    /// [`Done`](Progress::Done) is the whole execution; a command that merely failed is
-    /// an `Ok` with a non-zero [`code`](crate::console::ExecResult::code), and a
-    /// [`Refused`](Failure::Refused) is the execution having no result at all.
-    ///
-    /// [`Delegated`](Progress::Delegated) is the execution pausing on a name whose
-    /// behaviour lives out here, and it has to be answered before anything else is
-    /// asked — by another `exec` carrying what the name produced as an
-    /// [`ExecCmd::Resume`](crate::console::ExecCmd::Resume). Resolving those against
-    /// something that knows what a name
-    /// *does* is not a transport's job — that is
-    /// [`Console::exec`](crate::console::Console::exec), which is what a caller
-    /// normally wants.
-    ///
-    /// The [`RequestId`] comes back with it because this is the one method whose caller
-    /// has to quote it: answering a `Delegated` means naming the request that got it.
-    fn exec(&mut self, exec: Exec) -> BoxFuture<'_, (RequestId, Result<Progress, Failure>)> {
-        Box::pin(async move { answered(self.call(Call::Exec(exec)).await) })
+    /// An `Ok` is the whole execution; a command that merely failed is an `Ok` with a
+    /// non-zero [`code`](ExecResp::code), and a [`Refused`](Failure::Refused) is the
+    /// execution having no result at all — it timed out, or there was nothing there to run.
+    fn exec(&mut self, exec: ExecCall) -> BoxFuture<'_, Result<ExecResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::Exec(exec)).await? {
+                Response::Exec(answer) => Ok(answer),
+                other => Err(mismatched(Method::Exec, other)),
+            }
+        })
     }
 
     /// Read part of a file where the executor runs things.
     ///
     /// One message holds the answer, so a file larger than that comes back in pieces:
-    /// [`size`](ReadResult::size) against what arrived says whether there are more,
+    /// [`size`](ReadResp::size) against what arrived says whether there are more,
     /// and a further `read` from further along is how to get them.
-    fn read(&mut self, read: Read) -> BoxFuture<'_, Result<ReadResult, Failure>> {
-        Box::pin(async move { answered(self.call(Call::Read(read)).await).1 })
+    fn read(&mut self, read: ReadCall) -> BoxFuture<'_, Result<ReadResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::Read(read)).await? {
+                Response::Read(answer) => Ok(answer),
+                other => Err(mismatched(Method::Read, other)),
+            }
+        })
     }
 
     /// Put bytes in a file where the executor runs things, and hear how big it is
     /// afterwards.
-    fn write(&mut self, write: Write) -> BoxFuture<'_, Result<WriteResult, Failure>> {
-        Box::pin(async move { answered(self.call(Call::Write(write)).await).1 })
+    fn write(&mut self, write: WriteCall) -> BoxFuture<'_, Result<WriteResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::Write(write)).await? {
+                Response::Write(answer) => Ok(answer),
+                other => Err(mismatched(Method::Write, other)),
+            }
+        })
     }
 
     /// Keep what this session has written, as a base a later session can name.
@@ -196,8 +206,13 @@ pub trait Client: Send {
     /// The one call whose answer outlives the session: everything else here is about work
     /// inside one. A server with nothing to keep — one whose commands run on its own
     /// filesystem — refuses it, and so does a session that did not say it might.
-    fn commit(&mut self, commit: Commit) -> BoxFuture<'_, Result<CommitResult, Failure>> {
-        Box::pin(async move { answered(self.call(Call::Commit(commit)).await).1 })
+    fn commit(&mut self, commit: CommitCall) -> BoxFuture<'_, Result<CommitResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::Commit(commit)).await? {
+                Response::Commit(answer) => Ok(answer),
+                other => Err(mismatched(Method::Commit, other)),
+            }
+        })
     }
 
     /// Boot now, to hide the cold start.
@@ -216,8 +231,8 @@ pub trait Client: Send {
 
     /// Release what booting took, to stop occupying it while nothing is running.
     ///
-    /// The other half of [`start`](Self::start)'s trade: a guest, a socket and a scratch
-    /// directory are memory, descriptors and disk held on the far end, and the next call
+    /// The other half of [`start`](Self::start)'s trade: a guest, a mounted tree and a
+    /// scratch directory are memory, descriptors and disk held on the far end, and the next call
     /// that needs a booted session boots one — so handing them back costs one boot later
     /// and nothing else.
     fn stop(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
@@ -230,20 +245,20 @@ pub trait Client: Send {
     }
 }
 
-/// What a [`call`](Client::call) came to, as the type the method returns.
+/// A peer that answered one method with another's result.
 ///
-/// The half of a derived method that is the same for all of them: an [`Outcome`] is
-/// untyped on the wire because a `result` is typed by the method its `id` was issued for,
-/// and each method above is the one place that knows which type that is. A `result` that
-/// will not deserialize becomes an [`INTERNAL_ERROR`](Error::INTERNAL_ERROR) — see
-/// [`Outcome::take`].
-///
-/// The id passes through untouched, so a method that has to report which call this was
-/// still can.
-fn answered<T: serde::de::DeserializeOwned>(
-    (id, outcome): (RequestId, Result<Outcome, Failure>),
-) -> (RequestId, Result<T, Failure>) {
-    (id, outcome.and_then(|o| o.take().map_err(Failure::from)))
+/// Unreachable against a peer that is keeping its place — one call is outstanding, and the
+/// transport already dropped anything not carrying its `id` — so this is a peer that has
+/// lost track of itself and there is nothing usable either way. That is what
+/// [`INTERNAL_ERROR`](Error::INTERNAL_ERROR) is for, and the reason belongs in a log.
+fn mismatched(wanted: Method, got: Response) -> Failure {
+    Failure::from(Error::new(
+        Error::INTERNAL_ERROR,
+        match got.method() {
+            Some(answered) => format!("asked {wanted} and was answered a {answered} result"),
+            None => format!("asked {wanted} and was answered nothing this end can read"),
+        },
+    ))
 }
 
 /// The answering end of a channel: take what arrived, put an answer out.
@@ -260,5 +275,13 @@ pub trait Server: Send {
     fn recv(&mut self) -> BoxFuture<'_, io::Result<Option<Message>>>;
 
     /// Put out one response, with the id of the request it answers.
-    fn respond(&mut self, id: RequestId, outcome: Outcome) -> BoxFuture<'_, io::Result<()>>;
+    ///
+    /// One value and not a `Result` around one: a
+    /// [`Response`](crate::console::Response) is the answer *or* the
+    /// [`Error`](crate::console::Response::Error) saying there is none, which is the whole
+    /// of what a response can be — see [`Response`](crate::console::Response).
+    ///
+    /// It is also what a backend that *relays* one hands straight on. A response names its
+    /// own method, so a relay never has to re-type an answer it did not compose.
+    fn respond(&mut self, id: RequestId, result: Response) -> BoxFuture<'_, io::Result<()>>;
 }
