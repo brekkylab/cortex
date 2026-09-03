@@ -349,7 +349,7 @@ fn base(asked: Option<&ImageSource>) -> Result<Option<Reference>, Error> {
 /// read from its own environment like `CORTEX_UVM_IMAGE` and answered back at `init`.
 const NETWORK: &str = "CORTEX_UVM_NETWORK";
 
-/// The host TCP ports a session gets when its client did not say. ReadCall here for the same reason
+/// The host TCP ports a session gets when its client did not say. Read here for the same reason
 /// as [`NETWORK`], and parsed here because a boot is handed the ports and not the string.
 const HOST_PORTS: &str = "CORTEX_UVM_HOST_PORTS";
 

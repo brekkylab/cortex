@@ -445,16 +445,6 @@ fn cd_target(exec: &ExecCall) -> Option<&[String]> {
     }
 }
 
-/// The directory a workfs URL names, or why it names none this server can use.
-///
-/// `file://` and nothing else, which is the whole of what this build realizes — and the
-/// scheme is where that is decided, not the path, so anything else is
-/// [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) naming what was asked for.
-///
-/// Reading the URL is [`WorkFsSource`]'s, so that this server and any other realize the same
-/// string the same way. What is left here is the two refusals, which are this build's: a
-/// scheme it has no provider for, and a path that is not absolute — `file://srv/x`, whose
-/// authority is not something this can honour and whose path two ends would resolve
 /// A base a session named, refused, because there is nothing here to be one.
 ///
 /// A command on this backend is a process on this host, running against the filesystem this
@@ -479,7 +469,6 @@ fn base(asked: Option<&ImageSource>) -> Result<(), Error> {
     ))
 }
 
-/// differently.
 /// Refuse any reach but `full`, which is the only one a host-local session has.
 ///
 /// A command here is a process on this host, sharing this host's network with everything else
@@ -514,6 +503,17 @@ fn reach(asked: Option<&NetworkAccess>) -> Result<(), Error> {
     ))
 }
 
+/// The directory a workfs URL names, or why it names none this server can use.
+///
+/// `file://` and nothing else, which is the whole of what this build realizes — and the
+/// scheme is where that is decided, not the path, so anything else is
+/// [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) naming what was asked for.
+///
+/// Reading the URL is [`WorkFsSource`]'s, so that this server and any other realize the same
+/// string the same way. What is left here is the two refusals, which are this build's: a
+/// scheme it has no provider for, and a path that is not absolute — `file://srv/x`, whose
+/// authority is not something this can honour and whose path two ends would resolve
+/// differently.
 fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
     let Some(path) = workfs.file_path() else {
         return Err(refused(

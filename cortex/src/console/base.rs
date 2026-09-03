@@ -176,7 +176,7 @@ pub trait Client: Send {
         })
     }
 
-    /// ReadCall part of a file where the executor runs things.
+    /// Read part of a file where the executor runs things.
     ///
     /// One message holds the answer, so a file larger than that comes back in pieces:
     /// [`size`](ReadResp::size) against what arrived says whether there are more,

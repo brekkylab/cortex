@@ -63,7 +63,7 @@ use crate::{
 
 /// Guest vCPUs and memory, if this server was told to override the boot's own defaults.
 ///
-/// ReadCall here and passed on, rather than left for the child to find in the environment it
+/// Read here and passed on, rather than left for the child to find in the environment it
 /// inherits: a value the boot is given is a value the server can be asked what it sent.
 const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
 const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
@@ -258,7 +258,7 @@ impl Drop for Socket {
     }
 }
 
-/// ReadCall the agent's greeting, which is the first thing on the channel and not a frame.
+/// Read the agent's greeting, which is the first thing on the channel and not a frame.
 async fn greeting(incoming: &mut BufReader<OwnedReadHalf>) -> anyhow::Result<()> {
     let mut greeting = [0u8; HANDSHAKE.len()];
     incoming.read_exact(&mut greeting).await.map_err(|e| {

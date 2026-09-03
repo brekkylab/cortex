@@ -504,7 +504,7 @@ impl Console {
         self.client.exec(exec).await
     }
 
-    /// ReadCall part of a file where commands run.
+    /// Read part of a file where commands run.
     ///
     /// The path is the server's — under [`workfs_path`](Self::workfs_path), which is what a
     /// caller joins onto — so this names the file a command would open by the same name, and

@@ -98,7 +98,7 @@ use crate::console::{MAX_PAYLOAD, Message};
 /// The length prefix: a big-endian `u32`.
 pub const HEADER: usize = 4;
 
-/// WriteCall one frame and flush it.
+/// Write one frame and flush it.
 ///
 /// Header and payload go out in two calls rather than one, which avoids copying a
 /// payload that may be megabytes only to write it once. That costs one rule: a
@@ -120,7 +120,7 @@ where
     w.flush().await
 }
 
-/// ReadCall one frame. `Ok(None)` is a clean end of channel.
+/// Read one frame. `Ok(None)` is a clean end of channel.
 ///
 /// The length is read first and then exactly that many bytes, so a frame cannot
 /// run into the one after it however the payload is spelled.

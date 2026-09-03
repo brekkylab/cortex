@@ -165,7 +165,7 @@ fn environment(caller: &BTreeMap<String, String>, cwd: Option<&str>) -> Vec<(Str
 /// [`ExecCall::env`] is a report — what the invoking command had, wherever it ran — and applying
 /// it wholesale would put another machine's `PATH`, `HOME` and dynamic loader settings on a host
 /// process. So the default is to forward, minus two things: the names this host has to answer
-/// itself and the dynamic loaders — [`environment`] is the whole of it. Forwarding is the
+/// itself and the dynamic loaders — `environment` below is the whole of it. Forwarding is the
 /// default because it is what makes a registered name behave like a program on `PATH` rather
 /// than almost like one — `FOO=bar` reaches the program, and so does whatever vocabulary that
 /// particular tool has, which no table here could have known to list.
@@ -189,8 +189,8 @@ fn environment(caller: &BTreeMap<String, String>, cwd: Option<&str>) -> Vec<(Str
 /// program that reads: it sees EOF, and an interactive one cannot be registered at all. What a
 /// program is to read goes into the tree it was handed, and its path goes on the command line.
 ///
-/// Output is collected whole and capped at [`OUTPUT_LIMIT`]. Truncation is reported on stderr,
-/// because an [`ExecResult`] has no other channel for it.
+/// Output is collected whole and capped at `OUTPUT_LIMIT` (8 MiB a stream). Truncation is
+/// reported on stderr, because an [`ExecResult`] has no other channel for it.
 ///
 /// # What it needs of the runtime
 ///
