@@ -31,6 +31,97 @@ fn file_row(name: &str, id: &str, mime: &str) -> Value {
     })
 }
 
+/// A name too long to serve is cut here, and cutting forces a tag.
+///
+/// The mount hands names to macOS decomposed, where Korean costs six or nine bytes a
+/// character against three composed — so a name Drive holds well inside the limit can
+/// arrive over it. Measured on one account: 108 bytes stored, 258 served, against a
+/// `NAME_MAX` of 255. Nothing below this store enforces that limit — the 258-byte name
+/// listed fine — but `cp`, `tar` and `rsync` write to filesystems that do.
+///
+/// The tag is not decoration on a cut name. Two different names can share the prefix that
+/// survives the cut, so what is left is not something this code can call unique; the tag
+/// is what makes it so, and the cut leaves room for one.
+#[test]
+fn a_name_too_long_to_serve_is_cut_and_tagged() {
+    // Composed this fits and decomposed it does not, which is the whole case.
+    let long = "한".repeat(60);
+    assert!(
+        long.len() <= NAME_BUDGET,
+        "inside the budget as Drive holds it"
+    );
+    assert!(
+        served_name_len(&long) > NAME_BUDGET,
+        "and outside it as the mount serves it, or this test watches nothing"
+    );
+
+    let mut kids = vec![
+        child_from_file(&file_row(
+            &format!("{long}.pdf"),
+            "aaaaaaaaaa11",
+            "application/pdf",
+        ))
+        .unwrap(),
+        // Another long name sharing that prefix: the cut leaves these two the same.
+        child_from_file(&file_row(
+            &format!("{long}다른꼬리.pdf"),
+            "bbbbbbbbbb22",
+            "application/pdf",
+        ))
+        .unwrap(),
+        child_from_file(&file_row("짧은.pdf", "cccccccccc33", "application/pdf")).unwrap(),
+        // A long name with no prefix-sharing sibling. After the cut its group holds one,
+        // so the collision rule has nothing to say about it — only the cut itself does.
+        child_from_file(&file_row(
+            &format!("{}.pdf", "다".repeat(60)),
+            "dddddddddd44",
+            "application/pdf",
+        ))
+        .unwrap(),
+    ];
+    disambiguate(&mut kids);
+
+    for c in &kids[..2] {
+        assert!(
+            served_name_len(&c.vfs_name) <= NAME_BUDGET,
+            "{} is over {NAME_BUDGET}: {} bytes",
+            c.vfs_name,
+            served_name_len(&c.vfs_name)
+        );
+        assert!(
+            c.vfs_name.contains(&format!("_{}", id_tag(&c.id))),
+            "a cut name carries a tag: {}",
+            c.vfs_name
+        );
+        assert!(
+            c.vfs_name.ends_with(".pdf"),
+            "and keeps its extension: {}",
+            c.vfs_name
+        );
+    }
+    assert_ne!(
+        kids[0].vfs_name, kids[1].vfs_name,
+        "the tag tells apart what the cut left the same"
+    );
+    assert_eq!(
+        kids[2].vfs_name, "짧은.pdf",
+        "a name inside the budget is not touched"
+    );
+
+    // Cut and alone, and tagged anyway.
+    let lone = &kids[3];
+    assert!(
+        served_name_len(&lone.vfs_name) <= NAME_BUDGET,
+        "{}",
+        lone.vfs_name
+    );
+    assert!(
+        lone.vfs_name.contains(&format!("_{}", id_tag(&lone.id))),
+        "nothing collides with it and it is tagged all the same: {}",
+        lone.vfs_name
+    );
+}
+
 /// What one Drive row becomes on the mount.
 ///
 /// A file with bytes keeps its own name and Drive's own size — in *bytes*, which is the

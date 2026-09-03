@@ -14,7 +14,7 @@ use unicode_normalization::UnicodeNormalization;
 use super::accessor::{GdriveAccessor, GdriveConfig, MAX_DOCUMENT_BYTES};
 use crate::{
     BoxFuture,
-    fs::{Dirent, DirentKind, FileSystem, Stat},
+    fs::{Dirent, DirentKind, FileSystem, Stat, filesystem::posix::NAME_MAX},
 };
 
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
@@ -184,6 +184,19 @@ const MAX_FOLDER_FILES: usize = 10_000;
 /// How many characters of a Drive id a colliding name carries. See [`id_tag`], which
 /// takes them from the end for a measured reason.
 const ID_TAG_LEN: usize = 8;
+
+/// The longest name this store will hand out, measured the way the mount measures it.
+///
+/// [`NAME_MAX`] is what `statfs` reports, and nothing below enforces it — a 258-byte name
+/// listed fine in testing. The reason to keep to it anyway is what happens on the way
+/// *out*: `cp`, `tar` and `rsync` write to filesystems that do enforce 255, and a name
+/// over it fails there rather than here.
+///
+/// Counted decomposed, because that is the form the mount emits and it is not the form
+/// Drive stores. Korean costs three bytes a character composed and six or nine
+/// decomposed, so a name that fits comfortably as Drive holds it can be half again too
+/// long once served — measured on one account, 108 bytes arriving as 258.
+const NAME_BUDGET: usize = NAME_MAX as usize;
 
 /// Whether Drive holds real bytes for this row. The Docs-editors types (and Forms,
 /// Maps, Drawings) do not — `alt=media` answers *"Only files with binary content can be
@@ -1279,7 +1292,41 @@ fn sanitize_name(name: &str) -> String {
 /// Underneath both, a folder that also holds a file literally named like a tagged one
 /// still falls through to numbering. That is set-dependent, as the whole-id step is —
 /// but leaving two entries under one name is worse than renaming one of them.
+/// What this name costs the mount, which serves decomposed.
+fn served_name_len(name: &str) -> usize {
+    name.nfd().map(char::len_utf8).sum()
+}
+
+/// Cut `name` down so that it, an `_`, `tag` and its extension fit [`NAME_BUDGET`].
+///
+/// The stem is what gives: the tag is what makes the name unique and the extension is what
+/// keeps it in a glob, so neither can be the part that goes. Characters come off the end
+/// one at a time rather than by a byte count, because a byte slice can land inside one.
+fn shorten_for_tag(name: &str, serves: Serves, tag: &str) -> String {
+    let (stem, ext) = split_extension(name, serves);
+    let fixed = served_name_len(ext) + 1 + tag.len();
+    let mut stem: String = stem.to_string();
+    while !stem.is_empty() && served_name_len(&stem) + fixed > NAME_BUDGET {
+        stem.pop();
+    }
+    format!("{stem}{ext}")
+}
+
 fn disambiguate(children: &mut [Child]) {
+    // A name too long to serve is cut here rather than by whatever writes it out, and
+    // cutting forces a tag: two different names can share the prefix that survives, so
+    // what is left is not something this code can call unique. The tag is what makes it
+    // so, which is why the cut leaves room for one.
+    let mut forced: HashSet<usize> = HashSet::new();
+    for (i, c) in children.iter_mut().enumerate() {
+        if served_name_len(&c.vfs_name) <= NAME_BUDGET {
+            continue;
+        }
+        let tag = id_tag(&c.id).to_string();
+        c.vfs_name = shorten_for_tag(&c.vfs_name, c.serves, &tag);
+        forced.insert(i);
+    }
+
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (i, c) in children.iter().enumerate() {
         groups
@@ -1287,7 +1334,10 @@ fn disambiguate(children: &mut [Child]) {
             .or_default()
             .push(i);
     }
-    for idxs in groups.into_values().filter(|g| g.len() > 1) {
+    for idxs in groups
+        .into_values()
+        .filter(|g| g.len() > 1 || g.iter().any(|i| forced.contains(i)))
+    {
         // Whole ids for the group if a shortened one would repeat inside it.
         let short: HashSet<&str> = idxs.iter().map(|&i| id_tag(&children[i].id)).collect();
         let whole = short.len() != idxs.len();
