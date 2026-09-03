@@ -3,15 +3,13 @@
 //! What arrives here has come a long way — a client's `exec`, framed on the host, handed
 //! to a virtio-console port, read out of a character device in here — and none of that is
 //! visible below. A [`Server`] over the port brings requests in and puts responses out,
-//! and what is left is what is actually this end's: making a delegated name runnable,
-//! running a command, letting a delegated call back out while that command waits for it,
-//! and reading and writing the files a command works with.
+//! and what is left is what is actually this end's: running a command, keeping track of
+//! where the session stands, and reading and writing the files a command works with.
 //!
-//! Which is the same list [`cortex-local-console`]'s server role has, answered the same
-//! way. That is worth stating rather than hiding: the two backends differ in *where* a
-//! command runs and in nothing else, and the code below being recognisable is the shape
-//! of that fact rather than an accident. What should eventually be shared is shared —
-//! see [What is duplicated](#what-is-duplicated).
+//! Which is the same list [`cortex-local-console`]'s server has, answered the same way.
+//! That is worth stating rather than hiding: the two backends differ in *where* a command
+//! runs and in nothing else, and the code below being recognisable is the shape of that
+//! fact rather than an accident. See [What is duplicated](#what-is-duplicated).
 //!
 //! # The channel is a virtio port, not stdin and stdout
 //!
@@ -30,23 +28,25 @@
 //! has to be told when reading has started, and there is nothing in the protocol for this
 //! end to say first.
 //!
-//! # Running the command, and pausing it
+//! # Running the command
 //!
-//! [`Command`], captured — but spawned rather than run to completion, because a delegated
-//! call arrives *while* it runs and has to be answered before it can finish. So an
-//! execution is a [`select!`](tokio::select) over the two things that can happen next: a
-//! shim connects, or the command ends.
+//! [`Command`], captured: spawned, both pipes drained, and one response when it ends. An
+//! execution is one request and one answer, so there is nothing to interleave and nothing
+//! to hold — which is what makes [`execute`] a function of the request rather than
+//! something threaded through the channel.
 //!
-//! The command is waited for in a task of its own rather than in a branch of that
-//! `select!`. Waiting for it means draining its stdout and stderr as they fill, and a
-//! command that fills a pipe while nobody is reading it stops there — which would happen
-//! every time an execution paused on a delegated call, since answering one is round trips
-//! on the console channel and not polling of anything else. A task keeps the pipes moving
-//! throughout, and what the `select!` waits on is the task ending.
+//! # Where the session stands
 //!
-//! Shims first, when both are ready: a connection that arrived is a delegated call that
-//! has not been answered, and the process behind it is still waiting to hear. Reporting
-//! the command's ending while one sat unserved would strand it.
+//! It starts at the tree the boot shared, and moves only through
+//! [`cd`](Session::change_dir), which this agent answers itself: `cd` is a shell builtin
+//! rather than a program, so an `exec` carrying an argv has no other way to offer it, and
+//! the shell a person would be talking to is the session. A `cd` inside a command
+//! (`sh -c 'cd x'`) moves that command's own process and nothing else, exactly as a
+//! subshell does in a terminal.
+//!
+//! Nothing is reported about it either way. A `cd` is answered with a code and no output,
+//! the way a terminal answers one, and a client that wants to know where it is runs `pwd`
+//! — which lands here as an ordinary command, in the directory this session is holding.
 //!
 //! # Files
 //!
@@ -60,18 +60,14 @@
 //!
 //! # What is duplicated
 //!
-//! The interleaving loop in [`execute`], the shim socket, the bin directory and the two
-//! file calls are what a host-local console does, in a guest. They are written out again
-//! here rather than shared, and that is a debt with a known payment: the pieces belong in
-//! cortex's console module, as helpers a backend calls, so that a backend implements only
-//! what actually differs — where a command runs, what booting means, what has to be
-//! released. Until then, a fix to one of them is a fix owed to the other.
+//! [`execute`], the `cd` builtin and the two file calls are what a host-local console
+//! does, in a guest. They are written out again here rather than shared, and that is a
+//! debt with a known payment: the pieces belong in cortex's console module, as helpers a
+//! backend calls, so that a backend implements only what actually differs — where a
+//! command runs, what booting means, what has to be released. Until then, a fix to one of
+//! them is a fix owed to the other.
 //!
 //! # What this does not do
-//!
-//! A delegated name is linked **without being checked as a plain path component**, the
-//! same gap [`cortex-local-console`] has and for the same reason: every name that gets
-//! here came from the client, which is in-process with whoever chose them.
 //!
 //! A `read` or a `write` is not confined to anywhere. The path is used as it arrives, so
 //! a client can name any file in the guest — which is a smaller claim than it sounds,
@@ -79,14 +75,9 @@
 //!
 //! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
 //! the fallback, and this agent reads both and applies neither — so a command that never
-//! ends is one this agent waits on forever, and the client waits with it. What it takes
-//! is a bound around the `select!` in [`execute`] and an answer for what a delegated call
-//! already in flight becomes when it expires, which is the part that is a decision and
-//! not a line of code.
+//! ends is one this agent waits on forever, and the client waits with it.
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
-
-mod bin_dir;
 
 use std::ffi::OsString;
 use std::io::{self, SeekFrom};
@@ -95,20 +86,15 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
 
-use bson::Bson;
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, Exec, ExecCmd, ExecResult, Init, InitResult, MAX_PAYLOAD, Message, Notification,
-    Outcome, Progress, Read, ReadResult, RequestId, Server, WorkFsMount, WorkFsSource, Write,
-    WriteResult,
+    Call, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message, Notification,
+    ReadCall, ReadResp, Response, Server, WorkFsMount, WorkFsSource, WriteCall, WriteResp,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
 
-use crate::contract::{GUEST_PATH, HANDSHAKE};
-use crate::ipc::SOCK_ENV;
-use bin_dir::BinDir;
+use crate::contract::{GUEST_PATH, HANDSHAKE, ImageSpec};
 
 /// A command we found but could not start, and one we could not find at all.
 ///
@@ -125,12 +111,23 @@ const NOT_FOUND: i32 = 127;
 /// kibibyte covers those several times over.
 const MAX_DATA: u64 = MAX_PAYLOAD as u64 - 1024;
 
+/// How much of one of a command's two streams a response may carry.
+///
+/// Half of [`MAX_DATA`] apiece, because an [`ExecResp`] carries both and either one can be
+/// the large one. What is over it is dropped and [`ExecResp::truncated`] says so — see
+/// [`finished`].
+const MAX_STREAM: usize = MAX_DATA as usize / 2;
+
 /// Answer requests on `port` until the client says `quit` or the channel closes.
 ///
 /// `port` is the virtio-console port, open read-write. It becomes two halves here, from
 /// one `dup`: the driver refuses a second opener, and the framing wants to read and write
 /// through borrows that do not have to take turns.
-pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
+///
+/// `image` is what the base image stated, read by [`init`](crate::init) while its file was
+/// still reachable. It is the session's for the whole process because it describes the root
+/// every session in here runs on, which no `init` can change.
+pub async fn run(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
     // SAFETY: `dup` hands back a fresh descriptor for the same open file, and the
     // `File` built from it is the only owner of that number.
     let duplicate = unsafe { libc::dup(port.as_raw_fd()) };
@@ -157,13 +154,7 @@ pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
         tokio::fs::File::from_std(outgoing),
     );
 
-    // Bound once, before anything can be running, and kept for the process. See
-    // [`Shims::bind`] for why its lifetime is the process's and not a session's.
-    let shims = Shims::bind()?;
-
-    // Whatever it holds is dropped on `stop` and on the way out of this function
-    // whichever way it leaves, which takes the symlinks with it every time.
-    let mut session = Session::default();
+    let mut session = Session::new(image);
 
     while let Some(message) = server.recv().await? {
         match message {
@@ -175,7 +166,7 @@ pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
             // Nothing answers this, so a failure is only said here — the next call that
             // needs a boot tries again and tells whoever asked for it.
             Message::Notification(Notification::Start) => {
-                if let Err(Outcome::Error(e)) = session.boot() {
+                if let Err(e) = session.boot() {
                     eprintln!(
                         "{}: booting a session: {}",
                         env!("CARGO_BIN_NAME"),
@@ -191,58 +182,44 @@ pub async fn run(port: std::fs::File) -> anyhow::Result<()> {
                 // refused rather than answered with a path, since a path is what every
                 // later call is spelled in. See [`Session::configure`].
                 Call::Init(init) => {
-                    let outcome = match session.configure(init) {
-                        Ok(answer) => encoded(bson::serialize_to_bson(&answer)),
-                        Err(outcome) => outcome,
+                    let answered = match session.configure(init) {
+                        Ok(answer) => Response::Init(answer),
+                        Err(e) => Response::Error(e),
                     };
-                    server.respond(id, outcome).await?;
-                }
-
-                // An `exec` whose `cmd` is an answer rather than a command is read
-                // inside `execute`, by the execution that is waiting for it. Reaching the
-                // main loop means nothing is: the client is carrying on from an execution
-                // this end is not holding.
-                Call::Exec(exec) if matches!(exec.cmd, ExecCmd::Resume { .. }) => {
-                    server
-                        .respond(
-                            id,
-                            refused(
-                                Error::INVALID_REQUEST,
-                                "nothing is waiting on a delegated call, so there is nothing \
-                                 to carry on from",
-                            ),
-                        )
-                        .await?
+                    server.respond(id, answered).await?;
                 }
 
                 Call::Exec(exec) => match session.boot() {
-                    Err(outcome) => server.respond(id, outcome).await?,
+                    Err(e) => server.respond(id, Response::Error(e)).await?,
                     // `cd` is the session's own and not a program: see
                     // [`Session::change_dir`]. It is answered here rather than spawned,
                     // and it is the one thing that moves where the session stands.
                     Ok(()) => match cd_target(&exec) {
                         Some(argv) => {
-                            let outcome = session.change_dir(argv);
-                            server.respond(id, outcome).await?;
+                            let answered = session.change_dir(argv);
+                            server.respond(id, answered).await?;
                         }
-                        None => execute(&mut server, id, &exec, &session, &shims).await?,
+                        None => {
+                            let answered = execute(&exec, &session).await;
+                            server.respond(id, answered).await?
+                        }
                     },
                 },
 
                 Call::Read(read) => {
-                    let outcome = match session.boot() {
+                    let answered = match session.boot() {
                         Ok(()) => read_file(session.cwd(), &read).await,
-                        Err(outcome) => outcome,
+                        Err(e) => Response::Error(e),
                     };
-                    server.respond(id, outcome).await?;
+                    server.respond(id, answered).await?;
                 }
 
                 Call::Write(write) => {
-                    let outcome = match session.boot() {
+                    let answered = match session.boot() {
                         Ok(()) => write_file(session.cwd(), &write).await,
-                        Err(outcome) => outcome,
+                        Err(e) => Response::Error(e),
                     };
-                    server.respond(id, outcome).await?;
+                    server.respond(id, answered).await?;
                 }
             },
 
@@ -266,24 +243,18 @@ fn greet(outgoing: &mut std::fs::File) -> io::Result<()> {
     outgoing.flush()
 }
 
-/// What a session is in here: what the client announced, where it stands, and whatever
-/// booting it took.
+/// What a session is in here: the tree it works in, where it stands in it, the root it
+/// runs on, and whether it has booted.
 ///
-/// The three are apart because they are wanted at different moments. What [`Init`] carries
-/// is the session's shape and costs nothing to hold; where it stands is a path and costs no
-/// more; the directory of symlinks is a real thing on the overlay, and the point of `start`
-/// and `stop` being optional is that it may come and go underneath a session that does not
-/// change.
+/// The [`InitCall`] that produced it is not kept: everything in it that this end acts on is
+/// [`workfs`](Self::workfs), and the base and the reach are answered one boot up by the
+/// server that started this guest — see [`configure`](Self::configure).
 ///
 /// **The same shape the host-local backend has**, deliberately: a client cannot tell which
 /// one answered it, so what a session *is* must not depend on which one did. What differs
 /// between them is only where a command runs, which is the whole of what a backend is for.
 #[derive(Default)]
 struct Session {
-    /// What `init` said, or the defaults for a client that never sent one — which is a
-    /// session with nothing delegated, and that is a session.
-    config: Init,
-
     /// The tree the session works in, as `init` named it — and as it is mounted in here.
     ///
     /// The same path on both sides of the hypervisor: the boot shares the host's directory
@@ -295,17 +266,35 @@ struct Session {
     /// path in a file call resolves against.
     cwd: Option<PathBuf>,
 
-    /// `None` until something boots it: a `start`, or the first call that needs one.
-    linked: Option<BinDir>,
+    /// What the base image stated. A property of the root rather than of the session, so an
+    /// `init` neither sets it nor clears it.
+    image: ImageSpec,
+
+    /// Whether the tree `init` named has been found where the boot put it.
+    ///
+    /// A flag and not a resource, because the mount is the *boot's* — `init::prepare`
+    /// mounted the share before this process started, from what libkrun was told — so what
+    /// happens here is the check and not the mounting. What the flag earns is that the
+    /// check happens once per boot rather than once per request, and that `stop` means the
+    /// same thing here as on a backend where it hands something back.
+    booted: bool,
 }
 
 impl Session {
+    /// A session on the root the image describes, with nothing configured yet.
+    fn new(image: ImageSpec) -> Session {
+        Session {
+            image,
+            ..Session::default()
+        }
+    }
+
     /// Take a new shape, answering what the client has to know about it.
     ///
     /// The URL is read before anything is let go of, so a session this agent cannot take is
-    /// one it has not taken. Otherwise the old boot goes: the delegated names are built into
-    /// the directory, and a boot from before this is a boot that no longer matches.
-    fn configure(&mut self, config: Init) -> Result<InitResult, Outcome> {
+    /// one it has not taken. Otherwise the old boot goes: the tree is what a boot checked
+    /// for, and a boot from before this is a boot that no longer matches.
+    fn configure(&mut self, config: InitCall) -> Result<InitResp, Error> {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
 
         self.release();
@@ -313,13 +302,19 @@ impl Session {
         // set to `/`. Saying so beats leaving the client to guess what a relative path means.
         self.cwd = workfs.clone().or_else(|| std::env::current_dir().ok());
         self.workfs = workfs;
-        self.config = config;
 
-        Ok(InitResult {
+        Ok(InitResp {
             workfs: self.workfs.as_deref().map(|path| WorkFsMount {
                 path: path.to_string_lossy().into_owned(),
             }),
             cwd: self.named_cwd(),
+            // Nothing to say: this agent is running *inside* the base and never heard which
+            // one it is. The answer the client sees is the console server's, one boot up.
+            image: None,
+            // Not this end's to say. What it has is an interface or no interface; which reach
+            // that interface is behind is a policy on the far side of the device, and the host
+            // is what answers the client about it.
+            network: None,
         })
     }
 
@@ -333,30 +328,25 @@ impl Session {
         self.cwd().and_then(|cwd| cwd.to_str().map(str::to_owned))
     }
 
-    /// What booting produced, for the one thing outside this type that needs it.
-    fn linked(&self) -> Option<&BinDir> {
-        self.linked.as_ref()
-    }
-
+    /// Forget that the tree was checked for.
+    ///
+    /// Which is the whole of what a `stop` gives back in here — the share is the boot's and
+    /// stays mounted — so this is not the release it is on the host side, where a whole
+    /// guest goes away. It is still not a no-op: the next call that needs a session checks
+    /// again, which is what a client that sent `stop` is asking for.
     fn release(&mut self) {
-        self.linked = None;
+        self.booted = false;
     }
 
-    /// Bring the session up if nothing has: the tree where `init` said it would be, and the
-    /// delegated names somewhere `execvp` will find them.
+    /// Bring the session up if nothing has: the tree where `init` said it would be.
     ///
     /// The tree was mounted before this process started — `init::prepare` did it, from what
     /// the boot named — so realizing it here is checking that it is there, which is what
     /// [`MOUNT_FAILED`](Error::MOUNT_FAILED) reports when it is not. A guest whose share
     /// failed to mount is a session described correctly in an environment that is wrong for
     /// it, which is exactly that code's case.
-    ///
-    /// The directory of symlinks is not put on `PATH`: every execution is given its own
-    /// environment (see [`environment`]), which is what an inherited `PATH` and a `set_var`
-    /// would otherwise be for — and doing it per command rather than per process is what
-    /// lets this program have more than one thread.
-    fn boot(&mut self) -> Result<(), Outcome> {
-        if self.linked.is_some() {
+    fn boot(&mut self) -> Result<(), Error> {
+        if self.booted {
             return Ok(());
         }
 
@@ -378,13 +368,11 @@ impl Session {
             }
         }
 
-        let linked = BinDir::create(self.config.delegated.iter().map(String::as_str))
-            .map_err(boot_failed)?;
-        self.linked = Some(linked);
+        self.booted = true;
         Ok(())
     }
 
-    /// Move where the session stands, and say where to.
+    /// Move where the session stands.
     ///
     /// **`cd` is the session's own because it is nobody else's.** It is a shell builtin and
     /// not a program, so an `exec` carrying an argv has no other way to offer it — and the
@@ -392,13 +380,13 @@ impl Session {
     /// command (`sh -c 'cd x'`) moves that command's own process and nothing else, which is
     /// what a subshell does in a terminal too.
     ///
-    /// The answer is a `done` and not an error, including when it fails: `cd` behaves like
+    /// The answer is a result and not an error, including when it fails: `cd` behaves like
     /// the builtin it stands in for.
     ///
     /// **Logical, like a shell's own.** The path is normalized on paper and symlinks are
     /// left alone, so what goes back is spelled the way `init` answered — which here is also
     /// the way the *host* spells it, since the tree is mounted at the host's own path.
-    fn change_dir(&mut self, argv: &[String]) -> Outcome {
+    fn change_dir(&mut self, argv: &[String]) -> Response {
         let target = match argv {
             [] => match self.workfs.clone().or_else(|| self.cwd.clone()) {
                 Some(home) => home,
@@ -422,17 +410,19 @@ impl Session {
         }
 
         self.cwd = Some(moved);
-        result(Progress::Done(ExecResult {
+        // Nothing on the result says where that was. A shell answers `cd` with nothing
+        // either, and a client that wants to know runs `pwd` — see
+        // [`ExecResp`](cortex::console::ExecResp).
+        result(ExecResp {
             code: 0,
-            cwd: self.named_cwd(),
-            ..ExecResult::default()
-        }))
+            ..ExecResp::default()
+        })
     }
 }
 
 /// The argv of an `exec` that is a `cd`, without the name — or `None` for anything else.
-fn cd_target(exec: &Exec) -> Option<&[String]> {
-    match exec.cmd.split() {
+fn cd_target(exec: &ExecCall) -> Option<&[String]> {
+    match exec.split() {
         Some((program, args)) if program == "cd" => Some(args),
         _ => None,
     }
@@ -443,7 +433,7 @@ fn cd_target(exec: &Exec) -> Option<&[String]> {
 /// `file://` and nothing else. Inside a guest that is not a limitation the way it is on the
 /// host: whatever the tree is made of was realized before the VM started, and what reaches
 /// here is the directory it was mounted at.
-fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Outcome> {
+fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
     let Some(path) = workfs.file_path() else {
         return Err(refused(
             Error::UNSUPPORTED_WORKFS,
@@ -497,27 +487,20 @@ fn at(root: Option<&Path>, path: impl AsRef<Path>) -> PathBuf {
 
 /// A builtin that ran and failed, the way the shell builtin it stands in for would: a code
 /// and a line, and not a refusal of the call.
-fn builtin_failed(message: impl Into<String>) -> Outcome {
+fn builtin_failed(message: impl Into<String>) -> Response {
     let mut stderr: Vec<u8> = message.into().into_bytes();
     stderr.push(b'\n');
-    result(Progress::Done(ExecResult {
+    result(ExecResp {
         code: 1,
         stderr,
-        ..ExecResult::default()
-    }))
+        ..ExecResp::default()
+    })
 }
 
-/// A boot that did not happen, as the answer to whatever needed one.
-fn boot_failed(e: io::Error) -> Outcome {
-    refused(Error::BOOT_FAILED, format!("linking delegated names: {e}"))
-}
-
-/// Run one command, answering the console channel as many times as it takes.
+/// Run one command, and answer with everything it produced.
 ///
-/// Exactly one of those answers is the execution's own — a [`Done`](Progress::Done) or an
-/// error — and it goes to whichever request is owed one by then: the `exec` a caller
-/// asked for if nothing was delegated, or the last `exec` that carried an answer back if
-/// something was.
+/// One request, one answer: the command is spawned, both of its pipes are drained, and
+/// what comes back is how it ended.
 ///
 /// # Where it runs
 ///
@@ -526,22 +509,14 @@ fn boot_failed(e: io::Error) -> Outcome {
 /// this process's own working directory would be a second answer to that question, right
 /// only until the first `cd`. `read_file` and `write_file` resolve against the same value,
 /// which is what makes a command and a file call name the same file.
-async fn execute(
-    server: &mut StdioServer,
-    id: RequestId,
-    exec: &Exec,
-    session: &Session,
-    shims: &Shims,
-) -> io::Result<()> {
-    let Some((program, args)) = exec.cmd.split() else {
-        return server
-            .respond(id, refused(Error::INVALID_PARAMS, "an empty command"))
-            .await;
+async fn execute(exec: &ExecCall, session: &Session) -> Response {
+    let Some((program, args)) = exec.split() else {
+        return Response::Error(refused(Error::INVALID_PARAMS, "an empty command"));
     };
 
     let mut cmd = Command::new(program);
     cmd.args(args)
-        .envs(environment(session, shims))
+        .envs(environment(session))
         // Piped and then read by `wait_with_output`, which is what carries the output
         // back. Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
@@ -552,159 +527,57 @@ async fn execute(
         cmd.current_dir(dir);
     }
 
-    let child = cmd.spawn();
-
-    let child = match child {
+    let child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let code = match e.kind() {
                 io::ErrorKind::NotFound => NOT_FOUND,
                 _ => NOT_EXECUTABLE,
             };
-            return server
-                .respond(
-                    id,
-                    refused(
-                        Error::NOT_EXECUTABLE,
-                        format!("{program}: {e} (a shell would report {code})"),
-                    ),
-                )
-                .await;
+            return Response::Error(refused(
+                Error::NOT_EXECUTABLE,
+                format!("{program}: {e} (a shell would report {code})"),
+            ));
         }
     };
 
-    // In a task of its own, so both pipes keep draining while this function is busy
-    // answering a delegated call. See the module docs.
-    let mut running = tokio::spawn(child.wait_with_output());
-
-    // Which request this execution owes its answer to. The `exec` a caller asked for to
-    // begin with, and each `exec` carrying an answer back after that — a `Delegated`
-    // spends the one it is sent on.
-    let mut owed = id;
-
-    loop {
-        tokio::select! {
-            // A shim that has already connected is a delegated call already waiting, so
-            // it is served before an ending is reported.
-            biased;
-
-            accepted = shims.accept() => match accepted {
-                Some(stream) => match delegate(server, owed, stream).await? {
-                    Some(next) => owed = next,
-                    // The client stopped saying anything that could carry the execution
-                    // on, so there is nobody left to answer. The command is left to the
-                    // process's ending, which is moments away: the main loop reads the
-                    // same channel.
-                    None => return Ok(()),
-                },
-                // The socket is gone, so no delegated call will ever arrive again. The
-                // command still can end, which is the only thing left to wait for.
-                None => return server.respond(owed, finished(join(&mut running).await)).await,
-            },
-
-            output = &mut running => {
-                return server.respond(owed, finished(joined(output))).await;
-            }
-        }
-    }
+    // `wait_with_output` is what keeps both pipes draining while the command runs: a
+    // command that fills a pipe nobody is reading stops there, and neither of these is
+    // read anywhere else.
+    finished(child.wait_with_output().await)
 }
 
-/// Hand one delegated call to the client, and give the shim what comes back.
+/// The environment variables an execution is given: whatever the image stated, plus the two
+/// things this end has to answer for itself.
 ///
-/// Two messages on the console channel: the [`Delegated`](Progress::Delegated) that
-/// answers what this execution currently owes, and the `exec` whose `cmd` carries the
-/// answer back. What is returned is the id of the request now owed the execution's own
-/// answer, or `None` when the client said nothing that could be one.
-async fn delegate(
-    server: &mut StdioServer,
-    owed: RequestId,
-    stream: UnixStream,
-) -> io::Result<Option<RequestId>> {
-    // Owned halves, because the two directions are separate fields of a `StdioServer` and
-    // have to outlive the borrow the stream came in on.
-    let (incoming, outgoing) = stream.into_split();
-    let mut shim = StdioServer::new(incoming, outgoing);
-
-    // A connection carrying anything but a shim's one `exec` is not something to forward,
-    // and the execution still owes what it owed. Dropping the connection is all there is
-    // to say to it.
-    let (shim_id, exec) = match shim.recv().await? {
-        Some(Message::Request {
-            id,
-            call: Call::Exec(exec),
-        }) => (id, exec),
-        other => {
-            eprintln!(
-                "{}: a shim sent {other:?} instead of an exec",
-                env!("CARGO_BIN_NAME")
-            );
-            return Ok(Some(owed));
-        }
-    };
-
-    // Verbatim, `cwd` and `env` and all. The tree is mounted here at the path the host
-    // spells it with, so a directory inside it is already a name the client can use and
-    // there is nothing to translate — which is the whole reason the share lands where it
-    // does rather than at a constant of this crate's choosing.
-    server
-        .respond(owed, result(Progress::Delegated(exec)))
-        .await?;
-
-    // Only the answer to what was just asked for can arrive now: an `exec` whose `cmd`
-    // names the request the `Delegated` above went out on. This end owes an answer it has
-    // not sent, so there is nothing else the client could be asking about — and a `cmd`
-    // naming anything else is a client that has lost its place, which is the whole of what
-    // that id is for.
-    let carried = match server.recv().await? {
-        Some(Message::Request {
-            id,
-            call: Call::Exec(exec),
-        }) => match exec.cmd {
-            ExecCmd::Resume { id: from, outcome } if from == owed => Some((id, outcome)),
-            _ => None,
-        },
-        _ => None,
-    };
-
-    let Some((id, outcome)) = carried else {
-        // The shim goes unanswered on purpose. There is nothing to tell it, and a dropped
-        // connection is what says so — the shim reports that on its own stderr.
-        eprintln!(
-            "{}: the client sent nothing that carries on from request {owed}",
-            env!("CARGO_BIN_NAME")
-        );
-        return Ok(None);
-    };
-
-    // Whatever the client said, verbatim: a refusal is as much an answer as a result, and
-    // the shim is what turns either into an exit code.
-    shim.respond(shim_id, outcome).await?;
-    Ok(Some(id))
-}
-
-/// The environment variables an execution is given: the way home for a shim, and a `PATH`
-/// with the delegated names on it.
+/// Nothing is inherited. libkrun hands the guest's first process only what the boot named, so
+/// there is no ambient environment here to add to — which is why the image's own `ENV` has to
+/// be replayed rather than assumed present. It is where a Debian-based Python image puts its
+/// `PATH` and its `LANG`, and a command that runs without them runs somewhere the image was
+/// never built to be.
 ///
-/// `PATH` is composed rather than inherited. libkrun hands the guest's first process only
-/// what the boot named, so there is no ambient `PATH` here to add to — see
-/// [`GUEST_PATH`], which is what a login shell in this image would have had.
+/// The layering is image first, ours over the top. A `PATH` the image stated is a default and
+/// stands; a guest whose image stated none gets [`GUEST_PATH`], because a guest where `sh`
+/// cannot find `ls` is not a guest anything runs in. `PWD` is not a default at all — it has to
+/// agree with where the command is actually standing.
 ///
 /// Per command rather than per process, for the same reason a host-local console does it
 /// that way: `std::env::set_var` is unsound with any other thread running, and this
 /// program has one.
-fn environment(session: &Session, shims: &Shims) -> Vec<(OsString, OsString)> {
-    // Appended, not prepended: these names are meant to add commands, not to quietly
-    // shadow a real `git` or `python` the image ships.
-    let mut path = OsString::from(GUEST_PATH);
-    if let Some(linked) = session.linked() {
-        path.push(":");
-        path.push(linked.bin());
-    }
+fn environment(session: &Session) -> Vec<(OsString, OsString)> {
+    // Anything without a `=` is not a variable. The list comes out of an image's config, so
+    // it is somebody else's data and the one malformed entry should not cost the rest.
+    let mut env: Vec<(OsString, OsString)> = session
+        .image
+        .env
+        .iter()
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect();
 
-    let mut env = vec![
-        (SOCK_ENV.into(), shims.sock.clone().into_os_string()),
-        ("PATH".into(), path),
-    ];
+    if !env.iter().any(|(name, _)| name == "PATH") {
+        env.push(("PATH".into(), GUEST_PATH.into()));
+    }
 
     // `PWD` is what a shell reads to answer `pwd`, and a command spawned in the session's
     // directory would otherwise be told it was standing wherever this process is. Set to
@@ -715,110 +588,36 @@ fn environment(session: &Session, shims: &Shims) -> Vec<(OsString, OsString)> {
     env
 }
 
-/// The socket every shim dials.
-///
-/// # Why the process binds it and not a session
-///
-/// The path is in the environment of everything an execution spawns, and a socket bound
-/// per `start` would be a path that changes under anything long-lived a previous session
-/// left behind. One socket for the process is one answer to "where do I dial", for as
-/// long as there is a process to dial into.
-///
-/// Nothing accepts on it except an execution, and only while one is running. A shim that
-/// connects at any other moment — between a `stop` and the next `start`, or between two
-/// commands — waits in the socket's backlog until something accepts it or this process
-/// goes away. Which is what a shim does anyway: it is a program waiting for its own
-/// output, and it has nothing else to do.
-struct Shims {
-    /// Handed to every execution's environment, which is how a shim finds it.
-    sock: PathBuf,
-
-    listener: UnixListener,
-}
-
-impl Shims {
-    fn bind() -> anyhow::Result<Shims> {
-        let sock = std::env::temp_dir().join(format!("cortex-console-{}.sock", std::process::id()));
-        // A live pid cannot have left one behind, so anything here is from an earlier
-        // boot of this session: the overlay persists across the VMs, the pids do not.
-        let _ = std::fs::remove_file(&sock);
-        let listener = UnixListener::bind(&sock)?;
-
-        Ok(Shims { sock, listener })
-    }
-
-    /// The next shim to connect, or `None` if none ever will again.
-    ///
-    /// Cancel-safe, which is what lets this sit in a `select!` that an ending command may
-    /// win: a connection is either accepted whole or not accepted at all, and one left in
-    /// the backlog is still there for the next execution.
-    ///
-    /// A failed accept is not the end of anything by itself — a peer that hung up between
-    /// connecting and being accepted is one — so it is reported and waited past. What ends
-    /// this is the listener itself failing, which no later accept would survive either.
-    async fn accept(&self) -> Option<UnixStream> {
-        loop {
-            match self.listener.accept().await {
-                Ok((stream, _)) => return Some(stream),
-                Err(e) if transient(&e) => {
-                    eprintln!("{}: a shim went away: {e}", env!("CARGO_BIN_NAME"))
-                }
-                Err(e) => {
-                    eprintln!("{}: no more shims: {e}", env!("CARGO_BIN_NAME"));
-                    return None;
-                }
-            }
-        }
-    }
-}
-
-impl Drop for Shims {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.sock);
-    }
-}
-
-/// Whether an `accept` failure was about the one connection rather than the listener.
-fn transient(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::ConnectionAborted | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-    )
-}
-
-/// Wait for the task that is collecting a command, once there is nothing else to wait
-/// for.
-async fn join(running: &mut tokio::task::JoinHandle<io::Result<Output>>) -> io::Result<Output> {
-    joined(running.await)
-}
-
-/// What the collecting task came back with.
-///
-/// Two layers: whether the task itself got to finish, and whether waiting for the command
-/// worked. A task that did not finish is this process being torn down or a panic in the
-/// waiting itself; either way there is no output to report and the execution has to say
-/// so.
-fn joined(joined: Result<io::Result<Output>, tokio::task::JoinError>) -> io::Result<Output> {
-    joined.unwrap_or_else(|e| Err(io::Error::other(format!("collecting a command: {e}"))))
-}
-
 /// A command that ended, as the answer to whatever asked for it.
-fn finished(output: io::Result<Output>) -> Outcome {
+fn finished(output: io::Result<Output>) -> Response {
     let out = match output {
         Ok(out) => out,
-        Err(e) => return refused(Error::INTERNAL_ERROR, format!("waiting for a command: {e}")),
+        Err(e) => {
+            return Response::Error(refused(
+                Error::INTERNAL_ERROR,
+                format!("waiting for a command: {e}"),
+            ));
+        }
     };
 
-    result(Progress::Done(ExecResult {
+    // A response travels in one frame under `MAX_PAYLOAD`, so a command that writes
+    // without limit has to be cut off somewhere: an uncut one makes a frame this protocol
+    // refuses to send, which is the whole session lost rather than one answer shortened.
+    // Both streams, halved, because either of them alone can be the large one.
+    let mut stdout = out.stdout;
+    let mut stderr = out.stderr;
+    let truncated = stdout.len() > MAX_STREAM || stderr.len() > MAX_STREAM;
+    stdout.truncate(MAX_STREAM);
+    stderr.truncate(MAX_STREAM);
+
+    result(ExecResp {
         code: exit_code(&out.status),
-        stdout: out.stdout,
-        stderr: out.stderr,
-        truncated: false,
-        // A spawned command cannot have moved the session: `cd` in a child dies with the
-        // child, and the one `cd` that moves anything here is the builtin, which never
-        // reaches this function. See [`Session::change_dir`].
-        cwd: None,
-    }))
+        stdout,
+        stderr,
+        // Saying so is the point: an agent reading output it does not know is partial
+        // draws a conclusion from it, and a wrong answer is worse than a short one.
+        truncated,
+    })
 }
 
 /// Hand back part of a file, as the answer to the `read` that asked for it.
@@ -827,24 +626,24 @@ fn finished(output: io::Result<Output>) -> Outcome {
 /// reported as the shorter one it was — and one that shrinks is answered with however
 /// much was still there. Either way `data` is what was read and `size` is what the file
 /// measured, which is the pair a requester needs to know whether to ask again.
-async fn read_file(root: Option<&Path>, read: &Read) -> Outcome {
+async fn read_file(root: Option<&Path>, read: &ReadCall) -> Response {
     let path = at(root, &read.path);
     let path = path.as_path();
 
     let size = match tokio::fs::metadata(path).await {
         Ok(meta) if meta.is_dir() => {
-            return refused(
+            return Response::Error(refused(
                 Error::IS_A_DIRECTORY,
                 format!("{}: is a directory", read.path),
-            );
+            ));
         }
         Ok(meta) => meta.len(),
-        Err(e) => return file_error(e, &read.path),
+        Err(e) => return Response::Error(file_error(e, &read.path)),
     };
 
     let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
-        Err(e) => return file_error(e, &read.path),
+        Err(e) => return Response::Error(file_error(e, &read.path)),
     };
 
     // Starting past the end asks for nothing, which is an empty answer rather than an
@@ -856,7 +655,7 @@ async fn read_file(root: Option<&Path>, read: &Read) -> Outcome {
     // The handle is this call's alone, so a cursor is as good as a position on every
     // read: nothing else can move it.
     if let Err(e) = file.seek(SeekFrom::Start(offset)).await {
-        return file_error(e, &read.path);
+        return Response::Error(file_error(e, &read.path));
     }
 
     let mut data = vec![0u8; want];
@@ -867,12 +666,12 @@ async fn read_file(root: Option<&Path>, read: &Read) -> Outcome {
             Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return file_error(e, &read.path),
+            Err(e) => return Response::Error(file_error(e, &read.path)),
         }
     }
     data.truncate(filled);
 
-    encoded(bson::serialize_to_bson(&ReadResult { data, size }))
+    Response::Read(ReadResp { data, size })
 }
 
 /// Put bytes in a file, as the answer to the `write` that sent them.
@@ -881,7 +680,7 @@ async fn read_file(root: Option<&Path>, read: &Read) -> Outcome {
 /// was not there, cut to nothing if it was. An offset means only those bytes are being
 /// spoken for, so the file is opened without truncating and whatever lies past them
 /// stays.
-async fn write_file(root: Option<&Path>, write: &Write) -> Outcome {
+async fn write_file(root: Option<&Path>, write: &WriteCall) -> Response {
     let path = at(root, &write.path);
     let path = path.as_path();
 
@@ -899,28 +698,28 @@ async fn write_file(root: Option<&Path>, write: &Write) -> Outcome {
 
     let mut file = match file {
         Ok(file) => file,
-        Err(e) => return file_error(e, &write.path),
+        Err(e) => return Response::Error(file_error(e, &write.path)),
     };
 
     // Seeking past the end and writing there is what leaves zeroes in the gap, the same
     // as a positioned write would.
     if let Err(e) = file.seek(SeekFrom::Start(write.offset.unwrap_or(0))).await {
-        return file_error(e, &write.path);
+        return Response::Error(file_error(e, &write.path));
     }
 
     if let Err(e) = file.write_all(&write.data).await {
-        return file_error(e, &write.path);
+        return Response::Error(file_error(e, &write.path));
     }
 
     // Before the size is asked for, because these writes are buffered and a size taken
     // over a buffer that has not gone out is the size the file used to be.
     if let Err(e) = file.flush().await {
-        return file_error(e, &write.path);
+        return Response::Error(file_error(e, &write.path));
     }
 
     match file.metadata().await {
-        Ok(meta) => encoded(bson::serialize_to_bson(&WriteResult { size: meta.len() })),
-        Err(e) => file_error(e, &write.path),
+        Ok(meta) => Response::Write(WriteResp { size: meta.len() }),
+        Err(e) => Response::Error(file_error(e, &write.path)),
     }
 }
 
@@ -929,7 +728,7 @@ async fn write_file(root: Option<&Path>, write: &Write) -> Outcome {
 /// Everything that is not the path being absent or being a directory is
 /// [`IO_FAILED`](Error::IO_FAILED): permissions, a full overlay, a name too long. The
 /// message carries what the guest kernel said, since that is the part worth reading.
-fn file_error(e: io::Error, path: &str) -> Outcome {
+fn file_error(e: io::Error, path: &str) -> Error {
     let code = match e.kind() {
         io::ErrorKind::NotFound => Error::NOT_FOUND,
         io::ErrorKind::IsADirectory => Error::IS_A_DIRECTORY,
@@ -938,16 +737,9 @@ fn file_error(e: io::Error, path: &str) -> Outcome {
     refused(code, format!("{path}: {e}"))
 }
 
-fn result(progress: Progress) -> Outcome {
-    encoded(bson::serialize_to_bson(&progress))
-}
-
-/// A `result` from something that had to be encoded to become one.
-fn encoded(value: Result<Bson, bson::error::Error>) -> Outcome {
-    match value {
-        Ok(value) => Outcome::Result(value),
-        Err(e) => refused(Error::INTERNAL_ERROR, format!("encoding a result: {e}")),
-    }
+/// An execution that ended, as the answer to the `exec` that asked for it.
+fn result(ended: ExecResp) -> Response {
+    Response::Exec(ended)
 }
 
 /// The code to report for a command that ran, the way a shell would.
@@ -961,6 +753,7 @@ fn exit_code(status: &ExitStatus) -> i32 {
         .unwrap_or(NOT_EXECUTABLE)
 }
 
-fn refused(code: i64, message: impl Into<String>) -> Outcome {
-    Outcome::Error(Error::new(code, message))
+/// A refusal, as the `error` a response carries instead of a result.
+fn refused(code: i64, message: impl Into<String>) -> Error {
+    Error::new(code, message)
 }

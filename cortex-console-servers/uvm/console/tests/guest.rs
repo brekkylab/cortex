@@ -34,9 +34,7 @@ use std::{
 };
 
 use cortex::{
-    BoxFuture,
-    console::{Console, ExecResult, ReadResult},
-    exec::{ExecCall, ExecResult as ExecOutput, Executable, ExecutableSet},
+    console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp},
     fs::Mount,
 };
 use tokio::process::Command;
@@ -53,64 +51,7 @@ impl Mount for Mounted {
     }
 }
 
-/// Reports everything it was told, so a round trip can be told from a coincidence.
-struct Report;
-
-impl Executable for Report {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        _mount: Option<&'a dyn Mount>,
-    ) -> BoxFuture<'a, ExecOutput> {
-        Box::pin(async move { ExecOutput::ok(format!("{}|{}\n", call.name, call.args.join(","))) })
-    }
-}
-
-/// Answers with the contents of the file it was named, opened through the mount it was
-/// handed — the host's half of one file name meaning one file across a hypervisor.
-///
-/// Byte-for-byte what `cortex-local-console`'s own suite uses, and that is the claim: the
-/// client's half of a delegated call is the same on both backends, because the directory the
-/// guest reports is a path this host can open either way.
-struct CatHere;
-
-impl Executable for CatHere {
-    fn exec<'a>(
-        &'a self,
-        call: &'a ExecCall,
-        mount: Option<&'a dyn Mount>,
-    ) -> BoxFuture<'a, ExecOutput> {
-        Box::pin(async move {
-            let Some(mount) = mount else {
-                return ExecOutput::failed(1, "nothing is mounted");
-            };
-            let path = match call.resolve(&call.args[0]) {
-                Ok(path) => mount.host_path(&path),
-                Err(e) => return ExecOutput::failed(1, format!("{}: {e}", call.args[0])),
-            };
-            match std::fs::read(&path) {
-                Ok(bytes) => ExecOutput::ok(bytes),
-                Err(e) => ExecOutput::failed(1, format!("{}: {e}", path.display())),
-            }
-        })
-    }
-}
-
-/// A delegated name whose output is not text and not something a shell would survive
-/// re-encoding.
-struct RawBytes;
-
-impl Executable for RawBytes {
-    fn exec<'a>(
-        &'a self,
-        _call: &'a ExecCall,
-        _mount: Option<&'a dyn Mount>,
-    ) -> BoxFuture<'a, ExecOutput> {
-        Box::pin(async move { ExecOutput::ok([0xff, 0xfe, 0x00, b'\n'].as_slice()) })
-    }
-}
-
-/// A console over the real binary, with a session that delegates two names.
+/// A console over the real binary.
 struct Fixture {
     console: Console,
 }
@@ -142,17 +83,49 @@ impl Fixture {
         // answered. Nothing is booted by it — the first command below pays for that.
         let console = Console::builder()
             .client(client)
-            .executables(
-                ExecutableSet::new()
-                    .register("report", "report the call it was made with", Report)
-                    .register("rawbytes", "answer bytes that are not text", RawBytes)
-                    .register("cat-here", "read a file where the command stood", CatHere),
-            )
             .build()
             .await
             .expect("building the console");
 
         Fixture { console }
+    }
+
+    /// A fixture whose session names its base over the channel, the way a client does.
+    ///
+    /// Over the channel and not through the server's environment, which is the point: what a
+    /// client declares in its `init` is what the session runs on, and the server's own setting
+    /// is only the answer when nothing was declared.
+    async fn asking_for(image: impl Into<ImageSource>) -> anyhow::Result<Fixture> {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client = cortex::console::stdio::StdioClient::new(server)?;
+
+        let console = Console::builder()
+            .client(client)
+            .image(image)
+            .build()
+            .await?;
+
+        Ok(Fixture { console })
+    }
+
+    /// A fixture whose session asks for `reach` over the channel, the way a client does.
+    ///
+    /// The same shape as [`asking_for`](Self::asking_for) and for the same reason: what a
+    /// client declares in its `init` is what the session gets, and the server's own setting is
+    /// only the answer when nothing was declared.
+    async fn asking_for_reach(reach: NetworkAccess) -> anyhow::Result<Fixture> {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client = cortex::console::stdio::StdioClient::new(server)?;
+
+        let console = Console::builder()
+            .client(client)
+            .network(reach)
+            .build()
+            .await?;
+
+        Ok(Fixture { console })
     }
 
     /// A fixture whose session works in `root`, which is a directory on this host.
@@ -169,12 +142,6 @@ impl Fixture {
         let console = Console::builder()
             .client(client)
             .mount(Mounted(root.to_path_buf()))
-            .executables(
-                ExecutableSet::new()
-                    .register("report", "report the call it was made with", Report)
-                    .register("rawbytes", "answer bytes that are not text", RawBytes)
-                    .register("cat-here", "read a file where the command stood", CatHere),
-            )
             .build()
             .await
             .expect("building the console");
@@ -182,7 +149,7 @@ impl Fixture {
         Fixture { console }
     }
 
-    async fn output(&mut self, script: &str) -> ExecResult {
+    async fn output(&mut self, script: &str) -> ExecResp {
         self.console
             .exec(["sh", "-c", script], None)
             .await
@@ -197,7 +164,7 @@ impl Fixture {
             .size
     }
 
-    async fn read(&mut self, path: &str) -> ReadResult {
+    async fn read(&mut self, path: &str) -> ReadResp {
         self.console.read(path, None, None).await.expect("reading")
     }
 }
@@ -285,38 +252,431 @@ async fn commands_run_in_a_guest_of_their_own() {
     assert_eq!(out.size, 16);
 }
 
-/// The part that is not a remote `exec`: a name whose behaviour lives in *this* process is
-/// runnable by a command inside the guest, and composes with the shell like a program.
+/// An OCI image off a registry is a base like any other, and what it says about running a
+/// process in it reaches the process.
 ///
-/// Which is four processes, two filesystems and a hypervisor: the guest's `sh` runs a
-/// symlink, the symlink re-enters the guest binary as a shim, the shim dials a socket in
-/// the guest, the agent answers the console request with a `Delegated`, this process runs
-/// the closure, and the bytes come back out of the shim's own stdout.
+/// Two claims, and the second is the one worth the boot. That `python3` exists proves the
+/// image really is the root — no rootfs tarball has it. That `PYTHON_VERSION` is set proves
+/// the image's `ENV` was replayed: it is declared nowhere but the image config, so a shell
+/// that can read it read what the config said.
+///
+/// The values asserted are the ones this image's config actually carries, which is four
+/// variables and no more — an image that states a `LANG` or a `WORKDIR` is common enough to
+/// assume and this one does neither.
+///
+/// Debian-based on purpose. `mount(2)` is called directly precisely so a base whose `mount`
+/// binary is util-linux's works, and this is the test that would fail if that ever became a
+/// spawned command again. The guest binary being musl-static is the other half — it runs on a
+/// glibc image without sharing a libc with it.
+///
+/// `-slim` for the download, not for the coverage: it is the same Debian userland as the full
+/// tag with a few hundred megabytes less to pull the first time.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and a registry pull"]
+async fn an_oci_image_is_a_base_and_its_environment_is_the_command_s() {
+    let mut fx = Fixture::asking_for("python:3.13-slim")
+        .await
+        .expect("a session on an image it named");
+
+    // **The answer is this server's spelling, not an echo.** A bare reference names a default
+    // registry, and which one it was is the thing the client could not have worked out.
+    assert_eq!(
+        fx.console.image().map(|image| image.reference.as_str()),
+        Some("docker.io/library/python:3.13-slim"),
+        "the server did not say which image the session got"
+    );
+
+    let out = fx.output("python3 -c 'print(1 + 1)'").await;
+    assert_eq!(
+        out.stdout,
+        b"2\n",
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = fx.output(r#"printf '%s' "$PYTHON_VERSION""#).await;
+    assert!(
+        out.stdout.starts_with(b"3.13."),
+        "PYTHON_VERSION came out as {:?} — the image's ENV did not reach the command",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // And the `PATH` a command runs against is the image's own, which is what makes
+    // `python3` the one the image installed rather than whatever the guest's default path
+    // happened to find first.
+    let path = fx.output(r#"printf '%s' "$PATH""#).await.stdout;
+    let path = String::from_utf8(path).expect("a PATH that is text");
+    assert!(
+        path.contains("/usr/local/bin"),
+        "PATH is {path:?} — the image's own did not reach the command"
+    );
+    assert_eq!(
+        fx.output("command -v python3").await.stdout,
+        b"/usr/local/bin/python3\n"
+    );
+}
+
+/// What a client names beats what this server was configured with, and both are answered.
+///
+/// **Not** `#[ignore]`d, because nothing boots: naming a base settles which image a guest will
+/// be built on, and settling it is `init`'s. The pull it implies is the first boot's.
+#[tokio::test]
+async fn the_base_in_force_is_answered_whoever_chose_it() {
+    // Nothing declared, so this server's own setting stands — and is answered, which is how a
+    // client that declared nothing finds out what it got.
+    let quiet = Fixture::with_env(&[("CORTEX_UVM_IMAGE", "alpine:3.21")]).await;
+    assert_eq!(
+        quiet.console.image().map(|image| image.reference.as_str()),
+        Some("docker.io/library/alpine:3.21"),
+    );
+    drop(quiet);
+
+    // Declared, and it wins: the environment above says something else entirely.
+    let asked = Fixture::asking_for("python:3.13-slim")
+        .await
+        .expect("a session on an image it named");
+    assert_eq!(
+        asked.console.image().map(|image| image.reference.as_str()),
+        Some("docker.io/library/python:3.13-slim"),
+    );
+    drop(asked);
+
+    // And a session on the pinned rootfs has no reference to give, which is not the same as a
+    // server declining to answer but reads the same way to a client.
+    let bare = Fixture::new().await;
+    assert_eq!(bare.console.image(), None);
+}
+
+/// A reference that is not one is refused at `init`, before a VM is worth starting.
+///
+/// The line this draws is between a name that cannot be parsed and a name that cannot be
+/// fetched. The first is the client's mistake and is knowable from the frame; the second is a
+/// registry's answer and takes a pull, so it belongs to a boot.
+#[tokio::test]
+async fn a_reference_that_is_not_one_is_refused_before_a_vm_is_started() {
+    let err = match Fixture::asking_for("nota reference").await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened on something that is not a reference"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::INVALID_PARAMS),
+        "answered {err:?} — a malformed reference is not a backend that would not come up"
+    );
+}
+
+/// A listener on this host, and the port it is on.
+///
+/// One canned HTTP response per connection, and as many connections as are asked for — `wget`
+/// is what asks, so it has to be HTTP rather than bytes. The thread is returned so a caller can
+/// hold it for the length of the test; nothing joins it, because a reach that was refused is a
+/// connection that never came.
+fn host_listener() -> (u16, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this host");
+    let port = listener.local_addr().expect("its address").port();
+    let served = std::thread::spawn(move || {
+        while let Ok((mut connection, _)) = listener.accept() {
+            use std::io::Write as _;
+            let _ = connection.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nreached");
+        }
+    });
+    (port, served)
+}
+
+/// The same fetch, by the name the stack answers for the machine it runs beside.
+///
+/// `host.microsandbox.internal` is synthesized by the stack's own resolver rather than looked
+/// up anywhere, which is what spares a command from digging the gateway out of `resolv.conf`:
+/// the addresses are assigned per sandbox slot, so nothing writing a command can know them, and
+/// this name is a constant.
+fn fetch_by_host_name(port: u16) -> String {
+    format!("wget -q -T 5 -O - http://host.microsandbox.internal:{port}/")
+}
+
+/// A guest command that fetches `port` on the gateway — which is this host, one rewrite later.
+///
+/// The address comes out of the guest's own `resolv.conf` because that is where the gateway is
+/// written down: the stack names itself as the resolver, so the nameserver line *is* the
+/// gateway. Nothing in the guest was told this host's real address, and nothing could be.
+fn fetch_from_gateway(port: u16) -> String {
+    format!(
+        "wget -q -T 5 -O - \
+         http://$(awk '/^nameserver/{{print $2; exit}}' /etc/resolv.conf):{port}/"
+    )
+}
+
+/// A session that asked for nothing has no interface to configure, which is the default and the
+/// thing most worth keeping true.
+///
+/// Not "the interface is down" — there is no device, so there is nothing to bring up. What the
+/// guest does have is a loopback and the `dummy0` its kernel makes on its own, and neither goes
+/// anywhere: what this looks for is a default route, which is what a configured device would
+/// have left behind.
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
-async fn a_delegated_name_is_answered_on_the_host() {
-    let mut fx = Fixture::new().await;
+async fn a_session_is_air_gapped_unless_a_network_was_asked_for() {
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "none")]).await;
 
-    let out = fx.output("report one two").await;
-    assert_eq!(out.stdout, b"report|one,two\n");
-    assert_eq!(out.code, 0);
-
-    // A program as far as the shell is concerned.
-    assert_eq!(
-        fx.output("report a | tr a-z A-Z").await.stdout,
-        b"REPORT|A\n"
+    let routes = fx.output("cat /proc/net/route").await.stdout;
+    let routes = String::from_utf8(routes).expect("a route table that is text");
+    assert!(
+        !routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "a session that asked for no network has a default route:\n{routes}"
     );
 
-    // Twice in one command, so the chain is a loop and not a single extra step.
-    assert_eq!(
-        fx.output("report x; report y").await.stdout,
-        b"report|x\nreport|y\n"
+    // And nothing wrote a resolver, so a name has nowhere to be looked up either.
+    assert_eq!(fx.output("cat /etc/resolv.conf").await.code, 1);
+}
+
+/// The default posture: names resolve, granted doors open, everything else refused.
+///
+/// Four claims about one device. The interface came up and a lookup was answered — by the stack
+/// in the console server process, since there is nothing else on that network to answer it. A
+/// listener on *this host* is reached, which is what makes `host` a reach rather than an error
+/// message. **A second listener on this host is not**, which is the property the grant exists
+/// for: a door is a port and never the machine. And a public address is refused.
+///
+/// Both listeners are plain loopback on the test's own side. Nothing tells the guest where they
+/// are: it dials the gateway, and the stack rewrites that to the host's loopback when it dials
+/// out — the mechanism under test as much as the rules are.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_host_session_reaches_the_doors_it_was_granted() {
+    let (granted, _open) = host_listener();
+    let (ungranted, _shut) = host_listener();
+
+    let mut fx = Fixture::asking_for_reach(NetworkAccess::host().with_host_ports([granted]))
+        .await
+        .expect("a session with a granted port");
+
+    // What the server says it gave, which is both halves of the answer.
+    let answered = fx.console.network().expect("a server that says").clone();
+    assert_eq!(answered.reach, "host");
+    assert_eq!(answered.host_ports, [granted]);
+
+    // The interface the stack assigned, configured by the guest with no `ip` binary in sight.
+    let routes = fx.output("cat /proc/net/route").await.stdout;
+    let routes = String::from_utf8(routes).expect("a route table that is text");
+    assert!(
+        routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "no default route, so the interface was never configured:\n{routes}"
+    );
+    assert!(
+        fx.output("cat /etc/resolv.conf")
+            .await
+            .stdout
+            .starts_with(b"nameserver "),
+        "no resolver was written"
     );
 
-    // Bytes through all of it: a socket, a virtio port, a pipe and a shell.
+    // `getent hosts` rather than a ping: ICMP is a different permission from a name, and what
+    // is under test here is the resolver.
+    let out = fx.output("getent hosts example.com").await;
     assert_eq!(
-        fx.output("rawbytes").await.stdout,
-        [0xff, 0xfe, 0x00, b'\n']
+        out.code,
+        0,
+        "a name did not resolve: {:?} {:?}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The door that was granted.
+    let out = fx.output(&fetch_from_gateway(granted)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reached",
+        "the granted port was not reached: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And the one beside it, which was not. The whole reason ports are named one at a time.
+    let out = fx.output(&fetch_from_gateway(ungranted)).await;
+    assert_ne!(
+        out.code,
+        0,
+        "a port nobody granted was reached, so the grant is the machine and not a door: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The same door by name, which is how a command would actually be written: the gateway's
+    // address is assigned per sandbox and this is the constant that stands for it.
+    let out = fx.output(&fetch_by_host_name(granted)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "reached",
+        "the granted port was not reachable by name: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // **Resolving the name grants nothing.** It answers for every port on this machine and the
+    // policy is still what decides which of them reply.
+    let out = fx.output(&fetch_by_host_name(ungranted)).await;
+    assert_ne!(
+        out.code,
+        0,
+        "the name reached a port nobody granted, so resolving it is a grant: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // …and that is all it gets. `wget` is busybox's here and exits non-zero on a refusal; what
+    // matters is that it does not succeed.
+    let out = fx
+        .output("wget -q -T 5 -O /dev/null http://example.com/")
+        .await;
+    assert_ne!(
+        out.code, 0,
+        "the default posture reached the internet, which is what it exists not to do"
+    );
+}
+
+/// `public` reaches the internet, and *not* this machine's ports.
+///
+/// The second half is the one worth a boot: **widening what a session reaches outside must not
+/// widen what it reaches in here.** A session that asked for the internet to fetch a package did
+/// not thereby ask to talk to whatever else this host is listening on, and the only thing that
+/// opens those is a grant it did not make.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_public_session_reaches_the_internet_and_not_this_hosts_ports() {
+    let (ungranted, _shut) = host_listener();
+    let mut fx = Fixture::with_env(&[("CORTEX_UVM_NETWORK", "public")]).await;
+
+    let out = fx.output(&fetch_from_gateway(ungranted)).await;
+    assert_ne!(
+        out.code,
+        0,
+        "the internet came with a door onto this host: {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    let out = fx
+        .output("wget -q -T 10 -O /dev/null http://example.com/")
+        .await;
+    assert_eq!(
+        out.code,
+        0,
+        "a session that asked for the internet could not reach it: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And over TLS, which is a different path through the stack: a stream it does not read.
+    let out = fx
+        .output("wget -q -T 10 -O /dev/null https://example.com/")
+        .await;
+    assert_eq!(
+        out.code,
+        0,
+        "plain HTTP reached the internet and HTTPS did not: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A door onto a machine the guest cannot send a packet to is two settings that cannot both
+/// have been meant, and is said at `init` like any other.
+///
+/// **Not** `#[ignore]`d: nothing boots, which is the property being asserted.
+#[tokio::test]
+async fn a_granted_port_without_a_network_is_refused_before_a_vm_is_started() {
+    let asked = NetworkAccess::none().with_host_ports([8080]);
+    let err = match Fixture::asking_for_reach(asked).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened with doors onto a network it does not have"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::INVALID_PARAMS),
+        "answered {err:?} — a contradiction is not a name nobody defined"
+    );
+}
+
+/// A reach nobody defined is refused at `init`, before a VM is worth starting.
+///
+/// **Not** `#[ignore]`d, because nothing here boots — which is the property being asserted. A
+/// name the server cannot answer is knowable from the frame, so a client hears about it while
+/// it can still ask for something else.
+#[tokio::test]
+async fn a_reach_that_is_not_a_reach_is_refused_before_a_vm_is_started() {
+    let err = match Fixture::asking_for_reach(NetworkAccess::new("sort-of")).await {
+        Err(e) => e,
+        Ok(_) => panic!("a session was opened with a reach nobody defined"),
+    };
+
+    let err = err
+        .downcast_ref::<cortex::console::Failure>()
+        .expect("a protocol failure");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::UNSUPPORTED_NETWORK),
+        "answered {err:?} — a name nobody defined is not a backend that would not come up"
+    );
+}
+
+/// What the client asks for is what the session gets, and the server says so.
+///
+/// The `init` declaration is the whole subject here: nothing sets `CORTEX_UVM_NETWORK`, so a
+/// guest that reaches the internet reached it because the client asked over the channel.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and the internet"]
+async fn a_client_asks_for_its_reach_over_the_channel() {
+    // Asked for nothing, so the answer is the server's own — which is `host` by default, and
+    // the only way a client could have learnt that.
+    let quiet = Fixture::new().await;
+    assert_eq!(
+        quiet.console.network().map(|n| n.reach.as_str()),
+        Some("host"),
+        "a server that chose the reach did not say which"
+    );
+    drop(quiet);
+
+    // Asked for none: no device, so no default route for the guest to have.
+    let mut off = Fixture::asking_for_reach(NetworkAccess::none())
+        .await
+        .expect("a session with no network");
+    assert_eq!(
+        off.console.network().map(|n| n.reach.as_str()),
+        Some("none")
+    );
+    let routes = String::from_utf8(off.output("cat /proc/net/route").await.stdout)
+        .expect("a route table that is text");
+    assert!(
+        !routes
+            .lines()
+            .skip(1)
+            .any(|line| line.split_whitespace().nth(1) == Some("00000000")),
+        "a session that asked for no network has a default route:\n{routes}"
+    );
+    drop(off);
+
+    // And asked for the internet: reached, with nothing in the server's environment saying so.
+    let mut open = Fixture::asking_for_reach(NetworkAccess::public())
+        .await
+        .expect("a session with the internet");
+    assert_eq!(
+        open.console.network().map(|n| n.reach.as_str()),
+        Some("public")
+    );
+    let out = open
+        .output("wget -q -T 10 -O /dev/null http://example.com/")
+        .await;
+    assert_eq!(
+        out.code,
+        0,
+        "a session that asked for the internet could not reach it: {:?}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -375,39 +735,20 @@ async fn a_tree_is_the_same_path_on_both_sides() {
     );
 
     // `cd` moves the session, and the next command runs where it left off — the guest
-    // agent's state machine, reported back in the path the client already knows.
+    // agent's state machine, in the path the client already knows. Nothing reports the
+    // move: `pwd` is how it is observed, the way it is at a terminal.
     std::fs::create_dir(root.join("work")).expect("a subdirectory");
-    let moved = fx.console.exec(["cd", "work"], None).await.expect("cd");
-    assert_eq!(moved.cwd.as_deref(), root.join("work").to_str());
+    assert_eq!(
+        fx.console
+            .exec(["cd", "work"], None)
+            .await
+            .expect("cd")
+            .code,
+        0
+    );
     assert_eq!(
         fx.output("pwd").await.stdout,
         format!("{}\n", root.join("work").display()).into_bytes()
-    );
-}
-
-/// The whole point, end to end, across the VM boundary: a delegated executable running on
-/// the **host** opens the same file the guest command meant.
-///
-/// The guest reports the directory it stood in, which is a path this host has because the
-/// tree is shared at its own name; the host's executable resolves the argument against it
-/// and opens the file. Four processes and a hypervisor, and one name meaning one thing
-/// throughout — with nothing in the middle translating.
-#[tokio::test]
-#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
-async fn a_delegated_call_opens_what_the_guest_command_meant() {
-    let dir = tempfile::tempdir().expect("a temp directory");
-    let root = dir.path().canonicalize().expect("a real directory");
-    std::fs::create_dir(root.join("sub")).expect("a subdirectory");
-    std::fs::write(root.join("sub/report.md"), b"# from the tree\n").expect("writing a file");
-
-    let mut fx = Fixture::with_tree(&root).await;
-
-    let out = fx.output("cd sub && cat-here report.md").await;
-    assert_eq!(
-        out.stdout,
-        b"# from the tree\n",
-        "stderr: {:?}",
-        String::from_utf8_lossy(&out.stderr)
     );
 }
 

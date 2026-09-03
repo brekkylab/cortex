@@ -6,9 +6,9 @@
 //!
 //! ```no_run
 //! use cortex::console::stdio::StdioServer;
-//! use cortex::console::{Message, Outcome, Server};
+//! use cortex::console::{Message, Response, Server};
 //!
-//! # fn answer(call: cortex::console::Call) -> Outcome { unimplemented!() }
+//! # fn answer(call: cortex::console::Call) -> Response { unimplemented!() }
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! // Takes stdin and stdout for the protocol; everything else goes to stderr.
@@ -32,7 +32,7 @@ use futures_core::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 
 use crate::console::{
-    Message, Outcome, RequestId, Server,
+    Message, RequestId, Response, Server,
     stdio::{read, write},
 };
 
@@ -104,8 +104,8 @@ impl Server for StdioServer {
         Box::pin(read(&mut self.incoming))
     }
 
-    fn respond(&mut self, id: RequestId, outcome: Outcome) -> BoxFuture<'_, io::Result<()>> {
-        Box::pin(async move { write(&mut self.outgoing, &Message::Response { id, outcome }).await })
+    fn respond(&mut self, id: RequestId, result: Response) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(async move { write(&mut self.outgoing, &Message::Response { id, result }).await })
     }
 }
 
@@ -119,7 +119,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::console::{Call, Error, Exec, ExecCmd, Init, Notification};
+    use crate::console::{Call, Error, ExecCall, InitCall, InitResp, Notification};
 
     /// Everything this end wrote, readable after it has been dropped or not — a `Vec`
     /// cannot be, once the server owns it.
@@ -163,20 +163,20 @@ mod tests {
     #[tokio::test]
     async fn every_message_arrives_as_it_was_sent() {
         let sent = vec![
-            request(0, Call::Init(Init::default())),
+            request(0, Call::Init(InitCall::default())),
             Message::Notification(Notification::Start),
             request(
                 1,
-                Call::Exec(Exec {
-                    cmd: ExecCmd::New(vec!["echo".into(), "hi".into()]),
-                    ..Exec::default()
+                Call::Exec(ExecCall {
+                    cmd: vec!["echo".into(), "hi".into()],
+                    ..ExecCall::default()
                 }),
             ),
             Message::Notification(Notification::Stop),
             // Not a request, and this end has no opinion about that.
             Message::Response {
                 id: 99,
-                outcome: Outcome::Result(bson::Bson::Null),
+                result: Response::Init(InitResp::default()),
             },
             Message::Notification(Notification::Quit),
         ];
@@ -196,11 +196,11 @@ mod tests {
         let mut server = StdioServer::new(tokio::io::empty(), sent.clone());
 
         server
-            .respond(7, Outcome::Result(bson::Bson::Null))
+            .respond(7, Response::Init(InitResp::default()))
             .await
             .unwrap();
         server
-            .respond(9, Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")))
+            .respond(9, Response::Error(Error::new(Error::TIMED_OUT, "too slow")))
             .await
             .unwrap();
 
@@ -216,11 +216,11 @@ mod tests {
             [
                 Message::Response {
                     id: 7,
-                    outcome: Outcome::Result(bson::Bson::Null),
+                    result: Response::Init(InitResp::default()),
                 },
                 Message::Response {
                     id: 9,
-                    outcome: Outcome::Error(Error::new(Error::TIMED_OUT, "too slow")),
+                    result: Response::Error(Error::new(Error::TIMED_OUT, "too slow")),
                 },
             ]
         );

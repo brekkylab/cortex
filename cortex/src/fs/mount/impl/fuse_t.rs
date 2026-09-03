@@ -44,7 +44,6 @@ use crate::fs::{
 
 /// Open flags in the host's numbering: this reply goes to this host's kernel.
 const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
-    append: libc::O_APPEND,
     truncate: libc::O_TRUNC,
     create: libc::O_CREAT,
     create_new: libc::O_EXCL,

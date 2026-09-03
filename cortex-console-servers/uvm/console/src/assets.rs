@@ -1,33 +1,34 @@
-//! The five things a boot needs on disk, and where each one comes from.
+//! The four things a boot needs on disk, and where each one comes from.
 //!
 //! | | lifetime | cost |
 //! |---|---|---|
 //! | the libkrunfw kernel | installed | found, never built |
-//! | the base image (EROFS) | cached, shared | built once per rootfs, from a tarball |
+//! | the base image | cached, shared | pulled or built once per image |
 //! | the session image (ext4) | one session | formatted per boot, sparse |
-//! | the boot root | one session | a directory with one file in it |
-//! | the spec file (BSON) | one session, or less | a few kilobytes, `0600`, unlinked on sight |
+//! | the boot root | one session | a directory with two files in it |
 //!
 //! The split down the middle of that table is the point. Two of them are shared and
-//! expensive and live under [`home`]; three are this session's, live in a temp directory,
-//! and are deleted when the value holding them drops. Nothing a session writes can reach
-//! anything another session reads — which is the whole reason the guest boots onto an
-//! overlay instead of onto a writable directory, and the reason the spec file is here
-//! rather than anywhere the guest can see.
+//! expensive and live under [`home`]; two are this session's, live in a temp directory, and
+//! are deleted when the value holding them drops. Nothing a session writes can reach anything
+//! another session reads — which is the whole reason the guest boots onto an overlay instead
+//! of onto a writable directory.
 //!
-//! # The base image, and what is deliberately not here
+//! # Two ways to a base image
 //!
-//! A rootfs tarball becomes an EROFS: `ingest_compressed_tar` reads it into a file tree,
-//! `write_erofs` encodes that tree as a read-only image. No `mkfs`, no privileges, no
-//! loop device — which is what makes it work the same way on a laptop and in CI.
+//! An **OCI reference** is pulled: layers arrive from a registry, each is
+//! encoded as its own EROFS, and a descriptor stitches the set into one disk. That is the
+//! path for `python:3.13` and anything else somebody already publishes, and the layer store
+//! underneath it is content-addressed, so images sharing a base share the copy of it.
 //!
-//! What is *not* here is a registry client. `alpine` arrives as the tarball the
-//! distribution publishes, verified against a pinned digest, and that is the whole of the
-//! provisioning story. Pulling `python:3.12-slim` from a registry is the same three calls
-//! with a manifest fetch in front — [`base_image`] is where it would go, and
-//! [`BASE_IMAGE_ENV`] is how a caller who has already built one says so today.
+//! A **rootfs tarball** is the default when no reference is given: `ingest_compressed_tar`
+//! reads it into a file tree and `write_erofs` encodes that tree as a read-only image. No
+//! `mkfs`, no privileges, no loop device, and no registry to be reachable — which is what
+//! keeps a boot working the same way on a laptop, in CI and offline.
 //!
-//! [`BASE_IMAGE_ENV`]: crate::contract::BASE_IMAGE_ENV
+//! Either way what comes out is a disk the guest mounts as `erofs`, and — for an OCI image —
+//! an [`ImageSpec`] saying what the image expects of a process running in it. The tarball has
+//! nothing to say, and says nothing.
+//!
 
 use std::{
     io,
@@ -35,13 +36,14 @@ use std::{
 };
 
 use microsandbox_image::{
+    GlobalCache, Platform, PullOptions, Reference, Registry, RootfsMaterialization,
     erofs::write_erofs,
     ext4::{Ext4FormatOptions, format_ext4},
     tar::{Compression, ingest_compressed_tar},
     tree::ResourceLimits,
 };
 
-use crate::contract::{BASE_IMAGE_ENV, GUEST_BIN_PATH, SESSION_IMAGE_ENV};
+use crate::contract::{BaseFormat, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec};
 
 /// The guest half, cross-compiled and embedded by `build.rs`. Written into every boot
 /// root, which is why the guest crate optimises for size.
@@ -59,6 +61,13 @@ const SESSION_IMAGE_BYTES: u64 = 2 << 30;
 /// 16 MiB of journal. The default is four times that, which is most of a small session's
 /// image spent on a log for writes that are about to be thrown away.
 const SESSION_JOURNAL_BLOCKS: u32 = 4096;
+
+/// How long a provisioning step has to take before finishing it is worth a line. Under this it
+/// was cached, and nobody waited.
+///
+/// Unlike every other duration in this workspace, nothing branches on it: a step that runs past
+/// this is not retried, refused or invalidated, it is only mentioned. See [`took`].
+const ANNOUNCE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Base directory for what is shared between sessions — `CORTEX_UVM_HOME`, else
 /// `$HOME/.cortex/uvm`.
@@ -112,25 +121,124 @@ pub fn resolve_kernel() -> anyhow::Result<PathBuf> {
     })
 }
 
+/// A read-only base image, and the two things about it that are not the path.
+pub struct BaseImage {
+    /// The image on this host.
+    pub path: PathBuf,
+
+    /// What a boot has to attach it as.
+    pub format: BaseFormat,
+
+    /// What the image says about running a process in it. Empty for a base that came with
+    /// no such statement, which is every base that is not an OCI image.
+    pub spec: ImageSpec,
+}
+
+/// An OCI reference to use as the base — `python:3.13`, or `python@sha256:…`.
+///
+/// A tag is resolved once and then cached by digest, so a session started later gets the
+/// image the first one did rather than whatever the tag has moved on to. Which also means a
+/// caller who wants to *follow* a tag is asking for something this does not do; a digest
+/// says what you get and is the spelling to prefer.
+pub const IMAGE_ENV: &str = "CORTEX_UVM_IMAGE";
+
+/// A writable session image to reuse instead of a fresh one, as a host path.
+///
+/// A caller's knob and not a computed value: read from this server's own environment, like
+/// [`IMAGE_ENV`]. A session that survives the console, for whoever wants one.
+pub const SESSION_IMAGE_ENV: &str = "CORTEX_UVM_SESSION_IMAGE";
+
 /// The read-only base image every session overlays, provisioning it once if it is not
 /// cached.
 ///
-/// `CORTEX_UVM_BASE_IMAGE` takes it as given, which is the escape hatch for an image built
-/// some other way — a registry pull, a `mkfs.erofs`, an image shipped with a product.
-pub async fn base_image() -> anyhow::Result<PathBuf> {
-    if let Some(image) = std::env::var_os(BASE_IMAGE_ENV) {
-        return Ok(PathBuf::from(image));
+/// Three sources, in the order a client's own answer beats a server's:
+///
+/// Two sources, and the choice between them was made at `init`:
+///
+/// - `reference` — an OCI image, pulled and materialized (see [`pull`]). What the session named,
+///   or what [`IMAGE_ENV`] named for a session that named nothing; the server settled which
+///   before calling here.
+/// - `None` — the pinned rootfs tarball, encoded to an EROFS (see [`Rootfs`]).
+pub async fn base_image(reference: Option<&str>) -> anyhow::Result<BaseImage> {
+    if let Some(reference) = reference {
+        return pull(reference).await;
     }
 
     let rootfs = Rootfs::host();
     let image = home()?.join("images").join(rootfs.image_name());
-    if image.exists() {
-        return Ok(image);
+    if !image.exists() {
+        let tarball = rootfs.fetch().await?;
+        encode_erofs(&tarball, &image).await?;
     }
 
-    let tarball = rootfs.fetch().await?;
-    encode_erofs(&tarball, &image).await?;
-    Ok(image)
+    Ok(BaseImage {
+        path: image,
+        format: BaseFormat::Raw,
+        spec: ImageSpec::default(),
+    })
+}
+
+/// Pull an OCI image and make a base out of it.
+///
+/// The layered materialization is the one that fits: it writes each layer as its own EROFS,
+/// a metadata EROFS that references them, and a VMDK descriptor stitching the set into one
+/// disk. The guest mounts that disk as `erofs` exactly as it mounts a tarball's image — the
+/// layering is a host-side detail — so nothing on the far side of the hypervisor changes.
+/// Layers are content-addressed and shared, which is what makes two images built on the same
+/// base cost one copy of it.
+///
+/// Anonymous. Credentials for a private registry go to
+/// [`RegistryBuilder::auth`](microsandbox_image::RegistryBuilder::auth), and what is missing
+/// is not that call but a way for a caller to hand them over: a console session says nothing
+/// about a registry, and an environment variable holding a password is not a channel worth
+/// adding by default.
+async fn pull(reference: &str) -> anyhow::Result<BaseImage> {
+    let reference: Reference = reference
+        .parse()
+        .map_err(|e| anyhow::anyhow!("{IMAGE_ENV}: {reference} is not an OCI reference: {e}"))?;
+
+    // Its own directory rather than `images/`, which holds one file per pinned rootfs. This
+    // is a content-addressed store of layers, manifests and stitched descriptors, and the
+    // cache decides its own layout inside it.
+    let cache = GlobalCache::new(&home()?.join("oci"))
+        .map_err(|e| anyhow::anyhow!("opening the image cache: {e}"))?;
+
+    let registry = Registry::builder(Platform::host_linux(), cache.clone())
+        .build()
+        .map_err(|e| anyhow::anyhow!("building a registry client: {e}"))?;
+
+    // A pull with everything already cached touches no network, so this runs on every boot
+    // rather than being guarded by a path test: what "cached" means is the cache's to decide,
+    // and a layer that was half-written is a case only it can see.
+    eprintln!("cortex-uvm-console: resolving {reference}");
+    let started = std::time::Instant::now();
+    let pulled = registry
+        .pull(
+            &reference,
+            &PullOptions {
+                materialization: RootfsMaterialization::Layered,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("pulling {reference}: {e}"))?;
+    took(&format_args!("{reference}"), started);
+
+    let path = cache.vmdk_path(&pulled.manifest_digest);
+    anyhow::ensure!(
+        path.exists(),
+        "pulling {reference} left no image at {}",
+        path.display()
+    );
+
+    Ok(BaseImage {
+        path,
+        format: BaseFormat::Vmdk,
+        spec: ImageSpec {
+            env: pulled.config.env,
+            working_dir: pulled.config.working_dir,
+        },
+    })
 }
 
 /// A fresh, empty ext4 image for one session's writes.
@@ -192,19 +300,20 @@ fn format(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The directory libkrun serves as the guest's virtio-fs root, holding the guest binary
-/// and nothing else.
+/// The directory libkrun serves as the guest's virtio-fs root, holding the guest binary and
+/// what the base image said about running things in it.
 ///
 /// It is a real root only for the moment between the kernel handing over and the guest
-/// pivoting onto the overlay — long enough to exec one file. Which is why it is a fresh
-/// directory per session rather than something shared: it is writable by the guest for
-/// that moment, and two guests sharing one would be two guests writing the same tree.
+/// pivoting onto the overlay — long enough to exec one file and read one other. Which is why
+/// it is a fresh directory per session rather than something shared: it is writable by the
+/// guest for that moment, and two guests sharing one would be two guests writing the same
+/// tree.
 pub struct BootRoot {
     path: PathBuf,
 }
 
 impl BootRoot {
-    pub fn create() -> anyhow::Result<BootRoot> {
+    pub fn create(spec: &ImageSpec) -> anyhow::Result<BootRoot> {
         use std::os::unix::fs::PermissionsExt;
 
         let path = unique(std::env::temp_dir(), "boot");
@@ -214,6 +323,14 @@ impl BootRoot {
         let guest = root.path.join(GUEST_BIN_PATH.trim_start_matches('/'));
         std::fs::write(&guest, GUEST_BIN)?;
         std::fs::set_permissions(&guest, std::fs::Permissions::from_mode(0o755))?;
+
+        // Written even when it says nothing. A boot root has one shape either way, so the
+        // guest reads a spec that states nothing rather than reasoning about a missing file.
+        let encoded = bson::serialize_to_vec(spec)
+            .map_err(|e| anyhow::anyhow!("encoding the image spec: {e}"))?;
+        let spec_path = root.path.join(IMAGE_SPEC_PATH.trim_start_matches('/'));
+        std::fs::write(spec_path, encoded)?;
+
         Ok(root)
     }
 
@@ -336,7 +453,7 @@ impl Rootfs {
                 name: "alpine-3.24.1-x86_64",
             },
             // A guest runs the host's architecture, so there is nothing to fall back to.
-            other => panic!("no base rootfs pinned for a {other} host — set {BASE_IMAGE_ENV}"),
+            other => panic!("no base rootfs pinned for a {other} host — name an image instead"),
         }
     }
 
@@ -360,6 +477,7 @@ impl Rootfs {
         // one GET.
         let tmp = dest.with_extension("download");
         eprintln!("cortex-uvm-console: downloading {}", self.url);
+        let started = std::time::Instant::now();
         let status = tokio::process::Command::new("curl")
             .arg("-fsSL")
             .arg(self.url)
@@ -385,7 +503,26 @@ impl Rootfs {
         }
 
         std::fs::rename(&tmp, &dest)?;
+        took(&format_args!("{}", self.name), started);
         Ok(dest)
+    }
+}
+
+/// Say that something slow is done, and how slow it was.
+///
+/// Only when it was actually slow. Provisioning is announced before it starts, because the point
+/// of announcing is a wait somebody is sitting through; a cached boot does the same work in
+/// milliseconds and a second line about it is noise on every session that ever starts.
+///
+/// **The pairing is what carries the information.** One line and no second one means it was
+/// already there; one line and then another means the seconds in between were this.
+fn took(what: &std::fmt::Arguments<'_>, since: std::time::Instant) {
+    let elapsed = since.elapsed();
+    if elapsed >= ANNOUNCE_AFTER {
+        eprintln!(
+            "cortex-uvm-console: {what} ready in {:.1}s",
+            elapsed.as_secs_f64()
+        );
     }
 }
 
@@ -415,6 +552,14 @@ async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Announced like the download above, and for the same reason: it is minutes of CPU on a
+    // cold cache and there is nothing else on stderr to say a session is still coming up.
+    eprintln!(
+        "cortex-uvm-console: encoding {}",
+        tarball.file_name().unwrap_or_default().to_string_lossy()
+    );
+    let started = std::time::Instant::now();
+
     let file = tokio::fs::File::open(tarball).await?;
     let ingested = ingest_compressed_tar(file, Compression::Gzip, &ResourceLimits::default(), None)
         .await
@@ -431,5 +576,12 @@ async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("encoding the base image: {e:?}"))?;
 
     std::fs::rename(&tmp, image)?;
+    took(
+        &format_args!(
+            "{}",
+            image.file_name().unwrap_or_default().to_string_lossy()
+        ),
+        started,
+    );
     Ok(())
 }

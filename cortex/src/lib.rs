@@ -12,11 +12,10 @@
 //!   the caller chooses. A binding mounts that tree on the host, so what reads it is `cat`,
 //!   `grep`, and whatever else the agent thought to run.
 //! * **What it does is run commands.** A [`Console`](console::Console) runs them somewhere —
-//!   this host, a micro-VM — over one channel, and the `PATH` they run against carries more
-//!   than the programs that happen to be installed there. A caller registers
-//!   [`Executable`](exec::Executable)s: names that resolve back into *this* process, so
-//!   `summarize report.md` in a shell the agent wrote reaches Rust that can call a model,
-//!   and the shell cannot tell it from `wc`.
+//!   this host, a micro-VM — over one channel: an `exec` carrying an argv, and everything the
+//!   command wrote coming back. A command that should be Rust rather than a program on disk is
+//!   an [`Executable`](exec::Executable), which takes the same argv a program would and answers
+//!   the same way.
 //!
 //! ## Quickstart
 //!
@@ -64,30 +63,21 @@
 //!   [`FileSystem`](fs::FileSystem) and a binding puts it in front of a concrete interface: a
 //!   host FUSE mount, an NFS or FSKit one, whatever else addresses files by path.
 //!   `fs/ARCHITECTURE.md` has the long form.
-//! * [`exec`] — the names a console offers that are not programs on disk.
+//! * [`exec`] — a command that is Rust rather than a program on disk.
 //!   [`Executable`](exec::Executable) is what one of them runs and
-//!   [`ExecutableSet`](exec::ExecutableSet) is the allowlist announced for a session; how a
-//!   name is *reached* is the server's business and is not decided here. This is the module
-//!   that names both halves: an `Executable` is handed an [`ExecCall`](exec::ExecCall) by the
-//!   console and the [`Mount`](fs::Mount) the session runs against by `fs`, and resolving an
-//!   argument against a tree is the only operation in the crate that needs both.
+//!   [`ExecutableSet`](exec::ExecutableSet) is a named set of them; how a name is *reached* is
+//!   whoever dispatches it, and is not decided here. This is the module that names both halves:
+//!   an `Executable` is handed an [`ExecCall`](exec::ExecCall) and the [`Mount`](fs::Mount) its
+//!   paths are about, and resolving an argument against a tree is the only operation in the
+//!   crate that needs both.
 //! * [`console`] — run the commands, wherever the environment is: this host, a micro-VM.
-//!   One JSON-RPC channel carries them and the delegated names back the other way.
+//!   One JSON-RPC channel carries them, and the client is the only end that asks.
 //!   `console/ARCHITECTURE.md` has the long form.
-//!
-//! One module is built on [`fs`] rather than beside it:
-//!
-//! * [`skill`] — instructions the agent finds by looking. A [`Skill`](skill::Skill) is a
-//!   directory with a `skill.md` in it, so a capability added to a workspace arrives as files
-//!   to read rather than as an interface to learn — the bargain [`fs`] makes, one level up.
-//!   [`SkillDir`](skill::SkillDir) is such a directory as a [`FileSystem`](fs::FileSystem), and
-//!   a [`WorkFs`](fs::WorkFs) keeps the register of where its skills are. The dependency runs
-//!   one way: nothing in [`fs`] knows what a skill is.
 //!
 //! Nothing in [`console`] builds a tree, calls [`FileSystem`](fs::FileSystem) or
 //! touches a binding. What it does take is a [`Mount`](fs::Mount) — a tree somebody else
-//! already mounted, which is how a delegated executable comes to open the same file the
-//! command that called it did — and that is the whole of the seam. Nothing in [`fs`] knows a
+//! already mounted, which is what a session names as its workfs and what a `read` and a command
+//! then spell the same file under — and that is the whole of the seam. Nothing in [`fs`] knows a
 //! console exists. There is not even an error type between them: both halves answer in
 //! [`std::io::Error`], classified by kind, so neither has a vocabulary the other has to learn.
 //!
@@ -115,7 +105,6 @@ pub mod console;
 pub mod exec;
 pub mod fs;
 mod lock;
-pub mod skill;
 
 /// What every method that waits hands back — a [`Client`], a [`Server`], an
 /// [`Executable`].

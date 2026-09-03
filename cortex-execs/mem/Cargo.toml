@@ -8,21 +8,61 @@ edition.workspace = true
 # the difference is only who supplies the tree.
 [[bin]]
 name = "mem"
-path = "src/bin/mem.rs"
+path = "src/bin/main.rs"
 
 [dependencies]
+# The language model runtime. Extraction is one structured call to a provider the caller
+# chose by exporting a key, and ailoy is where that already lives: its provider registry
+# reads `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and the rest and resolves a `provider/model`
+# name against them, so `mem` picks a model rather than implementing a client. A path
+# dependency on a sibling checkout because ailoy is developed alongside this workspace —
+# pinning it to a version or a git rev is what makes this crate buildable elsewhere.
+ailoy = { path = "../../../ailoy" }
+# Error context on the extraction path. `Executable` answers in exit codes and `io::Result`
+# is what the store speaks, but what goes wrong between here and a provider is a chain —
+# which variable was unset, which model was asked, what it answered — and a caller reading
+# stderr wants the chain, not its last link.
+anyhow = { workspace = true }
+charabia = { version = "0.10" }
 # RFC 3339 timestamps. A memory carries when it was written, and the store is a file
 # other tools read: a sortable, unambiguous spelling is worth a dependency.
 chrono = { workspace = true }
-# `Executable`, `ExecCall`, `Mount` — the delegation surface this crate implements.
+# The command line. `mem` is several commands with different arities behind one name, and the
+# help a caller reads has to be the flags the parser accepts — a hand-written usage string and
+# a hand-written option loop are two places to say the same thing, which is one too many.
+#
+# `default-features = false` drops `color`: what this writes is not going to a terminal this
+# process can see, it is bytes on their way through a console to somebody else's, and ANSI
+# escapes chosen against *this* stdout would be escapes in a caller's data.
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+    "suggestions",
+] }
+# `Executable`, `ExecCall`, `Mount` — the surface this crate implements.
 cortex = { workspace = true }
+# `.env`, for the `mem` binary only — see `src/bin/main.rs` for why the library does not touch
+# it. What the extraction needs from the environment is a provider and the key that pays for
+# it, and a file beside the tree is where those already live for everything else here that
+# talks to a model.
+dotenvy = "0.15"
 # `BoxFuture`: `Executable` hands one back, and the traits here do the same so a
 # provider that waits on a network can be held behind a `dyn`.
 futures-core = { workspace = true }
+# `StreamExt`, for the one thing `futures-core` cannot do: `Agent::run` answers with a
+# stream — a turn is a sequence of messages, since an agent with tools emits one per round —
+# and reading it needs an adapter that the trait definition alone does not carry.
+futures = "0.3"
 rusqlite = { workspace = true }
+# `Deserialize`, for reading a model's answer. What comes back is JSON constrained by a
+# schema this crate wrote, so the shape is known and deriving it is cheaper — and stricter —
+# than walking a `Value`.
+serde = { workspace = true }
 serde_json = { workspace = true }
-sqlite-vec = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
 # Memory identity. Ids leave this process — they are what `mem delete` and
 # `mem history` are given back — so they cannot be rowids that a re-import renumbers.
 uuid = { workspace = true, features = ["v4"] }

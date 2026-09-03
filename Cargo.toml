@@ -2,9 +2,11 @@
 resolver = "3"
 members = [
     "cortex",
+    "cortex-execs/index",
     "cortex-execs/mem",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
+    "cortex-console-servers/uvm/boot",
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
@@ -28,6 +30,9 @@ async-trait = "0.1"
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
+# The boot process, and — as its library half — the strings a console server starts one with.
+# A server takes it without the `vm` feature and so links no VMM; see its own manifest.
+cortex-uvm-boot = { path = "cortex-console-servers/uvm/boot", default-features = false }
 futures-core = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -38,6 +43,16 @@ serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
+
+# The full-text index behind `cortex-exec-index`, and the parser its `--help` comes out of.
+# Only that crate takes either, which is what keeps a search engine and an argument parser out
+# of `cortex` — the same rule `rusqlite` follows for `cortex-exec-mem`.
+#
+# clap's `string` feature is load-bearing rather than a convenience: one executable can be
+# registered under several names, so the usage line has to carry the name it was invoked by,
+# and without `string` a command's name can only be a `&'static str`.
+clap = { version = "4", features = ["derive", "string"] }
+tantivy = "0.26"
 
 # The in-process, Rust-native libkrun fork. `VmBuilder` is what lets a boot be
 # assembled out of parts this workspace already holds: tagged virtio-fs shares, two
@@ -54,6 +69,14 @@ msb_krun = "0.1"
 # hypervisor — so the tree it drags in is charged to the one consumer that boots
 # a guest at all.
 microsandbox-image = "0.6.7"
+
+# The userspace network stack a session with a network gets: smoltcp behind a policy engine,
+# in this process rather than in a helper anyone has to install. Only `cortex-uvm-boot`'s `vm`
+# feature takes it — the stack lives with the VM it serves.
+#
+# **The pin matters.** It requires an exact `msb_krun`, so the two versions here have to agree
+# or a build ends up with two `NetBackend` traits and no way to hand one to the other.
+microsandbox-network = "=0.6.12"
 
 # Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl`
 # on `Posix` itself rather than a wrapper holding one — the same shape `fuse-t` takes,
@@ -89,15 +112,12 @@ serde_json = "1"
 unicode-normalization = "0.1"
 
 # A memory store that is one file in a cortex tree. `bundled` on purpose: the store
-# is a file a delegated executable opens on a mount, and which SQLite answers for it
-# must not be whichever one the host happens to ship — the schema below uses an
-# extension that is compiled against these headers.
+# is a file an executable opens on a mount, and which SQLite answers for it
+# must not be whichever one the host happens to ship — the schema is an FTS5 index,
+# and FTS5 is a compile-time option the host's own SQLite is free to have been built
+# without. A store that opened and then answered every search with nothing is the
+# failure being avoided.
 rusqlite = { version = "0.40", features = ["bundled"] }
-# Nearest-neighbour search inside that same file: a `vec0` virtual table, statically
-# registered as an auto-extension rather than loaded from a `.dylib` nobody would
-# have. Pinned off the 0.1.10 alphas, whose published crate is missing a `#include`d
-# source file and does not compile.
-sqlite-vec = "0.1.9"
 
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.

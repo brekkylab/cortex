@@ -1,0 +1,30 @@
+[package]
+name = "cortex-exec-index"
+version.workspace = true
+edition.workspace = true
+
+# `index` against a directory on this host, with no console and no mount in front of it.
+# The same `Executable` the console reaches, so what it does here is what it does there;
+# the difference is only who supplies the tree.
+[[bin]]
+name = "index"
+path = "src/bin/index.rs"
+
+[dependencies]
+# The argument parser. A registered name is a command line like any other, so it answers its
+# own `--help` — including on each subcommand, which is the half no runtime interception
+# could have covered. `string` is what lets the usage line carry the name it was invoked by.
+clap = { workspace = true }
+# `Executable`, `ExecCall`, `Mount` — the surface this crate implements.
+cortex = { workspace = true }
+# `BoxFuture`: `Executable` hands one back.
+futures-core = { workspace = true }
+# The index itself.
+tantivy = { workspace = true }
+# `spawn_blocking`: tantivy is synchronous and its calls are the slow kind (mmap, merges, a
+# commit's fsync), so they must not run on the task answering the console channel.
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
