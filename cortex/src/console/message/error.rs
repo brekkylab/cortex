@@ -130,6 +130,18 @@ impl Error {
 
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
     /// error) belongs to whoever reads the frame, not here.
+    /// The session named a built image this server does not have.
+    ///
+    /// Distinct from [`UNSUPPORTED_IMAGE`](Self::UNSUPPORTED_IMAGE), which says the backend
+    /// can swap no base at all: a client hearing this one can build the thing, where a client
+    /// hearing that one has to ask for something else.
+    ///
+    /// Said at `init`, unlike a reference that cannot be fetched — which is a boot that
+    /// failed. The difference is what finding out costs: whether an image built here is still
+    /// here is a file test, where whether a registry has one is a network round trip that
+    /// belongs to a boot.
+    pub const UNKNOWN_IMAGE: i64 = -32012;
+
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
@@ -171,6 +183,7 @@ mod tests {
             ("MOUNT_FAILED", Error::MOUNT_FAILED),
             ("UNSUPPORTED_NETWORK", Error::UNSUPPORTED_NETWORK),
             ("UNSUPPORTED_IMAGE", Error::UNSUPPORTED_IMAGE),
+            ("UNKNOWN_IMAGE", Error::UNKNOWN_IMAGE),
             ("INVALID_REQUEST", Error::INVALID_REQUEST),
             ("METHOD_NOT_FOUND", Error::METHOD_NOT_FOUND),
             ("INVALID_PARAMS", Error::INVALID_PARAMS),

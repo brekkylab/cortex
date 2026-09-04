@@ -15,13 +15,18 @@
 //! arrives on [`PORT_NAME`] as protocol frames, which is what makes this list stay
 //! short.
 //!
-//! Where the host *writes* this binary in the boot root is not here either, and could not
-//! usefully be: it is the path libkrun execs, so by the time anything in this crate runs it
-//! has already been used, and [`init`](crate::init) detaches the root holding it. The host
-//! keeps that one — `cortex-uvm-boot`'s `GUEST_BIN_PATH` — because the host is the only end
-//! that needs a name for it.
-
 use serde::{Deserialize, Serialize};
+
+/// Where the host wrote this binary in the boot root.
+///
+/// It is the path libkrun execs, so by the time anything in this crate runs it has already
+/// been used — and an ordinary session detaches the root holding it, which is why this end
+/// long had no name for it.
+///
+/// A **committable** session is the exception, and the reason this is here: it keeps that
+/// root so a commit can reach the overlay's upper through it, which leaves this binary
+/// reachable too. A commit has to leave it out, and cannot leave out what it cannot name.
+pub const GUEST_BIN_PATH: &str = "/.cortex-guest";
 
 /// The virtio-console port carrying the console session. The host holds a socket at the
 /// other end of it; the guest reaches it as `/dev/virtio-ports/<name>`, or by the device
@@ -55,6 +60,41 @@ pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
 
 /// Where it is mounted, and what goes first on `PATH`.
 pub const ABIN_PATH: &str = "/abin";
+
+/// The virtio-fs tag a committable session's scratch directory is shared under.
+pub const COMMIT_TAG: &str = "cortexcommit";
+
+/// Where that scratch is mounted, and where a commit writes its layer.
+pub const COMMIT_PATH: &str = "/.cortex-commit";
+
+/// Set when there is one to mount. Its value is [`COMMIT_PATH`].
+pub const COMMIT_ENV: &str = "CORTEX_UVM_COMMIT";
+
+/// Set when this session may commit at all.
+///
+/// Read before `pivot_root`, which is why it is separate from [`COMMIT_ENV`]: it decides
+/// whether the old root is kept, and that cannot be decided again afterwards.
+pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
+
+/// What a guest answers a `commit` with: the layer is written, and this big.
+///
+/// Not a [`CommitResp`](cortex::console::CommitResp), which names an image — something
+/// only the host can make, and only after reading what this wrote. The console server replaces
+/// this with one before the client sees anything, which is what it already does with `init`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuestCommit {
+    /// The tar's size, so the host can tell an empty layer from a missing one.
+    pub size: u64,
+}
+
+/// What a commit's layer is called inside the scratch. One name, said once.
+pub const LAYER_TAR: &str = "layer.tar";
+
+/// The upperdir of the overlay this guest stands on, for a boot that kept its old root.
+///
+/// The only way a commit sees what a session wrote: the host cannot read that ext4, and the
+/// overlay offers its upper under no other name.
+pub const UPPER_DIR: &str = "/oldroot/mnt/upper/upper";
 
 /// `PATH` for everything an execution spawns when the base image did not say — see
 /// [`ImageSpec::env`].

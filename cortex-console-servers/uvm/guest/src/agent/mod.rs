@@ -79,6 +79,8 @@
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
+mod commit;
+
 use std::ffi::OsString;
 use std::io::{self, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -88,13 +90,17 @@ use std::process::{ExitStatus, Output, Stdio};
 
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message, Notification,
-    ReadCall, ReadResp, Response, Server, WorkFsMount, WorkFsSource, WriteCall, WriteResp,
+    Call, CommitResp, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message,
+    Notification, ReadCall, ReadResp, Response, Server, WorkFsMount, WorkFsSource, WriteCall,
+    WriteResp,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
 use tokio::process::Command;
 
-use crate::contract::{ABIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec};
+use crate::contract::{
+    ABIN_PATH, COMMIT_ENV, COMMIT_PATH, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec,
+    LAYER_TAR, UPPER_DIR,
+};
 
 /// A command we found but could not start, and one we could not find at all.
 ///
@@ -220,6 +226,28 @@ pub async fn run(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
                         Err(e) => Response::Error(e),
                     };
                     server.respond(id, answered).await?;
+                }
+
+                Call::Commit(_) => {
+                    // On a blocking thread: walking the upperdir and archiving it is as big
+                    // as what the session wrote, and doing it here would stop this task
+                    // reading the channel — so an `exec` already in flight could not be
+                    // answered and a `stop` could not even arrive.
+                    let outcome = match session.boot() {
+                        Ok(()) => {
+                            let plan = commit_plan(&session);
+                            tokio::task::spawn_blocking(move || plan.run())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Response::Error(refused(
+                                        Error::IO_FAILED,
+                                        format!("writing this session's layer: {e}"),
+                                    ))
+                                })
+                        }
+                        Err(refusal) => Response::Error(refusal),
+                    };
+                    server.respond(id, outcome).await?;
                 }
             },
 
@@ -746,6 +774,93 @@ fn file_error(e: io::Error, path: &str) -> Error {
         _ => Error::IO_FAILED,
     };
     refused(code, format!("{path}: {e}"))
+}
+
+/// Everything a commit needs to know, worked out while the session is still in hand.
+///
+/// Separated from the writing so that the writing can be handed to a thread: what it takes is
+/// a few paths, where a [`Session`] is neither `Send` nor something to hold across one.
+enum CommitPlan {
+    /// Nothing was arranged for this at boot, so there is nothing to do but say so.
+    NotCommittable,
+    Write {
+        into: PathBuf,
+        excluded: Vec<PathBuf>,
+        mount_points: Vec<PathBuf>,
+    },
+}
+
+impl CommitPlan {
+    /// Write this session's layer where the host can read it.
+    ///
+    /// The answer carries no image, because this end has no idea what one is: it has written a
+    /// tar and that is the whole of what it knows. The console server turns it into one.
+    fn run(self) -> Response {
+        let CommitPlan::Write {
+            into,
+            excluded,
+            mount_points,
+        } = self
+        else {
+            return Response::Error(refused(
+                Error::INVALID_REQUEST,
+                "this session was not booted able to commit",
+            ));
+        };
+        match commit::write_layer(Path::new(UPPER_DIR), &into, &excluded, &mount_points) {
+            // No image: this end wrote a tar and has no idea what an image is. The console
+            // server fills that in on the way past — see `CommitResp`.
+            Ok(size) => Response::Commit(CommitResp { size, image: None }),
+            Err(e) => Response::Error(refused(
+                Error::IO_FAILED,
+                format!("writing this session's layer: {e}"),
+            )),
+        }
+    }
+}
+
+/// What this session would commit, and where.
+///
+/// A commit needs two things arranged while booting — the root holding this overlay's upper,
+/// and somewhere to write the result — and a session that did not say it might commit has
+/// neither. It cannot be given them now, so it is told rather than half-answered.
+fn commit_plan(session: &Session) -> CommitPlan {
+    let Ok(scratch) = std::env::var(COMMIT_ENV) else {
+        return CommitPlan::NotCommittable;
+    };
+
+    // Everything the console server and this agent put in the session's own filesystem. None
+    // of it is the session's work, and one of them is this binary.
+    let mut excluded: Vec<PathBuf> = [GUEST_BIN_PATH, "/oldroot", ABIN_PATH, COMMIT_PATH]
+        .iter()
+        .map(|path| PathBuf::from(path.trim_start_matches('/')))
+        .collect();
+    // Written into the session while it was up, by the network setup rather than by anything
+    // the session did. Docker leaves this file out of a commit too, and for the same reason.
+    //
+    // Named by the constant the writer uses rather than spelled again: two spellings of one
+    // path are two that drift, and the way this one would drift is silently — a committed
+    // image carrying a nameserver that belonged to a VM which no longer exists.
+    excluded.push(inside_upper(Path::new(crate::contract::RESOLV_CONF)));
+
+    // A mount point rather than a plain exclusion: the directories on the way to one exist
+    // only to reach it, and go with it.
+    let mount_points: Vec<PathBuf> = session
+        .workfs
+        .as_deref()
+        .map(|path| vec![inside_upper(path)])
+        .unwrap_or_default();
+
+    CommitPlan::Write {
+        into: Path::new(&scratch).join(LAYER_TAR),
+        excluded,
+        mount_points,
+    }
+}
+
+/// An absolute path in the guest, as the path it has inside the upperdir.
+fn inside_upper(path: &Path) -> PathBuf {
+    path.strip_prefix("/").unwrap_or(path).to_path_buf()
 }
 
 /// An execution that ended, as the answer to the `exec` that asked for it.
