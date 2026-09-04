@@ -529,7 +529,7 @@ fn file_row(name: &str, id: &str, size: u64) -> Value {
         "createdDateTime": "2025-11-01T12:00:00Z",
         "cTag": format!("ctag-{name}"),
         "eTag": format!("etag-{name}"),
-        "@microsoft.graph.downloadUrl": format!("{{HOST}}/content/{id}?listing=1"),
+        DOWNLOAD_URL_KEY: format!("{{HOST}}/content/{id}?listing=1"),
     })
 }
 
@@ -730,8 +730,10 @@ async fn start_full(
                 } else if let Some(folder) = graph_children_path(path) {
                     match tree.get(&folder).and_then(|v| v.as_array()) {
                         Some(rows) => {
-                            let rows: Vec<Value> =
-                                rows.iter().map(|r| with_host(r, &host, false)).collect();
+                            let rows: Vec<Value> = rows
+                                .iter()
+                                .map(|r| with_host(r, &host, false, query))
+                                .collect();
                             reply(200, json!({"value": rows}).to_string().into_bytes(), None)
                         }
                         None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec(), None),
@@ -742,7 +744,7 @@ async fn start_full(
                         // path can be told apart from the listing's.
                         Some(row) => reply(
                             200,
-                            with_host(&row, &host, true).to_string().into_bytes(),
+                            with_host(&row, &host, true, query).to_string().into_bytes(),
                             None,
                         ),
                         None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec(), None),
@@ -847,21 +849,28 @@ fn find_item(tree: &Value, path: &str) -> Option<Value> {
 }
 
 /// Point a row's download URL at this mock, marking it fresh when an item fetch hands it
-/// out rather than a listing.
-fn with_host(row: &Value, host: &str, fresh: bool) -> Value {
+/// out rather than a listing — and only when `$select` asked for it the way Graph requires.
+///
+/// That last part is the one place this mock is deliberately as unhelpful as the service:
+/// Graph accepts a `$select` naming the URL by the key it answers under, and then omits it
+/// from every row without saying so. A mock that answered anyway would hide the mistake,
+/// which is exactly what it did until a live read failed.
+fn with_host(row: &Value, host: &str, fresh: bool, query: &str) -> Value {
     let mut row = row.clone();
-    if let Some(u) = row
-        .get("@microsoft.graph.downloadUrl")
-        .and_then(|u| u.as_str())
-    {
-        let mut u = u.replace("{HOST}", host);
-        if fresh {
-            u.push_str("&fresh=1");
-        }
-        row.as_object_mut()
-            .unwrap()
-            .insert("@microsoft.graph.downloadUrl".into(), json!(u));
+    let Some(u) = row.get(DOWNLOAD_URL_KEY).and_then(|u| u.as_str()) else {
+        return row;
+    };
+    if !query.contains("content.downloadUrl") {
+        row.as_object_mut().unwrap().remove(DOWNLOAD_URL_KEY);
+        return row;
     }
+    let mut u = u.replace("{HOST}", host);
+    if fresh {
+        u.push_str("&fresh=1");
+    }
+    row.as_object_mut()
+        .unwrap()
+        .insert(DOWNLOAD_URL_KEY.into(), json!(u));
     row
 }
 

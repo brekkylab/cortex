@@ -112,9 +112,22 @@ const ITEM_FIELDS: &[&str] = &[
     "eTag",
 ];
 
-/// The instance annotation carrying a preauthenticated download URL. Asked for beside the
-/// fields above so a read does not cost a second round trip to learn where the bytes are.
-const DOWNLOAD_URL_FIELD: &str = "@microsoft.graph.downloadUrl";
+/// What `$select` has to name to be given a preauthenticated download URL.
+///
+/// Not what the response calls it, and the difference is not cosmetic. Measured against the
+/// live service: a `$select` naming [`DOWNLOAD_URL_KEY`] is accepted, answers `200`, and the
+/// annotation is absent from every row — no error says so. `content.downloadUrl` returns it,
+/// still spelled [`DOWNLOAD_URL_KEY`] in the JSON.
+///
+/// Asked for beside the fields above so a read does not cost a second round trip to learn
+/// where the bytes are. Getting it wrong does not degrade to that second trip either:
+/// [`OnedriveAccessor::get_item`] selects the same way, so a listing without the URL and
+/// the refetch meant to rescue it both come back without one.
+const DOWNLOAD_URL_SELECT: &str = "content.downloadUrl";
+
+/// The instance annotation a download URL actually arrives under. See
+/// [`DOWNLOAD_URL_SELECT`], which is spelled differently on purpose.
+pub(super) const DOWNLOAD_URL_KEY: &str = "@microsoft.graph.downloadUrl";
 
 /// Hard cap on listing pages so a duplicate or looping `@odata.nextLink` cannot spin
 /// forever.
@@ -321,7 +334,7 @@ impl OnedriveAccessor {
     /// The root is spelled differently from everything under it — `root/children`, not
     /// `root::/children` — because the colon form needs a path between its colons.
     fn children_url(&self, path: &str) -> String {
-        let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_FIELD);
+        let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_SELECT);
         let base = if path.is_empty() || path == "/" {
             format!("{}/me/drive/root/children", self.urls.graph)
         } else {
@@ -361,7 +374,7 @@ impl OnedriveAccessor {
     /// One item by path, for the case a listing cannot answer: a fresh download URL after
     /// the cached one has expired.
     pub async fn get_item(&self, path: &str) -> anyhow::Result<Value> {
-        let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_FIELD);
+        let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_SELECT);
         let url = if path.is_empty() || path == "/" {
             format!("{}/me/drive/root?$select={select}", self.urls.graph)
         } else {

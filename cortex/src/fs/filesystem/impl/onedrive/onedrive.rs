@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 use unicode_normalization::UnicodeNormalization;
 
-use super::accessor::{OnedriveAccessor, OnedriveConfig};
+use super::accessor::{DOWNLOAD_URL_KEY, OnedriveAccessor, OnedriveConfig};
 use crate::{
     BoxFuture,
     fs::filesystem::{Dirent, DirentKind, FileSystem, Stat},
@@ -435,7 +435,7 @@ fn child_from_item(v: &Value) -> Option<Child> {
 }
 
 fn download_url_of(v: &Value) -> Option<String> {
-    v.get("@microsoft.graph.downloadUrl")
+    v.get(DOWNLOAD_URL_KEY)
         .and_then(|u| u.as_str())
         .map(str::to_string)
 }
