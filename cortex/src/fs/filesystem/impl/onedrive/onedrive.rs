@@ -535,12 +535,15 @@ fn split_last(path: &str) -> (String, String) {
     }
 }
 
-/// A window of `data`, clamped twice so a range past the end is empty rather than fatal.
+/// A window of `data`, clamped so a range past the end is empty rather than fatal.
 fn slice(data: &[u8], range: Option<std::ops::Range<u64>>) -> Vec<u8> {
     match range {
         Some(r) => {
+            debug_assert!(r.end >= r.start, "callers hand this a forward range");
             let start = (r.start as usize).min(data.len());
-            let end = (r.end as usize).min(data.len()).max(start);
+            // No `.max(start)`: with `r.end >= r.start` above, clamping both to the same
+            // length keeps them in order.
+            let end = (r.end as usize).min(data.len());
             data[start..end].to_vec()
         }
         None => data.to_vec(),

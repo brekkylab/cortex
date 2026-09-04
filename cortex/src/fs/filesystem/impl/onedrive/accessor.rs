@@ -492,7 +492,7 @@ fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 /// `/` into `%2F` and address one long name instead of a path. `?` and `#` are what make
 /// this load-bearing rather than tidy — either one raw would end the path and start a
 /// query, and OneDrive allows neither in a name but a gateway is not obliged to agree.
-fn encode_path(path: &str) -> String {
+pub(super) fn encode_path(path: &str) -> String {
     path.trim_matches('/')
         .split('/')
         .map(encode_segment)
@@ -573,18 +573,11 @@ mod tests {
     #[test]
     fn a_path_is_encoded_by_segment() {
         assert_eq!(encode_path("/a/b c/d"), "a/b%20c/d");
-        assert_eq!(encode_path("보고/서.pdf"), {
-            let mut s = String::new();
-            for b in "보고".bytes() {
-                s.push_str(&format!("%{b:02X}"));
-            }
-            s.push('/');
-            for b in "서".bytes() {
-                s.push_str(&format!("%{b:02X}"));
-            }
-            s.push_str(".pdf");
-            s
-        });
+        // UTF-8 percent-encoded byte by byte, and the separator left alone.
+        assert_eq!(
+            encode_path("보고/서.pdf"),
+            "%EB%B3%B4%EA%B3%A0/%EC%84%9C.pdf"
+        );
         // The two that would end the path and start something else.
         assert_eq!(encode_path("a?b"), "a%3Fb");
         assert_eq!(encode_path("a#b"), "a%23b");

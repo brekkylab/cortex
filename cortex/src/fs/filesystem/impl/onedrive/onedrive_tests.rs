@@ -6,6 +6,7 @@ use std::sync::Mutex as StdMutex;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::super::accessor::encode_path;
 use super::super::{OnedriveConfig, OnedriveOrigins};
 use super::*;
 
@@ -13,11 +14,14 @@ use super::*;
 // Pure, no I/O
 // ---------------------------------------------------------------------------
 
-/// A package — a OneNote notebook is the one you meet — is neither a file nor a folder,
-/// and has no bytes this API will serve. A name that cannot be read is worse than an
-/// absence, so it is not listed.
+/// One listing row becomes the entry the mount shows, or nothing at all.
+///
+/// A **package** — a OneNote notebook is the one you meet — is dropped: Microsoft calls it
+/// "a package instead of a folder or file", treated as a folder by some clients and a file
+/// by others, and it has no bytes this API will serve. An item that is neither `file` nor
+/// `folder` goes the same way. A name that cannot be read is worse than an absence.
 #[test]
-fn a_package_and_a_facetless_row_are_not_listed() {
+fn a_row_becomes_the_entry_it_should() {
     let mut notebook = folder_row("Work Notes", "N1");
     notebook
         .as_object_mut()
@@ -38,49 +42,46 @@ fn a_package_and_a_facetless_row_are_not_listed() {
         child_from_item(&neither).is_some(),
         "a file facet is enough"
     );
+
+    let file = child_from_item(&file_row("report.docx", "F1", 1234)).unwrap();
+    assert_eq!(
+        (file.size, file.etag.as_deref()),
+        (1234, Some("ctag-report.docx")),
+        "the exact size, and the content tag rather than the other one"
+    );
+    // A folder states a size too — the sum of what it contains, which is not a length
+    // anything reads.
+    assert_eq!(
+        child_from_item(&folder_row("Documents", "D1"))
+            .unwrap()
+            .size,
+        0
+    );
 }
 
-/// A name is one path segment. OneDrive refuses most of what would need removing, so this
-/// guards against a gateway that is less strict — `/` being the one that would silently
-/// address something else.
+/// Nothing addresses what it does not name.
+///
+/// A name is one path segment. OneDrive refuses most of what would need removing — `\ / :
+/// * ? " < > |` are not allowed in one — so this guards a gateway that is less strict, `/`
+/// being the one that would silently become a separator. And `..` in a *path* is refused
+/// rather than walked: a name survives the sanitizer with almost anything in it, and the
+/// tree has no `..` of its own for it to mean.
 #[test]
-fn names_cannot_escape_their_directory() {
+fn nothing_addresses_what_it_does_not_name() {
     let evil = child_from_item(&file_row("../../etc/passwd", "E1", 1)).unwrap();
     assert!(!evil.name.contains('/'));
-    let dots = child_from_item(&file_row("..", "E2", 1)).unwrap();
-    assert_eq!(dots.name, "untitled");
-    let blank = child_from_item(&file_row("   ", "E3", 1)).unwrap();
-    assert_eq!(blank.name, "untitled");
-}
+    assert_eq!(
+        child_from_item(&file_row("..", "E2", 1)).unwrap().name,
+        "untitled"
+    );
+    assert_eq!(
+        child_from_item(&file_row("   ", "E3", 1)).unwrap().name,
+        "untitled"
+    );
 
-/// `..` is refused rather than walked: a name survives the sanitizer with almost anything
-/// in it, so a parent reference resolved here would address a directory nobody named.
-#[test]
-fn a_path_is_normalized_and_a_parent_reference_refused() {
-    assert_eq!(vpath(Path::new("/")).unwrap(), "/");
-    assert_eq!(vpath(Path::new("/a/b")).unwrap(), "/a/b");
     assert_eq!(vpath(Path::new("/a//b/")).unwrap(), "/a/b");
     assert_eq!(vpath(Path::new("/a/./b")).unwrap(), "/a/b");
     assert!(vpath(Path::new("/a/../b")).is_err(), "`..` is refused");
-}
-
-/// A window past the end is empty, not a panic — a hostile range is structurally unable
-/// to take the process down.
-#[test]
-fn a_window_past_the_end_is_empty() {
-    let data = b"0123456789";
-    assert_eq!(slice(data, Some(2..5)), b"234");
-    assert_eq!(slice(data, Some(8..99)), b"89");
-    assert_eq!(slice(data, Some(99..200)), b"");
-    // Built from values rather than written literally: a backwards range is what a
-    // caller's arithmetic produces, never what it types.
-    let (from, to) = (5u64, 2u64);
-    assert_eq!(
-        slice(data, Some(from..to)),
-        b"",
-        "backwards is empty, not fatal"
-    );
-    assert_eq!(slice(data, None), data);
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +169,7 @@ async fn one_listing_answers_the_whole_directory() {
     );
 }
 
-/// The span policy, in the cases that distinguish it — and the slot it lives in.
+/// The span policy, in the cases that distinguish it, and the one slot it lives in.
 ///
 /// The kernel's window is 64 KiB and not ours to choose. One ranged request per window is
 /// the pathology this exists to avoid: measured against Drive, whose round trip is the same
@@ -177,15 +178,15 @@ async fn one_listing_answers_the_whole_directory() {
 /// [`READ_SPAN`] for one buffer.
 #[tokio::test]
 async fn a_walk_pays_a_span_and_a_head_read_pays_less() {
-    const REAL: usize = 80 * 1024 * 1024;
+    const REAL: u64 = 80 * 1024 * 1024;
     const CHUNK: u64 = 64 * 1024;
     let mock = start(
         json!({"/": [
-            file_row("big.bin", "P1", REAL as u64),
+            file_row("big.bin", "P1", REAL),
             file_row("other.bin", "P2", 4096),
         ]}),
         HashMap::from([
-            ("P1".to_string(), vec![b'z'; REAL]),
+            ("P1".to_string(), vec![b'z'; REAL as usize]),
             ("P2".to_string(), vec![b'y'; 4096]),
         ]),
     )
@@ -210,19 +211,39 @@ async fn a_walk_pays_a_span_and_a_head_read_pays_less() {
         "eight windows, one span, and it is the smaller one"
     );
 
-    // Carrying on from where that span ended is a walk, and pays the bigger one.
-    mock.reset();
-    fs.read_window(file, Some(FIRST_SPAN..FIRST_SPAN + CHUNK))
+    // Carrying on from the span the reader spent is a walk, and pays the bigger one. Both
+    // shapes of carrying on: a window that begins inside the span and reaches past its end
+    // (which is what a window whose size does not divide the span does), and one that
+    // begins exactly at the end. Each new span begins where its read began rather than on
+    // a fixed boundary, which is what keeps a window from being split across two of them —
+    // and so what makes a short return mean end of file.
+    let mut at = FIRST_SPAN - CHUNK / 2;
+    for _ in 0..2 {
+        mock.reset();
+        let got = fs.read_window(file, Some(at..at + CHUNK)).await.unwrap();
+        assert_eq!(got.len() as u64, CHUNK, "at {at}");
+        assert_eq!(
+            mock.content_ranges(),
+            vec![Some(format!("bytes={at}-{}", at + READ_SPAN - 1))],
+            "carrying on from {at} pays READ_SPAN, from where the read began"
+        );
+        at += READ_SPAN;
+    }
+
+    // Past the end is an ordinary end. A window that starts inside the file and runs off it
+    // comes back short — which is the only thing short is allowed to mean — and one wholly
+    // past it comes back empty. Neither is an error.
+    let tail = fs
+        .read_window(file, Some(REAL - CHUNK / 2..REAL + CHUNK / 2))
         .await
         .unwrap();
-    assert_eq!(
-        mock.content_ranges(),
-        vec![Some(format!(
-            "bytes={}-{}",
-            FIRST_SPAN,
-            FIRST_SPAN + READ_SPAN - 1
-        ))],
-        "continuing pays READ_SPAN"
+    assert_eq!(tail.len() as u64, CHUNK / 2, "short, and short is the end");
+    assert!(
+        fs.read_window(file, Some(REAL + CHUNK..REAL + 2 * CHUNK))
+            .await
+            .unwrap()
+            .is_empty(),
+        "wholly past the end is empty"
     );
 
     // An empty window is not a read at all. The guard is at both levels, so neither alone
@@ -239,7 +260,7 @@ async fn a_walk_pays_a_span_and_a_head_read_pays_less() {
     assert!(mock.content_ranges().is_empty());
 
     // One slot: another file displaces what was held, and going back costs fetching it
-    // again — which is what it cost the first time.
+    // again — as a first read rather than a walk, which is what it cost the first time.
     fs.read_window(Path::new("/other.bin"), Some(0..16))
         .await
         .unwrap();
@@ -253,45 +274,7 @@ async fn a_walk_pays_a_span_and_a_head_read_pays_less() {
     assert_eq!(
         mock.content_ranges(),
         vec![Some(format!("bytes=0-{}", FIRST_SPAN - 1))],
-        "the displaced file was fetched again, and as a first read rather than a walk"
-    );
-}
-
-/// A window straddling the end of the held span is still one walk, and the span that
-/// answers it begins exactly where the read does.
-///
-/// This is what makes "a short return means EOF" true. If a span could begin on a fixed
-/// boundary instead, a window could fall across two of them and come back half full —
-/// which a reader is obliged to read as the end of the file.
-#[tokio::test]
-async fn a_window_straddling_a_span_boundary_is_still_a_walk() {
-    const REAL: usize = 80 * 1024 * 1024;
-    // A window size that does not divide the span, so the last one reaches past its end
-    // from inside rather than landing on the boundary.
-    const CHUNK: u64 = 3 * 1024 * 1024;
-    let mock = start(
-        json!({"/": [file_row("big.bin", "P1", REAL as u64)]}),
-        HashMap::from([("P1".to_string(), vec![b'q'; REAL])]),
-    )
-    .await;
-    let fs = mounted(&mock.config());
-    let file = Path::new("/big.bin");
-    fs.list(Path::new("/")).await.unwrap();
-
-    let mut at = 0u64;
-    while at < FIRST_SPAN + CHUNK {
-        let got = fs.read_window(file, Some(at..at + CHUNK)).await.unwrap();
-        assert_eq!(got.len() as u64, CHUNK, "at {at}");
-        at += CHUNK;
-    }
-    let asked = mock.content_ranges();
-    assert_eq!(asked.len(), 2, "one span, then its continuation: {asked:?}");
-    // Windows land at 0, 3, 6 and 9 MiB. The one at 6 MiB reaches to 9 MiB, past the end
-    // of an 8 MiB span it began inside — that is the straddle, and it is a walk.
-    assert_eq!(
-        asked[1],
-        Some(format!("bytes={}-{}", 2 * CHUNK, 2 * CHUNK + READ_SPAN - 1)),
-        "the second span begins where the read that missed began, not on a boundary"
+        "the displaced file was fetched again, and from the start"
     );
 }
 
@@ -428,10 +411,15 @@ fn live_config() -> Option<OnedriveConfig> {
     })
 }
 
-/// Walk a real account and read what it lists.
+/// Walk a real account, then read a real file by windows.
 ///
 ///     set -a; . ./.env; set +a
 ///     cargo test -p cortex --features onedrive onedrive_live -- --ignored --nocapture
+///
+/// Against the real service and not the mock, because the mock cannot be wrong in the same
+/// way: it answers whatever it is asked and Graph does not. `$select` naming the download
+/// URL the way the response spells it is accepted and silently answered without one — this
+/// is what noticed that.
 #[tokio::test]
 #[ignore = "requires ONEDRIVE_* env + network"]
 async fn onedrive_live_tree_and_reads() {
@@ -447,18 +435,14 @@ async fn onedrive_live_tree_and_reads() {
 
     for e in root.iter().take(10) {
         let st = e.stat().expect("a listing row carries its stat");
-        eprintln!(
-            "  {:<40} {:>12} {}",
-            e.name,
-            st.size,
-            if st.kind == DirentKind::Dir {
-                "dir"
-            } else {
-                ""
-            }
-        );
-        // Every entry's stat comes off the listing, so this states the real length and
-        // never a placeholder.
+        let kind = if st.kind == DirentKind::Dir {
+            "dir"
+        } else {
+            ""
+        };
+        eprintln!("  {:<44} {:>12} {kind}", e.name, st.size);
+        // Every attribute comes off the listing, so this states the real length and never
+        // a placeholder — and costs nothing to ask again.
         assert_eq!(
             fs.stat(&PathBuf::from("/").join(&e.name))
                 .await
@@ -469,18 +453,7 @@ async fn onedrive_live_tree_and_reads() {
             e.name
         );
     }
-}
 
-/// Read a real file by ranges and confirm the windows line up with the whole.
-#[tokio::test]
-#[ignore = "requires ONEDRIVE_* env + network"]
-async fn onedrive_live_reads_by_range() {
-    let Some(cfg) = live_config() else {
-        eprintln!("set ONEDRIVE_CLIENT_ID / ONEDRIVE_REFRESH_TOKEN to run");
-        return;
-    };
-    let fs = OnedriveFs::new(&cfg).unwrap();
-    let root = fs.list(Path::new("/")).await.expect("root listing");
     let Some(file) = root
         .iter()
         .find(|e| e.kind == DirentKind::File && e.stat().is_some_and(|s| s.size > 4096))
@@ -490,23 +463,22 @@ async fn onedrive_live_reads_by_range() {
     };
     let path = PathBuf::from("/").join(&file.name);
     let size = file.stat().unwrap().size;
-    eprintln!("  {} is {} bytes", file.name, size);
+    eprintln!("  reading {} ({size} bytes)", file.name);
 
     let head = fs.read_window(&path, Some(0..4096)).await.expect("head");
     assert_eq!(head.len(), 4096);
-    let mid = fs.read_window(&path, Some(2048..4096)).await.expect("mid");
     assert_eq!(
-        mid,
+        fs.read_window(&path, Some(2048..4096)).await.expect("mid"),
         &head[2048..4096],
         "a window is the file's bytes at that offset"
     );
-
     // Past the end is an ordinary end rather than an error.
-    let past = fs
-        .read_window(&path, Some(size..size + 4096))
-        .await
-        .expect("past the end");
-    assert!(past.is_empty());
+    assert!(
+        fs.read_window(&path, Some(size..size + 4096))
+            .await
+            .expect("past the end")
+            .is_empty()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -694,20 +666,11 @@ async fn start_full(
                 });
 
                 let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-                let reply = |status: u16, body: Vec<u8>, extra: Option<String>| {
+                let reply = |status: u16, body: Vec<u8>| {
                     let len = body.len();
-                    let mut out = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                         Content-Length: {len}\r\nConnection: close\r\n"
-                    );
-                    if let Some(e) = extra {
-                        out.push_str(&e);
-                        out.push_str("\r\n");
-                    }
-                    out.push_str("\r\n");
-                    let mut bytes = out.into_bytes();
-                    bytes.extend_from_slice(&body);
-                    (bytes, len)
+                    let mut out = http_head(status, "application/json", len, None);
+                    out.extend_from_slice(&body);
+                    (out, len)
                 };
 
                 let (out, body_len) = if method == "POST" && path.contains("/oauth2/") {
@@ -716,41 +679,39 @@ async fn start_full(
                         json!({"access_token": "at", "expires_in": 3600})
                             .to_string()
                             .into_bytes(),
-                        None,
                     )
                 } else if let Some(id) = path.strip_prefix("/content/") {
                     let fresh = query.contains("fresh=1");
                     if stale_listing_urls && !fresh {
                         // What an expired preauthenticated URL answers.
-                        reply(401, br#"{"error":"expired"}"#.to_vec(), None)
+                        reply(401, br#"{"error":"expired"}"#.to_vec())
                     } else {
                         let blob = blobs.get(id).cloned().unwrap_or_default();
                         serve_content(blob, range.as_deref(), range_mode)
                     }
-                } else if let Some(folder) = graph_children_path(path) {
+                } else if let Some(folder) = graph_children_path(&tree, path) {
                     match tree.get(&folder).and_then(|v| v.as_array()) {
                         Some(rows) => {
                             let rows: Vec<Value> = rows
                                 .iter()
                                 .map(|r| with_host(r, &host, false, query))
                                 .collect();
-                            reply(200, json!({"value": rows}).to_string().into_bytes(), None)
+                            reply(200, json!({"value": rows}).to_string().into_bytes())
                         }
-                        None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec(), None),
+                        None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
                     }
-                } else if let Some(item) = graph_item_path(path) {
-                    match find_item(&tree, &item) {
+                } else if let Some(inner) = graph_item_inner(path) {
+                    match find_item(&tree, inner) {
                         // The item fetch hands out a URL marked fresh, so the refetch
                         // path can be told apart from the listing's.
                         Some(row) => reply(
                             200,
                             with_host(&row, &host, true, query).to_string().into_bytes(),
-                            None,
                         ),
-                        None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec(), None),
+                        None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
                     }
                 } else {
-                    reply(404, br#"{"error":"no route"}"#.to_vec(), None)
+                    reply(404, br#"{"error":"no route"}"#.to_vec())
                 };
                 if sock.write_all(&out).await.is_ok() {
                     *written.lock().unwrap() += body_len as u64;
@@ -766,86 +727,88 @@ async fn start_full(
     }
 }
 
-/// Content, with or without a working `Range`.
-fn serve_content(blob: Vec<u8>, range: Option<&str>, mode: RangeMode) -> (Vec<u8>, usize) {
-    let head = |status: u16, len: usize, extra: Option<String>| {
-        let mut out = format!(
-            "HTTP/1.1 {status} X\r\nContent-Type: application/octet-stream\r\n\
-             Content-Length: {len}\r\nConnection: close\r\n"
-        );
-        if let Some(e) = extra {
-            out.push_str(&e);
-            out.push_str("\r\n");
-        }
+/// One HTTP response head. `extra`, when given, is a whole header line.
+fn http_head(status: u16, ctype: &str, len: usize, extra: Option<String>) -> Vec<u8> {
+    let mut out = format!(
+        "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\n\
+         Content-Length: {len}\r\nConnection: close\r\n"
+    );
+    if let Some(e) = extra {
+        out.push_str(&e);
         out.push_str("\r\n");
-        out.into_bytes()
-    };
-    match (mode, range.and_then(parse_range)) {
-        (RangeMode::Shifted, Some((start, end))) => {
-            // Answer from a bit earlier than asked, and state it.
-            let start = start.saturating_sub(1024);
-            let last = end
-                .unwrap_or(blob.len() as u64 - 1)
-                .min(blob.len() as u64 - 1);
-            let window = blob[start as usize..=last as usize].to_vec();
-            let len = window.len();
-            let cr = format!("Content-Range: bytes {start}-{last}/{}", blob.len());
-            let mut out = head(206, len, Some(cr));
-            out.extend_from_slice(&window);
-            (out, len)
-        }
-        (RangeMode::Ignore, Some(_)) | (_, None) => {
-            let len = blob.len();
-            let mut out = head(200, len, None);
-            out.extend_from_slice(&blob);
-            (out, len)
-        }
-        (RangeMode::Honour, Some((start, end))) => {
-            if start >= blob.len() as u64 {
-                return (head(416, 0, None), 0);
-            }
-            let last = end
-                .unwrap_or(blob.len() as u64 - 1)
-                .min(blob.len() as u64 - 1);
-            let window = blob[start as usize..=last as usize].to_vec();
-            let len = window.len();
-            let cr = format!("Content-Range: bytes {start}-{last}/{}", blob.len());
-            let mut out = head(206, len, Some(cr));
-            out.extend_from_slice(&window);
-            (out, len)
-        }
     }
+    out.push_str("\r\n");
+    out.into_bytes()
+}
+
+/// Content, answering a `Range` the way `mode` says this origin would.
+fn serve_content(blob: Vec<u8>, range: Option<&str>, mode: RangeMode) -> (Vec<u8>, usize) {
+    let body = |status: u16, bytes: &[u8], extra: Option<String>| {
+        let mut out = http_head(status, "application/octet-stream", bytes.len(), extra);
+        out.extend_from_slice(bytes);
+        (out, bytes.len())
+    };
+    let asked = range.and_then(parse_range);
+    // No range asked, or one this origin ignores — the whole file, which Microsoft
+    // documents as a legitimate answer to a range it cannot generate.
+    let Some((from, to)) = asked.filter(|_| mode != RangeMode::Ignore) else {
+        return body(200, &blob, None);
+    };
+    if mode == RangeMode::Honour && from >= blob.len() as u64 {
+        return body(416, &[], None);
+    }
+    // `Shifted` answers from earlier than asked and states it, which RFC 9110 allows and
+    // which is what makes `Content-Range` the only thing that knows where the bytes begin.
+    let from = if mode == RangeMode::Shifted {
+        from.saturating_sub(1024)
+    } else {
+        from
+    };
+    let end = blob.len() as u64 - 1;
+    let last = to.unwrap_or(end).min(end);
+    let window = &blob[from as usize..=last as usize];
+    let cr = format!("Content-Range: bytes {from}-{last}/{}", blob.len());
+    body(206, window, Some(cr))
 }
 
 /// `/graph/v1.0/me/drive/root/children` or `/graph/v1.0/me/drive/root:/A/B:/children`
 /// into the mount path the tree is keyed by.
-fn graph_children_path(path: &str) -> Option<String> {
+fn graph_children_path(tree: &Value, path: &str) -> Option<String> {
     let rest = path.split_once("/me/drive/root")?.1;
     if rest == "/children" {
         return Some("/".to_string());
     }
     let inner = rest.strip_prefix(":/")?.strip_suffix(":/children")?;
-    Some(format!("/{}", decode(inner)))
-}
-
-/// `/graph/v1.0/me/drive/root:/A/B` into the same.
-fn graph_item_path(path: &str) -> Option<String> {
-    let rest = path.split_once("/me/drive/root")?.1;
-    if rest.is_empty() {
-        return Some("/".to_string());
-    }
-    let inner = rest.strip_prefix(":/")?;
-    (!inner.contains(':')).then(|| format!("/{}", decode(inner)))
-}
-
-/// The row a mount path names, by walking the tree the way the store does.
-fn find_item(tree: &Value, path: &str) -> Option<Value> {
-    let (parent, name) = split_last(path);
-    tree.get(&parent)?
-        .as_array()?
-        .iter()
-        .find(|r| r.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+    tree.as_object()?
+        .keys()
+        .find(|k| encode_path(k) == inner)
         .cloned()
+}
+
+/// The encoded path in `/graph/v1.0/me/drive/root:/A/B`, which addresses one item rather
+/// than a folder's children.
+fn graph_item_inner(path: &str) -> Option<&str> {
+    let inner = path.split_once("/me/drive/root")?.1.strip_prefix(":/")?;
+    (!inner.contains(':')).then_some(inner)
+}
+
+/// The row whose path encodes to `inner`.
+///
+/// Encoding the fixtures forwards rather than decoding the request: the accessor's own
+/// encoder is the definition of what a path becomes on the wire, so a mock that compares
+/// against it cannot disagree with the thing under test about what was asked for. A
+/// second, hand-written decoder here could.
+fn find_item(tree: &Value, inner: &str) -> Option<Value> {
+    for (folder, rows) in tree.as_object()? {
+        for row in rows.as_array()? {
+            let name = row.get("name")?.as_str()?;
+            let sep = if folder.ends_with('/') { "" } else { "/" };
+            if encode_path(&format!("{folder}{sep}{name}")) == inner {
+                return Some(row.clone());
+            }
+        }
+    }
+    None
 }
 
 /// Point a row's download URL at this mock, marking it fresh when an item fetch hands it
@@ -872,26 +835,6 @@ fn with_host(row: &Value, host: &str, fresh: bool, query: &str) -> Value {
         .unwrap()
         .insert(DOWNLOAD_URL_KEY.into(), json!(u));
     row
-}
-
-fn decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let Ok(v) =
-                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
-        {
-            out.push(v);
-            i += 3;
-            continue;
-        }
-        out.push(b[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).to_string()
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
