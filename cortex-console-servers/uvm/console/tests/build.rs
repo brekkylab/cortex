@@ -7,7 +7,7 @@
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use cortex::console::{Console, ConsoleBuilder, ExecResult, NetworkAccess};
+use cortex::console::{Console, ConsoleBuilder, ExecResp, NetworkAccess};
 use cortex::rootfs::Rootfs;
 use tokio::process::Command;
 
@@ -68,7 +68,7 @@ async fn what_a_build_makes_is_what_the_next_session_boots() {
         .copy("marker.txt", "/marker.txt")
         .env("BUILT_BY", "cortex")
         .workdir("/srv")
-        .on_step(move |step, result: &ExecResult| {
+        .on_step(move |step, result: &ExecResp| {
             recorded
                 .lock()
                 .unwrap()

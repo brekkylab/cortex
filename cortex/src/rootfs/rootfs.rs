@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::console::{ConsoleBuilder, Error, ExecResult, Failure, ImageSource, NetworkAccess};
+use crate::console::{ConsoleBuilder, Error, ExecResp, Failure, ImageSource, NetworkAccess};
 use crate::fs::Mount;
 
 use super::{BuildId, Recipe, Step, digest};
@@ -42,7 +42,7 @@ pub struct Rootfs {
 ///
 /// A name rather than the type written out, because the type written out is long enough that
 /// the field it sits in stops being readable.
-type Observer = Box<dyn FnMut(&Step, &ExecResult) + Send>;
+type Observer = Box<dyn FnMut(&Step, &ExecResp) + Send>;
 
 /// Something a Dockerfile said that this build did not act on.
 ///
@@ -164,7 +164,7 @@ impl Rootfs {
     /// [`env`](Self::env) — that one accumulates here and sends nothing. It observes and
     /// cannot change anything: the return value is dropped, and a panic in it takes the
     /// build down with it.
-    pub fn on_step(mut self, f: impl FnMut(&Step, &ExecResult) + Send + 'static) -> Self {
+    pub fn on_step(mut self, f: impl FnMut(&Step, &ExecResp) + Send + 'static) -> Self {
         self.on_step = Some(Box::new(f));
         self
     }
@@ -333,7 +333,7 @@ pub struct StepFailed {
     /// What actually went on the wire, which is not the same thing — a `RUN` carries the
     /// accumulated environment in front of it.
     pub argv: Vec<String>,
-    pub result: ExecResult,
+    pub result: ExecResp,
 }
 
 impl fmt::Display for StepFailed {
@@ -543,8 +543,8 @@ mod tests {
 
     use crate::BoxFuture;
     use crate::console::{
-        Call, Client, CommitResult, ConsoleBuilder, Error, ExecCmd, Failure, ImageSource,
-        InitResult, Notification, Outcome, Progress, RequestId, WorkFsMount,
+        Call, Client, CommitResp, ConsoleBuilder, Error, Failure, ImageSource, InitResp,
+        Notification, Response, WorkFsMount,
     };
 
     /// Every call a build made, in order.
@@ -552,26 +552,27 @@ mod tests {
 
     /// A client over canned answers, recording every call it was handed.
     struct Recorder {
-        answers: Vec<Outcome>,
-        next_id: RequestId,
+        answers: Vec<Response>,
         log: Log,
     }
 
     impl Client for Recorder {
-        fn call(&mut self, call: Call) -> BoxFuture<'_, (RequestId, Result<Outcome, Failure>)> {
-            let id = self.next_id;
-            self.next_id += 1;
+        fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Response, Failure>> {
             self.log.lock().unwrap().push(call);
-            let answer = if self.answers.is_empty() {
-                Err(Failure::Refused(Error {
+            let answer = match self.answers.is_empty() {
+                true => Err(Failure::Refused(Error {
                     code: Error::INTERNAL_ERROR,
                     message: "the test ran out of answers".into(),
                     data: None,
-                }))
-            } else {
-                Ok(self.answers.remove(0))
+                })),
+                // A refusal becomes a `Refused` here, which is what a transport does with
+                // one — a caller never meets `Response::Error` itself.
+                false => match self.answers.remove(0) {
+                    Response::Error(error) => Err(Failure::Refused(error)),
+                    answer => Ok(answer),
+                },
             };
-            Box::pin(async move { (id, answer) })
+            Box::pin(async move { answer })
         }
 
         fn notify(&mut self, _: Notification) -> BoxFuture<'_, Result<(), Failure>> {
@@ -579,30 +580,27 @@ mod tests {
         }
     }
 
-    fn outcome<T: serde::Serialize>(value: &T) -> Outcome {
-        Outcome::Result(bson::serialize_to_bson(value).unwrap())
-    }
-
     /// A session taken, with the workfs put where the build said it was.
-    fn took_the_session(at: &Path) -> Outcome {
-        outcome(&InitResult {
+    fn took_the_session(at: &Path) -> Response {
+        Response::Init(InitResp {
             workfs: Some(WorkFsMount {
                 path: at.to_str().unwrap().to_string(),
             }),
-            ..InitResult::default()
+            ..InitResp::default()
         })
     }
 
-    fn ran(code: i32) -> Outcome {
-        outcome(&Progress::Done(ExecResult {
+    fn ran(code: i32) -> Response {
+        Response::Exec(ExecResp {
             code,
-            ..ExecResult::default()
-        }))
+            ..ExecResp::default()
+        })
     }
 
-    fn committed(reference: &str) -> Outcome {
-        outcome(&CommitResult {
-            image: ImageSource::new(reference),
+    fn committed(reference: &str) -> Response {
+        Response::Commit(CommitResp {
+            size: 4096,
+            image: Some(ImageSource::new(reference)),
         })
     }
 
@@ -612,10 +610,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|call| match call {
-                Call::Exec(exec) => match &exec.cmd {
-                    ExecCmd::New(argv) => Some(argv.clone()),
-                    ExecCmd::Resume { .. } => None,
-                },
+                Call::Exec(exec) => Some(exec.cmd.clone()),
                 _ => None,
             })
             .collect()
@@ -626,7 +621,7 @@ mod tests {
     /// One helper for both because `build` may open either one console or two, and a test
     /// that had to know which would be asserting the shape of the code rather than what it
     /// sent.
-    fn two(first: Vec<Outcome>, second: Vec<Outcome>) -> (impl Fn() -> ConsoleBuilder, Log) {
+    fn two(first: Vec<Response>, second: Vec<Response>) -> (impl Fn() -> ConsoleBuilder, Log) {
         let log: Log = Arc::new(Mutex::new(Vec::new()));
         let queued = Arc::new(Mutex::new(vec![second, first]));
         let shared = log.clone();
@@ -634,7 +629,6 @@ mod tests {
             let answers = queued.lock().unwrap().pop().expect("a third console");
             ConsoleBuilder::new().client(Recorder {
                 answers,
-                next_id: 0,
                 log: shared.clone(),
             })
         };
@@ -642,8 +636,8 @@ mod tests {
     }
 
     /// The one answer that means the image is not there and the build should run.
-    fn unknown_image() -> Outcome {
-        Outcome::Error(Error {
+    fn unknown_image() -> Response {
+        Response::Error(Error {
             code: Error::UNKNOWN_IMAGE,
             message: "no such built image".into(),
             data: None,
@@ -661,7 +655,7 @@ mod tests {
             .run("true");
         let id = rootfs.id().unwrap();
 
-        let (make, log) = two(vec![outcome(&InitResult::default())], Vec::new());
+        let (make, log) = two(vec![Response::Init(InitResp::default())], Vec::new());
         let built = rootfs.build(make).await.expect("the cached image");
 
         assert_eq!(built.id(), &id);
@@ -692,7 +686,7 @@ mod tests {
             .run("true");
         let id = rootfs.id().unwrap();
 
-        let (make, log) = two(vec![outcome(&InitResult::default())], Vec::new());
+        let (make, log) = two(vec![Response::Init(InitResp::default())], Vec::new());
         rootfs.build(make).await.expect("the cached image");
 
         let calls = log.lock().unwrap();
@@ -737,7 +731,7 @@ mod tests {
     async fn a_refusal_that_is_not_about_the_cache_is_reported() {
         let context = tempfile::tempdir().unwrap();
         let (make, _) = two(
-            vec![Outcome::Error(Error {
+            vec![Response::Error(Error {
                 code: Error::UNSUPPORTED_IMAGE,
                 message: "commands here run on this host's own filesystem".into(),
                 data: None,
@@ -834,7 +828,6 @@ mod tests {
             panic!("the build session did not begin with an init");
         };
         assert!(init.committable, "a build session cannot commit");
-        assert!(init.delegated.is_empty(), "a build delegated something");
         assert_eq!(init.image.as_ref().unwrap().reference, "alpine:3.20");
         assert!(init.workfs.is_some(), "the context was not mounted");
     }
