@@ -7,7 +7,7 @@
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
-use cortex::console::{Console, ConsoleBuilder, ExecResp, NetworkAccess};
+use cortex::console::{Console, ConsoleBuilder, ExecResp};
 use cortex::rootfs::Rootfs;
 use tokio::process::Command;
 
@@ -58,9 +58,8 @@ async fn what_a_build_makes_is_what_the_next_session_boots() {
 
     let built = Rootfs::from_image("alpine:3.20")
         .context(context.path().to_path_buf())
-        // The one step here that needs it. A build gets the reach it asks for and no more,
-        // and this is not in the build's id — how a build was made, not what it is.
-        .network(NetworkAccess::public())
+        // No `network` call: a build reaches the internet by default, which is what the
+        // `apk add` below needs and what this test is therefore also checking.
         .run("apk add --no-cache jq")
         .run("rm -f /etc/motd")
         .run("rm -rf /media && mkdir /media")

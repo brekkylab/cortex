@@ -29,7 +29,7 @@ pub struct Rootfs {
     /// workfs. Defaults to the current directory, which is what a caller writing
     /// `.copy("app", …)` means by `app`.
     context: PathBuf,
-    network: Option<NetworkAccess>,
+    network: NetworkAccess,
     warnings: Vec<Warning>,
     /// Called after each step that reached the server. Boxed because a caller's closure is
     /// its own type and this struct has no business being generic over it — a `Rootfs` is
@@ -78,7 +78,7 @@ impl Rootfs {
             base: reference.into(),
             steps: Vec::new(),
             context: PathBuf::from("."),
-            network: None,
+            network: NetworkAccess::public(),
             warnings: Vec::new(),
             on_step: None,
         }
@@ -142,19 +142,21 @@ impl Rootfs {
 
     /// How much of a network the build's commands get.
     ///
-    /// **Leaving it out is not the internet.** The choice falls to the server, and a
-    /// micro-VM one defaults to reaching the host and nothing beyond it — so a `RUN` that
-    /// installs a package fails at a refused connection unless this asks for
-    /// [`public`](NetworkAccess::public). That is the same default an ordinary session
-    /// gets, deliberately: a build is a session, and nothing about being one makes egress
-    /// safer. An operator who wants it everywhere sets the server's own default instead of
-    /// every caller saying it.
+    /// **A build reaches the internet unless this says otherwise**, which is the one place
+    /// this differs from an ordinary session. A session's default is the host and nothing
+    /// beyond it; a build's first step is almost always fetching something — a package
+    /// index, a wheel, a base's own updates — and a default that made every such build fail
+    /// at a refused connection would be a default nobody wants.
+    ///
+    /// Say [`none`](NetworkAccess::none) for a build that only copies, or
+    /// [`host`](NetworkAccess::host) for one that reaches a proxy this host is running and
+    /// nothing else.
     ///
     /// Not part of the id: this is how the build was made rather than what it is, and a
     /// build that failed for want of a network commits nothing, so no wrong entry can be
-    /// cached by it.
+    /// cached by it. Two builds that differ only here are the same image.
     pub fn network(mut self, network: NetworkAccess) -> Self {
-        self.network = Some(network);
+        self.network = network;
         self
     }
 
@@ -408,9 +410,7 @@ impl Rootfs {
             .image(self.base.clone())
             .mount(Context(context))
             .committable();
-        if let Some(network) = self.network.clone() {
-            builder = builder.network(network);
-        }
+        builder = builder.network(self.network.clone());
         let mut session = builder.build().await?;
 
         let workfs = session
@@ -830,6 +830,13 @@ mod tests {
         assert!(init.committable, "a build session cannot commit");
         assert_eq!(init.image.as_ref().unwrap().reference, "alpine:3.20");
         assert!(init.workfs.is_some(), "the context was not mounted");
+        // Said without being asked for: a build's first step is usually a fetch, so this is
+        // the one place a build differs from an ordinary session's default.
+        assert_eq!(
+            init.network.as_ref().map(|reach| reach.reach.as_str()),
+            Some("public"),
+            "a build that said nothing about the network did not get the internet"
+        );
     }
 
     /// The commit says the id the recipe computed, and what the image should state.
@@ -859,6 +866,37 @@ mod tests {
         assert_eq!(commit.id, expected.to_string());
         assert_eq!(commit.env, ["TZ=UTC"]);
         assert_eq!(commit.working_dir.as_deref(), Some("/srv"));
+    }
+
+    /// Saying so takes it away again. The default is the internet, not a floor.
+    #[tokio::test]
+    async fn a_build_can_ask_for_less_than_the_internet() {
+        let context = tempfile::tempdir().unwrap();
+        let (make, log) = two(
+            vec![unknown_image()],
+            vec![
+                took_the_session(context.path()),
+                ran(0),
+                committed("cortex.local/built@sha256:whatever"),
+            ],
+        );
+
+        Rootfs::from_image("alpine")
+            .context(context.path().to_path_buf())
+            .network(crate::console::NetworkAccess::none())
+            .run("true")
+            .build(make)
+            .await
+            .expect("building");
+
+        let calls = log.lock().unwrap();
+        let Call::Init(init) = &calls[1] else {
+            panic!("the build session did not begin with an init");
+        };
+        assert_eq!(
+            init.network.as_ref().map(|reach| reach.reach.as_str()),
+            Some("none")
+        );
     }
 
     /// A step that fails stops the build, and nothing is committed — so nothing is cached

@@ -7,14 +7,13 @@
 //! nothing else.
 //!
 //! ```no_run
-//! use cortex::console::{Console, ConsoleBuilder, NetworkAccess};
+//! use cortex::console::{Console, ConsoleBuilder};
 //! use cortex::rootfs::Rootfs;
 //!
 //! # async fn f() -> anyhow::Result<()> {
+//! // A build reaches the internet unless it says otherwise — see [`Rootfs::network`],
+//! // which is also how to take that away.
 //! let built = Rootfs::from_image("python:3.13-slim")
-//!     // Said out loud, because leaving it out is not the internet — see
-//!     // [`Rootfs::network`].
-//!     .network(NetworkAccess::public())
 //!     .run("pip install --no-cache-dir pandas")
 //!     .env("TZ", "UTC")
 //!     .workdir("/srv/app")
