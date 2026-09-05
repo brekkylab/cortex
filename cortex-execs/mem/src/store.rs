@@ -3,7 +3,7 @@
 //!
 //! # One file, and why that decides most of this
 //!
-//! A store is named the way a document is — `memstore insert notes.db "..."` — because it lives
+//! A store is named the way a document is — `mem insert notes.db "..."` — because it lives
 //! in a cortex tree, beside whatever else the session works on. Everything a memory needs is
 //! therefore in that one file. Nothing here reaches a service, and copying the file copies the
 //! memories.
@@ -21,7 +21,7 @@
 //!
 //! `item_fts` holds the memory itself, not a pre-cut list of terms, and `porter unicode61`
 //! turns it into terms inside SQLite. That is what makes `bm25()` rank on stems — a search for
-//! `mounting` finds `mounts` — and it is the same shape `docstore` uses, so the two crates
+//! `mounting` finds `mounts` — and it is the same shape `index` uses, so the two crates
 //! index text one way rather than two.
 //!
 //! **What is stored is the original.** That is the rule, and it is what keeps the door open: a
@@ -54,14 +54,14 @@ use crate::memory::Memory;
 
 /// What this crate writes into `meta.kind`, and what it insists on when opening.
 ///
-/// The tables are `storebase`'s and `docstore` keeps the same ones, so this is the only thing
+/// The tables are `storebase`'s and `index` keeps the same ones, so this is the only thing
 /// that tells a store of one kind from a store of the other — see
 /// [`cortex_exec_storebase::sqlite`].
-const KIND: &str = "memstore";
+const KIND: &str = "mem";
 
 /// A memory as a row is [`sqlite::UPSERT`] with a null `path`, which is what makes it a memory
 /// rather than a document: nulls do not collide, so every call inserts and the same sentence can
-/// be remembered twice. `docstore` binds a path into the same statement and gets an upsert.
+/// be remembered twice. `index` binds a path into the same statement and gets an upsert.
 ///
 /// The id and the date are bound rather than defaulted in SQL, because both are decided per
 /// batch and not per row: [`Store::insert`] gives every memory of one call the same
@@ -222,7 +222,7 @@ impl Store {
 /// Once each, because `bm25` adds up a contribution per term of the pattern: a word repeated in
 /// the question would otherwise count twice and outweigh what the question is about.
 ///
-/// `docstore` has the same function, and they stay apart on purpose — two consumers agreeing
+/// `index` has the same function, and they stay apart on purpose — two consumers agreeing
 /// today is not a rule, and the first time one of them needs a different query language the
 /// shared one would have to be argued with.
 fn as_expression(query: &str) -> Option<String> {
@@ -254,7 +254,7 @@ mod tests {
     /// What this crate has to get right about `meta` is the one key that is its own: which kind
     /// of store it just made. The version beside it is `storebase`'s, and tested there.
     #[test]
-    fn a_new_store_says_it_is_a_memstore() {
+    fn a_new_store_says_which_kind_it_is() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("notes.sqlite");
 

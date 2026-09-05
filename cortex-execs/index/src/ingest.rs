@@ -1,4 +1,4 @@
-//! `docstore ingest|sync|purge` — what goes into the store, and what comes back out.
+//! `index ingest|sync|purge` — what goes into the store, and what comes back out.
 //!
 //! Which files a directory argument picks up, how large one may be, what a dangling symlink
 //! counts as, and what a second `ingest` of a path means are all decided here, and none of them
@@ -124,7 +124,7 @@ pub(crate) fn run(store: &Store, paths: &[PathBuf]) -> std::io::Result<String> {
     Ok(report)
 }
 
-/// `docstore sync <STORE> <PATH>...` — make the store match the tree under `paths`.
+/// `index sync <STORE> <PATH>...` — make the store match the tree under `paths`.
 ///
 /// [`run`] is idempotent for everything except a file that is *gone*: a second ingest picks up
 /// what was added and replaces what changed, and leaves a document behind for what was removed.
@@ -223,7 +223,7 @@ pub(crate) fn sync(store: &Store, paths: &[PathBuf], force: bool) -> std::io::Re
     Ok(report)
 }
 
-/// `docstore purge <STORE> <PATH>...` — take documents back out.
+/// `index purge <STORE> <PATH>...` — take documents back out.
 ///
 /// The inverse of [`run`], and it opens no file in the tree: what is removed is decided by what
 /// the store holds, not by what the tree does. A file deleted from the tree is the reason to

@@ -3,9 +3,9 @@
 //!
 //! # One file, and why that decides most of this
 //!
-//! A store is named the way a document is — `docstore ingest notes.db docs` — because it lives
-//! beside what it indexes. Everything the index needs is therefore in that one file, and copying
-//! the file copies the index.
+//! A store is named the way a document is — `index ingest notes.db docs` — because it lives
+//! beside what it indexes. Everything a search needs is therefore in that one file, and copying
+//! the file copies everything that was indexed.
 //!
 //! Being an ordinary file is what SQLite makes possible. A store on the rollback journal needs
 //! nothing of its host but the ability to create a sibling file: no `mmap` of its own data, no
@@ -38,18 +38,18 @@ use crate::ingest::Stamp;
 
 /// What this crate writes into `meta.kind`, and what it insists on when opening.
 ///
-/// The tables are `storebase`'s and `memstore` keeps the same ones, so this is the only thing
+/// The tables are `storebase`'s and `mem` keeps the same ones, so this is the only thing
 /// that tells a store of one kind from a store of the other — see
 /// [`cortex_exec_storebase::sqlite`].
-const KIND: &str = "docstore";
+const KIND: &str = "index";
 
 /// A document written or replaced is [`sqlite::UPSERT`] with a path bound, which is what makes
 /// it a document rather than a memory: `path` is `unique`, so a second `ingest` of it lands on
 /// the conflict clause and updates in place, keeping the rowid `item_fts` is filed under.
 ///
-/// `item.id` is left null — that column is `memstore`'s. What makes a document is its path.
+/// `item.id` is left null — that column is `mem`'s. What makes a document is its path.
 /// Every row that has a path — which in a shared table is what "every document" means, since a
-/// row with none is `memstore`'s. The whole set and not a filtered slice, because the filter is
+/// row with none is `mem`'s. The whole set and not a filtered slice, because the filter is
 /// [`under`](crate::ingest::under) and it is component-wise: `notes-other/a.md` is not under
 /// `notes`, where a SQL `like 'notes%'` would say it was. Doing the prefix test in SQL would
 /// mean either escaping `%` and `_` out of every path or keeping a second spelling of the
@@ -126,10 +126,10 @@ impl Store {
         })
     }
 
-    /// Whether `path` is a `docstore` store — what `list` sifts a directory with, and what
+    /// Whether `path` is an `index` store — what `list` sifts a directory with, and what
     /// `drop` asks before it deletes anything.
     ///
-    /// It has to ask about the *kind* and not only the schema, because a `memstore` file has the
+    /// It has to ask about the *kind* and not only the schema, because a `mem` file has the
     /// same tables: without that, `list` would count somebody's memories as documents and `drop`
     /// would delete them.
     pub fn looks_like_one(path: &Path) -> bool {

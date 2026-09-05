@@ -3,8 +3,8 @@ resolver = "3"
 members = [
     "cortex",
     "cortex-execs/storebase",
-    "cortex-execs/memstore",
-    "cortex-execs/docstore",
+    "cortex-execs/mem",
+    "cortex-execs/index",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",
@@ -30,7 +30,7 @@ async-trait = "0.1"
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
-# The store format `memstore` and `docstore` share: the tables, what a store says about
+# The store format `mem` and `index` share: the tables, what a store says about
 # itself, and how one is opened.
 cortex-exec-storebase = { path = "cortex-execs/storebase" }
 # The boot process, and — as its library half — the strings a console server starts one with.

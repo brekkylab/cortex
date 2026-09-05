@@ -1,22 +1,22 @@
-//! `docstore` — full-text search over a directory tree, kept in a store that is one file.
+//! `index` — full-text search over a directory tree, kept in a store that is one file.
 //!
 //! ```text
-//! docstore init   notes.db
-//! docstore ingest notes.db docs          # a directory means everything under it
-//! docstore search notes.db -n 5 borrow checker
-//! docstore sync   notes.db docs          # the store says what the tree says
-//! docstore purge  notes.db docs/old      # ingest undone
-//! docstore list                          # the stores beside this one
-//! docstore drop   notes.db
+//! index init   notes.db
+//! index ingest notes.db docs          # a directory means everything under it
+//! index search notes.db -n 5 borrow checker
+//! index sync   notes.db docs          # the store says what the tree says
+//! index purge  notes.db docs/old      # ingest undone
+//! index list                          # the stores beside this one
+//! index drop   notes.db
 //! ```
 //!
-//! # What this is, next to `memstore`
+//! # What this is, next to `mem`
 //!
-//! `memstore` takes text a caller hands it; this takes files, and remembers where each one came
+//! `mem` takes text a caller hands it; this takes files, and remembers where each one came
 //! from. That is the whole difference between them as commands — and it is why the answer to a
 //! search here names a path the caller can open, rather than only the text.
 //!
-//! The store is SQLite's FTS5, the engine `memstore` uses, so the two link one search engine
+//! The store is SQLite's FTS5, the engine `mem` uses, so the two link one search engine
 //! rather than two. What they share and where they part is written down in
 //! [`cortex_exec_storebase::sqlite`]: one set of tables, and `meta.kind` to tell a store of one
 //! from a store of the other.
@@ -28,7 +28,7 @@
 //! that lives beside what it indexes copyable along with it; an absolute one stays absolute,
 //! because a caller who named a file that way meant that file wherever this is run from.
 //!
-//! **So a relative path means what it meant to the shell that typed it.** `docstore ingest
+//! **So a relative path means what it meant to the shell that typed it.** `index ingest
 //! notes.db docs` from one directory and from another are two different corpora as far as the
 //! store is concerned, in exactly the way `ls docs` is two different listings — and `sync` and
 //! `purge`, which name documents by the same paths `ingest` filed them under, are read the same
@@ -52,14 +52,15 @@ mod ingest;
 mod search;
 mod store;
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::{
+    io::Write as _,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 
 use clap::{Parser as _, Subcommand};
 
-use crate::search::DEFAULT_LIMIT;
-use crate::store::Store;
+use crate::{search::DEFAULT_LIMIT, store::Store};
 
 /// The name every message this program writes about itself is spelled with.
 ///

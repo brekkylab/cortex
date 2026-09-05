@@ -1,4 +1,4 @@
-//! Ingest a tree, then find it again — all through the `docstore` binary itself.
+//! Ingest a tree, then find it again — all through the `index` binary itself.
 //!
 //! The program under test is the one cargo just built, run as a program: a working directory, a
 //! command line, and what came back on each stream. That is not an accident of convenience. A
@@ -10,21 +10,20 @@
 //! What these pin is the observable contract: what a walk picks up, what a second `ingest` means,
 //! what `sync` removes, which stream each answer goes to, and what exit code rides with it.
 
-use std::path::Path;
-use std::process::Output;
+use std::{path::Path, process::Output};
 
 /// One line, run in `tree` the way a shell standing there would run it.
-fn docstore(tree: &Path, args: &[&str]) -> Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_docstore"))
+fn index(tree: &Path, args: &[&str]) -> Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_index"))
         .current_dir(tree)
         .args(args)
         .output()
-        .expect("the docstore binary runs")
+        .expect("the index binary runs")
 }
 
 /// Run one line and insist it succeeded, handing back stdout.
 fn ok(tree: &Path, args: &[&str]) -> String {
-    let out = docstore(tree, args);
+    let out = index(tree, args);
     assert_eq!(
         out.status.code(),
         Some(0),
@@ -180,7 +179,7 @@ fn a_question_with_no_answer_is_still_an_answer() {
     ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
     for query in ["zygote", "!!!"] {
-        let out = docstore(dir.path(), &["search", "notes.db", query]);
+        let out = index(dir.path(), &["search", "notes.db", query]);
         assert_eq!(out.status.code(), Some(0), "{query:?}");
         assert_eq!(String::from_utf8_lossy(&out.stdout), "no matches\n");
     }
@@ -202,7 +201,7 @@ fn a_query_that_looks_like_an_expression_is_read_as_words() {
         "^x",
         "a OR",
     ] {
-        let out = docstore(dir.path(), &["search", "notes.db", query]);
+        let out = index(dir.path(), &["search", "notes.db", query]);
         assert_eq!(
             out.status.code(),
             Some(0),
@@ -214,13 +213,13 @@ fn a_query_that_looks_like_an_expression_is_read_as_words() {
     // A word starting with `-` is the parser's business and not FTS5's: clap takes it for an
     // option, and `--` is how a caller says it is a word. That is the ordinary command-line
     // convention, and borrowing it is the reason there is a parser here at all.
-    let flagged = docstore(dir.path(), &["search", "notes.db", "-x"]);
+    let flagged = index(dir.path(), &["search", "notes.db", "-x"]);
     assert_eq!(
         flagged.status.code(),
         Some(2),
         "an unknown option is a misunderstood line"
     );
-    let quoted = docstore(dir.path(), &["search", "notes.db", "--", "-x"]);
+    let quoted = index(dir.path(), &["search", "notes.db", "--", "-x"]);
     assert_eq!(
         quoted.status.code(),
         Some(0),
@@ -270,7 +269,7 @@ fn a_store_that_is_not_there_is_not_made_by_using_it() {
         vec!["ingest", "nope.db", "docs"],
         vec!["purge", "nope.db", "docs"],
     ] {
-        let out = docstore(dir.path(), &args);
+        let out = index(dir.path(), &args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?} wrote something to read");
         assert!(
@@ -283,7 +282,7 @@ fn a_store_that_is_not_there_is_not_made_by_using_it() {
 #[test]
 fn init_will_not_make_a_store_twice() {
     let dir = ready();
-    let again = docstore(dir.path(), &["init", "notes.db"]);
+    let again = index(dir.path(), &["init", "notes.db"]);
     assert_eq!(again.status.code(), Some(1));
     assert!(again.stdout.is_empty(), "nothing to read as a store's path");
     assert!(
@@ -439,7 +438,7 @@ fn list_counts_stores_and_passes_over_everything_else() {
     // A directory with no store in it says so rather than answering with nothing.
     assert_eq!(
         ok(dir.path(), &["list", "docs"]),
-        "no stores here — `docstore init <STORE>` makes one\n"
+        "no stores here — `index init <STORE>` makes one\n"
     );
 }
 
@@ -465,7 +464,7 @@ fn drop_refuses_what_is_not_a_store() {
     std::fs::write(dir.path().join("plain.txt"), "not a store\n").unwrap();
 
     for arg in ["plain.txt", "docs/ownership.md"] {
-        let out = docstore(dir.path(), &["drop", arg]);
+        let out = index(dir.path(), &["drop", arg]);
         assert_eq!(out.status.code(), Some(1), "{arg}");
         assert!(
             dir.path().join(arg).try_exists().unwrap(),
@@ -473,23 +472,23 @@ fn drop_refuses_what_is_not_a_store() {
         );
     }
 
-    let missing = docstore(dir.path(), &["drop", "nope.db"]);
+    let missing = index(dir.path(), &["drop", "nope.db"]);
     assert_eq!(missing.status.code(), Some(1));
 }
 
-/// The tables are shared with `memstore`, so nothing about a file's *structure* says which
+/// The tables are shared with `mem`, so nothing about a file's *structure* says which
 /// command wrote it. `meta.kind` does, and these are the three places it has to be asked.
 ///
 /// Without it `list` would count somebody's memories as documents, `drop` would delete them, and
 /// `search` would answer from rows whose path is null.
 #[test]
-fn a_memstore_file_is_not_a_docstore_one() {
+fn a_mem_store_is_not_one_of_these() {
     let dir = ready();
     ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
     // A store of the other kind, beside this one, made through the shared schema.
     let theirs = dir.path().join("memories.db");
-    drop(cortex_exec_storebase::sqlite::create(&theirs, "memstore").expect("a memstore store"));
+    drop(cortex_exec_storebase::sqlite::create(&theirs, "mem").expect("a mem store"));
 
     assert_eq!(
         ok(dir.path(), &["list", "."]),
@@ -502,11 +501,11 @@ fn a_memstore_file_is_not_a_docstore_one() {
         vec!["drop", "memories.db"],
         vec!["ingest", "memories.db", "docs"],
     ] {
-        let out = docstore(dir.path(), &args);
+        let out = index(dir.path(), &args);
         assert_eq!(out.status.code(), Some(1), "{args:?}");
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(
-            said.contains("memstore") || said.contains("not a store"),
+            said.contains("mem") || said.contains("not a store"),
             "{args:?} said: {said}"
         );
     }
@@ -518,17 +517,17 @@ fn a_memstore_file_is_not_a_docstore_one() {
 fn help_is_an_answer_and_a_usage_error_is_not() {
     let dir = tree();
 
-    let helped = docstore(dir.path(), &["--help"]);
+    let helped = index(dir.path(), &["--help"]);
     assert_eq!(helped.status.code(), Some(0));
     assert!(helped.stderr.is_empty());
     let said = String::from_utf8_lossy(&helped.stdout);
-    assert!(said.contains("Usage: docstore"), "{said}");
+    assert!(said.contains("Usage: index"), "{said}");
     for command in ["init", "ingest", "search", "sync", "purge", "list", "drop"] {
         assert!(said.contains(command), "{command} is missing from: {said}");
     }
 
     // The half a hand-written option loop always ends up missing.
-    let sub = docstore(dir.path(), &["sync", "--help"]);
+    let sub = index(dir.path(), &["sync", "--help"]);
     assert_eq!(sub.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&sub.stdout).contains("--force"),
@@ -537,7 +536,7 @@ fn help_is_an_answer_and_a_usage_error_is_not() {
 
     // Getting the usage wrong is `2` and goes to stderr, which is the distinction a caller acts
     // on: this line can be reissued differently, where a `1` was understood and did not work.
-    let wrong = docstore(dir.path(), &["ingest"]);
+    let wrong = index(dir.path(), &["ingest"]);
     assert_eq!(wrong.status.code(), Some(2));
     assert!(wrong.stdout.is_empty());
     assert!(!wrong.stderr.is_empty());
@@ -555,7 +554,7 @@ fn nothing_it_writes_carries_an_escape() {
         vec!["search", "notes.db", "ownership"],
         vec!["list", "."],
     ] {
-        let out = docstore(dir.path(), &args);
+        let out = index(dir.path(), &args);
         let written = [out.stdout, out.stderr].concat();
         assert!(
             !written.contains(&0x1b),

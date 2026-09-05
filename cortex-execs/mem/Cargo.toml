@@ -6,17 +6,17 @@ edition.workspace = true
 # `mem` is what a caller types, and the package name is not it: this is one program, and the
 # name it answers to is the one in its usage line and in everything it says about itself.
 [[bin]]
-name = "mems"
+name = "mem"
 path = "src/main.rs"
 
 [dependencies]
 chrono = { workspace = true }
-# The command line, and the whole of the driving: `memstore` is several commands with different
+# The command line, and the whole of the driving: `mem` is several commands with different
 # arities behind one name, and the help a caller reads has to be the flags the parser accepts — a
 # hand-written usage string and a hand-written option loop are two places to say the same thing,
 # which is one too many.
 clap = { workspace = true }
-# Opening the store: the schema, `meta`, and the write that `docstore` keeps the same.
+# Opening the store: the schema, `meta`, and the write that `index` keeps the same.
 cortex-exec-storebase = { workspace = true }
 rusqlite = { workspace = true }
 # Item identity. Ids leave this process — they are what a later `delete` or `history` would be

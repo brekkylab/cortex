@@ -1,4 +1,4 @@
-//! The store format `memstore` and `docstore` share, and the SQLite handling that comes with it.
+//! The store format `mem` and `index` share, and the SQLite handling that comes with it.
 //!
 //! The two are different commands over one file format, and the parts of them that differ are
 //! meant to stay that way. What they are not is two answers to the questions both have to answer
@@ -27,6 +27,6 @@
 //! mapping differs in each crate either way.
 //!
 //! Command surfaces and domain types are not here and would not be even if they matched today:
-//! a `Memory` is not a document, and `memstore insert` is not `docstore ingest`.
+//! a `Memory` is not a document, and `mem insert` is not `index ingest`.
 
 pub mod sqlite;

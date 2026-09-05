@@ -1,4 +1,4 @@
-//! `docstore search [-n N] <query>...` — ask the store.
+//! `index search [-n N] <query>...` — ask the store.
 
 use std::fmt::Write as _;
 
@@ -11,7 +11,7 @@ pub(crate) const DEFAULT_LIMIT: usize = 10;
 ///
 /// Takes no path and opens no file in the tree: the bytes were read when they were ingested, and
 /// a query is answered from the store alone. `query` arrives already joined — a shell has split
-/// the words, and `docstore search notes.db rust ownership` is what a caller writes when they
+/// the words, and `index search notes.db rust ownership` is what a caller writes when they
 /// mean the phrase.
 pub(crate) fn run(store: &Store, limit: usize, query: &str) -> std::io::Result<String> {
     // A query with no words in it is answered here rather than asked of FTS5: the expression

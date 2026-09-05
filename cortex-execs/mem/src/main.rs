@@ -1,9 +1,9 @@
-//! `memstore` — a store that is one file, written by whoever calls it.
+//! `mem` — a store that is one file, written by whoever calls it.
 //!
 //! ```text
-//! memstore init   notes.sqlite
-//! memstore insert notes.sqlite "User switched to oat milk" "User drinks tea"
-//! memstore search notes.sqlite "oat milk"
+//! mem init   notes.sqlite
+//! mem insert notes.sqlite "User switched to oat milk" "User drinks tea"
+//! mem search notes.sqlite "oat milk"
 //! ```
 //!
 //! # What it does not do
@@ -17,13 +17,13 @@
 //! writing down a result, an agent recording a conclusion, a person. Anything that wants a
 //! judgement made about a conversation first has to make it before calling.
 //!
-//! # What it shares with `docstore`
+//! # What it shares with `index`
 //!
 //! The file. Same tables, same `meta`, same write — see [`cortex_exec_storebase::sqlite`] — and
 //! `meta.kind` is what tells one from the other, since the structure is what they share. What
 //! differs is which columns each fills: a memory has an `id` and no `path`, so nothing collides
 //! and the same sentence can be stored twice; a document has a `path`, which is its identity and
-//! what makes `docstore ingest` idempotent.
+//! what makes `index ingest` idempotent.
 
 mod memory;
 mod store;
@@ -44,18 +44,18 @@ use crate::{memory::Memory, store::Store};
 /// and the same one clap puts in the usage line.
 const NAME: &str = env!("CARGO_BIN_NAME");
 
-/// What `memstore` accepts and what it says about it.
+/// What `mem` accepts and what it says about it.
 #[derive(Debug, clap::Parser)]
 #[command(
-    about = "memstore — a store that is one file, written by whoever calls it",
+    about = "mem — a store that is one file, written by whoever calls it",
     after_help = "<store> is a path like any other this program is given, so a relative one resolves against the working directory. `init` creates it; every other command expects it to be there already.",
     // The doc comments here are for whoever reads this file. What a caller of the command sees is
     // `about` and the first line of each item's; nothing below argues a design decision at
     // somebody who typed `--help`.
     long_about = None,
-    // Bare `memstore` is a line that asked for nothing, and the help is the useful answer to it.
+    // Bare `mem` is a line that asked for nothing, and the help is the useful answer to it.
     arg_required_else_help = true,
-    // `memstore help insert` as well as `memstore insert --help` is a second spelling of one thing.
+    // `mem help insert` as well as `mem insert --help` is a second spelling of one thing.
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -87,7 +87,7 @@ enum Command {
     Search(Search),
 }
 
-/// `memstore init <store>` — a store where there was no file.
+/// `mem init <store>` — a store where there was no file.
 #[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
 struct Init {
     /// the store to make
@@ -99,7 +99,7 @@ struct Init {
     store: PathBuf,
 }
 
-/// `memstore insert <store> <texts>...` — the memories to keep, as the caller wrote them.
+/// `mem insert <store> <texts>...` — the memories to keep, as the caller wrote them.
 #[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
 struct Insert {
     /// the store to write to
@@ -140,7 +140,7 @@ fn trimmed(text: &str) -> Result<String, String> {
     Ok(text.to_owned())
 }
 
-/// `memstore search <store> <query>` — the memories in one store nearest what was asked.
+/// `mem search <store> <query>` — the memories in one store nearest what was asked.
 #[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
 struct Search {
     /// the store to search
@@ -218,7 +218,7 @@ fn run(command: Command) -> Result<String, String> {
             opened.insert(&memories).map_err(|e| refused(&store, e))?;
 
             // The memories back, one per line — the same lines `search` prints, and the same
-            // shape `docstore` answers in, so that something driving either reads one kind of
+            // shape `index` answers in, so that something driving either reads one kind of
             // output. What it adds over the arguments the caller already had is that these are
             // the ones the store now holds. Nothing to write is no output at all, which is the
             // answer a script producing an empty list wants.

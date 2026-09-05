@@ -3,9 +3,9 @@
 //!
 //! # One schema, two kinds
 //!
-//! `memstore` and `docstore` keep the same tables. What differs is which columns they fill:
+//! `mem` and `index` keep the same tables. What differs is which columns they fill:
 //!
-//! | | `memstore` | `docstore` |
+//! | | `mem` | `index` |
 //! |---|---|---|
 //! | `item.id` | a UUID | null |
 //! | `item.path` | null | the path it was given under |
@@ -16,15 +16,15 @@
 //! contributes nothing to `bm25` — measured over a corpus where scores actually separate, the
 //! ranking and the scores are identical to eight decimals with the column present or absent —
 //! and it matches nothing, so it cannot produce a hit. `unique` on a nullable column is the
-//! same story: SQLite allows any number of nulls, so `memstore` can hold the same sentence
+//! same story: SQLite allows any number of nulls, so `mem` can hold the same sentence
 //! twice while `path` still makes a document's identity, which is what makes `ingest`
 //! idempotent.
 //!
 //! # `kind`, and why the version is not enough
 //!
 //! The tables are the same either way, so structure cannot say which command wrote a file.
-//! `meta.kind` does: [`create`] writes it and [`open`] insists on it, so a `docstore` handed a
-//! `memstore` file is told what it is rather than answering with rows whose `path` is null.
+//! `meta.kind` does: [`create`] writes it and [`open`] insists on it, so an `index` handed a
+//! `mem` file is told what it is rather than answering with rows whose `path` is null.
 //!
 //! `schema_version` alone could not carry it. It says which shape a file has, and both kinds
 //! have the same one, so a match across two kinds is a mismatch nobody catches until a column
@@ -85,10 +85,10 @@ pub const SCHEMA_VERSION: &str = "1";
 
 /// One item written — `queries/upsert.sql`.
 ///
-/// **One statement for both kinds, and the difference between them is the data.** `memstore`
+/// **One statement for both kinds, and the difference between them is the data.** `mem`
 /// binds a null `path`, so `on conflict(path)` can never fire — a null collides with nothing in
 /// a `unique` index — and every call inserts, which is why the same sentence can be remembered
-/// twice. `docstore` binds the path the document was given under, so a second `ingest` of it
+/// twice. `index` binds the path the document was given under, so a second `ingest` of it
 /// lands on the conflict clause and updates in place.
 ///
 /// The rowid has to survive that update: `item_fts` is joined to it, and a replacement that
@@ -200,7 +200,7 @@ pub fn open(path: &Path, kind: &str) -> io::Result<Connection> {
         // The whole reason `kind` is written down: the tables are the same either way, so this
         // is the only thing that can tell the caller they named the wrong file rather than
         // handing them rows whose columns are all null.
-        Some(found) => Err(invalid(format!("this is a {found} store, not a {kind} one"))),
+        Some(found) => Err(invalid(format!("this is a {found} store; {kind} was asked for"))),
         None => Err(invalid("not a store: it does not say what kind it is".into())),
     }
 }
@@ -286,21 +286,21 @@ mod tests {
     fn a_new_store_says_which_schema_and_kind_it_is() {
         let dir = tempfile::tempdir().unwrap();
         let path = at(&dir, "s.db");
-        let conn = create(&path, "memstore").expect("a store can be made");
+        let conn = create(&path, "mem").expect("a store can be made");
         assert_eq!(said(&conn, VERSION_KEY).unwrap().as_deref(), Some("1"));
-        assert_eq!(said(&conn, KIND_KEY).unwrap().as_deref(), Some("memstore"));
+        assert_eq!(said(&conn, KIND_KEY).unwrap().as_deref(), Some("mem"));
         // The shared tables are there, and a row can be written under either kind's columns.
         conn.execute(
             "insert into item (id, written_at) values ('u', '2026-01-01T00:00:00Z')",
             [],
         )
-        .expect("a memstore row");
+        .expect("a mem row");
         conn.execute(
             "insert into item (path, title, mtime, len, written_at)
              values ('/a.md', 'a.md', 1, 2, '2026-01-01T00:00:00Z')",
             [],
         )
-        .expect("a docstore row");
+        .expect("an index row");
     }
 
     /// The point of `kind`: the tables are the same, so nothing else could tell these apart.
@@ -308,16 +308,16 @@ mod tests {
     fn a_store_of_the_other_kind_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = at(&dir, "notes.db");
-        drop(create(&path, "memstore").unwrap());
+        drop(create(&path, "mem").unwrap());
 
-        open(&path, "memstore").expect("its own kind opens");
-        let e = open(&path, "docstore").expect_err("the other kind does not");
+        open(&path, "mem").expect("its own kind opens");
+        let e = open(&path, "index").expect_err("the other kind does not");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert!(e.to_string().contains("memstore"), "{e}");
-        assert!(e.to_string().contains("docstore"), "{e}");
+        assert!(e.to_string().contains("mem"), "{e}");
+        assert!(e.to_string().contains("index"), "{e}");
 
-        assert!(is_store(&path, "memstore"));
-        assert!(!is_store(&path, "docstore"));
+        assert!(is_store(&path, "mem"));
+        assert!(!is_store(&path, "index"));
     }
 
     /// A nullable `unique` column takes any number of nulls, which is what lets one schema hold
@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn nulls_do_not_collide_but_a_repeated_path_does() {
         let dir = tempfile::tempdir().unwrap();
-        let conn = create(&at(&dir, "s.db"), "memstore").unwrap();
+        let conn = create(&at(&dir, "s.db"), "mem").unwrap();
 
         for _ in 0..3 {
             conn.execute("insert into item (written_at) values ('t')", [])
@@ -342,24 +342,24 @@ mod tests {
     fn a_store_from_another_schema_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = at(&dir, "newer.db");
-        let conn = create(&path, "memstore").unwrap();
+        let conn = create(&path, "mem").unwrap();
         conn.execute("update meta set value = '99' where key = ?1", (VERSION_KEY,))
             .unwrap();
         drop(conn);
 
-        let e = open(&path, "memstore").expect_err("99 is not a schema this speaks");
+        let e = open(&path, "mem").expect_err("99 is not a schema this speaks");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(e.to_string().contains("99"), "{e}");
         assert!(e.to_string().contains(SCHEMA_VERSION), "{e}");
-        assert!(!is_store(&path, "memstore"), "nor one to sift into a list");
+        assert!(!is_store(&path, "mem"), "nor one to sift into a list");
     }
 
     /// One statement, two behaviours, and the data is what picks. This is the whole of why
-    /// `memstore` and `docstore` do not each need a write of their own.
+    /// `mem` and `index` do not each need a write of their own.
     #[test]
     fn one_upsert_inserts_for_a_memory_and_updates_for_a_document() {
         let dir = tempfile::tempdir().unwrap();
-        let conn = create(&at(&dir, "s.db"), "memstore").unwrap();
+        let conn = create(&at(&dir, "s.db"), "mem").unwrap();
         let mut up = conn.prepare(UPSERT).unwrap();
         let write = |up: &mut rusqlite::Statement<'_>, id, path, title, mtime, len, at| -> i64 {
             up.query_row(
@@ -402,7 +402,7 @@ mod tests {
         let path = at(&dir, "taken.db");
         std::fs::write(&path, b"someone else's").unwrap();
 
-        let e = create(&path, "memstore").expect_err("the name is taken");
+        let e = create(&path, "mem").expect_err("the name is taken");
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
             std::fs::read(&path).unwrap(),
@@ -415,7 +415,7 @@ mod tests {
     fn a_store_that_is_not_there_is_not_made_by_opening_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = at(&dir, "missing.db");
-        let e = open(&path, "memstore").expect_err("there is no store");
+        let e = open(&path, "mem").expect_err("there is no store");
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
         assert!(!path.exists());
     }
@@ -429,23 +429,23 @@ mod tests {
             .unwrap()
             .execute_batch("create table something_else (id integer primary key)")
             .unwrap();
-        let e = open(&other, "memstore").expect_err("not one of ours");
+        let e = open(&other, "mem").expect_err("not one of ours");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert!(!is_store(&other, "memstore"));
+        assert!(!is_store(&other, "mem"));
 
         // Not a database at all: SQLite's own complaint, and not a claim that the file is fine.
         let prose = at(&dir, "notes.txt");
         std::fs::write(&prose, b"dear diary").unwrap();
-        open(&prose, "memstore").expect_err("prose is not a store");
-        assert!(!is_store(&prose, "memstore"));
+        open(&prose, "mem").expect_err("prose is not a store");
+        assert!(!is_store(&prose, "mem"));
     }
 
     /// A directory is not a store, and asking must not create or journal anything.
     #[test]
     fn is_store_is_false_for_anything_it_cannot_read_as_one() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(!is_store(dir.path(), "memstore"));
-        assert!(!is_store(&at(&dir, "nothing-here.db"), "memstore"));
+        assert!(!is_store(dir.path(), "mem"));
+        assert!(!is_store(&at(&dir, "nothing-here.db"), "mem"));
         assert_eq!(
             std::fs::read_dir(dir.path()).unwrap().count(),
             0,
