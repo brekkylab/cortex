@@ -14,14 +14,14 @@ anyhow = { workspace = true }
 # `error` is decided by which member is present — and BSON is the self-describing
 # one with a native byte type, which is most of what this channel carries.
 bson = { workspace = true }
-# `BoxFuture`, which is what every method on `Client`, `Server` and `Executable`
-# hands back — see `console::base` for why they are boxed rather than `async fn`.
+# `BoxFuture`, which is what every method on `Client` and `Server` hands back — see
+# `console::base` for why they are boxed rather than `async fn`.
 futures-core = { workspace = true }
 fuser = { workspace = true, optional = true }
-# `kill(2)` on a process group, which is how `BinExecutable` takes down a spawned program
-# that forked — `std` has no `killpg`, and killing only the leader leaves its children holding
-# the pipes. Unconditional, unlike the bindings' other dependencies: `tokio/process` already
-# activates it on every unix build, so naming it here adds no crate to anyone's graph.
+# The `errno` values a POSIX filesystem answers in: `Posix` maps an `io::ErrorKind` onto one,
+# and a binding hands that number to the kernel. Unconditional, unlike the bindings' other
+# dependencies: `tokio/process` already activates it on every unix build, so naming it here
+# adds no crate to anyone's graph.
 libc = { workspace = true }
 object_store = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
@@ -29,8 +29,7 @@ uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-# `macros` for `try_join!`, which is how `BinExecutable` drains a child's two pipes while
-# awaiting its exit: one future, so dropping the call drops every part of it at once.
+# `process` for the server a `StdioClient` starts, `macros` for the `#[tokio::test]`s.
 tokio = { workspace = true, features = [
     "io-std",
     "io-util",
@@ -41,9 +40,8 @@ tokio = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
-# A directory standing in for a mounted tree: what `BinExecutable`'s tests exercise is what a
-# spawned program is given for a path a mount reported, and a plain directory reports one the
-# same way.
+# A directory standing in for a mounted tree, which is what a `Mount` is from the far side: a
+# path any process can open.
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 
