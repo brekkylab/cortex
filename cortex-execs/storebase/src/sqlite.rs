@@ -1,5 +1,5 @@
-//! A store that is one SQLite file in a cortex tree: what its tables are, how one is made, how
-//! one is opened, and how a file that is not one is refused.
+//! A store that is one SQLite file: what its tables are, how one is made, how one is opened,
+//! and how a file that is not one is refused.
 //!
 //! # One schema, two kinds
 //!
@@ -8,7 +8,7 @@
 //! | | `memstore` | `docstore` |
 //! |---|---|---|
 //! | `item.id` | a UUID | null |
-//! | `item.path` | null | the workspace path |
+//! | `item.path` | null | the path it was given under |
 //! | `item.title` / `mtime` / `len` | left at their defaults | the file's name and stamp |
 //! | `item_fts.title` | empty | the file's name |
 //!
@@ -50,8 +50,8 @@
 //!
 //! # No write-ahead log
 //!
-//! These files sit on a mounted cortex tree, which is a FUSE mount, and WAL mode does not
-//! survive that assumption: the log's index is a shared-memory file that every connection
+//! A store may well sit on a FUSE mount, and WAL mode does not survive that possibility: the
+//! log's index is a shared-memory file that every connection
 //! `mmap`s and expects to be coherent between processes. A FUSE filesystem is under no
 //! obligation to give them that, and the failure is silent — two writers each see their own
 //! index. So a store stays on the rollback journal SQLite starts in, which needs nothing but
@@ -88,8 +88,8 @@ pub const SCHEMA_VERSION: &str = "1";
 /// **One statement for both kinds, and the difference between them is the data.** `memstore`
 /// binds a null `path`, so `on conflict(path)` can never fire — a null collides with nothing in
 /// a `unique` index — and every call inserts, which is why the same sentence can be remembered
-/// twice. `docstore` binds the workspace path, so a second `ingest` of it lands on the conflict
-/// clause and updates in place.
+/// twice. `docstore` binds the path the document was given under, so a second `ingest` of it
+/// lands on the conflict clause and updates in place.
 ///
 /// The rowid has to survive that update: `item_fts` is joined to it, and a replacement that
 /// renumbered the row would leave the text filed under a number nothing points at. `returning
@@ -169,9 +169,9 @@ pub fn create(path: &Path, kind: &str) -> io::Result<Connection> {
 pub fn open(path: &Path, kind: &str) -> io::Result<Connection> {
     // Asked of the filesystem before SQLite, for two reasons that happen to have one answer.
     // SQLite reports a file that is not there and a file it may not read with the same code,
-    // which would make "no such store" the message for a permission problem; and its text
-    // carries the host path, which is on the far side of a mount the caller cannot see. So the
-    // ordinary case is answered here, and anything stranger keeps SQLite's own words.
+    // which would make "no such store" the message for a permission problem; and it says so in
+    // words about SQL rather than about the file that was named. So the ordinary case is
+    // answered here, and anything stranger keeps SQLite's own words.
     if !path.try_exists()? {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -247,7 +247,7 @@ pub fn said(conn: &Connection, key: &str) -> io::Result<Option<String>> {
     .map_err(sql_error)
 }
 
-/// Open one connection, with the pragmas a store on a mounted tree needs.
+/// Open one connection, with the pragmas a store that may sit on a FUSE mount needs.
 pub fn connect(path: &Path, flags: OpenFlags) -> io::Result<Connection> {
     let conn = Connection::open_with_flags(path, flags).map_err(sql_error)?;
     conn.busy_timeout(BUSY_TIMEOUT).map_err(sql_error)?;

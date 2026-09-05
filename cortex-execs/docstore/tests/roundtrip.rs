@@ -1,32 +1,37 @@
-//! Ingest a tree through a mount, then find it again — all through the one `docstore` name.
+//! Ingest a tree, then find it again — all through the `docstore` binary itself.
 //!
-//! The mount here is a plain directory, which is what a [`Mount`] is from this executable's
-//! side: a path any process can `open`. Standing one up for real needs a binding, a libfuse
-//! provider and a kernel, and none of that is what these test.
+//! The program under test is the one cargo just built, run as a program: a working directory, a
+//! command line, and what came back on each stream. That is not an accident of convenience. A
+//! path argument here means what it means to the shell that typed it, and a working directory is
+//! a property of a process — so a test that called into this code in-process would have to either
+//! spell every path absolutely, which is not how anybody runs it, or share one directory between
+//! every test in the binary.
 //!
-//! What these pin is the observable contract: what a walk picks up, what a second `ingest`
-//! means, what `sync` removes, and which stream each answer goes to. A test whose property is a
-//! consequence of the store being a file in the tree (every command needs the mount) says so in
-//! its own name.
+//! What these pin is the observable contract: what a walk picks up, what a second `ingest` means,
+//! what `sync` removes, which stream each answer goes to, and what exit code rides with it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::process::Output;
 
-use cortex::exec::{ExecCall, ExecResult, ExecutableSet};
-use cortex::fs::Mount;
-use cortex_exec_docstore::DocStore;
-
-struct Mounted(PathBuf);
-
-impl Mount for Mounted {
-    fn mountpoint(&self) -> &Path {
-        &self.0
-    }
+/// One line, run in `tree` the way a shell standing there would run it.
+fn docstore(tree: &Path, args: &[&str]) -> Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_docstore"))
+        .current_dir(tree)
+        .args(args)
+        .output()
+        .expect("the docstore binary runs")
 }
 
-/// The set as a consumer registers it. There is no root to hand over: a store is a path in the
-/// tree, so the executable holds nothing.
-fn registered() -> ExecutableSet {
-    ExecutableSet::new().register("docstore", DocStore::SUMMARY, DocStore::new())
+/// Run one line and insist it succeeded, handing back stdout.
+fn ok(tree: &Path, args: &[&str]) -> String {
+    let out = docstore(tree, args);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// A tree to index. The store goes in it too, which is the arrangement being tested.
@@ -41,7 +46,10 @@ fn tree() -> tempfile::TempDir {
         "docs/ownership.md",
         "Rust ownership is what makes the borrow checker possible.\n",
     );
-    at("docs/mounts.md", "A mount is a path the kernel answers on.\n");
+    at(
+        "docs/mounts.md",
+        "A mount is a path the kernel answers on.\n",
+    );
     at(
         "docs/sub/nested.md",
         "Nested prose about lifetimes and elision.\n",
@@ -51,45 +59,17 @@ fn tree() -> tempfile::TempDir {
     // Dotted, so the walk should not descend into it.
     at("docs/.hidden/secret.md", "Nobody should index this.\n");
     // A sibling whose name starts with the same letters as `docs`.
-    at("docs-other/x.md", "The borrow checker elsewhere entirely.\n");
+    at(
+        "docs-other/x.md",
+        "The borrow checker elsewhere entirely.\n",
+    );
     dir
 }
 
-fn call(args: &[&str]) -> ExecCall {
-    ExecCall {
-        name: "docstore".into(),
-        args: args.iter().map(|a| a.to_string()).collect(),
-        env: Default::default(),
-        // `None` — a backend that reports no working directory, so every path below is
-        // workspace-absolute and the test is written the way a caller has to write it then.
-        cwd: None,
-    }
-}
-
-/// Run one line against `tree`, and insist it was understood.
-async fn run(tree: &Path, args: &[&str]) -> ExecResult {
-    registered()
-        .invoke(&call(args), Some(&Mounted(tree.to_path_buf())))
-        .await
-        .expect("docstore is registered")
-}
-
-/// Run one line and insist it succeeded, handing back stdout.
-async fn ok(tree: &Path, args: &[&str]) -> String {
-    let out = run(tree, args).await;
-    assert_eq!(
-        out.exit_code,
-        0,
-        "{args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 /// A tree with a store in it, already made.
-async fn ready() -> tempfile::TempDir {
+fn ready() -> tempfile::TempDir {
     let dir = tree();
-    ok(dir.path(), &["init", "/notes.db"]).await;
+    ok(dir.path(), &["init", "notes.db"]);
     dir
 }
 
@@ -101,16 +81,16 @@ fn hits(said: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
-async fn ingest_then_search_finds_the_file_by_its_words() {
-    let dir = ready().await;
+#[test]
+fn ingest_then_search_finds_the_file_by_its_words() {
+    let dir = ready();
     assert_eq!(
-        ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["ingest", "notes.db", "docs"]),
         "indexed 3 file(s)\n",
         "the allowlist took the three .md files and nothing else"
     );
 
-    let said = ok(dir.path(), &["search", "/notes.db", "ownership"]).await;
+    let said = ok(dir.path(), &["search", "notes.db", "ownership"]);
     assert_eq!(hits(&said), ["docs/ownership.md"]);
     // The snippet is the line under the hit, cut around what was asked for.
     assert!(
@@ -119,78 +99,113 @@ async fn ingest_then_search_finds_the_file_by_its_words() {
     );
 }
 
-/// The property that lets an agent run `ingest` without keeping track of what it has run.
-#[tokio::test]
-async fn ingesting_twice_means_the_same_as_ingesting_once() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+/// A document is filed under the path it was given, so where the command was run from is what a
+/// relative argument means — and `list` with nothing after it asks about that same directory.
+#[test]
+fn a_path_means_what_it_meant_to_the_shell_that_typed_it() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "./docs/sub"]);
 
-    assert_eq!(ok(dir.path(), &["list", "/"]).await, "notes.db\t3 document(s)\n");
-    let said = ok(dir.path(), &["search", "/notes.db", "ownership"]).await;
+    assert_eq!(
+        hits(&ok(dir.path(), &["search", "notes.db", "lifetimes"])),
+        ["docs/sub/nested.md"],
+        "`.` names nothing, so it is not part of what the document is called"
+    );
+    assert_eq!(ok(dir.path(), &["list"]), "notes.db\t1 document(s)\n");
+
+    // The same file named absolutely is a different document, because it is a different name —
+    // and this program does not decide on the caller's behalf that the two are one file.
+    let absolute = dir.path().join("docs/sub").to_str().unwrap().to_owned();
+    ok(dir.path(), &["ingest", "notes.db", &absolute]);
+    let both = hits(&ok(dir.path(), &["search", "notes.db", "lifetimes"]));
+    assert_eq!(both.len(), 2, "{both:?}");
+    assert!(
+        both.iter().any(|p| p.starts_with('/')),
+        "an absolute argument is filed absolutely: {both:?}"
+    );
+}
+
+/// The property that lets an agent run `ingest` without keeping track of what it has run.
+#[test]
+fn ingesting_twice_means_the_same_as_ingesting_once() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
+
+    assert_eq!(ok(dir.path(), &["list", "."]), "notes.db\t3 document(s)\n");
+    let said = ok(dir.path(), &["search", "notes.db", "ownership"]);
     assert_eq!(hits(&said), ["docs/ownership.md"], "one document, not two");
 }
 
 /// Overlapping arguments walk the same file twice; the count must not say so.
-#[tokio::test]
-async fn overlapping_arguments_are_counted_once() {
-    let dir = ready().await;
+#[test]
+fn overlapping_arguments_are_counted_once() {
+    let dir = ready();
     assert_eq!(
-        ok(dir.path(), &["ingest", "/notes.db", "/docs", "/docs/sub"]).await,
+        ok(dir.path(), &["ingest", "notes.db", "docs", "docs/sub"]),
         "indexed 3 file(s)\n"
     );
 }
 
 /// The walk's rules: an unlisted extension and a dotted directory are not in the store.
-#[tokio::test]
-async fn the_walk_skips_dotfiles_and_unlisted_extensions() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn the_walk_skips_dotfiles_and_unlisted_extensions() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
-    let nothing = ok(dir.path(), &["search", "/notes.db", "Nobody"]).await;
-    assert_eq!(nothing, "no matches\n", "the dotted directory was not walked");
-    assert_eq!(ok(dir.path(), &["list", "/"]).await, "notes.db\t3 document(s)\n");
+    let nothing = ok(dir.path(), &["search", "notes.db", "Nobody"]);
+    assert_eq!(
+        nothing, "no matches\n",
+        "the dotted directory was not walked"
+    );
+    assert_eq!(ok(dir.path(), &["list", "."]), "notes.db\t3 document(s)\n");
 }
 
 /// The bytes were read when they were ingested, so a search does not open the corpus again.
-#[tokio::test]
-async fn search_reads_no_file_of_the_corpus() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn search_reads_no_file_of_the_corpus() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
     std::fs::remove_dir_all(dir.path().join("docs")).unwrap();
 
-    let said = ok(dir.path(), &["search", "/notes.db", "ownership"]).await;
+    let said = ok(dir.path(), &["search", "notes.db", "ownership"]);
     assert_eq!(hits(&said), ["docs/ownership.md"]);
 }
 
 /// Nothing near the question is no hits and a zero: the store was read and holds nothing near
 /// this, which is an answer and not a failure.
-#[tokio::test]
-async fn a_question_with_no_answer_is_still_an_answer() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn a_question_with_no_answer_is_still_an_answer() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
-    let out = run(dir.path(), &["search", "/notes.db", "zygote"]).await;
-    assert_eq!(out.exit_code, 0);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "no matches\n");
-
-    // And a query with no words in it at all, which never reaches the index.
-    let out = run(dir.path(), &["search", "/notes.db", "!!!"]).await;
-    assert_eq!(out.exit_code, 0);
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "no matches\n");
+    for query in ["zygote", "!!!"] {
+        let out = docstore(dir.path(), &["search", "notes.db", query]);
+        assert_eq!(out.status.code(), Some(0), "{query:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "no matches\n");
+    }
 }
 
 /// FTS5 reads its pattern as an expression, and a caller was never told that language.
-#[tokio::test]
-async fn a_query_that_looks_like_an_expression_is_read_as_words() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn a_query_that_looks_like_an_expression_is_read_as_words() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
-    for query in ["NOT", "ownership AND", "\"unbalanced", "a:b", "*", "(", "^x", "a OR"] {
-        let out = run(dir.path(), &["search", "/notes.db", query]).await;
+    for query in [
+        "NOT",
+        "ownership AND",
+        "\"unbalanced",
+        "a:b",
+        "*",
+        "(",
+        "^x",
+        "a OR",
+    ] {
+        let out = docstore(dir.path(), &["search", "notes.db", query]);
         assert_eq!(
-            out.exit_code,
-            0,
+            out.status.code(),
+            Some(0),
             "{query:?} was read as syntax: {}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -199,12 +214,16 @@ async fn a_query_that_looks_like_an_expression_is_read_as_words() {
     // A word starting with `-` is the parser's business and not FTS5's: clap takes it for an
     // option, and `--` is how a caller says it is a word. That is the ordinary command-line
     // convention, and borrowing it is the reason there is a parser here at all.
-    let flagged = run(dir.path(), &["search", "/notes.db", "-x"]).await;
-    assert_eq!(flagged.exit_code, 2, "an unknown option is a misunderstood line");
-    let quoted = run(dir.path(), &["search", "/notes.db", "--", "-x"]).await;
+    let flagged = docstore(dir.path(), &["search", "notes.db", "-x"]);
     assert_eq!(
-        quoted.exit_code,
-        0,
+        flagged.status.code(),
+        Some(2),
+        "an unknown option is a misunderstood line"
+    );
+    let quoted = docstore(dir.path(), &["search", "notes.db", "--", "-x"]);
+    assert_eq!(
+        quoted.status.code(),
+        Some(0),
         "{}",
         String::from_utf8_lossy(&quoted.stderr)
     );
@@ -212,14 +231,14 @@ async fn a_query_that_looks_like_an_expression_is_read_as_words() {
 
 /// What indexing the body rather than a list of terms buys: `porter` stems, so a question asked
 /// in one form finds a file written in another.
-#[tokio::test]
-async fn a_file_is_found_by_a_word_in_another_form() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn a_file_is_found_by_a_word_in_another_form() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
     for asked in ["mount", "mounts", "mounting", "answer", "answers"] {
         assert_eq!(
-            hits(&ok(dir.path(), &["search", "/notes.db", asked]).await),
+            hits(&ok(dir.path(), &["search", "notes.db", asked])),
             ["docs/mounts.md"],
             "{asked} did not reach the file"
         );
@@ -228,12 +247,12 @@ async fn a_file_is_found_by_a_word_in_another_form() {
 
 /// The snippet is cut from the body as it was written — the store holds the original, which is
 /// what lets the index be rebuilt under another tokenizer later without a re-ingest.
-#[tokio::test]
-async fn the_snippet_is_the_body_as_it_was_written() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn the_snippet_is_the_body_as_it_was_written() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
-    let said = ok(dir.path(), &["search", "/notes.db", "kernel"]).await;
+    let said = ok(dir.path(), &["search", "notes.db", "kernel"]);
     let snippet = said.lines().nth(1).expect("a snippet under the hit");
     assert!(
         snippet.contains("A mount is a path the kernel answers on"),
@@ -243,26 +262,29 @@ async fn the_snippet_is_the_body_as_it_was_written() {
 
 /// A store that was never made is an error, not an empty index answering "no matches" — which
 /// reads as a corpus with nothing in it.
-#[tokio::test]
-async fn a_store_that_is_not_there_is_not_made_by_using_it() {
+#[test]
+fn a_store_that_is_not_there_is_not_made_by_using_it() {
     let dir = tree();
     for args in [
-        vec!["search", "/nope.db", "ownership"],
-        vec!["ingest", "/nope.db", "/docs"],
-        vec!["purge", "/nope.db", "/docs"],
+        vec!["search", "nope.db", "ownership"],
+        vec!["ingest", "nope.db", "docs"],
+        vec!["purge", "nope.db", "docs"],
     ] {
-        let out = run(dir.path(), &args).await;
-        assert_eq!(out.exit_code, 1, "{args:?}");
+        let out = docstore(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
         assert!(out.stdout.is_empty(), "{args:?} wrote something to read");
-        assert!(!dir.path().join("nope.db").exists(), "{args:?} made a store");
+        assert!(
+            !dir.path().join("nope.db").exists(),
+            "{args:?} made a store"
+        );
     }
 }
 
-#[tokio::test]
-async fn init_will_not_make_a_store_twice() {
-    let dir = ready().await;
-    let again = run(dir.path(), &["init", "/notes.db"]).await;
-    assert_eq!(again.exit_code, 1);
+#[test]
+fn init_will_not_make_a_store_twice() {
+    let dir = ready();
+    let again = docstore(dir.path(), &["init", "notes.db"]);
+    assert_eq!(again.status.code(), Some(1));
     assert!(again.stdout.is_empty(), "nothing to read as a store's path");
     assert!(
         String::from_utf8_lossy(&again.stderr).contains("notes.db"),
@@ -272,17 +294,17 @@ async fn init_will_not_make_a_store_twice() {
 
 /// `purge` is `ingest` undone, and a sibling whose name merely starts the same way is not under
 /// the path given.
-#[tokio::test]
-async fn purge_takes_a_subtree_out_and_leaves_a_sibling() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs", "/docs-other"]).await;
-    assert_eq!(ok(dir.path(), &["list", "/"]).await, "notes.db\t4 document(s)\n");
+#[test]
+fn purge_takes_a_subtree_out_and_leaves_a_sibling() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs", "docs-other"]);
+    assert_eq!(ok(dir.path(), &["list", "."]), "notes.db\t4 document(s)\n");
 
     assert_eq!(
-        ok(dir.path(), &["purge", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["purge", "notes.db", "docs"]),
         "purged 3 document(s)\n"
     );
-    let said = ok(dir.path(), &["search", "/notes.db", "borrow"]).await;
+    let said = ok(dir.path(), &["search", "notes.db", "borrow"]);
     assert_eq!(
         hits(&said),
         ["docs-other/x.md"],
@@ -291,56 +313,56 @@ async fn purge_takes_a_subtree_out_and_leaves_a_sibling() {
 }
 
 /// The case `purge` exists for: the file is gone from the tree, and the document is not.
-#[tokio::test]
-async fn purge_opens_no_file_of_the_corpus() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn purge_opens_no_file_of_the_corpus() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
     std::fs::remove_dir_all(dir.path().join("docs")).unwrap();
 
     assert_eq!(
-        ok(dir.path(), &["purge", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["purge", "notes.db", "docs"]),
         "purged 3 document(s)\n"
     );
 }
 
 /// The gap a second `ingest` leaves: added and changed files it handles, a removed one it does
 /// not.
-#[tokio::test]
-async fn sync_removes_what_the_tree_no_longer_has() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn sync_removes_what_the_tree_no_longer_has() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
     std::fs::remove_file(dir.path().join("docs/mounts.md")).unwrap();
 
     // A second ingest leaves the document behind, which is why `sync` exists.
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
     assert_eq!(
-        hits(&ok(dir.path(), &["search", "/notes.db", "kernel"]).await),
+        hits(&ok(dir.path(), &["search", "notes.db", "kernel"])),
         ["docs/mounts.md"],
         "ingest only ever adds"
     );
 
     assert_eq!(
-        ok(dir.path(), &["sync", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["sync", "notes.db", "docs"]),
         "synced 0 file(s), 2 unchanged, removed 1 document(s)\n"
     );
     assert_eq!(
-        ok(dir.path(), &["search", "/notes.db", "kernel"]).await,
+        ok(dir.path(), &["search", "notes.db", "kernel"]),
         "no matches\n"
     );
 }
 
 /// Only files whose stamp moved are read again — and `--force` is the way to say otherwise.
-#[tokio::test]
-async fn sync_rereads_only_what_changed_unless_forced() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn sync_rereads_only_what_changed_unless_forced() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
     assert_eq!(
-        ok(dir.path(), &["sync", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["sync", "notes.db", "docs"]),
         "synced 0 file(s), 3 unchanged, removed 0 document(s)\n"
     );
     assert_eq!(
-        ok(dir.path(), &["sync", "/notes.db", "/docs", "--force"]).await,
+        ok(dir.path(), &["sync", "notes.db", "docs", "--force"]),
         "synced 3 file(s), 0 unchanged, removed 0 document(s)\n"
     );
 
@@ -352,81 +374,82 @@ async fn sync_rereads_only_what_changed_unless_forced() {
     )
     .unwrap();
     assert_eq!(
-        ok(dir.path(), &["sync", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["sync", "notes.db", "docs"]),
         "synced 1 file(s), 2 unchanged, removed 0 document(s)\n"
     );
     assert_eq!(
-        hits(&ok(dir.path(), &["search", "/notes.db", "unmounting"]).await),
+        hits(&ok(dir.path(), &["search", "notes.db", "unmounting"])),
         ["docs/mounts.md"]
     );
 }
 
 /// A directory that is gone entirely means an empty tree under it.
-#[tokio::test]
-async fn sync_of_a_path_that_is_gone_empties_it() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn sync_of_a_path_that_is_gone_empties_it() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
     std::fs::remove_dir_all(dir.path().join("docs")).unwrap();
 
     assert_eq!(
-        ok(dir.path(), &["sync", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["sync", "notes.db", "docs"]),
         "synced 0 file(s), 0 unchanged, removed 3 document(s)\n"
     );
-    assert_eq!(ok(dir.path(), &["list", "/"]).await, "notes.db\t0 document(s)\n");
+    assert_eq!(ok(dir.path(), &["list", "."]), "notes.db\t0 document(s)\n");
 }
 
-/// `sync` is scoped to the paths it was given, so it does not touch what another `ingest` put
-/// in from somewhere else.
-#[tokio::test]
-async fn sync_is_scoped_to_the_paths_it_was_given() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs", "/docs-other"]).await;
+/// `sync` is scoped to the paths it was given, so it does not touch what another `ingest` put in
+/// from somewhere else.
+#[test]
+fn sync_is_scoped_to_the_paths_it_was_given() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs", "docs-other"]);
     std::fs::remove_dir_all(dir.path().join("docs")).unwrap();
 
     assert_eq!(
-        ok(dir.path(), &["sync", "/notes.db", "/docs"]).await,
+        ok(dir.path(), &["sync", "notes.db", "docs"]),
         "synced 0 file(s), 0 unchanged, removed 3 document(s)\n"
     );
     assert_eq!(
-        hits(&ok(dir.path(), &["search", "/notes.db", "borrow"]).await),
+        hits(&ok(dir.path(), &["search", "notes.db", "borrow"])),
         ["docs-other/x.md"],
-        "what came from `/docs-other` was never in scope"
+        "what came from `docs-other` was never in scope"
     );
 }
 
 /// `list` answers about one directory: the stores in it, and nothing else that is in it.
-#[tokio::test]
-async fn list_counts_stores_and_passes_over_everything_else() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
-    ok(dir.path(), &["init", "/second.db"]).await;
+#[test]
+fn list_counts_stores_and_passes_over_everything_else() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
+    ok(dir.path(), &["init", "second.db"]);
     // A plain file and somebody else's SQLite database, both beside the stores.
     std::fs::write(dir.path().join("plain.txt"), "not a store\n").unwrap();
-    std::fs::write(dir.path().join("foreign.db"), b"SQLite format 3\0not really").unwrap();
+    std::fs::write(
+        dir.path().join("foreign.db"),
+        b"SQLite format 3\0not really",
+    )
+    .unwrap();
 
     assert_eq!(
-        ok(dir.path(), &["list", "/"]).await,
+        ok(dir.path(), &["list", "."]),
         "notes.db\t3 document(s)\nsecond.db\t0 document(s)\n",
         "sorted by name, and only the stores"
     );
 
     // A directory with no store in it says so rather than answering with nothing.
     assert_eq!(
-        ok(dir.path(), &["list", "/docs"]).await,
+        ok(dir.path(), &["list", "docs"]),
         "no stores here — `docstore init <STORE>` makes one\n"
     );
 }
 
 /// Dropping forgets the store and leaves the files it was built from alone.
-#[tokio::test]
-async fn drop_removes_the_store_and_not_the_corpus() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn drop_removes_the_store_and_not_the_corpus() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
-    assert_eq!(
-        ok(dir.path(), &["drop", "/notes.db"]).await,
-        "dropped /notes.db\n"
-    );
+    assert_eq!(ok(dir.path(), &["drop", "notes.db"]), "dropped notes.db\n");
     assert!(!dir.path().join("notes.db").exists());
     assert!(
         dir.path().join("docs/ownership.md").is_file(),
@@ -436,25 +459,22 @@ async fn drop_removes_the_store_and_not_the_corpus() {
 
 /// The whole of what `drop` does that `rm` does not: a store is a path, so one mistyped argument
 /// would otherwise be somebody's data.
-#[tokio::test]
-async fn drop_refuses_what_is_not_a_store() {
-    let dir = ready().await;
+#[test]
+fn drop_refuses_what_is_not_a_store() {
+    let dir = ready();
     std::fs::write(dir.path().join("plain.txt"), "not a store\n").unwrap();
 
-    for arg in ["/plain.txt", "/docs/ownership.md"] {
-        let out = run(dir.path(), &["drop", arg]).await;
-        assert_eq!(out.exit_code, 1, "{arg}");
+    for arg in ["plain.txt", "docs/ownership.md"] {
+        let out = docstore(dir.path(), &["drop", arg]);
+        assert_eq!(out.status.code(), Some(1), "{arg}");
         assert!(
-            dir.path()
-                .join(arg.trim_start_matches('/'))
-                .try_exists()
-                .unwrap(),
+            dir.path().join(arg).try_exists().unwrap(),
             "{arg} was removed"
         );
     }
 
-    let missing = run(dir.path(), &["drop", "/nope.db"]).await;
-    assert_eq!(missing.exit_code, 1);
+    let missing = docstore(dir.path(), &["drop", "nope.db"]);
+    assert_eq!(missing.status.code(), Some(1));
 }
 
 /// The tables are shared with `memstore`, so nothing about a file's *structure* says which
@@ -462,30 +482,28 @@ async fn drop_refuses_what_is_not_a_store() {
 ///
 /// Without it `list` would count somebody's memories as documents, `drop` would delete them, and
 /// `search` would answer from rows whose path is null.
-#[tokio::test]
-async fn a_memstore_file_is_not_a_docstore_one() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs"]).await;
+#[test]
+fn a_memstore_file_is_not_a_docstore_one() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs"]);
 
     // A store of the other kind, beside this one, made through the shared schema.
     let theirs = dir.path().join("memories.db");
-    drop(
-        cortex_exec_storebase::sqlite::create(&theirs, "memstore").expect("a memstore store"),
-    );
+    drop(cortex_exec_storebase::sqlite::create(&theirs, "memstore").expect("a memstore store"));
 
     assert_eq!(
-        ok(dir.path(), &["list", "/"]).await,
+        ok(dir.path(), &["list", "."]),
         "notes.db\t3 document(s)\n",
         "only this kind is listed"
     );
 
     for args in [
-        vec!["search", "/memories.db", "ownership"],
-        vec!["drop", "/memories.db"],
-        vec!["ingest", "/memories.db", "/docs"],
+        vec!["search", "memories.db", "ownership"],
+        vec!["drop", "memories.db"],
+        vec!["ingest", "memories.db", "docs"],
     ] {
-        let out = run(dir.path(), &args).await;
-        assert_eq!(out.exit_code, 1, "{args:?}");
+        let out = docstore(dir.path(), &args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
         let said = String::from_utf8_lossy(&out.stderr);
         assert!(
             said.contains("memstore") || said.contains("not a store"),
@@ -496,21 +514,22 @@ async fn a_memstore_file_is_not_a_docstore_one() {
 }
 
 /// `--help` on the name, on stdout, succeeding — a caller asked a question and got an answer.
-#[tokio::test]
-async fn help_is_an_answer_and_a_usage_error_is_not() {
+#[test]
+fn help_is_an_answer_and_a_usage_error_is_not() {
     let dir = tree();
 
-    let helped = run(dir.path(), &["--help"]).await;
-    assert_eq!(helped.exit_code, 0);
+    let helped = docstore(dir.path(), &["--help"]);
+    assert_eq!(helped.status.code(), Some(0));
     assert!(helped.stderr.is_empty());
     let said = String::from_utf8_lossy(&helped.stdout);
+    assert!(said.contains("Usage: docstore"), "{said}");
     for command in ["init", "ingest", "search", "sync", "purge", "list", "drop"] {
         assert!(said.contains(command), "{command} is missing from: {said}");
     }
 
-    // The half a runtime that intercepted `--help` could not have covered.
-    let sub = run(dir.path(), &["sync", "--help"]).await;
-    assert_eq!(sub.exit_code, 0);
+    // The half a hand-written option loop always ends up missing.
+    let sub = docstore(dir.path(), &["sync", "--help"]);
+    assert_eq!(sub.status.code(), Some(0));
     assert!(
         String::from_utf8_lossy(&sub.stdout).contains("--force"),
         "a subcommand answers its own help"
@@ -518,48 +537,25 @@ async fn help_is_an_answer_and_a_usage_error_is_not() {
 
     // Getting the usage wrong is `2` and goes to stderr, which is the distinction a caller acts
     // on: this line can be reissued differently, where a `1` was understood and did not work.
-    let wrong = run(dir.path(), &["ingest"]).await;
-    assert_eq!(wrong.exit_code, 2);
+    let wrong = docstore(dir.path(), &["ingest"]);
+    assert_eq!(wrong.status.code(), Some(2));
     assert!(wrong.stdout.is_empty());
     assert!(!wrong.stderr.is_empty());
 }
 
-/// The usage line is spelled with the name it was invoked by, so an executable registered under
-/// another name does not tell a caller to run a command they do not have. This is what clap's
-/// `string` feature is on for.
-#[tokio::test]
-async fn usage_names_the_name_it_was_called_by() {
-    let execs = ExecutableSet::new().register("kb", "the knowledge base", DocStore::new());
-    let out = execs
-        .invoke(
-            &ExecCall {
-                name: "kb".into(),
-                args: vec!["--help".into()],
-                env: Default::default(),
-                cwd: None,
-            },
-            None,
-        )
-        .await
-        .expect("kb is registered");
-
-    let said = String::from_utf8_lossy(&out.stdout);
-    assert!(said.contains("Usage: kb"), "{said}");
-    assert!(!said.contains("Usage: docstore"), "{said}");
-}
-
-/// No colour: there is no tty here and this output is bytes on a wire.
-#[tokio::test]
-async fn nothing_it_writes_carries_an_escape() {
-    let dir = ready().await;
+/// No colour: this output went to a pipe, and an escape chosen for a terminal would be bytes in
+/// whatever the caller does with it.
+#[test]
+fn nothing_it_writes_carries_an_escape() {
+    let dir = ready();
     for args in [
         vec!["--help"],
         vec!["search", "--help"],
         vec!["purge"],
-        vec!["search", "/notes.db", "ownership"],
-        vec!["list", "/"],
+        vec!["search", "notes.db", "ownership"],
+        vec!["list", "."],
     ] {
-        let out = run(dir.path(), &args).await;
+        let out = docstore(dir.path(), &args);
         let written = [out.stdout, out.stderr].concat();
         assert!(
             !written.contains(&0x1b),
@@ -569,58 +565,15 @@ async fn nothing_it_writes_carries_an_escape() {
     }
 }
 
-/// A store is a path in the tree, so there is nothing to reach with nothing mounted. That holds
-/// even for `search` and `purge`, which open no file of the corpus: what they need the mount for
-/// is the store itself.
-#[tokio::test]
-async fn every_command_needs_the_mount() {
-    for args in [
-        vec!["init", "/notes.db"],
-        vec!["ingest", "/notes.db", "/docs"],
-        vec!["search", "/notes.db", "ownership"],
-        vec!["sync", "/notes.db", "/docs"],
-        vec!["purge", "/notes.db", "/docs"],
-        vec!["list", "/"],
-        vec!["drop", "/notes.db"],
-    ] {
-        let out = registered()
-            .invoke(&call(&args), None)
-            .await
-            .expect("docstore is registered");
-        assert_eq!(out.exit_code, 1, "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("nothing is mounted"),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-/// Today's limit, written down as a test so it fails when `cwd` starts arriving: a relative
-/// argument needs a directory to resolve against, and a substituted root would read a different
-/// file and say nothing about it.
-#[tokio::test]
-async fn a_relative_path_is_refused_while_the_backend_reports_no_directory() {
-    let dir = ready().await;
-
-    let out = run(dir.path(), &["ingest", "/notes.db", "docs"]).await;
-    assert_eq!(out.exit_code, 1);
-    assert!(out.stdout.is_empty());
-
-    // `list` with no argument is the same case: its default is the caller's own directory.
-    let listed = run(dir.path(), &["list"]).await;
-    assert_eq!(listed.exit_code, 1);
-}
-
 /// The bound reaches the store rather than trimming an answer that was already built.
-#[tokio::test]
-async fn a_search_is_bounded_and_the_count_is_the_callers_to_raise() {
-    let dir = ready().await;
-    ok(dir.path(), &["ingest", "/notes.db", "/docs", "/docs-other"]).await;
+#[test]
+fn a_search_is_bounded_and_the_count_is_the_callers_to_raise() {
+    let dir = ready();
+    ok(dir.path(), &["ingest", "notes.db", "docs", "docs-other"]);
 
-    let all = ok(dir.path(), &["search", "/notes.db", "the"]).await;
+    let all = ok(dir.path(), &["search", "notes.db", "the"]);
     assert!(hits(&all).len() > 1, "{all}");
 
-    let one = ok(dir.path(), &["search", "/notes.db", "-n", "1", "the"]).await;
+    let one = ok(dir.path(), &["search", "notes.db", "-n", "1", "the"]);
     assert_eq!(hits(&one).len(), 1, "{one}");
 }

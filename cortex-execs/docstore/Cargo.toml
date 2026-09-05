@@ -3,39 +3,25 @@ name = "cortex-exec-docstore"
 version.workspace = true
 edition.workspace = true
 
-# `docstore` against a directory on this host, with nothing mounted in front of it. The same
-# `Executable` a consumer registers, so what it does here is what it does there; the
-# difference is only who supplies the tree.
+# `docstore` is what a caller types, and the package name is not it: this is one program, and the
+# name it answers to is the one in its usage line and in everything it says about itself.
 [[bin]]
 name = "docstore"
-path = "src/bin/main.rs"
+path = "src/main.rs"
 
 [dependencies]
 # RFC 3339 timestamps. A document carries when it was last written into the store, and the
 # store is a file other tools read: a sortable, unambiguous spelling is worth a dependency.
 chrono = { workspace = true }
-# The argument parser. A registered name is a command line like any other, so it answers its
-# own `--help` — including on each subcommand, which is the half no runtime interception
-# could have covered.
-#
-# The workspace one rather than a local declaration, for its `string` feature: one executable
-# can be registered under several names, so the usage line has to carry the name it was
-# invoked by, and without `string` a command's name can only be a `&'static str`.
+# The argument parser, and the whole of the driving. It answers its own `--help`, including on
+# each subcommand, which is the half a hand-written option loop always ends up missing.
 clap = { workspace = true }
-# `Executable`, `ExecCall`, `Mount` — the surface this crate implements, and
-# `BoxFuture`, which is what `exec` hands back.
-cortex = { workspace = true }
-# Opening the store, and the shell around a registered command — see its own docs for
-# where the line between shared and not-shared is drawn.
+# Opening the store: the schema, `meta`, and the write that `memstore` keeps the same.
 cortex-exec-storebase = { workspace = true }
 # The store. `bundled` (from the workspace) on purpose: the schema is an FTS5 index, and FTS5
 # is a compile-time option the host's own SQLite is free to have been built without. A store
 # that opened and then answered every search with nothing is the failure being avoided.
 rusqlite = { workspace = true }
-# `spawn_blocking`: SQLite is synchronous and a walk of a tree is the slow kind of work, so
-# neither may run on the task the call arrived on.
-tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

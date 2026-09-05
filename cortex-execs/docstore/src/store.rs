@@ -3,23 +3,23 @@
 //!
 //! # One file, and why that decides most of this
 //!
-//! A store is named the way a document is — `docstore ingest notes.db /docs` — because it
-//! lives in a cortex tree, beside whatever else the session works on. Everything the index
-//! needs is therefore in that one file, and copying the file copies the index.
+//! A store is named the way a document is — `docstore ingest notes.db docs` — because it lives
+//! beside what it indexes. Everything the index needs is therefore in that one file, and copying
+//! the file copies the index.
 //!
-//! Being a file in the tree is what SQLite makes possible. A store on the rollback journal needs
+//! Being an ordinary file is what SQLite makes possible. A store on the rollback journal needs
 //! nothing of its host but the ability to create a sibling file: no `mmap` of its own data, no
-//! lock file held across a session. Under FUSE-T a mount is an NFS one, where both of those are
-//! exactly the operations that behave differently, so an engine that wanted them would have to
-//! keep its state somewhere off the tree.
+//! lock file held across a session. That is what lets one sit on a directory this has no say
+//! over — a network share, or a FUSE mount, where an engine wanting either of those would
+//! quietly misbehave.
 //!
 //! # No write-ahead log
 //!
-//! The file usually sits on a mounted cortex tree, which is a FUSE mount, and WAL mode does
-//! not survive that assumption: the log's index is a shared-memory file that every connection
-//! `mmap`s and expects to be coherent between processes. A FUSE filesystem is under no
-//! obligation to give them that, and the failure is silent. So the store stays on the
-//! rollback journal SQLite starts in, and concurrent writers wait on [`BUSY_TIMEOUT`].
+//! A store may well sit on a FUSE mount, and WAL mode does not survive that assumption: the
+//! log's index is a shared-memory file that every connection `mmap`s and expects to be coherent
+//! between processes. A FUSE filesystem is under no obligation to give them that, and the
+//! failure is silent. So the store stays on the rollback journal SQLite starts in, and
+//! concurrent writers wait on [`BUSY_TIMEOUT`].
 //!
 //! # The body lives in the FTS table
 //!
@@ -73,7 +73,8 @@ const SEARCH: &str = include_str!("../queries/search.sql");
 
 /// A document on its way into the store.
 pub(crate) struct Writing<'a> {
-    pub workspace: &'a Path,
+    /// What it is filed under, which is the path the caller named it by.
+    pub path: &'a Path,
     pub title: String,
     pub body: String,
     pub stamp: Stamp,
@@ -96,9 +97,8 @@ pub(crate) struct Hit {
 
 /// An open store.
 ///
-/// Every method here is synchronous and blocks — this is SQLite. Keeping that off the task
-/// the call arrived on is the caller's job, and [`exec`](crate::exec) does it: every
-/// call into this type goes through `spawn_blocking`.
+/// Every method here is synchronous and blocks — this is SQLite. Nothing here hides that: the
+/// program a store is opened by is doing this one thing and has nothing else to get on with.
 #[derive(Debug)]
 pub(crate) struct Store {
     conn: Mutex<Connection>,
@@ -172,7 +172,7 @@ impl Store {
             let mut forget = tx.prepare(FORGET).map_err(sql_error)?;
 
             for doc in writing {
-                let path = doc.workspace.to_string_lossy();
+                let path = doc.path.to_string_lossy();
                 let rowid: i64 = upsert
                     .query_row(
                         (

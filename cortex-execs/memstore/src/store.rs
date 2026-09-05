@@ -82,8 +82,8 @@ const SEARCH: &str = include_str!("../queries/search.sql");
 
 /// An open memory store.
 ///
-/// Every method here is synchronous and blocks — this is SQLite. Keeping that off the task
-/// the call arrived on is the caller's job, and [`exec`](crate::exec) does it.
+/// Every method here is synchronous and blocks — this is SQLite. Nothing here hides that: the
+/// program a store is opened by is doing this one thing and has nothing else to get on with.
 ///
 /// [`Send`] + [`Sync`] through the mutex, which is what lets a caller hold one in an
 /// [`Arc`](std::sync::Arc) and hand it to a blocking thread per call. A `Connection` is not
