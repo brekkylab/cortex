@@ -41,7 +41,7 @@ pub struct Memory {
     /// "she" referred to, when "last week" was — has to have been folded in before it was
     /// written, because none of it will be there to lean on.
     ///
-    /// **Nothing here enforces it, and nothing can.** `memstore` writes what it is handed; a
+    /// **Nothing here enforces it, and nothing can.** `mem` writes what it is handed; a
     /// caller that hands it "she moved there last week" gets a row saying exactly that, which
     /// is the honest behaviour for a command whose whole point is not to second-guess its
     /// input.

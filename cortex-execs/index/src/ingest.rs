@@ -1,16 +1,11 @@
-//! `<name> ingest|sync|purge` — what goes into the store, and what comes back out.
+//! `index ingest|sync|purge` — what goes into the store, and what comes back out.
 //!
 //! Which files a directory argument picks up, how large one may be, what a dangling symlink
 //! counts as, and what a second `ingest` of a path means are all decided here, and none of them
 //! have anything to do with the store underneath: the walk hands over text and a stamp, and what
 //! becomes of those is [`store`](crate::store)'s.
 
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use cortex::exec::{ExecCall, ExecResult};
-use cortex::fs::Mount;
-use cortex_exec_storebase::command::host_path;
+use std::path::{Component, Path, PathBuf};
 
 use crate::store::{Held, Store, Writing};
 
@@ -63,66 +58,59 @@ impl Stamp {
     }
 }
 
-/// The workspace/host path pairs `paths` names, or the refusal to answer with.
+/// `path` with the components that name nothing taken out, and nothing else touched.
 ///
-/// Resolved before anything is opened, so a mistyped argument is one refusal and not a
-/// half-finished store. That `paths` is non-empty is the parser's to have enforced.
-fn targets(
-    call: &ExecCall,
-    mount: Option<&dyn Mount>,
-    paths: &[String],
-) -> Result<Vec<(PathBuf, PathBuf)>, ExecResult> {
-    let mut targets = Vec::new();
-    for arg in paths {
-        let host = host_path(call, mount, arg)?;
-        let workspace = call
-            .resolve(arg)
-            .map_err(|e| ExecResult::failed(1, format!("{arg}: {e}\n")))?;
-        targets.push((workspace, host));
+/// This is what a document is filed under, and it is also what gets opened, which is the whole
+/// reason it does so little. `..` stays, and so does a leading `/`: resolving either would mean
+/// deciding on the caller's behalf what file they meant, and the kernel resolving the same path
+/// afterwards could disagree — a store asserting the contents of a file that was never opened is
+/// the failure this avoids. Taking `.` out is safe because no `.` names a different place.
+///
+/// The result of `.` is the empty path, which is this program's spelling for "where it was run",
+/// and what makes a document under it `docs/a.md` rather than `./docs/a.md`. [`readable`] is what
+/// turns it back into something to open.
+fn cleaned(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|c| !matches!(c, Component::CurDir))
+        .collect()
+}
+
+/// A path as something to open: the empty path is where this was run, which is `.` to the
+/// filesystem and nothing at all to a document's name.
+fn readable(path: &Path) -> &Path {
+    if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
     }
-    Ok(targets)
 }
 
 /// Index the files named by `paths`; a directory means everything under it.
 ///
 /// Re-ingesting a path **replaces** it rather than adding a second copy — `path` is the
-/// document's identity in the schema, and the upsert is keyed on it. That is what makes
-/// running this twice mean the same as running it once, which is the only version an agent can
-/// use without keeping track.
-pub(crate) async fn run(
-    store: Arc<Store>,
-    call: &ExecCall,
-    mount: Option<&dyn Mount>,
-    paths: &[String],
-) -> ExecResult {
-    let targets = match targets(call, mount, paths) {
-        Ok(targets) => targets,
-        Err(refusal) => return refusal,
-    };
-    blocking("ingest", move || index_all(&store, targets)).await
-}
-
-/// The whole of the blocking half: walk, read, write once.
-fn index_all(store: &Store, targets: Vec<(PathBuf, PathBuf)>) -> std::io::Result<String> {
+/// document's identity in the schema, and the upsert is keyed on it. That is what makes running
+/// this twice mean the same as running it once, which is the only version an agent can use
+/// without keeping track.
+pub(crate) fn run(store: &Store, paths: &[PathBuf]) -> std::io::Result<String> {
     let mut walk = Walk::default();
-    for (workspace, host) in targets {
-        collect(&workspace, &host, &mut walk)?;
+    for path in paths {
+        collect(&cleaned(path), &mut walk)?;
     }
     walk.dedup();
 
     let mut skipped = walk.declined;
     let mut writing = Vec::new();
     for file in &walk.files {
-        match std::fs::read_to_string(&file.host) {
+        match std::fs::read_to_string(&file.path) {
             Ok(body) => writing.push(Writing {
-                workspace: &file.workspace,
-                title: title_of(&file.workspace),
+                path: &file.path,
+                title: title_of(&file.path),
                 body,
                 stamp: file.stamp,
             }),
             // A file that is not UTF-8 is not a failure of the call: the allowlist said what to
             // look at, and this one turned out not to be text.
-            Err(e) => skipped.push(format!("{}: {e}", file.workspace.display())),
+            Err(e) => skipped.push(format!("{}: {e}", file.path.display())),
         }
     }
 
@@ -136,47 +124,30 @@ fn index_all(store: &Store, targets: Vec<(PathBuf, PathBuf)>) -> std::io::Result
     Ok(report)
 }
 
-/// `<name> sync <STORE> <PATH>...` — make the store match the tree under `paths`.
+/// `index sync <STORE> <PATH>...` — make the store match the tree under `paths`.
 ///
 /// [`run`] is idempotent for everything except a file that is *gone*: a second ingest picks up
-/// what was added and replaces what changed, and leaves a document behind for what was
-/// removed. This is that one case.
+/// what was added and replaces what changed, and leaves a document behind for what was removed.
+/// This is that one case.
 ///
 /// **A path that is not there means an empty tree under it**, so `sync` removes what the store
-/// still holds for it. That is the reading a caller wants when a directory was deleted
-/// wholesale; where nothing was indexed under the path anyway — a typo — the empty set meets an
-/// empty set and nothing happens.
-pub(crate) async fn sync(
-    store: Arc<Store>,
-    call: &ExecCall,
-    mount: Option<&dyn Mount>,
-    paths: &[String],
-    force: bool,
-) -> ExecResult {
-    let targets = match targets(call, mount, paths) {
-        Ok(targets) => targets,
-        Err(refusal) => return refusal,
-    };
-    blocking("sync", move || sync_all(&store, targets, force)).await
-}
-
-fn sync_all(
-    store: &Store,
-    targets: Vec<(PathBuf, PathBuf)>,
-    force: bool,
-) -> std::io::Result<String> {
+/// still holds for it. That is the reading a caller wants when a directory was deleted wholesale;
+/// where nothing was indexed under the path anyway — a typo — the empty set meets an empty set
+/// and nothing happens.
+pub(crate) fn sync(store: &Store, paths: &[PathBuf], force: bool) -> std::io::Result<String> {
     let mut walk = Walk::default();
     let mut prefixes = Vec::new();
-    for (workspace, host) in &targets {
-        prefixes.push(workspace.to_string_lossy().into_owned());
+    for path in paths {
+        let path = cleaned(path);
+        prefixes.push(path.to_string_lossy().into_owned());
         // Only *this* path being absent means an empty tree under it. A `NotFound` from
         // somewhere inside the walk is a file that went while it was being read, and taking
         // that for "the whole path is gone" would delete everything the walk had not reached
         // yet.
-        if !host.exists() {
+        if !readable(&path).exists() {
             continue;
         }
-        collect(workspace, host, &mut walk)?;
+        collect(&path, &mut walk)?;
     }
     walk.dedup();
 
@@ -202,7 +173,7 @@ fn sync_all(
     let walked: Vec<String> = walk
         .files
         .iter()
-        .map(|f| f.workspace.to_string_lossy().into_owned())
+        .map(|f| f.path.to_string_lossy().into_owned())
         .collect();
 
     let mut to_read = Vec::new();
@@ -218,10 +189,10 @@ fn sync_all(
     let mut skipped = walk.declined;
     let mut writing = Vec::new();
     for (file, path) in to_read {
-        match std::fs::read_to_string(&file.host) {
+        match std::fs::read_to_string(&file.path) {
             Ok(body) => writing.push(Writing {
-                workspace: &file.workspace,
-                title: title_of(&file.workspace),
+                path: &file.path,
+                title: title_of(&file.path),
                 body,
                 stamp: file.stamp,
             }),
@@ -252,26 +223,20 @@ fn sync_all(
     Ok(report)
 }
 
-/// `<name> purge <STORE> <PATH>...` — take documents back out.
+/// `index purge <STORE> <PATH>...` — take documents back out.
 ///
 /// The inverse of [`run`], and it opens no file in the tree: what is removed is decided by what
 /// the store holds, not by what the tree does. A file deleted from the tree is the reason to
 /// purge in the first place.
 ///
-/// A path removes the document at it and everything under it, so `purge notes.db /docs` undoes
-/// `ingest notes.db /docs` whether that argument named a file or a directory.
-pub(crate) async fn purge(store: Arc<Store>, call: &ExecCall, paths: &[String]) -> ExecResult {
-    let mut prefixes = Vec::new();
-    for arg in paths {
-        match call.resolve(arg) {
-            Ok(path) => prefixes.push(path.to_string_lossy().into_owned()),
-            Err(e) => return ExecResult::failed(1, format!("{arg}: {e}\n")),
-        }
-    }
-    blocking("purge", move || purge_all(&store, &prefixes)).await
-}
+/// A path removes the document at it and everything under it, so `purge notes.db docs` undoes
+/// `ingest notes.db docs` whether that argument named a file or a directory.
+pub(crate) fn purge(store: &Store, paths: &[PathBuf]) -> std::io::Result<String> {
+    let prefixes: Vec<String> = paths
+        .iter()
+        .map(|path| cleaned(path).to_string_lossy().into_owned())
+        .collect();
 
-fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
     let doomed: Vec<i64> = store
         .held()?
         .into_iter()
@@ -282,36 +247,17 @@ fn purge_all(store: &Store, prefixes: &[String]) -> std::io::Result<String> {
     Ok(format!("purged {} document(s)\n", doomed.len()))
 }
 
-/// Run `work` off the task the call arrived on.
-///
-/// Every call into the store goes through here. SQLite is synchronous and a walk of a tree is
-/// the slow kind of work, and the task this is called from is whatever the consumer was doing
-/// when it dispatched — so neither may run on it, and `memstore` does the same.
-async fn blocking<F>(what: &'static str, work: F) -> ExecResult
-where
-    F: FnOnce() -> std::io::Result<String> + Send + 'static,
-{
-    match tokio::task::spawn_blocking(work).await {
-        Ok(Ok(report)) => ExecResult::ok(report),
-        Ok(Err(e)) => ExecResult::failed(1, format!("{what}: {e}\n")),
-        // The blocking task panicked. Reported rather than resumed.
-        Err(e) => ExecResult::failed(1, format!("{what}: {e}\n")),
-    }
-}
-
 /// The name a document is also searchable by, so a query matching a file's name outranks one
 /// matching a mention in somebody else's body.
-fn title_of(workspace: &Path) -> String {
-    workspace
-        .file_name()
+fn title_of(path: &Path) -> String {
+    path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| workspace.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-/// One file the walk found: both its names, and what it was when it was looked at.
+/// One file the walk found: what it is filed under, and what it was when it was looked at.
 pub(crate) struct Walked {
-    pub workspace: PathBuf,
-    pub host: PathBuf,
+    pub path: PathBuf,
     pub stamp: Stamp,
 }
 
@@ -333,52 +279,47 @@ impl Walk {
     ///
     /// The size cap lives here and not at the read, so that "too large" and "not there" leave
     /// the walk by the same door: both are files this will not have a document for.
-    fn take(&mut self, workspace: &Path, host: &Path, meta: &std::fs::Metadata) {
+    fn take(&mut self, path: &Path, meta: &std::fs::Metadata) {
         if meta.len() > MAX_BODY {
             self.declined.push(format!(
                 "{}: {} bytes, over the {MAX_BODY} this reads",
-                workspace.display(),
+                path.display(),
                 meta.len()
             ));
             return;
         }
         self.files.push(Walked {
-            workspace: workspace.to_path_buf(),
-            host: host.to_path_buf(),
+            path: path.to_path_buf(),
             stamp: Stamp::of(meta),
         });
     }
 
     /// Drop what two overlapping arguments found twice.
     ///
-    /// `ingest notes.db /a /a/b` walks `/a/b` under both, and without this the same file is
-    /// written twice in one batch and counted twice in the report. The documents come out right
-    /// either way, because a write is an upsert; the count does not.
+    /// `ingest notes.db a a/b` walks `a/b` under both, and without this the same file is written
+    /// twice in one batch and counted twice in the report. The documents come out right either
+    /// way, because a write is an upsert; the count does not.
     fn dedup(&mut self) {
         let mut seen = std::collections::BTreeSet::new();
         self.files
-            .retain(|f| seen.insert(f.workspace.to_string_lossy().into_owned()));
+            .retain(|f| seen.insert(f.path.to_string_lossy().into_owned()));
         self.declined.sort();
         self.declined.dedup();
     }
 }
 
-/// Every indexable file under `host`, paired with the workspace path it is known by.
-///
-/// Both paths are carried down together because only one of them can be walked and only the
-/// other can be stored: the walk needs the host's directory entries, and a result has to name a
-/// file the caller can open.
-fn collect(workspace: &Path, host: &Path, out: &mut Walk) -> std::io::Result<()> {
-    let meta = std::fs::metadata(host)?;
+/// Every indexable file under `path`, filed under the path it is reached by.
+fn collect(path: &Path, out: &mut Walk) -> std::io::Result<()> {
+    let meta = std::fs::metadata(readable(path))?;
     if meta.is_file() {
-        out.take(workspace, host, &meta);
+        out.take(path, &meta);
         return Ok(());
     }
     if !meta.is_dir() {
         return Ok(());
     }
 
-    for entry in std::fs::read_dir(host)? {
+    for entry in std::fs::read_dir(readable(path))? {
         let entry = entry?;
         let name = entry.file_name();
         // Dotfiles are skipped whole: `.git` is the case that matters, and walking into it
@@ -386,26 +327,26 @@ fn collect(workspace: &Path, host: &Path, out: &mut Walk) -> std::io::Result<()>
         if name.to_string_lossy().starts_with('.') {
             continue;
         }
-        let child_host = entry.path();
-        let child_workspace = workspace.join(&name);
+        // Joined onto the path this was reached by rather than taken from the directory entry,
+        // so that a document's name is the caller's spelling all the way down: under `docs` the
+        // answer is `docs/sub/a.md`, and under `.` it is `sub/a.md`.
+        let child = path.join(&name);
 
         if entry.file_type()?.is_dir() {
-            collect(&child_workspace, &child_host, out)?;
-        } else if indexable(&child_host) {
+            collect(&child, out)?;
+        } else if indexable(&child) {
             // `metadata` and not `entry.metadata()`: a symlink should be measured by what it
             // points at, which is also what will be read. One that points nowhere fails here and
             // is left out of the walk entirely, so `sync` treats it as the absent file it is
             // rather than as a file it merely could not read.
-            match std::fs::metadata(&child_host) {
-                Ok(meta) => out.take(&child_workspace, &child_host, &meta),
+            match std::fs::metadata(&child) {
+                Ok(meta) => out.take(&child, &meta),
                 // Not there at all: a dangling symlink, or a file that went while this was
                 // walking. Absent, and so not among what the tree has.
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 // There but not readable. Declined rather than fatal: one file nobody can open
                 // should not end a walk over everything beside it.
-                Err(e) => out
-                    .declined
-                    .push(format!("{}: {e}", child_workspace.display())),
+                Err(e) => out.declined.push(format!("{}: {e}", child.display())),
             }
         }
     }
@@ -426,7 +367,7 @@ fn indexable(path: &Path) -> bool {
 /// does the filtering — a SQL `like` would have to escape `%` and `_` out of every path, and
 /// would be a second spelling of this rule.
 pub(crate) fn under(path: &str, prefix: &str) -> bool {
-    // The root, spelled as `resolve` spells it, covers everything.
+    // The empty path is where this was run, and everything is under that.
     if prefix.is_empty() {
         return true;
     }

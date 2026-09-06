@@ -3,8 +3,8 @@ resolver = "3"
 members = [
     "cortex",
     "cortex-execs/storebase",
-    "cortex-execs/memstore",
-    "cortex-execs/docstore",
+    "cortex-execs/mem",
+    "cortex-execs/index",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",
@@ -21,17 +21,17 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1"
 # Declared for a consumer that wants the macro, not used by any member: `FileSystem`,
-# `Client`, `Server` and `Executable` are async *and* object-safe (`dyn FileSystem`,
-# `Box<dyn Client>`), which native `async fn` in traits cannot be — and they box their
-# futures by hand, so the lifetimes are visible where the borrows are.
+# `Client` and `Server` are async *and* object-safe (`dyn FileSystem`, `Box<dyn Client>`),
+# which native `async fn` in traits cannot be — and they box their futures by hand, so the
+# lifetimes are visible where the borrows are.
 async-trait = "0.1"
 # The console wire. Declared here rather than per crate because `Outcome::Result`
 # carries a `Bson` in public API: two versions of it in one build would be a type
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
-# What the executables in `cortex-execs` had three copies of: opening a store that is a
-# file on a mounted tree, and the two rules they all follow about clap's output.
+# The store format `mem` and `index` share: the tables, what a store says about
+# itself, and how one is opened.
 cortex-exec-storebase = { path = "cortex-execs/storebase" }
 # The boot process, and — as its library half — the strings a console server starts one with.
 # A server takes it without the `vm` feature and so links no VMM; see its own manifest.
@@ -47,13 +47,10 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
 
-# The parser every registered command's `--help` comes out of. Only `cortex-execs/` takes it,
-# which is what keeps an argument parser out of `cortex` — the same rule `rusqlite` follows.
-#
-# clap's `string` feature is load-bearing rather than a convenience: one executable can be
-# registered under several names, so the usage line has to carry the name it was invoked by,
-# and without `string` a command's name can only be a `&'static str`.
-clap = { version = "4", features = ["derive", "string"] }
+# The parser the programs in `cortex-execs/` are driven by, and where their `--help` comes
+# from. Only those take it, which is what keeps an argument parser out of `cortex` — the same
+# rule `rusqlite` follows.
+clap = { version = "4", features = ["derive"] }
 
 # The in-process, Rust-native libkrun fork. `VmBuilder` is what lets a boot be
 # assembled out of parts this workspace already holds: tagged virtio-fs shares, two

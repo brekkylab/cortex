@@ -591,29 +591,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-exec-docstore"
+name = "cortex-exec-index"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "cortex",
  "cortex-exec-storebase",
  "rusqlite",
  "tempfile",
- "tokio",
 ]
 
 [[package]]
-name = "cortex-exec-memstore"
+name = "cortex-exec-mem"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
- "cortex",
  "cortex-exec-storebase",
  "rusqlite",
  "tempfile",
- "tokio",
  "uuid",
 ]
 
@@ -621,8 +617,6 @@ dependencies = [
 name = "cortex-exec-storebase"
 version = "0.1.0"
 dependencies = [
- "clap",
- "cortex",
  "rusqlite",
  "tempfile",
 ]
