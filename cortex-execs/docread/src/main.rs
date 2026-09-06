@@ -1,8 +1,8 @@
-//! `read` — a file's lines, numbered, a window at a time.
+//! `docread` — a file's lines, numbered, a window at a time.
 //!
 //! ```text
-//! read src/main.rs
-//! read src/main.rs -o 200 -n 50
+//! docread src/main.rs
+//! docread src/main.rs -o 200 -n 50
 //! ```
 //!
 //! # Lines, because a line is what a caller can name
@@ -22,20 +22,6 @@
 //! no notion of a function, a section, or a symbol below. Those need a parser per language
 //! and are wrong in a way a line number cannot be — a window that claims to be a function and
 //! is not is worse than one that claims to be lines 100 to 150.
-//!
-//! # The name, and the shell builtin that shares it
-//!
-//! A session runs a command as an argv — `Command::new(program)` in the guest's agent, with
-//! no shell between — so `read` there is this program and nothing else. The name is the one
-//! the thing calling it already has for this: every agent tool that reads a file is called
-//! `read`, and a program that does what the caller already means by the word is one less
-//! thing to have learned.
-//!
-//! The exception is a caller who goes through a shell on purpose: `sh -c 'read a.txt'` is the
-//! POSIX builtin, which reads a *line of input* into a variable and will sit there with the
-//! file name as a variable name. That is worth knowing and is not worth the name: a command
-//! wrapped in `sh -c` is already asking for the shell's meaning of everything in it, and
-//! `sh -c '/abin/read a.txt'` says which one is wanted.
 //!
 //! # The window is bounded before the caller says anything
 //!
@@ -105,10 +91,10 @@ const NAME: &str = env!("CARGO_BIN_NAME");
 /// enough that a file which is not fits in what is reading it anyway.
 const DEFAULT_LIMIT: usize = 2000;
 
-/// What `read` accepts and what it says about it.
+/// What `docread` accepts and what it says about it.
 #[derive(Debug, clap::Parser)]
 #[command(
-    about = "read — a file's lines, numbered, a window at a time",
+    about = "docread — a file's lines, numbered, a window at a time",
     after_help = "Lines are counted from 1, and the numbers printed are the ones -o takes back. \
                   Output ends with a bracketed line only when the window is not the whole file; \
                   no such line means there is nothing else in it.",
@@ -116,7 +102,8 @@ const DEFAULT_LIMIT: usize = 2000;
     // is `about` and the first line of each item's; nothing below argues a design decision at
     // somebody who typed `--help`.
     long_about = None,
-    // Bare `read` is a line that asked for nothing, and the help is the useful answer to it.
+    // Bare `docread` is a line that asked for nothing, and the help is the useful answer
+    // to it.
     arg_required_else_help = true
 )]
 struct Cli {
@@ -547,7 +534,7 @@ mod tests {
         assert!(said.contains("     1\tA paragraph\n"), "{said}");
     }
 
-    /// Bare `read` is a line that asked for nothing, and help is the useful answer to it.
+    /// Bare `docread` is a line that asked for nothing, and help is the useful answer to it.
     #[test]
     fn asking_for_nothing_is_answered_with_help() {
         let e = parse(&[]).expect_err("nothing was asked for");

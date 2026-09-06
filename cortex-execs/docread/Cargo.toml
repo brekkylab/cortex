@@ -3,13 +3,10 @@ name = "cortex-exec-docread"
 version.workspace = true
 edition.workspace = true
 
-# `read` is what a caller types, and the package name is not it. The two differ by more than
-# the workspace prefix here: what this program reads is files *and* documents, which is what
-# the package is named for, while the name it answers to on a command line stays the word
-# every tool that reads a file is called. A caller types the short one; a manifest naming a
-# crate `read` would be a crate nobody could tell from the verb.
+# `docread` is what a caller types, and the package name is not it: this is one program, and
+# the name it answers to is the one in its usage line and in everything it says about itself.
 [[bin]]
-name = "read"
+name = "docread"
 path = "src/main.rs"
 
 # Reading a `.docx`, and on by default because it costs nothing anybody has to install: it is
