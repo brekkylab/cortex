@@ -5,6 +5,7 @@ members = [
     "cortex-execs/storebase",
     "cortex-execs/mem",
     "cortex-execs/index",
+    "cortex-execs/docread",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",

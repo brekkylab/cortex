@@ -1,0 +1,90 @@
+[package]
+name = "cortex-exec-docread"
+version.workspace = true
+edition.workspace = true
+
+# `read` is what a caller types, and the package name is not it. The two differ by more than
+# the workspace prefix here: what this program reads is files *and* documents, which is what
+# the package is named for, while the name it answers to on a command line stays the word
+# every tool that reads a file is called. A caller types the short one; a manifest naming a
+# crate `read` would be a crate nobody could tell from the verb.
+[[bin]]
+name = "read"
+path = "src/main.rs"
+
+# Reading a `.docx`, and on by default because it costs nothing anybody has to install: it is
+# Rust from end to end, so a build for the guest is the same `cargo build` as without it. What
+# the switch is for is a build that wants the text reader and nothing else — the crate below is
+# by far the heaviest thing here, and a `/abin` that never meets a Word document has no use for
+# it.
+#
+# `pdfium` is the other shape entirely: it is off, because it needs a library this machine has
+# to have built. See `build.rs`.
+#
+# Turned on to link a PDF engine into this program; off is the default and off is what the
+# `/abin` release is built with today. A feature and not a second binary because what changes
+# is one refusal turning into an answer: with it, a PDF is a file this reads, and without it a
+# PDF is named and refused. Everything else about the program is the same either way.
+#
+# It is off by default because it is the difference between a program that builds anywhere with
+# rustup alone and one that needs a `libpdfium.a` — see `build.rs`, which is where that library
+# is found or made.
+[features]
+default = ["docx"]
+docx = ["dep:docx-rs"]
+pdfium = ["dep:pdfium-render"]
+
+[dependencies]
+# The command line, and the whole of the driving. One command with two options is small enough
+# to have been read by hand — but `--help` is what tells a caller that a window has a default
+# size at all, and a hand-written usage string is a second place for that number to be wrong.
+clap = { workspace = true }
+
+# And nothing else. Deciding whether a file is text is two questions about the bytes of the
+# lines being shown — do they decode as UTF-8, is there a NUL among them — which is `std`'s to
+# answer. The handful of magic numbers this knows are written out in `text::format_of`, where
+# they decide nothing and only put a name to what is being refused; a library of them would be
+# a classifier for formats this prints either way it answers.
+#
+# Nor is there a decoder for other encodings: a window this hands back is text a caller will
+# quote line numbers of back at something, and text transcoded out of an encoding nobody
+# declared is a guess wearing the clothes of the file.
+#
+# A document that holds text without being it — a PDF — is a different question, and it is the
+# `pdfium` feature below. Off, this program builds with rustup and nothing else, which is what
+# lets a `/abin` be cross-compiled from a Mac with no toolchain to install. On, a PDF engine is
+# linked into the binary statically, and what a caller gets back is still numbered lines — but
+# lines the engine laid out rather than lines somebody wrote, which is a difference the output
+# says out loud rather than one a caller has to know.
+
+# Reading Word documents. The model it parses into keeps `w:ins` and `w:del` as what they are
+# — tracked insertions and deletions — which is the reason it is this crate and not one of the
+# two that answer with plain text in a single call. Both of those drop the text inside `w:ins`:
+# in a document under revision that is the *newest* sentence disappearing, silently, from an
+# answer that otherwise looks complete. Here the walking is ours, so what counts as the
+# document as it stands is a decision written down in `docx.rs` rather than one inherited.
+#
+# It also parses real files the alternatives choke on, and it writes as well as reads — which
+# is what the tests build their fixtures with, so no `.docx` is checked into this repository.
+docx-rs = { version = "0.4.22", optional = true }
+
+# The PDF engine's Rust side, and only its bindings: `static` is the feature that offers
+# `bind_to_statically_linked_library`, which is the whole point — no `dlopen`, no `.so` beside
+# the binary, one static ELF in `/abin` as every other program there is.
+#
+# `default-features = false` drops the `image` crate, which is there to render pages to
+# bitmaps and is a tree this program has no use for: what is wanted here is the text layer.
+# `pdfium_7881` and not `pdfium_latest`: the API version has to be the one the library was
+# built at, so it is pinned here and in `build.rs` together, and a version that moved on its
+# own would be a link that fails or, worse, a call through the wrong signature.
+#
+# The linking itself is `build.rs`'s and not this crate's: setting `PDFIUM_STATIC_LIB_PATH`
+# would have this crate's own build script emit the flags too, and two places saying where a
+# library comes from is how one of them ends up wrong.
+pdfium-render = { version = "0.9.3", optional = true, default-features = false, features = [
+    "static",
+    "pdfium_7881",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
