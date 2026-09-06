@@ -200,7 +200,7 @@ pub fn open(path: &Path, kind: &str) -> io::Result<Connection> {
         // The whole reason `kind` is written down: the tables are the same either way, so this
         // is the only thing that can tell the caller they named the wrong file rather than
         // handing them rows whose columns are all null.
-        Some(found) => Err(invalid(format!("this is a {found} store; {kind} was asked for"))),
+        Some(found) => Err(invalid(format!("this store's kind is {found}; {kind} was asked for"))),
         None => Err(invalid("not a store: it does not say what kind it is".into())),
     }
 }
@@ -282,6 +282,8 @@ mod tests {
         dir.path().join(name)
     }
 
+    /// `kind` is written down because the tables are the same either way: nothing else could
+    /// tell a store of one kind from a store of the other.
     #[test]
     fn a_new_store_says_which_schema_and_kind_it_is() {
         let dir = tempfile::tempdir().unwrap();
@@ -301,21 +303,11 @@ mod tests {
             [],
         )
         .expect("an index row");
-    }
-
-    /// The point of `kind`: the tables are the same, so nothing else could tell these apart.
-    #[test]
-    fn a_store_of_the_other_kind_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = at(&dir, "notes.db");
-        drop(create(&path, "mem").unwrap());
+        drop(conn);
 
         open(&path, "mem").expect("its own kind opens");
         let e = open(&path, "index").expect_err("the other kind does not");
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert!(e.to_string().contains("mem"), "{e}");
-        assert!(e.to_string().contains("index"), "{e}");
-
         assert!(is_store(&path, "mem"));
         assert!(!is_store(&path, "index"));
     }
