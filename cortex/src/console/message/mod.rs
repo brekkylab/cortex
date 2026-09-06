@@ -214,9 +214,8 @@
 //!
 //! The output on an [`ExecResp`] and the file contents on a [`ReadCall`] or a [`WriteCall`]
 //! are raw `Vec<u8>`, because those are program bytes and nothing may touch them. A
-//! command's name and arguments are required to be UTF-8: they have to become the
-//! `String`s an [`Executable`](crate::exec::Executable) takes, so a name that
-//! could not be one would have nowhere to go. A [`path`](ReadCall::path) is a `String` for
+//! command's name and arguments are required to be UTF-8: an argv is a list of `String`s by
+//! the time anything runs it, so a name that could not be one would have nowhere to go. A [`path`](ReadCall::path) is a `String` for
 //! the practical version of the same reason — the executor turns it into a path for
 //! whatever filesystem it has, and it is the one member of a file call that both ends
 //! have to read rather than carry.

@@ -13,9 +13,7 @@
 //!   `grep`, and whatever else the agent thought to run.
 //! * **What it does is run commands.** A [`Console`](console::Console) runs them somewhere —
 //!   this host, a micro-VM — over one channel: an `exec` carrying an argv, and everything the
-//!   command wrote coming back. A command that should be Rust rather than a program on disk is
-//!   an [`Executable`](exec::Executable), which takes the same argv a program would and answers
-//!   the same way.
+//!   command wrote coming back.
 //!
 //! ## Quickstart
 //!
@@ -56,20 +54,12 @@
 //!
 //! ## Structure
 //!
-//! Three modules. Two are halves that share a crate and nothing else; the third is where
-//! both are spoken of at once.
+//! Two modules, halves that share a crate and one seam.
 //!
 //! * [`fs`] — expose any path-addressed store as a real filesystem. A store implements
 //!   [`FileSystem`](fs::FileSystem) and a binding puts it in front of a concrete interface: a
 //!   host FUSE mount, an NFS or FSKit one, whatever else addresses files by path.
 //!   `fs/ARCHITECTURE.md` has the long form.
-//! * [`exec`] — a command that is Rust rather than a program on disk.
-//!   [`Executable`](exec::Executable) is what one of them runs and
-//!   [`ExecutableSet`](exec::ExecutableSet) is a named set of them; how a name is *reached* is
-//!   whoever dispatches it, and is not decided here. This is the module that names both halves:
-//!   an `Executable` is handed an [`ExecCall`](exec::ExecCall) and the [`Mount`](fs::Mount) its
-//!   paths are about, and resolving an argument against a tree is the only operation in the
-//!   crate that needs both.
 //! * [`console`] — run the commands, wherever the environment is: this host, a micro-VM.
 //!   One JSON-RPC channel carries them, and the client is the only end that asks.
 //!   `console/ARCHITECTURE.md` has the long form.
@@ -102,19 +92,16 @@
 #![allow(clippy::module_inception)]
 
 pub mod console;
-pub mod exec;
 pub mod fs;
 mod lock;
 
-/// What every method that waits hands back — a [`Client`], a [`Server`], an
-/// [`Executable`].
+/// What every method that waits hands back — a [`Client`] or a [`Server`].
 ///
-/// Re-exported because implementing any of those three means writing the type, and a
+/// Re-exported because implementing either of them means writing the type, and a
 /// caller should not have to take a dependency of ours to say what our own traits
 /// return. See [`console::base`](console) for why the futures are boxed rather than
 /// written as `async fn`.
 ///
 /// [`Client`]: console::Client
 /// [`Server`]: console::Server
-/// [`Executable`]: exec::Executable
 pub use futures_core::future::BoxFuture;
