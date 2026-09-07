@@ -86,9 +86,10 @@ const MAX_TABS: usize = 64;
 
 /// Size reported for a document whose length nobody has learned yet.
 ///
-/// It cannot be 0. Reads run under the guest's FUSE mount with `direct_io`, and a
-/// 0-length file was measured (in ailoy's Drive mount, which hit this first) to
-/// clamp reads to nothing — and a search tool skips a file it is told is empty.
+/// It cannot be 0. A client bounds a read by the length it was told, so a file reported as
+/// empty hands back nothing however many bytes are behind it — measured first in ailoy's
+/// Drive mount, whose `direct_io` made it plainer, and true of this one too, which sets no
+/// such flag. A search tool skips a file it is told is empty either way.
 ///
 /// An over-estimate does *not* mean `cat` stops at the true end: the client bounds a
 /// read by the length it was told, so it asks for the whole span and takes back the whole
@@ -1026,9 +1027,10 @@ fn kind_of(c: &Child) -> DirentKind {
 /// timestamps in one response: filling it costs nothing here and saves the caller a
 /// `stat` per entry.
 ///
-/// [`is_estimate`] has nowhere to be said. A `Stat` carries a length and not whether
-/// the length was measured, so a document's placeholder reads as a size like any
-/// other until something reads the file and the length that read produced is kept.
+/// Whether that length was measured or guessed has nowhere to be said. A `Stat` carries a
+/// length and nothing about its provenance — the flag this store carried for a while is
+/// gone — so a document's placeholder reads as a size like any other until something reads
+/// the file and the length that read produced is kept.
 fn dirent_for(c: &Child) -> Dirent {
     Dirent::with_stat(
         c.vfs_name.clone(),

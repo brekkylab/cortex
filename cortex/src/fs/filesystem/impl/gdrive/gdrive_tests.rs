@@ -244,9 +244,9 @@ fn a_row_becomes_the_thing_it_can_serve() {
     );
     assert_eq!(entry_size(&dir), 0);
 
-    // A row Drive reported no size for still lists, with the placeholder rather than 0:
-    // under the guest's `direct_io` mount a 0 was measured to clamp reads to nothing, and
-    // a search tool skips a file it is told is empty.
+    // A row Drive reported no size for still lists, with the placeholder rather than 0: a
+    // client bounds a read by the length it was told, so 0 hands back nothing, and a search
+    // tool skips a file it is told is empty.
     let mut sizeless = file_row("mystery.bin", "id1", "application/octet-stream");
     sizeless.as_object_mut().unwrap().remove("size");
     let c = child_from_file(&sizeless).unwrap();
