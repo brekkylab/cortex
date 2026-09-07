@@ -588,6 +588,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "unicode-normalization",
  "uuid",
 ]
 

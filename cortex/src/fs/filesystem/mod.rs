@@ -24,6 +24,8 @@ pub use filesystem::*;
 // A store that reaches the network is behind its own feature, for the reason the crate has no
 // default features at all: `s3` costs 131 crates, and a build that serves local files should
 // not compile an HTTP and TLS stack to do it.
+#[cfg(feature = "gdrive")]
+pub use r#impl::{GdriveConfig, GdriveFs, GdriveOrigins};
 pub use r#impl::{InMemFs, PassthroughFs};
 #[cfg(feature = "notion")]
 pub use r#impl::{NotionConfig, NotionFs};
