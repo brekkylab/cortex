@@ -2,7 +2,7 @@
 //!
 //! [`Call`] is which one a request names; the rest is what each one carries — an
 //! [`InitCall`] and the vocabulary a session is described in, an [`ExecCall`], a
-//! [`ReadCall`], a [`WriteCall`].
+//! [`ReadCall`], a [`WriteCall`], a [`CommitCall`].
 //!
 //! One file for the asking half and one for the answering half, because that is the
 //! division a reader of this protocol has: a client writes calls and reads responses, a
@@ -18,7 +18,7 @@ use std::path::Path;
 use bson::{Bson, doc};
 use serde::{Deserialize, Serialize, de};
 
-use super::{Method, utils::bytes};
+use super::{CommitCall, Method, utils::bytes};
 
 /// A method and its parameters: what a request carries.
 ///
@@ -75,6 +75,13 @@ pub enum Call {
 
     /// Put these bytes in a file.
     Write(WriteCall),
+
+    /// Keep what this session has written, as a base a later session can name.
+    ///
+    /// The last thing a build says. Refused unless the session declared
+    /// [`committable`](InitCall::committable) at `init`, because a backend may have had to
+    /// arrange for it while booting.
+    Commit(CommitCall),
 }
 
 impl Call {
@@ -84,6 +91,7 @@ impl Call {
             Call::Exec(_) => Method::Exec,
             Call::Read(_) => Method::Read,
             Call::Write(_) => Method::Write,
+            Call::Commit(_) => Method::Commit,
         }
     }
 
@@ -169,6 +177,18 @@ pub struct InitCall {
     /// has no choice to make.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkAccess>,
+
+    /// Whether this session may [`commit`](super::CommitCall) what it writes.
+    ///
+    /// **Said here and not on `commit` because a backend may have to arrange for it while
+    /// booting.** A micro-VM one keeps the root that holds its overlay's upper, which is
+    /// decided before the first command runs and cannot be decided again after — by the time
+    /// a `commit` arrived, the thing it needs would have been gone for the whole session.
+    ///
+    /// False by default, so a session that will never commit pays nothing for a facility it
+    /// does not use, and a `commit` on one is refused rather than answered wrongly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub committable: bool,
 }
 
 /// The tree a session works in, named by URL.
@@ -552,6 +572,7 @@ mod tests {
             workfs: Some(WorkFsSource::new("file:///srv/project")),
             image: None,
             network: None,
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(doc, doc! {"workfs": {"url": "file:///srv/project"}},);
@@ -569,6 +590,7 @@ mod tests {
             workfs: None,
             image: Some(ImageSource::new("python:3.13-slim")),
             network: None,
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(doc, doc! {"image": {"reference": "python:3.13-slim"}});
@@ -592,6 +614,7 @@ mod tests {
             workfs: None,
             image: None,
             network: None,
+            committable: false,
         };
         assert_eq!(bson::serialize_to_document(&quiet).unwrap(), doc! {},);
         assert_eq!(
@@ -608,6 +631,7 @@ mod tests {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::public()),
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(doc, doc! {"network": {"reach": "public"}});
@@ -623,6 +647,7 @@ mod tests {
             workfs: None,
             image: None,
             network: None,
+            committable: false,
         };
         assert_eq!(bson::serialize_to_document(&quiet).unwrap(), doc! {},);
         assert_eq!(
@@ -639,6 +664,7 @@ mod tests {
             workfs: None,
             image: None,
             network: Some(NetworkAccess::host().with_host_ports([8080, 3000])),
+            committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(
@@ -780,6 +806,35 @@ mod tests {
         assert_eq!(
             bson::deserialize_from_document::<WriteCall>(doc).unwrap(),
             write,
+        );
+    }
+
+    /// False says nothing, so a session that will never commit costs nothing to describe —
+    /// and a server that predates the member reads one correctly.
+    #[test]
+    fn a_session_that_will_not_commit_says_nothing() {
+        let init = InitCall::default();
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(doc.get("committable"), None);
+        assert!(
+            !bson::deserialize_from_document::<InitCall>(doc)
+                .unwrap()
+                .committable
+        );
+    }
+
+    #[test]
+    fn a_session_that_might_commit_says_so() {
+        let init = InitCall {
+            committable: true,
+            ..InitCall::default()
+        };
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(doc.get("committable"), Some(&bson::Bson::Boolean(true)));
+        assert!(
+            bson::deserialize_from_document::<InitCall>(doc)
+                .unwrap()
+                .committable
         );
     }
 }

@@ -56,6 +56,12 @@ pub const HANDSHAKE: &[u8; 8] = b"CORTEXUV";
 /// this is a promise `cortex-uvm-boot` keeps rather than something either end computes.
 pub const GUEST_LOWER_DEV: &str = "/dev/vdb";
 
+/// The read-only `/abin` disk, when a session has one.
+///
+/// Third, because the session's own image is `/dev/vda` and the base is `/dev/vdb` — the
+/// order a boot attaches disks in is the order the guest names them.
+pub const GUEST_ABIN_DEV: &str = "/dev/vdc";
+
 /// The overlay's upper, as the guest sees it.
 pub const GUEST_UPPER_DEV: &str = "/dev/vda";
 
@@ -68,9 +74,42 @@ pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 /// Told to the guest as `CORTEX_UVM_SHARE`, spelled `tag:/guest/path`.
 pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
 
+/// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
+/// which is a guest with no `/abin` at all rather than an empty one.
+pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
+
 /// The virtio-fs tag the tree is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
 pub const WORKFS_TAG: &str = "cortexws";
+
+/// The virtio-fs tag a committable session's scratch directory is shared under.
+pub const COMMIT_TAG: &str = "cortexcommit";
+
+/// Where the guest finds that scratch, and where it writes a commit's layer.
+///
+/// A fixed path rather than the host's own, unlike the workfs: nothing outside this
+/// workspace names it, so there is no second speller for it to have to agree with.
+pub const COMMIT_PATH: &str = "/.cortex-commit";
+
+/// Set for a guest that has one. Its value is [`COMMIT_PATH`].
+pub const COMMIT_ENV: &str = "CORTEX_UVM_COMMIT";
+
+/// Set for a guest that may commit at all.
+///
+/// Separate from [`COMMIT_ENV`] because the two are read at different moments and decide
+/// different things: this one before `pivot_root`, to keep the old root rather than detach it,
+/// and that one after, to mount somewhere to write. A guest with the share and no kept root
+/// would have somewhere to put a layer and no way to see one.
+pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
+
+/// What a commit's layer is called inside the scratch. One name, said once.
+pub const LAYER_TAR: &str = "layer.tar";
+
+/// Where a guest that kept its old root can reach the upperdir of the overlay it stands on.
+///
+/// The host cannot read that ext4 itself and the overlay offers the upper under no other
+/// name, so this is the only way a commit sees what a session wrote.
+pub const UPPER_DIR: &str = "/oldroot/mnt/upper/upper";
 
 /// Everything a console server tells a boot, as the boot's own command line.
 ///
@@ -109,6 +148,26 @@ pub struct BootArgs {
 
     /// The session's writable image, as a host path.
     pub session: PathBuf,
+
+    /// Whether this session may commit, which decides one thing at boot and nothing after:
+    /// the old root is kept rather than detached, so the guest can still reach the upperdir of
+    /// the overlay it is standing on.
+    pub committable: bool,
+
+    /// A directory on this host the guest may write a commit's layer into, shared in at
+    /// [`COMMIT_PATH`]. `None` for a session that cannot commit.
+    ///
+    /// Writable, unlike the `/abin` disk, and that is not a contradiction: `/abin` is a cache
+    /// every later session reads, where this is one session's scratch — made by the server,
+    /// thrown away with the session, and holding nothing but that session's own output.
+    pub commit_out: Option<PathBuf>,
+
+    /// A read-only image of native executables to mount at `/abin`.
+    ///
+    /// `None` is a session that gets none. Always a raw EROFS and never a descriptor, so
+    /// there is no format to say alongside it: `/abin` is cortex's own executables and no
+    /// others, which is one layer attached as it stands rather than anything stitched.
+    pub abin: Option<PathBuf>,
 
     /// The host directory to put in front of the guest, and `None` for a session that declared
     /// no tree. Mounted in the guest at **this same path** — see [`SHARE_ENV`].
@@ -150,6 +209,15 @@ impl BootArgs {
     /// string, and that is refused where it is used rather than here.
     pub fn to_args(&self) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
+
+        // First, before the closure below takes its borrow of `args`. This is the one flag
+        // that carries no value — it is a fact about the session rather than a thing with a
+        // spelling — so it cannot go through `put`, and where it sits does not matter to
+        // `parse`.
+        if self.committable {
+            args.push(OsString::from("--committable"));
+        }
+
         let mut put = |flag: &str, value: &OsStr| {
             args.push(OsString::from(flag));
             args.push(value.to_os_string());
@@ -167,6 +235,12 @@ impl BootArgs {
         }
         if let Some(workfs) = &self.workfs {
             put("--workfs", workfs.as_os_str());
+        }
+        if let Some(abin) = &self.abin {
+            put("--abin", abin.as_os_str());
+        }
+        if let Some(out) = &self.commit_out {
+            put("--commit-out", out.as_os_str());
         }
         if let Some(vcpus) = self.vcpus {
             put("--vcpus", OsStr::new(&vcpus.to_string()));
@@ -192,6 +266,9 @@ impl BootArgs {
         let mut network = None;
         let mut host_ports = Vec::new();
         let mut workfs = None;
+        let mut abin = None;
+        let mut committable = false;
+        let mut commit_out = None;
         let mut vcpus = None;
         let mut memory_mib = None;
 
@@ -214,6 +291,9 @@ impl BootArgs {
                 "--network" => network = Some(text(&flag, value()?)?),
                 "--host-port" => host_ports.push(number(&flag, value()?)?),
                 "--workfs" => workfs = Some(PathBuf::from(value()?)),
+                "--abin" => abin = Some(PathBuf::from(value()?)),
+                "--committable" => committable = true,
+                "--commit-out" => commit_out = Some(PathBuf::from(value()?)),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
                 other => anyhow::bail!("{other} is not an argument a boot takes"),
@@ -240,6 +320,9 @@ impl BootArgs {
             },
             host_ports,
             workfs,
+            committable,
+            commit_out,
+            abin,
             vcpus,
             memory_mib,
         })
@@ -411,9 +494,57 @@ mod tests {
             network: Network::Public,
             host_ports: vec![8080, 3000],
             workfs: Some("/Users/someone/project".into()),
+            abin: Some("/cache/layers/sha256_2b91c4.erofs".into()),
+            committable: true,
+            commit_out: Some("/tmp/cortex-uvm-commit".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
         }
+    }
+
+    /// A committable session says both things, and an ordinary one says neither.
+    ///
+    /// The pair matters. A kept root with nowhere to write is a guest that can see what the
+    /// session wrote and cannot hand it over; somewhere to write with no kept root is the
+    /// reverse.
+    #[test]
+    fn a_committable_boot_says_so_and_names_somewhere_to_write() {
+        let args = args();
+        let back = BootArgs::parse(args.to_args()).unwrap();
+        assert!(back.committable);
+        assert_eq!(back.commit_out, args.commit_out);
+    }
+
+    #[test]
+    fn an_ordinary_boot_says_neither() {
+        let plain = BootArgs {
+            committable: false,
+            commit_out: None,
+            ..args()
+        };
+        let written = plain.to_args();
+        assert!(
+            !written
+                .iter()
+                .any(|arg| arg == "--committable" || arg == "--commit-out"),
+            "{written:?}"
+        );
+        let back = BootArgs::parse(written).unwrap();
+        assert!(!back.committable);
+        assert_eq!(back.commit_out, None);
+    }
+
+    /// A session with no `/abin` says nothing about one, and reads back as having none.
+    #[test]
+    fn a_session_with_no_abin_says_nothing_about_one() {
+        let bare = BootArgs {
+            abin: None,
+            ..args()
+        };
+        let written = bare.to_args();
+        assert!(!written.iter().any(|arg| arg == "--abin"), "{written:?}");
+        let back = BootArgs::parse(written).unwrap();
+        assert_eq!(back.abin, None);
     }
 
     /// Everything this writes is something it reads. Both ends are this type, so the compiler

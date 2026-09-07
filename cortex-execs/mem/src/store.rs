@@ -1,109 +1,72 @@
-//! The memory store: one SQLite file, holding what a store knows about itself and — as the
-//! commands that write them arrive — the memories, their vectors and their history.
+//! The memory store: one SQLite file holding what a store knows about itself, a row per
+//! memory, and the full-text index over their text.
 //!
 //! # One file, and why that decides most of this
 //!
-//! A store is named the way a document is — `mem insert notes.sqlite "..."` — because it lives
+//! A store is named the way a document is — `mem insert notes.db "..."` — because it lives
 //! in a cortex tree, beside whatever else the session works on. Everything a memory needs is
-//! therefore in that one file: the rows, the vector index over them, and the record of what
-//! happened to each. Nothing here reaches a service, and copying the file copies the memory.
+//! therefore in that one file. Nothing here reaches a service, and copying the file copies the
+//! memories.
 //!
 //! # No write-ahead log
 //!
 //! The file usually sits on a mounted cortex tree, which is a FUSE mount, and WAL mode does not
 //! survive that assumption: the log's index is a shared-memory file that every connection
 //! `mmap`s and expects to be coherent between processes. A FUSE filesystem is under no
-//! obligation to give them that, and the failure is silent — two writers each see their own
-//! index. So the store stays on the rollback journal SQLite starts in, which needs nothing but
-//! the ability to create a sibling file, and concurrent writers wait on
-//! [`BUSY_TIMEOUT`](self::BUSY_TIMEOUT) rather than racing.
+//! obligation to give them that, and the failure is silent. So the store stays on the rollback
+//! journal SQLite starts in, and concurrent writers wait on
+//! [`BUSY_TIMEOUT`](cortex_exec_storebase::sqlite::BUSY_TIMEOUT).
+//!
+//! # The text is stored as written, and FTS5 cuts it
+//!
+//! `item_fts` holds the memory itself, not a pre-cut list of terms, and `porter unicode61`
+//! turns it into terms inside SQLite. That is what makes `bm25()` rank on stems — a search for
+//! `mounting` finds `mounts` — and it is the same shape `index` uses, so the two crates
+//! index text one way rather than two.
+//!
+//! **What is stored is the original.** That is the rule, and it is what keeps the door open: a
+//! store whose content is the text as the caller wrote it can be re-indexed under any tokenizer
+//! later, from itself, with no re-ingest and nothing lost. A store that held lemmas instead
+//! could not — the case, the punctuation and (for a language that needs segmenting) the word
+//! boundaries would already be gone, and no rebuild could put them back.
+//!
+//! # Multilingual, and why it is not here yet
+//!
+//! `unicode61` splits on character class, which is the right rule for text that puts spaces
+//! between its words and no rule at all for text that does not: `서울에서` is one token to it,
+//! so a search for `서울` finds nothing. A language that needs segmenting needs a segmenter —
+//! `charabia` is the one this workspace has used — and there is no way to reach one from
+//! inside FTS5 here, because neither `rusqlite` nor `libsqlite3-sys` exposes the `fts5_api`
+//! that registering a tokenizer goes through.
+//!
+//! The shape that would carry one is a third FTS column, `terms`, holding what a segmenter cut
+//! and matched alongside `body`. `bm25(item_fts, 1.0, 1.0, 0.0)` keeps ranking on the text the
+//! caller wrote, so the extra column only adds matches, and `body` goes on answering snippets
+//! from the original. It costs a new
+//! [`SCHEMA_VERSION`](cortex_exec_storebase::sqlite::SCHEMA_VERSION) and a rebuild from the text
+//! this store already holds.
 
 use std::{collections::HashSet, io, path::Path, sync::Mutex};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
+use cortex_exec_storebase::sqlite::{self, sql_error};
 
-use crate::memory::{Memory, terms};
+use crate::memory::Memory;
 
-/// How long a connection waits for another writer before giving up.
+/// What this crate writes into `meta.kind`, and what it insists on when opening.
 ///
-/// A rollback-journal store serializes writers, and `mem` is invoked once per command: the
-/// contention that happens is two commands overlapping by a moment, not a queue. Waiting is
-/// therefore almost always the right answer, and a bound is still needed because the other side
-/// may be a process that died holding the lock.
-pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// The tables are `storebase`'s and `index` keeps the same ones, so this is the only thing
+/// that tells a store of one kind from a store of the other — see
+/// [`cortex_exec_storebase::sqlite`].
+const KIND: &str = "mem";
 
-/// What this crate's schema is; refuse a file written by a newer one.
-const SCHEMA_VERSION: &str = "1";
-
-/// Every table a store is made of — `queries/init.sql`.
-///
-/// The statements are a file rather than a string literal, like every other query here. What
-/// they describe is a file format: a store outlives this build, and somebody holding one will
-/// want to read it with `sqlite3` or write a tool that does. A schema that can be opened, read
-/// and diffed on its own is worth more to them than one spelled inside Rust quotes, and keeping
-/// it out here is also what keeps the argument below from being interleaved with the DDL it is
-/// about.
-///
-/// # `meta`
-///
-/// What holds for the whole file, and in practice which schema wrote it. Read before anything
-/// else is, which is what lets [`Store::try_from_file`] refuse somebody else's database by
-/// looking rather than by failing at a column three statements later.
-///
-/// # `memory`
-///
-/// One row per memory: what was remembered, what it is called from outside, and when it was
-/// written. The text is the memory as [`Memory`] defines it, and the other two columns are the
-/// facts a row has that a memory does not — which is exactly the split
-/// [`memory`](crate::memory) argues.
-///
-/// `id` is a UUID and not the rowid, because it leaves the process: it is what a later `mem
-/// delete` or `mem history` is handed back, and a rowid is a number this file assigns and a
-/// re-import reassigns. `rowid` is nevertheless named and declared, rather than left implicit,
-/// because the term index below refers to memories by it — and SQLite renumbers the rowids of
-/// any table without an explicit integer primary key when the file is `VACUUM`ed. An index
-/// pointing at renumbered rows is not a store that fails; it is a store that answers with the
-/// wrong memories.
-///
-/// # `memory_fts_index`
-///
-/// The inverted index over [`terms`], one FTS5 row per memory under the same rowid.
-/// It is what makes "the memories nearest a query" a question SQLite can answer by term at all,
-/// and it brings `bm25()` with it — the ranking a keyword half of a search needs, which a table
-/// of `(memory, term)` pairs would leave to be hand-written against statistics it would also
-/// have to keep.
-///
-/// `content=''` because the terms are an index and not data. What the store holds is the text;
-/// the terms are what one function makes of it, and are re-derivable from the text by running it
-/// again — which is also the only honest rebuild, since the answer moves when the tokenizer's
-/// dictionaries do. `contentless_delete=1` so that forgetting a memory is a `delete` and not a
-/// row that stays findable after the memory it named is gone.
-///
-/// `tokenize='ascii'` because by the time FTS5 sees the terms there is no tokenizing left to do:
-/// charabia has already cut the text by its language's own rules and normalized what it cut, and
-/// the terms arrive here joined by spaces. All that is wanted is to split them apart again on
-/// those spaces, and `ascii` is the tokenizer that leaves every byte above `0x7f` alone —
-/// `unicode61` would be a second opinion about word boundaries, applied to text that is no
-/// longer sentences.
-const SCHEMA: &str = include_str!("../queries/init.sql");
-
-/// One memory as a row — `queries/insert.sql`.
+/// A memory as a row is [`sqlite::UPSERT`] with a null `path`, which is what makes it a memory
+/// rather than a document: nulls do not collide, so every call inserts and the same sentence can
+/// be remembered twice. `index` binds a path into the same statement and gets an upsert.
 ///
 /// The id and the date are bound rather than defaulted in SQL, because both are decided per
-/// batch and not per row: [`Store::insert`] gives every memory of one reading the same
+/// batch and not per row: [`Store::insert`] gives every memory of one call the same
 /// `written_at`, which a column default of `current_timestamp` could not do — it would time each
 /// row by when this loop reached it.
-const INSERT: &str = include_str!("../queries/insert.sql");
-
-/// The terms one memory is found by — `queries/index.sql`.
-///
-/// A second statement and not a trigger on `memory`, because nothing SQLite can see produces
-/// these: the terms are what charabia made of the text, and a trigger would have to read them
-/// off a column the row would then have to carry. There is no such column on purpose — see
-/// [`SCHEMA`] on why the terms are an index and not data — so the two writes are two statements,
-/// held together by the transaction around them instead.
-const INDEX: &str = include_str!("../queries/index.sql");
-
 /// The memories nearest a query, nearest first — `queries/search.sql`.
 ///
 /// `bm25()` ascending is best first: FTS5 scores a better match as a more negative number, so
@@ -113,15 +76,14 @@ const INDEX: &str = include_str!("../queries/index.sql");
 /// them, and a search that answers the same question two ways is one nobody can test or script
 /// against. Oldest first among equals, since that is what a rowid is.
 ///
-/// The join is how a contentless index is read at all: `memory_fts_index` holds no copy of the
-/// text, so what a match produces is rowids, and the memories are on the other side of them.
+/// No join: the text is in `item_fts`, which is the point of it not being contentless. Nothing
+/// of `item` is needed to answer — a memory is its text.
 const SEARCH: &str = include_str!("../queries/search.sql");
 
 /// An open memory store.
 ///
-/// Every method here is synchronous and blocks: this is SQLite, and a vector search is a C
-/// extension running in the calling thread. Keeping that off a task's thread is the caller's
-/// job, so nothing in this module needs to know a runtime exists.
+/// Every method here is synchronous and blocks — this is SQLite. Nothing here hides that: the
+/// program a store is opened by is doing this one thing and has nothing else to get on with.
 ///
 /// [`Send`] + [`Sync`] through the mutex, which is what lets a caller hold one in an
 /// [`Arc`](std::sync::Arc) and hand it to a blocking thread per call. A `Connection` is not
@@ -130,157 +92,43 @@ const SEARCH: &str = include_str!("../queries/search.sql");
 #[derive(Debug)]
 pub struct Store {
     /// The one connection, taken under a lock by whatever asks the file a question.
-    conn: Mutex<Connection>,
+    conn: Mutex<rusqlite::Connection>,
 }
 
 impl Store {
-    /// Make the store at `path`, and write into it the facts that hold for its whole life.
+    /// Make the store at `path`.
     ///
-    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) when there is already a file at `path`.
-    /// This is the one command that brings a store into being, so being handed a name that is
-    /// taken is an ambiguity and not a detail to smooth over: the caller either meant a store
-    /// they already have — in which case they wanted `insert` — or they meant a new one and
-    /// named the wrong file.
+    /// [`AlreadyExists`](io::ErrorKind::AlreadyExists) when there is already a file there, and
+    /// nothing half-made left behind when the schema will not install — see
+    /// [`sqlite::create`], which is where both of those rules live.
     pub fn try_new(path: impl AsRef<Path>) -> io::Result<Store> {
-        let path = path.as_ref();
-        // The absence of the file *is* the check, so it is made by the creation rather than by a
-        // `try_exists` before it: two `mem init`s racing for one name both see nothing there, and
-        // only an exclusive create makes one of them lose.
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-
-        // A closure so that every step below can `?` and still be undone in one place. From here
-        // on the file exists, and each of these can fail on it.
-        let installed = (|| -> io::Result<Store> {
-            // No `CREATE`: the file was made a line ago. Asking SQLite to make it again would
-            // turn a path that went missing in between — a race, a tree unmounted underneath —
-            // into a second empty store rather than the error it is.
-            let conn = connect(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-
-            // No `if not exists`, and no transaction around the statements: the file is one this
-            // call made and nothing else has seen it, so there is nothing to collide with and
-            // nothing a half-written schema could damage. What plays the part of a rollback is
-            // the removal below, which undoes the file rather than the statements in it.
-            conn.execute_batch(SCHEMA).map_err(sql_error)?;
-            conn.execute(
-                "insert into meta (key, value) values ('schema_version', ?1)",
-                (SCHEMA_VERSION,),
-            )
-            .map_err(sql_error)?;
-
-            Ok(Store {
-                conn: Mutex::new(conn),
-            })
-        })();
-
-        // Nothing was here a moment ago and nothing usable is here now. Leaving the file behind
-        // would make every retry of this exact command fail as "already exists" — a store that
-        // does not exist, standing in the way of creating itself.
-        installed.inspect_err(|_| {
-            std::fs::remove_file(path).ok();
+        Ok(Store {
+            conn: Mutex::new(sqlite::create(path.as_ref(), KIND)?),
         })
     }
 
     /// Open the store that is already at `path`.
     ///
-    /// [`NotFound`](io::ErrorKind::NotFound) when there is no file there. Every command but
-    /// `init` is about memories, and memories are in a store somebody made: creating one here
-    /// would turn a misspelled name into an empty store that answers every search with nothing,
-    /// while the memories the caller meant sit in the file they meant to name.
-    ///
-    /// [`InvalidData`](io::ErrorKind::InvalidData) for a file that is not this: somebody else's
-    /// SQLite database, or a store written by a `mem` whose schema this one does not speak. Both
-    /// are refused here rather than left to fail as a missing column three statements later,
-    /// where the message would be about SQL and not about the file that was named.
-    ///
-    /// Opened for writing, because that is what the commands that load a store do to it.
+    /// [`NotFound`](io::ErrorKind::NotFound) for no file, [`InvalidData`](io::ErrorKind::InvalidData)
+    /// for somebody else's database or a schema this build does not speak — see
+    /// [`sqlite::open`].
     pub fn try_from_file(path: impl AsRef<Path>) -> io::Result<Store> {
-        let path = path.as_ref();
-
-        // Asked of the filesystem before SQLite, for two reasons that happen to have one answer.
-        // SQLite reports a file that is not there and a file it may not read with the same code,
-        // which would make "no such store" the message for a permission problem; and its text
-        // carries the host path, which is on the far side of a mount the caller cannot see. So
-        // the ordinary case is answered here, and anything stranger keeps SQLite's own words.
-        if !path.try_exists()? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "there is no store here; `mem init` makes one",
-            ));
-        }
-
-        let conn = connect(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-
-        // Asked of the catalogue rather than by reading `meta` and interpreting the failure:
-        // "no such table" arrives as the same error code as a dozen unrelated things, so a file
-        // that was never a store would otherwise be reported as a broken one.
-        let ours: bool = conn
-            .query_row(
-                "select count(*) from sqlite_master where type = 'table' and name = 'meta'",
-                [],
-                |row| Ok(row.get::<_, i64>(0)? > 0),
-            )
-            .map_err(sql_error)?;
-        if !ours {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not a mem store: it has no meta table",
-            ));
-        }
-
-        let version: Option<String> = conn
-            .query_row(
-                "select value from meta where key = 'schema_version'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(sql_error)?;
-
-        match version.as_deref() {
-            Some(SCHEMA_VERSION) => Ok(Store {
-                conn: Mutex::new(conn),
-            }),
-            // Both versions, because neither alone tells the caller which side is old: a store
-            // from a newer `mem` and a `mem` newer than the store are the same sentence read in
-            // opposite directions, and what they do about it differs.
-            Some(other) => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("this store is schema version {other}; this mem speaks {SCHEMA_VERSION}"),
-            )),
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not a mem store: its meta table does not say which schema it is",
-            )),
-        }
+        Ok(Store {
+            conn: Mutex::new(sqlite::open(path.as_ref(), KIND)?),
+        })
     }
 
-    /// Write these memories, and index each under the terms it is found by.
+    /// Write these memories.
     ///
-    /// All of them or none. What produced a batch is one reading of one conversation — the
-    /// extraction answers with the memories in it and nothing else, so there is no half of that
-    /// answer worth keeping. A store left holding three of five would also be a store nobody
-    /// can tell from one that was told three, since a memory carries nothing about the
-    /// conversation it came out of.
+    /// All of them or none. What produced a batch is one `insert`, and a caller who named five
+    /// memories meant five: there is no half of that worth keeping. A store left holding three
+    /// of them would also be a store nobody can tell from one that was told three, since a
+    /// memory carries nothing about the call it arrived on.
     ///
-    /// They share a `written_at` for the same reason: what is being timestamped is the reading,
+    /// They share a `written_at` for the same reason: what is being timestamped is the call,
     /// and a batch written in one call happened at one moment. Ordering two rows of it by a
     /// microsecond would be recording the order this loop ran in.
-    ///
-    /// The terms are taken here rather than accepted from the caller, which is what keeps a
-    /// memory's index and its text from being able to disagree: [`terms`] is the only way into
-    /// `memory_fts_index`, and [`Store::search`] cuts a query with the same function.
     pub fn insert(&self, memories: &[Memory]) -> io::Result<()> {
-        // Before the lock, because this is the one expensive thing here: charabia is walking
-        // text against a dictionary, and doing it while holding the file's write lock would make
-        // every other writer wait on work that has nothing to do with the file.
-        let indexed: Vec<(&str, String)> = memories
-            .iter()
-            .map(|memory| (memory.text.as_str(), terms(&memory.text).join(" ")))
-            .collect();
-
         // A poisoned lock is a panic that happened while somebody held this connection, and it
         // is not a reason to refuse the file: what a poisoned lock protects is data whose
         // invariants a panic may have left half-applied, and the invariants here are SQLite's
@@ -291,17 +139,28 @@ impl Store {
 
         let written_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         {
-            let mut row = tx.prepare(INSERT).map_err(sql_error)?;
-            let mut terms = tx.prepare(INDEX).map_err(sql_error)?;
+            let mut row = tx.prepare(sqlite::UPSERT).map_err(sql_error)?;
+            let mut text = tx.prepare(sqlite::FTS_WRITE).map_err(sql_error)?;
 
-            for (text, indexed) in &indexed {
-                row.execute((uuid::Uuid::new_v4().to_string(), text, &written_at))
+            for memory in memories {
+                let rowid: i64 = row
+                    .query_row(
+                        (
+                            uuid::Uuid::new_v4().to_string(),
+                            // The null that says "this is a memory": no path, so nothing to
+                            // conflict with, so no update — see `sqlite::UPSERT`.
+                            None::<&str>,
+                            "", // title: a memory has no name
+                            0,  // mtime
+                            0,  // len
+                            &written_at,
+                        ),
+                        |r| r.get(0),
+                    )
                     .map_err(sql_error)?;
-                // The rowid the line above assigned, which is what the index entry has to be
-                // filed under: `memory_fts_index` holds no copy of the memory and is only ever read
-                // back through it.
-                terms
-                    .execute((tx.last_insert_rowid(), indexed))
+                // The empty `title`: a memory has no name, and an FTS5 column with no tokens
+                // in it contributes nothing to `bm25` and matches nothing.
+                text.execute((rowid, "", &memory.text))
                     .map_err(sql_error)?;
             }
         }
@@ -326,40 +185,16 @@ impl Store {
     /// with the question, ranked low but present. `limit` is what makes that a non-issue rather
     /// than a flaw — an answer is the first few lines, and the tail is never reached.
     ///
-    /// # A query with no terms in it
+    /// # A query with no words in it
     ///
     /// Punctuation, whitespace, nothing at all: no memories, and no error. There is no question
-    /// here for the index to answer — a term is what [`terms`] made of the text, and it made
-    /// none — and "no memories are near this" is a true answer to it. Refusing instead would be
-    /// this function deciding that the caller made a mistake, on the evidence of a string it
-    /// cannot read the intent of.
+    /// here for the index to answer, and "no memories are near this" is a true answer to it.
+    /// Refusing instead would be this function deciding that the caller made a mistake, on the
+    /// evidence of a string it cannot read the intent of.
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<String>> {
-        // Cut by the same function that cut the memories, which is the whole contract between
-        // the two halves: what charabia does to `서울에서` on the way in is what it does to
-        // `서울` on the way out, and neither side is ever compared to a string as typed.
-        let asked = terms(query);
-        if asked.is_empty() {
+        let Some(expression) = as_expression(query) else {
             return Ok(Vec::new());
-        }
-
-        // Every term quoted, because FTS5 reads the pattern as an expression in a small language
-        // of its own — `AND`, `NOT`, `*`, `:` and parentheses all mean something in it. A term is
-        // text and not an expression, and a caller searching for `NOT` means the word. Quoting is
-        // how FTS5 is told so, and doubling is its own escape for a quote inside a quoted string.
-        //
-        // Once each, because `bm25` adds up a contribution per term of the pattern: a term named
-        // twice counts twice, and what a memory is *about* would then be outweighed by whichever
-        // word the query happened to repeat. On a phrase somebody typed that is a rounding error;
-        // on a whole conversation asked as one question — which is how `insert` finds the
-        // memories it already holds — the repeated words are `the` and `user`, and they would
-        // decide the answer. First seen wins, so the order is still the order they were written.
-        let mut seen = HashSet::new();
-        let expression = asked
-            .iter()
-            .filter(|term| seen.insert(term.as_str()))
-            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        };
 
         // SQLite counts in `i64`, and a `usize` that will not fit one is a caller asking for
         // more memories than a store could hold — which `i64::MAX` is also the answer to.
@@ -376,28 +211,28 @@ impl Store {
     }
 }
 
-/// Open one connection, with the pragmas this store needs.
-fn connect(path: &Path, flags: OpenFlags) -> io::Result<Connection> {
-    let conn = Connection::open_with_flags(path, flags).map_err(sql_error)?;
-    conn.busy_timeout(BUSY_TIMEOUT).map_err(sql_error)?;
-    Ok(conn)
-}
-
-/// A SQLite failure as the rest of the crate answers in.
+/// What a caller typed, as something FTS5 will accept.
 ///
-/// Two codes are worth a kind of their own, because they are the two a caller can act on: a file
-/// that is not there, and a tree that will not be written to. Everything else is a database
-/// error whose own message says more than a kind would.
-fn sql_error(e: rusqlite::Error) -> io::Error {
-    use rusqlite::ErrorCode;
-    match &e {
-        rusqlite::Error::SqliteFailure(f, _) => match f.code {
-            ErrorCode::CannotOpen => io::Error::new(io::ErrorKind::NotFound, e),
-            ErrorCode::ReadOnly => io::Error::new(io::ErrorKind::PermissionDenied, e),
-            _ => io::Error::other(e),
-        },
-        _ => io::Error::other(e),
-    }
+/// **Every word is quoted, and that is the whole of the escaping.** FTS5 reads a pattern as an
+/// expression in a small language of its own — `AND`, `OR`, `NOT`, `NEAR`, `*`, `:`, `-` and
+/// parentheses all mean something in it — and a query written by an agent that was never told
+/// that language would otherwise be a syntax error rather than a search. Quoting says "these are
+/// words"; doubling is FTS5's own escape for a quote inside a quoted string.
+///
+/// Once each, because `bm25` adds up a contribution per term of the pattern: a word repeated in
+/// the question would otherwise count twice and outweigh what the question is about.
+///
+/// `index` has the same function, and they stay apart on purpose — two consumers agreeing
+/// today is not a rule, and the first time one of them needs a different query language the
+/// shared one would have to be argued with.
+fn as_expression(query: &str) -> Option<String> {
+    let mut seen = HashSet::new();
+    let terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|word| seen.insert(*word))
+        .map(|word| format!("\"{}\"", word.replace('"', "\"\"")))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" OR "))
 }
 
 #[cfg(test)]
@@ -407,7 +242,8 @@ mod tests {
     /// What a store says about itself, read off the file rather than off the handle that made
     /// it: what `init` leaves behind is read by the next command, in another process.
     fn meta(path: &Path) -> std::collections::BTreeMap<String, String> {
-        let conn = connect(path, OpenFlags::SQLITE_OPEN_READ_ONLY).expect("the file opens");
+        let conn = sqlite::connect(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("the file opens");
         let mut stmt = conn.prepare("select key, value from meta").unwrap();
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
@@ -415,18 +251,15 @@ mod tests {
         rows.collect::<Result<_, _>>().unwrap()
     }
 
+    /// What this crate has to get right about `meta` is the one key that is its own: which kind
+    /// of store it just made. The version beside it is `storebase`'s, and tested there.
     #[test]
-    fn a_new_store_says_which_schema_it_is() {
+    fn a_new_store_says_which_kind_it_is() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("notes.sqlite");
 
         Store::try_new(&path).expect("a store can be made");
-
-        let said = meta(&path);
-        assert_eq!(
-            said.get("schema_version").map(String::as_str),
-            Some(SCHEMA_VERSION)
-        );
+        assert_eq!(meta(&path).get("kind").map(String::as_str), Some(KIND));
     }
 
     /// What `init` writes is what the next command opens.
@@ -441,9 +274,14 @@ mod tests {
 
     /// A store to write to, and the memories in it read back the way another command would.
     fn stored(path: &Path) -> Vec<(String, String, String)> {
-        let conn = connect(path, OpenFlags::SQLITE_OPEN_READ_ONLY).expect("the file opens");
+        let conn = sqlite::connect(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("the file opens");
         let mut stmt = conn
-            .prepare("select id, text, written_at from memory order by rowid")
+            .prepare(
+                "select item.id, item_fts.body, item.written_at
+                 from item join item_fts on item_fts.rowid = item.rowid
+                 order by item.rowid",
+            )
             .unwrap();
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -489,7 +327,7 @@ mod tests {
         assert_eq!(rows[1].1, "User lives in Seoul");
 
         // A name of the store's giving, and a different one per row: two memories out of one
-        // conversation are two memories, and a later command names one of them.
+        // `insert` are two memories, and a later command names one of them.
         assert_ne!(rows[0].0, rows[1].0);
         assert!(
             rows.iter()
@@ -507,9 +345,8 @@ mod tests {
         );
     }
 
-    /// The point of writing terms at all: a memory is found by a term of it, and the terms are
-    /// the language's own — a Korean noun with its particle still on it in the text, asked for
-    /// without one.
+    /// The point of writing terms at all: a memory is found by a term of it, and by a term
+    /// rather than by the string it was written as.
     #[test]
     fn a_memory_is_found_by_its_terms() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -517,18 +354,13 @@ mod tests {
             dir.path(),
             &[
                 "User switched to oat milk",
-                "User met a friend 서울에서 last Tuesday",
+                "User met a friend in Seoul last Tuesday",
             ],
         );
 
         let found = |query: &str| store.search(query, 10).expect("the store answers");
 
         assert_eq!(found("oat milk"), ["User switched to oat milk"]);
-        assert_eq!(
-            found("서울"),
-            ["User met a friend 서울에서 last Tuesday"],
-            "the particle came off the noun on the way in, and there is none on the way out"
-        );
         // A term of both is both, and a term of neither is nothing: what is being asked of the
         // index is which memories hold the terms, not which hold the string.
         assert_eq!(found("User").len(), 2, "lowercased on both sides");
@@ -631,9 +463,8 @@ mod tests {
     }
 
     /// A word repeated in the question does not count twice. `bm25` adds up a contribution per
-    /// term of the pattern, so a whole conversation asked as one question — which is what
-    /// `insert` asks to find the memories it already holds — would otherwise be decided by
-    /// whichever common word it happened to repeat, and not by what it is about.
+    /// term of the pattern, so a long passage asked as one question would otherwise be decided
+    /// by whichever common word it happened to repeat, and not by what it is about.
     ///
     /// The corpus is chosen so that the two orders differ if the repetition is passed through:
     /// doubling `oat` lifts the memory that holds only `oat` above the one that holds only
@@ -712,9 +543,9 @@ mod tests {
         );
     }
 
-    /// Nothing to write is a write of nothing, and a store that is unchanged by it. A
-    /// conversation carrying no memories is the extraction's own answer, and this is the
-    /// caller's line for it — not a case every caller has to special-case first.
+    /// Nothing to write is a write of nothing, and a store that is unchanged by it. `insert`
+    /// with no text after the store is a line a script can produce without checking whether it
+    /// had anything to say — not a case every caller has to special-case first.
     #[test]
     fn writing_no_memories_writes_nothing() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -725,8 +556,8 @@ mod tests {
         assert!(stored(&path).is_empty());
     }
 
-    /// The index and the rows are one write. A batch is one reading of one conversation, and a
-    /// store holding half of it could not say which half.
+    /// The text and the row are one write. A batch is one `insert`, and a store holding half
+    /// of it could not say which half.
     #[test]
     fn a_batch_that_cannot_be_finished_writes_none_of_itself() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -740,8 +571,8 @@ mod tests {
         {
             let conn = store.conn.lock().unwrap();
             conn.execute_batch(
-                "create trigger no_second before insert on memory
-                 when (select count(*) from memory) >= 1
+                "create trigger no_second before insert on item
+                 when (select count(*) from item) >= 1
                  begin select raise(abort, 'no'); end",
             )
             .unwrap();
@@ -762,13 +593,53 @@ mod tests {
             stored(&path).is_empty(),
             "the first row went back with the second"
         );
-        let conn = connect(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let conn = sqlite::connect(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let indexed: i64 = conn
-            .query_row("select count(*) from memory_fts_index", [], |row| {
+            .query_row("select count(*) from item_fts", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(indexed, 0, "and so did what was indexed under it");
+    }
+
+    /// What indexing the text rather than a list of terms buys: `porter` stems, so a question
+    /// asked in one form finds a memory written in another. A pre-cut term list cannot do this —
+    /// there is no stemmer to run once the words have already been chosen.
+    #[test]
+    fn a_memory_is_found_by_a_word_in_another_form() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = holding(
+            dir.path(),
+            &["User switched to oat milk because of mounting allergies"],
+        );
+
+        for asked in ["mounting", "mount", "allergies", "allergy", "switched", "switch"] {
+            assert_eq!(
+                store.search(asked, 10).expect("the store answers").len(),
+                1,
+                "{asked} did not reach the memory"
+            );
+        }
+        assert!(
+            store.search("zygote", 10).expect("the store answers").is_empty(),
+            "and a word that is not there still finds nothing"
+        );
+    }
+
+    /// The text comes back as it was written — the store holds the original, not what a
+    /// tokenizer made of it. That is what lets the index be rebuilt under another tokenizer
+    /// later without a re-ingest.
+    #[test]
+    fn a_memory_comes_back_exactly_as_it_was_written() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let written = "User met a friend on Tuesday — CAFE, not cafe!";
+        let store = holding(dir.path(), &[written]);
+
+        assert_eq!(
+            store.search("friend", 10).expect("the store answers"),
+            [written],
+            "case and punctuation survive"
+        );
     }
 
     /// A store that is not there is not made: the name was wrong, and an empty store would
@@ -783,46 +654,7 @@ mod tests {
         assert!(!path.try_exists().unwrap(), "opening made nothing");
     }
 
-    /// Somebody else's file is said to be somebody else's, rather than failing later as SQL
-    /// about a column nobody named.
-    #[test]
-    fn a_file_that_is_not_a_store_is_refused_as_one() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
 
-        let other = dir.path().join("other.sqlite");
-        Connection::open(&other)
-            .unwrap()
-            .execute_batch("create table something_else (id integer primary key)")
-            .unwrap();
-        let e = Store::try_from_file(&other).expect_err("this is not a mem store");
-        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert!(e.to_string().contains("meta"), "{e}");
-
-        // Not a database at all: SQLite's own complaint, and not a claim that the file is fine.
-        let prose = dir.path().join("notes.txt");
-        std::fs::write(&prose, b"dear diary").unwrap();
-        Store::try_from_file(&prose).expect_err("prose is not a store");
-    }
-
-    /// A schema this build does not speak is refused, and the refusal says both versions:
-    /// which side is old is the caller's next question.
-    #[test]
-    fn a_store_from_another_schema_is_refused() {
-        let dir = tempfile::tempdir().expect("a temporary directory");
-        let path = dir.path().join("newer.sqlite");
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(
-            "create table meta (key text primary key, value text not null);
-             insert into meta (key, value) values ('schema_version', '99')",
-        )
-        .unwrap();
-        drop(conn);
-
-        let e = Store::try_from_file(&path).expect_err("99 is not a schema this speaks");
-        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
-        assert!(e.to_string().contains("99"), "{e}");
-        assert!(e.to_string().contains(SCHEMA_VERSION), "{e}");
-    }
 
     /// A name that is taken is an ambiguity, and the existing file is left exactly as it was.
     #[test]

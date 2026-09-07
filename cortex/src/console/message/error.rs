@@ -130,6 +130,18 @@ impl Error {
 
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
     /// error) belongs to whoever reads the frame, not here.
+    /// The session named a built image this server does not have.
+    ///
+    /// Distinct from [`UNSUPPORTED_IMAGE`](Self::UNSUPPORTED_IMAGE), which says the backend
+    /// can swap no base at all: a client hearing this one can build the thing, where a client
+    /// hearing that one has to ask for something else.
+    ///
+    /// Said at `init`, unlike a reference that cannot be fetched — which is a boot that
+    /// failed. The difference is what finding out costs: whether an image built here is still
+    /// here is a file test, where whether a registry has one is a network round trip that
+    /// belongs to a boot.
+    pub const UNKNOWN_IMAGE: i64 = -32012;
+
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
@@ -151,3 +163,37 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+#[cfg(test)]
+mod tests {
+    use super::Error;
+
+    /// Every code is its own. Two that collided would be two failures a client could not
+    /// tell apart, and the compiler has nothing to say about it.
+    #[test]
+    fn every_error_code_is_distinct() {
+        let codes = [
+            ("TIMED_OUT", Error::TIMED_OUT),
+            ("NOT_EXECUTABLE", Error::NOT_EXECUTABLE),
+            ("BOOT_FAILED", Error::BOOT_FAILED),
+            ("NOT_FOUND", Error::NOT_FOUND),
+            ("IS_A_DIRECTORY", Error::IS_A_DIRECTORY),
+            ("IO_FAILED", Error::IO_FAILED),
+            ("UNSUPPORTED_WORKFS", Error::UNSUPPORTED_WORKFS),
+            ("MOUNT_FAILED", Error::MOUNT_FAILED),
+            ("UNSUPPORTED_NETWORK", Error::UNSUPPORTED_NETWORK),
+            ("UNSUPPORTED_IMAGE", Error::UNSUPPORTED_IMAGE),
+            ("UNKNOWN_IMAGE", Error::UNKNOWN_IMAGE),
+            ("INVALID_REQUEST", Error::INVALID_REQUEST),
+            ("METHOD_NOT_FOUND", Error::METHOD_NOT_FOUND),
+            ("INVALID_PARAMS", Error::INVALID_PARAMS),
+            ("INTERNAL_ERROR", Error::INTERNAL_ERROR),
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for (name, code) in codes {
+            if let Some(taken) = seen.insert(code, name) {
+                panic!("{code} is both {taken} and {name}");
+            }
+        }
+    }
+}

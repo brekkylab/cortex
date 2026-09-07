@@ -2,11 +2,23 @@
 //!
 //! Notion pages/blocks are projected onto a filesystem tree:
 //! ```text
-//! /pages/<title>__<page-id>/page.json      — metadata + markdown body + raw blocks
-//! /pages/<title>__<page-id>/<child>__<id>/ — nested child pages, recursively
+//! /pages/<title>__<page-id>/page.json         — metadata + markdown body + raw blocks
+//! /pages/<title>__<page-id>/<child>__<id>/    — nested child pages, recursively
+//! /pages/<title>__<page-id>/<db>__db__<id>/   — a database in the page
+//! /pages/.../<db>__db__<id>/database.json     — its schema and a row index
+//! /pages/.../<db>__db__<id>/<row>__<id>/      — a row, which is a page like any other
 //! ```
 //! `/pages` lists only top-level (workspace) pages; the `<page-id>` is the part
 //! after the last `__`. `page.json` is rendered on read.
+//!
+//! One path level per page, whatever the block depth: Notion's own two-column
+//! layouts put a page's sub-pages inside a `column`, two blocks below the page,
+//! and those get a directory directly under their page like any other.
+//!
+//! A database row *is* a page — the API returns it as one, with properties and a
+//! block body — so a row directory is a page directory, and a page nested inside a
+//! row continues the same recursion. Only the database itself is a new kind of
+//! node, and [`DB_MARKER`] in its directory name is what tells the two apart.
 //!
 //! The Notion API is async (reqwest) and so is this store — each operation `.await`s the
 //! client directly; no runtime lives here. A `page.json`'s bytes are rendered once and cached
@@ -62,10 +74,18 @@ impl std::fmt::Debug for NotionConfig {
     }
 }
 
-/// A rendered `page.json`: its bytes plus the page's timestamps.
+/// A rendered `page.json`: its bytes, the page's timestamps, and the sub-page
+/// directories that go beside it.
+///
+/// The directories come from the same tree the bytes do, which is what keeps the
+/// two from disagreeing: a `child_page` block renders as a marker on the grounds
+/// that its own directory carries the content, so the directory has to exist for
+/// exactly the blocks the render marked.
 #[derive(Clone)]
 struct Rendered {
     bytes: Arc<Vec<u8>>,
+    /// `<sanitized-title>__<id>` per `child_page` block, at whatever depth it sat.
+    child_dirs: Arc<Vec<String>>,
     mtime: Option<SystemTime>,
     ctime: Option<SystemTime>,
 }
@@ -176,6 +196,52 @@ impl NotionFs {
             .await
     }
 
+    async fn get_database(&self, id: &str) -> io::Result<Value> {
+        if !valid_notion_id(id) {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        self.send(self.client.get(format!("{API}/databases/{id}")))
+            .await
+    }
+
+    /// Every row of a database, paging through the query.
+    ///
+    /// A row comes back as a full page object — its `properties` are the row, and
+    /// its blocks are read through its own directory. Notion leaves a database's
+    /// *templates* out of this answer even though they are parented to it, which
+    /// is why the tree shows rows and not templates.
+    async fn query_database(&self, id: &str) -> io::Result<Vec<Value>> {
+        if !valid_notion_id(id) {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        let mut results = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut body = json!({ "page_size": 100 });
+            if let Some(c) = &cursor {
+                body["start_cursor"] = json!(c);
+            }
+            let v = self
+                .send(
+                    self.client
+                        .post(format!("{API}/databases/{id}/query"))
+                        .json(&body),
+                )
+                .await?;
+            if let Some(arr) = v.get("results").and_then(|r| r.as_array()) {
+                results.extend(arr.iter().cloned());
+            }
+            if !v.get("has_more").and_then(|h| h.as_bool()).unwrap_or(false) {
+                break;
+            }
+            match v.get("next_cursor").and_then(|c| c.as_str()) {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
+        Ok(results)
+    }
+
     /// All immediate block children of `id`, paging through every result.
     async fn list_children(&self, id: &str) -> io::Result<Vec<Value>> {
         if !valid_notion_id(id) {
@@ -212,8 +278,9 @@ impl NotionFs {
     }
 
     /// Block children recursively, embedding nested blocks under a `children`
-    /// key. `child_page`/`child_database` blocks are not descended into (they
-    /// surface as subdirectories). Recursion stops at [`MAX_BLOCK_DEPTH`].
+    /// key. A `child_page` is not descended into — its own directory is where its
+    /// blocks are read — and neither is a `child_database`, whose rows are a query
+    /// this backend does not make. Recursion stops at [`MAX_BLOCK_DEPTH`].
     fn list_block_tree<'a>(
         &'a self,
         id: String,
@@ -259,10 +326,13 @@ impl NotionFs {
         }
         let page = self.get_page(page_id).await?;
         let blocks = self.list_block_tree(page_id.to_string(), 0).await?;
+        let mut child_dirs = Vec::new();
+        collect_child_dirs(&blocks, &mut child_dirs);
         let normalized = normalize_page(&page, &blocks);
         let bytes = serde_json::to_vec_pretty(&normalized).map_err(io_other)?;
         let rendered = Rendered {
             bytes: Arc::new(bytes),
+            child_dirs: Arc::new(child_dirs),
             mtime: page_time(&page, "last_edited_time"),
             ctime: page_time(&page, "created_time"),
         };
@@ -271,6 +341,67 @@ impl NotionFs {
             .unwrap()
             .insert(page_id.to_string(), (Instant::now(), rendered.clone()));
         Ok(rendered)
+    }
+
+    /// The rendered `database.json` for `db_id`, served from the same cache a page
+    /// render uses — a database id and a page id are both UUIDs and never collide.
+    ///
+    /// Shaped like a page render on purpose: bytes plus the directories that go
+    /// beside them, which here are the rows. One query answers both, so an `ls` of
+    /// a database and the read of its `database.json` cost one query between them.
+    async fn render_database_cached(&self, db_id: &str) -> io::Result<Rendered> {
+        if let Some((at, r)) = self.cache.lock().unwrap().get(db_id)
+            && at.elapsed() < RENDER_TTL
+        {
+            return Ok(r.clone());
+        }
+        let db = self.get_database(db_id).await?;
+        let rows = self.query_database(db_id).await?;
+        let child_dirs: Vec<String> = rows.iter().map(page_dirname).collect();
+        let bytes = serde_json::to_vec_pretty(&normalize_database(&db, &rows, &child_dirs))
+            .map_err(io_other)?;
+        let rendered = Rendered {
+            bytes: Arc::new(bytes),
+            child_dirs: Arc::new(child_dirs),
+            mtime: page_time(&db, "last_edited_time"),
+            ctime: page_time(&db, "created_time"),
+        };
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(db_id.to_string(), (Instant::now(), rendered.clone()));
+        Ok(rendered)
+    }
+
+    /// Contents of a database dir: `database.json` plus a subdir per row.
+    async fn database_dir_entries(&self, db_id: &str) -> io::Result<Vec<Dirent>> {
+        let rendered = self.render_database_cached(db_id).await?;
+        let mut out = vec![Dirent::new("database.json", DirentKind::File)];
+        out.extend(
+            rendered
+                .child_dirs
+                .iter()
+                .map(|name| Dirent::new(name.clone(), DirentKind::Dir)),
+        );
+        Ok(out)
+    }
+
+    /// The render behind a `<dir>/<file>.json` path.
+    ///
+    /// [`NotFound`](io::ErrorKind::NotFound) when the file name and the directory
+    /// kind disagree: `database.json` names nothing inside a page directory, and
+    /// neither does `page.json` inside a database's. One resolver for both readers,
+    /// so `stat` cannot answer for a file `read_at` would refuse.
+    async fn render_for_file(&self, rest: &[String]) -> io::Result<Rendered> {
+        // `/pages/page.json` has no enclosing directory.
+        let [.., dir, file] = rest else {
+            return Err(io::ErrorKind::NotFound.into());
+        };
+        match (file.as_str(), node(dir)) {
+            ("page.json", Node::Page(id)) => self.render_cached(&id).await,
+            ("database.json", Node::Database(id)) => self.render_database_cached(&id).await,
+            _ => Err(io::ErrorKind::NotFound.into()),
+        }
     }
 
     /// Top-level (workspace) pages as `<title>__<id>` dir entries.
@@ -289,24 +420,21 @@ impl NotionFs {
     }
 
     /// Contents of a page dir: `page.json` plus a subdir per `child_page` block.
+    ///
+    /// Served from the render, not from one level of blocks: a child page sits
+    /// wherever the page's layout puts it, and the immediate children of a
+    /// two-column page are the columns. Reading the render costs the fetch a
+    /// `stat` of `page.json` would have paid anyway, and the cache means an `ls`
+    /// and the read after it share it.
     async fn page_dir_entries(&self, page_id: &str) -> io::Result<Vec<Dirent>> {
-        let blocks = self.list_children(page_id).await?;
+        let rendered = self.render_cached(page_id).await?;
         let mut out = vec![Dirent::new("page.json", DirentKind::File)];
-        for b in &blocks {
-            if b.get("type").and_then(|t| t.as_str()) != Some("child_page") {
-                continue;
-            }
-            let child_title = b
-                .get("child_page")
-                .and_then(|c| c.get("title"))
-                .and_then(|t| t.as_str())
-                .unwrap_or("untitled");
-            let child_id = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
-            out.push(Dirent::new(
-                format!("{}__{}", sanitize_name(child_title), child_id),
-                DirentKind::Dir,
-            ));
-        }
+        out.extend(
+            rendered
+                .child_dirs
+                .iter()
+                .map(|name| Dirent::new(name.clone(), DirentKind::Dir)),
+        );
         Ok(out)
     }
 }
@@ -322,28 +450,21 @@ impl FileSystem for NotionFs {
                 [] => Ok(Stat::new(DirentKind::Dir, 0)),
                 [p] if p == "pages" => Ok(Stat::new(DirentKind::Dir, 0)),
                 [p, rest @ ..] if p == "pages" && !rest.is_empty() => {
-                    let is_json = rest.last().map(String::as_str) == Some("page.json");
-                    let dir = if is_json {
-                        // `/pages/page.json` has no enclosing page dir.
-                        let Some(dir) = rest.iter().nth_back(1) else {
-                            return Err(io::ErrorKind::NotFound.into());
-                        };
-                        dir.as_str()
-                    } else {
-                        rest.last().unwrap().as_str()
-                    };
-                    let id = page_id(dir);
-                    if is_json {
+                    let last = rest.last().unwrap().as_str();
+                    if matches!(last, "page.json" | "database.json") {
                         // Render so the guest kernel sees the real size (no direct_io).
-                        Ok(self.render_cached(&id).await?.stat())
-                    } else {
-                        // Confirm the page dir exists (and pick up its times) cheaply.
-                        let page = self.get_page(&id).await?;
-                        let mut st = Stat::new(DirentKind::Dir, 0);
-                        st.mtime = page_time(&page, "last_edited_time");
-                        st.ctime = page_time(&page, "created_time");
-                        Ok(st)
+                        return Ok(self.render_for_file(rest).await?.stat());
                     }
+                    // Confirm the directory exists (and pick up its times) cheaply —
+                    // one retrieve, where listing it would be a whole render.
+                    let obj = match node(last) {
+                        Node::Page(id) => self.get_page(&id).await?,
+                        Node::Database(id) => self.get_database(&id).await?,
+                    };
+                    let mut st = Stat::new(DirentKind::Dir, 0);
+                    st.mtime = page_time(&obj, "last_edited_time");
+                    st.ctime = page_time(&obj, "created_time");
+                    Ok(st)
                 }
                 _ => Err(io::ErrorKind::NotFound.into()),
             }
@@ -358,10 +479,13 @@ impl FileSystem for NotionFs {
                 [p] if p == "pages" => self.top_level_page_dirs().await,
                 [p, rest @ ..] if p == "pages" && !rest.is_empty() => {
                     let last = rest.last().unwrap();
-                    if last == "page.json" {
+                    if matches!(last.as_str(), "page.json" | "database.json") {
                         return Err(io::ErrorKind::NotADirectory.into());
                     }
-                    self.page_dir_entries(&page_id(last)).await
+                    match node(last) {
+                        Node::Page(id) => self.page_dir_entries(&id).await,
+                        Node::Database(id) => self.database_dir_entries(&id).await,
+                    }
                 }
                 _ => Err(io::ErrorKind::NotFound.into()),
             }
@@ -381,18 +505,18 @@ impl FileSystem for NotionFs {
     ) -> BoxFuture<'a, io::Result<usize>> {
         Box::pin(async move {
             let segs = segments(path);
-            // `page.json` is the only file in this tree; everything else that resolves is a
-            // directory, which is what a read of one has to say.
+            // `page.json` and `database.json` are the only files in this tree; everything
+            // else that resolves is a directory, which is what a read of one has to say.
             if segs.len() < 3
                 || segs[0] != "pages"
-                || segs.last().map(String::as_str) != Some("page.json")
+                || !matches!(
+                    segs.last().map(String::as_str),
+                    Some("page.json" | "database.json")
+                )
             {
                 return Err(io::ErrorKind::IsADirectory.into());
             }
-            let data = self
-                .render_cached(&page_id(&segs[segs.len() - 2]))
-                .await?
-                .bytes;
+            let data = self.render_for_file(&segs[1..]).await?.bytes;
             if offset >= data.len() as u64 {
                 return Ok(0);
             }
@@ -449,12 +573,72 @@ fn segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// What a directory segment in the tree names.
+///
+/// Both kinds are `<title>__<uuid>` and a Notion id says nothing about what it
+/// identifies, so the name has to carry it: [`DB_MARKER`] is the difference. That
+/// keeps a path resolvable on its own — no ancestor is fetched to learn what a
+/// segment is, which matters because [`FileSystem`] addresses by path and hands no
+/// parent along.
+enum Node {
+    Page(String),
+    Database(String),
+}
+
+/// Marks a database directory: `<title>__db__<database-id>`.
+///
+/// Unambiguous because [`sanitize_name`] folds runs of `_` to one, so a sanitized
+/// title can never contain `__` and this sequence can only be the marker.
+const DB_MARKER: &str = "__db__";
+
+fn node(dir_name: &str) -> Node {
+    match dir_name.rsplit_once(DB_MARKER) {
+        Some((_, id)) => Node::Database(id.to_string()),
+        None => Node::Page(page_id(dir_name)),
+    }
+}
+
 /// Page id encoded as the part after the last `__` in a directory name.
 fn page_id(dir_name: &str) -> String {
     dir_name
         .rsplit_once("__")
         .map(|(_, id)| id)
         .unwrap_or(dir_name)
+        .to_string()
+}
+
+/// Every `child_page` and `child_database` block in a tree, at whatever depth, as
+/// a directory name.
+///
+/// Depth is the whole point: a page whose sub-pages live in a two-column layout
+/// has columns as its immediate children and not one child page among them.
+/// Neither kind is ever descended into, so neither has `children` to walk.
+fn collect_child_dirs(blocks: &[Value], out: &mut Vec<String>) {
+    for b in blocks {
+        let btype = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if btype == "child_page" || btype == "child_database" {
+            let title = child_title(b.get(btype).unwrap_or(&Value::Null));
+            let id = b.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let sep = if btype == "child_database" {
+                DB_MARKER
+            } else {
+                "__"
+            };
+            out.push(format!("{}{sep}{id}", sanitize_name(&title)));
+            continue;
+        }
+        if let Some(kids) = b.get("children").and_then(|c| c.as_array()) {
+            collect_child_dirs(kids, out);
+        }
+    }
+}
+
+/// The `title` a `child_page`/`child_database` block's payload carries.
+fn child_title(content: &Value) -> String {
+    content
+        .get("title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("untitled")
         .to_string()
 }
 
@@ -511,14 +695,6 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
         .get(parent_type)
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let content_blocks: Vec<Value> = blocks
-        .iter()
-        .filter(|b| {
-            let t = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            t != "child_page" && t != "child_database"
-        })
-        .cloned()
-        .collect();
     json!({
         "page_id": page.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "title": extract_title(page),
@@ -528,8 +704,62 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
         "parent_type": parent_type,
         "parent_id": parent_id,
         "archived": page.get("archived").and_then(|v| v.as_bool()).unwrap_or(false),
-        "markdown": blocks_to_markdown(&content_blocks),
-        "blocks": content_blocks,
+        // Verbatim, and the whole of it. For a database row this *is* the row —
+        // the block body below is whatever was typed into the row's page — so a
+        // reader that has the render has the record, without a second shape to
+        // learn per property type.
+        "properties": page.get("properties").cloned().unwrap_or_else(|| json!({})),
+        "markdown": blocks_to_markdown(blocks),
+        "blocks": blocks,
+    })
+}
+
+/// `database.json`: what the database is, its schema, and an index of its rows.
+///
+/// The index carries each row's `dir` so a reader that has the index has the path
+/// to the row's body, rather than a name it has to rebuild the same way this module
+/// builds it. `properties` is Notion's own schema, unedited, for the reason a page's
+/// is.
+fn normalize_database(db: &Value, rows: &[Value], dirs: &[String]) -> Value {
+    let parent = db.get("parent").cloned().unwrap_or_else(|| json!({}));
+    let parent_type = parent.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let parent_id = parent
+        .get(parent_type)
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let title = db
+        .get("title")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.get("plain_text").and_then(|p| p.as_str()))
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    let rows: Vec<Value> = rows
+        .iter()
+        .zip(dirs)
+        .map(|(r, dir)| {
+            json!({
+                "page_id": r.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                "dir": dir,
+                "properties": r.get("properties").cloned().unwrap_or_else(|| json!({})),
+            })
+        })
+        .collect();
+    json!({
+        "database_id": db.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+        "title": title,
+        "url": db.get("url").and_then(|v| v.as_str()).unwrap_or(""),
+        "is_inline": db.get("is_inline").and_then(|v| v.as_bool()).unwrap_or(false),
+        "created_time": db.get("created_time").and_then(|v| v.as_str()).unwrap_or(""),
+        "last_edited_time": db.get("last_edited_time").and_then(|v| v.as_str()).unwrap_or(""),
+        "parent_type": parent_type,
+        "parent_id": parent_id,
+        "archived": db.get("archived").and_then(|v| v.as_bool()).unwrap_or(false),
+        "properties": db.get("properties").cloned().unwrap_or_else(|| json!({})),
+        "row_count": rows.len(),
+        "rows": rows,
     })
 }
 
@@ -686,7 +916,11 @@ fn block_to_md(block: &Value, indent: usize) -> String {
             format!("$${expr}$$")
         }
         "table_of_contents" => "[TOC]".to_string(),
-        "child_page" | "child_database" => String::new(),
+        // The content is not here — a child page's is in its own directory, a
+        // database's stays behind a query this backend does not make — so the
+        // line says where it went rather than reading as a gap in the page.
+        "child_page" => format!("{prefix}[page: {}]", child_title(&content)),
+        "child_database" => format!("{prefix}[database: {}]", child_title(&content)),
         _ => {
             if text.is_empty() {
                 String::new()
@@ -719,5 +953,80 @@ fn blocks_to_markdown(blocks: &[Value]) -> String {
         String::new()
     } else {
         format!("{}\n", lines.join("\n\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn child(btype: &str, title: &str, id: &str) -> Value {
+        json!({ "type": btype, "id": id, btype: { "title": title } })
+    }
+
+    /// A page directory and a database directory are told apart by the name alone,
+    /// which is what lets a path resolve without fetching its parent.
+    #[test]
+    fn a_directory_name_says_which_kind_it_is() {
+        let id = "2fd2589f-40ea-8115-95e3-c4970d29590c";
+        assert!(matches!(node(&format!("자료실__{id}")), Node::Page(x) if x == id));
+        assert!(matches!(node(&format!("프로젝트_자료실__db__{id}")), Node::Database(x) if x == id));
+    }
+
+    /// The marker cannot be forged by a title, because `sanitize_name` folds runs of
+    /// `_` to one and a sanitized title therefore never contains `__` at all.
+    #[test]
+    fn a_title_cannot_forge_the_marker() {
+        for title in ["vector db", "a__db", "db", "__db__", "x  db  y"] {
+            let clean = sanitize_name(title);
+            assert!(!clean.contains("__"), "{title:?} sanitized to {clean:?}");
+        }
+        let id = "2fd2589f-40ea-8115-95e3-c4970d29590c";
+        let dir = format!("{}__{id}", sanitize_name("vector db"));
+        assert!(matches!(node(&dir), Node::Page(x) if x == id));
+    }
+
+    /// Both kinds are collected, at whatever depth a layout block buried them.
+    #[test]
+    fn child_pages_and_databases_are_collected_at_depth() {
+        let blocks = vec![json!({
+            "type": "column_list",
+            "id": "col-list",
+            "children": [json!({
+                "type": "column",
+                "id": "col",
+                "children": [
+                    child("child_page", "회의록", "aaaaaaaa-0000-0000-0000-000000000001"),
+                    child("child_database", "프로젝트 일정", "bbbbbbbb-0000-0000-0000-000000000002"),
+                ],
+            })],
+        })];
+        let mut out = Vec::new();
+        collect_child_dirs(&blocks, &mut out);
+        assert_eq!(
+            out,
+            [
+                "회의록__aaaaaaaa-0000-0000-0000-000000000001",
+                "프로젝트_일정__db__bbbbbbbb-0000-0000-0000-000000000002",
+            ]
+        );
+        // And each round-trips to the id and kind it was built from.
+        assert!(matches!(node(&out[0]), Node::Page(_)));
+        assert!(matches!(node(&out[1]), Node::Database(_)));
+    }
+
+    /// A `child_page` is never descended into, so a database *below* one belongs to
+    /// that page's own directory and not to this listing.
+    #[test]
+    fn a_collected_child_is_not_walked_through() {
+        let blocks = vec![json!({
+            "type": "child_page",
+            "id": "aaaaaaaa-0000-0000-0000-000000000001",
+            "child_page": { "title": "부모" },
+            "children": [child("child_database", "안쪽", "bbbbbbbb-0000-0000-0000-000000000002")],
+        })];
+        let mut out = Vec::new();
+        collect_child_dirs(&blocks, &mut out);
+        assert_eq!(out.len(), 1, "only the child page itself: {out:?}");
     }
 }

@@ -58,9 +58,10 @@ mod guest;
 use std::path::PathBuf;
 
 use cortex::console::{
-    Call, Error, ImageSource, InitCall, InitResp, Message, NetworkAccess, Notification, RequestId,
-    Response, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
+    Call, CommitCall, CommitResp, Error, ImageSource, InitCall, InitResp, Message, NetworkAccess,
+    Notification, RequestId, Response, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
 };
+use cortex_uvm_console::built::{self, LOCAL_HOST};
 use microsandbox_image::Reference;
 
 use crate::{assets, contract::Network};
@@ -119,6 +120,17 @@ pub async fn run() -> anyhow::Result<()> {
                     Err(e) => Response::Error(e),
                 };
                 server.respond(id, answered).await?;
+            }
+
+            // Relayed like everything else, and then finished here. The guest writes the
+            // layer — only it can see the upperdir — and this end turns that into an image,
+            // because only it knows what one is. The answer the client gets is this end's.
+            Message::Request {
+                id,
+                call: Call::Commit(commit),
+            } => {
+                let outcome = session.commit(id, commit).await;
+                server.respond(id, outcome).await?;
             }
 
             // Everything else is the guest's to answer, including an `exec` that carries
@@ -214,6 +226,7 @@ impl Session {
         let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
         let image = base(config.image.as_ref())?;
         let (network, host_ports) = reach(config.network.as_ref())?;
+        already_built(config.image.as_ref())?;
 
         self.guest = None;
         self.workfs = workfs;
@@ -292,6 +305,7 @@ impl Session {
                 image.as_deref(),
                 self.network,
                 &self.host_ports,
+                self.config.committable,
             )
             .await
             .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
@@ -314,6 +328,80 @@ impl Session {
             self.guest = Some(guest);
         }
         Ok(self.guest.as_mut().expect("just booted"))
+    }
+}
+
+impl Session {
+    /// Keep what this session has written, and answer with the image it made.
+    ///
+    /// Two halves. The guest walks its own upperdir into the scratch it was given, because
+    /// only it can see that upperdir; this end reads what it left and stitches it onto the
+    /// layers the base was made of, because only it knows what an image is.
+    ///
+    /// A session that did not say it might commit is refused by the guest, which has neither
+    /// of the two things a commit needs — and refusing there rather than here keeps one answer
+    /// to the question rather than two that could disagree.
+    async fn commit(&mut self, id: RequestId, commit: CommitCall) -> Response {
+        let guest = match self.booted().await {
+            Ok(guest) => guest,
+            Err(refusal) => return Response::Error(refusal),
+        };
+
+        let wrote = match guest.relay(id, Call::Commit(commit.clone())).await {
+            Ok(answer) => answer,
+            Err(e) => {
+                self.release();
+                return Response::Error(refused(
+                    Error::INTERNAL_ERROR,
+                    format!("the channel into the guest failed: {e}"),
+                ));
+            }
+        };
+        // The guest's refusal is the right one — it knows whether this session was booted
+        // able to commit — so it is passed through rather than reworded. Its *answer* is a
+        // size and no image, which is the half it can fill in; the rest is below.
+        let wrote = match wrote {
+            Response::Commit(wrote) => wrote,
+            other => return other,
+        };
+
+        let guest = self.guest.as_ref().expect("just relayed through it");
+        let Some(scratch) = guest
+            .commit
+            .as_ref()
+            .map(|scratch| scratch.path().to_path_buf())
+        else {
+            return Response::Error(refused(
+                Error::INTERNAL_ERROR,
+                "the guest wrote a layer and this session has nowhere it could have put it",
+            ));
+        };
+        let base = guest.base_layers.clone();
+
+        let made = async {
+            crate::commit::keep(
+                &commit,
+                &scratch,
+                &base,
+                crate::base::store()?,
+                crate::base::built_store()?,
+            )
+            .await
+        }
+        .await;
+
+        // The image filled in on the way past, over the size the guest answered with — the
+        // two halves of one response, from the two ends that each know one of them.
+        match made {
+            Ok(image) => Response::Commit(CommitResp {
+                image: Some(image),
+                ..wrote
+            }),
+            Err(e) => Response::Error(refused(
+                Error::IO_FAILED,
+                format!("keeping this session's layer: {e}"),
+            )),
+        }
     }
 }
 
@@ -410,6 +498,42 @@ fn reach(asked: Option<&NetworkAccess>) -> Result<(Network, Vec<u16>), Error> {
     }
 
     Ok((network, asked.host_ports.clone()))
+}
+
+/// Refuse a session that named an image nobody built here.
+///
+/// **Said now, unlike a registry reference that cannot be resolved.** The difference is what
+/// finding out costs: whether an image made here is still here is a file test, where whether a
+/// registry has one is a round trip that belongs to a boot. A client told now can build the
+/// thing; one told at its first command has already paid for a boot it cannot use.
+fn already_built(asked: Option<&ImageSource>) -> Result<(), Error> {
+    let Some(rest) = asked
+        .map(|image| image.reference.as_str())
+        .and_then(|reference| reference.strip_prefix(LOCAL_HOST))
+    else {
+        return Ok(());
+    };
+
+    // A name this host cannot even read is not an image it is missing. Told apart, because
+    // the two ask the client for opposite things: "go and build it" is useless advice to
+    // somebody who spelled the reference wrong, and no spelling would ever have worked.
+    let id = built::digest_of(rest)
+        .map_err(|e| refused(Error::INVALID_PARAMS, format!("{LOCAL_HOST}{rest}: {e}")))?;
+
+    // And a store this server cannot open is this host's fault rather than the client's.
+    let built = crate::base::built_store()
+        .map_err(|e| refused(Error::IO_FAILED, format!("opening the built images: {e}")))?;
+
+    if built.has(&id) {
+        return Ok(());
+    }
+    Err(refused(
+        Error::UNKNOWN_IMAGE,
+        format!(
+            "{LOCAL_HOST}{rest}: no image by that name was made here — it was never committed, \
+             or this host's cache has been cleared"
+        ),
+    ))
 }
 
 /// The host directory a workfs URL names, or why it names none this backend can use.

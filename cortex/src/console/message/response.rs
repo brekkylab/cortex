@@ -23,7 +23,7 @@ use serde::{
     ser::SerializeMap,
 };
 
-use super::{Error, ImageSource, Method, NetworkAccess, utils::bytes};
+use super::{CommitResp, Error, ImageSource, Method, NetworkAccess, utils::bytes};
 
 /// What a request was answered with: the method's own result, or why there is none.
 ///
@@ -83,6 +83,7 @@ pub enum Response {
     Exec(ExecResp),
     Read(ReadResp),
     Write(WriteResp),
+    Commit(CommitResp),
 
     /// Why the method produced no result. See [`Error`] for the codes.
     Error(Error),
@@ -93,6 +94,7 @@ impl Response {
     /// answers whichever one asked, and says so with a code rather than a name.
     pub fn method(&self) -> Option<Method> {
         Some(match self {
+            Response::Commit(_) => Method::Commit,
             Response::Init(_) => Method::Init,
             Response::Exec(_) => Method::Exec,
             Response::Read(_) => Method::Read,
@@ -167,6 +169,7 @@ impl Serialize for Response {
             Response::Exec(exec) => map.serialize_entry("result", exec)?,
             Response::Read(read) => map.serialize_entry("result", read)?,
             Response::Write(write) => map.serialize_entry("result", write)?,
+            Response::Commit(commit) => map.serialize_entry("result", commit)?,
             Response::Error(error) => map.serialize_entry("error", error)?,
         }
 
@@ -236,6 +239,7 @@ impl<'de> Visitor<'de> for ResponseVisitor {
 /// method it answers.
 fn typed_result<E: de::Error>(method: Method, result: Bson) -> Result<Response, E> {
     Ok(match method {
+        Method::Commit => Response::Commit(payload(method, result)?),
         Method::Init => Response::Init(payload(method, result)?),
         Method::Exec => Response::Exec(payload(method, result)?),
         Method::Read => Response::Read(payload(method, result)?),

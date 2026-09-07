@@ -32,15 +32,15 @@
 //! path, inside this process, and does not care whether anything outside can see it. A
 //! parameter typed [`Mount`] asks for a tree the host already has — the caller must have
 //! mounted it, and what arrives is a directory that `std::fs`, a spawned program or a guest can
-//! open by name. [`Executable`] takes the second: it is handed a path its caller used and has to
-//! open the file its caller meant, so its signature says "a tree plugged into this host" rather
-//! than "a tree".
+//! open by name. [`Console`] takes the second: what a session names as its workfs is what a
+//! command it runs will open by name, so its signature says "a tree plugged into this host"
+//! rather than "a tree".
 //!
 //! Errors are [`std::io::Error`], classified by kind. There is no error type here to
 //! learn: a store's own `std::fs` calls travel up unchanged, and `FileSystem`'s docs say
 //! which kind answers what.
 //!
-//! [`Executable`]: crate::exec::Executable
+//! [`Console`]: crate::console::Console
 
 mod filesystem;
 mod mount;

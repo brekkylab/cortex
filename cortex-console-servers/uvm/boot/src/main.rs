@@ -61,7 +61,8 @@ use std::{
 use msb_krun::{DiskImageFormat, VmBuilder};
 
 use cortex_uvm_boot::{
-    BaseFormat, BootArgs, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
+    ABIN_ENV, BaseFormat, BootArgs, COMMIT_ENV, COMMIT_PATH, COMMIT_TAG, COMMITTABLE_ENV,
+    GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
     PORT_NAME, SHARE_ENV, UPPER_ENV, WORKFS_TAG,
 };
 
@@ -104,6 +105,17 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
         // guest opens is one thing rather than a pair.
         .console(|c| c.port(PORT_NAME, port, port));
 
+    // `/abin`, third and so `/dev/vdc`. Read-only **at the device**, which is the whole
+    // reason it is a disk and not a share: a virtio-fs share has no such option, and the
+    // guest is root inside itself, so a guest-side mount flag would be a guard rail rather
+    // than a boundary.
+    //
+    // Raw, always: `/abin` is cortex's own executables and no others, which is one layer of
+    // the store attached as it stands rather than anything stitched into a descriptor.
+    if let Some(abin) = &args.abin {
+        builder = builder.disk(|d| d.path(abin).read_only(true).format(DiskImageFormat::Raw));
+    }
+
     // The network, when the session asked for one. Everything about it lives in this process:
     // the stack, its runtime, and the policy it enforces — and all three have to outlive
     // `enter` below, which never returns, so the guard is held to the end of the function that
@@ -129,6 +141,13 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
         None => None,
     };
 
+    // A committable session's scratch. Shared rather than sent back over the channel: a
+    // layer can be hundreds of megabytes, and that channel is bounded by `MAX_PAYLOAD` and is
+    // also what the protocol itself runs on.
+    if let Some(out) = &args.commit_out {
+        builder = builder.fs(|fs| fs.tag(COMMIT_TAG).path(out));
+    }
+
     // What the stack wants the guest to know: its address, its gateway, its resolver. Passed
     // through as the stack spelled them — the names are `microsandbox-network`'s own, and this
     // process is not a party to what they mean. The guest reads them; see its `net` module.
@@ -142,6 +161,22 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
                 .env(UPPER_ENV, GUEST_UPPER_DEV);
             let e = match &share {
                 Some(share) => e.env(SHARE_ENV, share),
+                None => e,
+            };
+            let e = match &args.abin {
+                Some(_) => e.env(ABIN_ENV, GUEST_ABIN_DEV),
+                None => e,
+            };
+            // Two values and not one: the first is read before `pivot_root` and the second
+            // after, and a guest with only the second could write a layer it had no way to
+            // see. See `COMMITTABLE_ENV`.
+            let e = if args.committable {
+                e.env(COMMITTABLE_ENV, "1")
+            } else {
+                e
+            };
+            let e = match &args.commit_out {
+                Some(_) => e.env(COMMIT_ENV, COMMIT_PATH),
                 None => e,
             };
             guest_net

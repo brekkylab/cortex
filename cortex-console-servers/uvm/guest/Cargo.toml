@@ -35,6 +35,12 @@ libc = "0.2"
 # rather than as an environment value. Already in the tree via `bson`; named here
 # because the derive macro has to be.
 serde = { version = "1", features = ["derive"] }
+# Writing the layer a commit produces. The host reads it with `ingest_tar`, which already
+# understands OCI whiteouts, so tar is what the two ends agree on rather than a format one of
+# them would have to learn. Hand-rolling a writer would save a little of the size this binary
+# pays on every cold start, and would have to get long names right — which paths under a macOS
+# `$TMPDIR` need immediately.
+tar = "0.4"
 tokio = { version = "1", features = [
     "fs",
     "io-util",
@@ -43,6 +49,12 @@ tokio = { version = "1", features = [
     "process",
     "rt-multi-thread",
 ] }
+
+# The unit tests here build only for a linux target — the crate itself does not compile
+# anywhere else, `net.rs` included — so they run on a linux host and are type-checked
+# everywhere else by `cargo clippy --all-targets --target aarch64-unknown-linux-musl`.
+[dev-dependencies]
+tempfile = "3"
 
 # This binary is embedded in `cortex-uvm-console` and written into every boot
 # root, so its size is paid on every cold start.

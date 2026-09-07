@@ -37,13 +37,12 @@ use std::{
 
 use microsandbox_image::{
     GlobalCache, Platform, PullOptions, Reference, Registry, RootfsMaterialization,
-    erofs::write_erofs,
     ext4::{Ext4FormatOptions, format_ext4},
     tar::{Compression, ingest_compressed_tar},
     tree::ResourceLimits,
 };
 
-use crate::contract::{BaseFormat, GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec};
+use crate::contract::{GUEST_BIN_PATH, IMAGE_SPEC_PATH, ImageSpec};
 
 /// The guest half, cross-compiled and embedded by `build.rs`. Written into every boot
 /// root, which is why the guest crate optimises for size.
@@ -121,19 +120,6 @@ pub fn resolve_kernel() -> anyhow::Result<PathBuf> {
     })
 }
 
-/// A read-only base image, and the two things about it that are not the path.
-pub struct BaseImage {
-    /// The image on this host.
-    pub path: PathBuf,
-
-    /// What a boot has to attach it as.
-    pub format: BaseFormat,
-
-    /// What the image says about running a process in it. Empty for a base that came with
-    /// no such statement, which is every base that is not an OCI image.
-    pub spec: ImageSpec,
-}
-
 /// An OCI reference to use as the base — `python:3.13`, or `python@sha256:…`.
 ///
 /// A tag is resolved once and then cached by digest, so a session started later gets the
@@ -147,36 +133,6 @@ pub const IMAGE_ENV: &str = "CORTEX_UVM_IMAGE";
 /// A caller's knob and not a computed value: read from this server's own environment, like
 /// [`IMAGE_ENV`]. A session that survives the console, for whoever wants one.
 pub const SESSION_IMAGE_ENV: &str = "CORTEX_UVM_SESSION_IMAGE";
-
-/// The read-only base image every session overlays, provisioning it once if it is not
-/// cached.
-///
-/// Three sources, in the order a client's own answer beats a server's:
-///
-/// Two sources, and the choice between them was made at `init`:
-///
-/// - `reference` — an OCI image, pulled and materialized (see [`pull`]). What the session named,
-///   or what [`IMAGE_ENV`] named for a session that named nothing; the server settled which
-///   before calling here.
-/// - `None` — the pinned rootfs tarball, encoded to an EROFS (see [`Rootfs`]).
-pub async fn base_image(reference: Option<&str>) -> anyhow::Result<BaseImage> {
-    if let Some(reference) = reference {
-        return pull(reference).await;
-    }
-
-    let rootfs = Rootfs::host();
-    let image = home()?.join("images").join(rootfs.image_name());
-    if !image.exists() {
-        let tarball = rootfs.fetch().await?;
-        encode_erofs(&tarball, &image).await?;
-    }
-
-    Ok(BaseImage {
-        path: image,
-        format: BaseFormat::Raw,
-        spec: ImageSpec::default(),
-    })
-}
 
 /// Pull an OCI image and make a base out of it.
 ///
@@ -192,7 +148,20 @@ pub async fn base_image(reference: Option<&str>) -> anyhow::Result<BaseImage> {
 /// is not that call but a way for a caller to hand them over: a console session says nothing
 /// about a registry, and an environment variable holding a password is not a channel worth
 /// adding by default.
-async fn pull(reference: &str) -> anyhow::Result<BaseImage> {
+/// A pulled image, as the parts cortex needs from it.
+///
+/// Not a disk. `microsandbox-image` stitches one of its own, but a commit has to be able to
+/// add a layer to whatever it started from and that stitch cannot be added to — the data maps
+/// behind it exist only during the pull. So what comes back is the layers, and cortex builds
+/// its own base out of them. See `base::seeded`.
+pub struct Pulled {
+    pub manifest_digest: microsandbox_image::Digest,
+    /// Each pulled layer's EROFS on this host, bottom first.
+    pub layers: Vec<PathBuf>,
+    pub config: microsandbox_image::ImageConfig,
+}
+
+pub async fn pull(reference: &str) -> anyhow::Result<Pulled> {
     let reference: Reference = reference
         .parse()
         .map_err(|e| anyhow::anyhow!("{IMAGE_ENV}: {reference} is not an OCI reference: {e}"))?;
@@ -224,20 +193,21 @@ async fn pull(reference: &str) -> anyhow::Result<BaseImage> {
         .map_err(|e| anyhow::anyhow!("pulling {reference}: {e}"))?;
     took(&format_args!("{reference}"), started);
 
-    let path = cache.vmdk_path(&pulled.manifest_digest);
-    anyhow::ensure!(
-        path.exists(),
-        "pulling {reference} left no image at {}",
-        path.display()
-    );
+    let mut layers = Vec::with_capacity(pulled.layer_diff_ids.len());
+    for diff_id in &pulled.layer_diff_ids {
+        let path = cache.layer_erofs_path(diff_id);
+        anyhow::ensure!(
+            path.exists(),
+            "pulling {reference} left no layer at {}",
+            path.display()
+        );
+        layers.push(path);
+    }
 
-    Ok(BaseImage {
-        path,
-        format: BaseFormat::Vmdk,
-        spec: ImageSpec {
-            env: pulled.config.env,
-            working_dir: pulled.config.working_dir,
-        },
+    Ok(Pulled {
+        manifest_digest: pulled.manifest_digest,
+        layers,
+        config: pulled.config,
     })
 }
 
@@ -345,6 +315,35 @@ impl Drop for BootRoot {
     }
 }
 
+/// Where a committable session's guest writes the layer a `commit` produces.
+///
+/// One session's, and owned outright: dropping this removes the directory and whatever the
+/// guest left in it. A layer can be hundreds of megabytes, so leaving one behind would be a
+/// real cost — and the sweep that catches a killed server's leavings finds this too, because
+/// it is named the same way everything else here is.
+pub struct CommitScratch {
+    path: PathBuf,
+}
+
+impl CommitScratch {
+    pub fn create() -> anyhow::Result<CommitScratch> {
+        let path = unique(std::env::temp_dir(), "commit");
+        std::fs::create_dir_all(&path)
+            .map_err(|e| anyhow::anyhow!("making {}: {e}", path.display()))?;
+        Ok(CommitScratch { path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for CommitScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Marks a path as a console server's and carries the owning pid, so a later run can tell
 /// what was abandoned from what is in use. See [`sweep_abandoned`].
 pub const PREFIX: &str = "cortex-uvm-";
@@ -430,7 +429,7 @@ pub fn sweep_abandoned() {
 ///
 /// Pinned per architecture rather than resolved, because "latest" is a moving target and
 /// the thing being downloaded decides what every command in every guest runs.
-struct Rootfs {
+pub struct Rootfs {
     url: &'static str,
     /// Lowercase hex SHA-256 of the tarball.
     sha256: &'static str,
@@ -440,7 +439,7 @@ struct Rootfs {
 }
 
 impl Rootfs {
-    fn host() -> Rootfs {
+    pub fn host() -> Rootfs {
         match std::env::consts::ARCH {
             "aarch64" => Rootfs {
                 url: "https://dl-cdn.alpinelinux.org/alpine/latest-stable/releases/aarch64/alpine-minirootfs-3.24.1-aarch64.tar.gz",
@@ -457,12 +456,8 @@ impl Rootfs {
         }
     }
 
-    fn image_name(&self) -> String {
-        format!("{}.erofs", self.name)
-    }
-
     /// The tarball on disk, downloading and verifying it if it is not cached.
-    async fn fetch(&self) -> anyhow::Result<PathBuf> {
+    pub async fn fetch(&self) -> anyhow::Result<PathBuf> {
         let dest = home()?.join("rootfs").join(format!("{}.tar.gz", self.name));
         if dest.exists() && digest(&dest).await? == self.sha256 {
             return Ok(dest);
@@ -542,20 +537,17 @@ async fn digest(path: &Path) -> anyhow::Result<String> {
     hash.map_err(|e| anyhow::anyhow!("hashing {}: {e}", path.display()))
 }
 
-/// Turn a gzipped rootfs tarball into a read-only EROFS image.
+/// Read a gzipped rootfs tarball into a file tree.
 ///
-/// Written to a temp path and renamed, so two consoles provisioning the same base image at
-/// once cannot see a half-encoded one: both do the work, and the rename decides which
-/// copy survives.
-async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = image.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    // Announced like the download above, and for the same reason: it is minutes of CPU on a
-    // cold cache and there is nothing else on stderr to say a session is still coming up.
+/// The tree and not an image: what a base is made of is a layer, and turning a tree into one
+/// is the layer store's. This half is here because it is the tarball's — which compression,
+/// which limits — and `assets` is what owns the tarball.
+///
+/// Announced, because it is minutes of CPU on a cold cache and there is nothing else on
+/// stderr to say a session is still coming up.
+pub async fn ingest(tarball: &Path) -> anyhow::Result<microsandbox_image::tree::FileTree> {
     eprintln!(
-        "cortex-uvm-console: encoding {}",
+        "cortex-uvm-console: reading {}",
         tarball.file_name().unwrap_or_default().to_string_lossy()
     );
     let started = std::time::Instant::now();
@@ -565,23 +557,12 @@ async fn encode_erofs(tarball: &Path, image: &Path) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("reading {}: {e:?}", tarball.display()))?;
 
-    let tmp = unique(
-        image.parent().unwrap_or(Path::new(".")).to_path_buf(),
-        "base.erofs",
-    );
-    let (tree, encode_to) = (ingested.tree, tmp.clone());
-    tokio::task::spawn_blocking(move || write_erofs(&tree, &encode_to))
-        .await
-        .map_err(|e| anyhow::anyhow!("encoding the base image: {e}"))?
-        .map_err(|e| anyhow::anyhow!("encoding the base image: {e:?}"))?;
-
-    std::fs::rename(&tmp, image)?;
     took(
         &format_args!(
             "{}",
-            image.file_name().unwrap_or_default().to_string_lossy()
+            tarball.file_name().unwrap_or_default().to_string_lossy()
         ),
         started,
     );
-    Ok(())
+    Ok(ingested.tree)
 }

@@ -47,6 +47,7 @@ use cortex::console::{
     Call, Message, RequestId, Response,
     stdio::{read, write},
 };
+use cortex_uvm_console::layer::{LayerId, LayerStore};
 use tokio::{
     io::{AsyncReadExt as _, BufReader},
     net::{
@@ -56,10 +57,16 @@ use tokio::{
 };
 
 use crate::{
-    assets::{self, BootRoot, SessionImage},
+    abin,
+    assets::{self, BootRoot, CommitScratch, SessionImage},
     contract::{BootArgs, HANDSHAKE, Network},
     helper::boot_helper,
 };
+
+/// Where layers live, shared by everything on this host that makes one.
+fn layer_store() -> anyhow::Result<LayerStore> {
+    LayerStore::open(&assets::home()?.join("layers"))
+}
 
 /// Guest vCPUs and memory, if this server was told to override the boot's own defaults.
 ///
@@ -98,6 +105,22 @@ pub struct Guest {
     _socket: Socket,
     _session: SessionImage,
     _boot_root: BootRoot,
+
+    /// The layers the base this guest booted on is made of, bottom first, as ids.
+    ///
+    /// Kept because a `commit` stitches onto them, and because asking again would mean
+    /// resolving the base a second time — which for a pulled image is a registry round trip.
+    ///
+    /// Ids and not layers: a `Layer` carries its whole data map, one entry per file in it, and
+    /// a commit reads nothing from these but the names. The store is the way from a name back
+    /// to the layer, and it is walked once at the commit rather than held until the quit.
+    pub base_layers: Vec<LayerId>,
+
+    /// Where this guest writes a commit's layer, for a session that may make one.
+    ///
+    /// Held so that it outlives the guest that writes into it and no longer: the directory
+    /// goes when the session does.
+    pub commit: Option<CommitScratch>,
 }
 
 impl Guest {
@@ -114,10 +137,38 @@ impl Guest {
         image: Option<&str>,
         network: Network,
         host_ports: &[u16],
+        committable: bool,
     ) -> anyhow::Result<Guest> {
         let kernel = assets::resolve_kernel()?;
-        let base = assets::base_image(image).await?;
+        // The layers come back with the disk because the session keeps them: a `commit`
+        // stitches onto what its base was made of, and asking again would mean pulling twice.
+        let (base, base_layers) = crate::base::image(image).await?;
         let helper = boot_helper()?;
+
+        // `/abin` is the same disk for every session — cortex's own executables and no
+        // others — so this is a store lookup that finds it already there after the first
+        // session on this host. On a blocking thread all the same: the first one reads every
+        // executable and writes them back out as an EROFS, which is the same reason
+        // `SessionImage::create` below is not on the runtime's own thread.
+        let store = layer_store()?;
+        // **The one place this variable is read.** Here rather than inside `disk`, where the
+        // rest of this server's configuration is read, and so that building the disk is a
+        // function of its arguments and a test can call it twice.
+        let builtin = std::env::var_os(abin::DIR_ENV).map(PathBuf::from);
+        let found = tokio::task::spawn_blocking(move || abin::disk(builtin.as_deref(), &store))
+            .await
+            .map_err(|e| anyhow::anyhow!("preparing /abin: {e}"))?;
+
+        // Cortex has published no executables yet, so the strict reading would mean no
+        // session boots at all. A session without them costs its `/abin` and not its
+        // existence — said on the way past so it is not silent.
+        let abin = match found {
+            Ok(disk) => Some(disk),
+            Err(e) => {
+                eprintln!("cortex-uvm-console: this session gets no /abin: {e}");
+                None
+            }
+        };
 
         // Formatting writes a filesystem's worth of metadata, which is milliseconds and
         // still not something to do on the runtime's own thread.
@@ -125,6 +176,10 @@ impl Guest {
             .await
             .map_err(|e| anyhow::anyhow!("formatting the session image: {e}"))??;
         let boot_root = BootRoot::create(&base.spec)?;
+
+        // Made only for a session that said it might commit: it is a directory the guest can
+        // write into, and a session that will never write a layer should not be handed one.
+        let commit = committable.then(CommitScratch::create).transpose()?;
 
         let socket = Socket::bind()?;
 
@@ -140,6 +195,9 @@ impl Guest {
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
             workfs: workfs.map(Path::to_path_buf),
+            committable,
+            commit_out: commit.as_ref().map(|scratch| scratch.path().to_path_buf()),
+            abin,
             vcpus: number(VCPUS_ENV),
             memory_mib: number(MEMORY_ENV),
         };
@@ -183,6 +241,8 @@ impl Guest {
             _socket: socket,
             _session: session,
             _boot_root: boot_root,
+            base_layers,
+            commit,
         })
     }
 

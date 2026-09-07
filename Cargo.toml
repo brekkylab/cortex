@@ -2,8 +2,9 @@
 resolver = "3"
 members = [
     "cortex",
-    "cortex-execs/index",
+    "cortex-execs/storebase",
     "cortex-execs/mem",
+    "cortex-execs/index",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",
@@ -11,7 +12,6 @@ members = [
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
 # bare `cargo build` — for a target that has no host to run on.
-#
 exclude = ["cortex-console-servers/uvm/guest"]
 
 [workspace.package]
@@ -21,15 +21,18 @@ edition = "2024"
 [workspace.dependencies]
 anyhow = "1"
 # Declared for a consumer that wants the macro, not used by any member: `FileSystem`,
-# `Client`, `Server` and `Executable` are async *and* object-safe (`dyn FileSystem`,
-# `Box<dyn Client>`), which native `async fn` in traits cannot be — and they box their
-# futures by hand, so the lifetimes are visible where the borrows are.
+# `Client` and `Server` are async *and* object-safe (`dyn FileSystem`, `Box<dyn Client>`),
+# which native `async fn` in traits cannot be — and they box their futures by hand, so the
+# lifetimes are visible where the borrows are.
 async-trait = "0.1"
 # The console wire. Declared here rather than per crate because `Outcome::Result`
 # carries a `Bson` in public API: two versions of it in one build would be a type
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
 cortex = { path = "cortex", default-features = false }
+# The store format `mem` and `index` share: the tables, what a store says about
+# itself, and how one is opened.
+cortex-exec-storebase = { path = "cortex-execs/storebase" }
 # The boot process, and — as its library half — the strings a console server starts one with.
 # A server takes it without the `vm` feature and so links no VMM; see its own manifest.
 cortex-uvm-boot = { path = "cortex-console-servers/uvm/boot", default-features = false }
@@ -44,15 +47,10 @@ sha2 = "0.10"
 tempfile = "3"
 tokio = "1"
 
-# The full-text index behind `cortex-exec-index`, and the parser its `--help` comes out of.
-# Only that crate takes either, which is what keeps a search engine and an argument parser out
-# of `cortex` — the same rule `rusqlite` follows for `cortex-exec-mem`.
-#
-# clap's `string` feature is load-bearing rather than a convenience: one executable can be
-# registered under several names, so the usage line has to carry the name it was invoked by,
-# and without `string` a command's name can only be a `&'static str`.
-clap = { version = "4", features = ["derive", "string"] }
-tantivy = "0.26"
+# The parser the programs in `cortex-execs/` are driven by, and where their `--help` comes
+# from. Only those take it, which is what keeps an argument parser out of `cortex` — the same
+# rule `rusqlite` follows.
+clap = { version = "4", features = ["derive"] }
 
 # The in-process, Rust-native libkrun fork. `VmBuilder` is what lets a boot be
 # assembled out of parts this workspace already holds: tagged virtio-fs shares, two
@@ -112,12 +110,21 @@ serde_json = "1"
 unicode-normalization = "0.1"
 
 # A memory store that is one file in a cortex tree. `bundled` on purpose: the store
-# is a file an executable opens on a mount, and which SQLite answers for it
-# must not be whichever one the host happens to ship — the schema is an FTS5 index,
-# and FTS5 is a compile-time option the host's own SQLite is free to have been built
-# without. A store that opened and then answered every search with nothing is the
-# failure being avoided.
+# is a file a delegated executable opens on a mount, and which SQLite answers for it
+# must not be whichever one the host happens to ship — the schema below uses an
+# extension that is compiled against these headers.
 rusqlite = { version = "0.40", features = ["bundled"] }
+# Nearest-neighbour search inside that same file: a `vec0` virtual table, statically
+# registered as an auto-extension rather than loaded from a `.dylib` nobody would
+# have. Pinned off the 0.1.10 alphas, whose published crate is missing a `#include`d
+# source file and does not compile.
+sqlite-vec = "0.1.9"
+
+# Bytes in a BSON document. A layer's data map is keyed by paths, and a path in a layer is
+# whatever filesystem it came from allowed rather than necessarily UTF-8 — so it is stored as
+# bytes. Without this, serde hands BSON a `Vec<u8>` as an array of integers, which is both
+# several times larger and a different type coming back.
+serde_bytes = "0.11"
 
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.
