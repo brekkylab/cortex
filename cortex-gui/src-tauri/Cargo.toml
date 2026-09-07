@@ -1,0 +1,48 @@
+[package]
+name = "cortex-gui"
+version = "0.1.0"
+edition = "2024"
+description = "A desktop window onto a cortex workspace"
+publish = false
+
+# Its own workspace root, and deliberately not a member of the one above.
+#
+# A Tauri app pulls in the whole desktop webview stack — several hundred crates that
+# nothing else here links — and a member is built by a bare `cargo build` at the root.
+# Charging every `cargo test` in this repository for a GUI's dependency tree buys
+# nothing: the only code shared with the workspace is `cortex` itself, which arrives
+# below as a path dependency and resolves its own `workspace = true` inheritance
+# against the root manifest exactly as it does for any other consumer.
+[workspace]
+
+[lib]
+# `cortex_gui_lib` rather than `cortex_gui`, so the library and the binary that runs it
+# can both exist under one package name.
+name = "cortex_gui_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The workspace, the stores mounted into it, and the errors all of it answers in. The
+# two network stores are named here because the connectors in the UI are exactly them;
+# no binding feature is taken, since a window reads the tree in-process and nothing
+# asks the host kernel for a mount.
+cortex = { path = "../../cortex", features = ["notion", "s3"] }
+serde = { version = "1", features = ["derive"] }
+# A resource's manifest is a file in the workspace, so it needs a format that survives being
+# read by something other than this program — see `agents.rs`.
+serde_json = "1"
+tauri = { version = "2", features = [] }
+# The "파일 추가" button's file chooser. Drag-and-drop arrives on the window itself and
+# needs no plugin; a picker is the same import for whoever would rather not drag.
+tauri-plugin-dialog = "2"
+# `sync` for the locks the workspace is held behind, `fs` for reading host files during
+# an import. `cortex`'s own features already put a multi-threaded runtime in the build.
+tokio = { version = "1", features = ["fs", "sync"] }
+
+[dev-dependencies]
+# `macros` for `#[tokio::test]`. The resource commands are `async` over an async trait, so the
+# tests that drive them need a runtime to be on.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

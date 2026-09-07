@@ -9,10 +9,16 @@ members = [
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",
 ]
-# `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
-# it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
-# bare `cargo build` — for a target that has no host to run on.
-exclude = ["cortex-console-servers/uvm/guest"]
+# Two directories that hold a crate this workspace does not build.
+#
+# * `cortex-console-servers/uvm/guest` is the guest half of `cortex-uvm-console`: its own
+#   workspace root, because it is cross-compiled to `*-unknown-linux-musl` and a member would be
+#   built for the host by a bare `cargo build` — for a target that has no host to run on.
+# * `cortex-gui/src-tauri` is a desktop app, and its own workspace root for the reason its
+#   manifest gives: a member is built by a bare `cargo build`, and the webview stack it links is
+#   several hundred crates nothing else here needs. It reaches `cortex` as a path dependency,
+#   which is the only edge between them.
+exclude = ["cortex-console-servers/uvm/guest", "cortex-gui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
