@@ -486,7 +486,39 @@ impl GdriveFs {
             eprintln!("gdrive: shared drives could not be listed, root omits them: {e:#}");
         }
         let complete = listed.is_ok();
-        if let Ok(drives) = listed {
+        if let Ok(mut drives) = listed {
+            // Ordered here rather than by the API: `drives.list` takes no `orderBy` — Google
+            // accepts one and discards it, measured, where `files.list` answers `400` to a
+            // bad value — and documents no order of its own. Left as it arrived, two `ls /`
+            // could disagree, and worse: `unique_name` gives the plain name to whichever of
+            // two same-named drives it reaches first, so the suffix would move between
+            // listings. That is the rank-in-a-name failure `disambiguate` exists to avoid,
+            // and a shared drive has no tag to fall back on.
+            //
+            // Not `files.list`'s key either: a shared drive has no `modifiedTime` at all,
+            // and asking for one is a `400 Invalid field selection`.
+            //
+            // By name for a reader, then by id, which is the part that makes it total: two
+            // drives really can share a name, and only their ids tell them apart. Ordering
+            // by a time would not do it — two drives created in the same second leave the
+            // suffix loose again, which is the whole thing this is for.
+            drives.sort_by(|a, b| {
+                let key = |d: &Value| {
+                    let name: String = d
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .nfc()
+                        .collect();
+                    let id = d
+                        .get("id")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (name, id)
+                };
+                key(a).cmp(&key(b))
+            });
             // Composed, because that is what `resolve` compares by. Two shared drives
             // spelled the same name two ways would otherwise both keep it, and one of
             // them would be unreachable from the root.
