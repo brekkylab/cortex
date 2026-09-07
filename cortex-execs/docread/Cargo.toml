@@ -28,7 +28,7 @@ path = "src/main.rs"
 # is found or made.
 [features]
 default = ["docx"]
-docx = ["dep:docx-rs"]
+docx = ["dep:docx-rs", "dep:zip"]
 pdfium = ["dep:pdfium-render", "dep:flate2", "dep:sha2", "dep:ureq"]
 
 [dependencies]
@@ -64,6 +64,20 @@ clap = { workspace = true }
 # It also parses real files the alternatives choke on, and it writes as well as reads — which
 # is what the tests build their fixtures with, so no `.docx` is checked into this repository.
 docx-rs = { version = "0.4.22", optional = true }
+
+# Deciding whether a file is a Word document, which is a different job from reading one and
+# the reason this is here beside `docx-rs`. `read_docx` takes the file's bytes — all of them,
+# in memory — so what asks the question cannot be it: every file this program is pointed at
+# would then be read whole before the text reader got to say what it holds, and a window onto
+# two lines of a gigabyte would cost a gigabyte. A zip carries an index of its entries at its
+# end, so `ZipArchive` answers `word/document.xml`, yes or no, out of a seek and a few
+# kilobytes however large the archive is.
+#
+# It costs no dependency: `docx-rs` links this same crate to do its own unpacking, so the
+# version here is the one already in the build either way. `default-features = false` because
+# nothing is being decompressed — the entry *names* are stored uncompressed, which is the
+# whole reason the question is cheap.
+zip = { version = "8", optional = true, default-features = false }
 
 # The PDF engine's Rust side, and only its bindings: `static` is the feature that offers
 # `bind_to_statically_linked_library`, which is the whole point — no `dlopen`, no `.so` beside

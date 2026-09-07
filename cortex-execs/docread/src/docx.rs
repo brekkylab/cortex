@@ -29,7 +29,11 @@
 //! body, and a caller reading line 12 of a document means the twelfth paragraph of what is
 //! written on the page — not a running header that would push every number down by one.
 
-use std::{io::Cursor, path::Path};
+use std::{
+    fs::File,
+    io::{BufReader, Cursor, Read as _, Seek as _},
+    path::Path,
+};
 
 use docx_rs::{
     DocumentChild, Insert, InsertChild, Paragraph, ParagraphChild, Run, RunChild, Table,
@@ -43,18 +47,42 @@ pub const ORIGIN: &str = "paragraphs of this Word document, not lines in the fil
 
 /// What every zip begins with.
 ///
-/// Asked first, and not only because it is cheap: without it the search below is a search for
-/// a string, and a *text* file that happens to contain `word/document.xml` — this file does —
-/// would be handed to a zip reader that then says something baffling about it.
+/// Asked first because it is the whole of what most files cost this module. Everything below
+/// it is work about an archive, and a file that is not one — the text file, the source file,
+/// the log, which is nearly everything this program is pointed at — is four bytes and gone.
+/// Handed straight to a zip reader instead, it would be crawled backwards end to end looking
+/// for a central directory it does not have.
 const ZIP: &[u8] = b"PK\x03\x04";
 
 /// The entry every `.docx` has and the other zips do not.
 ///
-/// Searched for in the file's own bytes, because a zip stores its entry names uncompressed:
-/// the name is there to be found without unpacking anything. This is what tells a Word
-/// document from the `.xlsx`, `.pptx` and `.jar` that are the same container — asked of the
-/// bytes, like every other question here, and not of the extension.
-const BODY: &[u8] = b"word/document.xml";
+/// Looked up in the archive's own index rather than searched for in the file: a zip ends with
+/// a directory of its entry names, so this is a seek and a few kilobytes whatever the archive
+/// weighs. That it is exact is the second thing it buys — the name is an entry or it is not,
+/// where a search over the bytes also finds it in a `.xlsx` that happens to embed one and in
+/// prose about the format. This is what tells a Word document from the `.xlsx`, `.pptx` and
+/// `.jar` that are the same container, and it is asked of the file and not of its extension,
+/// like every other question here.
+const BODY: &str = "word/document.xml";
+
+/// What a zip ends with.
+///
+/// The end-of-central-directory record is what a zip reader looks for first, and it is asked
+/// about here rather than left to [`zip`] because a reader handed a file that has no such
+/// record goes looking: backwards, in windows, to the front of the file. That is a gigabyte
+/// of reading to answer *no* about a gigabyte of junk that happens to begin `PK`.
+///
+/// Looking in the only place it can be — see [`TAIL`] — is one read instead. An archive that
+/// has it is then handed over and the reader finds it in its own first window; a file that
+/// does not is not an archive anything could read, and that is the answer.
+const EOCD: &[u8] = b"PK\x05\x06";
+
+/// How much of the end of a file [`EOCD`] can be in.
+///
+/// The record is 22 bytes and the archive's comment follows it, and the length of that
+/// comment is a `u16` — so 65535 bytes and not one more, whatever the archive weighs. Which
+/// is what makes the question a bounded one: 64 KiB of the tail, and never a byte of the rest.
+const TAIL: u64 = 22 + u16::MAX as u64;
 
 /// `limit` lines of `path`'s paragraphs from line `offset`, or `None` if this is not a Word
 /// document at all.
@@ -62,21 +90,91 @@ const BODY: &[u8] = b"word/document.xml";
 /// `None` and not a refusal, so that the caller can go on to name what the file actually is.
 /// Once the body part is known to be in there, every later failure is a refusal about a Word
 /// document — which is the truth, and more use than being told it is a zip.
+///
+/// # The file is read whole, and only once it is known to be a document
+///
+/// [`read_docx`] parses out of memory, so a document costs its own size — there is no reading
+/// a `.docx` a window at a time, and little point: the text is spread over compressed XML
+/// that has to be unpacked to be counted, and what comes back is the whole document either
+/// way.
+///
+/// What matters is that nothing *else* costs that. This runs before [`text::read`] on every
+/// file the program is handed, so a check that read the bytes to look at them would be the
+/// text reader's bound — hold the window, walk the rest — undone from underneath by the
+/// module that runs first. [`is_document`] is therefore bounded on purpose, and the whole
+/// read happens on the other side of it.
 pub fn read(path: &Path, offset: usize, limit: usize) -> Option<std::io::Result<Window>> {
     // A file that will not open at all is not this module's to refuse: whatever is wrong with
     // it — a directory, a permission — the read that follows meets the same thing and says it
     // about the file rather than about a look inside a zip.
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(mut file) = File::open(path) else {
         return None;
     };
-    if !bytes.starts_with(ZIP) || !bytes.windows(BODY.len()).any(|window| window == BODY) {
+    if !is_document(BufReader::new(&file)) {
         return None;
     }
-    Some(lines(&bytes).and_then(|text| {
-        // Through the same window as every other read, so a number, a cut line and the count
-        // at the end mean what they mean everywhere else.
-        text::window(Cursor::new(text.into_bytes()), offset, limit, None)
-    }))
+    Some(
+        bytes(&mut file)
+            .and_then(|bytes| lines(&bytes))
+            .and_then(|text| {
+                // Through the same window as every other read, so a number, a cut line and the
+                // count at the end mean what they mean everywhere else.
+                text::window(Cursor::new(text.into_bytes()), offset, limit, None)
+            }),
+    )
+}
+
+/// Whether this is a Word document, out of a peek and an index.
+///
+/// Two questions, neither of which is the file's length: the four bytes that say it is a zip,
+/// and then the archive's directory, which lists what is in it without any of it being
+/// unpacked. What that costs is a read of the head and a read of the tail.
+///
+/// A zip that will not open is a `false` and not a document that failed. It is the honest
+/// answer — an archive whose directory is unreadable is one nothing can say the contents of —
+/// and it leaves the file to be named as the zip it is, which is what [`text::read`] does with
+/// it. The refusal about a document that will not parse is still there for the case it is
+/// about: a readable archive holding a body part that the parser then chokes on.
+fn is_document(mut reader: impl std::io::Read + std::io::Seek) -> bool {
+    let mut head = [0; ZIP.len()];
+    // A file shorter than the magic is not a zip, which is what the failure means here.
+    if reader.read_exact(&mut head).is_err() || head != *ZIP {
+        return false;
+    }
+    if !ends_with_a_directory(&mut reader) {
+        return false;
+    }
+    // Wherever the reads above left the cursor: an archive is read from its end, and
+    // `ZipArchive` seeks there itself.
+    zip::ZipArchive::new(reader).is_ok_and(|archive| archive.index_for_name(BODY).is_some())
+}
+
+/// Whether the tail of `reader` holds the record a zip ends with. See [`EOCD`].
+fn ends_with_a_directory(reader: &mut (impl std::io::Read + std::io::Seek)) -> bool {
+    let Ok(len) = reader.seek(std::io::SeekFrom::End(0)) else {
+        return false;
+    };
+    if reader
+        .seek(std::io::SeekFrom::Start(len.saturating_sub(TAIL)))
+        .is_err()
+    {
+        return false;
+    }
+    // Bounded by `TAIL` and by nothing else, which is the point of the function.
+    let mut tail = Vec::new();
+    reader.take(TAIL).read_to_end(&mut tail).is_ok()
+        && tail.windows(EOCD.len()).any(|bytes| bytes == EOCD)
+}
+
+/// The file, from the top, all of it.
+///
+/// Rewound rather than reopened: the file that was decided about is the file that is read,
+/// and a second `open` of the same path is a second chance for it to have become another one.
+fn bytes(file: &mut File) -> std::io::Result<Vec<u8>> {
+    file.rewind()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The document's text, a paragraph or a table row per line.
@@ -179,6 +277,8 @@ fn push_run(run: &Run, out: &mut String) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write as _;
+
     use docx_rs::{Delete, Docx, Paragraph, Run, Table, TableCell, TableRow};
 
     use super::*;
@@ -301,13 +401,90 @@ mod tests {
     }
 
     /// A zip that is not a Word document is not this module's to answer about, so that the
-    /// caller goes on to name it for what it is.
+    /// caller goes on to name it for what it is. A real archive, with a directory that reads
+    /// and no body part in it — which is the shape an `.xlsx` arrives in.
     #[test]
     fn a_zip_that_is_not_a_word_document_is_left_alone() {
+        use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("a.xlsx");
+        let mut zip = ZipWriter::new(std::fs::File::create(&path).expect("a file"));
+        zip.start_file(
+            "xl/workbook.xml",
+            SimpleFileOptions::default().compression_method(CompressionMethod::Stored),
+        )
+        .expect("an entry");
+        zip.write_all(b"<workbook/>").expect("the entry");
+        zip.finish().expect("an archive");
+
+        assert!(read(&path, 1, 10).is_none());
+    }
+
+    /// And so is a file that only begins like one: an archive whose directory cannot be read
+    /// is an archive nothing can say the contents of.
+    #[test]
+    fn a_file_that_only_starts_like_a_zip_is_left_alone() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let path = dir.path().join("a.zip");
         std::fs::write(&path, b"PK\x03\x04not a word document at all").expect("a zip");
 
         assert!(read(&path, 1, 10).is_none());
+    }
+
+    /// Deciding costs a peek, not the file. This is the property the whole of [`is_document`]
+    /// is shaped by: it runs on every file the program is handed, ahead of the reader whose
+    /// job is to hold a window and walk the rest, so a decision that read the bytes would be
+    /// that bound undone by the module that runs first.
+    #[test]
+    fn deciding_what_a_file_is_reads_a_peek_of_it() {
+        /// A reader that says how much of itself was read.
+        struct Counted<'a> {
+            bytes: Cursor<Vec<u8>>,
+            read: &'a std::cell::Cell<usize>,
+        }
+
+        impl std::io::Read for Counted<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.bytes.read(buf)?;
+                self.read.set(self.read.get() + read);
+                Ok(read)
+            }
+        }
+
+        impl std::io::Seek for Counted<'_> {
+            fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.bytes.seek(to)
+            }
+        }
+
+        let read = std::cell::Cell::new(0);
+        let large = vec![b'x'; 8 << 20];
+        assert!(!is_document(Counted {
+            bytes: Cursor::new(large.clone()),
+            read: &read,
+        }));
+        assert!(
+            read.get() <= ZIP.len(),
+            "a file that is not a zip is answered out of its first bytes, and {} were read",
+            read.get()
+        );
+
+        // A file that begins like a zip and is not one: the head, the tail, and nothing in
+        // between. This is the case [`TAIL`] is there for — left to the zip reader, it is a
+        // search backwards over the whole file for a record that is not in it.
+        let mut bytes = ZIP.to_vec();
+        bytes.extend_from_slice(&large);
+        read.set(0);
+        assert!(!is_document(Counted {
+            bytes: Cursor::new(bytes),
+            read: &read,
+        }));
+        assert!(
+            read.get() <= ZIP.len() + TAIL as usize,
+            "answering about a zip with no directory read {} of {}",
+            read.get(),
+            large.len()
+        );
     }
 }

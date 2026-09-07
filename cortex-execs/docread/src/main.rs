@@ -252,6 +252,12 @@ fn run(cli: Cli) -> Result<String, String> {
 /// a build with neither feature is [`text::read`] and nothing else. Nothing looks at the
 /// extension, for the reason every question about a file's contents is asked of its bytes: the
 /// name is a claim.
+///
+/// **Asking has to be cheaper than reading**, because these questions are asked of every file
+/// and answered `no` about nearly all of them. The one below is bounded on purpose ([`docx`],
+/// and see [`docx::read`]): a window onto two lines of a gigabyte of text costs a peek here,
+/// or else the reader whose whole design is to hold the window and walk the rest is bounded by
+/// a module that already read the file.
 fn read(
     file: &Path,
     offset: usize,
@@ -310,12 +316,58 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        io::Write as _,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use clap::error::ErrorKind;
     use tempfile::TempDir;
 
     use super::*;
+
+    /// The largest single allocation this test binary has made.
+    ///
+    /// What is being watched is a file's size turning into memory, and that has one shape: a
+    /// `Vec` as long as the file, allocated in one go and grown by doubling. So the largest
+    /// allocation is the whole of the number worth having, and it needs no allocator that
+    /// tracks what is live — a `fetch_max` on the way past.
+    ///
+    /// It is global because an allocator is: every test here is measured whether it looks or
+    /// not, and they run at the same time. Which is why what is asserted below is a fraction
+    /// of the file that was written rather than a tight number — everything else running
+    /// allocates kilobytes, and what this is here to catch is a megabyte per megabyte of file.
+    static LARGEST: AtomicUsize = AtomicUsize::new(0);
+
+    /// [`System`], counted.
+    struct Counted;
+
+    #[global_allocator]
+    static ALLOCATOR: Counted = Counted;
+
+    unsafe impl GlobalAlloc for Counted {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        // Counted too, and not only for tidiness: a `Vec` that was not told how long the file
+        // is arrives at the file's length through this and never through `alloc`.
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            LARGEST.fetch_max(size, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
 
     /// Through the same parser the program runs on, so that what these pin is what runs. The
     /// program's own name in front, because that is what `argv` carries.
@@ -532,6 +584,49 @@ mod tests {
             "{said}"
         );
         assert!(said.contains("     1\tA paragraph\n"), "{said}");
+    }
+
+    /// A file is not held in memory because it was looked at.
+    ///
+    /// The bound belongs to the text reader — the window is what it keeps — and what can take
+    /// it away is a question asked *before* it: reading a file to decide what it is costs the
+    /// file, whatever the reader would then have done. So this is a read of two lines of a
+    /// file far larger than the answer, in the build that also reads Word documents, and what
+    /// it asserts is that nothing on the way allocated the file's size.
+    ///
+    /// 64 MiB and a bound of an eighth of it: large enough that a read of the whole file is
+    /// unmistakable next to what a window and a `BufReader` cost, small enough to write in a
+    /// test. The number is a fraction of the file rather than a tight bound because [`LARGEST`]
+    /// is global — see it for why.
+    #[test]
+    fn a_large_file_that_is_not_a_document_is_not_held_in_memory() {
+        const SIZE: usize = 64 << 20;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("big.txt");
+        let mut file = std::fs::File::create(&path).expect("a file");
+        // Written a chunk at a time, so that the fixture is not itself the allocation being
+        // looked for.
+        let chunk: String = std::iter::repeat_n("line...\n", (1 << 20) / 8).collect();
+        for _ in 0..SIZE / chunk.len() {
+            file.write_all(chunk.as_bytes()).expect("the text");
+        }
+        file.sync_all().expect("the file");
+        let path = path.to_str().expect("UTF-8").to_owned();
+
+        // From here on the numbers are the program's.
+        LARGEST.store(0, Ordering::Relaxed);
+        let said = run_line(&[&path, "-o", "5", "-n", "2"]).expect("the file reads");
+        let largest = LARGEST.load(Ordering::Relaxed);
+
+        assert!(
+            said.starts_with("     5\tline...\n     6\tline...\n"),
+            "{said}"
+        );
+        assert!(
+            largest < SIZE / 8,
+            "a window of 2 lines allocated {largest} bytes of a {SIZE}-byte file"
+        );
     }
 
     /// Bare `docread` is a line that asked for nothing, and help is the useful answer to it.
