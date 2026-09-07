@@ -88,18 +88,26 @@ object_store = { version = "0.14", default-features = false, features = ["aws"] 
 
 # The Notion backend: an async HTTP client, plus the two things its payloads are
 # made of — page ids are UUIDs, and its timestamps are RFC 3339. reqwest 0.13
-# renamed `rustls-tls` → `rustls` and made `query`/`form` optional; pagination
-# uses `.query()`, so it is named.
+# renamed `rustls-tls` → `rustls` and made `query`/`form` optional; Notion's
+# pagination uses `.query()` and Google's token endpoint takes a form body, so
+# both are named.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
     "query",
+    "form",
 ] }
 uuid = "1"
 chrono = "0.4"
 # Notion answers in JSON and `page.json` is rendered back to it, so the backend
 # holds pages as `Value` rather than a mirror of a schema it does not own.
 serde_json = "1"
+
+# One name, two spellings. macOS hands a lookup the decomposed form of whatever a
+# listing returned, and a store may hold either — so a filesystem that compares names
+# by their bytes answers `ENOENT` for a name it had just printed. Two crates, against
+# `s3`'s 131.
+unicode-normalization = "0.1"
 
 # A memory store that is one file in a cortex tree. `bundled` on purpose: the store
 # is a file a delegated executable opens on a mount, and which SQLite answers for it
