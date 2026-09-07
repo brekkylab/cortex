@@ -1,12 +1,19 @@
-//! A Word document as lines: one paragraph, one line.
+//! A Word document as lines: one break the author made, one line.
 //!
-//! # Why a paragraph is a line
+//! # Why an authored break is a line
 //!
 //! A `.docx` has no lines — what it has is paragraphs, and a paragraph is a unit somebody
 //! wrote rather than one a renderer arrived at. Where a line of text is broken at a byte and a
 //! line of a PDF is broken wherever an engine guessed the page came apart, a `<w:p>` is
 //! authored: it survives being opened in another word processor, at another paper size, at
 //! another zoom.
+//!
+//! Which is the reason a `<w:br/>` is a line here too. Shift+Enter is a break somebody typed
+//! and the file remembers, as stable as the paragraph mark and shown on screen the same way,
+//! so the two cannot be worth different amounts to a reader whose rule is that a line is
+//! authored. `<w:cr/>` is the same break spelled another way and counts the same — see
+//! [`push_run`], where both are one arm. What stays out is the *wrap*: the break a renderer
+//! arrived at, which is in no file and is [`crate::pdf`]'s difficulty rather than this one's.
 //!
 //! So the numbers here are worth more than [`crate::pdf`]'s and still less than a text file's.
 //! They are stable against everything except this module's own rules, which is why the answer
@@ -23,7 +30,9 @@
 //!
 //! Tables are rows of cells and there is nothing to guess about them, so a row is a line
 //! spelled `| cell | cell |`. It is not markdown and is not trying to be; it is the one
-//! spelling in which a row reads as a row and the cells stay told apart.
+//! spelling in which a row reads as a row and the cells stay told apart. That spelling is
+//! also where the rule above stops: a break inside a cell is a space, because a row torn in
+//! half is not a row, and the same is already true of a cell holding two paragraphs.
 //!
 //! Headers, footers, footnotes and comments are not read. Each is a part of its own beside the
 //! body, and a caller reading line 12 of a document means the twelfth paragraph of what is
@@ -43,7 +52,8 @@ use docx_rs::{
 use crate::text::{self, Window};
 
 /// What the answer calls these lines.
-pub const ORIGIN: &str = "paragraphs of this Word document, not lines in the file";
+pub const ORIGIN: &str =
+    "paragraphs of this Word document and the breaks inside them, not lines in the file";
 
 /// What every zip begins with.
 ///
@@ -177,7 +187,7 @@ fn bytes(file: &mut File) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The document's text, a paragraph or a table row per line.
+/// The document's text, a paragraph — or a piece of one a break cut off — or a row per line.
 fn lines(bytes: &[u8]) -> std::io::Result<String> {
     let docx = read_docx(bytes).map_err(|e| {
         std::io::Error::new(
@@ -238,14 +248,19 @@ fn rows_of(table: &Table, out: &mut String) {
                 // A cell holds paragraphs, and a cell that is several of them is still one
                 // cell: joined with a space rather than broken across lines, because a row
                 // whose cells landed on different lines is not a row any more.
-                cell.children
+                let cell = cell
+                    .children
                     .iter()
                     .filter_map(|child| match child {
                         TableCellContent::Paragraph(paragraph) => Some(text_of(paragraph)),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(" ");
+                // And a break inside one is a space for the same reason. `push_run` makes a
+                // line of it, which is what it is in the body and what would leave half a row
+                // on the line below here.
+                cell.replace('\n', " ")
             })
             .collect();
         out.push_str(&format!("| {} |\n", cells.join(" | ")));
@@ -270,6 +285,14 @@ fn push_run(run: &Run, out: &mut String) {
         match child {
             RunChild::Text(text) => out.push_str(&text.text),
             RunChild::Tab(_) | RunChild::PTab(_) => out.push('\t'),
+            // Shift+Enter, and `<w:cr/>` which is the same break written another way. Without
+            // this the two sides of it are one word — `firstsecond` — which is worse than a
+            // wrong line count: it is a sentence the document does not contain.
+            //
+            // Which kind of break it is does not come up. `docx-rs` keeps the type behind a
+            // private field, and there is nothing to decide anyway: a page break and a column
+            // break also end the line they are in.
+            RunChild::Break(_) | RunChild::CarriageReturn(_) => out.push('\n'),
             _ => {}
         }
     }
@@ -352,6 +375,49 @@ mod tests {
         );
     }
 
+    /// A break the author typed is a line, both ways of spelling it.
+    ///
+    /// Shift+Enter is a `<w:br/>` and the file remembers it, so it is as much a line as the
+    /// paragraph mark is. Left out of [`push_run`] it is worse than a line miscounted: the
+    /// words on either side of it run together into one the document does not contain.
+    #[test]
+    fn a_break_the_author_made_is_a_line() {
+        use docx_rs::BreakType;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = document(
+            &dir,
+            "a.docx",
+            Docx::new()
+                .add_paragraph(
+                    Paragraph::new().add_run(
+                        Run::new()
+                            .add_text("first")
+                            .add_break(BreakType::TextWrapping)
+                            .add_text("second"),
+                    ),
+                )
+                // `<w:cr/>`: the same break, and the same answer.
+                .add_paragraph(
+                    Paragraph::new().add_run(
+                        Run::new()
+                            .add_text("third")
+                            .add_carriage_return()
+                            .add_text("fourth"),
+                    ),
+                ),
+        );
+
+        let window = read(&path, 1, 10)
+            .expect("a Word document")
+            .expect("it reads");
+        assert_eq!(
+            window.shown,
+            "     1\tfirst\n     2\tsecond\n     3\tthird\n     4\tfourth\n"
+        );
+        assert_eq!(window.total, 4, "two paragraphs, and a break in each");
+    }
+
     /// A row is a line, and its cells stay told apart.
     #[test]
     fn a_table_row_is_a_line() {
@@ -369,6 +435,35 @@ mod tests {
             .expect("a Word document")
             .expect("it reads");
         assert_eq!(window.shown, "     1\t| left | right |\n");
+    }
+
+    /// Except in a cell, where a break is a space: half a row on the line below is not a row,
+    /// and the cells would stop lining up from there down.
+    #[test]
+    fn a_break_inside_a_cell_does_not_break_the_row() {
+        use docx_rs::BreakType;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = document(
+            &dir,
+            "a.docx",
+            Docx::new().add_table(Table::new(vec![TableRow::new(vec![
+                TableCell::new().add_paragraph(
+                    Paragraph::new().add_run(
+                        Run::new()
+                            .add_text("over")
+                            .add_break(BreakType::TextWrapping)
+                            .add_text("two lines"),
+                    ),
+                ),
+                TableCell::new().add_paragraph(paragraph("right")),
+            ])])),
+        );
+
+        let window = read(&path, 1, 10)
+            .expect("a Word document")
+            .expect("it reads");
+        assert_eq!(window.shown, "     1\t| over two lines | right |\n");
     }
 
     /// A window into a document is the window it would be into a file: the same numbers, the
