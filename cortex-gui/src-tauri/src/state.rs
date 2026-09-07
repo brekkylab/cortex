@@ -21,18 +21,21 @@
 //! * [`Agent`] — a registered agent: a system message and the resources it was given.
 //!
 //! Memories and docsets are deliberately *not* a fourth list. They live in the tree, under
-//! `/.cortex`, as files like anything else — see [`ResourceKind`] — so they are carried by
+//! `/.cortex`, as the store files they are — see [`ResourceKind`] — so they are carried by
 //! whatever carries the workspace rather than by a `Vec` that a later save would have to learn
 //! to serialize separately.
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use cortex::fs::{InMemFs, WorkFs};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::error::{Error, Result};
 
@@ -44,9 +47,19 @@ use crate::error::{Error, Result};
 pub struct Workspace {
     /// The tree. `RwLock` and not `Mutex` because reads are what a file browser does: several
     /// listings and a read can overlap, and only mounting takes the tree exclusively.
-    pub fs: RwLock<WorkFs>,
+    ///
+    /// Behind an `Arc` because a binding takes ownership of what it serves: putting the
+    /// workspace where a kernel can see it — which is what creating a store needs — hands a
+    /// [`SharedFs`](crate::shared::SharedFs) clone to the mount and keeps this one here.
+    pub fs: Arc<RwLock<WorkFs>>,
     pub mounts: RwLock<Vec<MountInfo>>,
     pub agents: RwLock<Vec<Agent>>,
+    /// Held for the length of one store creation.
+    ///
+    /// There is one mount point, and a mount point has to be empty — so two `init`s at once
+    /// would have the second fail on the first's mount. Serializing them is the whole of what
+    /// this is for; it guards no data.
+    pub store_init: Mutex<()>,
     /// The source of every id handed to the window.
     ///
     /// A counter, not a UUID: these identify rows within one process that ends when the window
@@ -60,7 +73,7 @@ impl Workspace {
     pub fn empty() -> Result<Self> {
         let fs = WorkFs::new().try_with_mount(ROOT_PATH, InMemFs::new())?;
         Ok(Workspace {
-            fs: RwLock::new(fs),
+            fs: Arc::new(RwLock::new(fs)),
             mounts: RwLock::new(vec![MountInfo {
                 path: "/".into(),
                 kind: MountKind::Scratch,
@@ -69,6 +82,7 @@ impl Workspace {
                 writable: true,
             }]),
             agents: RwLock::new(Vec::new()),
+            store_init: Mutex::new(()),
             next_id: AtomicU64::new(1),
         })
     }
@@ -131,17 +145,24 @@ pub struct MountInfo {
 
 /// Whether a resource is a `mem` store or an `index` one.
 ///
-/// **A resource lives in the workspace.** Registering one writes `<name>.json` under this kind's
-/// directory in the tree, and that file is the resource — there is no list beside the tree
-/// holding a copy. Two things follow, and both are the reason for it: whatever ends up carrying
-/// a workspace (the save that does not exist yet, a `WorkFs` mounted for a guest) carries the
-/// resources with it for free, and a docset written by something other than this window is
-/// visible here the moment it appears.
+/// **A resource is its store.** One file — `<name>.sqlite` under this kind's directory — and
+/// nothing beside it: no manifest, and no list held next to the tree. `mem init` and `index init`
+/// are what make one, so registering a resource *is* creating it, and there is no state between
+/// "nothing here" and "a store" for the window to have to describe.
 ///
-/// The store itself is still to come. `mem` and `index` in `cortex-execs/` are the programs that
-/// write one — a single SQLite file — and neither is wired up here, so what a registration
-/// produces today is the manifest and a name for the store that will sit beside it. That is what
-/// [`Resource::backed`] reports on.
+/// Three things follow from the file being the whole record.
+///
+/// * Whatever ends up carrying a workspace — the save that does not exist yet, a `WorkFs`
+///   mounted for a guest — carries the resources with it for free.
+/// * A store written by something other than this window shows up here the moment it appears,
+///   because a listing is all this window does to find them.
+/// * There is nothing to keep in step. A manifest beside the store would be a second file
+///   saying what the first one is, and the two can disagree — a store deleted by hand, a
+///   manifest whose `init` failed.
+///
+/// What it costs is a description: a `mem` store's `meta` table has room for one, but writing
+/// there means opening SQLite, which means a mount and a program that has no command for it. So
+/// a resource is a name and nothing else, and the name is the file's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ResourceKind {
@@ -155,6 +176,10 @@ impl ResourceKind {
     /// Under a dot-directory because these are the workspace's own bookkeeping rather than
     /// anything a person put there, and a workspace whose root is a connected local folder
     /// should not grow two top-level directories nobody asked for.
+    ///
+    /// **Which directory a store is in is what says which kind it is.** Reading `meta.kind` out
+    /// of the file would be the authority, and it is unreachable without a mount — so the
+    /// directory carries it instead, and `init` puts each store in the one that matches.
     pub fn dir(self) -> &'static str {
         match self {
             ResourceKind::Memory => "/.cortex/memory",
@@ -163,46 +188,17 @@ impl ResourceKind {
     }
 }
 
-/// `name` as a single path component: lowercase, and nothing that could redirect a path.
-///
-/// The result is what a resource is filed under, so it decides identity — two names that slug
-/// the same are the same resource, and the collision surfaces as the `AlreadyExists` that
-/// creating the manifest answers with.
-///
-/// **A run of separators collapses to one.** Mapping each rejected character to its own `-`
-/// would file `Team  Notes!` under `team--notes-` and `team notes` under `team-notes`, so two
-/// names nobody would call different would quietly become two resources — and the second, being
-/// a different file, would never hit the collision that is supposed to catch exactly this.
-pub fn slug(name: &str) -> String {
-    let mut out = String::new();
-    for c in name.chars() {
-        if c.is_alphanumeric() {
-            out.extend(c.to_lowercase());
-        } else if !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
 /// A memory or a docset an agent can be given.
 #[derive(Clone, Debug, Serialize)]
 pub struct Resource {
-    /// The manifest's path, which is also the resource's identity: it is where the resource is,
-    /// and an agent holding it can be resolved by reading the tree rather than a registry.
+    /// The store's path, which is the resource's identity — it is *where the resource is*, so an
+    /// agent holding one is resolved by reading the tree rather than a registry.
     pub id: String,
     pub kind: ResourceKind,
+    /// The file's name without the extension, which is the name as it was typed: nothing is
+    /// slugified, so it round-trips exactly and the window never shows a name nobody chose.
     pub name: String,
-    /// Free text the form collected — what this memory is for, which directory the docset will
-    /// be ingested from.
-    pub note: String,
-    /// The `.sqlite` beside the manifest: where `mem` / `index` will write. `backed` says
-    /// whether it is there yet.
-    pub store_path: String,
-    /// Whether [`Self::store_path`] exists in the workspace. `false` for everything this window
-    /// creates today, and the label the UI shows is drawn from it rather than hard-coded, so the
-    /// day a store does appear the window says so without changing.
-    pub backed: bool,
+    /// From the file's own timestamps. Only used to order the list.
     pub created_ms: u64,
 }
 

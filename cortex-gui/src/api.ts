@@ -37,8 +37,8 @@ export const mountS3 = (path: string, form: S3Form) => invoke<MountInfo>("mount_
 export const unmount = (path: string) => invoke<void>("unmount", { path });
 
 export const listResources = () => invoke<Resource[]>("resources");
-export const addResource = (kind: ResourceKind, name: string, note: string) =>
-  invoke<Resource>("add_resource", { form: { kind, name, note } });
+export const addResource = (kind: ResourceKind, name: string) =>
+  invoke<Resource>("add_resource", { form: { kind, name } });
 export const removeResource = (id: string) => invoke<void>("remove_resource", { id });
 
 export const listAgents = () => invoke<Agent[]>("agents");

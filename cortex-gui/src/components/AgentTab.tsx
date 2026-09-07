@@ -171,8 +171,7 @@ export default function AgentTab(props: Props) {
                   />
                   <span>{resource.name}</span>
                   <span className={`badge kind-${resource.kind}`}>{resource.kind}</span>
-                  {!resource.backed && <span className="badge stub">준비 중</span>}
-                  <span className="sub">{resource.store_path}</span>
+                  <span className="sub">{resource.id}</span>
                 </label>
               ))}
             </div>

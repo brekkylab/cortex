@@ -25,15 +25,18 @@ crate-type = ["lib", "cdylib", "staticlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# The workspace, the stores mounted into it, and the errors all of it answers in. The
-# two network stores are named here because the connectors in the UI are exactly them;
-# no binding feature is taken, since a window reads the tree in-process and nothing
-# asks the host kernel for a mount.
-cortex = { path = "../../cortex", features = ["notion", "s3"] }
+# The workspace, the stores mounted into it, and the errors all of it answers in. The two
+# network stores are named because the connectors in the UI are exactly them.
+#
+# `fuse-t` is the binding, and it is here for one reason: `mem` and `index` write a SQLite
+# file, SQLite opens files rather than paths in a `WorkFs`, so a store that is to live *in*
+# the workspace needs the workspace to be somewhere a kernel answers for while the program
+# runs. See `store.rs`. It needs FUSE-T installed at build time
+# (`brew install --cask fuse-t`), whose `fuse-t.pc` is already on pkg-config's default
+# search path — unlike the `fuse` feature, which needs the `fuse.pc` shim in
+# `cortex/contrib/pkgconfig` on `PKG_CONFIG_PATH`.
+cortex = { path = "../../cortex", features = ["fuse-t", "notion", "s3"] }
 serde = { version = "1", features = ["derive"] }
-# A resource's manifest is a file in the workspace, so it needs a format that survives being
-# read by something other than this program — see `agents.rs`.
-serde_json = "1"
 tauri = { version = "2", features = [] }
 # The "파일 추가" button's file chooser. Drag-and-drop arrives on the window itself and
 # needs no plugin; a picker is the same import for whoever would rather not drag.

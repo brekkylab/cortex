@@ -274,7 +274,10 @@ export default function WorkspaceTab(props: Props) {
           </button>
         </div>
         {props.resources.length === 0 && (
-          <p className="empty">아직 없습니다. 에이전트 탭에서 고를 수 있는 memory / docset 을 여기서 만듭니다.</p>
+          <p className="empty">
+            아직 없습니다. 여기서 만들면 워크스페이스 안에 저장소가 생기고, 에이전트 탭에서
+            고를 수 있습니다.
+          </p>
         )}
         {props.resources.map((resource) => (
           <div className="mount" key={resource.id}>
@@ -282,10 +285,9 @@ export default function WorkspaceTab(props: Props) {
               <div className="name">
                 <strong>{resource.name}</strong>
                 <span className={`badge kind-${resource.kind}`}>{resource.kind}</span>
-                {!resource.backed && <span className="badge stub">준비 중</span>}
               </div>
-              <div className="detail" title={`${resource.id} · ${resource.store_path}`}>
-                {resource.note || resource.id}
+              <div className="detail" title={resource.id}>
+                {resource.id}
               </div>
             </div>
             <button

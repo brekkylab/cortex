@@ -197,7 +197,6 @@ export function ResourceDialog(props: {
 }) {
   const memory = props.kind === "memory";
   const [name, setName] = useState("");
-  const [note, setNote] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -205,7 +204,7 @@ export function ResourceDialog(props: {
     setBusy(true);
     setError(null);
     try {
-      props.onDone(await addResource(props.kind, name, note));
+      props.onDone(await addResource(props.kind, name));
       props.onClose();
     } catch (err) {
       setError(messageOf(err));
@@ -219,30 +218,22 @@ export function ResourceDialog(props: {
       title={memory ? "memory 추가" : "docset 추가"}
       hint={
         memory
-          ? "워크스페이스 안 /.cortex/memory 에 파일로 만들어집니다. 옆에 놓일 .sqlite 저장소는 cortex-execs/mem 이 붙는 시점에 생깁니다."
-          : "워크스페이스 안 /.cortex/docset 에 파일로 만들어집니다. 옆에 놓일 .sqlite 색인은 cortex-execs/index 가 붙는 시점에 생깁니다."
+          ? "워크스페이스를 잠깐 마운트해 mem init 으로 /.cortex/memory/<이름>.sqlite 를 만듭니다. 그 파일이 곧 memory 입니다."
+          : "워크스페이스를 잠깐 마운트해 index init 으로 /.cortex/docset/<이름>.sqlite 를 만듭니다. 그 파일이 곧 docset 입니다."
       }
       error={error}
-      submitLabel="등록"
+      submitLabel="만들기"
       busy={busy}
       onSubmit={submit}
       onClose={props.onClose}
     >
       <label>
-        <span>이름</span>
+        <span>이름 — 파일 이름이 그대로 이름이 됩니다</span>
         <input
           autoFocus
           placeholder={memory ? "사용자 선호" : "제품 문서"}
           value={name}
           onChange={(event) => setName(event.target.value)}
-        />
-      </label>
-      <label>
-        <span>{memory ? "무엇을 기억할지" : "무엇을 색인할지"} (선택)</span>
-        <input
-          placeholder={memory ? "대화에서 확정된 사실" : "/docs 아래 마크다운"}
-          value={note}
-          onChange={(event) => setNote(event.target.value)}
         />
       </label>
     </Modal>

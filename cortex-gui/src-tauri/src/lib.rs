@@ -14,7 +14,9 @@ mod agents;
 mod error;
 mod fsops;
 mod mounts;
+mod shared;
 mod state;
+mod store;
 
 use state::Workspace;
 

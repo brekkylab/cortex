@@ -37,14 +37,11 @@ export interface ImportReport {
 export type ResourceKind = "memory" | "docset";
 
 export interface Resource {
+  /** The store's path in the workspace, which is also its identity. */
   id: string;
   kind: ResourceKind;
+  /** The file's name without `.sqlite` — the name as it was typed. */
   name: string;
-  note: string;
-  /** Where its store will live once `mem` / `index` are wired in. */
-  store_path: string;
-  /** Always false today: nothing is written at `store_path` yet. */
-  backed: boolean;
   created_ms: number;
 }
 
