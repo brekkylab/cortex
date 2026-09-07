@@ -1,31 +1,36 @@
 //! Building a rootfs: a base image, a list of steps, and the image they make.
 //!
-//! A build is a console session that may [`commit`](crate::console::Console::commit). Each
-//! step becomes an `exec` on that session, and the session ends by keeping what it wrote as
-//! an image a later session can name. Nothing here knows what an image *is* — that is the
-//! console server's, and this module drives a [`Console`](crate::console::Console) and
-//! nothing else.
+//! A [`Rootfs`] is a recipe and never more than that. It is handed to a console, and the
+//! console runs it if it has to: the recipe's digest names the image it makes, so the
+//! `init` that asks for the session is also the question "is this already here?". An image
+//! that exists costs one message. One that does not is built first — a session of its own
+//! that may [`commit`](crate::console::Console::commit), one `exec` per step, and the
+//! commit that keeps what they wrote — and then the session is asked for again.
+//!
+//! Nothing here knows what an image *is*. That is the console server's; this module speaks
+//! the protocol and nothing else.
 //!
 //! ```no_run
-//! use cortex::console::{Console, ConsoleBuilder};
+//! use cortex::console::Console;
 //! use cortex::rootfs::Rootfs;
 //!
 //! # async fn f() -> anyhow::Result<()> {
 //! // A build reaches the internet unless it says otherwise — see [`Rootfs::network`],
 //! // which is also how to take that away.
-//! let built = Rootfs::from_image("python:3.13-slim")
-//!     .run("pip install --no-cache-dir pandas")
-//!     .env("TZ", "UTC")
-//!     .workdir("/srv/app")
-//!     .build(|| ConsoleBuilder::new().stdio_client(&["cortex-uvm-console"]))
-//!     .await?;
-//!
-//! // And a session on what it made, which is where the build stops mattering.
-//! let console = Console::builder()
+//! let mut console = Console::builder()
 //!     .stdio_client(&["cortex-uvm-console"])
-//!     .image(&built)
+//!     .rootfs(
+//!         Rootfs::from_image("python:3.13-slim")
+//!             .run("pip install --no-cache-dir pandas")
+//!             .env("TZ", "UTC")
+//!             .workdir("/srv/app"),
+//!     )
 //!     .build()
 //!     .await?;
+//!
+//! // And from here the build has stopped mattering: this is an ordinary session.
+//! let result = console.exec(["python", "-c", "import pandas"], None).await?;
+//! assert_eq!(result.code, 0);
 //! # Ok(()) }
 //! ```
 
@@ -35,8 +40,8 @@ mod rootfs;
 mod step;
 
 pub use id::BuildId;
-pub use rootfs::{BuiltImage, Rootfs, StepFailed, Warning};
+pub use rootfs::{Rootfs, StepFailed, Warning};
 pub use step::Step;
 
 pub(crate) use id::{Recipe, digest};
-pub(crate) use rootfs::inside_context;
+pub(crate) use rootfs::{Plan, inside_context, plan, run};

@@ -13,8 +13,8 @@ use tokio::process::Command;
 
 /// A fresh server process, as a console builder.
 ///
-/// A function rather than a value because `build` may open two consoles and each needs its
-/// own process — which is the whole reason `build` takes a factory.
+/// One process per console, and one console per test — a build now happens on the same
+/// channel as the session that runs in what it made.
 fn server() -> ConsoleBuilder {
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
     server.stderr(Stdio::inherit());
@@ -47,7 +47,7 @@ fn salt(test: &str) -> String {
 }
 
 /// The whole of it. A base, a step of each kind, a deletion, and a directory emptied —
-/// committed, and then a **new session** on the result where all of it holds.
+/// committed, and then the session that comes back, which boots what the build made.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots a micro-VM"]
 async fn what_a_build_makes_is_what_the_next_session_boots() {
@@ -56,7 +56,7 @@ async fn what_a_build_makes_is_what_the_next_session_boots() {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorded = seen.clone();
 
-    let built = Rootfs::from_image("alpine:3.20")
+    let recipe = Rootfs::from_image("alpine:3.20")
         .context(context.path().to_path_buf())
         // No `network` call: a build reaches the internet by default, which is what the
         // `apk add` below needs and what this test is therefore also checking.
@@ -72,14 +72,21 @@ async fn what_a_build_makes_is_what_the_next_session_boots() {
                 .lock()
                 .unwrap()
                 .push((step.to_string(), result.code))
-        })
-        .build(server)
+        });
+    let id = recipe.id().expect("a build id");
+
+    let mut second = server()
+        .rootfs(recipe)
+        .build()
         .await
-        .expect("building");
+        .expect("a session on what the build made");
 
     assert_eq!(
-        built.image().reference,
-        format!("cortex.local/built@{}", built.id()),
+        second
+            .image()
+            .expect("the server said what it booted")
+            .reference,
+        format!("cortex.local/built@{id}"),
         "a built image is not named the way the design says"
     );
 
@@ -90,20 +97,6 @@ async fn what_a_build_makes_is_what_the_next_session_boots() {
     let steps = std::mem::take(&mut *seen.lock().unwrap());
     assert_eq!(steps.len(), 6, "on_step saw {steps:?}");
     assert!(steps.iter().all(|(_, code)| *code == 0), "{steps:?}");
-
-    let mut second = Console::builder()
-        .client(
-            cortex::console::stdio::StdioClient::new({
-                let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
-                server.stderr(Stdio::inherit());
-                server
-            })
-            .expect("a server"),
-        )
-        .image(&built)
-        .build()
-        .await
-        .expect("a session on the built image");
 
     // What a RUN installed.
     assert!(
@@ -139,14 +132,14 @@ async fn what_a_build_makes_is_what_the_next_session_boots() {
     );
 }
 
-/// The same recipe twice: the second is answered from the cache, without booting.
+/// The same recipe twice: the second session finds the image and does not build it again.
 ///
-/// Asserted by time, because there is nothing else to see from out here — a boot is seconds
-/// and a probe is one process that starts and exits. The bound is generous on purpose: this
-/// is meant to catch a cache that never hits, not to measure one that does.
+/// Asserted by time, because there is nothing else to see from out here — running the steps
+/// is seconds and finding the image is one `init`. The bound is generous on purpose: this is
+/// meant to catch a cache that never hits, not to measure one that does.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots a micro-VM"]
-async fn the_same_recipe_twice_boots_once() {
+async fn the_same_recipe_twice_builds_once() {
     let context = context(&salt("cache"));
     let recipe = || {
         Rootfs::from_image("alpine:3.20")
@@ -154,18 +147,36 @@ async fn the_same_recipe_twice_boots_once() {
             .copy("marker.txt", "/marker.txt")
             .run("true")
     };
+    let id = recipe().id().expect("a build id");
 
-    let first = recipe().build(server).await.expect("the first build");
+    let first = server()
+        .rootfs(recipe())
+        .build()
+        .await
+        .expect("the first session");
+    // Dropped before the second, so the timing below is not waiting on a server this test is
+    // still holding.
+    drop(first);
 
     let ran = std::time::Instant::now();
-    let second = recipe().build(server).await.expect("the second build");
+    let second = server()
+        .rootfs(recipe())
+        .build()
+        .await
+        .expect("the second session");
     let took = ran.elapsed();
 
-    assert_eq!(first.id(), second.id(), "one recipe gave two ids");
-    assert_eq!(first.image().reference, second.image().reference);
+    assert_eq!(
+        second
+            .image()
+            .expect("the server said what it booted")
+            .reference,
+        format!("cortex.local/built@{id}"),
+        "the second session is not on the image the first built"
+    );
     assert!(
-        took < std::time::Duration::from_secs(3),
-        "the second build took {took:?}, which is long enough that it booted"
+        took < std::time::Duration::from_secs(10),
+        "the second session took {took:?}, which is long enough that it built again"
     );
 }
 
@@ -182,7 +193,10 @@ async fn a_failed_build_leaves_nothing_behind() {
             .run("exit 7")
     };
 
-    let refused = recipe().build(server).await.unwrap_err();
+    let refused = match server().rootfs(recipe()).build().await {
+        Ok(_) => panic!("a build with a failing step gave a session"),
+        Err(refused) => refused,
+    };
     let failed = refused
         .downcast_ref::<cortex::rootfs::StepFailed>()
         .unwrap_or_else(|| panic!("a step failure, and not {refused:#}"));
@@ -191,7 +205,7 @@ async fn a_failed_build_leaves_nothing_behind() {
     // The second attempt fails the same way. If the first had committed, this would find a
     // cached image and succeed.
     assert!(
-        recipe().build(server).await.is_err(),
+        server().rootfs(recipe()).build().await.is_err(),
         "a failed build was cached"
     );
 }
@@ -220,27 +234,16 @@ async fn a_copy_makes_its_parent_and_a_run_keeps_its_path() {
             .client(cortex::console::stdio::StdioClient::new(server).expect("a server"))
     };
 
-    let built = Rootfs::from_image("alpine:3.20")
-        .context(context.path().to_path_buf())
-        // No `mkdir -p /deep/er` in front of it: making the parent is the copy's job.
-        .copy("marker.txt", "/deep/er/marker.txt")
-        // And what cortex provides is runnable from a step, which it is not if the shell
-        // re-reads `/etc/profile` and assigns `PATH` over the agent's.
-        .run("mytool > /ran-from-abin")
-        .build(with_abin)
-        .await
-        .expect("building");
-
-    let mut session = Console::builder()
-        .client(
-            cortex::console::stdio::StdioClient::new({
-                let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
-                server.stderr(Stdio::inherit());
-                server
-            })
-            .expect("a server"),
+    let mut session = with_abin()
+        .rootfs(
+            Rootfs::from_image("alpine:3.20")
+                .context(context.path().to_path_buf())
+                // No `mkdir -p /deep/er` in front of it: making the parent is the copy's job.
+                .copy("marker.txt", "/deep/er/marker.txt")
+                // And what cortex provides is runnable from a step, which it is not if the
+                // shell re-reads `/etc/profile` and assigns `PATH` over the agent's.
+                .run("mytool > /ran-from-abin"),
         )
-        .image(&built)
         .build()
         .await
         .expect("a session on what the build made");

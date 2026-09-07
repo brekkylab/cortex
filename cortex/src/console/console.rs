@@ -58,6 +58,7 @@ use crate::{
         stdio::StdioClient,
     },
     fs::Mount,
+    rootfs::Rootfs,
 };
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
@@ -97,6 +98,13 @@ pub struct ConsoleBuilder {
     /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
     network: Option<NetworkAccess>,
+
+    /// A rootfs to build and then run in, and `None` for a session on an image that
+    /// already exists somewhere.
+    ///
+    /// Mutually exclusive with [`image`](Self::image): both name what the session's commands
+    /// run in, and a caller that said each of them meant one of them.
+    rootfs: Option<Rootfs>,
 
     /// Whether this session may keep what it writes. False is what every caller wanted
     /// before this existed.
@@ -234,6 +242,40 @@ impl ConsoleBuilder {
         self
     }
 
+    /// Build a rootfs, and run this session's commands in what it makes.
+    ///
+    /// ```no_run
+    /// # use cortex::console::Console;
+    /// # use cortex::rootfs::Rootfs;
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .rootfs(Rootfs::from_image("alpine:3.20").run("apk add --no-cache jq"))
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// **A build that has already been done is not done again.** The recipe's digest names
+    /// the image it makes, so the first thing [`build`](Self::build) sends is an `init` on
+    /// that name — which either takes the session, and there was nothing to do, or is
+    /// refused and the build runs. The common case costs exactly what a session on an
+    /// existing image costs.
+    ///
+    /// **So this can take minutes.** A session on an image is a process and one message; a
+    /// session on a rootfs that nobody has built yet is a boot, every step, and a commit.
+    /// [`on_step`](Rootfs::on_step) is how to watch it happen.
+    ///
+    /// The build runs in a session of its own, with the recipe's context as its tree — so
+    /// whatever [`mount`](Self::mount) and [`network`](Self::network) say here is about the
+    /// session that comes *out* of the build, and is not disturbed by it.
+    ///
+    /// Refused together with [`image`](Self::image): both say what the commands run in.
+    pub fn rootfs(mut self, rootfs: Rootfs) -> Self {
+        self.rootfs = Some(rootfs);
+        self
+    }
+
     /// Let this session [`commit`](Console::commit) what it writes.
     ///
     /// Asked for rather than always on, because it costs something on a backend that has to
@@ -253,9 +295,40 @@ impl ConsoleBuilder {
     /// starts a process, and a process is registered with the runtime that will reap it.
     /// Building one from outside a task or `main` is a panic, not an `Err` — the missing
     /// runtime is the caller's own shape and not something the channel could report.
+    ///
+    /// Usually one message. The exception is [`rootfs`](Self::rootfs), whose image this may
+    /// have to make before there is a session to be had — see there for what that costs.
     pub async fn build(self) -> anyhow::Result<Console> {
         Console::new(self).await
     }
+}
+
+/// Open the build's own session on `client`, run the steps, and keep what they wrote.
+///
+/// A second `init` on the same channel, which the protocol says replaces the first — so a
+/// build costs no second server and no second process. The session it makes is the build's:
+/// committable, on the recipe's base, with the recipe's context as its tree. The one the
+/// caller asked for is opened afterwards, by the `init` that follows this.
+async fn build_it(
+    client: &mut dyn Client,
+    rootfs: &mut Rootfs,
+    plan: &crate::rootfs::Plan,
+) -> anyhow::Result<()> {
+    let answered = client
+        .init(InitCall {
+            workfs: Some(plan.workfs.clone()),
+            image: Some(plan.base.clone()),
+            network: Some(plan.network.clone()),
+            committable: true,
+        })
+        .await?;
+
+    let at = answered
+        .workfs
+        .map(|at| at.path)
+        .context("the console server took the build context and did not say where it put it")?;
+
+    crate::rootfs::run(client, rootfs, plan, Path::new(&at)).await
 }
 
 /// A console: something to run commands in.
@@ -368,8 +441,17 @@ impl Console {
             mount,
             image,
             network,
+            rootfs,
             committable,
         } = builder;
+
+        // Before the channel, so a caller that said both hears it without a process having
+        // been started for a session that could not be described.
+        anyhow::ensure!(
+            !(image.is_some() && rootfs.is_some()),
+            "a session names both an image and a rootfs, and both say what its commands run \
+             in — name one"
+        );
 
         let client_factory =
             client_factory.context("a console needs a client to drive its server")?;
@@ -389,14 +471,41 @@ impl Console {
             None => None,
         };
 
-        let answered = client
-            .init(InitCall {
-                workfs,
-                image,
-                network,
-                committable,
-            })
-            .await?;
+        // Worked out before anything is sent, and on a blocking thread because it reads
+        // every file a `COPY` names. Its whole point is that the `init` below can *be* the
+        // cache probe: a build whose image is already here costs one message.
+        let mut rootfs = rootfs;
+        let plan = match rootfs.as_ref() {
+            None => None,
+            Some(declared) => {
+                let declared = declared.spec();
+                Some(
+                    tokio::task::spawn_blocking(move || crate::rootfs::plan(&declared))
+                        .await
+                        .context("working out what this build is called")??,
+                )
+            }
+        };
+
+        let session = InitCall {
+            workfs: workfs.clone(),
+            image: plan.as_ref().map(|plan| plan.image.clone()).or(image),
+            network: network.clone(),
+            committable,
+        };
+
+        let mut answered = client.init(session.clone()).await;
+
+        // Refused because nobody has built it yet — which is not a failure, it is the other
+        // half of asking. Build it, then ask again.
+        if let (Err(Failure::Refused(refusal)), Some(plan), Some(rootfs)) =
+            (&answered, &plan, rootfs.as_mut())
+            && refusal.code == Error::UNKNOWN_IMAGE
+        {
+            build_it(&mut *client, rootfs, plan).await?;
+            answered = client.init(session).await;
+        }
+        let answered = answered?;
 
         let server_path = match (&mount, answered.workfs) {
             (Some(_), Some(at)) => Some(absolute(at.path)?),

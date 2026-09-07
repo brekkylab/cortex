@@ -1,16 +1,24 @@
-//! The builder: what a caller says a build is.
+//! The builder: what a caller says a build is, and what running it means.
 //!
-//! Everything here is declaration. Nothing contacts a server, nothing is read except what
-//! [`id`](Rootfs::id) has to hash, and the value can be carried around and asked its id
-//! before anything is started.
+//! [`Rootfs`] is declaration and nothing else. It has no terminal method: nothing here
+//! contacts a server, nothing is read except what [`id`](Rootfs::id) has to hash, and the
+//! value can be carried around and asked its id before anything is started. A caller hands
+//! it to [`ConsoleBuilder::rootfs`](crate::console::ConsoleBuilder::rootfs), and the console
+//! that comes back is a session in what it describes — built on the way there if nobody has
+//! built it yet.
+//!
+//! The rest of this module is what a build *means*: [`plan`] works out its name from the
+//! declaration alone, and [`run`] turns the steps into `exec`s on a session someone else
+//! opened.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::console::{ConsoleBuilder, Error, ExecResp, Failure, ImageSource, NetworkAccess};
-use crate::fs::Mount;
+use crate::console::{
+    Client, CommitCall, ExecCall, ExecResp, ImageSource, NetworkAccess, WorkFsSource,
+};
 
 use super::{BuildId, Recipe, Step, digest};
 
@@ -19,9 +27,10 @@ use super::{BuildId, Recipe, Step, digest};
 /// Built by chaining — every setter takes and returns `self` — because a build is one
 /// declaration and a half-configured one is not a thing worth having a name for.
 ///
-/// What it does *not* hold is a console. A build opens its own, from the factory handed to
-/// `build`, because it may open two: one to ask whether the image already exists, and one to
-/// make it.
+/// What it does *not* hold is a console, and it has no method that takes one. A `Rootfs` is
+/// handed to [`ConsoleBuilder::rootfs`](crate::console::ConsoleBuilder::rootfs), which is
+/// where a server is spoken to — so this value is inert, and a caller can build one, hash it,
+/// store it, and decide later whether anything runs.
 pub struct Rootfs {
     base: String,
     steps: Vec<Step>,
@@ -204,30 +213,18 @@ impl Rootfs {
         &self.steps
     }
 
-    /// What the built image should state about running a process in it: the accumulated
-    /// environment as `KEY=VALUE`, and the last working directory.
+    /// The half of this declaration that names it: everything a [`Plan`] is worked out
+    /// from, owned so it can go to a thread of its own.
     ///
-    /// Computed from the steps rather than observed from a session, so the answer is the
-    /// same whether the build ran or was found in the cache.
-    pub(crate) fn stated(&self) -> (Vec<String>, Option<String>) {
-        let mut env: Vec<(&str, &str)> = Vec::new();
-        let mut working_dir = None;
-        for step in &self.steps {
-            match step {
-                Step::Env { key, value } => match env.iter_mut().find(|(k, _)| *k == key) {
-                    // In the position it was first given: a repeated assignment replaces a
-                    // value, it does not move the variable to the end.
-                    Some(existing) => existing.1 = value,
-                    None => env.push((key, value)),
-                },
-                Step::Workdir(dir) => working_dir = Some(dir.clone()),
-                Step::Run(_) | Step::Copy { .. } => {}
-            }
+    /// Not a `Clone` impl on `Rootfs`, because a `Rootfs` also holds
+    /// [`on_step`](Self::on_step) and a closure is not something to hand out copies of.
+    pub(crate) fn spec(&self) -> Spec {
+        Spec {
+            base: self.base.clone(),
+            steps: self.steps.clone(),
+            context: self.context.clone(),
+            network: self.network.clone(),
         }
-        (
-            env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
-            working_dir,
-        )
     }
 
     /// Where the warnings live, for the adapter to fill in.
@@ -235,6 +232,32 @@ impl Rootfs {
         self.warnings = warnings;
         self
     }
+}
+
+/// What the built image should state about running a process in it: the accumulated
+/// environment as `KEY=VALUE`, and the last working directory.
+///
+/// Computed from the steps rather than observed from a session, so the answer is the same
+/// whether the build ran or was found in the cache.
+pub(crate) fn stated(steps: &[Step]) -> (Vec<String>, Option<String>) {
+    let mut env: Vec<(&str, &str)> = Vec::new();
+    let mut working_dir = None;
+    for step in steps {
+        match step {
+            Step::Env { key, value } => match env.iter_mut().find(|(k, _)| *k == key) {
+                // In the position it was first given: a repeated assignment replaces a
+                // value, it does not move the variable to the end.
+                Some(existing) => existing.1 = value,
+                None => env.push((key, value)),
+            },
+            Step::Workdir(dir) => working_dir = Some(dir.clone()),
+            Step::Run(_) | Step::Copy { .. } => {}
+        }
+    }
+    (
+        env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        working_dir,
+    )
 }
 
 /// The host a built image is named under.
@@ -271,57 +294,74 @@ pub(crate) fn inside_context(src: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The build context, as something a console can be given.
+/// What a console has to know before it sends anything: what the build is called, and what
+/// it will have to say to make it.
 ///
-/// A directory and nothing else. [`Mount`]'s contract is about a tree that goes away when the
-/// value does; this one is the caller's own directory and outlives the build, which is
-/// exactly what a build context should do.
-struct Context(PathBuf);
-
-impl Mount for Context {
-    fn mountpoint(&self) -> &Path {
-        &self.0
-    }
+/// Worked out from the declaration alone — no server is contacted — which is what lets the
+/// first `init` a console sends *be* the cache probe rather than a round trip in front of
+/// one.
+pub(crate) struct Plan {
+    /// What the built image is called, which is the digest of the recipe.
+    pub id: BuildId,
+    /// That, as a reference a server understands.
+    pub image: ImageSource,
+    /// The base to build over, as the caller spelled it.
+    pub base: ImageSource,
+    /// The build context, as the workfs a build session works in.
+    pub workfs: WorkFsSource,
+    /// How much of a network the build's own commands get.
+    pub network: NetworkAccess,
+    /// What the built image should state, accumulated from the steps.
+    pub env: Vec<String>,
+    pub working_dir: Option<String>,
 }
 
-/// An image a build made.
+/// The half of a declaration that a build's *name* is computed from.
 ///
-/// Hand it to [`ConsoleBuilder::image`] — `From<&BuiltImage>` is why `.image(&built)` works —
-/// and the next session starts where the build left off.
-#[derive(Clone, Debug)]
-pub struct BuiltImage {
-    id: BuildId,
-    image: ImageSource,
-    env: Vec<String>,
-    working_dir: Option<String>,
+/// Owned and [`Clone`], because working out a name reads every file a `COPY` points at and
+/// so belongs on a thread of its own — and a [`Rootfs`] cannot go there: it carries the
+/// caller's [`on_step`](Rootfs::on_step), which is a closure and stays here.
+#[derive(Clone)]
+pub(crate) struct Spec {
+    base: String,
+    steps: Vec<Step>,
+    context: PathBuf,
+    network: NetworkAccess,
 }
 
-impl BuiltImage {
-    /// The digest of the recipe that made it.
-    pub fn id(&self) -> &BuildId {
-        &self.id
-    }
+/// Work out [`Plan`] from a declaration.
+///
+/// **Blocking**, because computing the id reads every file a `COPY` names — a caller on a
+/// runtime owes this a thread of its own.
+pub(crate) fn plan(spec: &Spec) -> anyhow::Result<Plan> {
+    let id = digest(Recipe {
+        base: &spec.base,
+        steps: &spec.steps,
+        context: &spec.context,
+    })?;
 
-    /// How to name it to a console server.
-    pub fn image(&self) -> &ImageSource {
-        &self.image
-    }
+    // Absolute, because a workfs is named to the server as a `file://` URL and a relative
+    // path after `file://` reads as a host. Resolved here rather than in `context` so that a
+    // caller can name a directory that does not exist yet and be told when it is used.
+    let context = std::path::absolute(&spec.context)
+        .with_context(|| format!("resolving the build context at {}", spec.context.display()))?;
+    let context = context.to_str().with_context(|| {
+        format!(
+            "a build context that is not UTF-8 cannot be named as a workfs: {:?}",
+            context
+        )
+    })?;
 
-    /// What it states about running a process in it, as `KEY=VALUE`.
-    pub fn env(&self) -> &[String] {
-        &self.env
-    }
-
-    /// Where a process in it starts.
-    pub fn working_dir(&self) -> Option<&str> {
-        self.working_dir.as_deref()
-    }
-}
-
-impl From<&BuiltImage> for ImageSource {
-    fn from(built: &BuiltImage) -> ImageSource {
-        built.image.clone()
-    }
+    let (env, working_dir) = stated(&spec.steps);
+    Ok(Plan {
+        image: ImageSource::new(reference(&id)),
+        id,
+        base: ImageSource::new(spec.base.clone()),
+        workfs: WorkFsSource::new(format!("file://{context}")),
+        network: spec.network.clone(),
+        env,
+        working_dir,
+    })
 }
 
 /// A step that did not succeed, with everything needed to see why.
@@ -354,185 +394,104 @@ impl fmt::Display for StepFailed {
 
 impl std::error::Error for StepFailed {}
 
-impl Rootfs {
-    /// Build it, and answer the image.
-    ///
-    /// # Why a factory and not a builder
-    ///
-    /// This may open two consoles — one to ask whether the image already exists, one to
-    /// build it — and a [`ConsoleBuilder`]'s client factory is `FnOnce`, so one builder
-    /// cannot serve both. Taking a server command instead would read better and would stop a
-    /// test from supplying its own [`Client`](crate::console::Client).
-    ///
-    /// `image`, `network`, `mount` and `committable` are set on whatever the factory
-    /// returns; anything the caller set for those is overwritten.
-    pub async fn build(
-        mut self,
-        console: impl Fn() -> ConsoleBuilder,
-    ) -> anyhow::Result<BuiltImage> {
-        // On a blocking thread: this reads every file a `COPY` names, which is as big as
-        // whatever the caller builds from. `id` itself stays synchronous, because a caller
-        // asking a build its name outside a runtime is the case that makes it worth having.
-        let id = {
-            let (base, steps) = (self.base.clone(), self.steps.clone());
-            let context = self.context.clone();
-            tokio::task::spawn_blocking(move || {
-                digest(Recipe {
-                    base: &base,
-                    steps: &steps,
-                    context: &context,
-                })
-            })
-            .await
-            .context("computing this build's id")??
+/// Run the steps on a session that is already up, and keep what they wrote.
+///
+/// The session `client` holds must be the build one — committable, on the base, with the
+/// context mounted — and `at` is where the server said it put that context. Everything about
+/// arranging that is [`ConsoleBuilder::build`](crate::console::ConsoleBuilder::build)'s,
+/// because it is the end that holds the client; what is here is the part that has to know
+/// what a step *means*.
+pub(crate) async fn run(
+    client: &mut dyn Client,
+    rootfs: &mut Rootfs,
+    plan: &Plan,
+    at: &Path,
+) -> anyhow::Result<()> {
+    let mut running: Vec<(String, String)> = Vec::new();
+
+    for step in &rootfs.steps {
+        let argv = match step {
+            Step::Env { key, value } => {
+                match running.iter_mut().find(|(k, _)| k == key) {
+                    Some(existing) => existing.1 = value.clone(),
+                    None => running.push((key.clone(), value.clone())),
+                }
+                // Nothing on the wire: there is no session-level environment, so this rides
+                // on every later command instead.
+                continue;
+            }
+            Step::Run(command) => {
+                // `env` in front rather than a shell assignment, because the argv is already
+                // split and no shell is consulted to build it — so no value needs quoting
+                // and a value with a space in it cannot become two words.
+                let mut argv = vec!["env".to_string()];
+                argv.extend(running.iter().map(|(k, v)| format!("{k}={v}")));
+                argv.push("sh".into());
+                // `-c` and not `-lc`. A login shell sources `/etc/profile`, and what
+                // `/etc/profile` does on every base worth naming is *assign* `PATH` — which
+                // throws away the one the agent built, `/abin` with it. A build would then
+                // be unable to run the executables cortex provides it.
+                argv.push("-c".into());
+                argv.push(command.clone());
+                argv
+            }
+            Step::Copy { src, dst } => {
+                inside_context(src)?;
+                let from = at.join(src);
+                let from = from.to_str().with_context(|| {
+                    format!("{} is not a UTF-8 path to name to a server", from.display())
+                })?;
+                // The destination's parent is made first, because `COPY app /srv/app` with
+                // no `/srv` is the ordinary Dockerfile spelling — `docker build` creates the
+                // path and a bare `cp -a` does not, which would fail an instruction this
+                // adapter had already accepted.
+                //
+                // One `sh -c` rather than two steps, so a caller watching `on_step` sees the
+                // one instruction it declared.
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "mkdir -p -- \"$(dirname -- \"$2\")\" && cp -a -- \"$1\" \"$2\"".to_string(),
+                    // `sh -c … name arg1 arg2`: the paths travel as arguments rather than
+                    // inside the script, so nothing in either is ever word-split or read as
+                    // a shell operator.
+                    "cp".to_string(),
+                    from.to_string(),
+                    dst.clone(),
+                ]
+            }
+            // `cd` is a protocol builtin and moves the session, so it persists across the
+            // steps after it rather than ending with the command.
+            Step::Workdir(dir) => vec!["cd".to_string(), dir.clone()],
         };
-        let (env, working_dir) = self.stated();
 
-        if let Some(image) = already_built(&id, &console).await? {
-            // Nothing was booted to find this out: `init` answered from a file test, and the
-            // console it answered on has been dropped.
-            return Ok(BuiltImage {
-                id,
-                image,
-                env,
-                working_dir,
-            });
-        }
-
-        // Absolute, because a mount is named to the server as a `file://` URL and a relative
-        // path after `file://` reads as a host. Done here rather than in `context` so that a
-        // caller can name a directory that does not exist yet and be told at build time.
-        let context = std::path::absolute(&self.context).with_context(|| {
-            format!("resolving the build context at {}", self.context.display())
-        })?;
-
-        let mut builder = console()
-            .image(self.base.clone())
-            .mount(Context(context))
-            .committable();
-        builder = builder.network(self.network.clone());
-        let mut session = builder.build().await?;
-
-        let workfs = session
-            .workfs_path()
-            .context("the console server took the build context and did not say where")?
-            .to_path_buf();
-
-        let mut running: Vec<(String, String)> = Vec::new();
-        for step in &self.steps {
-            let argv = match step {
-                Step::Env { key, value } => {
-                    match running.iter_mut().find(|(k, _)| k == key) {
-                        Some(existing) => existing.1 = value.clone(),
-                        None => running.push((key.clone(), value.clone())),
-                    }
-                    // Nothing on the wire: there is no session-level environment, so this
-                    // rides on every later command instead.
-                    continue;
-                }
-                Step::Run(command) => {
-                    // `env` in front rather than a shell assignment, because the argv is
-                    // already split and no shell is consulted to build it — so no value
-                    // needs quoting and a value with a space in it cannot become two words.
-                    let mut argv = vec!["env".to_string()];
-                    argv.extend(running.iter().map(|(k, v)| format!("{k}={v}")));
-                    argv.push("sh".into());
-                    // `-c` and not `-lc`. A login shell sources `/etc/profile`, and what
-                    // `/etc/profile` does on every base worth naming is *assign* `PATH` —
-                    // which throws away the one the agent built, `/abin` and the delegated
-                    // names with it. A build would then be unable to run the executables it
-                    // declared, while still hashing them into its own id.
-                    argv.push("-c".into());
-                    argv.push(command.clone());
-                    argv
-                }
-                Step::Copy { src, dst } => {
-                    inside_context(src)?;
-                    let from = workfs.join(src);
-                    let from = from.to_str().with_context(|| {
-                        format!("{} is not a UTF-8 path to name to a server", from.display())
-                    })?;
-                    // The destination's parent is made first, because `COPY app /srv/app`
-                    // with no `/srv` is the ordinary Dockerfile spelling — `docker build`
-                    // creates the path and a bare `cp -a` does not, which would fail an
-                    // instruction this adapter had already accepted.
-                    //
-                    // One `sh -c` rather than two steps, so a caller watching `on_step` sees
-                    // the one instruction it declared.
-                    vec![
-                        "sh".to_string(),
-                        "-c".to_string(),
-                        "mkdir -p -- \"$(dirname -- \"$2\")\" && cp -a -- \"$1\" \"$2\""
-                            .to_string(),
-                        // `sh -c … name arg1 arg2`: the paths travel as arguments rather
-                        // than inside the script, so nothing in either is ever word-split or
-                        // read as a shell operator.
-                        "cp".to_string(),
-                        from.to_string(),
-                        dst.clone(),
-                    ]
-                }
-                // `cd` is a protocol builtin and moves the session, so it persists across the
-                // steps after it rather than ending with the command.
-                Step::Workdir(dir) => vec!["cd".to_string(), dir.clone()],
-            };
-
-            let result = session.exec(&argv, None).await?;
-            if let Some(on_step) = self.on_step.as_mut() {
-                on_step(step, &result);
-            }
-            if result.code != 0 {
-                // Nothing is committed, so nothing is cached and the next attempt starts
-                // over. Dropping the session here is what releases the guest.
-                return Err(anyhow::Error::new(StepFailed {
-                    step: step.clone(),
-                    argv,
-                    result,
-                }));
-            }
-        }
-
-        let image = session
-            .commit(id.to_string(), env.clone(), working_dir.clone())
+        let result = client
+            .exec(ExecCall {
+                cmd: argv.clone(),
+                timeout_ms: None,
+            })
             .await?;
+        if let Some(on_step) = rootfs.on_step.as_mut() {
+            on_step(step, &result);
+        }
+        if result.code != 0 {
+            // Nothing is committed, so nothing is cached and the next attempt starts over.
+            return Err(anyhow::Error::new(StepFailed {
+                step: step.clone(),
+                argv,
+                result,
+            }));
+        }
+    }
 
-        Ok(BuiltImage {
-            id,
-            image,
-            env,
-            working_dir,
+    client
+        .commit(CommitCall {
+            id: plan.id.to_string(),
+            env: plan.env.clone(),
+            working_dir: plan.working_dir.clone(),
         })
-    }
-}
-
-/// Whether a console server already has the image `id` names.
-///
-/// # Why there is no method for this
-///
-/// Opening a session on the image *is* the question. `init` either provides the base asked
-/// for or refuses the session, which is a contract the protocol already has — so the probe
-/// costs one server process and no boot, and adding a method would have meant a second way
-/// to ask the same thing.
-///
-/// That a *built* image's existence is answered at `init` while an *OCI reference*'s is
-/// deferred to boot is deliberate: the first is a local file test, the second is a network
-/// round trip that belongs to a boot.
-async fn already_built(
-    id: &BuildId,
-    console: &impl Fn() -> ConsoleBuilder,
-) -> anyhow::Result<Option<ImageSource>> {
-    let image = ImageSource::new(reference(id));
-    match console().image(image.clone()).build().await {
-        // Taken, so it is there. The console goes out of scope here, which says `quit`.
-        Ok(_) => Ok(Some(image)),
-        Err(e) => match e.downcast_ref::<Failure>().and_then(Failure::code) {
-            Some(Error::UNKNOWN_IMAGE) => Ok(None),
-            // Anything else is the caller's to hear: a server that can swap no base at all, a
-            // channel that broke, a server that would not start. Building anyway would fail
-            // the same way and more slowly.
-            _ => Err(e),
-        },
-    }
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -543,8 +502,8 @@ mod tests {
 
     use crate::BoxFuture;
     use crate::console::{
-        Call, Client, CommitResp, ConsoleBuilder, Error, Failure, ImageSource, InitResp,
-        Notification, Response, WorkFsMount,
+        Call, Client, CommitResp, Console, ConsoleBuilder, Error, Failure, ImageSource, InitCall,
+        InitResp, Notification, Response, WorkFsMount,
     };
 
     /// Every call a build made, in order.
@@ -578,6 +537,20 @@ mod tests {
         fn notify(&mut self, _: Notification) -> BoxFuture<'_, Result<(), Failure>> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    /// A console builder over canned answers, and the log of everything sent to it.
+    ///
+    /// One client for the whole thing, because that is what a build is here: the session's
+    /// own `init`, and — only if that one is refused — a build session on the same channel
+    /// and then the session's `init` again.
+    fn answering(answers: Vec<Response>) -> (ConsoleBuilder, Log) {
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let builder = ConsoleBuilder::new().client(Recorder {
+            answers,
+            log: log.clone(),
+        });
+        (builder, log)
     }
 
     /// A session taken, with the workfs put where the build said it was.
@@ -616,23 +589,27 @@ mod tests {
             .collect()
     }
 
-    /// Two consoles, in order: the first is asked for the built image, the second builds it.
-    ///
-    /// One helper for both because `build` may open either one console or two, and a test
-    /// that had to know which would be asserting the shape of the code rather than what it
-    /// sent.
-    fn two(first: Vec<Response>, second: Vec<Response>) -> (impl Fn() -> ConsoleBuilder, Log) {
-        let log: Log = Arc::new(Mutex::new(Vec::new()));
-        let queued = Arc::new(Mutex::new(vec![second, first]));
-        let shared = log.clone();
-        let make = move || {
-            let answers = queued.lock().unwrap().pop().expect("a third console");
-            ConsoleBuilder::new().client(Recorder {
-                answers,
-                log: shared.clone(),
+    /// The `init` calls in a log, in order.
+    fn inits(log: &Log) -> Vec<InitCall> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Init(init) => Some(init.clone()),
+                _ => None,
             })
-        };
-        (make, log)
+            .collect()
+    }
+
+    /// What a build refused with.
+    ///
+    /// Not `unwrap_err`, which wants `Debug` on the other side — and a `Console` holds a
+    /// live channel, which is not a thing to print.
+    fn refusal(built: anyhow::Result<Console>) -> anyhow::Error {
+        match built {
+            Ok(_) => panic!("this was expected to fail, and a session came back"),
+            Err(refused) => refused,
+        }
     }
 
     /// The one answer that means the image is not there and the build should run.
@@ -644,8 +621,8 @@ mod tests {
         })
     }
 
-    /// An image that already exists is answered without building it. The probe is one
-    /// `init` — no boot, no steps, no commit.
+    /// An image that already exists is not built again. The whole session costs one `init` —
+    /// no boot, no steps, no commit.
     #[tokio::test]
     async fn an_image_that_exists_is_not_built_again() {
         let context = tempfile::tempdir().unwrap();
@@ -654,75 +631,79 @@ mod tests {
             .env("TZ", "UTC")
             .run("true");
         let id = rootfs.id().unwrap();
+        let reference = format!("cortex.local/built@{id}");
 
-        let (make, log) = two(vec![Response::Init(InitResp::default())], Vec::new());
-        let built = rootfs.build(make).await.expect("the cached image");
+        let (builder, log) = answering(vec![Response::Init(InitResp {
+            image: Some(ImageSource::new(&reference)),
+            ..InitResp::default()
+        })]);
+        let console = builder.rootfs(rootfs).build().await.expect("a session");
 
-        assert_eq!(built.id(), &id);
-        assert_eq!(
-            built.image().reference,
-            format!("cortex.local/built@{id}"),
-            "the cached image is not named the way a built one is"
-        );
-        // What the image states is the recipe's, not a session's — so it is the same whether
-        // the build ran or was found.
-        assert_eq!(built.env(), ["TZ=UTC"]);
-
+        assert_eq!(console.image().unwrap().reference, reference);
         assert!(argvs(&log).is_empty(), "a cache hit ran a step");
         assert_eq!(
             log.lock().unwrap().len(),
             1,
-            "a cache hit did more than ask"
+            "a cache hit sent more than the session's own init"
         );
     }
 
-    /// The probe names the built image and asks for nothing else — a session that is not a
-    /// build, so it is not committable and mounts nothing.
+    /// The session's own `init` names the built image, and is otherwise the session the
+    /// caller described — a rootfs says what the commands run *in*, and nothing else.
     #[tokio::test]
-    async fn the_probe_asks_only_whether_the_image_is_there() {
+    async fn the_first_init_names_the_built_image_and_nothing_more() {
         let context = tempfile::tempdir().unwrap();
         let rootfs = Rootfs::from_image("alpine")
             .context(context.path().to_path_buf())
             .run("true");
         let id = rootfs.id().unwrap();
 
-        let (make, log) = two(vec![Response::Init(InitResp::default())], Vec::new());
-        rootfs.build(make).await.expect("the cached image");
+        let (builder, log) = answering(vec![Response::Init(InitResp::default())]);
+        builder.rootfs(rootfs).build().await.expect("a session");
 
-        let calls = log.lock().unwrap();
-        let Call::Init(init) = &calls[0] else {
-            panic!("the probe was not an init");
-        };
+        let init = inits(&log).remove(0);
         assert_eq!(
             init.image.as_ref().unwrap().reference,
             format!("cortex.local/built@{id}")
         );
-        assert!(!init.committable, "the probe asked to be committable");
-        assert!(init.workfs.is_none(), "the probe mounted the context");
+        // Neither asked for by this caller, and neither borrowed from the build: a build is
+        // committable and mounts its context, and this session is not and does not.
+        assert!(!init.committable, "the build's commit right leaked");
+        assert!(init.workfs.is_none(), "the build's context leaked");
     }
 
-    /// An image nobody has built is built. `UNKNOWN_IMAGE` is the answer that says so, and
-    /// it is the only one that means "carry on".
+    /// An image nobody has built is built, and then the session is asked for again.
+    /// `UNKNOWN_IMAGE` is the answer that says so, and it is the only one that means
+    /// "carry on".
     #[tokio::test]
     async fn an_image_nobody_has_built_is_built() {
         let context = tempfile::tempdir().unwrap();
-        let (make, log) = two(
-            vec![unknown_image()],
-            vec![
-                took_the_session(context.path()),
-                ran(0),
-                committed("cortex.local/built@sha256:whatever"),
-            ],
-        );
+        let (builder, log) = answering(vec![
+            unknown_image(),
+            took_the_session(context.path()),
+            ran(0),
+            committed("cortex.local/built@sha256:whatever"),
+            Response::Init(InitResp::default()),
+        ]);
 
-        Rootfs::from_image("alpine")
-            .context(context.path().to_path_buf())
-            .run("true")
-            .build(make)
+        builder
+            .rootfs(
+                Rootfs::from_image("alpine")
+                    .context(context.path().to_path_buf())
+                    .run("true"),
+            )
+            .build()
             .await
-            .expect("building");
+            .expect("a session on what the build made");
 
         assert_eq!(argvs(&log), [vec!["env", "sh", "-c", "true"]]);
+        // Three: the one that was refused, the build's, and the one that was answered.
+        let inits = inits(&log);
+        assert_eq!(inits.len(), 3);
+        assert_eq!(
+            inits[0], inits[2],
+            "the session asked for after the build is not the one asked for before it"
+        );
     }
 
     /// Any other refusal is the caller's to hear. A server that cannot swap a base at all
@@ -730,24 +711,30 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_that_is_not_about_the_cache_is_reported() {
         let context = tempfile::tempdir().unwrap();
-        let (make, _) = two(
-            vec![Response::Error(Error {
-                code: Error::UNSUPPORTED_IMAGE,
-                message: "commands here run on this host's own filesystem".into(),
-                data: None,
-            })],
-            Vec::new(),
-        );
+        let (builder, log) = answering(vec![Response::Error(Error {
+            code: Error::UNSUPPORTED_IMAGE,
+            message: "commands here run on this host's own filesystem".into(),
+            data: None,
+        })]);
 
-        let refused = Rootfs::from_image("alpine")
-            .context(context.path().to_path_buf())
-            .run("true")
-            .build(make)
-            .await
-            .unwrap_err();
+        let refused = refusal(
+            builder
+                .rootfs(
+                    Rootfs::from_image("alpine")
+                        .context(context.path().to_path_buf())
+                        .run("true"),
+                )
+                .build()
+                .await,
+        );
         assert!(
             format!("{refused:#}").contains("host's own filesystem"),
             "the server's refusal was swallowed: {refused:#}"
+        );
+        assert_eq!(
+            inits(&log).len(),
+            1,
+            "a refusal that is not the cache built"
         );
     }
 
@@ -759,26 +746,28 @@ mod tests {
         std::fs::write(context.path().join("app.py"), b"x").unwrap();
         let workfs = context.path().to_path_buf();
 
-        let (make, log) = two(
-            vec![unknown_image()],
-            vec![
-                took_the_session(&workfs),
-                ran(0), // RUN
-                ran(0), // COPY
-                ran(0), // WORKDIR
-                committed("cortex.local/built@sha256:whatever"),
-            ],
-        );
+        let (builder, log) = answering(vec![
+            unknown_image(),
+            took_the_session(&workfs),
+            ran(0), // RUN
+            ran(0), // COPY
+            ran(0), // WORKDIR
+            committed("cortex.local/built@sha256:whatever"),
+            Response::Init(InitResp::default()),
+        ]);
 
-        let built = Rootfs::from_image("alpine:3.20")
-            .context(context.path().to_path_buf())
-            .env("TZ", "UTC")
-            .run("apk add jq")
-            .copy("app.py", "/srv/app.py")
-            .workdir("/srv")
-            .build(make)
+        builder
+            .rootfs(
+                Rootfs::from_image("alpine:3.20")
+                    .context(context.path().to_path_buf())
+                    .env("TZ", "UTC")
+                    .run("apk add jq")
+                    .copy("app.py", "/srv/app.py")
+                    .workdir("/srv"),
+            )
+            .build()
             .await
-            .expect("building");
+            .expect("a session on what the build made");
 
         assert_eq!(
             argvs(&log),
@@ -797,36 +786,32 @@ mod tests {
                 vec!["cd", "/srv"],
             ]
         );
-        assert_eq!(built.env(), ["TZ=UTC"]);
-        assert_eq!(built.working_dir(), Some("/srv"));
     }
 
     /// A build session says what it is at `init`: committable, with the context as its
-    /// workfs, on the base the caller named, and delegating nothing — a build does not use
-    /// delegation.
+    /// workfs, and on the base the caller named rather than the image being built.
     #[tokio::test]
     async fn a_build_session_declares_itself() {
         let context = tempfile::tempdir().unwrap();
-        let (make, log) = two(
-            vec![unknown_image()],
-            vec![
-                took_the_session(context.path()),
-                ran(0),
-                committed("cortex.local/built@sha256:whatever"),
-            ],
-        );
+        let (builder, log) = answering(vec![
+            unknown_image(),
+            took_the_session(context.path()),
+            ran(0),
+            committed("cortex.local/built@sha256:whatever"),
+            Response::Init(InitResp::default()),
+        ]);
 
-        Rootfs::from_image("alpine:3.20")
-            .context(context.path().to_path_buf())
-            .run("true")
-            .build(make)
+        builder
+            .rootfs(
+                Rootfs::from_image("alpine:3.20")
+                    .context(context.path().to_path_buf())
+                    .run("true"),
+            )
+            .build()
             .await
-            .expect("building");
+            .expect("a session on what the build made");
 
-        let calls = log.lock().unwrap();
-        let Call::Init(init) = &calls[1] else {
-            panic!("the build session did not begin with an init");
-        };
+        let init = inits(&log).remove(1);
         assert!(init.committable, "a build session cannot commit");
         assert_eq!(init.image.as_ref().unwrap().reference, "alpine:3.20");
         assert!(init.workfs.is_some(), "the context was not mounted");
@@ -843,59 +828,67 @@ mod tests {
     #[tokio::test]
     async fn the_commit_says_the_id_and_what_the_image_states() {
         let context = tempfile::tempdir().unwrap();
-        let (make, log) = two(
-            vec![unknown_image()],
-            vec![
-                took_the_session(context.path()),
-                ran(0),
-                committed("cortex.local/built@sha256:whatever"),
-            ],
-        );
+        let (builder, log) = answering(vec![
+            unknown_image(),
+            took_the_session(context.path()),
+            ran(0), // the WORKDIR; the ENV sends nothing
+            committed("cortex.local/built@sha256:whatever"),
+            Response::Init(InitResp::default()),
+        ]);
 
         let rootfs = Rootfs::from_image("alpine")
             .context(context.path().to_path_buf())
             .env("TZ", "UTC")
             .workdir("/srv");
         let expected = rootfs.id().unwrap();
-        rootfs.build(make).await.expect("building");
+        builder
+            .rootfs(rootfs)
+            .build()
+            .await
+            .expect("a session on what the build made");
 
         let calls = log.lock().unwrap();
-        let Call::Commit(commit) = calls.last().unwrap() else {
-            panic!("the last call was not a commit");
+        let Some(Call::Commit(commit)) = calls.iter().find(|call| matches!(call, Call::Commit(_)))
+        else {
+            panic!("the build did not commit");
         };
         assert_eq!(commit.id, expected.to_string());
         assert_eq!(commit.env, ["TZ=UTC"]);
         assert_eq!(commit.working_dir.as_deref(), Some("/srv"));
     }
 
-    /// Saying so takes it away again. The default is the internet, not a floor.
+    /// Saying so takes it away again. The default is the internet, not a floor — and what
+    /// the build asked for is the build's, not the session's.
     #[tokio::test]
     async fn a_build_can_ask_for_less_than_the_internet() {
         let context = tempfile::tempdir().unwrap();
-        let (make, log) = two(
-            vec![unknown_image()],
-            vec![
-                took_the_session(context.path()),
-                ran(0),
-                committed("cortex.local/built@sha256:whatever"),
-            ],
-        );
+        let (builder, log) = answering(vec![
+            unknown_image(),
+            took_the_session(context.path()),
+            ran(0),
+            committed("cortex.local/built@sha256:whatever"),
+            Response::Init(InitResp::default()),
+        ]);
 
-        Rootfs::from_image("alpine")
-            .context(context.path().to_path_buf())
-            .network(crate::console::NetworkAccess::none())
-            .run("true")
-            .build(make)
+        builder
+            .rootfs(
+                Rootfs::from_image("alpine")
+                    .context(context.path().to_path_buf())
+                    .network(crate::console::NetworkAccess::none())
+                    .run("true"),
+            )
+            .build()
             .await
-            .expect("building");
+            .expect("a session on what the build made");
 
-        let calls = log.lock().unwrap();
-        let Call::Init(init) = &calls[1] else {
-            panic!("the build session did not begin with an init");
-        };
+        let inits = inits(&log);
         assert_eq!(
-            init.network.as_ref().map(|reach| reach.reach.as_str()),
+            inits[1].network.as_ref().map(|reach| reach.reach.as_str()),
             Some("none")
+        );
+        assert!(
+            inits[0].network.is_none(),
+            "the build's reach was asked for on the session too"
         );
     }
 
@@ -904,18 +897,23 @@ mod tests {
     #[tokio::test]
     async fn a_failed_step_stops_the_build_and_commits_nothing() {
         let context = tempfile::tempdir().unwrap();
-        let (make, log) = two(
-            vec![unknown_image()],
-            vec![took_the_session(context.path()), ran(3)],
-        );
+        let (builder, log) = answering(vec![
+            unknown_image(),
+            took_the_session(context.path()),
+            ran(3),
+        ]);
 
-        let refused = Rootfs::from_image("alpine")
-            .context(context.path().to_path_buf())
-            .run("false")
-            .run("never reached")
-            .build(make)
-            .await
-            .unwrap_err();
+        let refused = refusal(
+            builder
+                .rootfs(
+                    Rootfs::from_image("alpine")
+                        .context(context.path().to_path_buf())
+                        .run("false")
+                        .run("never reached"),
+                )
+                .build()
+                .await,
+        );
 
         let failed = refused
             .downcast_ref::<StepFailed>()
@@ -936,6 +934,8 @@ mod tests {
                 .any(|call| matches!(call, Call::Commit(_))),
             "a failed build committed"
         );
+        // And no session on top of it: there is no image for one to run in.
+        assert_eq!(inits(&log).len(), 2);
     }
 
     /// `on_step` sees every step that reached the server, and only those — an `ENV` sends
@@ -943,29 +943,50 @@ mod tests {
     #[tokio::test]
     async fn on_step_sees_the_steps_that_ran() {
         let context = tempfile::tempdir().unwrap();
-        let (make, _) = two(
-            vec![unknown_image()],
-            vec![
-                took_the_session(context.path()),
-                ran(0),
-                ran(0),
-                committed("cortex.local/built@sha256:whatever"),
-            ],
-        );
+        let (builder, _) = answering(vec![
+            unknown_image(),
+            took_the_session(context.path()),
+            ran(0),
+            ran(0),
+            committed("cortex.local/built@sha256:whatever"),
+            Response::Init(InitResp::default()),
+        ]);
 
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorded = seen.clone();
-        Rootfs::from_image("alpine")
-            .context(context.path().to_path_buf())
-            .env("TZ", "UTC")
-            .run("true")
-            .workdir("/srv")
-            .on_step(move |step, _| recorded.lock().unwrap().push(step.to_string()))
-            .build(make)
+        builder
+            .rootfs(
+                Rootfs::from_image("alpine")
+                    .context(context.path().to_path_buf())
+                    .env("TZ", "UTC")
+                    .run("true")
+                    .workdir("/srv")
+                    .on_step(move |step, _| recorded.lock().unwrap().push(step.to_string())),
+            )
+            .build()
             .await
-            .expect("building");
+            .expect("a session on what the build made");
 
         assert_eq!(*seen.lock().unwrap(), ["RUN true", "WORKDIR /srv"]);
+    }
+
+    /// A session cannot be told twice what its commands run in. Refused before a process is
+    /// started, because there is nothing to ask a server about.
+    #[tokio::test]
+    async fn a_session_names_an_image_or_a_rootfs_and_not_both() {
+        let (builder, log) = answering(Vec::new());
+        let refused = refusal(
+            builder
+                .image("alpine:3.20")
+                .rootfs(Rootfs::from_image("alpine").run("true"))
+                .build()
+                .await,
+        );
+        assert!(
+            format!("{refused:#}").contains("name one"),
+            "the wrong complaint: {refused:#}"
+        );
+        assert!(log.lock().unwrap().is_empty(), "something was sent anyway");
     }
 
     /// The calls accumulate in the order they were made, which is the order they will run.
@@ -1016,7 +1037,7 @@ mod tests {
             .workdir("/one")
             .env("LANG", "C")
             .workdir("/two");
-        let (env, working_dir) = rootfs.stated();
+        let (env, working_dir) = stated(rootfs.steps());
         assert_eq!(env, ["TZ=UTC", "LANG=C"]);
         assert_eq!(working_dir.as_deref(), Some("/two"));
     }
@@ -1029,7 +1050,7 @@ mod tests {
             .env("TZ", "UTC")
             .env("LANG", "C")
             .env("TZ", "Asia/Seoul");
-        let (env, _) = rootfs.stated();
+        let (env, _) = stated(rootfs.steps());
         assert_eq!(env, ["TZ=Asia/Seoul", "LANG=C"]);
     }
 
