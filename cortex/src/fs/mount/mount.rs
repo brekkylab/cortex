@@ -70,9 +70,7 @@ pub trait Mount: Send + Sync {
     /// The translation every consumer of a mount performs, provided once because the join is
     /// only correct for a *relative* path: `Path::join` given an absolute one throws the
     /// mountpoint away and answers about the host's own root instead. The paths this crate
-    /// hands around are relative for that reason — see
-    /// [`resolve_under`](crate::exec::resolve_under), which is where an argument from
-    /// outside becomes one.
+    /// hands around are relative for that reason.
     fn host_path(&self, path: &Path) -> PathBuf {
         self.mountpoint().join(path)
     }

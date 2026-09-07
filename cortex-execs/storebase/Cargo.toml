@@ -1,0 +1,14 @@
+[package]
+name = "cortex-exec-storebase"
+version.workspace = true
+edition.workspace = true
+
+# No `[[bin]]`: this is the substrate `mem` and `index` are built on, not one of them.
+
+[dependencies]
+# The store. `bundled` (from the workspace) on purpose: every schema here is an FTS5 index, and
+# FTS5 is a compile-time option the host's own SQLite is free to have been built without.
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
