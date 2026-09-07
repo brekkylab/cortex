@@ -28,7 +28,7 @@ use std::path::Path;
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 
-use super::Step;
+use super::{Recipe, Step};
 
 /// The version of what goes into a [`BuildId`].
 ///
@@ -57,26 +57,21 @@ impl fmt::Display for BuildId {
     }
 }
 
-/// Everything a [`BuildId`] is computed from, gathered so that computing one is a function
-/// and not a method — which is what lets the digest be tested without a builder.
-pub(crate) struct Recipe<'a> {
-    pub base: &'a str,
-    pub steps: &'a [Step],
-    /// What a `COPY` source is relative to.
-    pub context: &'a Path,
-}
-
-/// The digest of `recipe`.
+/// The digest of `recipe`, whose `COPY` sources are read relative to `context`.
+///
+/// A function rather than a method, which is what lets the digest be tested without a
+/// builder — and it takes the context beside the recipe rather than inside it, because a
+/// recipe is deliberately free of anything machine-local. See [`Recipe`].
 ///
 /// Fails only for a `COPY` source it could not read. Inventing a digest for one would let two
 /// different builds share a cache entry, which is the one mistake a content-addressed cache
 /// must not make.
-pub(crate) fn digest(recipe: Recipe<'_>) -> anyhow::Result<BuildId> {
+pub(crate) fn digest(recipe: &Recipe, context: &Path) -> anyhow::Result<BuildId> {
     let mut hasher = Sha256::new();
     feed(&mut hasher, HASH_VERSION.as_bytes());
     feed(&mut hasher, recipe.base.as_bytes());
 
-    for step in recipe.steps {
+    for step in &recipe.steps {
         match step {
             Step::Run(command) => {
                 feed(&mut hasher, b"run");
@@ -91,7 +86,7 @@ pub(crate) fn digest(recipe: Recipe<'_>) -> anyhow::Result<BuildId> {
                 feed(&mut hasher, b"copy");
                 feed(&mut hasher, path_bytes(src));
                 feed(&mut hasher, dst.as_bytes());
-                tree(&mut hasher, recipe.context, src)?;
+                tree(&mut hasher, context, src)?;
             }
             Step::Env { key, value } => {
                 feed(&mut hasher, b"env");
@@ -198,16 +193,14 @@ const MAX_DEPTH: usize = 256;
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::*;
 
-    fn recipe<'a>(base: &'a str, steps: &'a [Step], context: &'a Path) -> Recipe<'a> {
-        Recipe {
-            base,
-            steps,
-            context,
-        }
+    /// A recipe from the pieces a test names. The context travels beside it now rather
+    /// than inside it, which is what lets the same recipe be built anywhere.
+    fn recipe(base: &str, steps: &[Step]) -> Recipe {
+        Recipe::new(base, steps.to_vec())
     }
 
     /// The same recipe twice is the same id, which is the whole point of it.
@@ -215,8 +208,8 @@ mod tests {
     fn the_same_recipe_is_the_same_id() {
         let steps = [Step::Run("apk add jq".into())];
         let here = PathBuf::from(".");
-        let first = digest(recipe("alpine:3.20", &steps, &here)).unwrap();
-        let again = digest(recipe("alpine:3.20", &steps, &here)).unwrap();
+        let first = digest(&recipe("alpine:3.20", &steps), &here).unwrap();
+        let again = digest(&recipe("alpine:3.20", &steps), &here).unwrap();
         assert_eq!(first, again);
         assert!(
             first.as_str().starts_with("sha256:"),
@@ -233,8 +226,8 @@ mod tests {
         let forwards = [Step::Run("a".into()), Step::Run("b".into())];
         let backwards = [Step::Run("b".into()), Step::Run("a".into())];
         assert_ne!(
-            digest(recipe("alpine", &forwards, &here)).unwrap(),
-            digest(recipe("alpine", &backwards, &here)).unwrap()
+            digest(&recipe("alpine", &forwards), &here).unwrap(),
+            digest(&recipe("alpine", &backwards), &here).unwrap()
         );
     }
 
@@ -244,8 +237,8 @@ mod tests {
         let steps = [Step::Run("a".into())];
         let here = PathBuf::from(".");
         assert_ne!(
-            digest(recipe("alpine:3.20", &steps, &here)).unwrap(),
-            digest(recipe("alpine:3.21", &steps, &here)).unwrap()
+            digest(&recipe("alpine:3.20", &steps), &here).unwrap(),
+            digest(&recipe("alpine:3.21", &steps), &here).unwrap()
         );
     }
 
@@ -264,8 +257,8 @@ mod tests {
             value: "BC".into(),
         }];
         assert_ne!(
-            digest(recipe("alpine", &one, &here)).unwrap(),
-            digest(recipe("alpine", &other, &here)).unwrap()
+            digest(&recipe("alpine", &one), &here).unwrap(),
+            digest(&recipe("alpine", &other), &here).unwrap()
         );
     }
 
@@ -280,9 +273,9 @@ mod tests {
             dst: "/srv/app.py".into(),
         }];
 
-        let before = digest(recipe("alpine", &steps, context.path())).unwrap();
+        let before = digest(&recipe("alpine", &steps), context.path()).unwrap();
         std::fs::write(context.path().join("app.py"), b"print(2)").unwrap();
-        let after = digest(recipe("alpine", &steps, context.path())).unwrap();
+        let after = digest(&recipe("alpine", &steps), context.path()).unwrap();
         assert_ne!(before, after, "an edited file did not change the build id");
     }
 
@@ -297,11 +290,11 @@ mod tests {
             dst: "/srv/app".into(),
         }];
 
-        let before = digest(recipe("alpine", &steps, context.path())).unwrap();
+        let before = digest(&recipe("alpine", &steps), context.path()).unwrap();
         std::fs::write(context.path().join("app/extra.py"), b"y").unwrap();
         assert_ne!(
             before,
-            digest(recipe("alpine", &steps, context.path())).unwrap()
+            digest(&recipe("alpine", &steps), context.path()).unwrap()
         );
     }
 
@@ -319,11 +312,11 @@ mod tests {
             dst: "/run.sh".into(),
         }];
 
-        let before = digest(recipe("alpine", &steps, context.path())).unwrap();
+        let before = digest(&recipe("alpine", &steps), context.path()).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_ne!(
             before,
-            digest(recipe("alpine", &steps, context.path())).unwrap()
+            digest(&recipe("alpine", &steps), context.path()).unwrap()
         );
     }
 
@@ -336,7 +329,7 @@ mod tests {
             src: "absent".into(),
             dst: "/absent".into(),
         }];
-        let refused = digest(recipe("alpine", &steps, context.path())).unwrap_err();
+        let refused = digest(&recipe("alpine", &steps), context.path()).unwrap_err();
         assert!(
             refused.to_string().contains("absent"),
             "the error does not name the missing path: {refused}"
@@ -353,7 +346,7 @@ mod tests {
             src: "../secrets.env".into(),
             dst: "/secrets.env".into(),
         }];
-        let refused = digest(recipe("alpine", &steps, context.path()))
+        let refused = digest(&recipe("alpine", &steps), context.path())
             .unwrap_err()
             .to_string();
         assert!(refused.contains("climbs out of it"), "{refused}");

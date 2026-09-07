@@ -7,6 +7,11 @@
 //! that comes back is a session in what it describes — built on the way there if nobody has
 //! built it yet.
 //!
+//! It is two things beside each other: a [`Recipe`](super::Recipe), which is what the build
+//! declares and can be written down, and a context directory, which is where this machine
+//! keeps what a `COPY` reads. Everything that computes takes them as a pair, because the
+//! line between them is the line between what travels and what does not.
+//!
 //! The rest of this module is what a build *means*: [`plan`] works out its name from the
 //! declaration alone, and [`run`] turns the steps into `exec`s on a session someone else
 //! opened.
@@ -30,11 +35,15 @@ use super::{BuildId, Recipe, Step, digest};
 /// where a server is spoken to — so this value is inert, and a caller can build one, hash it,
 /// store it, and decide later whether anything runs.
 pub struct Rootfs {
-    base: String,
-    steps: Vec<Step>,
+    /// What this build declares — the base and the steps — and nothing about this machine.
+    /// The half that can be written down and read back somewhere else.
+    recipe: Recipe,
     /// What a `COPY` source is relative to, and what is mounted as the build session's
     /// workfs. Defaults to the current directory, which is what a caller writing
     /// `.copy("app", …)` means by `app`.
+    ///
+    /// Beside the recipe rather than in it: an absolute path on one machine means nothing on
+    /// another, so a recipe carrying one could not travel.
     context: PathBuf,
     /// Called after each step that reached the server. Boxed because a caller's closure is
     /// its own type and this struct has no business being generic over it — a `Rootfs` is
@@ -80,9 +89,19 @@ impl Rootfs {
     /// A tag works and a digest is better, for the reason [`BuildId`] states: this build's
     /// id sees the string, so a tag that moves keeps serving the old image.
     pub fn from_image(reference: impl Into<String>) -> Self {
+        Rootfs::from_recipe(Recipe::new(reference, Vec::new()))
+    }
+
+    /// A build over a recipe that already exists — one read back from wherever it was
+    /// stored, or built up as a [`Recipe`] rather than by chaining.
+    ///
+    /// The [`context`](Self::context) starts at the current directory, as it does for
+    /// [`from_image`](Self::from_image), because a recipe carries none: that is what lets it
+    /// be the same recipe on another machine. A recipe with a `COPY` in it needs one named
+    /// here.
+    pub fn from_recipe(recipe: Recipe) -> Self {
         Rootfs {
-            base: reference.into(),
-            steps: Vec::new(),
+            recipe,
             context: PathBuf::from("."),
             on_step: None,
         }
@@ -90,7 +109,7 @@ impl Rootfs {
 
     /// A command, run through `sh -c` with everything [`env`](Self::env) has said so far.
     pub fn run(mut self, command: impl Into<String>) -> Self {
-        self.steps.push(Step::Run(command.into()));
+        self.recipe.steps.push(Step::Run(command.into()));
         self
     }
 
@@ -100,7 +119,7 @@ impl Rootfs {
     /// refused when the build runs, because it names a place the context does not contain
     /// and so is not part of what this build declared.
     pub fn copy(mut self, src: impl AsRef<Path>, dst: impl Into<String>) -> Self {
-        self.steps.push(Step::Copy {
+        self.recipe.steps.push(Step::Copy {
             src: src.as_ref().to_path_buf(),
             dst: dst.into(),
         });
@@ -109,7 +128,7 @@ impl Rootfs {
 
     /// A variable, for every later [`run`](Self::run) and for what the image states.
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        self.steps.push(Step::Env {
+        self.recipe.steps.push(Step::Env {
             key: key.into(),
             value: value.into(),
         });
@@ -118,7 +137,7 @@ impl Rootfs {
 
     /// Where later steps run, and what the image states.
     pub fn workdir(mut self, dir: impl Into<String>) -> Self {
-        self.steps.push(Step::Workdir(dir.into()));
+        self.recipe.steps.push(Step::Workdir(dir.into()));
         self
     }
 
@@ -163,34 +182,22 @@ impl Rootfs {
     /// Fails for a `COPY` source it cannot read. See [`BuildId`] for why that is an error
     /// rather than a digest of nothing.
     pub fn id(&self) -> anyhow::Result<BuildId> {
-        digest(Recipe {
-            base: &self.base,
-            steps: &self.steps,
-            context: &self.context,
-        })
+        digest(&self.recipe, &self.context)
     }
 
-    /// The base, as the caller spelled it.
-    pub fn base(&self) -> &str {
-        &self.base
-    }
-
-    /// The steps, in order.
-    pub fn steps(&self) -> &[Step] {
-        &self.steps
-    }
-
-    /// The half of this declaration that names it: everything a [`Plan`] is worked out
-    /// from, owned so it can go to a thread of its own.
+    /// What this build declares: the base, and the steps in order.
     ///
-    /// Not a `Clone` impl on `Rootfs`, because a `Rootfs` also holds
-    /// [`on_step`](Self::on_step) and a closure is not something to hand out copies of.
-    pub(crate) fn spec(&self) -> Spec {
-        Spec {
-            base: self.base.clone(),
-            steps: self.steps.clone(),
-            context: self.context.clone(),
-        }
+    /// The serializable half — see [`Recipe`] for what storing one does and does not carry.
+    pub fn recipe(&self) -> &Recipe {
+        &self.recipe
+    }
+
+    /// The directory a `COPY` reads from, as the caller named it.
+    ///
+    /// Relative until a build resolves it, which is why this is the path that was given
+    /// rather than the one that will be mounted.
+    pub fn context_dir(&self) -> &Path {
+        &self.context
     }
 }
 
@@ -274,34 +281,22 @@ pub(crate) struct Plan {
     pub working_dir: Option<String>,
 }
 
-/// The half of a declaration that a build's *name* is computed from.
-///
-/// Owned and [`Clone`], because working out a name reads every file a `COPY` points at and
-/// so belongs on a thread of its own — and a [`Rootfs`] cannot go there: it carries the
-/// caller's [`on_step`](Rootfs::on_step), which is a closure and stays here.
-#[derive(Clone)]
-pub(crate) struct Spec {
-    base: String,
-    steps: Vec<Step>,
-    context: PathBuf,
-}
-
 /// Work out [`Plan`] from a declaration.
+///
+/// Takes the two halves of a [`Rootfs`] rather than the `Rootfs` itself, because a `Rootfs`
+/// carries the caller's [`on_step`](Rootfs::on_step) — a closure, which cannot be handed to
+/// a thread of its own, and which this has no use for anyway.
 ///
 /// **Blocking**, because computing the id reads every file a `COPY` names — a caller on a
 /// runtime owes this a thread of its own.
-pub(crate) fn plan(spec: &Spec) -> anyhow::Result<Plan> {
-    let id = digest(Recipe {
-        base: &spec.base,
-        steps: &spec.steps,
-        context: &spec.context,
-    })?;
+pub(crate) fn plan(recipe: &Recipe, context: &Path) -> anyhow::Result<Plan> {
+    let id = digest(recipe, context)?;
 
     // Absolute, because a workfs is named to the server as a `file://` URL and a relative
     // path after `file://` reads as a host. Resolved here rather than in `context` so that a
     // caller can name a directory that does not exist yet and be told when it is used.
-    let context = std::path::absolute(&spec.context)
-        .with_context(|| format!("resolving the build context at {}", spec.context.display()))?;
+    let context = std::path::absolute(context)
+        .with_context(|| format!("resolving the build context at {}", context.display()))?;
     let context = context.to_str().with_context(|| {
         format!(
             "a build context that is not UTF-8 cannot be named as a workfs: {:?}",
@@ -309,11 +304,11 @@ pub(crate) fn plan(spec: &Spec) -> anyhow::Result<Plan> {
         )
     })?;
 
-    let (env, working_dir) = stated(&spec.steps);
+    let (env, working_dir) = stated(&recipe.steps);
     Ok(Plan {
         image: ImageSource::new(reference(&id)),
         id,
-        base: ImageSource::new(spec.base.clone()),
+        base: ImageSource::new(recipe.base.clone()),
         workfs: WorkFsSource::new(format!("file://{context}")),
         env,
         working_dir,
@@ -365,7 +360,7 @@ pub(crate) async fn run(
 ) -> anyhow::Result<()> {
     let mut running: Vec<(String, String)> = Vec::new();
 
-    for step in &rootfs.steps {
+    for step in &rootfs.recipe.steps {
         let argv = match step {
             Step::Env { key, value } => {
                 match running.iter_mut().find(|(k, _)| k == key) {
@@ -962,7 +957,7 @@ mod tests {
             .workdir("/srv/app");
 
         assert_eq!(
-            rootfs.steps(),
+            rootfs.recipe().steps,
             [
                 Step::Run("apk add jq".into()),
                 Step::Copy {
@@ -976,7 +971,7 @@ mod tests {
                 Step::Workdir("/srv/app".into()),
             ]
         );
-        assert_eq!(rootfs.base(), "alpine:3.20");
+        assert_eq!(rootfs.recipe().base, "alpine:3.20");
     }
 
     /// What the built image will state: the environment accumulated in order, and the last
@@ -988,7 +983,7 @@ mod tests {
             .workdir("/one")
             .env("LANG", "C")
             .workdir("/two");
-        let (env, working_dir) = stated(rootfs.steps());
+        let (env, working_dir) = stated(&rootfs.recipe().steps);
         assert_eq!(env, ["TZ=UTC", "LANG=C"]);
         assert_eq!(working_dir.as_deref(), Some("/two"));
     }
@@ -1001,7 +996,7 @@ mod tests {
             .env("TZ", "UTC")
             .env("LANG", "C")
             .env("TZ", "Asia/Seoul");
-        let (env, _) = stated(rootfs.steps());
+        let (env, _) = stated(&rootfs.recipe().steps);
         assert_eq!(env, ["TZ=Asia/Seoul", "LANG=C"]);
     }
 

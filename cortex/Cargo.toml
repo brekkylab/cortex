@@ -49,6 +49,10 @@ tokio = { workspace = true, features = [
 # A directory standing in for a mounted tree, which is what a `Mount` is from the far side: a
 # path any process can open — and the build contexts the `rootfs` tests hash, which want a
 # real directory for the same reason.
+# A concrete format to round-trip a `Recipe` through. The type is format-agnostic —
+# whatever a caller stores it as is theirs — so this is here to test that and not to
+# name the one it must be.
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 

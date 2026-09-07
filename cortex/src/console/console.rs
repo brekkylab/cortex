@@ -491,9 +491,13 @@ impl Console {
         let plan = match rootfs.as_ref() {
             None => None,
             Some(declared) => {
-                let declared = declared.spec();
+                // The two halves, cloned out: the declaration and where its `COPY`s read
+                // from. Not the `Rootfs`, which also holds the caller's `on_step` and so
+                // cannot cross to a thread of its own.
+                let recipe = declared.recipe().clone();
+                let context = declared.context_dir().to_path_buf();
                 Some(
-                    tokio::task::spawn_blocking(move || crate::rootfs::plan(&declared))
+                    tokio::task::spawn_blocking(move || crate::rootfs::plan(&recipe, &context))
                         .await
                         .context("working out what this build is called")??,
                 )

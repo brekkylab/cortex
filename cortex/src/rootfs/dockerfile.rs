@@ -379,8 +379,8 @@ mod tests {
         let (rootfs, skipped) = Rootfs::from_dockerfile(dir.path().join("Dockerfile"))
             .expect("a Dockerfile this can read");
 
-        assert_eq!(rootfs.base(), "alpine");
-        assert_eq!(rootfs.steps(), [Step::Run("true".into())]);
+        assert_eq!(rootfs.recipe().base, "alpine");
+        assert_eq!(rootfs.recipe().steps, [Step::Run("true".into())]);
 
         assert_eq!(skipped.len(), 1, "{skipped:?}");
         assert_eq!(skipped[0].instruction, "USER");
@@ -594,7 +594,7 @@ mod tests {
             .env("TZ", "UTC")
             .workdir("/srv");
 
-        assert_eq!(parsed.steps, translated.steps());
+        assert_eq!(parsed.steps, translated.recipe().steps);
         assert_eq!(dockerfile.id().unwrap(), translated.id().unwrap());
     }
 

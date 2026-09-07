@@ -8,12 +8,17 @@
 use std::fmt;
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
 /// One instruction of a build.
 ///
 /// The four the design settled on, and no others. Anything a Dockerfile can say that is not
 /// one of these is warned about or refused by the adapter rather than represented here — see
 /// [`Rootfs::from_dockerfile`](super::Rootfs::from_dockerfile).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Written under its own name — `{"run": …}`, `{"copy": {…}}` — rather than by position,
+/// so a variant added later cannot change what a stored [`Recipe`](super::Recipe) means.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Step {
     /// A command, run through `sh -c` with the environment accumulated so far.
     Run(String),

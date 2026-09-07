@@ -7,6 +7,11 @@
 //! that may [`commit`](crate::console::Console::commit), one `exec` per step, and the
 //! commit that keeps what they wrote — and then the session is asked for again.
 //!
+//! What a build declares is a [`Recipe`] — a base and its steps — and that half is
+//! serializable, so it can be stored beside the image it made or sent to whatever will build
+//! it. What it is built *against*, the context directory, stays on the `Rootfs`: it is a
+//! path on one machine and means nothing on another.
+//!
 //! Nothing here knows what an image *is*. That is the console server's; this module speaks
 //! the protocol and nothing else.
 //!
@@ -37,12 +42,14 @@
 
 mod dockerfile;
 mod id;
+mod recipe;
 mod rootfs;
 mod step;
 
 pub use id::BuildId;
+pub use recipe::Recipe;
 pub use rootfs::{Rootfs, StepFailed, Warning};
 pub use step::Step;
 
-pub(crate) use id::{Recipe, digest};
+pub(crate) use id::digest;
 pub(crate) use rootfs::{Plan, inside_context, plan, run};
