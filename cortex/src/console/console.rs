@@ -266,9 +266,15 @@ impl ConsoleBuilder {
     /// session on a rootfs that nobody has built yet is a boot, every step, and a commit.
     /// [`on_step`](Rootfs::on_step) is how to watch it happen.
     ///
-    /// The build runs in a session of its own, with the recipe's context as its tree — so
-    /// whatever [`mount`](Self::mount) and [`network`](Self::network) say here is about the
-    /// session that comes *out* of the build, and is not disturbed by it.
+    /// The build runs in a session of its own, with the recipe's context as its tree
+    /// rather than whatever [`mount`](Self::mount) names — a recipe says what it copies from,
+    /// and that is not the session's business.
+    ///
+    /// [`network`](Self::network) is the exception, and it reaches both: the build asks for
+    /// the reach this session asked for, and for the internet when this session asked for
+    /// nothing. A recipe carries no reach of its own, because what a build may touch is a
+    /// property of the machine it runs on and not of the image it makes — two callers with
+    /// the same recipe and different network policies still get the same image.
     ///
     /// Refused together with [`image`](Self::image): both say what the commands run in.
     pub fn rootfs(mut self, rootfs: Rootfs) -> Self {
@@ -313,12 +319,19 @@ async fn build_it(
     client: &mut dyn Client,
     rootfs: &mut Rootfs,
     plan: &crate::rootfs::Plan,
+    network: Option<NetworkAccess>,
 ) -> anyhow::Result<()> {
     let answered = client
         .init(InitCall {
             workfs: Some(plan.workfs.clone()),
             image: Some(plan.base.clone()),
-            network: Some(plan.network.clone()),
+            // What the session asked for, and the internet when it asked for nothing. A
+            // session that said nothing gets the server's own default, which is the host and
+            // no further — and a build's first step is almost always a fetch, so that
+            // default would fail nearly every build at a refused connection. A session that
+            // *did* say is taken at its word: a caller who sandboxed the session meant the
+            // build too, and has no second knob here to contradict it with.
+            network: network.or_else(|| Some(NetworkAccess::public())),
             committable: true,
         })
         .await?;
@@ -502,7 +515,7 @@ impl Console {
             (&answered, &plan, rootfs.as_mut())
             && refusal.code == Error::UNKNOWN_IMAGE
         {
-            build_it(&mut *client, rootfs, plan).await?;
+            build_it(&mut *client, rootfs, plan, network.clone()).await?;
             answered = client.init(session).await;
         }
         let answered = answered?;

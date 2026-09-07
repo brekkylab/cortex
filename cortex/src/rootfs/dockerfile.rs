@@ -75,26 +75,31 @@ const SKIPPED: &[(&str, &str)] = &[
 ];
 
 impl Rootfs {
-    /// A build read from a Dockerfile.
+    /// A build read from a Dockerfile, and what reading it skipped.
     ///
     /// The [`context`](Self::context) defaults to the Dockerfile's own directory, which is
     /// what a caller with a `COPY app /srv/app` beside their Dockerfile means. Override it
     /// with `context` if the tree is somewhere else.
     ///
-    /// What was skipped is on [`warnings`](Self::warnings), and has already been written to
-    /// stderr by the time this returns.
-    pub fn from_dockerfile(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    /// The [`Warning`]s are returned rather than printed, because where a diagnostic goes is
+    /// the caller's to decide — a library reaching for stderr on its own has decided for
+    /// them, and one reaching for it *as well* has said the same thing twice. They are empty
+    /// for a Dockerfile that said nothing this build does not act on.
+    ///
+    /// ```no_run
+    /// # use cortex::rootfs::Rootfs;
+    /// # fn f() -> anyhow::Result<()> {
+    /// let (recipe, skipped) = Rootfs::from_dockerfile("app/Dockerfile")?;
+    /// for warning in &skipped {
+    ///     eprintln!("{warning}");
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn from_dockerfile(path: impl AsRef<Path>) -> anyhow::Result<(Self, Vec<Warning>)> {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading the Dockerfile at {}", path.display()))?;
         let parsed = parse(&text)?;
-
-        for warning in &parsed.warnings {
-            // stderr, never stdout: a caller reaching its server over stdio has stdout as
-            // the framing channel, and one stray line there corrupts the stream rather than
-            // merely cluttering it.
-            eprintln!("rootfs: {warning}");
-        }
 
         let mut rootfs = Rootfs::from_image(parsed.base);
         if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
@@ -108,7 +113,7 @@ impl Rootfs {
                 Step::Workdir(dir) => rootfs.workdir(dir),
             };
         }
-        Ok(rootfs.warned(parsed.warnings))
+        Ok((rootfs, parsed.warnings))
     }
 }
 
@@ -358,6 +363,57 @@ fn unquoted(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Dockerfile on disk, in a directory of its own.
+    fn written(text: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a directory");
+        std::fs::write(dir.path().join("Dockerfile"), text).expect("writing it");
+        dir
+    }
+
+    /// What was skipped comes back to the caller, rather than being printed at them. A
+    /// library that prints has decided where a diagnostic goes; this one has not.
+    #[test]
+    fn from_dockerfile_hands_back_what_it_skipped() {
+        let dir = written("FROM alpine\nUSER node\nRUN true\n");
+        let (rootfs, skipped) = Rootfs::from_dockerfile(dir.path().join("Dockerfile"))
+            .expect("a Dockerfile this can read");
+
+        assert_eq!(rootfs.base(), "alpine");
+        assert_eq!(rootfs.steps(), [Step::Run("true".into())]);
+
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].instruction, "USER");
+        assert_eq!(skipped[0].line, 2);
+    }
+
+    /// And a Dockerfile with nothing to skip hands back nothing — an empty `Vec`, not a
+    /// silence the caller has to interpret.
+    #[test]
+    fn a_dockerfile_with_nothing_to_skip_warns_about_nothing() {
+        let dir = written("FROM alpine\nRUN true\n");
+        let (_, skipped) =
+            Rootfs::from_dockerfile(dir.path().join("Dockerfile")).expect("a clean Dockerfile");
+        assert!(skipped.is_empty(), "{skipped:?}");
+    }
+
+    /// The context defaults to the Dockerfile's own directory, which is what a `COPY app …`
+    /// beside it means.
+    ///
+    /// Asserted through `id`, which is what actually depends on it: the id hashes what every
+    /// `COPY` reads, so it can only be answered if the source resolves — and `app` exists
+    /// beside the Dockerfile and nowhere near this test's working directory.
+    #[test]
+    fn the_context_defaults_to_the_dockerfiles_own_directory() {
+        let dir = written("FROM alpine\nCOPY app /srv/app\n");
+        std::fs::write(dir.path().join("app"), b"x").expect("something to copy");
+
+        let (rootfs, _) =
+            Rootfs::from_dockerfile(dir.path().join("Dockerfile")).expect("a Dockerfile");
+        rootfs
+            .id()
+            .expect("the COPY source resolved against the Dockerfile's directory");
+    }
 
     /// The five that are translated, each to the call it corresponds to.
     #[test]

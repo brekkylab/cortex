@@ -15,8 +15,9 @@
 //! use cortex::rootfs::Rootfs;
 //!
 //! # async fn f() -> anyhow::Result<()> {
-//! // A build reaches the internet unless it says otherwise — see [`Rootfs::network`],
-//! // which is also how to take that away.
+//! // A build reaches the internet unless the session says otherwise — see
+//! // [`ConsoleBuilder::rootfs`](crate::console::ConsoleBuilder::rootfs), which is where a
+//! // recipe meets a server and so the one place a reach is decided.
 //! let mut console = Console::builder()
 //!     .stdio_client(&["cortex-uvm-console"])
 //!     .rootfs(

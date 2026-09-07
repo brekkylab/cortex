@@ -16,9 +16,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::console::{
-    Client, CommitCall, ExecCall, ExecResp, ImageSource, NetworkAccess, WorkFsSource,
-};
+use crate::console::{Client, CommitCall, ExecCall, ExecResp, ImageSource, WorkFsSource};
 
 use super::{BuildId, Recipe, Step, digest};
 
@@ -38,8 +36,6 @@ pub struct Rootfs {
     /// workfs. Defaults to the current directory, which is what a caller writing
     /// `.copy("app", …)` means by `app`.
     context: PathBuf,
-    network: NetworkAccess,
-    warnings: Vec<Warning>,
     /// Called after each step that reached the server. Boxed because a caller's closure is
     /// its own type and this struct has no business being generic over it — a `Rootfs` is
     /// passed around and stored, and a type parameter for an observer would spread to
@@ -55,8 +51,9 @@ type Observer = Box<dyn FnMut(&Step, &ExecResp) + Send>;
 
 /// Something a Dockerfile said that this build did not act on.
 ///
-/// Carried on the value as well as written to stderr, because a library that can only print
-/// is a library whose behaviour cannot be asserted.
+/// Handed back by [`Rootfs::from_dockerfile`] rather than printed. A library that only
+/// prints is one whose behaviour cannot be asserted, and one that prints *as well* has
+/// decided on the caller's behalf where its diagnostics go.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Warning {
     /// The line of the Dockerfile it was on, counting from one.
@@ -87,8 +84,6 @@ impl Rootfs {
             base: reference.into(),
             steps: Vec::new(),
             context: PathBuf::from("."),
-            network: NetworkAccess::public(),
-            warnings: Vec::new(),
             on_step: None,
         }
     }
@@ -149,26 +144,6 @@ impl Rootfs {
         self
     }
 
-    /// How much of a network the build's commands get.
-    ///
-    /// **A build reaches the internet unless this says otherwise**, which is the one place
-    /// this differs from an ordinary session. A session's default is the host and nothing
-    /// beyond it; a build's first step is almost always fetching something — a package
-    /// index, a wheel, a base's own updates — and a default that made every such build fail
-    /// at a refused connection would be a default nobody wants.
-    ///
-    /// Say [`none`](NetworkAccess::none) for a build that only copies, or
-    /// [`host`](NetworkAccess::host) for one that reaches a proxy this host is running and
-    /// nothing else.
-    ///
-    /// Not part of the id: this is how the build was made rather than what it is, and a
-    /// build that failed for want of a network commits nothing, so no wrong entry can be
-    /// cached by it. Two builds that differ only here are the same image.
-    pub fn network(mut self, network: NetworkAccess) -> Self {
-        self.network = network;
-        self
-    }
-
     /// Watch each step as it finishes.
     ///
     /// Called for every step that reached the server, which is every step but
@@ -195,14 +170,6 @@ impl Rootfs {
         })
     }
 
-    /// What [`from_dockerfile`](Self::from_dockerfile) skipped, in the order it met them.
-    ///
-    /// Already written to stderr; this is for a caller that wants to render them itself.
-    /// Empty for a builder written by hand, which has nothing to skip.
-    pub fn warnings(&self) -> &[Warning] {
-        &self.warnings
-    }
-
     /// The base, as the caller spelled it.
     pub fn base(&self) -> &str {
         &self.base
@@ -223,14 +190,7 @@ impl Rootfs {
             base: self.base.clone(),
             steps: self.steps.clone(),
             context: self.context.clone(),
-            network: self.network.clone(),
         }
-    }
-
-    /// Where the warnings live, for the adapter to fill in.
-    pub(crate) fn warned(mut self, warnings: Vec<Warning>) -> Self {
-        self.warnings = warnings;
-        self
     }
 }
 
@@ -309,8 +269,6 @@ pub(crate) struct Plan {
     pub base: ImageSource,
     /// The build context, as the workfs a build session works in.
     pub workfs: WorkFsSource,
-    /// How much of a network the build's own commands get.
-    pub network: NetworkAccess,
     /// What the built image should state, accumulated from the steps.
     pub env: Vec<String>,
     pub working_dir: Option<String>,
@@ -326,7 +284,6 @@ pub(crate) struct Spec {
     base: String,
     steps: Vec<Step>,
     context: PathBuf,
-    network: NetworkAccess,
 }
 
 /// Work out [`Plan`] from a declaration.
@@ -358,7 +315,6 @@ pub(crate) fn plan(spec: &Spec) -> anyhow::Result<Plan> {
         id,
         base: ImageSource::new(spec.base.clone()),
         workfs: WorkFsSource::new(format!("file://{context}")),
-        network: spec.network.clone(),
         env,
         working_dir,
     })
@@ -789,7 +745,8 @@ mod tests {
     }
 
     /// A build session says what it is at `init`: committable, with the context as its
-    /// workfs, and on the base the caller named rather than the image being built.
+    /// workfs, on the base the caller named rather than the image being built, and reaching
+    /// the internet because this session asked for nothing.
     #[tokio::test]
     async fn a_build_session_declares_itself() {
         let context = tempfile::tempdir().unwrap();
@@ -815,12 +772,12 @@ mod tests {
         assert!(init.committable, "a build session cannot commit");
         assert_eq!(init.image.as_ref().unwrap().reference, "alpine:3.20");
         assert!(init.workfs.is_some(), "the context was not mounted");
-        // Said without being asked for: a build's first step is usually a fetch, so this is
-        // the one place a build differs from an ordinary session's default.
+        // Said without being asked for: a build's first step is usually a fetch, so a
+        // server default of "the host and no further" would fail nearly every build.
         assert_eq!(
             init.network.as_ref().map(|reach| reach.reach.as_str()),
             Some("public"),
-            "a build that said nothing about the network did not get the internet"
+            "a build under a session that said nothing did not get the internet"
         );
     }
 
@@ -857,10 +814,11 @@ mod tests {
         assert_eq!(commit.working_dir.as_deref(), Some("/srv"));
     }
 
-    /// Saying so takes it away again. The default is the internet, not a floor — and what
-    /// the build asked for is the build's, not the session's.
+    /// A session that asked for a reach gets it, and so does the build under it. The
+    /// internet is the default, not a floor: a caller who sandboxed the session meant the
+    /// build too, and there is no second knob on the recipe to contradict it with.
     #[tokio::test]
-    async fn a_build_can_ask_for_less_than_the_internet() {
+    async fn a_build_reaches_what_its_session_asked_for() {
         let context = tempfile::tempdir().unwrap();
         let (builder, log) = answering(vec![
             unknown_image(),
@@ -871,24 +829,29 @@ mod tests {
         ]);
 
         builder
+            .network(crate::console::NetworkAccess::none())
             .rootfs(
                 Rootfs::from_image("alpine")
                     .context(context.path().to_path_buf())
-                    .network(crate::console::NetworkAccess::none())
                     .run("true"),
             )
             .build()
             .await
             .expect("a session on what the build made");
 
-        let inits = inits(&log);
+        let reaches: Vec<_> = inits(&log)
+            .iter()
+            .map(|init| {
+                init.network
+                    .as_ref()
+                    .map(|reach| reach.reach.clone())
+                    .unwrap_or_default()
+            })
+            .collect();
         assert_eq!(
-            inits[1].network.as_ref().map(|reach| reach.reach.as_str()),
-            Some("none")
-        );
-        assert!(
-            inits[0].network.is_none(),
-            "the build's reach was asked for on the session too"
+            reaches,
+            ["none", "none", "none"],
+            "the build did not get the reach its session asked for"
         );
     }
 
@@ -1014,18 +977,6 @@ mod tests {
             ]
         );
         assert_eq!(rootfs.base(), "alpine:3.20");
-    }
-
-    /// A builder written by hand warns about nothing. Only the Dockerfile adapter has
-    /// anything to skip.
-    #[test]
-    fn a_hand_written_builder_warns_about_nothing() {
-        assert!(
-            Rootfs::from_image("alpine")
-                .run("true")
-                .warnings()
-                .is_empty()
-        );
     }
 
     /// What the built image will state: the environment accumulated in order, and the last
