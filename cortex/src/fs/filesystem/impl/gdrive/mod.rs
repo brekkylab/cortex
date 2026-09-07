@@ -36,8 +36,12 @@
 //! them answers an API or exports to anything, and a name that cannot be read is worse than
 //! an absence.
 //!
-//! Two files of one name are numbered before the extension (`report (2).pdf`), because Drive
-//! lets a folder hold both and a directory cannot.
+//! **Every entry carries a tag off its own Drive id**, in front of the extension
+//! (`report_a1b2c3d4.pdf`), because Drive lets one folder hold two files of a name and a
+//! directory cannot. On every entry rather than only on the ones that collide, so a name
+//! depends on its own file and on nothing else in the folder: no arrival, departure, rename
+//! or move touches anybody else's. The root's sections are not tagged — they are names this
+//! store invents rather than names Drive gave.
 //!
 //! **A listing says which of the two an entry was, by its extension.** An uploaded
 //! `.pptx` keeps its name; a Google Slides deck is served as `<name>.gslide.json`, the

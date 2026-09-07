@@ -181,8 +181,9 @@ const MAX_REMEMBERED_LENGTHS: usize = 50_000;
 /// `ls` anyway.
 const MAX_FOLDER_FILES: usize = 10_000;
 
-/// How many characters of a Drive id a colliding name carries. See [`id_tag`], which
-/// takes them from the end for a measured reason.
+/// How many characters of a Drive id every served name carries. See [`id_tag`], which takes
+/// them from the end for a measured reason, and [`disambiguate`], which says why every name
+/// and not only a colliding one.
 const ID_TAG_LEN: usize = 8;
 
 /// The longest name this store will hand out, measured the way the mount measures it.
@@ -264,8 +265,9 @@ enum Listing {
 /// One resolved Drive entry, as the VFS sees it.
 #[derive(Clone)]
 struct Child {
-    /// Listing name: the sanitized (and, on collision, disambiguated) Drive
-    /// name — plus a `.json` suffix when the entry serves a document's API JSON.
+    /// Listing name: the sanitized Drive name with a tag off this entry's own id (see
+    /// [`disambiguate`]) — plus a `.json` suffix when the entry serves a document's API
+    /// JSON. Untagged at the root, whose sections this store names itself.
     vfs_name: String,
     id: String,
     /// Set when the entry lives in a shared drive (listing scope).
@@ -553,8 +555,9 @@ impl GdriveFs {
             children
         };
 
-        // Two Drive files can share a name; disambiguate so every entry is
-        // reachable (readdir shows distinct names, resolve finds each one).
+        // Drive lets one folder hold two files of a name and a directory cannot, so every
+        // entry takes a tag off its own id: readdir shows distinct names, resolve finds each
+        // one, and no entry's name depends on what else the folder holds.
         //
         // Not at the root. Those three sections are names this store invents rather than
         // names Drive gave, `unique_name` already keeps them apart, and `Shared with me`
@@ -1380,12 +1383,12 @@ fn id_tag(id: &str) -> &str {
     &id[id.len().saturating_sub(ID_TAG_LEN)..]
 }
 
-/// Split a listing name into the part a number can follow and the extension it must
-/// stay in front of.
+/// Split a listing name into the part a tag can follow and the extension that tag must stay
+/// in front of.
 ///
 /// A document's suffix is known exactly (`.gsheet.json`, not `.json`). A file keeps
 /// whatever follows its last dot when that looks like an extension. A directory has
-/// no extension to protect, so `v1.2` numbers as `v1.2 (2)`.
+/// no extension to protect, so `v1.2` is served as `v1.2_1a2b3c4d`.
 fn split_extension(name: &str, serves: Serves) -> (&str, &str) {
     if serves == Serves::Nothing {
         return (name, "");
