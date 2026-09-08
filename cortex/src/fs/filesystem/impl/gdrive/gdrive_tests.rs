@@ -1549,7 +1549,8 @@ async fn one_service_can_move_without_moving_the_others() {
 
 /// What a fetch costs, in every case that changes the answer.
 ///
-/// The kernel asks in 64 KiB windows and that is not ours to choose; sending each one down
+/// The kernel asks in 64 KiB windows, 32 through FUSE-T, and that is not ours to choose;
+/// sending each one down
 /// as its own ranged request is what made a 641 MB archive take two and a half hours. But a
 /// span is not free either — 0.90 s for a window against 5.63 s for 64 MiB — and the tools
 /// that read a file's head and stop would pay all of it for one buffer. So the size of a
@@ -1685,15 +1686,15 @@ async fn what_a_fetch_costs() {
 
 /// Reads of several files interleave, and each one keeps its span.
 ///
-/// Not exotic and not threaded. FUSE ops are serialized, so alternating is all it takes,
-/// and the transport supplies it: traced through a real mount, `grep -r` — which reads one
-/// file at a time — had the next file's windows arriving before the current file was done,
-/// because the NFS client prefetches across files. It alternated every 512 KiB, which is
-/// the chunk this walks.
+/// Not exotic and not threaded. FUSE ops are serialized, so alternating is all it takes.
+/// The 512 KiB chunk this alternates in is what a local `PassthroughFs` mount produced under
+/// `grep -r`, where the NFS client's read-ahead pulled the next file in before the current
+/// one was done. Against Drive it does not, so this pattern is the shape of the hazard rather
+/// than a claim about what any one tool costs there — see [`GdriveFs::held`].
 ///
 /// The assertion is that nothing is fetched twice. One slot could not make it: each read
 /// found another file's span, so `walking` never became true and every window bought a
-/// whole [`FIRST_SPAN`] — 15.5x the bytes and 23x the requests on that trace.
+/// whole [`FIRST_SPAN`].
 #[tokio::test]
 async fn interleaved_files_each_keep_a_span() {
     const REAL: u64 = 32 * 1024 * 1024;
@@ -1755,10 +1756,11 @@ async fn interleaved_files_each_keep_a_span() {
         "{waste} wasted over {spans} spans is more than a boundary each: {:?}",
         mock.media_ranges()
     );
-    assert!(
-        spans <= 4 * ids.len() as u64,
-        "a few spans per file, not one per window: {spans}"
-    );
+    // No ceiling on the span count, because one cannot catch this: reverting the
+    // share-sizing half alone fetches *fewer* spans than the fix does (8 against 9) by
+    // taking a whole `READ_SPAN` each time and throwing most of it away. What separates them
+    // is the waste, which is what the bound above measures. Reverting the map as well costs
+    // 192 spans, and the waste catches that too.
     for (i, id) in ids.iter().enumerate() {
         assert!(
             fs.held_bytes(id).await.is_some(),
