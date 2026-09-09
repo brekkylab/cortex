@@ -169,9 +169,10 @@ async fn one_listing_answers_the_whole_directory() {
     );
 }
 
-/// The span policy, in the cases that distinguish it, and the one slot it lives in.
+/// The span policy, in the cases that distinguish it, and the map it lives in.
 ///
-/// The kernel's window is 64 KiB and not ours to choose. One ranged request per window is
+/// The kernel's window is 64 KiB, 32 through FUSE-T, and not ours to choose. One ranged
+/// request per window is
 /// the pathology this exists to avoid: measured against Drive, whose round trip is the same
 /// shape, it put a 641 MB archive at 0.04 MB/s. Two sizes rather than one because a span is
 /// not free either — a reader that takes a file's head and stops would pay a whole
@@ -259,23 +260,170 @@ async fn a_walk_pays_a_span_and_a_head_read_pays_less() {
     assert_eq!(mock.bytes_sent(), 0, "and moves nothing");
     assert!(mock.content_ranges().is_empty());
 
-    // One slot: another file displaces what was held, and going back costs fetching it
-    // again — as a first read rather than a walk, which is what it cost the first time.
+    // Another file's read does not evict this one while there is room for both, which is
+    // what lets an interleaved reader keep walking. What is bounded is bytes held, not the
+    // number of files, so two spans under one budget coexist.
+    let before = fs.held_bytes("/big.bin").await;
+    assert!(before.is_some(), "the walked file is held");
     fs.read_window(Path::new("/other.bin"), Some(0..16))
         .await
         .unwrap();
     assert_eq!(
-        fs.held_slot().await.map(|(p, _)| p),
-        Some("/other.bin".into()),
-        "the second file displaced the first"
+        fs.held_bytes("/other.bin").await,
+        Some(4096),
+        "the second file is held too, at its own size"
     );
-    mock.reset();
-    fs.read_window(file, Some(0..CHUNK)).await.unwrap();
     assert_eq!(
-        mock.content_ranges(),
-        vec![Some(format!("bytes=0-{}", FIRST_SPAN - 1))],
-        "the displaced file was fetched again, and from the start"
+        fs.held_bytes("/big.bin").await,
+        before,
+        "and it did not cost the first file its span"
     );
+}
+
+/// A span nobody has come back to stops dividing the budget, and then stops being kept.
+///
+/// Presence in the map is the wrong test for both. An entry lives for [`DIR_TTL`], so a
+/// traversal across a folder leaves one behind per file it passed. Counting those as readers
+/// cuts the share of the file actually being walked — nineteen of them took a walk from two
+/// requests to five — and keeping them forever is how a map grows unbounded.
+#[tokio::test]
+async fn spans_left_behind_stop_counting_and_stop_being_kept() {
+    const SMALL: u64 = 4 * 1024 * 1024;
+    const BIG: u64 = 32 * 1024 * 1024;
+    const W: u64 = 32 * 1024;
+    let mut rows = vec![file_row("big.bin", "BIG", BIG)];
+    let mut blobs: HashMap<String, Vec<u8>> =
+        HashMap::from([("BIG".to_string(), vec![b'z'; BIG as usize])]);
+    for i in 0..5 {
+        rows.push(file_row(&format!("s{i}.bin"), &format!("S{i}"), SMALL));
+        blobs.insert(format!("S{i}"), vec![b's'; SMALL as usize]);
+    }
+    let mock = start(json!({"/": rows}), blobs).await;
+    let fs = mounted(&mock.config());
+    fs.list(Path::new("/")).await.unwrap();
+
+    // Touched once each and not returned to, the way a traversal leaves them.
+    for i in 0..5 {
+        fs.read_window(Path::new(&format!("/s{i}.bin")), Some(0..W))
+            .await
+            .unwrap();
+    }
+    fs.age_spans_for_test(ACTIVE + Duration::from_secs(1)).await;
+
+    // Now walk one file. It is the only reader, so it gets the whole budget as its span and
+    // the walk is two fetches: a first span, then the rest of the file.
+    mock.reset();
+    let big = Path::new("/big.bin");
+    let mut at = 0;
+    while at < BIG {
+        fs.read_window(big, Some(at..(at + W).min(BIG)))
+            .await
+            .unwrap();
+        at += W;
+    }
+    assert_eq!(
+        mock.content_ranges().len(),
+        2,
+        "the abandoned spans are not readers: {:?}",
+        mock.content_ranges()
+    );
+    assert_eq!(mock.bytes_sent(), BIG, "and nothing was fetched twice");
+
+    // Past the TTL they are not even kept. The sweep runs when something is held, since
+    // nothing else ever removes an entry.
+    fs.age_spans_for_test(DIR_TTL + Duration::from_secs(1))
+        .await;
+    fs.read_window(Path::new("/s0.bin"), Some(0..W))
+        .await
+        .unwrap();
+    assert!(
+        fs.held_bytes("/big.bin").await.is_none(),
+        "aged out and swept on the way in"
+    );
+    for i in 1..5 {
+        assert!(
+            fs.held_bytes(&format!("/s{i}.bin")).await.is_none(),
+            "s{i} too"
+        );
+    }
+}
+
+/// Reads of several files interleave, and each one keeps its span.
+///
+/// Not exotic and not threaded. FUSE ops are serialized, so alternating is all it takes, and
+/// the 512 KiB chunk this alternates in is what a local `PassthroughFs` mount produced under
+/// `grep -r`, where the NFS client's read-ahead pulled the next file in before the current
+/// one was done. A network store does not do that on its own, so this pattern is the shape of
+/// the hazard rather than a claim about what one tool costs here — see [`OnedriveFs::held`]
+/// for what two concurrent readers measured live.
+///
+/// The assertion is that nothing is fetched twice. One slot could not make it: each read
+/// found another file's span, so `walking` never became true and every window bought a whole
+/// [`FIRST_SPAN`]. Three files rather than two, and each usefully larger than a span, because
+/// a constant [`READ_SPAN`] clamped by a smaller file never overruns the budget and the
+/// division would go unmeasured.
+#[tokio::test]
+async fn interleaved_files_each_keep_a_span() {
+    const REAL: u64 = 32 * 1024 * 1024;
+    // The traced window is 32 KiB and the traced chunk 512 KiB. Only the chunk decides what
+    // this exercises, so the window is widened to keep the walk cheap.
+    const W: u64 = 256 * 1024;
+    const CHUNK: u64 = 2;
+    let ids = ["P1", "P2", "P3"];
+    let mock = start(
+        json!({"/": ids.iter().enumerate()
+            .map(|(i, id)| file_row(&format!("f{i}.bin"), id, REAL))
+            .collect::<Vec<_>>()}),
+        ids.iter()
+            .map(|id| (id.to_string(), vec![b'z'; REAL as usize]))
+            .collect(),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    fs.list(Path::new("/")).await.unwrap();
+    mock.reset();
+
+    let mut at = 0;
+    while at < REAL {
+        for i in 0..ids.len() {
+            let path = format!("/f{i}.bin");
+            for k in 0..CHUNK {
+                let o = at + k * W;
+                if o >= REAL {
+                    break;
+                }
+                let got = fs
+                    .read_window(Path::new(&path), Some(o..(o + W).min(REAL)))
+                    .await
+                    .unwrap();
+                assert_eq!(got.len() as u64, (REAL - o).min(W), "f{i} at {o}");
+            }
+        }
+        at += CHUNK * W;
+    }
+
+    // Nothing is fetched twice, up to the overlap a span boundary costs: a span begins where
+    // the reader asks, so a window straddling the end of one makes the next start inside it.
+    // That overlap is under one window per span, and it is what buys never splitting a window
+    // across two spans — which is what makes a short read mean EOF.
+    //
+    // No ceiling on the span count, because one cannot catch this: reverting the share-sizing
+    // half alone fetches *fewer* spans than the fix does, by taking a whole `READ_SPAN` each
+    // time and throwing most of it away. What separates them is the waste.
+    let consumed = REAL * ids.len() as u64;
+    let spans = mock.content_ranges().len() as u64;
+    let waste = mock.bytes_sent().saturating_sub(consumed);
+    assert!(
+        waste < spans * W,
+        "{waste} wasted over {spans} spans is more than a boundary each: {:?}",
+        mock.content_ranges()
+    );
+    for (i, id) in ids.iter().enumerate() {
+        assert!(
+            fs.held_bytes(&format!("/f{i}.bin")).await.is_some(),
+            "f{i} ({id}) still holds a span at the end"
+        );
+    }
 }
 
 /// **The response, not the request, says where the bytes begin.**

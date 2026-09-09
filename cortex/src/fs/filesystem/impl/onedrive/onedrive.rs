@@ -27,12 +27,20 @@ use crate::{
 /// costs a round trip rather than a LAN hop.
 const DIR_TTL: Duration = Duration::from_secs(300);
 
-/// How much a read fetches once it is clear the reader is walking the file, so a walk pays
-/// a round trip per span of this size rather than one per window.
+/// How much a read fetches once it is clear the reader is walking the file *and* nothing
+/// else is being walked, so a lone walk pays a round trip per span of this size rather
+/// than one per window.
 ///
-/// The kernel's window is 64 KiB and not ours to choose. Sending each one down as its own
-/// ranged request is the pathology this exists to avoid — measured against Drive, whose
-/// round trip is the same shape, it put a 641 MB archive at 0.04 MB/s.
+/// The kernel's window is 64 KiB and not ours to choose (32 KiB through FUSE-T, measured).
+/// Sending each one down as its own ranged request is the pathology this exists to avoid —
+/// measured against Drive, whose round trip is the same shape, it put a 641 MB archive at
+/// 0.04 MB/s.
+///
+/// It is a ceiling rather than the size every walk gets: [`HELD_BUDGET`] is divided among
+/// whatever is being walked, and this is what one reader's share comes to. Shrinking it
+/// instead of dividing it would cost every large read its round trips — a 4 GB file at a
+/// fixed 8 MiB is 512 requests against 65, and a request to the download host costs 0.232 s
+/// of round trip, measured over ten on one connection.
 const READ_SPAN: u64 = 64 * 1024 * 1024;
 
 /// How much a *first* read fetches, before anything says the reader is walking.
@@ -53,17 +61,45 @@ const MAX_CACHED_DIRS: usize = 4_096;
 
 type CachedListing = (Instant, Arc<Vec<Child>>);
 
-/// The one span this holds, and where in which file it came from.
+/// Ceiling on the bytes held across every file at once. See [`OnedriveFs::held`].
 ///
-/// One slot rather than a map, because a reader works through one file at a time — `cat`,
-/// `grep` and `cp` all do — so what the next window needs is what the last one had. A map
-/// would hold [`READ_SPAN`] per file ever touched until the TTL ran out; this holds it
-/// once.
+/// One [`READ_SPAN`], so the peak is what a single slot already cost.
+const HELD_BUDGET: u64 = READ_SPAN;
+
+/// Floor on one file's share of [`HELD_BUDGET`].
+///
+/// For the case the count cannot tell apart: many files touched once beside one being
+/// walked. [`ACTIVE`] keeps a file counted for seconds after its single read, so a
+/// traversal past 500 small files divides the budget 500 ways while one large file is
+/// walked. Measured on the mock, that walk costs 8 requests with this floor and 256
+/// without.
+///
+/// It costs traffic in the opposite case, where the files really are all being walked: at
+/// 100 of them, 6.4x the bytes against 3.8x with no floor. Past `HELD_BUDGET / MIN_SPAN`
+/// files the shares stop fitting and eviction comes back.
+const MIN_SPAN: u64 = 4 * 1024 * 1024;
+
+/// How recently a span must have been read from for its file to count as one of the
+/// readers dividing [`HELD_BUDGET`].
+///
+/// Being in the map is the wrong test: an entry lives for [`DIR_TTL`], so a traversal past
+/// eight files leaves eight behind and would divide the budget eight ways while one file is
+/// walked — measured, nineteen abandoned entries took a walk of one file from two requests
+/// to five. Seconds rather than milliseconds because a miss against Graph costs about that
+/// (see [`READ_SPAN`]), so two files alternating touch each other's spans a second or more
+/// apart; what matters is the interval between *misses* on one file, since a hit refreshes
+/// [`HeldSpan::used`].
+const ACTIVE: Duration = Duration::from_secs(3);
+
+/// One span of one file, and where in it the span begins.
 struct HeldSpan {
-    path: String,
     at: u64,
     to_eof: bool,
+    /// When the bytes were fetched. Decides the TTL, so it is not touched by a read.
     when: Instant,
+    /// When a read last came out of these bytes. Decides which span is evicted to make
+    /// room, which has to be the one nobody is walking rather than the oldest fetch.
+    used: Instant,
     bytes: Arc<Vec<u8>>,
 }
 
@@ -96,8 +132,35 @@ pub struct OnedriveFs {
     /// Folder path → its children. Everything `stat` reports comes from here, so a
     /// listing is what makes the kernel's per-entry `getattr` storm free.
     dir_cache: Mutex<HashMap<String, CachedListing>>,
-    /// The last span read. See [`HeldSpan`].
-    held: Mutex<Option<HeldSpan>>,
+    /// File path → the span last read from it, bounded in bytes by [`HELD_BUDGET`].
+    ///
+    /// This was one slot, on the reasoning that a reader works through one file at a time —
+    /// `cat`, `grep` and `cp` all do — so what the next window needs is what the last one
+    /// had, and a map would hold [`READ_SPAN`] per file ever touched.
+    ///
+    /// The premise fails the moment reads of a *second* file interleave, and that needs
+    /// neither threads nor a second process: FUSE ops are serialized, so alternating is
+    /// all it takes. Each read then finds the other file's span in the slot, so `walking`
+    /// is false forever and every window pays a whole [`FIRST_SPAN`].
+    ///
+    /// What that costs was measured on the Drive twin of this code, live: two files walked
+    /// by `xargs -P 2 cat` reached 7.3 MiB of progress after 328 MiB downloaded over 41
+    /// requests, and was abandoned rather than completed. The same work divided is 4
+    /// requests and 53.9 MiB.
+    ///
+    /// Two concurrent readers is the whole requirement, and also the limit of what was
+    /// reproduced. A single tool does not do it on a network store: `grep -r` over six
+    /// 24 MiB files costs 1.0x even on one slot, because read-ahead overlaps files only when
+    /// it can outrun the reader, and a miss costing about a second never lets it. Traced
+    /// through a local [`PassthroughFs`](super::PassthroughFs) mount it interleaves heavily
+    /// — 679 path switches in 0.5 s against 6 in 33 s on the real service — so a trace
+    /// replayed from there describes a fast store, not this one.
+    ///
+    /// Two things together fix it and neither is enough alone. A map bounded by *bytes*
+    /// rather than by count, so the ceiling is unchanged and divided rather than owned by
+    /// whoever fetched last. And a span sized to that division rather than to a constant, so
+    /// nothing has to be evicted for a new span to fit. See [`READ_SPAN`] and [`ACTIVE`].
+    held: Mutex<HashMap<String, HeldSpan>>,
 }
 
 impl OnedriveFs {
@@ -105,7 +168,7 @@ impl OnedriveFs {
         Ok(Self {
             accessor: OnedriveAccessor::new(config)?,
             dir_cache: Mutex::new(HashMap::new()),
-            held: Mutex::new(None),
+            held: Mutex::new(HashMap::new()),
         })
     }
 
@@ -158,7 +221,7 @@ impl OnedriveFs {
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
     }
 
-    /// The span covering `want` bytes from `start`, from the slot when it reaches and from
+    /// The span covering `want` bytes from `start`, from the map when one reaches and from
     /// the service otherwise. The span's own start comes back beside its bytes, because
     /// the caller cuts by an offset into the file rather than into the buffer — and
     /// because the response, not the request, is what says where the bytes begin.
@@ -174,27 +237,54 @@ impl OnedriveFs {
         start: u64,
         want: u64,
     ) -> io::Result<(u64, Arc<Vec<u8>>)> {
-        let walking = {
-            let slot = self.held.lock().await;
-            match slot.as_ref() {
-                Some(held) if held.path == path && held.when.elapsed() < DIR_TTL => {
-                    if held.at <= start
-                        && (start.saturating_add(want)
-                            <= held.at.saturating_add(held.bytes.len() as u64)
-                            || held.to_eof)
+        let (walking, sharers) = {
+            let mut held = self.held.lock().await;
+            // Every *other* file read within [`ACTIVE`], plus this one, which is about to
+            // hold a span whether or not it already has an entry. Counting the map's own
+            // entry for `path` instead misses this reader exactly when its last span has
+            // gone stale — and then a lone active neighbour is told it is alone, takes the
+            // whole budget, and evicts the very span the division exists to keep.
+            let sharers = held
+                .iter()
+                .filter(|(k, h)| k.as_str() != path && h.used.elapsed() < ACTIVE)
+                .count() as u64
+                + 1;
+            let walking = match held.get_mut(path) {
+                Some(h) if h.when.elapsed() < DIR_TTL => {
+                    if h.at <= start
+                        && (start.saturating_add(want) <= h.at.saturating_add(h.bytes.len() as u64)
+                            || h.to_eof)
                     {
-                        return Ok((held.at, held.bytes.clone()));
+                        // Served, so the file goes on counting for *everyone else's* share.
+                        // It always counts for its own, which is `count() + 1`; what this
+                        // buys is that a neighbour computing a share does not skip this
+                        // file, decide it is alone, and take a share large enough to evict
+                        // this span. Reasoned rather than measured, and no test covers it:
+                        // hits are microseconds apart, so ACTIVE only lapses between them
+                        // for a reader that pauses seconds mid-file.
+                        h.used = Instant::now();
+                        return Ok((h.at, h.bytes.clone()));
                     }
                     // Not covered, but beginning inside what was — at its end, or
                     // straddling it — so the reader spent the span and wants the next.
                     // Not just `== end`: a window whose size does not divide the span
                     // reaches past it from inside, and that is the same walk.
-                    held.at <= start && start <= held.at.saturating_add(held.bytes.len() as u64)
+                    h.at <= start && start <= h.at.saturating_add(h.bytes.len() as u64)
                 }
                 _ => false,
-            }
+            };
+            (walking, sharers)
         };
-        let len = want.max(if walking { READ_SPAN } else { FIRST_SPAN });
+        // A span sized so that everything being walked fits in the budget at once. The
+        // alternative is a constant, and a constant equal to the budget is the one value
+        // that cannot work: two files each wanting all of it means one is always evicted,
+        // whatever the eviction order. Dividing removes the reason to evict.
+        let share = (HELD_BUDGET / sharers).max(MIN_SPAN);
+        let len = want.max(if walking {
+            share
+        } else {
+            share.min(FIRST_SPAN)
+        });
         let range = start..start.saturating_add(len);
 
         let url = match child.download_url.as_deref() {
@@ -217,18 +307,53 @@ impl OnedriveFs {
         };
 
         // Short of what was asked for means the file ended inside it. Recorded, because it
-        // is what lets a later window past the end be answered from the slot instead of
+        // is what lets a later window past the end be answered from the map instead of
         // fetching nothing again.
         let to_eof = (bytes.len() as u64) < len;
         let bytes = Arc::new(bytes);
-        *self.held.lock().await = Some(HeldSpan {
-            path: path.to_string(),
-            at,
-            to_eof,
-            when: Instant::now(),
-            bytes: bytes.clone(),
-        });
+        let now = Instant::now();
+        self.hold(
+            path,
+            HeldSpan {
+                at,
+                to_eof,
+                when: now,
+                used: now,
+                bytes: bytes.clone(),
+            },
+        )
+        .await;
         Ok((at, bytes))
+    }
+
+    /// Keep one span, dropping what has aged out and then the least recently read from
+    /// until [`HELD_BUDGET`] has room.
+    ///
+    /// The new span goes in even when it alone is over budget: it has already been fetched
+    /// and the caller is about to read from it, so refusing to hold it would only cost the
+    /// next window another fetch.
+    async fn hold(&self, path: &str, span: HeldSpan) {
+        let len = span.bytes.len() as u64;
+        let mut held = self.held.lock().await;
+        held.remove(path);
+        // Dropped on the way in, the way a listing is: nothing else removes an entry, so a
+        // span read once would otherwise stay for the life of the mount.
+        held.retain(|_, h| h.when.elapsed() < DIR_TTL);
+        while !held.is_empty()
+            && held.values().map(|h| h.bytes.len() as u64).sum::<u64>() + len > HELD_BUDGET
+        {
+            let coldest = held
+                .iter()
+                .min_by_key(|(_, h)| h.used)
+                .map(|(k, _)| k.clone());
+            match coldest {
+                Some(k) => {
+                    held.remove(&k);
+                }
+                None => break,
+            }
+        }
+        held.insert(path.to_string(), span);
     }
 
     /// A download URL straight from the service, for when the listing's has expired.
@@ -287,7 +412,7 @@ impl OnedriveFs {
             return Ok(Vec::new());
         }
         let (at, bytes) = self.span(&child, path, r.start, want).await?;
-        // `at <= r.start` on both of `span`'s return paths: the slot branch carries it as
+        // `at <= r.start` on both of `span`'s return paths: the hit branch carries it as
         // a conjunct, and a fetch returns where the response said the bytes begin, which
         // is `r.start` for a `206` and `0` for a whole file. So neither subtraction here
         // goes backwards.
@@ -301,12 +426,27 @@ impl OnedriveFs {
         self.dir_cache.lock().await.len()
     }
 
-    /// What the one slot is holding: the path and how many bytes. Tests only.
+    /// How many bytes are held for one path, and `None` when nothing is. Tests only.
     #[cfg(test)]
-    pub(crate) async fn held_slot(&self) -> Option<(String, u64)> {
-        let slot = self.held.lock().await;
-        slot.as_ref()
-            .map(|h| (h.path.clone(), h.bytes.len() as u64))
+    pub(crate) async fn held_bytes(&self, path: &str) -> Option<u64> {
+        self.held
+            .lock()
+            .await
+            .get(path)
+            .map(|h| h.bytes.len() as u64)
+    }
+
+    /// Push every held span `by` into the past, both when it was fetched and when it was
+    /// last read from, so a test can make one look abandoned without waiting. Tests only.
+    #[cfg(test)]
+    pub(crate) async fn age_spans_for_test(&self, by: Duration) {
+        let mut held = self.held.lock().await;
+        for h in held.values_mut() {
+            if let (Some(w), Some(u)) = (h.when.checked_sub(by), h.used.checked_sub(by)) {
+                h.when = w;
+                h.used = u;
+            }
+        }
     }
 
     /// Age every retained listing past its TTL. Tests only.

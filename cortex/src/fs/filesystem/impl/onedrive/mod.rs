@@ -51,8 +51,10 @@
 //! because FUSE-T serves over NFS, costs one request rather than one per entry.
 //!
 //! Bytes come from a preauthenticated URL the listing already carried. A walk pays one
-//! round trip per [64 MiB span](READ_SPAN) rather than one per 64 KiB kernel window; a
-//! read that stops after the head pays [8 MiB](FIRST_SPAN).
+//! round trip per span rather than one per kernel window, which is 64 KiB or 32 through
+//! FUSE-T. Both span sizes are ceilings divided among the files being read at once: a lone
+//! walk takes a whole [`READ_SPAN`], two concurrent walks 32 MiB each, and a read that stops
+//! after the head takes at most [`FIRST_SPAN`].
 //!
 //! ## A note on what is duplicated
 //!
