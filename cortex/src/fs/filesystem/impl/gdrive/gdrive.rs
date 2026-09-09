@@ -416,7 +416,7 @@ impl GdriveFs {
         })
     }
 
-    /// The span covering `want` bytes from `start`, from the slot when it reaches and
+    /// The span covering `want` bytes from `start`, from the map when one reaches and
     /// from Drive otherwise. The span's own start comes back beside its bytes, because
     /// the caller cuts by an offset into the file rather than into the buffer.
     ///
@@ -454,11 +454,13 @@ impl GdriveFs {
                         && (start.saturating_add(want) <= h.at.saturating_add(h.bytes.len() as u64)
                             || h.to_eof)
                     {
-                        // Served, so the file still counts as a reader. Reasoned rather
-                        // than measured, and no test covers it: hits are microseconds
-                        // apart, so ACTIVE only lapses between them for a reader that
-                        // pauses seconds mid-file — which would stop counting itself and
-                        // have its own span evicted by the next oversized share.
+                        // Served, so the file goes on counting for *everyone else's*
+                        // share. It always counts for its own, which is `count() + 1`;
+                        // what this buys is that a neighbour computing a share does not
+                        // skip this file, decide it is alone, and take a share large
+                        // enough to evict this span. Reasoned rather than measured, and no
+                        // test covers it: hits are microseconds apart, so ACTIVE only
+                        // lapses between them for a reader that pauses seconds mid-file.
                         h.used = Instant::now();
                         return Ok((h.at, h.bytes.clone()));
                     }
@@ -538,7 +540,7 @@ impl GdriveFs {
         held.insert(id.to_string(), span);
     }
 
-    /// A document's JSON, from the slot when it is the document being read and from its
+    /// A document's JSON, from the map when it is held there and from its
     /// own API otherwise.
     ///
     /// Stored as what it is: a span of the whole file at offset 0, in the same map a blob's
