@@ -78,10 +78,13 @@
 //! Every one of them is network:
 //!
 //! * A real file reads by spans, not by the window the kernel asked for. The window is
-//!   64 KiB, and a request costs a round trip of about 0.9 s whatever its size, so one
-//!   request per window put a 641 MB archive at 0.04 MB/s. A first read takes 8 MiB and a
-//!   read carrying on from the last takes 64 MiB, which is where the rate tops out at
-//!   11-12 MB/s. `head` of that archive moves 8 MiB; `cat` of it moves all 641 MB in 53 s.
+//!   64 KiB, 32 through FUSE-T, and a request costs a round trip of about 0.9 s whatever
+//!   its size, so one request per window put a 641 MB archive at 0.04 MB/s. A first read
+//!   takes up to 8 MiB and a read carrying on from the last up to 64 MiB, where the rate
+//!   tops out at 11-12 MB/s. Both are *divided* among the files being read at once, so two
+//!   concurrent walks take 32 MiB each and 6.6 MB/s rather than 11-12; that is bought
+//!   against re-fetching whole spans, which costs a round trip each. `head` of that archive
+//!   moves 8 MiB; `cat` of it moves all 641 MB in 53 s.
 //! * A document has no windows. Any read of one produces the whole JSON, and until
 //!   something does, its size is a **placeholder rather than a length** — `ls -l` and
 //!   `find -size` are wrong about an unread document, and [`Stat`](crate::fs::Stat) has no

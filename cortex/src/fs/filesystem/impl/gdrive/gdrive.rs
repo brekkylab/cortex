@@ -132,7 +132,8 @@ const PAD_LINE: u64 = 4096;
 /// How much a blob read fetches once it is clear the reader is walking the file, so a
 /// walk pays a round trip per span of this size rather than one per window.
 ///
-/// The kernel's window is 64 KiB and not ours to choose. Sending each one down as its
+/// The kernel's window is 64 KiB and not ours to choose, and FUSE-T's NFS backend halves
+/// it to 32 (`rsize=32768`). Sending each one down as its
 /// own ranged request is what made a 641 MB archive take two and a half hours: 10,250
 /// requests, and a request is 200 quota units however few bytes it moves.
 ///
@@ -155,6 +156,9 @@ const PAD_LINE: u64 = 4096;
 ///
 /// This is not what the *first* fetch takes. That one is [`FIRST_SPAN`], so a reader that
 /// stops after a buffer never pays for a span it will not use.
+///
+/// Nor is it what every walk takes. It is one reader's share of [`HELD_BUDGET`], which is
+/// divided among whatever is being read at once — see [`GdriveFs::held`].
 const READ_SPAN: u64 = 64 * 1024 * 1024;
 
 /// What the first fetch of a file takes, before anything says the reader is walking it.
@@ -169,6 +173,34 @@ const READ_SPAN: u64 = 64 * 1024 * 1024;
 /// there. A reader that really is walking spends this span and gets [`READ_SPAN`] for the
 /// next one, which is where the rate tops out.
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
+
+/// Ceiling on the bytes held across every file at once, which is one [`READ_SPAN`]: the
+/// peak is what the one slot this replaced already cost. See [`GdriveFs::held`].
+const HELD_BUDGET: u64 = READ_SPAN;
+
+/// Floor on one file's share of [`HELD_BUDGET`].
+///
+/// For the case the count cannot tell apart: many files touched once beside one being
+/// walked. [`ACTIVE`] keeps a file counted for seconds after its single read, so a
+/// traversal past 500 small files divides the budget 500 ways while one large file is
+/// walked. Measured on the mock, that walk costs 8 requests with this floor and 256
+/// without.
+///
+/// It costs traffic in the opposite case, where the files really are all being walked: at
+/// 100 of them, 6.4x the bytes against 3.8x with no floor. Past `HELD_BUDGET / MIN_SPAN`
+/// files the shares stop fitting and eviction comes back.
+const MIN_SPAN: u64 = 4 * 1024 * 1024;
+
+/// How recently a span must have been read from for its file to count as one of the readers
+/// dividing [`HELD_BUDGET`].
+///
+/// Being in the map is the wrong test: an entry lives for [`DIR_TTL`], so a traversal past
+/// eight files leaves eight behind and would divide the budget eight ways while one file is
+/// walked. Seconds rather than milliseconds because a miss against Drive costs about that
+/// (see [`READ_SPAN`]), so two files alternating touch each other's spans a second or more
+/// apart; what matters is the interval between *misses* on one file, since a hit refreshes
+/// [`HeldSpan::used`].
+const ACTIVE: Duration = Duration::from_secs(3);
 
 /// Cap on remembered document lengths — one per Docs-editors file this mount has read.
 ///
@@ -300,17 +332,25 @@ type CachedListing = (Instant, Arc<Vec<Child>>);
 /// edit replaces that row instead of leaving the old one behind unreadable.
 type RememberedLength = (Option<std::time::SystemTime>, u64);
 
-/// The one span of one blob this holds.
+/// One span of one file, and where in it the span begins. Keyed by Drive id in
+/// [`GdriveFs::held`], which is why the id is not a field here.
 struct HeldSpan {
-    id: String,
     /// Where in the file the span begins. A read cuts by absolute offset, so this is
     /// needed to answer one.
     at: u64,
     /// Drive answered shorter than the span asked for, which means the span runs to the
     /// end of the file. Without this a read near the end misses every time — the span
-    /// does not reach the offset asked for, and never will.
+    /// does not reach the offset asked for, and never will. A document is always this: its
+    /// API has no ranges, so what comes back is the whole of it.
     to_eof: bool,
+    /// When the bytes were fetched. Decides the TTL, so a read does not touch it.
     when: Instant,
+    /// When a read last came out of these bytes, which is what the share count needs and
+    /// `when` cannot say: a hit does not touch `when`, so by it a file still being walked
+    /// looks abandoned after [`ACTIVE`]. Counting abandoned entries as readers took a walk
+    /// of one file from two requests to five. Eviction orders by it too, having it to hand
+    /// — not because it beats `when` there, where the two measure the same.
+    used: Instant,
     bytes: Arc<Vec<u8>>,
 }
 
@@ -330,20 +370,40 @@ pub struct GdriveFs {
     /// parent listings, so one cached listing answers readdir, stat and the lookup
     /// a read starts with; fetching the bytes themselves still costs a request.
     dir_cache: Mutex<HashMap<String, CachedListing>>,
-    /// The last content read, and where in which file it came from.
-    ///
-    /// One slot rather than a map, because a reader works through one file at a time —
-    /// `cat`, `grep` and `cp` all do — so what the next window needs is what the last one
-    /// had. A map would hold [`READ_SPAN`] per file ever touched until the TTL ran out;
-    /// this holds it once.
+    /// Drive id → the span last read from that file, bounded in bytes by [`HELD_BUDGET`].
     ///
     /// A document lands here too, as the span it is: a whole file at offset 0. Its API has
-    /// no ranges, so a read of any window produces all of it, and the next window has to
-    /// find it here or produce it again — 3.4 MB read at 64 KiB a time is 52 windows and
-    /// would be 52 renders at about 1.8 s each. Held apart from a blob's span at first,
-    /// under a byte budget of its own; the two turned out to be the same slot with the
-    /// same reason under it, and one of them can hold what the reader is reading.
-    held: Mutex<Option<HeldSpan>>,
+    /// no ranges, so a read of any window produces all of it, and the next window finds it
+    /// here or renders it again — 3.4 MB is 104 windows at the 32 KiB [`READ_SPAN`] names,
+    /// so 104 renders at about 1.8 s each.
+    ///
+    /// This was one slot, on the reasoning that a reader works through one file at a time.
+    /// The premise fails the moment reads of a *second* file interleave, which takes
+    /// neither threads nor a second process: FUSE ops are serialized, so alternating is
+    /// enough. Each read then finds the other file in the slot, `walking` is false forever,
+    /// and every window pays a whole [`FIRST_SPAN`].
+    ///
+    /// What that costs, live against Drive: two files walked by `xargs -P 2 cat` reached
+    /// 7.3 MiB of progress after 328 MiB downloaded over 41 requests, and was abandoned
+    /// rather than completed. The same work here is 4 requests and 53.9 MiB. A request is
+    /// 200 quota units however few bytes it moves, so the request count is what this costs.
+    /// The document axis is worse than the byte one, since a lost span costs a re-fetch and
+    /// a lost document a re-render: a 3.4 MB document read beside one blob went from 0
+    /// renders to 6 against the mock.
+    ///
+    /// Two concurrent readers is the whole requirement, and also the limit of what was
+    /// reproduced. A single tool does not do it on this store: `grep -r` over six 24 MiB
+    /// files costs 1.0x even on one slot, because read-ahead overlaps files only when it can
+    /// outrun the reader, and a miss costing about a second never lets it. Traced through a
+    /// local [`PassthroughFs`](super::PassthroughFs) mount it interleaves heavily — 679 path
+    /// switches in 0.5 s against 6 in 33 s on Drive — so the traces this crate's tests replay
+    /// describe a fast store, not this one.
+    ///
+    /// Two things fix it and neither is enough alone: a map bounded by *bytes* rather than
+    /// by count, so the ceiling is divided rather than owned by whoever fetched last; and a
+    /// span sized to that division rather than to a constant, so nothing has to be evicted
+    /// to fit. See [`READ_SPAN`] and [`ACTIVE`].
+    held: Mutex<HashMap<String, HeldSpan>>,
 }
 
 impl GdriveFs {
@@ -352,11 +412,11 @@ impl GdriveFs {
             accessor: GdriveAccessor::new(config)?,
             lengths: Mutex::new(HashMap::new()),
             dir_cache: Mutex::new(HashMap::new()),
-            held: Mutex::new(None),
+            held: Mutex::new(HashMap::new()),
         })
     }
 
-    /// The span covering `want` bytes from `start`, from the slot when it reaches and
+    /// The span covering `want` bytes from `start`, from the map when one reaches and
     /// from Drive otherwise. The span's own start comes back beside its bytes, because
     /// the caller cuts by an offset into the file rather than into the buffer.
     ///
@@ -366,36 +426,63 @@ impl GdriveFs {
     /// read comes back short of what it asked for — which [`FileSystem::read_at`] would
     /// report to the kernel as the end of the file.
     ///
-    /// How much a miss fetches depends on what the last one did. A read that carries on
-    /// from where the held span ended is a reader walking the file, and gets a whole
-    /// [`READ_SPAN`]; anything else — a different file, a jump to somewhere new — gets
-    /// [`FIRST_SPAN`]. So a reader that stops after a buffer pays for 8 MiB it mostly
-    /// throws away, and only a walk pays for the 64 MiB that a walk actually spends.
+    /// How much a miss fetches depends on what the last one did and on how many other files
+    /// are being read. A read that carries on from where the held span ended is a reader
+    /// walking the file, and gets its share of [`HELD_BUDGET`] — a whole [`READ_SPAN`] when
+    /// it is the only reader, half that at two. Anything else — a different file, a jump to
+    /// somewhere new — gets that share capped at [`FIRST_SPAN`], so a reader that stops
+    /// after a buffer pays for 8 MiB it mostly throws away rather than a walk's worth.
     ///
     /// A span is never smaller than the window asked for, so an oversized read is
     /// answered whole rather than truncated.
     async fn span(&self, id: &str, start: u64, want: u64) -> io::Result<(u64, Arc<Vec<u8>>)> {
-        let walking = {
-            let slot = self.held.lock().await;
-            match slot.as_ref() {
-                Some(held) if held.id == id && held.when.elapsed() < DIR_TTL => {
-                    if held.at <= start
-                        && (start.saturating_add(want)
-                            <= held.at.saturating_add(held.bytes.len() as u64)
-                            || held.to_eof)
+        let (walking, sharers) = {
+            let mut held = self.held.lock().await;
+            // Every *other* file read within [`ACTIVE`], plus this one, which is about to
+            // hold a span whether or not it already has an entry. Counting the map's own
+            // entry for `id` instead misses this reader exactly when its last span has gone
+            // stale — and then a lone active neighbour is told it is alone, takes the whole
+            // budget, and evicts the very span the division exists to keep.
+            let sharers = held
+                .iter()
+                .filter(|(k, h)| k.as_str() != id && h.used.elapsed() < ACTIVE)
+                .count() as u64
+                + 1;
+            let walking = match held.get_mut(id) {
+                Some(h) if h.when.elapsed() < DIR_TTL => {
+                    if h.at <= start
+                        && (start.saturating_add(want) <= h.at.saturating_add(h.bytes.len() as u64)
+                            || h.to_eof)
                     {
-                        return Ok((held.at, held.bytes.clone()));
+                        // Served, so the file goes on counting for *everyone else's*
+                        // share. It always counts for its own, which is `count() + 1`;
+                        // what this buys is that a neighbour computing a share does not
+                        // skip this file, decide it is alone, and take a share large
+                        // enough to evict this span. Reasoned rather than measured, and no
+                        // test covers it: hits are microseconds apart, so ACTIVE only
+                        // lapses between them for a reader that pauses seconds mid-file.
+                        h.used = Instant::now();
+                        return Ok((h.at, h.bytes.clone()));
                     }
                     // Not covered, but beginning inside what was — at its end, or
                     // straddling it — so the reader spent the span and wants the next.
                     // Not just `== end`: a window whose size does not divide the span
                     // reaches past it from inside, and that is the same walk.
-                    held.at <= start && start <= held.at.saturating_add(held.bytes.len() as u64)
+                    h.at <= start && start <= h.at.saturating_add(h.bytes.len() as u64)
                 }
                 _ => false,
-            }
+            };
+            (walking, sharers)
         };
-        let len = want.max(if walking { READ_SPAN } else { FIRST_SPAN });
+        // Sized so everything being read fits at once, rather than a constant. A constant
+        // equal to the budget is the one value that cannot work: two files each wanting
+        // all of it means one is always evicted, whatever the order.
+        let share = (HELD_BUDGET / sharers).max(MIN_SPAN);
+        let len = want.max(if walking {
+            share
+        } else {
+            share.min(FIRST_SPAN)
+        });
         let bytes = self
             .accessor
             .download(id, Some(start..start.saturating_add(len)))
@@ -403,39 +490,80 @@ impl GdriveFs {
             .map_err(not_found_or_backend)?;
         let to_eof = (bytes.len() as u64) < len;
         let bytes = Arc::new(bytes);
-        *self.held.lock().await = Some(HeldSpan {
-            id: id.to_string(),
-            at: start,
-            to_eof,
-            when: Instant::now(),
-            bytes: bytes.clone(),
-        });
+        let now = Instant::now();
+        self.hold(
+            id,
+            HeldSpan {
+                at: start,
+                to_eof,
+                when: now,
+                used: now,
+                bytes: bytes.clone(),
+            },
+        )
+        .await;
         Ok((start, bytes))
     }
 
-    /// A document's JSON, from the slot when it is the document being read and from its
+    /// Keep one span, dropping what has aged out and then the least recently read from
+    /// until [`HELD_BUDGET`] has room.
+    ///
+    /// Dividing the budget keeps this loop from running at all in the ordinary case, so
+    /// the order matters only past the point where a share hits [`MIN_SPAN`]. It does
+    /// matter there: over 30 files interleaved, evicting in *some* order costs 7.5x the
+    /// bytes against 9.6x for evicting arbitrarily.
+    ///
+    /// The new span goes in even when it alone is over budget: it has already been paid
+    /// for and the caller is about to read from it, so refusing to hold it would only cost
+    /// the next window another fetch — or, for a document, another render.
+    async fn hold(&self, id: &str, span: HeldSpan) {
+        let len = span.bytes.len() as u64;
+        let mut held = self.held.lock().await;
+        held.remove(id);
+        // Dropped on the way in, the way a listing is: nothing else removes an entry, so a
+        // span read once would otherwise stay for the life of the mount.
+        held.retain(|_, h| h.when.elapsed() < DIR_TTL);
+        while !held.is_empty()
+            && held.values().map(|h| h.bytes.len() as u64).sum::<u64>() + len > HELD_BUDGET
+        {
+            let coldest = held
+                .iter()
+                .min_by_key(|(_, h)| h.used)
+                .map(|(k, _)| k.clone());
+            match coldest {
+                Some(k) => {
+                    held.remove(&k);
+                }
+                None => break,
+            }
+        }
+        held.insert(id.to_string(), span);
+    }
+
+    /// A document's JSON, from the map when it is held there and from its
     /// own API otherwise.
     ///
-    /// Stored as what it is: a span of the whole file at offset 0, in the same slot a
-    /// blob's span goes in. The two were separate caches with the same sentence under
-    /// each — whatever is being read is held and nothing more is promised — and a map
-    /// under a byte budget was buying what one slot already gives, at the cost of an
-    /// eviction loop and a second [`READ_SPAN`]-sized ceiling to hold at once.
+    /// Stored as what it is: a span of the whole file at offset 0, in the same map a blob's
+    /// span goes in. This was two caches, then one slot on the reasoning that a reader works
+    /// through one file at a time, and is a map under a byte budget again now that reads of
+    /// two files are known to interleave. See [`GdriveFs::held`] for what that measured.
     ///
     /// `to_eof`, because there is no more of it: the API answers with the whole document
     /// or nothing, which is also why this has to exist at all. Without it a 3.4 MB
-    /// document read at 64 KiB a time is 52 renders of the same document.
+    /// document read a window at a time is 104 renders of the same document.
     async fn rendered_json(&self, child: &Child, api: NativeApi) -> io::Result<Arc<Vec<u8>>> {
         let id = child.id.as_str();
         {
-            let slot = self.held.lock().await;
-            if let Some(held) = slot.as_ref()
-                && held.id == id
-                && held.at == 0
-                && held.to_eof
-                && held.when.elapsed() < DIR_TTL
+            let mut held = self.held.lock().await;
+            if let Some(h) = held.get_mut(id)
+                && h.at == 0
+                && h.to_eof
+                && h.when.elapsed() < DIR_TTL
             {
-                return Ok(held.bytes.clone());
+                // Read from, so this is the one to keep when room runs short — and losing
+                // a document costs a render rather than a range request.
+                h.used = Instant::now();
+                return Ok(h.bytes.clone());
             }
         }
         let bytes = match api {
@@ -445,13 +573,18 @@ impl GdriveFs {
         }
         .map_err(not_found_or_backend)?;
         let bytes = Arc::new(bytes);
-        *self.held.lock().await = Some(HeldSpan {
-            id: id.to_string(),
-            at: 0,
-            to_eof: true,
-            when: Instant::now(),
-            bytes: bytes.clone(),
-        });
+        let now = Instant::now();
+        self.hold(
+            id,
+            HeldSpan {
+                at: 0,
+                to_eof: true,
+                when: now,
+                used: now,
+                bytes: bytes.clone(),
+            },
+        )
+        .await;
         // Outlives the bytes above, so a listing after they age out still knows the length.
         self.remember_len(child, bytes.len() as u64).await;
         Ok(bytes)
@@ -704,9 +837,9 @@ impl GdriveFs {
         // The bytes first, while they are still held: `stat` and a read of the same
         // document answer from the same place or they disagree about where it ends.
         let in_hand = {
-            let slot = self.held.lock().await;
-            slot.as_ref()
-                .filter(|h| h.id == child.id && h.at == 0 && h.to_eof)
+            let held = self.held.lock().await;
+            held.get(child.id.as_str())
+                .filter(|h| h.at == 0 && h.to_eof)
                 .filter(|h| h.when.elapsed() < DIR_TTL)
                 .map(|h| h.bytes.len() as u64)
         };
@@ -749,21 +882,33 @@ impl GdriveFs {
         self.dir_cache.lock().await.len()
     }
 
-    /// What the one slot is holding: the Drive id and how many bytes. Tests only — a
-    /// slot nothing can see is a slot nothing keeps. Which *kind* it is cannot be read
+    /// How many bytes are held for one Drive id, and `None` when nothing is. Tests only —
+    /// a span nothing can see is a span nothing keeps. Which *kind* it is cannot be read
     /// off the span (a small blob read from 0 is also `at: 0, to_eof`), so the id is what
-    /// a caller compares, exactly as `rendered_json` and `remembered_len` do.
+    /// a caller names, exactly as `rendered_json` and `remembered_len` do.
     #[cfg(test)]
-    pub(crate) async fn held_slot(&self) -> Option<(String, u64)> {
-        let slot = self.held.lock().await;
-        slot.as_ref().map(|h| (h.id.clone(), h.bytes.len() as u64))
+    pub(crate) async fn held_bytes(&self, id: &str) -> Option<u64> {
+        self.held.lock().await.get(id).map(|h| h.bytes.len() as u64)
     }
 
     /// Drop the produced bytes while keeping what was learned from them. Tests only —
     /// it is the state a document reaches on its own, by the byte budget or the TTL.
     #[cfg(test)]
     pub(crate) async fn forget_rendered_for_test(&self) {
-        *self.held.lock().await = None;
+        self.held.lock().await.clear();
+    }
+
+    /// Push every held span `by` into the past, both when it was fetched and when it was
+    /// last read from, so a test can make one look abandoned without waiting. Tests only.
+    #[cfg(test)]
+    pub(crate) async fn age_spans_for_test(&self, by: Duration) {
+        let mut held = self.held.lock().await;
+        for h in held.values_mut() {
+            if let (Some(w), Some(u)) = (h.when.checked_sub(by), h.used.checked_sub(by)) {
+                h.when = w;
+                h.used = u;
+            }
+        }
     }
 
     /// How many document lengths are remembered. Tests only.
