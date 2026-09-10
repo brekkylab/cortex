@@ -310,8 +310,19 @@ fn main() -> ExitCode {
 
     // Written as bytes: this is program output on its way to whatever the shell pointed at,
     // and a caller piping it into something byte-oriented has to get what was produced.
-    std::io::stdout().write_all(said.as_bytes()).ok();
-    ExitCode::SUCCESS
+    match std::io::stdout().write_all(said.as_bytes()) {
+        Ok(()) => ExitCode::SUCCESS,
+        // A reader that stopped reading — `| head` — is not this program failing.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        // Anything else and the answer is not the answer: a caller cannot be told that by a
+        // zero, which is what says the window held everything it was going to.
+        Err(e) => {
+            std::io::stderr()
+                .write_all(format!("{NAME}: writing the answer: {e}\n").as_bytes())
+                .ok();
+            ExitCode::FAILURE
+        }
+    }
 }
 
 #[cfg(test)]
