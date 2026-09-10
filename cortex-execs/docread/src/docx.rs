@@ -279,6 +279,22 @@ fn rows_of(table: &Table, out: &mut String) {
                     .iter()
                     .filter_map(|child| match child {
                         TableCellContent::Paragraph(paragraph) => Some(text_of(paragraph)),
+                        // A nested table is text in this cell too. Flattened into it rather
+                        // than dropped: its rows on lines of their own would leave the cells
+                        // of the row above no longer lining up.
+                        TableCellContent::Table(table) => {
+                            let mut rows = String::new();
+                            rows_of(table, &mut rows);
+                            // Its text, not its row spelling: the `| |` of the inner table
+                            // inside a cell of the outer one reads as a column that is not
+                            // there.
+                            Some(
+                                rows.lines()
+                                    .map(|row| row.trim_matches('|').trim())
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                            )
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>()
