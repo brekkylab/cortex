@@ -34,6 +34,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use super::super::{
+    signal::{Registered, register},
+    table::{mounts_under, resolved, unmount_under},
+};
 use crate::fs::{
     FileSystem, Mount, Posix, SetAttr, Stat,
     filesystem::posix::{
@@ -140,7 +144,7 @@ unsafe extern "C" {
         ops: *const Ops,
     ) -> *mut c_void;
     fn cortex_fuse_t_loop(session: *mut c_void) -> c_int;
-    fn cortex_fuse_t_unmount(session: *mut c_void);
+    fn cortex_fuse_t_stop(session: *mut c_void);
     fn cortex_fuse_t_destroy(session: *mut c_void);
 }
 
@@ -431,6 +435,17 @@ const FSNAME: &CStr = c"cortex";
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// How long a drop gives the mount table to catch up with a forceful unmount that has
+/// already been accepted. Short: this is bookkeeping settling, not work being done.
+const UNMOUNT_SETTLE: Duration = Duration::from_secs(3);
+
+/// How long a drop waits for the serving thread to notice that its channel is gone.
+///
+/// Generous, because overrunning it costs a leaked session and a leaked thread — but
+/// bounded, because the alternative is a destructor that never returns. A loop that
+/// has not come back in this long is not going to.
+const LOOP_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Which of FUSE-T's transports serves the mount.
 ///
 /// The helper carries all three and the choice is one mount option, so nothing on this side
@@ -518,6 +533,11 @@ pub struct FuseTMount {
     /// `dyn Send + Sync` rather than `dyn Any`: the two erase equally well, and this one does
     /// not also advertise a downcast nothing should ever perform.
     _fs: Box<dyn Send + Sync>,
+
+    /// This mount's place on the process's register of live mounts, which is where an
+    /// opt-in [`unmount_on_signal`](crate::fs::unmount_on_signal) finds it. Held rather
+    /// than read: dropping it is what takes the mount back off the register.
+    _registered: Registered,
 }
 
 impl FuseTMount {
@@ -605,6 +625,7 @@ impl FuseTMount {
             thread: Some(thread),
             mountpoint: mountpoint.to_path_buf(),
             _fs: fs,
+            _registered: register(mountpoint),
         };
         if !mount.wait_until_mounted(MOUNT_TIMEOUT) {
             return Err(io::Error::new(
@@ -709,9 +730,40 @@ unsafe impl Send for FuseTMount {}
 unsafe impl Sync for FuseTMount {}
 
 impl Drop for FuseTMount {
-    /// Unmount → join → destroy, in that order and at most once. Unmounting is what makes the
-    /// serving loop return, so joining first would hang; destroying first would free the
-    /// session under the thread still reading it.
+    /// Unmount → stop the loop → join → unmount again if it was busy → release the session,
+    /// in that order and at most once.
+    ///
+    /// The unmount is attempted twice on purpose. The first is while the mount is still being
+    /// served, so anything the kernel has cached can be written back and a plain `umount`
+    /// refuses rather than pulls the tree out from under a reader. The second is after the
+    /// loop has stopped, which is what makes a reader let go — a mount with traffic on it
+    /// answers the first attempt with `EBUSY` and the second without complaint.
+    ///
+    /// # Why the unmount does not go through libfuse-t
+    ///
+    /// `fuse_unmount` cannot be called while a second mount is alive in this process.
+    /// libfuse-t keeps the FUSE-T helper's pid in one process-global slot (`_cpid`, written by
+    /// `fuse_mount_core` after its `fork`) and `fuse_kern_unmount` ends in a *blocking*
+    /// `waitpid` on whatever is in it. Every mount overwrites the slot, so an unmount waits on
+    /// whichever session mounted last — a helper that is still serving and will not exit until
+    /// its own mount goes. With two mounts up, `drop(a); drop(b)` therefore never reaches the
+    /// second line: both teardowns sit in `wait4` while the mounts stay in the table.
+    /// `_mount_wait_thread`, joined a few instructions later, is a single global in the same
+    /// way. The whole path is written for one mount per process, and cortex mounts one per
+    /// session.
+    ///
+    /// So the mount comes down the way a mount whose owner is *gone* has to come down anyway
+    /// — `umount`, in a child process, bounded. One mechanism for both cases rather than two,
+    /// and it depends on nothing libfuse-t keeps in a global.
+    ///
+    /// What is left for the shim is releasing the session that was serving it, which is
+    /// per-session and safe: end the loop, join its thread, free.
+    ///
+    /// The contract is unchanged — the mount is taken down here and there is still no
+    /// `unmount` to call. What this cannot promise is that the kernel agreed: every step is
+    /// bounded, so a mount that refuses both rungs of the ladder with nothing serving it
+    /// leaves this returning anyway, having said so on stderr. The alternative is a
+    /// destructor that never returns, which is the bug above wearing different clothes.
     ///
     /// Nothing here panics. A `Drop` that panics mid-unwind aborts the process, which in a
     /// failing test replaces the real assertion with a bare abort.
@@ -719,11 +771,91 @@ impl Drop for FuseTMount {
         if self.session.is_null() {
             return;
         }
-        unsafe { cortex_fuse_t_unmount(self.session) };
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        let session = std::mem::replace(&mut self.session, std::ptr::null_mut());
+        let mountpoint = resolved(&self.mountpoint);
+
+        // First while the mount is still being served, so an unmount that has to flush a
+        // cached write still has something to flush it to.
+        let was_busy = !unmount_under(&mountpoint);
+
+        // Then stop serving, whether or not that worked. It is what releases anything still
+        // reading through the mount, and a caller that has dropped the guard has already
+        // said the mount is over.
+        unsafe { cortex_fuse_t_stop(session) };
+
+        // Joined before the session is freed, because the loop reads it — and joined with a
+        // deadline, because a thread that did not notice the shutdown must not become a hang
+        // in a destructor. The session is then deliberately leaked: freeing it under a live
+        // loop is a use-after-free, and a leaked allocation is the cheaper of the two.
+        let collected = match self.thread.take() {
+            Some(thread) if thread_ends(&thread, LOOP_EXIT_TIMEOUT) => {
+                let _ = thread.join();
+                true
+            }
+            Some(_) => false,
+            // Already collected by `join`, so there was nothing to wait for.
+            None => true,
+        };
+
+        // A mount that was busy a moment ago is not busy now that nothing is being served
+        // through it, so the rungs that refused the first time are worth one more try.
+        let left = if was_busy {
+            unmount_under(&mountpoint);
+            // Polled rather than read once: a forceful unmount is *accepted* before the
+            // table catches up, so a single read here reports a mount that is already on
+            // its way out. That report would be a false alarm on every busy teardown.
+            settle(&mountpoint, UNMOUNT_SETTLE)
+        } else {
+            Vec::new()
+        };
+
+        // Reported rather than propagated, and never a panic: what is left is left for
+        // someone to clear by hand, so saying so is the least this can do.
+        for survivor in left {
+            eprintln!(
+                "cortex: {} would not unmount — take it down by hand",
+                survivor.display()
+            );
         }
-        unsafe { cortex_fuse_t_destroy(self.session) };
-        self.session = std::ptr::null_mut();
+        if !collected {
+            eprintln!(
+                "cortex: the thread serving {} did not stop within {LOOP_EXIT_TIMEOUT:?}; \
+                 leaving its session allocated",
+                self.mountpoint.display()
+            );
+            return;
+        }
+        unsafe { cortex_fuse_t_destroy(session) };
     }
+}
+
+/// Wait for the mount table to stop naming anything at `mountpoint`, and report whatever it
+/// still names when the time is up.
+///
+/// Empty is the good answer. Anything else is a mount that has had both rungs of the ladder
+/// aimed at it, with nothing serving it, and is still there.
+fn settle(mountpoint: &Path, timeout: Duration) -> Vec<PathBuf> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let left = mounts_under(mountpoint);
+        if left.is_empty() || Instant::now() >= deadline {
+            return left;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Whether `thread` finishes inside `timeout`.
+///
+/// Polled, because `JoinHandle::join` has no timed form and the whole point here is to not
+/// wait forever on one.
+fn thread_ends(thread: &JoinHandle<c_int>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !thread.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    true
 }

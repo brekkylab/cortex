@@ -31,6 +31,10 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
+use super::super::{
+    signal::{Registered, register},
+    table::{resolved, unmount_under},
+};
 use crate::fs::{
     DirentKind, FileSystem, Mount, Posix, SetAttr, Stat,
     filesystem::posix::{
@@ -65,6 +69,11 @@ pub struct FuseMount {
     session: Option<fuser::BackgroundSession>,
 
     mountpoint: PathBuf,
+
+    /// This mount's place on the process's register of live mounts, which is where an
+    /// opt-in [`unmount_on_signal`](crate::fs::unmount_on_signal) finds it. Held rather
+    /// than read: dropping it is what takes the mount back off the register.
+    _registered: Registered,
 }
 
 impl FuseMount {
@@ -104,6 +113,7 @@ impl FuseMount {
         Ok(FuseMount {
             session: Some(session),
             mountpoint: mountpoint.to_path_buf(),
+            _registered: register(mountpoint),
         })
     }
 
@@ -133,20 +143,37 @@ impl Mount for FuseMount {
 }
 
 impl Drop for FuseMount {
+    /// `fuser`'s own unmount, then the operating system's if that was refused.
+    ///
+    /// `umount_and_join` is `mount.umount()?` followed by the join, so a refused unmount
+    /// returns before the join and leaves the mount up — and a mount with readers on it *is*
+    /// refused, with `EBUSY`. Stopping there would leave the mount behind, which breaks the
+    /// contract rather than merely putting a message on stderr.
+    ///
+    /// So the refusal is not the end of it. A caller that has dropped the guard has said the
+    /// mount is over, and what follows is the escalation the FUSE-T binding also uses — a
+    /// bounded child per attempt, ending in a lazy detach — so a busy mount comes down the
+    /// same way whoever is taking it down.
+    ///
+    /// Nothing here panics. A `Drop` that panics mid-unwind aborts the process, which in a
+    /// failing test replaces the real assertion with a bare abort.
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            // Reported rather than propagated, and never a panic: a `Drop` that panics
-            // mid-unwind aborts the process, which in a failing test replaces the real
-            // assertion with a bare abort. Not silent either — a mount that would not come
-            // down is left behind for someone to clear by hand, so saying so is the least this
-            // can do.
-            if let Err(err) = session.umount_and_join() {
-                eprintln!(
-                    "cortex: unmounting {} failed: {err}",
-                    self.mountpoint.display()
-                );
-            }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let Err(refused) = session.umount_and_join() else {
+            return;
+        };
+
+        if unmount_under(&resolved(&self.mountpoint)) {
+            return;
         }
+        // Not silent: a mount that would not come down is left behind for someone to clear by
+        // hand, so saying so — and saying what `fuser` made of it — is the least this can do.
+        eprintln!(
+            "cortex: unmounting {} failed: {refused}",
+            self.mountpoint.display()
+        );
     }
 }
 

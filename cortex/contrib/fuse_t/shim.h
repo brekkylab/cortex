@@ -89,8 +89,16 @@ void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname,
 /* Serve requests until the session ends. Blocks; call from a dedicated thread. */
 int cortex_fuse_t_loop(void *session);
 
-/* Unmount, which is what makes the blocking loop return. */
-void cortex_fuse_t_unmount(void *session);
+/* End the serving loop, so `cortex_fuse_t_loop` returns and its thread can be
+ * joined. Idempotent.
+ *
+ * **Does not unmount.** libfuse-t's `fuse_unmount` cannot be used while a second
+ * mount is alive in the process: it ends in a blocking `waitpid` on a
+ * process-global pid that every mount overwrites, so it waits on another
+ * session's helper. The mount is taken down through the operating system
+ * instead — see `fs::mount::unmount_under` — and this only releases the session
+ * that was serving it. */
+void cortex_fuse_t_stop(void *session);
 
 /* Release the session and channel. Must follow a `cortex_fuse_t_loop` return. */
 void cortex_fuse_t_destroy(void *session);

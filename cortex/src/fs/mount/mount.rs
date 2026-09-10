@@ -34,6 +34,24 @@ use std::{
 /// What a guard adds beyond this trait is its own — `join`, waiting for something else to end
 /// the mount, consumes the guard and so is not something a `dyn Mount` could offer.
 ///
+/// # The one exit that runs no destructor
+///
+/// A signal does not drop anything. The process stops between two instructions, every
+/// destructor it owed goes unrun, and the mount is left registered with nothing answering
+/// it — which is worse than a leak, because a path that no longer answers stops everything
+/// that walks it. That is not a hole in the rule above so much as the rule having nothing to
+/// stand on: there is no destructor to be the lifecycle.
+///
+/// Two things cover it, and they are deliberately not on this trait:
+///
+/// * [`unmount_on_signal`](crate::fs::unmount_on_signal), for the signals that can be caught.
+///   **Opt-in**, because a signal disposition is process-global and a library that claimed
+///   one would be overwriting whatever the program embedding it had arranged.
+/// * [`unmount_under`](crate::fs::unmount_under), for `SIGKILL`, which reaches no handler at
+///   all. Nothing the dying process does can help; the mount is reclaimed by whoever comes
+///   next, which is why this is a free function over a path rather than a method on a guard
+///   that no longer exists.
+///
 /// [`Send`] + [`Sync`], because a mount is held for as long as it serves and the holder is
 /// usually a task: a console keeps one across every await in an execution, and hands `&self`
 /// to whatever runs in the meantime.

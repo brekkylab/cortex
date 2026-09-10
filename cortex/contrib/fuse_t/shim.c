@@ -13,6 +13,7 @@
 #include <fuse_lowlevel.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 
@@ -30,6 +31,9 @@ struct session {
     struct fuse_session *se;
     char *mountpoint;
     void *fs;
+    /* The serving loop has been told to stop. Makes stopping idempotent, which
+     * is what lets `cortex_fuse_t_destroy` call it unconditionally. */
+    int stopped;
     struct cortex_fuse_t_ops ops;
 };
 
@@ -351,24 +355,39 @@ int cortex_fuse_t_loop(void *session) {
     return fuse_session_loop(s->se);
 }
 
-void cortex_fuse_t_unmount(void *session) {
+void cortex_fuse_t_stop(void *session) {
     struct session *s = session;
-    /* Exit flag first: the loop checks it between requests, and the unmount
-     * below closes the channel so an in-flight read returns. Together they are
-     * what let the loop come back instead of deadlocking the caller's join. */
+    if (!s || s->stopped) return;
+    s->stopped = 1;
+
+    /* Exit flag first: the loop checks it between requests. On its own it is not
+     * enough — the loop spends its time blocked in `recvfrom` on the channel and
+     * only looks at the flag once a request wakes it — so the shutdown below is
+     * what actually ends it. */
     if (s->se) fuse_session_exit(s->se);
-    if (s->ch) {
-        /* This is what breaks the blocking loop. */
-        fuse_session_remove_chan(s->ch);
-        fuse_unmount(s->mountpoint, s->ch);
-        s->ch = NULL;
-    }
+    if (!s->ch) return;
+
+    /* `shutdown` and not `close`: it wakes the blocked `recvfrom` with an
+     * end-of-file while leaving the descriptor in place, so the
+     * `fuse_chan_destroy` reached from `fuse_session_destroy` closes the number
+     * exactly once. Closing here as well would put a second close on a number
+     * another thread may have been handed in between.
+     *
+     * The channel also stays *attached* to the session, and `fuse_chan_destroy`
+     * takes it off later — reached from `fuse_session_destroy`, where the loop is
+     * provably done with it. Detaching here instead would set `ch->se` to NULL
+     * under the serving thread, which a reply already on its way out asserts on
+     * (`fuse_kern_chan_send`: "se != NULL"), and would leave `se->ch` NULL so that
+     * `fuse_chan_destroy` never runs and the channel leaks. */
+    int fd = fuse_chan_fd(s->ch);
+    if (fd >= 0) shutdown(fd, SHUT_RDWR);
 }
 
 void cortex_fuse_t_destroy(void *session) {
     struct session *s = session;
     if (!s) return;
-    cortex_fuse_t_unmount(s);
+    cortex_fuse_t_stop(s);
+    /* Takes the channel with it, and with it the one close of its descriptor. */
     if (s->se) fuse_session_destroy(s->se);
     free(s->mountpoint);
     free(s);
