@@ -77,10 +77,20 @@ pub struct Window {
 pub fn read(path: &Path, offset: usize, limit: usize) -> std::io::Result<Window> {
     // Asked before opening: a directory opens perfectly well and fails on the first read, with
     // an error about a descriptor rather than about the thing the caller named.
-    if std::fs::metadata(path)?.is_dir() {
+    let about = std::fs::metadata(path)?;
+    if about.is_dir() {
         return Err(std::io::Error::new(
             ErrorKind::IsADirectory,
             "is a directory, and this answers about files",
+        ));
+    }
+    // A device, a fifo, a socket. `read_line` below hunts a newline until the end of the file,
+    // and one of these has neither: `docread /dev/zero` never returns rather than being
+    // refused. A regular file is the only thing that has a length to be a window onto.
+    if !about.is_file() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "is not a regular file, and this answers about files",
         ));
     }
 
