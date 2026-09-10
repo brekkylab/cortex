@@ -185,12 +185,20 @@ mod pdfium {
     /// **The digest is of what was downloaded**, before any of that. It is the bytes somebody
     /// published that are being agreed to, and hashing what came out of a decompressor instead
     /// would be agreeing to whatever the decompressor made of them.
+    /// The most this will download. Room for an archive several times pdfium's size, and a
+    /// bound all the same: what answers a URL is not something to let name this build's memory.
+    const MAX_FETCH: u64 = 512 * 1024 * 1024;
+
     fn fetch(url: &str, sha256: &str, into: &Path) -> Result<PathBuf, String> {
         say(&format!("fetching {url}"));
         let body = ureq::get(url)
             .call()
             .map_err(|e| format!("{url}: {e}"))?
             .body_mut()
+            // `read_to_vec()` on its own is ureq's 10 MiB default, which no `libpdfium.a` is
+            // under: the fetch then fails on size before the digest is ever looked at.
+            .with_config()
+            .limit(MAX_FETCH)
             .read_to_vec()
             .map_err(|e| format!("{url}: {e}"))?;
 
