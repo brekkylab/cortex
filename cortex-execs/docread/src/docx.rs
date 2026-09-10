@@ -258,6 +258,16 @@ fn text_of(paragraph: &Paragraph) -> String {
                     }
                 }
             }
+            // A tracked *move*: `w:moveTo` is where the text stands now, so it is in the
+            // document for the reason an insertion is. `MoveFrom` is where it used to be and
+            // stays out, like `Delete`.
+            ParagraphChild::MoveTo(moved) => {
+                for child in &moved.children {
+                    if let docx_rs::MoveToChild::Run(run) = child {
+                        push_run(run, &mut out);
+                    }
+                }
+            }
             _ => {}
         }
     }
