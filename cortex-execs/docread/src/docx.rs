@@ -204,13 +204,39 @@ fn lines(bytes: &[u8]) -> std::io::Result<String> {
                 out.push('\n');
             }
             DocumentChild::Table(table) => rows_of(table, &mut out),
-            // A section break, a bookmark, a structured tag: things a document is made of that
-            // hold no text of their own. Passed over rather than turned into blank lines,
-            // which would be numbers standing for nothing.
+            // A content control, which is where the body of a document made from a template
+            // is. Passing over it drops that text *and* shifts the number of every line after
+            // it, so what it holds is walked like anything else the body is made of.
+            DocumentChild::StructuredDataTag(tag) => tag_of(tag, &mut out),
+            // A section break, a bookmark: things a document is made of that hold no text of
+            // their own. Passed over rather than turned into blank lines, which would be
+            // numbers standing for nothing.
             _ => {}
         }
     }
     Ok(out)
+}
+
+/// A content control's contents, as the lines they are in the body.
+fn tag_of(tag: &docx_rs::StructuredDataTag, out: &mut String) {
+    use docx_rs::StructuredDataTagChild as Child;
+
+    for child in &tag.children {
+        match child {
+            Child::Paragraph(paragraph) => {
+                out.push_str(&text_of(paragraph));
+                out.push('\n');
+            }
+            Child::Table(table) => rows_of(table, out),
+            Child::Run(run) => {
+                push_run(run, out);
+                out.push('\n');
+            }
+            // One control inside another, which Word writes for a nested field.
+            Child::StructuredDataTag(tag) => tag_of(tag, out),
+            _ => {}
+        }
+    }
 }
 
 /// One paragraph, as it reads.
