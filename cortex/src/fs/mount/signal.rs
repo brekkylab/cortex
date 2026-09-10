@@ -1,5 +1,9 @@
 //! Taking this process's mounts down when it is killed, for the signals that can
-//! be caught — and the register of live mounts that makes it possible.
+//! be caught.
+//!
+//! What is taken down is [`claim::live`](super::claim::live) — the mount points
+//! this process owns. That register is not kept here, because the other thing
+//! that needs it runs in a *later* process; see [`claim`](super::claim).
 //!
 //! # Why a guard is not enough
 //!
@@ -31,82 +35,35 @@
 //! # `SIGKILL` is not here
 //!
 //! No handler catches it, so a `kill -9` leaves the mount up and no amount of
-//! care in this process can change that. That case is recovered at the *next*
-//! run, by whoever owns the mount point: see
-//! [`unmount_under`](super::unmount_under), and `bin_dir.rs` in the local
-//! console for a root-per-pid convention built on it.
+//! care in this process can change that. That case is recovered by the *next*
+//! run, and needs nobody to ask: see
+//! [`reclaim_abandoned`](super::reclaim_abandoned), which every `try_new` calls.
+//!
+//! So what this module buys is not *whether* an abandoned mount is cleared but
+//! *when*. Without it the mount point stays blocked until something mounts again;
+//! with it, a program that is asked to stop takes its mounts with it.
 
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
-use std::path::Path;
 use std::{
     io,
-    path::PathBuf,
     sync::{
         Mutex, OnceLock,
         atomic::{AtomicI32, Ordering},
     },
 };
 
-// Only registering needs these, and only a build with a binding can register.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
-use super::table::resolved;
-use super::table::unmount_under;
+use super::{claim::live, table::unmount_under};
 
 /// The signals worth catching: the four a person or a supervisor sends to ask a
 /// process to stop. Everything else that is catchable means the process is
 /// already broken, and a mount is the smaller problem.
 const CAUGHT: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
 
-/// Every mount this process has up, resolved as the mount table spells them.
-///
-/// Written by every guard, whether or not a handler was ever installed: a
-/// consumer that calls [`unmount_on_signal`] after mounting has to find the
-/// mounts that already exist, and a register that only started counting at
-/// installation would miss exactly those.
-static LIVE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-
 /// The write end of the self-pipe, for the handler to poke.
 ///
-/// An atomic and not a `Mutex`, because a handler may not lock: this is read
-/// with a single relaxed load, and `-1` means no handler is installed and the
-/// byte has nowhere to go.
+/// An atomic and not a `Mutex`, because a handler may not lock: this is read with
+/// a single relaxed load, and `-1` means no handler is installed and the byte has
+/// nowhere to go.
 static WAKE: AtomicI32 = AtomicI32::new(-1);
-
-/// A mount's place in [`LIVE`], held for as long as the mount is.
-///
-/// Deregisters on drop, so an ordinary teardown leaves nothing for the signal
-/// path to find and try to unmount a second time.
-///
-/// Gated on there being a binding to register anything: with none compiled in,
-/// nothing in this process can mount, and the register is a list that only ever
-/// stays empty. [`unmount_on_signal`] itself stays ungated — a consumer that
-/// takes a mount someone else made can still ask for it, and gets the same
-/// (empty) answer honestly.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
-pub(crate) struct Registered(PathBuf);
-
-/// Put `mountpoint` on the register of live mounts.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
-pub(crate) fn register(mountpoint: &Path) -> Registered {
-    let path = resolved(mountpoint);
-    // Poisoning is ignored: a panic elsewhere must not turn every later mount
-    // into an unrecoverable one.
-    if let Ok(mut live) = LIVE.lock() {
-        live.push(path.clone());
-    }
-    Registered(path)
-}
-
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
-impl Drop for Registered {
-    fn drop(&mut self) {
-        if let Ok(mut live) = LIVE.lock()
-            && let Some(at) = live.iter().position(|p| p == &self.0)
-        {
-            live.swap_remove(at);
-        }
-    }
-}
 
 /// Take this process's mounts down when it is asked to stop.
 ///
@@ -235,11 +192,10 @@ fn watch(read: libc::c_int) -> ! {
         }
     };
 
-    // A copy, so the lock is not held across the unmounts — one of which spawns
-    // a child and waits on it, while a guard being dropped on another thread
-    // wants this same lock to deregister.
-    let live = LIVE.lock().map(|live| live.clone()).unwrap_or_default();
-    for mountpoint in live {
+    // A copy, so no lock is held across the unmounts — one of which spawns a
+    // child and waits on it, while a guard being dropped on another thread wants
+    // that same lock to give its mount point up.
+    for mountpoint in live() {
         if !unmount_under(&mountpoint) {
             // Not silent: a mount that would not come down is one somebody has
             // to clear by hand, and this is the last moment anything in this
@@ -269,31 +225,5 @@ fn watch(read: libc::c_int) -> ! {
     // it has nothing left to watch.
     loop {
         std::thread::park();
-    }
-}
-
-// Every test here is about the register, which only a build with a binding has.
-#[cfg(all(test, any(feature = "fuse", feature = "fuse-t")))]
-mod tests {
-    use super::*;
-
-    /// The register is what the signal path reads, so a mount that is up has to
-    /// be on it and one that is gone has to be off it.
-    #[test]
-    fn a_registration_lasts_exactly_as_long_as_it_is_held() {
-        let path = std::env::temp_dir().join("cortex-registry-probe");
-        let resolved = resolved(&path);
-
-        let before = LIVE.lock().unwrap().len();
-        let registration = register(&path);
-        assert!(LIVE.lock().unwrap().contains(&resolved));
-
-        drop(registration);
-        assert!(!LIVE.lock().unwrap().contains(&resolved));
-        assert_eq!(
-            LIVE.lock().unwrap().len(),
-            before,
-            "deregistering leaves the register as it was found"
-        );
     }
 }

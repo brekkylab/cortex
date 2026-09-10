@@ -354,6 +354,58 @@ fn child_holding_a_mount(path: &std::path::Path, catches_signals: bool) -> Fixtu
     child
 }
 
+/// `SIGKILL` reaches no handler, so the mount outlives the process — and the only
+/// place left to deal with it is whoever comes next. Nobody has to ask: mounting
+/// is what reclaims it.
+///
+/// Nothing is asserted about the state *between* the kill and the next mount. Any
+/// mount in this process sweeps, including one made by a test running beside this
+/// one, so the middle is racy by design and the end state is what the contract is
+/// about: after something mounts, an abandoned mount is gone.
+#[test]
+#[ignore = "needs a host binding and mounts real filesystems"]
+fn a_killed_process_leaves_a_mount_that_the_next_mount_reclaims() {
+    let abandoned = mountpoint("killed");
+    let mut child = child_holding_a_mount(&abandoned, false);
+    child.kill_and_reap(libc::SIGKILL);
+
+    // Any mount at all, anywhere — the sweep is over the register, not over this
+    // path, so nothing here has to name what it is reclaiming.
+    let elsewhere = mountpoint("killed-probe");
+    let probe = HostMount::try_new(volume(), &elsewhere).expect("mount");
+
+    assert!(
+        !in_mount_table(&abandoned),
+        "{} outlived the process that made it and was not reclaimed",
+        abandoned.display()
+    );
+    drop(probe);
+    let _ = fs::remove_dir_all(&abandoned);
+    let _ = fs::remove_dir_all(&elsewhere);
+}
+
+/// Reclaiming asks whether the *owner* is gone, not whether the path is one it
+/// recognises.
+///
+/// The whole safety of doing this automatically rests on that. A sweep that went by
+/// path alone would take down a second instance's tree the moment the first instance
+/// mounted, which is why sweeping by path is not something a consumer can ask for.
+#[test]
+#[ignore = "needs a host binding and mounts real filesystems"]
+fn reclaiming_leaves_a_running_process_its_own_mounts() {
+    let path = mountpoint("livesibling");
+    let mount = HostMount::try_new(volume(), &path).expect("mount");
+    assert_serves(&mount);
+
+    cortex::fs::reclaim_abandoned();
+
+    // This process is running, so its mount is not abandoned, whatever the register
+    // says about the path.
+    assert_serves(&mount);
+    drop(mount);
+    let _ = fs::remove_dir_all(&path);
+}
+
 /// A signal that *can* be caught takes the mount with it — once the program has
 /// asked for that.
 #[test]

@@ -35,7 +35,7 @@ use std::{
 };
 
 use super::super::{
-    signal::{Registered, register},
+    claim::{Claim, claim, reclaim_abandoned},
     table::{mounts_under, resolved, unmount_under},
 };
 use crate::fs::{
@@ -534,10 +534,11 @@ pub struct FuseTMount {
     /// not also advertise a downcast nothing should ever perform.
     _fs: Box<dyn Send + Sync>,
 
-    /// This mount's place on the process's register of live mounts, which is where an
-    /// opt-in [`unmount_on_signal`](crate::fs::unmount_on_signal) finds it. Held rather
-    /// than read: dropping it is what takes the mount back off the register.
-    _registered: Registered,
+    /// This process's ownership of the mount point — what an opt-in
+    /// [`unmount_on_signal`](crate::fs::unmount_on_signal) reads now, and what a later run's
+    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) reads if this one is killed. Held
+    /// rather than read: dropping it is what gives the mount point up.
+    _claim: Claim,
 }
 
 impl FuseTMount {
@@ -581,6 +582,11 @@ impl FuseTMount {
         mountpoint: &Path,
         backend: *const c_char,
     ) -> io::Result<Self> {
+        // What a `SIGKILL`ed run left behind is nobody's but the next run's, and this
+        // is the next run. Only mounts whose owning process is gone are touched, so a
+        // sibling instance keeps its own.
+        reclaim_abandoned();
+
         let c_mountpoint = CString::new(mountpoint.as_os_str().as_bytes())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidFilename))?;
 
@@ -625,7 +631,7 @@ impl FuseTMount {
             thread: Some(thread),
             mountpoint: mountpoint.to_path_buf(),
             _fs: fs,
-            _registered: register(mountpoint),
+            _claim: claim(mountpoint),
         };
         if !mount.wait_until_mounted(MOUNT_TIMEOUT) {
             return Err(io::Error::new(
@@ -753,8 +759,9 @@ impl Drop for FuseTMount {
     /// session.
     ///
     /// So the mount comes down the way a mount whose owner is *gone* has to come down anyway
-    /// — `umount`, in a child process, bounded. One mechanism for both cases rather than two,
-    /// and it depends on nothing libfuse-t keeps in a global.
+    /// — `umount`, in a child process, bounded. That is one mechanism for both a guard's own
+    /// teardown and [`reclaim_abandoned`](crate::fs::reclaim_abandoned), and it depends on
+    /// nothing libfuse-t keeps in a global.
     ///
     /// What is left for the shim is releasing the session that was serving it, which is
     /// per-session and safe: end the loop, join its thread, free.

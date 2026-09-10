@@ -32,7 +32,7 @@ use fuser::{
 };
 
 use super::super::{
-    signal::{Registered, register},
+    claim::{Claim, claim, reclaim_abandoned},
     table::{resolved, unmount_under},
 };
 use crate::fs::{
@@ -70,10 +70,11 @@ pub struct FuseMount {
 
     mountpoint: PathBuf,
 
-    /// This mount's place on the process's register of live mounts, which is where an
-    /// opt-in [`unmount_on_signal`](crate::fs::unmount_on_signal) finds it. Held rather
-    /// than read: dropping it is what takes the mount back off the register.
-    _registered: Registered,
+    /// This process's ownership of the mount point — what an opt-in
+    /// [`unmount_on_signal`](crate::fs::unmount_on_signal) reads now, and what a later run's
+    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) reads if this one is killed. Held
+    /// rather than read: dropping it is what gives the mount point up.
+    _claim: Claim,
 }
 
 impl FuseMount {
@@ -105,6 +106,11 @@ impl FuseMount {
         mountpoint: &Path,
         options: Vec<MountOption>,
     ) -> io::Result<Self> {
+        // What a `SIGKILL`ed run left behind is nobody's but the next run's, and this
+        // is the next run. Only mounts whose owning process is gone are touched, so a
+        // sibling instance keeps its own.
+        reclaim_abandoned();
+
         // `Config` is `#[non_exhaustive]`, so it cannot be built with a struct literal from
         // outside `fuser` — start from the default and assign.
         let mut config = Config::default();
@@ -113,7 +119,7 @@ impl FuseMount {
         Ok(FuseMount {
             session: Some(session),
             mountpoint: mountpoint.to_path_buf(),
-            _registered: register(mountpoint),
+            _claim: claim(mountpoint),
         })
     }
 
@@ -151,9 +157,10 @@ impl Drop for FuseMount {
     /// contract rather than merely putting a message on stderr.
     ///
     /// So the refusal is not the end of it. A caller that has dropped the guard has said the
-    /// mount is over, and what follows is the escalation the FUSE-T binding also uses — a
-    /// bounded child per attempt, ending in a lazy detach — so a busy mount comes down the
-    /// same way whoever is taking it down.
+    /// mount is over, and what follows is the escalation the FUSE-T binding and
+    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) also use — a bounded child per
+    /// attempt, ending in a lazy detach — so a busy mount comes down the same way whoever is
+    /// taking it down.
     ///
     /// Nothing here panics. A `Drop` that panics mid-unwind aborts the process, which in a
     /// failing test replaces the real assertion with a bare abort.

@@ -47,10 +47,10 @@ use std::{
 /// * [`unmount_on_signal`](crate::fs::unmount_on_signal), for the signals that can be caught.
 ///   **Opt-in**, because a signal disposition is process-global and a library that claimed
 ///   one would be overwriting whatever the program embedding it had arranged.
-/// * [`unmount_under`](crate::fs::unmount_under), for `SIGKILL`, which reaches no handler at
-///   all. Nothing the dying process does can help; the mount is reclaimed by whoever comes
-///   next, which is why this is a free function over a path rather than a method on a guard
-///   that no longer exists.
+/// * [`reclaim_abandoned`](crate::fs::reclaim_abandoned), for `SIGKILL`, which reaches no
+///   handler at all. Nothing the dying process does can help, so the mount is reclaimed by
+///   whoever comes next — which is why it is a free function rather than a method on a guard
+///   that no longer exists, and why every `try_new` calls it so that nobody has to.
 ///
 /// [`Send`] + [`Sync`], because a mount is held for as long as it serves and the holder is
 /// usually a task: a console keeps one across every await in an execution, and hands `&self`
