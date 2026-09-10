@@ -134,16 +134,28 @@ mod pdfium {
             ));
         }
 
-        let cached = cache()?.join(REVISION.replace('/', "-")).join(target);
-        if cached.join(LIB).is_file() {
-            return Ok(cached.join(LIB));
-        }
-
         // A published library before a built one: fetching is seconds and needs nothing installed,
         // where building needs a toolchain and an hour. The source build is what *makes* one of
         // these, so it is the last resort and not the first.
+        //
+        // Kept under its own digest, and that is the whole of why this is asked before the cache
+        // below: keyed by revision alone, a build pointed at another artifact reads the last one
+        // out of the cache and never fetches, so what is linked and what the environment names
+        // are two different libraries.
         if let Some((url, sha256)) = published(target) {
+            let cached = cache()?
+                .join(REVISION.replace('/', "-"))
+                .join(target)
+                .join(&sha256);
+            if cached.join(LIB).is_file() {
+                return Ok(cached.join(LIB));
+            }
             return fetch(&url, &sha256, &cached);
+        }
+
+        let cached = cache()?.join(REVISION.replace('/', "-")).join(target);
+        if cached.join(LIB).is_file() {
+            return Ok(cached.join(LIB));
         }
 
         if std::env::var_os(BUILD_ENV).is_none() {
