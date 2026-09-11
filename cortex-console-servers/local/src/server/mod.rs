@@ -658,11 +658,15 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
                     #[cfg(unix)]
                     if let Some(pid) = pid {
                         // SAFETY: a plain libc call, and `pid` is a group id this process
-                        // created (`process_group(0)`) whose leader is the child still
-                        // held alive by `wait` above — so it names this command's group
-                        // and no other. Were the leader already reaped, the id would be
-                        // free for the kernel to hand to someone else and this would be a
-                        // signal to strangers.
+                        // created (`process_group(0)`). While the direct child has not
+                        // exited, `wait` above still holds it unreaped, so the id names
+                        // this command's group and no other. The guarantee is only that
+                        // wide: `wait_with_output` reaps the direct child as soon as it
+                        // exits even while descendants keep the pipes open, so a command
+                        // shaped `sh -c 'a & exit'` can leave the leader reaped — and the
+                        // id free for the kernel to reuse — before the timeout fires. The
+                        // common shell shape (a foreground command) keeps the leader alive
+                        // until the kill.
                         unsafe {
                             libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                         }
