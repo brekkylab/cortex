@@ -94,6 +94,36 @@ const EOCD: &[u8] = b"PK\x05\x06";
 /// is what makes the question a bounded one: 64 KiB of the tail, and never a byte of the rest.
 const TAIL: u64 = 22 + u16::MAX as u64;
 
+/// The most this will unpack to read one document, every part of it together.
+///
+/// A `.docx` is a compressed archive, so what it weighs on disk says nothing about what
+/// reading it costs: a body part that is nothing but repeated `<w:p>` deflates to a
+/// three-hundredth of itself, and a file too small on disk to be worth noticing unpacks into
+/// more memory than the machine has. That is the one way a caller here can still name this
+/// program's memory — [`text::read`] holds a window and walks the rest, and a document holds
+/// all of itself — so it is bounded by a number rather than by what the file happens to say.
+///
+/// The whole archive and not the body alone, because [`read_docx`] reads every part there is
+/// into memory beside it: styles, numbering, settings, comments, the headers and footers, and
+/// the images in `word/media`. A bound over one entry is a bound the same bomb is moved out
+/// of, into a part that is read just as eagerly and named in no check.
+const MAX_UNPACKED_BYTES: u64 = 128 << 20;
+
+/// The most any one of its XML parts may weigh.
+///
+/// Lower than [`MAX_UNPACKED_BYTES`] because what a part weighs is not what it costs to read:
+/// [`read_docx`] turns a part into a tree of nodes, and a part made of nothing but `<w:p>` is the worst of that
+/// trade — 219 MB of such a body was measured at 5.15 GB resident against a 12.32 GB peak,
+/// which is fifty-odd bytes held for every byte unpacked. A bound of 128 MiB spent on one
+/// part would be a bound on nothing.
+///
+/// An image is the other extreme and is kept as the bytes it is, so what holds it is the
+/// total above and nothing tighter — which is the reason these are two numbers and not one,
+/// and the reason this one is asked of the `.xml` and `.rels` entries rather than of every
+/// entry there is. Sixteen mebibytes of body XML is a document of some hundreds of pages:
+/// what this bounds is the shape a bomb has, not the size a document has.
+const MAX_PART_BYTES: u64 = 16 << 20;
+
 /// `limit` lines of `path`'s paragraphs from line `offset`, or `None` if this is not a Word
 /// document at all.
 ///
@@ -111,8 +141,13 @@ const TAIL: u64 = 22 + u16::MAX as u64;
 /// What matters is that nothing *else* costs that. This runs before [`text::read`] on every
 /// file the program is handed, so a check that read the bytes to look at them would be the
 /// text reader's bound — hold the window, walk the rest — undone from underneath by the
-/// module that runs first. [`is_document`] is therefore bounded on purpose, and the whole
-/// read happens on the other side of it.
+/// module that runs first. [`verdict`] is therefore bounded on purpose for every file that
+/// is not a document, and the whole read happens on the other side of it.
+///
+/// And a document's own size is not the file's, which is why the size is measured before any
+/// of it is parsed: see [`MAX_UNPACKED_BYTES`] and [`fits`]. A file that unpacks past what
+/// this will hold is refused here rather than met halfway through with a failure to allocate,
+/// which on the guest is the program being killed rather than answering.
 pub fn read(path: &Path, offset: usize, limit: usize) -> Option<std::io::Result<Window>> {
     // A file that will not open at all is not this module's to refuse: whatever is wrong with
     // it — a directory, a permission — the read that follows meets the same thing and says it
@@ -120,8 +155,39 @@ pub fn read(path: &Path, offset: usize, limit: usize) -> Option<std::io::Result<
     let Ok(mut file) = File::open(path) else {
         return None;
     };
-    if !is_document(BufReader::new(&file)) {
-        return None;
+    match verdict(BufReader::new(&file)) {
+        Verdict::No => return None,
+        // A refusal and not a `None`: the body part is in there, so what the caller is holding
+        // is a Word document, and hearing that it is too large to read is worth more than
+        // hearing from the text reader that it is a zip. Which bound it is past is said,
+        // because the two are different facts about the file — one part that is enormous, or
+        // a great many that are not.
+        Verdict::TooLarge => {
+            return Some(Err(too_large(&format!(
+                "it unpacks past the {} MiB this reads at once",
+                MAX_UNPACKED_BYTES >> 20
+            ))));
+        }
+        Verdict::PartTooLarge => {
+            return Some(Err(too_large(&format!(
+                "one part of it unpacks past the {} MiB this reads at once",
+                MAX_PART_BYTES >> 20
+            ))));
+        }
+        Verdict::Yes => {}
+    }
+    // The archive is held whole as well — [`read_docx`] parses out of memory — and what it
+    // weighs on disk is not what its entries weigh: a zip is read from its end, so a
+    // directory listing a kilobyte can hang off a gigabyte of anything at all. Bounded by the
+    // same number, because it is the same memory.
+    if file
+        .metadata()
+        .is_ok_and(|about| about.len() > MAX_UNPACKED_BYTES)
+    {
+        return Some(Err(too_large(&format!(
+            "it is more than the {} MiB of file this reads at once",
+            MAX_UNPACKED_BYTES >> 20
+        ))));
     }
     Some(
         bytes(&mut file)
@@ -134,29 +200,112 @@ pub fn read(path: &Path, offset: usize, limit: usize) -> Option<std::io::Result<
     )
 }
 
-/// Whether this is a Word document, out of a peek and an index.
+/// What a file turned out to be.
+enum Verdict {
+    /// Not a Word document: not a zip, or not an archive whose directory reads, or an archive
+    /// with no body part in it.
+    No,
+    /// A Word document, and one that unpacks into what this will hold.
+    Yes,
+    /// A Word document whose parts unpack past [`MAX_UNPACKED_BYTES`] together.
+    TooLarge,
+    /// A Word document with one XML part past [`MAX_PART_BYTES`].
+    PartTooLarge,
+}
+
+/// Which of those `reader` is, out of a peek, an index, and — only for an archive that holds a
+/// body part — the unpacking of it.
 ///
-/// Two questions, neither of which is the file's length: the four bytes that say it is a zip,
-/// and then the archive's directory, which lists what is in it without any of it being
-/// unpacked. What that costs is a read of the head and a read of the tail.
+/// The first two questions are not the file's length: the four bytes that say it is a zip, and
+/// then the archive's directory, which lists what is in it without any of it being unpacked.
+/// What that costs is a read of the head and a read of the tail, and it is what nearly every
+/// file this program is handed costs, because nearly every one of them is answered `No` here.
 ///
-/// A zip that will not open is a `false` and not a document that failed. It is the honest
-/// answer — an archive whose directory is unreadable is one nothing can say the contents of —
-/// and it leaves the file to be named as the zip it is, which is what [`text::read`] does with
-/// it. The refusal about a document that will not parse is still there for the case it is
-/// about: a readable archive holding a body part that the parser then chokes on.
-fn is_document(mut reader: impl std::io::Read + std::io::Seek) -> bool {
+/// A zip that will not open is a `No` and not a document that failed. It is the honest answer
+/// — an archive whose directory is unreadable is one nothing can say the contents of — and it
+/// leaves the file to be named as the zip it is, which is what [`text::read`] does with it.
+/// The refusal about a document that will not parse is still there for the case it is about: a
+/// readable archive holding a body part that the parser then chokes on.
+fn verdict(mut reader: impl std::io::Read + std::io::Seek) -> Verdict {
     let mut head = [0; ZIP.len()];
     // A file shorter than the magic is not a zip, which is what the failure means here.
     if reader.read_exact(&mut head).is_err() || head != *ZIP {
-        return false;
+        return Verdict::No;
     }
     if !ends_with_a_directory(&mut reader) {
-        return false;
+        return Verdict::No;
     }
     // Wherever the reads above left the cursor: an archive is read from its end, and
     // `ZipArchive` seeks there itself.
-    zip::ZipArchive::new(reader).is_ok_and(|archive| archive.index_for_name(BODY).is_some())
+    let Ok(mut archive) = zip::ZipArchive::new(reader) else {
+        return Verdict::No;
+    };
+    if archive.index_for_name(BODY).is_none() {
+        return Verdict::No;
+    }
+    fits(&mut archive, MAX_UNPACKED_BYTES, MAX_PART_BYTES)
+}
+
+/// [`Verdict::Yes`] if the archive unpacks into `total` with no one XML part of it past
+/// `part`, and which of the two it is past otherwise.
+///
+/// The two bounds are arguments and not the constants read straight off, because a test of
+/// which one stopped an archive has to build an archive that goes past them, and a fixture of
+/// [`MAX_UNPACKED_BYTES`] is a fixture no test should be making. The caller passes the real
+/// ones — there is one caller.
+///
+/// Unpacked here and not read out of the directory, which is the part worth arguing. Every
+/// entry's uncompressed size is written down in the central directory and this could be four
+/// lookups instead of a decompression — but that number is one the file's author wrote, and
+/// nothing on the way in enforces it: the deflate decoder is handed no bound, and [`read_docx`]
+/// reads each part with `read_to_end` into a `Vec` whose *capacity* is the declared size. A
+/// bomb that claims a kilobyte is therefore a bomb that passes a check on the claim and blows
+/// up on the read. Measuring costs one decompression that is thrown away; believing costs the
+/// bound being a bound against honest files only.
+///
+/// It is measured into [`std::io::sink`] and stopped the moment the total goes past, so this
+/// holds a buffer and not a part however large the archive says it is — the property the whole
+/// module is shaped by, kept by the one thing here that touches the compressed bytes.
+///
+/// An entry that will not unpack at all is passed over rather than answered about. Whatever is
+/// wrong with it — a compression method that is not in this build, a truncated stream — the
+/// parser meets the same thing on the other side of this and refuses about a Word document,
+/// which is a better sentence than anything this function knows how to say.
+fn fits<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    total: u64,
+    part: u64,
+) -> Verdict {
+    let mut left = total;
+    for at in 0..archive.len() {
+        // The XML bound is the tighter of the two and applies to the parts [`read_docx`] turns
+        // into nodes; `word/media` and anything else in there is bytes, and is held by what is
+        // left of the total alone.
+        let xml = archive
+            .name_for_index(at)
+            .is_some_and(|name| name.ends_with(".xml") || name.ends_with(".rels"));
+        let cap = if xml { left.min(part) } else { left };
+        let Ok(entry) = archive.by_index(at) else {
+            continue;
+        };
+        // One byte past what is allowed, so that reading it is the answer: an entry that fills
+        // `cap` exactly is an entry that fits.
+        let Ok(unpacked) = std::io::copy(&mut entry.take(cap + 1), &mut std::io::sink()) else {
+            continue;
+        };
+        // Which bound stopped it, and not merely which entry: an XML part that is under `part`
+        // and past what the entries before it left of the total is the total's doing, and
+        // saying otherwise would send a caller looking for a part that is not there.
+        if unpacked > cap {
+            return if xml && unpacked > part {
+                Verdict::PartTooLarge
+            } else {
+                Verdict::TooLarge
+            };
+        }
+        left -= unpacked;
+    }
+    Verdict::Yes
 }
 
 /// Whether the tail of `reader` holds the record a zip ends with. See [`EOCD`].
@@ -174,6 +323,15 @@ fn ends_with_a_directory(reader: &mut (impl std::io::Read + std::io::Seek)) -> b
     let mut tail = Vec::new();
     reader.take(TAIL).read_to_end(&mut tail).is_ok()
         && tail.windows(EOCD.len()).any(|bytes| bytes == EOCD)
+}
+
+/// A refusal about a document that is too large to read, in the words every other refusal
+/// here is written in: what the file is, and then what is the matter with it.
+fn too_large(said: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("this is a Word document and {said}"),
+    )
 }
 
 /// The file, from the top, all of it.
@@ -579,7 +737,7 @@ mod tests {
         assert!(read(&path, 1, 10).is_none());
     }
 
-    /// Deciding costs a peek, not the file. This is the property the whole of [`is_document`]
+    /// Deciding costs a peek, not the file. This is the property the whole of [`verdict`]
     /// is shaped by: it runs on every file the program is handed, ahead of the reader whose
     /// job is to hold a window and walk the rest, so a decision that read the bytes would be
     /// that bound undone by the module that runs first.
@@ -607,10 +765,13 @@ mod tests {
 
         let read = std::cell::Cell::new(0);
         let large = vec![b'x'; 8 << 20];
-        assert!(!is_document(Counted {
-            bytes: Cursor::new(large.clone()),
-            read: &read,
-        }));
+        assert!(matches!(
+            verdict(Counted {
+                bytes: Cursor::new(large.clone()),
+                read: &read,
+            }),
+            Verdict::No
+        ));
         assert!(
             read.get() <= ZIP.len(),
             "a file that is not a zip is answered out of its first bytes, and {} were read",
@@ -623,15 +784,123 @@ mod tests {
         let mut bytes = ZIP.to_vec();
         bytes.extend_from_slice(&large);
         read.set(0);
-        assert!(!is_document(Counted {
-            bytes: Cursor::new(bytes),
-            read: &read,
-        }));
+        assert!(matches!(
+            verdict(Counted {
+                bytes: Cursor::new(bytes),
+                read: &read,
+            }),
+            Verdict::No
+        ));
         assert!(
             read.get() <= ZIP.len() + TAIL as usize,
             "answering about a zip with no directory read {} of {}",
             read.get(),
             large.len()
         );
+    }
+    /// A body part that unpacks past the bound is a refusal about a Word document, not a
+    /// `None` that would have the text reader call it a zip — and not a read that finds out by
+    /// running out of memory. Deflated, because that is the shape of the thing: this fixture is
+    /// a third of a megabyte on disk and is refused for what it weighs unpacked.
+    #[test]
+    fn a_document_that_unpacks_past_the_bound_is_refused() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("bomb.docx");
+        std::fs::write(&path, archive(&[(BODY, MAX_PART_BYTES + 1)], None)).expect("a file");
+
+        let refusal = read(&path, 1, 10)
+            .expect("a Word document")
+            .expect_err("a refusal");
+        assert_eq!(refusal.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            refusal.to_string().contains("one part of it unpacks past"),
+            "refused for the wrong reason: {refusal}"
+        );
+    }
+
+    /// And it is refused when the archive says otherwise. The size in a zip's directory is a
+    /// number the file's author wrote, and nothing between there and `read_to_end` enforces
+    /// it, so believing it would be a bound that holds against honest files alone. This one
+    /// claims a hundred bytes.
+    #[test]
+    fn a_document_that_lies_about_its_size_is_refused_too() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("liar.docx");
+        std::fs::write(&path, archive(&[(BODY, MAX_PART_BYTES + 1)], Some(100))).expect("a file");
+
+        let refusal = read(&path, 1, 10)
+            .expect("a Word document")
+            .expect_err("a refusal");
+        assert!(
+            refusal.to_string().contains("unpacks past"),
+            "refused for the wrong reason: {refusal}"
+        );
+    }
+
+    /// The total is a bound of its own and not the largest part's: entries that are each small
+    /// enough and together are not are past it, and an entry that is not XML is held by it
+    /// alone. Both are asked of [`fits`] at bounds this can make files of — the constants are
+    /// megabytes, and a test that built a fixture of them would be paying for a number rather
+    /// than for what the walk does with it.
+    #[test]
+    fn the_bound_on_the_whole_archive_is_not_the_bound_on_one_part() {
+        let bytes = archive(&[(BODY, 8 << 10), ("word/media/a.png", 40 << 10)], None);
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes.clone())).expect("an archive");
+        // The image is past what is left of the total, and is not a part: the total is what
+        // stopped it, and the total is what is said.
+        assert!(matches!(
+            fits(&mut zip, 32 << 10, 16 << 10),
+            Verdict::TooLarge
+        ));
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes.clone())).expect("an archive");
+        // Room enough in the total for both, and the body alone past the part bound.
+        assert!(matches!(
+            fits(&mut zip, 1 << 20, 4 << 10),
+            Verdict::PartTooLarge
+        ));
+
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).expect("an archive");
+        assert!(matches!(fits(&mut zip, 1 << 20, 16 << 10), Verdict::Yes));
+    }
+
+    /// An archive of `entries`, each deflated and as many bytes unpacked as it says — and, if
+    /// `claims` is given, with the first entry's size overwritten in the central directory,
+    /// which is where a zip reader looks it up and where a file that means harm would put the
+    /// lie.
+    fn archive(entries: &[(&str, u64)], claims: Option<u32>) -> Vec<u8> {
+        use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, unpacked) in entries {
+            zip.start_file(
+                *name,
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated),
+            )
+            .expect("an entry");
+            // `<w:p/>` over and over: a part that is all elements and no text, which is the
+            // document that costs the most memory per byte unpacked.
+            let chunk = "<w:p/>".repeat(1 << 10);
+            let mut written = 0;
+            while written < *unpacked {
+                zip.write_all(chunk.as_bytes()).expect("the entry");
+                written += chunk.len() as u64;
+            }
+        }
+        let mut bytes = zip.finish().expect("an archive").into_inner();
+
+        if let Some(claims) = claims {
+            // The uncompressed size is the sixth field of a central directory file header, at a
+            // fixed offset from the signature that begins it.
+            const HEADER: &[u8] = b"PK\x01\x02";
+            const SIZE: usize = 24;
+            let at = bytes
+                .windows(HEADER.len())
+                .position(|bytes| bytes == HEADER)
+                .expect("a central directory");
+            bytes[at + SIZE..at + SIZE + 4].copy_from_slice(&claims.to_le_bytes());
+        }
+        bytes
     }
 }

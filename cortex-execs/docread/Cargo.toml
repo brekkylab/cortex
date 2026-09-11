@@ -74,10 +74,17 @@ docx-rs = { version = "0.4.22", optional = true }
 # kilobytes however large the archive is.
 #
 # It costs no dependency: `docx-rs` links this same crate to do its own unpacking, so the
-# version here is the one already in the build either way. `default-features = false` because
-# nothing is being decompressed — the entry *names* are stored uncompressed, which is the
-# whole reason the question is cheap.
-zip = { version = "8", optional = true, default-features = false }
+# version here is the one already in the build either way — `deflate-flate2` included, which
+# is why asking for it below adds nothing to compile. Asked for all the same: what depends on
+# it is ours (`docx::fits` unpacks the archive to find out how large it really is, the entry's
+# declared size being a number the file's author wrote), and a dependency that works because
+# another crate happens to turn a feature on is one that breaks when that crate stops.
+#
+# `default-features = false` because the rest is compression methods a `.docx` does not use
+# and a writer this only wants in its tests.
+zip = { version = "8", optional = true, default-features = false, features = [
+    "deflate-flate2",
+] }
 
 # The PDF engine's Rust side, and only its bindings: `static` is the feature that offers
 # `bind_to_statically_linked_library`, which is the whole point — no `dlopen`, no `.so` beside
