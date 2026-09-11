@@ -602,9 +602,14 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // The future below owns the child; dropping it on expiry kills the direct child.
-        // The group kill after it reaches whatever that child spawned.
+        // The future below owns the child; dropping it kills the direct child. The group
+        // kill before that drop reaches whatever that child spawned.
         .kill_on_drop(true);
+    // Its own process group, so a `killpg` here reaches everything the command started —
+    // `sh -c 'a & b'` leaves two children of its own — and so that the group is this
+    // command's alone. It also detaches the command from *this* server's group: a signal
+    // sent to the server's group (a Ctrl-C in the terminal that started it, say) no longer
+    // reaches spawned commands, and the `killpg` below never reaches the server.
     #[cfg(unix)]
     cmd.process_group(0);
 
@@ -636,16 +641,28 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
     let waited = match exec.timeout_ms {
         None => child.wait_with_output().await,
         Some(ms) => {
-            match tokio::time::timeout(Duration::from_millis(ms), child.wait_with_output()).await {
+            // Pinned on the stack and borrowed into `timeout`, rather than handed to it by
+            // value: on expiry `timeout` drops only the borrow, so the future — and the
+            // child it owns — is still alive, unkilled and unreaped, while `killpg` runs
+            // below. Handed over by value it would be dropped on expiry instead, killing
+            // and reaping the group leader first and leaving `killpg` aiming at a pid the
+            // kernel had already freed.
+            let mut wait = std::pin::pin!(child.wait_with_output());
+            match tokio::time::timeout(Duration::from_millis(ms), &mut wait).await {
                 Ok(output) => output,
                 Err(_elapsed) => {
-                    // The child went with the dropped future (`kill_on_drop`); this reaches
-                    // its descendants, which are in the group the spawn put it in.
+                    // Everything the command started is in the group the spawn put it in,
+                    // so one signal to the group ends all of it — the direct child
+                    // included, which is why nothing here relies on `kill_on_drop`
+                    // (dropping `wait` on the way out is only the reaping).
                     #[cfg(unix)]
                     if let Some(pid) = pid {
-                        // SAFETY: plain libc call on a pid we spawned; a stale pid is a
-                        // no-op (ESRCH), never a wrong target, because a group id is not
-                        // reused while any member lives.
+                        // SAFETY: a plain libc call, and `pid` is a group id this process
+                        // created (`process_group(0)`) whose leader is the child still
+                        // held alive by `wait` above — so it names this command's group
+                        // and no other. Were the leader already reaped, the id would be
+                        // free for the kernel to hand to someone else and this would be a
+                        // signal to strangers.
                         unsafe {
                             libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                         }
