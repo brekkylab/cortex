@@ -73,10 +73,9 @@
 //! What that would take is a shell kept alive across executions, which is a different
 //! backend rather than a line of code.
 //!
-//! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
-//! the `default_timeout_ms` to fall back on, and this server reads both and applies
-//! neither — so a command that never ends is a command this server waits on forever, and
-//! the client waits with it.
+//! `exec.timeout_ms` is enforced by a kill; `init` carries no default. An `exec` that
+//! names no timeout is therefore unbounded — a command that never ends is one this server
+//! waits on forever, and the client waits with it.
 
 use std::{
     ffi::OsString,
@@ -84,6 +83,7 @@ use std::{
     os::unix::process::ExitStatusExt as _,
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
+    time::Duration,
 };
 
 use cortex::console::{
@@ -584,6 +584,11 @@ fn at(root: Option<&Path>, path: &str) -> PathBuf {
 /// what comes back is how it ended. Nothing arrives on the channel in between, which is
 /// why this is a function of the request rather than something threaded through the
 /// server.
+///
+/// `timeout_ms` is a kill, as the protocol promises: the command runs in a process group
+/// of its own so that what a shell spawned goes with it, and expiry answers
+/// [`TIMED_OUT`](Error::TIMED_OUT) with nothing of the partial output — a killed command
+/// has no result to report. No timeout is no limit, and the wait is the whole command's.
 async fn execute(exec: &ExecCall, session: &Session) -> Response {
     let Some((program, args)) = exec.split() else {
         return Response::Error(refused(Error::INVALID_PARAMS, "an empty command"));
@@ -596,7 +601,12 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
         // back. Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // The future below owns the child; dropping it on expiry kills the direct child.
+        // The group kill after it reaches whatever that child spawned.
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     // Where the session stands, which is what makes a relative path in a command mean the
     // same thing as one in a `read` — and what a `cd` before this one moved.
@@ -617,11 +627,39 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
             ));
         }
     };
+    // Read before `wait_with_output` takes the child, which is the only other holder of it.
+    let pid = child.id();
 
     // `wait_with_output` is what keeps both pipes draining while the command runs: a
     // command that fills a pipe nobody is reading stops there, and neither of these is
     // read anywhere else.
-    finished(child.wait_with_output().await)
+    let waited = match exec.timeout_ms {
+        None => child.wait_with_output().await,
+        Some(ms) => {
+            match tokio::time::timeout(Duration::from_millis(ms), child.wait_with_output()).await {
+                Ok(output) => output,
+                Err(_elapsed) => {
+                    // The child went with the dropped future (`kill_on_drop`); this reaches
+                    // its descendants, which are in the group the spawn put it in.
+                    #[cfg(unix)]
+                    if let Some(pid) = pid {
+                        // SAFETY: plain libc call on a pid we spawned; a stale pid is a
+                        // no-op (ESRCH), never a wrong target, because a group id is not
+                        // reused while any member lives.
+                        unsafe {
+                            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                        }
+                    }
+                    return Response::Error(refused(
+                        Error::TIMED_OUT,
+                        format!("killed after {ms}ms"),
+                    ));
+                }
+            }
+        }
+    };
+
+    finished(waited)
 }
 
 /// The environment variables an execution is given, on top of the ones it inherits.
