@@ -374,7 +374,6 @@ async fn build_it(
     client: &mut dyn Client,
     rootfs: &mut Rootfs,
     plan: &crate::rootfs::Plan,
-    network: Option<NetworkAccess>,
 ) -> anyhow::Result<()> {
     let answered = client
         .init(InitCall {
@@ -386,13 +385,23 @@ async fn build_it(
             artifacts: None,
             scratch: None,
             image: Some(plan.base.clone()),
-            // What the session asked for, and the internet when it asked for nothing. A
-            // session that said nothing gets the server's own default, which is the host and
-            // no further — and a build's first step is almost always a fetch, so that
-            // default would fail nearly every build at a refused connection. A session that
-            // *did* say is taken at its word: a caller who sandboxed the session meant the
-            // build too, and has no second knob here to contradict it with.
-            network: network.or_else(|| Some(NetworkAccess::public())),
+            // The internet, whatever the session asked for. A build's first step is
+            // almost always a fetch — the server's own default is the host and no
+            // further, which would fail nearly every recipe at a refused connection —
+            // and, unlike the session, this is not something the caller opened. A caller
+            // asks for a *session*; how the image that session runs on gets made is
+            // cortex's, and it is made the same way whatever the session may reach.
+            //
+            // The reach ends with the build. The session's own `init` follows this one
+            // and carries [`ConsoleBuilder::network`], so a recipe that fetched what the
+            // image is made of does not leave a session that can fetch anything.
+            //
+            // The thing this gives up: a caller cannot ask for a build that reaches
+            // nothing, and a caller who asked the session for more than `public` — a
+            // [`full`](NetworkAccess::full) reach, or host ports for a mirror on this
+            // machine — does not get it here. Neither has come up; both are a knob on
+            // the recipe when one does.
+            network: Some(NetworkAccess::public()),
             committable: true,
         })
         .await?;
@@ -595,7 +604,7 @@ impl Console {
             (&answered, &plan, rootfs.as_mut())
             && refusal.code == Error::UNKNOWN_IMAGE
         {
-            build_it(&mut *client, rootfs, plan, network.clone()).await?;
+            build_it(&mut *client, rootfs, plan).await?;
             answered = client.init(session).await;
         }
         let answered = answered?;

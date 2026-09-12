@@ -809,11 +809,17 @@ mod tests {
         assert_eq!(commit.working_dir.as_deref(), Some("/srv"));
     }
 
-    /// A session that asked for a reach gets it, and so does the build under it. The
-    /// internet is the default, not a floor: a caller who sandboxed the session meant the
-    /// build too, and there is no second knob on the recipe to contradict it with.
+    /// A sandboxed session does not sandbox the build under it.
+    ///
+    /// The two are not the same question. A caller asks for a *session* — what its
+    /// commands may reach — and how the image those commands run on gets made is cortex's
+    /// own business: a recipe is fetched whatever the session that asked for it may do,
+    /// because a build that cannot resolve a name cannot install anything.
+    ///
+    /// What matters is that it does not leak. The build's reach is the build's; the
+    /// session's own `init` follows it carrying what the caller actually asked for.
     #[tokio::test]
-    async fn a_build_reaches_what_its_session_asked_for() {
+    async fn a_build_reaches_the_internet_and_the_session_it_was_for_still_does_not() {
         let context = tempfile::tempdir().unwrap();
         let (builder, log) = answering(vec![
             unknown_image(),
@@ -828,7 +834,7 @@ mod tests {
             .rootfs(
                 Rootfs::from_image("alpine")
                     .context(context.path().to_path_buf())
-                    .run("true"),
+                    .run("apk add --no-cache python3"),
             )
             .build()
             .await
@@ -843,10 +849,12 @@ mod tests {
                     .unwrap_or_default()
             })
             .collect();
+        // The first `init` is the one that found no image, the second is the build's, and
+        // the third is the session the caller asked for.
         assert_eq!(
             reaches,
-            ["none", "none", "none"],
-            "the build did not get the reach its session asked for"
+            ["none", "public", "none"],
+            "the build and the session did not each get their own reach"
         );
     }
 
