@@ -285,9 +285,10 @@ fn greet(outgoing: &mut std::fs::File) -> io::Result<()> {
 struct Session {
     /// The tree the session works in, as `init` named it — and as it is mounted in here.
     ///
-    /// The same path on both sides of the hypervisor: the boot shares the host's directory
-    /// at its own path, so what the client was told and what this end opens are one string.
-    /// See `crate::init::share`.
+    /// One string, because the `init` this end hears is the console server's replay and
+    /// names the tree by the guest's own mount point rather than by the host directory
+    /// behind it. So what the client was told, what that replay says, and what this end
+    /// opens are all `/context`. See `crate::init::share`.
     context: Option<PathBuf>,
 
     /// Where the session leaves what it produces, mounted in here on the same terms.

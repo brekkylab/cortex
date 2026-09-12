@@ -36,12 +36,15 @@
 //! and mounted on the host before this process started, so nothing in here knows or asks:
 //! it attaches a path.
 //!
-//! Where it lands in the guest is **that same path**, and that is the one decision worth
-//! reading here. A constant of our own (`/workspace`, say) would mean a directory has two
-//! names, one per side of the hypervisor, and every path crossing between them would have
-//! to be rewritten — a `cwd` on the way out, a `read` on the way in, an argv nobody could
-//! rewrite safely. Mounting it where the host already has it makes the two spellings one
-//! string, and the translation problem does not exist.
+//! Where it lands in the guest is **a constant per role** — `/context`, `/artifacts`,
+//! `/scratch`, see [`CONTEXT_PATH`](cortex_uvm_boot::CONTEXT_PATH) — and that is the one
+//! decision worth reading here. A directory therefore has two names, one per side of the
+//! hypervisor, and nothing translates between them because nothing has to: the protocol
+//! speaks the guest's name and only that one. The console server answers `init` with it
+//! without asking anything, the guest stands in it and reports it, and a path arriving on a
+//! `read` is already spelled the way the guest has it. The host's own name for the directory
+//! belongs to whatever mounted it, which never needed the guest to tell it where its own
+//! files are.
 //!
 //! # Networking
 //!
@@ -63,10 +66,10 @@ use std::{
 use msb_krun::{DiskImageFormat, VmBuilder};
 
 use cortex_uvm_boot::{
-    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_TAG, BaseFormat, BootArgs, COMMIT_ENV, COMMIT_PATH,
-    COMMIT_TAG, COMMITTABLE_ENV, CONTEXT_ENV, CONTEXT_TAG, GUEST_ABIN_DEV, GUEST_BIN_PATH,
-    GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network, PORT_NAME, SCRATCH_ENV, SCRATCH_TAG,
-    UPPER_ENV,
+    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, COMMIT_ENV,
+    COMMIT_PATH, COMMIT_TAG, COMMITTABLE_ENV, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG,
+    GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
+    PORT_NAME, SCRATCH_ENV, SCRATCH_PATH, SCRATCH_TAG, UPPER_ENV,
 };
 
 /// Guest vCPUs when nothing says otherwise. Two rather than one because a command and the
@@ -141,29 +144,35 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // work: this process has no opinion about what a tree is for, and the guest is told which
     // is which by the name it arrives under.
     let mut shares: Vec<(&str, String)> = Vec::new();
-    for (flag, env, tag, path) in [
+    for (flag, env, tag, at, path) in [
         (
             "--context",
             CONTEXT_ENV,
             CONTEXT_TAG,
+            CONTEXT_PATH,
             args.context.as_deref(),
         ),
         (
             "--artifacts",
             ARTIFACTS_ENV,
             ARTIFACTS_TAG,
+            ARTIFACTS_PATH,
             args.artifacts.as_deref(),
         ),
         (
             "--scratch",
             SCRATCH_ENV,
             SCRATCH_TAG,
+            SCRATCH_PATH,
             args.scratch.as_deref(),
         ),
     ] {
         if let Some(path) = shared(flag, path)? {
+            // The host's path names the device and the guest's names the mount point: the
+            // first is the directory to serve out of this process, and the second is what
+            // the tree is called on the other side of the hypervisor.
             builder = builder.fs(|fs| fs.tag(tag).path(&path));
-            shares.push((env, format!("{tag}:{path}")));
+            shares.push((env, format!("{tag}:{at}")));
         }
     }
 

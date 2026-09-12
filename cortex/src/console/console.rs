@@ -178,8 +178,9 @@ impl ConsoleBuilder {
     /// kernel is a build's business, and this is the whole of what the server is then told
     /// about it: [`build`](Self::build) names this mount point as the session's context —
     /// `file://` and the path — and the server answers where *it* plugged that in. The two
-    /// are usually the same path and nothing requires them to be, which is why the answer
-    /// is read rather than assumed; see [`TreeMount`](crate::console::TreeMount).
+    /// need not be the same path, and on a server that runs commands in a kernel of its own
+    /// they are not: what comes back is a path in there. Which is why the answer is read
+    /// rather than assumed; see [`TreeMount`](crate::console::TreeMount).
     ///
     /// Takes the mount by value, so a console holds it and the tree is there for at least as
     /// long as the session is (see [`Mount`]). A caller that needs it elsewhere as well hands
@@ -465,8 +466,9 @@ struct Tree {
     ///
     /// **The paths this protocol speaks are these.** A [`read`](Console::read) names a file
     /// under one, and so does a [`write`](Console::write). It is the server's answer and not
-    /// the mount point above: the two are usually the same directory, and nothing requires
-    /// them to be.
+    /// the mount point above: a host-local server answers the mount point itself, and one
+    /// with a guest answers where the tree is *in the guest*, which is not a path this host
+    /// has at all.
     ///
     /// Where the session *stands* is not here and is not kept anywhere on this side: the
     /// current directory is the far end's state machine, `init` says where it starts, and
@@ -612,9 +614,10 @@ impl Console {
     /// is relative to — `None` when nothing is mounted.
     ///
     /// A caller builds a [`read`](Self::read) or a [`write`](Self::write) path by joining
-    /// onto this. It is the server's answer and not the mount point this end passed in: the
-    /// two are usually the same directory, and which one the protocol speaks in is settled
-    /// rather than assumed.
+    /// onto this, and reaches the same files on this host by joining onto the mount point it
+    /// handed over instead. The two are not required to be the same directory and on a
+    /// server with a guest they are not — which is why the protocol settles which one it
+    /// speaks in rather than leaving it assumed.
     pub fn context_path(&self) -> Option<&Path> {
         self.context.as_ref().map(|tree| tree.path.as_path())
     }
@@ -1199,8 +1202,9 @@ mod tests {
     /// answer — which is the path every later call in the session is spelled in, and not
     /// the mount point that was sent.
     ///
-    /// The two are usually the same directory. They are different here so that the
-    /// difference is visible at all: what a caller joins onto is what came back.
+    /// The two need not be the same directory — a server with a guest of its own answers a
+    /// path in there — so they are different here, to make visible which of them a caller
+    /// joins onto: what came back.
     #[tokio::test]
     async fn a_console_names_its_mount_and_reads_back_where_it_went() {
         let (client, log) = recorder(vec![initialized_at(Path::new("/srv/served"))]);

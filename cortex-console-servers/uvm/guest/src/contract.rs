@@ -51,8 +51,12 @@ pub const LOWER_ENV: &str = "CORTEX_UVM_LOWER";
 /// The writable session image, as a guest block device — the overlay's upper.
 pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 
-/// The workspace share, as `tag:/guest/path`. Absent for a session with no workspace,
-/// which is a session.
+/// The context share, as `tag:/guest/path`. Absent for a session with no context, which is
+/// a session.
+///
+/// The path half is where this guest mounts it and is the boot's to choose — one constant per
+/// role rather than the host's own name for the directory, so a session looks the same from
+/// in here whichever machine and whichever directory it was given.
 pub const CONTEXT_ENV: &str = "CORTEX_UVM_CONTEXT";
 
 /// Where the session leaves what it produces, spelled the same way. Absent for a session

@@ -13,6 +13,9 @@ path = "src/lib.rs"
 
 [build-dependencies]
 anyhow = { workspace = true }
+# Only to learn where `libfuse-t.dylib` lives, so the binary can carry an rpath to it.
+# See `build.rs` for why nothing else can supply that.
+pkg-config = { workspace = true }
 
 [dependencies]
 anyhow = { workspace = true }

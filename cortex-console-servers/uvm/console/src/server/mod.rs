@@ -36,13 +36,14 @@
 //!   [replayed](Session::booted) into whichever guest comes up next. A second `init`
 //!   therefore releases the guest booted under the first, which is exactly what the
 //!   protocol says it does.
-//! - **The trees.** A `file://` context is a directory on *this* host, and it is shared into
-//!   the guest at that same path — see [`boot`](crate::boot). So are the artifacts and
-//!   scratch trees, by the same mechanism and for the same reason. So the paths this end
-//!   answers are paths the guest has, and everything after `init` relays untouched: a `cwd`
-//!   the agent reports is already a name the client can open, and a `read`'s path is
-//!   already one the guest can. **Nothing here translates a path**, and that is the whole
-//!   reason a share lands where it does.
+//! - **The trees.** A `file://` tree is a directory on *this* host, and it is shared into the
+//!   guest at the constant for its role — `/context`, `/artifacts`, `/scratch`, see
+//!   [`CONTEXT_PATH`](crate::contract::CONTEXT_PATH). So the paths this end answers are those
+//!   three strings and not this host's, and the replayed `init` names them too — which is
+//!   what makes everything after it relay untouched: a `cwd` the agent reports is already
+//!   what the client was told at `init`, and a `read`'s path is already one the guest can
+//!   resolve. **Nothing here translates a path.** The host's own name for a directory is the
+//!   caller's, who mounted it and never needed this protocol to say where it is.
 //! - **Releasing.** `stop` drops the guest, which kills the VMM and deletes the image it
 //!   was writing. `quit` ends the process, and the guest goes with it.
 //!
@@ -65,7 +66,10 @@ use cortex::console::{
 use cortex_uvm_console::built::{self, LOCAL_HOST};
 use microsandbox_image::Reference;
 
-use crate::{assets, contract::Network};
+use crate::{
+    assets,
+    contract::{ARTIFACTS_PATH, CONTEXT_PATH, Network, SCRATCH_PATH},
+};
 use guest::Guest;
 
 /// The id the replayed `init` goes out under.
@@ -251,18 +255,18 @@ impl Session {
         self.config = config;
 
         Ok(InitResp {
-            context: self.context.as_deref().map(placed),
-            artifacts: self.artifacts.as_deref().map(placed),
-            scratch: self.scratch.as_deref().map(placed),
+            // Where the guest will have them, which is a constant per role rather than
+            // anything about the host directory behind it — see `CONTEXT_PATH`. Answerable
+            // before a guest exists for the same reason it is answerable at all: the boot
+            // does not choose it.
+            context: self.context.as_ref().map(|_| placed(CONTEXT_PATH)),
+            artifacts: self.artifacts.as_ref().map(|_| placed(ARTIFACTS_PATH)),
+            scratch: self.scratch.as_ref().map(|_| placed(SCRATCH_PATH)),
             // Where a session starts is its scratch, its context when it has no scratch, and
             // `/` when it named neither — which is what `init::prepare` puts the agent in.
             // Either way this is the same answer the agent will give when the session is
             // replayed into it, because both ends work it out the same way. See `home`.
-            cwd: Some(
-                self.home()
-                    .map(|at| at.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "/".to_string()),
-            ),
+            cwd: Some(self.home().unwrap_or("/").to_string()),
             // The base in force, in this server's spelling of it — which is the registry a
             // bare reference turned out to name, and the one thing about it the client could
             // not have worked out. `None` is a session running on the pinned rootfs, which is
@@ -281,15 +285,19 @@ impl Session {
         self.guest = None;
     }
 
-    /// Where a session with this shape starts — `None` for one that named no tree.
+    /// Where a session with this shape starts, as the guest will spell it — `None` for one
+    /// that named no tree.
     ///
     /// **The scratch before the context.** A session stands somewhere before it is told
     /// anything and every relative path a command writes lands there, so standing in the
     /// context would make the tree the client gave the session the default destination for
     /// everything it produces. Worked out here *and* in the guest, by the same rule, because
     /// this end answers `init` before there is a guest to ask — see `configure`.
-    fn home(&self) -> Option<&Path> {
-        self.scratch.as_deref().or(self.context.as_deref())
+    fn home(&self) -> Option<&'static str> {
+        self.scratch
+            .as_ref()
+            .map(|_| SCRATCH_PATH)
+            .or_else(|| self.context.as_ref().map(|_| CONTEXT_PATH))
     }
 
     /// Every tree this session named, with what to call each in a failure.
@@ -352,13 +360,19 @@ impl Session {
             .await
             .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
 
-            // The trees **do** go in the replay, and they are the same URLs the client sent:
-            // the guest mounted those host directories at those host paths, so what the agent
-            // is told is true on its side too. Nothing secret is in them — a `file://` URL is
-            // a directory this host already has, and whatever it took to build that tree
-            // stayed on this side of the boundary.
+            // The trees **do** go in the replay, and they are named as the guest has them
+            // rather than as the client sent them: the agent is being told which tree is
+            // which and where it stands, and the answer to both is a path on its own side.
+            // The host directory behind each is this end's business and stops here, which is
+            // also why nothing about a caller's filesystem crosses the boundary.
+            let replayed = InitCall {
+                context: self.context.as_ref().map(|_| named(CONTEXT_PATH)),
+                artifacts: self.artifacts.as_ref().map(|_| named(ARTIFACTS_PATH)),
+                scratch: self.scratch.as_ref().map(|_| named(SCRATCH_PATH)),
+                ..self.config.clone()
+            };
             let outcome = guest
-                .relay(REPLAYED_INIT, Call::Init(self.config.clone()))
+                .relay(REPLAYED_INIT, Call::Init(replayed))
                 .await
                 .map_err(|e| refused(Error::BOOT_FAILED, format!("announcing the session: {e}")))?;
             if let Some(error) = outcome.error() {
@@ -615,10 +629,20 @@ fn tree(named: Option<&TreeSource>, role: TreeRole) -> Result<Option<PathBuf>, E
 }
 
 /// Where a tree went, as the protocol carries it.
-fn placed(at: &Path) -> TreeMount {
+fn placed(at: &str) -> TreeMount {
     TreeMount {
-        path: at.to_string_lossy().into_owned(),
+        path: at.to_string(),
     }
+}
+
+/// A guest mount point, as the `init` replay names a tree by it.
+///
+/// `file://` because that is what the tree *is* on the side being told: a directory the agent
+/// can open, which is the one scheme every backend realizes without a provider. What made it
+/// one is on this side and does not travel — the agent is not being told where the tree came
+/// from, only where it is.
+fn named(at: &str) -> TreeSource {
+    TreeSource::new(format!("file://{at}"))
 }
 
 /// A refusal, as the `error` a response carries instead of a result.

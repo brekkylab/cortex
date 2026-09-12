@@ -260,8 +260,12 @@ A `read` names a file under it, and so does a `write`.
 Nothing is workspace-relative and nothing is rewritten in flight.
 
 That is the trade this member exists to make. Two ends realizing one description separately is the other way to have a name mean one file, and it costs a tree on each side and a translation on every path that crosses — to reconstruct something one end already has.
-So the server realizes it once and says where, and what it costs instead is that the client has to be able to open what the server opened.
-A backend whose commands run somewhere else — a guest, a container — answers a path on *this* side of that boundary, and then either translates behind it or arranges that there is nothing to translate. `cortex-uvm-console` does the second: it shares the host's directory into the guest at the host's own path, so a path a command in the guest prints is already a name the client can open.
+So the server realizes it once and says where, and what it costs instead is that a path in this protocol is a name in the *server's* namespace and not always one in the client's.
+A backend whose commands run somewhere else — a guest, a container — answers a path on the far side of that boundary and relays every later path untouched. `cortex-uvm-console` mounts each tree at a constant for its role (`/context`, `/artifacts`, `/scratch`) and answers that, so a `pwd` a command prints, a path a `read` carries and what the client was told at `init` are one string, and nothing anywhere rewrites a path.
+
+A client that also wants to reach those files *itself* already can, and not through this answer: it mounted the tree, so it has its own name for the same directory — the mount point it sent.
+The two names never have to meet, because only one of them is ever in a frame.
+This is what [`Console`](console.rs) keeps apart by holding both: the mount it was handed, and the path the server answered.
 
 **One spelling, and it is this one.**
 Every path that comes out of a session afterwards has to be spelled the way this answer is, because the client's only way to relate one to the other is the characters — including what a command's own `pwd` prints, which is a path a client will turn around and send back in a `read`.

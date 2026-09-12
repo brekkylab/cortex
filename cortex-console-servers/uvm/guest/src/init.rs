@@ -312,8 +312,11 @@ fn pivot(new_root: &str) -> anyhow::Result<()> {
 /// mounted where — is cortex's business on the host side, and arrives here already
 /// assembled into one tree.
 ///
-/// The mountpoint is the host's own path for it, which is what makes a `cwd` this end
-/// reports a name the client can open — see [`contract`](crate::contract).
+/// The mountpoint is the boot's constant for that tree's role — `/context`, `/artifacts`,
+/// `/scratch` — and not the host's own path for the directory behind it. So a `cwd` this end
+/// reports is a name the client was already told at `init` and can send straight back, and
+/// nothing in here is named after the machine the session was started from. See
+/// [`contract`](crate::contract).
 ///
 /// `flags` is what separates the three: they are otherwise the same mount, and the only one
 /// that differs is the context, which goes up [`MS_RDONLY`](libc::MS_RDONLY) — see the caller

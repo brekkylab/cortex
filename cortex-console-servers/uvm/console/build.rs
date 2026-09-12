@@ -41,6 +41,11 @@
 //! A build without it fails here with that line in the message, rather than later with a
 //! guest that will not start. `CORTEX_UVM_GUEST_BIN` and `CORTEX_UVM_BOOT_BIN` short-circuit
 //! either half and embed the file they name, for a caller who builds one some other way.
+//!
+//! # The FUSE-T rpath
+//!
+//! One more thing this leaves in the binary, and nothing to do with the two halves above:
+//! an `LC_RPATH` for `libfuse-t.dylib`. See [`fuse_t_rpath`].
 
 use std::{
     path::{Path, PathBuf},
@@ -48,9 +53,46 @@ use std::{
 };
 
 fn main() -> anyhow::Result<()> {
+    println!("cargo::rerun-if-changed=build.rs");
+    fuse_t_rpath();
     guest()?;
     boot()?;
     Ok(())
+}
+
+/// Give this binary an `LC_RPATH` for FUSE-T, which nothing else can.
+///
+/// `libfuse-t.dylib`'s install name is `@rpath/libfuse-t.dylib`, so anything linking it needs
+/// an rpath saying where that is. This binary links it without ever asking to: `cortex/fuse-t`
+/// is a feature of a *dependency*, and a workspace build that enables it anywhere — `cargo
+/// build --all-features`, a sibling member, a test — unifies it into the cortex this links.
+/// Three things then conspire to leave the rpath to this file:
+///
+/// - `fuse-t.pc` asks for it (`-Wl,-rpath,/usr/local/lib` in `Libs:`), but the `pkg_config`
+///   crate forwards only `-L` and `-l` and drops the rest.
+/// - Cargo scopes a build script's `rustc-link-arg` to its own package's targets, so
+///   `cortex`'s build script cannot supply it for this binary.
+/// - `DYLD_FALLBACK_LIBRARY_PATH` would paper over it, and cannot be relied on: macOS strips
+///   every `DYLD_*` variable when it executes a system binary, so anything reached through
+///   `/bin/sh` loses it.
+///
+/// Without it the binary aborts in dyld before it reaches `main` — `Library not loaded:
+/// @rpath/libfuse-t.dylib … no LC_RPATH's found` — and a caller sees a console server that
+/// closed the channel before answering anything.
+///
+/// Unconditional, because the feature that decides whether the dylib is linked is not this
+/// crate's to read. A probe that finds nothing is a host without FUSE-T, where `cortex/fuse-t`
+/// cannot have been built either and no rpath is wanted; a probe that finds it on a build that
+/// did not link the dylib leaves one unused load command, which costs nothing.
+fn fuse_t_rpath() {
+    // Metadata off: this asks *where* FUSE-T is, not to link it. `probe` would otherwise
+    // print the `-l fuse-t` that pulls the dylib into a binary that had no reason to carry it.
+    let Ok(fuse_t) = pkg_config::Config::new().cargo_metadata(false).probe("fuse-t") else {
+        return;
+    };
+    for path in &fuse_t.link_paths {
+        println!("cargo::rustc-link-arg-bins=-Wl,-rpath,{}", path.display());
+    }
 }
 
 /// Cross-compile the guest half and leave it in `OUT_DIR`.

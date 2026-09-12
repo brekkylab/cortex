@@ -113,8 +113,8 @@ impl Fixture {
     /// A fixture whose session works in `root`, which is a directory on this host.
     ///
     /// Over the channel and not through the server's environment: what a client says is a
-    /// tree it has, and the server answers where it put it. Here the answer is the same
-    /// path, because a `file://` tree is shared into the guest where the host has it.
+    /// tree it has, and the server answers where it put it — which here is `/context`, the
+    /// guest's name for that role, and not the host path this was handed.
     async fn with_tree(root: &Path) -> Fixture {
         let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
         server.stderr(Stdio::inherit());
@@ -124,6 +124,27 @@ impl Fixture {
         let console = Console::builder()
             .client(client)
             .context(root.to_path_buf())
+            .build()
+            .await
+            .expect("building the console");
+
+        Fixture { console }
+    }
+
+    /// A fixture whose one tree is a **scratch**, standing in `root`.
+    ///
+    /// What it buys is a tree the session may write in: the context is mounted read-only, so
+    /// a session given only that one has nowhere to put a file — which is what the tree means
+    /// rather than something to work around here.
+    async fn with_scratch(root: &Path) -> Fixture {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client =
+            cortex::console::stdio::StdioClient::new(server).expect("starting the console server");
+
+        let console = Console::builder()
+            .client(client)
+            .scratch(root.to_path_buf())
             .build()
             .await
             .expect("building the console");
@@ -255,24 +276,23 @@ async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
 
     let mut fx = Fixture::with_trees(&context, &artifacts, &scratch).await;
 
-    // Each tree is where the client named it, on both sides of the hypervisor.
-    assert_eq!(fx.console.context_path(), Some(context.as_path()));
-    assert_eq!(fx.console.artifacts_path(), Some(artifacts.as_path()));
-    assert_eq!(fx.console.scratch_path(), Some(scratch.as_path()));
+    // Each tree is answered by the guest's name for its role, which is what the client
+    // sends paths in from here on. The host directory behind each stays the caller's own —
+    // it is the mount point this test handed over, and nothing in the guest is named after
+    // it.
+    assert_eq!(fx.console.context_path(), Some(Path::new("/context")));
+    assert_eq!(fx.console.artifacts_path(), Some(Path::new("/artifacts")));
+    assert_eq!(fx.console.scratch_path(), Some(Path::new("/scratch")));
 
     // The guest stands in the scratch, which nothing on the `exec` frame said.
     assert_eq!(
         String::from_utf8_lossy(&fx.output("pwd").await.stdout).trim_end(),
-        scratch.to_str().unwrap()
+        "/scratch"
     );
 
-    // The context is readable at the path the client knows it by...
+    // The context is readable at the path the client was told it is at...
     assert_eq!(
-        String::from_utf8_lossy(
-            &fx.output(&format!("cat {}/given.txt", context.display()))
-                .await
-                .stdout
-        ),
+        String::from_utf8_lossy(&fx.output("cat /context/given.txt").await.stdout),
         "from the client\n"
     );
 
@@ -285,8 +305,7 @@ async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
 
     // ...and what the session leaves in the artifacts tree is on this host, which is the
     // whole reason for the tree: the client collects it without a `read`.
-    fx.output(&format!("echo kept > {}/report.txt", artifacts.display()))
-        .await;
+    fx.output("echo kept > /artifacts/report.txt").await;
     assert_eq!(
         std::fs::read_to_string(artifacts.join("report.txt")).unwrap(),
         "kept\n"
@@ -295,9 +314,7 @@ async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
     // The context is read-only, and here that is the guest kernel's answer rather than a
     // rule the protocol applies: the share went up `MS_RDONLY`, so the command's own
     // redirection fails and the client's project is as it was.
-    let refused = fx
-        .output(&format!("echo edited > {}/given.txt", context.display()))
-        .await;
+    let refused = fx.output("echo edited > /context/given.txt").await;
     assert_ne!(refused.code, 0, "a command wrote into a read-only context");
     assert_eq!(
         std::fs::read_to_string(context.join("given.txt")).unwrap(),
@@ -310,11 +327,7 @@ async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
     // where there is no mount to be read-only and the server checks the path itself.
     let refused = fx
         .console
-        .write(
-            context.join("given.txt").to_str().unwrap(),
-            &b"edited"[..],
-            None,
-        )
+        .write("/context/given.txt", &b"edited"[..], None)
         .await
         .expect_err("writing into the context");
     assert_eq!(refused.code(), Some(cortex::console::Error::IO_FAILED));
@@ -802,36 +815,44 @@ async fn a_client_asks_for_its_reach_over_the_channel() {
     );
 }
 
-/// A tree the host has, in front of a guest — **at the same path on both sides**.
+/// A tree the host has, in front of a guest — **named by its role on the guest's side**.
 ///
 /// Which is the whole of what makes this backend usable through the protocol: the client is
 /// told where the tree is, the guest stands in a directory of that name, and neither end
-/// rewrites a path to talk to the other. A constant of this crate's choosing would have made
-/// every path crossing the boundary two paths.
+/// rewrites a path to talk to the other. The two names for one directory never meet, because
+/// only one of them is ever in a frame — the host's own is the caller's mount point, which is
+/// what this test uses to check the bytes and never sends.
+///
+/// Over a scratch, because half of what this asserts is writing: the context is read-only,
+/// and a session given only one has no tree the protocol will write in.
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
-async fn a_tree_is_the_same_path_on_both_sides() {
+async fn a_tree_is_named_by_its_role_on_the_guests_side() {
     let dir = tempfile::tempdir().expect("a temp directory");
     let root = dir.path().canonicalize().expect("a real directory");
     std::fs::write(root.join("from-the-host"), b"hello from the host\n")
         .expect("writing a file for the guest to read");
 
-    let mut fx = Fixture::with_tree(&root).await;
+    let mut fx = Fixture::with_scratch(&root).await;
 
-    // What the server answered is the path this host has, and the session stands in it.
-    assert_eq!(fx.console.context_path(), Some(root.as_path()));
+    // What the server answered is the guest's name for the role, and the session stands in
+    // it — the host's own path for the same directory is not in the answer at all.
+    assert_eq!(fx.console.scratch_path(), Some(Path::new("/scratch")));
     assert_eq!(
         fx.output("pwd").await.stdout,
-        format!("{}\n", root.display()).into_bytes(),
-        "the guest stands where the host says the tree is"
+        b"/scratch\n",
+        "the guest stands in the tree it was given, by the name it has for it"
+    );
+    assert_ne!(
+        root.to_str(),
+        Some("/scratch"),
+        "the host path and the guest path are different strings, which is the point"
     );
 
-    // The guest reads what the host wrote, by the name the host would use and by a
-    // relative one from where it stands.
+    // The guest reads what the host wrote, by the name it was told and by a relative one
+    // from where it stands.
     assert_eq!(
-        fx.output(&format!("cat {}/from-the-host", root.display()))
-            .await
-            .stdout,
+        fx.output("cat /scratch/from-the-host").await.stdout,
         b"hello from the host\n"
     );
     assert_eq!(
@@ -850,9 +871,7 @@ async fn a_tree_is_the_same_path_on_both_sides() {
 
     // And the file plane names what a command names, through the same path.
     assert_eq!(
-        fx.read(root.join("from-the-guest").to_str().unwrap())
-            .await
-            .data,
+        fx.read("/scratch/from-the-guest").await.data,
         b"hello from the guest\n"
     );
 
@@ -868,10 +887,7 @@ async fn a_tree_is_the_same_path_on_both_sides() {
             .code,
         0
     );
-    assert_eq!(
-        fx.output("pwd").await.stdout,
-        format!("{}\n", root.join("work").display()).into_bytes()
-    );
+    assert_eq!(fx.output("pwd").await.stdout, b"/scratch/work\n");
 }
 
 /// A console server that is killed outright takes its guest with it.

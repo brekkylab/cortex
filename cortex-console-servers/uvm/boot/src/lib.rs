@@ -14,10 +14,11 @@
 //!   file** — that crate is built for a different target and takes nothing it does not need,
 //!   so the compiler will not notice a mismatch.
 //!
-//! Where a tree lands inside the guest is **the host's own path for it**, carried in that
-//! tree's env like any other share. Not a constant of this crate's choosing: one spelling on
-//! both sides of the hypervisor is what lets a `cwd` the guest reports be a path the client
-//! can open, with nothing in the middle translating and nothing to disagree about.
+//! Where a tree lands inside the guest is **this crate's constant for it** —
+//! [`CONTEXT_PATH`], [`ARTIFACTS_PATH`], [`SCRATCH_PATH`] — carried in that tree's env
+//! alongside the tag. One name per role, the same in every session, so what a guest reports
+//! and what a client sends are the same three strings no matter which host directory is
+//! behind them.
 //!
 //! Three of them, one per tree a session can name, and three envs rather than one list
 //! because the guest does something different with one of them: it **stands** in the scratch.
@@ -75,7 +76,8 @@ pub const LOWER_ENV: &str = "CORTEX_UVM_LOWER";
 /// Told to the guest as `CORTEX_UVM_UPPER`.
 pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 
-/// Told to the guest as `CORTEX_UVM_CONTEXT`, spelled `tag:/guest/path`.
+/// Told to the guest as `CORTEX_UVM_CONTEXT`, spelled `tag:/guest/path` — the tag is
+/// [`CONTEXT_TAG`] and the path is [`CONTEXT_PATH`].
 pub const CONTEXT_ENV: &str = "CORTEX_UVM_CONTEXT";
 
 /// The artifacts tree, spelled the same way. Absent for a session that named none.
@@ -83,6 +85,40 @@ pub const ARTIFACTS_ENV: &str = "CORTEX_UVM_ARTIFACTS";
 
 /// The scratch tree, spelled the same way, and **where the guest stands** when there is one.
 pub const SCRATCH_ENV: &str = "CORTEX_UVM_SCRATCH";
+
+/// Where the context is mounted inside the guest.
+///
+/// **A name for the role and not for the directory behind it.** What a session is given is a
+/// directory somewhere on the host, and what it is *called* in here says which of the three
+/// trees it is — so a command reads `/context/src/main.rs` and a client sends the same
+/// string, in a session that would have spelled it `/Users/someone/project/src/main.rs` on
+/// the other side of the hypervisor and in another one that would have spelled it `/srv/wt/9`.
+///
+/// Three consequences, and all three are the reason:
+///
+/// - **A guest's paths do not name the host.** Where a caller keeps its projects is that
+///   caller's, and a path is the easiest thing in the world to leak — into a command's
+///   output, a log, a build artifact, a model's transcript.
+/// - **Two sessions over different directories are the same session to look at**, which is
+///   what makes a transcript comparable and a command reproducible.
+/// - **The guest's root stays a root.** Mounting at the host's own path means a guest with
+///   `/Users/someone/project` in it, which is a directory tree invented inside an image to
+///   mirror a stranger's laptop.
+///
+/// What it costs is that a mount point has two names, one per side — and nothing has to
+/// translate between them, because the protocol only ever speaks this one. The host answers
+/// `init` with it, the replayed `init` names it, the guest stands in it and reports it, and a
+/// `read`'s path arrives already spelled the way the guest has it. The other name is the
+/// caller's own [`Mount`](https://docs.rs/cortex/latest/cortex/fs/trait.Mount.html), which is
+/// the thing that put the directory there and never needed the protocol to tell it where.
+pub const CONTEXT_PATH: &str = "/context";
+
+/// Where the artifacts tree is mounted inside the guest — see [`CONTEXT_PATH`].
+pub const ARTIFACTS_PATH: &str = "/artifacts";
+
+/// Where the scratch tree is mounted inside the guest, and where a session stands when it has
+/// one — see [`CONTEXT_PATH`].
+pub const SCRATCH_PATH: &str = "/scratch";
 
 /// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
 /// which is a guest with no `/abin` at all rather than an empty one.
@@ -108,8 +144,9 @@ pub const COMMIT_TAG: &str = "cortexcommit";
 
 /// Where the guest finds that scratch, and where it writes a commit's layer.
 ///
-/// A fixed path rather than the host's own, unlike the context: nothing outside this
-/// workspace names it, so there is no second speller for it to have to agree with.
+/// Not one of the three above and not reached the way they are: nothing outside this
+/// workspace names it, so it is a path the two halves of the commit agree on and no client
+/// ever sees.
 pub const COMMIT_PATH: &str = "/.cortex-commit";
 
 /// Set for a guest that has one. Its value is [`COMMIT_PATH`].
@@ -191,15 +228,17 @@ pub struct BootArgs {
     pub abin: Option<PathBuf>,
 
     /// The host directory to put in front of the guest, and `None` for a session that declared
-    /// no tree. Mounted in the guest at **this same path** — see [`CONTEXT_ENV`].
+    /// no tree. Mounted in the guest at [`CONTEXT_PATH`], which is where it is named from
+    /// there on — see [`CONTEXT_ENV`].
     pub context: Option<PathBuf>,
 
     /// Where the session leaves what it produces, and `None` for a session that named none.
-    /// Shared and mounted exactly as the context is, at this same host path.
+    /// Shared exactly as the context is, and mounted at [`ARTIFACTS_PATH`].
     pub artifacts: Option<PathBuf>,
 
     /// Room for the session to work in, and `None` for a session that named none. Shared as
-    /// the two above are, and additionally **where the guest stands** — see [`SCRATCH_ENV`].
+    /// the two above are, mounted at [`SCRATCH_PATH`], and additionally **where the guest
+    /// stands** — see [`SCRATCH_ENV`].
     pub scratch: Option<PathBuf>,
 
     /// How much of a network the session gets. Decided by the server, because it decides a
