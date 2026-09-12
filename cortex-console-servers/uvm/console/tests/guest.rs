@@ -28,28 +28,10 @@
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::{path::Path, process::Stdio};
 
-use cortex::{
-    console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp},
-    fs::Mount,
-};
+use cortex::console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp};
 use tokio::process::Command;
-
-/// A directory standing in for a mounted tree.
-///
-/// Not a mount this test made: what is under test is what the *backend* does with the path
-/// it is given, and a plain directory answers one the way a mount point does.
-struct Mounted(PathBuf);
-
-impl Mount for Mounted {
-    fn mountpoint(&self) -> &Path {
-        &self.0
-    }
-}
 
 /// A console over the real binary.
 struct Fixture {
@@ -141,7 +123,29 @@ impl Fixture {
 
         let console = Console::builder()
             .client(client)
-            .mount(Mounted(root.to_path_buf()))
+            .context(root.to_path_buf())
+            .build()
+            .await
+            .expect("building the console");
+
+        Fixture { console }
+    }
+
+    /// A fixture with all three trees, each a directory on this host.
+    ///
+    /// The same exchange `with_tree` makes, three times over: what a client says is a tree it
+    /// has, and the server answers where it put each one.
+    async fn with_trees(context: &Path, artifacts: &Path, scratch: &Path) -> Fixture {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client =
+            cortex::console::stdio::StdioClient::new(server).expect("starting the console server");
+
+        let console = Console::builder()
+            .client(client)
+            .context(context.to_path_buf())
+            .artifacts(artifacts.to_path_buf())
+            .scratch(scratch.to_path_buf())
             .build()
             .await
             .expect("building the console");
@@ -195,6 +199,93 @@ async fn a_tree_that_is_not_there_is_refused_before_a_vm_is_started() {
         err.code(),
         Some(cortex::console::Error::MOUNT_FAILED),
         "answered {err:?} — a tree that is missing is not a backend that would not come up"
+    );
+}
+
+/// Every tree is checked before a VM is started, not just the context — a client will send
+/// paths into all of them, and a missing artifacts directory would otherwise fail at the
+/// first write into it rather than at the boot that could not be made.
+///
+/// **Not** `#[ignore]`d, for the reason above: nothing here boots.
+#[tokio::test]
+async fn an_artifacts_tree_that_is_not_there_is_refused_before_a_vm_is_started() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let context = dir.path().join("project");
+    std::fs::create_dir(&context).unwrap();
+
+    let mut fx = Fixture::with_trees(
+        &context,
+        &dir.path().join("not-created"),
+        &dir.path().join("scratch-not-created"),
+    )
+    .await;
+
+    let err = fx
+        .console
+        .exec(["true"], None)
+        .await
+        .expect_err("no session can leave output in a directory that is not there");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::MOUNT_FAILED),
+        "answered {err:?} — a tree that is missing is not a backend that would not come up"
+    );
+}
+
+/// The three trees are three shares, each at the host's own path for it, and **the session
+/// stands in the scratch** — so a relative path a command writes lands there rather than in
+/// the tree the client was working on.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
+async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let (context, artifacts, scratch) = (
+        dir.path().join("project"),
+        dir.path().join("out"),
+        dir.path().join("scratch"),
+    );
+    for at in [&context, &artifacts, &scratch] {
+        std::fs::create_dir(at).unwrap();
+    }
+    std::fs::write(context.join("given.txt"), b"from the client\n").unwrap();
+
+    let mut fx = Fixture::with_trees(&context, &artifacts, &scratch).await;
+
+    // Each tree is where the client named it, on both sides of the hypervisor.
+    assert_eq!(fx.console.context_path(), Some(context.as_path()));
+    assert_eq!(fx.console.artifacts_path(), Some(artifacts.as_path()));
+    assert_eq!(fx.console.scratch_path(), Some(scratch.as_path()));
+
+    // The guest stands in the scratch, which nothing on the `exec` frame said.
+    assert_eq!(
+        String::from_utf8_lossy(&fx.output("pwd").await.stdout).trim_end(),
+        scratch.to_str().unwrap()
+    );
+
+    // The context is readable at the path the client knows it by...
+    assert_eq!(
+        String::from_utf8_lossy(
+            &fx.output(&format!("cat {}/given.txt", context.display()))
+                .await
+                .stdout
+        ),
+        "from the client\n"
+    );
+
+    // ...a relative write lands in the scratch...
+    fx.output("echo working > note.txt").await;
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("note.txt")).unwrap(),
+        "working\n"
+    );
+
+    // ...and what the session leaves in the artifacts tree is on this host, which is the
+    // whole reason for the tree: the client collects it without a `read`.
+    fx.output(&format!("echo kept > {}/report.txt", artifacts.display()))
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("report.txt")).unwrap(),
+        "kept\n"
     );
 }
 
@@ -697,7 +788,7 @@ async fn a_tree_is_the_same_path_on_both_sides() {
     let mut fx = Fixture::with_tree(&root).await;
 
     // What the server answered is the path this host has, and the session stands in it.
-    assert_eq!(fx.console.workfs_path(), Some(root.as_path()));
+    assert_eq!(fx.console.context_path(), Some(root.as_path()));
     assert_eq!(
         fx.output("pwd").await.stdout,
         format!("{}\n", root.display()).into_bytes(),

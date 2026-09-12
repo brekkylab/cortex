@@ -7,29 +7,37 @@ use std::{
 ///
 /// # Not a filesystem — a mounted one
 ///
-/// [`FileSystem`] and [`WorkFs`] *describe* a tree: they are contracts and types in this
+/// [`FileSystem`] and [`ContextFs`] *describe* a tree: they are contracts and types in this
 /// process, saying what is under which name and what its bytes are. Nothing outside the
 /// process can see either of them. This is the other thing entirely — the state of having
-/// been mounted. What implements it is not a store but the guard a binding hands back once a
-/// kernel has attached one, and what it offers is the one fact only that state has:
+/// been mounted. What implements it is not a store but that state: the guard a binding hands
+/// back once a kernel has attached a tree, or a path on one the host attached long before
+/// this process started. What it offers is the one fact only that state has:
 /// [`mountpoint`](Self::mountpoint), a path any process on this host can `open`.
 ///
-/// So the two compose rather than overlap. A `WorkFs` is what a mount serves; a `Mount` is
+/// So the two compose rather than overlap. A `ContextFs` is what a mount serves; a `Mount` is
 /// what makes it reachable by name — which is how anything that is not this library reads a
 /// cortex tree, a guest included, and why a consumer that needs real paths takes one of these
 /// and not a store.
 ///
-/// # A mount lives exactly as long as the value
+/// # The tree is there for as long as the value is
 ///
-/// **Dropping it unmounts.** That is the contract, not an incidental property of the two
-/// bindings that have it: an implementor whose `Drop` leaves the mount up is not a `Mount`,
-/// because a caller holding one would have no way to take it down and no way to know it was
-/// still there. RAII is the whole lifecycle here — `try_new` mounts, the value *is* the
-/// mount, and there is no `unmount` to forget and none to call twice.
+/// **That is the whole of the contract**, and it is a lower bound rather than a lifecycle: a
+/// holder may `open` under the mount point at any moment it still has the value, and the tree
+/// will not have gone out from under it. What happens *after* the value goes is the
+/// implementor's own business — a binding's guard unmounts, a temporary directory is removed,
+/// a directory the host already had stays exactly as it stood. None of those is visible
+/// through this trait, and nothing consuming a mount asks which one it holds.
 ///
-/// A caller that wants the mount to outlive one holder shares it ([`Arc`], impl below) rather
-/// than leaking it: the mount then comes down when the last holder goes, which is still the
-/// same rule.
+/// So the two kinds of implementor meet the bound from opposite ends and are equally mounts
+/// here. A tree this process put up meets it by RAII — `try_new` mounts, the value *is* the
+/// mount, `Drop` takes it down, and there is no `unmount` to forget and none to call twice —
+/// and holding the value is then the only thing keeping the tree up. A tree the host already
+/// had meets it because nothing that happens to the value can affect the tree at all.
+///
+/// A caller that wants a mount of the first kind to outlive one holder shares it ([`Arc`],
+/// impl below) rather than leaking it: the bound then runs to the last holder, which is the
+/// same rule read once more.
 ///
 /// What a guard adds beyond this trait is its own — `join`, waiting for something else to end
 /// the mount, consumes the guard and so is not something a `dyn Mount` could offer.
@@ -39,7 +47,7 @@ use std::{
 /// to whatever runs in the meantime.
 ///
 /// [`FileSystem`]: crate::fs::FileSystem
-/// [`WorkFs`]: crate::fs::WorkFs
+/// [`ContextFs`]: crate::fs::ContextFs
 pub trait Mount: Send + Sync {
     /// Where this is mounted — the directory a kernel now answers for.
     fn mountpoint(&self) -> &Path;
@@ -76,14 +84,39 @@ pub trait Mount: Send + Sync {
     }
 }
 
+/// A path is a mount, and is its own mount point.
+///
+/// The host mounted this one — at boot, or whenever whatever holds the directory was
+/// attached — and it is under *that* mount that a kernel answers for the path. None of it is
+/// this library's to take down, which is why a `PathBuf` satisfies the rule above by doing
+/// nothing in `Drop`: the tree outlives every holder, and what the rule asks is that it
+/// outlive this one.
+///
+/// **What it buys is a directory being enough.** A console left to put its artifacts in
+/// `./out`, or to work in a temporary directory the caller already made, is being handed a
+/// tree the host can reach with nothing to mount — and without this impl every such caller
+/// writes the same newtype around the same `PathBuf` to say so.
+///
+/// The path is taken as it stands. It is not canonicalized, because the spelling handed over
+/// is the one a consumer reports back, and canonicalizing a temporary directory on macOS
+/// answers through `/private` a name the caller never used. It is not required to be absolute
+/// either: [`url`](Mount::url) is where that matters and already answers `None`, so a caller
+/// that names a relative directory hears about it where the path has to travel, and one that
+/// only ever joins onto it locally is not stopped over a rule it is not relying on.
+impl Mount for PathBuf {
+    fn mountpoint(&self) -> &Path {
+        self.as_path()
+    }
+}
+
 /// A boxed mount is still a mount, and reports the same path.
 ///
 /// `?Sized`, so this covers `Box<dyn Mount>` as well as `Box<T>`: a caller that chooses its
 /// binding at runtime holds that choice erased, and passes it on as a `Mount` without having to
 /// unwrap it first.
 ///
-/// A box has one owner, so nothing about the rule above changes — the unmount happens when the
-/// box drops, which is when the mount inside it does.
+/// A box has one owner, so nothing about the rule above changes — whatever the mount inside
+/// does when it goes happens when the box drops.
 impl<T: Mount + ?Sized> Mount for Box<T> {
     fn mountpoint(&self) -> &Path {
         (**self).mountpoint()
@@ -96,9 +129,9 @@ impl<T: Mount + ?Sized> Mount for Box<T> {
 /// erased still has something it can pass on as a `Mount`.
 ///
 /// Sharing is how a mount serves two holders — whoever mounted, and whatever was handed the
-/// tree — without either of them deciding when it comes down. The unmount happens when the
-/// last `Arc` goes, so the RAII rule above holds for the group rather than being weakened by
-/// it.
+/// tree — without either of them deciding when it comes down. The last `Arc` to go is what
+/// ends it, so the rule above holds for the group rather than being weakened by it: the tree
+/// is there for as long as any holder has one.
 impl<T: Mount + ?Sized> Mount for Arc<T> {
     fn mountpoint(&self) -> &Path {
         (**self).mountpoint()

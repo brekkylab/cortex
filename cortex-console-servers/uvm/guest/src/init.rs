@@ -50,7 +50,7 @@ use std::ptr;
 
 use crate::contract::{
     ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, IMAGE_SPEC_PATH, ImageSpec,
-    LOWER_ENV, PORT_NAME, SHARE_ENV, UPPER_ENV,
+    ARTIFACTS_ENV, LOWER_ENV, PORT_NAME, SCRATCH_ENV, UPPER_ENV, CONTEXT_ENV,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
@@ -66,15 +66,15 @@ const PORT_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 /// the agent needs from here and cannot get for itself, the second because it is a file in a
 /// root that no longer exists by the time the agent runs.
 ///
-/// Where the tree landed is **not** returned, and that is the point: the agent hears it in
-/// the `init` the host replays, as a `file://` URL naming the same absolute path the host
-/// spells it with — one fact from one place. This function only has to put the tree where
-/// that URL says, which the boot arranged by naming the share after the host's own
+/// Where the trees landed is **not** returned, and that is the point: the agent hears them in
+/// the `init` the host replays, as `file://` URLs naming the same absolute paths the host
+/// spells them with — one fact from one place. This function only has to put each tree where
+/// its URL says, which the boot arranged by naming every share after the host's own
 /// directory.
 ///
 /// The order is the only one that works: pseudo-filesystems first because `/proc` is how
 /// this binary finds itself and `/dev` is where the block devices are, the spec next because
-/// the overlay is about to replace the root it is in, then the overlay, then the share, then
+/// the overlay is about to replace the root it is in, then the overlay, then the shares, then
 /// the port.
 pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
     mount_pseudo();
@@ -107,11 +107,22 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
     // network, which is the default.
     crate::net::configure()?;
 
+    // Every tree the session named, each at the host's own path for it. The artifacts tree is
+    // mounted and nothing else is done with it: what it is *for* is the client's, and a
+    // command reaches it by the path `init` answered.
+    let context = share(CONTEXT_ENV)?;
+    share(ARTIFACTS_ENV)?;
+    let scratch = share(SCRATCH_ENV)?;
+
     // Where a command runs is the session's, and the agent sets it per command — but this
-    // process has to stand somewhere, and a session with no tree stands here. The tree when
-    // there is one; otherwise where the image expects a process to be, and `/` when it said
-    // nothing or named a directory it never created.
-    match share()? {
+    // process has to stand somewhere, and a session with no tree stands here.
+    //
+    // **The scratch first**, because it is the tree a command may write in freely: standing
+    // in the context would make the tree the client gave the session the place every relative
+    // path a command writes lands in. The context when there is no scratch; otherwise where
+    // the image expects a process to be, and `/` when it said nothing or named a directory it
+    // never created.
+    match scratch.or(context) {
         Some(root) => set_cwd(&root)?,
         None => match image.working_dir.as_deref().map(Path::new) {
             Some(stated) if set_cwd(stated).is_ok() => {}
@@ -281,23 +292,26 @@ fn pivot(new_root: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Mount the workspace share, if the boot named one, and say where it landed.
+/// Mount one of the session's shares, if the boot named it, and say where it landed.
 ///
-/// One virtio-fs device for the whole workspace: what is underneath it — how many
-/// volumes, of what kind, mounted where — is cortex's business on the host side, and
-/// arrives here already assembled into one tree.
-fn share() -> anyhow::Result<Option<PathBuf>> {
-    let Ok(spec) = std::env::var(SHARE_ENV) else {
+/// One virtio-fs device per tree: what is underneath one — how many volumes, of what kind,
+/// mounted where — is cortex's business on the host side, and arrives here already
+/// assembled into one tree.
+///
+/// The mountpoint is the host's own path for it, which is what makes a `cwd` this end
+/// reports a name the client can open — see [`contract`](crate::contract).
+fn share(env: &str) -> anyhow::Result<Option<PathBuf>> {
+    let Ok(spec) = std::env::var(env) else {
         return Ok(None);
     };
     // Split on the first `:` only: a guest path may not contain one, but the split has
     // to be unambiguous rather than merely usually right.
     let Some((tag, mountpoint)) = spec.split_once(':') else {
-        anyhow::bail!("{SHARE_ENV} is `{spec}`, which is not `tag:/mountpoint`");
+        anyhow::bail!("{env} is `{spec}`, which is not `tag:/mountpoint`");
     };
 
     mount(tag, mountpoint, "virtiofs", 0)
-        .map_err(|e| anyhow::anyhow!("mounting the workspace at {mountpoint}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("mounting {env} at {mountpoint}: {e}"))?;
     Ok(Some(PathBuf::from(mountpoint)))
 }
 

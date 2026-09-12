@@ -91,7 +91,7 @@ use std::process::{ExitStatus, Output, Stdio};
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
     Call, CommitResp, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message,
-    Notification, ReadCall, ReadResp, Response, Server, WorkFsMount, WorkFsSource, WriteCall,
+    Notification, ReadCall, ReadResp, Response, Server, TreeMount, TreeRole, TreeSource, WriteCall,
     WriteResp,
 };
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
@@ -275,8 +275,8 @@ fn greet(outgoing: &mut std::fs::File) -> io::Result<()> {
 /// runs on, and whether it has booted.
 ///
 /// The [`InitCall`] that produced it is not kept: everything in it that this end acts on is
-/// [`workfs`](Self::workfs), and the base and the reach are answered one boot up by the
-/// server that started this guest — see [`configure`](Self::configure).
+/// the three trees, and the base and the reach are answered one boot up by the server that
+/// started this guest — see [`configure`](Self::configure).
 ///
 /// **The same shape the host-local backend has**, deliberately: a client cannot tell which
 /// one answered it, so what a session *is* must not depend on which one did. What differs
@@ -288,7 +288,19 @@ struct Session {
     /// The same path on both sides of the hypervisor: the boot shares the host's directory
     /// at its own path, so what the client was told and what this end opens are one string.
     /// See `crate::init::share`.
-    workfs: Option<PathBuf>,
+    context: Option<PathBuf>,
+
+    /// Where the session leaves what it produces, mounted in here on the same terms.
+    ///
+    /// Nothing in this agent treats it differently from the context: both are directories a
+    /// command reaches by path, and what the tree is *for* is the client's. Held so that a
+    /// boot can check it is there, which is the whole of this end's part in it.
+    artifacts: Option<PathBuf>,
+
+    /// Room for the session to work in, mounted in here on the same terms — and where the
+    /// session stands, which is the one way this end treats it differently. See
+    /// [`home`](Self::home).
+    scratch: Option<PathBuf>,
 
     /// Where the session stands, which is what an execution runs in and what a relative
     /// path in a file call resolves against.
@@ -319,22 +331,26 @@ impl Session {
 
     /// Take a new shape, answering what the client has to know about it.
     ///
-    /// The URL is read before anything is let go of, so a session this agent cannot take is
-    /// one it has not taken. Otherwise the old boot goes: the tree is what a boot checked
+    /// Every URL is read before anything is let go of, so a session this agent cannot take is
+    /// one it has not taken. Otherwise the old boot goes: the trees are what a boot checked
     /// for, and a boot from before this is a boot that no longer matches.
     fn configure(&mut self, config: InitCall) -> Result<InitResp, Error> {
-        let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+        let context = tree(config.context.as_ref(), TreeRole::Context)?;
+        let artifacts = tree(config.artifacts.as_ref(), TreeRole::Artifacts)?;
+        let scratch = tree(config.scratch.as_ref(), TreeRole::Scratch)?;
 
         self.release();
+        self.context = context;
+        self.artifacts = artifacts;
+        self.scratch = scratch;
         // A session with no tree stands where this process was put, which `init::prepare`
         // set to `/`. Saying so beats leaving the client to guess what a relative path means.
-        self.cwd = workfs.clone().or_else(|| std::env::current_dir().ok());
-        self.workfs = workfs;
+        self.cwd = self.home().or_else(|| std::env::current_dir().ok());
 
         Ok(InitResp {
-            workfs: self.workfs.as_deref().map(|path| WorkFsMount {
-                path: path.to_string_lossy().into_owned(),
-            }),
+            context: self.context.as_deref().map(placed),
+            artifacts: self.artifacts.as_deref().map(placed),
+            scratch: self.scratch.as_deref().map(placed),
             cwd: self.named_cwd(),
             // Nothing to say: this agent is running *inside* the base and never heard which
             // one it is. The answer the client sees is the console server's, one boot up.
@@ -349,6 +365,29 @@ impl Session {
     /// Where the session stands.
     fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// Where this session starts, and what `cd` with no argument goes back to — `None` for a
+    /// session that named no tree.
+    ///
+    /// **The scratch before the context**, which is the one thing this end does with the
+    /// difference between the three: a session handed room to work in starts in that room,
+    /// so a relative path a command writes does not land in the tree the client gave it.
+    /// `init::prepare` stands this process in the same place for the same reason, which is
+    /// what makes the two agree before an `init` has even arrived.
+    fn home(&self) -> Option<PathBuf> {
+        self.scratch.clone().or_else(|| self.context.clone())
+    }
+
+    /// Every tree this session named, with what to call each in a failure.
+    fn trees(&self) -> impl Iterator<Item = (TreeRole, &Path)> {
+        [
+            (TreeRole::Context, self.context.as_deref()),
+            (TreeRole::Artifacts, self.artifacts.as_deref()),
+            (TreeRole::Scratch, self.scratch.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(role, path)| path.map(|path| (role, path)))
     }
 
     /// The same, as the protocol can carry it.
@@ -378,19 +417,22 @@ impl Session {
             return Ok(());
         }
 
-        if let Some(workfs) = &self.workfs {
-            match std::fs::metadata(workfs) {
+        // Every tree the session named, because the boot shared every one of them and a
+        // client will send paths into all of them. The message says which: one code, three
+        // places it can be about.
+        for (role, at) in self.trees() {
+            match std::fs::metadata(at) {
                 Ok(meta) if meta.is_dir() => {}
                 Ok(_) => {
                     return Err(refused(
                         Error::MOUNT_FAILED,
-                        format!("{}: not a directory in the guest", workfs.display()),
+                        format!("{role} {}: not a directory in the guest", at.display()),
                     ));
                 }
                 Err(e) => {
                     return Err(refused(
                         Error::MOUNT_FAILED,
-                        format!("{}: not mounted in the guest: {e}", workfs.display()),
+                        format!("{role} {}: not mounted in the guest: {e}", at.display()),
                     ));
                 }
             }
@@ -416,7 +458,7 @@ impl Session {
     /// the way the *host* spells it, since the tree is mounted at the host's own path.
     fn change_dir(&mut self, argv: &[String]) -> Response {
         let target = match argv {
-            [] => match self.workfs.clone().or_else(|| self.cwd.clone()) {
+            [] => match self.home().or_else(|| self.cwd.clone()) {
                 Some(home) => home,
                 None => return builtin_failed("cd: this session stands nowhere to return to"),
             },
@@ -456,29 +498,45 @@ fn cd_target(exec: &ExecCall) -> Option<&[String]> {
     }
 }
 
-/// The directory a workfs URL names, or why it names none this agent can use.
+/// The directory one of a session's tree URLs names, or why it names none this agent can use
+/// — and `None` for a tree the session did not name.
 ///
 /// `file://` and nothing else. Inside a guest that is not a limitation the way it is on the
-/// host: whatever the tree is made of was realized before the VM started, and what reaches
-/// here is the directory it was mounted at.
-fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
-    let Some(path) = workfs.file_path() else {
+/// host: whatever a tree is made of was realized before the VM started, and what reaches here
+/// is the directory it was mounted at.
+///
+/// One function for all three, which is the same arrangement the host-local backend has and
+/// for the same reason: the trees differ in what the client means by them and not in how a
+/// URL is read. `role` is what makes a refusal name which of them it was about.
+fn tree(named: Option<&TreeSource>, role: TreeRole) -> Result<Option<PathBuf>, Error> {
+    let Some(named) = named else {
+        return Ok(None);
+    };
+
+    let Some(path) = named.file_path() else {
         return Err(refused(
-            Error::UNSUPPORTED_WORKFS,
+            role.unsupported(),
             format!(
-                "{}: a guest is handed a mounted directory, so file:// is the only kind it \
-                 can be told about",
-                workfs.scheme()
+                "{role}: {}: a guest is handed a mounted directory, so file:// is the only \
+                 kind it can be told about",
+                named.scheme()
             ),
         ));
     };
     if !path.is_absolute() {
         return Err(refused(
             Error::INVALID_PARAMS,
-            format!("{}: a file:// workfs needs an absolute path", workfs.url),
+            format!("{}: a file:// {role} needs an absolute path", named.url),
         ));
     }
-    Ok(path.to_path_buf())
+    Ok(Some(path.to_path_buf()))
+}
+
+/// Where a tree went, as the protocol carries it.
+fn placed(at: &Path) -> TreeMount {
+    TreeMount {
+        path: at.to_string_lossy().into_owned(),
+    }
 }
 
 /// `path` with `.` dropped and `..` popped, on paper and without touching the filesystem.
@@ -846,7 +904,7 @@ fn commit_plan(session: &Session) -> CommitPlan {
     // A mount point rather than a plain exclusion: the directories on the way to one exist
     // only to reach it, and go with it.
     let mount_points: Vec<PathBuf> = session
-        .workfs
+        .context
         .as_deref()
         .map(|path| vec![inside_upper(path)])
         .unwrap_or_default();

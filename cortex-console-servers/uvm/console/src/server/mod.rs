@@ -36,12 +36,13 @@
 //!   [replayed](Session::booted) into whichever guest comes up next. A second `init`
 //!   therefore releases the guest booted under the first, which is exactly what the
 //!   protocol says it does.
-//! - **The tree.** A `file://` workfs is a directory on *this* host, and it is shared into
-//!   the guest at that same path — see [`boot`](crate::boot). So the path this end answers
-//!   is the path the guest stands in, and everything after `init` relays untouched: a `cwd`
+//! - **The trees.** A `file://` context is a directory on *this* host, and it is shared into
+//!   the guest at that same path — see [`boot`](crate::boot). So are the artifacts and
+//!   scratch trees, by the same mechanism and for the same reason. So the paths this end
+//!   answers are paths the guest has, and everything after `init` relays untouched: a `cwd`
 //!   the agent reports is already a name the client can open, and a `read`'s path is
 //!   already one the guest can. **Nothing here translates a path**, and that is the whole
-//!   reason the share lands where it does.
+//!   reason a share lands where it does.
 //! - **Releasing.** `stop` drops the guest, which kills the VMM and deletes the image it
 //!   was writing. `quit` ends the process, and the guest goes with it.
 //!
@@ -55,11 +56,11 @@
 
 mod guest;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cortex::console::{
     Call, CommitCall, CommitResp, Error, ImageSource, InitCall, InitResp, Message, NetworkAccess,
-    Notification, RequestId, Response, Server, WorkFsMount, WorkFsSource, stdio::StdioServer,
+    Notification, RequestId, Response, Server, TreeMount, TreeRole, TreeSource, stdio::StdioServer,
 };
 use cortex_uvm_console::built::{self, LOCAL_HOST};
 use microsandbox_image::Reference;
@@ -184,16 +185,24 @@ struct Session {
     /// session that named no tree, and that is a session.
     config: InitCall,
 
-    /// The host directory a `file://` workfs named, or `None` for a session with no tree.
+    /// The host directory a `file://` context named, or `None` for a session with no tree.
     ///
     /// Held apart from `config` because it is the one thing in it this end acts on: the
     /// boot shares it, and the answer to `init` was spelled from it.
-    workfs: Option<PathBuf>,
+    context: Option<PathBuf>,
+
+    /// Where the session leaves what it produces, and `None` for a session that named none.
+    /// Shared into the guest exactly as the context is, at this same host path.
+    artifacts: Option<PathBuf>,
+
+    /// Room for the session to work in, and `None` for a session that named none. Shared as
+    /// the two above are, and additionally where the session stands — see [`home`](Self::home).
+    scratch: Option<PathBuf>,
 
     /// The base this session's guest overlays, as a reference this server has parsed, and
     /// `None` for a session that left the choice here.
     ///
-    /// Held apart from `config` for the same reason `workfs` is: it was checked at `init` and
+    /// Held apart from `config` for the same reason `context` is: it was checked at `init` and
     /// the boot is handed the result. **Not fetched here** — pulling an image is a boot's work,
     /// and this is only the name of one.
     image: Option<Reference>,
@@ -223,28 +232,37 @@ impl Session {
     /// **The path answered here is a host path**, and the guest will stand at the same one.
     /// Nothing is mounted or booted by saying so: the share happens when a guest does.
     fn configure(&mut self, config: InitCall) -> Result<InitResp, Error> {
-        let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+        // All three before the guest goes, and each with the code its own member is refused
+        // by: a session this backend cannot take whole is one it has not taken at all.
+        let context = tree(config.context.as_ref(), TreeRole::Context)?;
+        let artifacts = tree(config.artifacts.as_ref(), TreeRole::Artifacts)?;
+        let scratch = tree(config.scratch.as_ref(), TreeRole::Scratch)?;
         let image = base(config.image.as_ref())?;
         let (network, host_ports) = reach(config.network.as_ref())?;
         already_built(config.image.as_ref())?;
 
         self.guest = None;
-        self.workfs = workfs;
+        self.context = context;
+        self.artifacts = artifacts;
+        self.scratch = scratch;
         self.image = image;
         self.network = network;
         self.host_ports = host_ports.clone();
         self.config = config;
 
-        let path = self
-            .workfs
-            .as_deref()
-            .map(|path| path.to_string_lossy().into_owned());
         Ok(InitResp {
-            workfs: path.clone().map(|path| WorkFsMount { path }),
-            // Where a session starts is its tree, and a guest with no tree stands at `/` —
-            // which is what `init::prepare` puts the agent in. Either way this is the same
-            // answer the agent will give when the session is replayed into it.
-            cwd: Some(path.unwrap_or_else(|| "/".to_string())),
+            context: self.context.as_deref().map(placed),
+            artifacts: self.artifacts.as_deref().map(placed),
+            scratch: self.scratch.as_deref().map(placed),
+            // Where a session starts is its scratch, its context when it has no scratch, and
+            // `/` when it named neither — which is what `init::prepare` puts the agent in.
+            // Either way this is the same answer the agent will give when the session is
+            // replayed into it, because both ends work it out the same way. See `home`.
+            cwd: Some(
+                self.home()
+                    .map(|at| at.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/".to_string()),
+            ),
             // The base in force, in this server's spelling of it — which is the registry a
             // bare reference turned out to name, and the one thing about it the client could
             // not have worked out. `None` is a session running on the pinned rootfs, which is
@@ -263,6 +281,28 @@ impl Session {
         self.guest = None;
     }
 
+    /// Where a session with this shape starts — `None` for one that named no tree.
+    ///
+    /// **The scratch before the context.** A session stands somewhere before it is told
+    /// anything and every relative path a command writes lands there, so standing in the
+    /// context would make the tree the client gave the session the default destination for
+    /// everything it produces. Worked out here *and* in the guest, by the same rule, because
+    /// this end answers `init` before there is a guest to ask — see `configure`.
+    fn home(&self) -> Option<&Path> {
+        self.scratch.as_deref().or(self.context.as_deref())
+    }
+
+    /// Every tree this session named, with what to call each in a failure.
+    fn trees(&self) -> impl Iterator<Item = (TreeRole, &Path)> {
+        [
+            (TreeRole::Context, self.context.as_deref()),
+            (TreeRole::Artifacts, self.artifacts.as_deref()),
+            (TreeRole::Scratch, self.scratch.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(role, path)| path.map(|path| (role, path)))
+    }
+
     /// A guest with this session's shape, booting one if nothing has.
     ///
     /// The `init` replay is part of booting and not a step after it: an agent that has not
@@ -276,24 +316,24 @@ impl Session {
     /// would otherwise be lost.
     async fn booted(&mut self) -> Result<&mut Guest, Error> {
         if self.guest.is_none() {
-            // The tree has to be there before a guest is told to mount it: a directory that
-            // is not on this host is the environment being wrong for a session that is
+            // Every tree has to be there before a guest is told to mount it: a directory
+            // that is not on this host is the environment being wrong for a session that is
             // described correctly, which is what `MOUNT_FAILED` says — and saying it here is
             // the difference between that and a guest that comes up without a filesystem and
-            // fails at the first command.
-            if let Some(workfs) = &self.workfs {
-                match std::fs::metadata(workfs) {
+            // fails at the first command. The message names which of the three it was.
+            for (role, at) in self.trees() {
+                match std::fs::metadata(at) {
                     Ok(meta) if meta.is_dir() => {}
                     Ok(_) => {
                         return Err(refused(
                             Error::MOUNT_FAILED,
-                            format!("{}: not a directory", workfs.display()),
+                            format!("{role} {}: not a directory", at.display()),
                         ));
                     }
                     Err(e) => {
                         return Err(refused(
                             Error::MOUNT_FAILED,
-                            format!("{}: {e}", workfs.display()),
+                            format!("{role} {}: {e}", at.display()),
                         ));
                     }
                 }
@@ -301,7 +341,9 @@ impl Session {
 
             let image = self.image.as_ref().map(Reference::to_string);
             let mut guest = Guest::boot(
-                self.workfs.as_deref(),
+                self.context.as_deref(),
+                self.artifacts.as_deref(),
+                self.scratch.as_deref(),
                 image.as_deref(),
                 self.network,
                 &self.host_ports,
@@ -310,10 +352,10 @@ impl Session {
             .await
             .map_err(|e| refused(Error::BOOT_FAILED, format!("booting a guest: {e}")))?;
 
-            // The tree **does** go in the replay, and it is the same URL the client sent:
-            // the guest mounted that host directory at that host path, so what the agent is
-            // told is true on its side too. Nothing secret is in it — a `file://` URL is a
-            // directory this host already has, and whatever it took to build that tree
+            // The trees **do** go in the replay, and they are the same URLs the client sent:
+            // the guest mounted those host directories at those host paths, so what the agent
+            // is told is true on its side too. Nothing secret is in them — a `file://` URL is
+            // a directory this host already has, and whatever it took to build that tree
             // stayed on this side of the boundary.
             let outcome = guest
                 .relay(REPLAYED_INIT, Call::Init(self.config.clone()))
@@ -536,35 +578,47 @@ fn already_built(asked: Option<&ImageSource>) -> Result<(), Error> {
     ))
 }
 
-/// The host directory a workfs URL names, or why it names none this backend can use.
+/// The host directory one of a session's tree URLs names, or why it names none this backend
+/// can use — and `None` for a tree the session did not name.
 ///
 /// The same two refusals `cortex-local-console` makes, and deliberately the same: a client
 /// cannot tell which backend answered it, so the two must not disagree about a URL they both
-/// decline. Reading the URL itself is [`WorkFsSource`]'s, which is what keeps them from
-/// drifting apart.
+/// decline. Reading the URL itself is [`TreeSource`]'s and which code refuses which member is
+/// [`TreeRole`]'s, which is what keeps them from drifting apart.
 ///
-/// `file://` and nothing else, for a reason this backend has and the local one does not: the
+/// `file://` and nothing else, for a reason this backend has and the local one does not: a
 /// tree is shared into a guest as a directory, so a kind that is not one on this host is a
 /// kind there is nothing to share. What realizes an object store as a directory is a mount,
 /// and mounting is the caller's.
-fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
-    let Some(path) = workfs.file_path() else {
+fn tree(named: Option<&TreeSource>, role: TreeRole) -> Result<Option<PathBuf>, Error> {
+    let Some(named) = named else {
+        return Ok(None);
+    };
+
+    let Some(path) = named.file_path() else {
         return Err(refused(
-            Error::UNSUPPORTED_WORKFS,
+            role.unsupported(),
             format!(
-                "{}: a guest is handed a directory, so this server realizes file:// and \
-                 nothing else",
-                workfs.scheme()
+                "{role}: {}: a guest is handed a directory, so this server realizes file:// \
+                 and nothing else",
+                named.scheme()
             ),
         ));
     };
     if !path.is_absolute() {
         return Err(refused(
             Error::INVALID_PARAMS,
-            format!("{}: a file:// workfs needs an absolute path", workfs.url),
+            format!("{}: a file:// {role} needs an absolute path", named.url),
         ));
     }
-    Ok(path.to_path_buf())
+    Ok(Some(path.to_path_buf()))
+}
+
+/// Where a tree went, as the protocol carries it.
+fn placed(at: &Path) -> TreeMount {
+    TreeMount {
+        path: at.to_string_lossy().into_owned(),
+    }
 }
 
 /// A refusal, as the `error` a response carries instead of a result.

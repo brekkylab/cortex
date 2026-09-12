@@ -7,8 +7,8 @@ Two things make it more than a remote `exec`:
 
 1. JSON-RPC 2.0's object model — the three shapes, the `id` pairing, the error codes — encoded as BSON rather than as JSON text.
    The semantics are the spec's and read as it; the bytes are not, so a peer needs a BSON codec. See [Codec](#codec) for what that trade bought.
-2. The session declares a **workfs**, and the server says where it put it.
-   The client names a tree by URL, the server answers with a path in its own filesystem, and every path in the protocol after that is spelled under that one — so a file name means the same thing to a command and to a `read`. See [`workfs`](#workfs--what-can-be-reached).
+2. The session declares its **trees** — a context, an artifacts and a scratch — and the server says where it put each.
+   The client names a tree by URL, the server answers with a path in its own filesystem, and every path in the protocol after that is spelled under one of those — so a file name means the same thing to a command and to a `read`. See [the trees](#the-trees--what-can-be-reached-and-where-it-ends-up).
 
 **Each end of the channel does one job.** The client only asks; the server only answers.
 There is no request a server ever issues, which is what leaves one channel, one end that asks and one end that answers — see [The channel](#the-channel).
@@ -149,7 +149,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{workfs?}` | `{workfs?, cwd?}` |
+| `init` | `{context?, artifacts?, scratch?}` | `{context?, artifacts?, scratch?, cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -187,8 +187,8 @@ A boot that fails is reported to whoever asked for the call that needed it, as `
 ### `init` — this is the session
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"init","params":{"workfs":{"url":"file:///srv/project"}}}
-{"jsonrpc":"2.0","id":0,"method":"init","result":{"workfs":{"path":"/mnt/workfs"},"cwd":"/mnt/workfs"}}
+{"jsonrpc":"2.0","id":0,"method":"init","params":{"context":{"url":"file:///srv/project"},"artifacts":{"url":"file:///srv/out"},"scratch":{"url":"file:///srv/scratch"}}}
+{"jsonrpc":"2.0","id":0,"method":"init","result":{"context":{"path":"/mnt/context"},"artifacts":{"path":"/mnt/artifacts"},"scratch":{"path":"/mnt/scratch"},"cwd":"/mnt/scratch"}}
 ```
 
 What a session is: **what can be reached**.
@@ -196,20 +196,40 @@ It outlives any one execution, which is why it is here and not on an `exec` — 
 
 The other thing a session *has* is where it stands, and that is the server's to keep rather than the client's to say — so it is not in the request at all, and the answer is the first reading of it.
 
-It is also the only method whose answer carries anything, and both members are why: a client that has not been told where the tree is cannot name a file in it, and one that has not been told where the session stands cannot say where a command would look.
+It is also the only method whose answer carries anything, and every member is why: a client that has not been told where a tree is cannot name a file in it, and one that has not been told where the session stands cannot say where a command would look.
 
-#### `workfs` — what can be reached, and where it ends up
+#### The trees — what can be reached, and where it ends up
 
-One tree, named by URL going out and by a path coming back.
-
-The name is [`fs`](../fs/ARCHITECTURE.md)'s — a *workfs* is a workspace, as against a rootfs — and it is the same thing meant on both sides of this exchange, which is why the protocol borrows the word rather than inventing one for the wire.
+Up to three of them, each named by URL going out and by a path coming back, and each independently optional.
 
 ```json
-→ {"url":"file:///srv/project"}
-← {"path":"/mnt/workfs"}
+→ {"context":{"url":"file:///srv/project"},"artifacts":{"url":"file:///srv/out"},"scratch":{"url":"file:///srv/scratch"}}
+← {"context":{"path":"/mnt/context"},"artifacts":{"path":"/mnt/artifacts"},"scratch":{"path":"/mnt/scratch"}}
 ```
 
-Absent is nothing mounted, in both directions, and that is not an error — a client with no tree is still a client, and then the member is left off the frame rather than sent empty.
+| member | is | outlives the session |
+|---|---|---|
+| `context` | what the session is given to work **from**, and reads | yes — it was there before |
+| `artifacts` | what the session is to leave behind | yes — that is the point of it |
+| `scratch` | room to work in, and **where the session stands** | no |
+
+A *context* is what the session is given to work from, as against the rootfs its commands run on.
+**The work is not done here**: a session writes in its scratch and leaves its result in its artifacts, so what this tree is for is being read.
+That is the intent rather than something enforced today — no server refuses a write to it yet — and it is what the other two members exist to make possible.
+
+[`fs`](../fs/ARCHITECTURE.md) spells it the same way (`ContextFs`), so one word means one thing on both sides of the seam.
+
+**Three members and not one tree with three directories in it.**
+A single tree makes the three the same thing to everyone holding them: the same store behind them, the same lifetime, the same permissions — and a client that wants to keep what a session produced has to know which subdirectory that was and trust the session not to have written outside it.
+Naming them separately is what lets each be backed by what it should be — a project directory, a bucket the caller collects from, something the host throws away — and it is this protocol's only way to say which of them a path is in.
+
+That is a different question from the one [`fs`](../fs/ARCHITECTURE.md) answers by composing many stores behind one URL, and both answers stand: several stores under one root are one namespace a command walks, where these are separate namespaces a client has separate intentions for.
+So a session that needs five project directories in view at once still composes them behind one `context` URL.
+
+**They are the same kind of value and differ only in the member name.**
+One spelling, one way of reading a URL, one shape coming back — which is what keeps two servers from disagreeing about what one URL names. What a tree is *for* is the client's, and the whole of a server's part in it is to realize it and say where.
+
+Absent is nothing mounted, for each of them independently, and that is not an error — a client with no tree is still a client, and then the member is left off the frame rather than sent empty.
 Such a session's commands see whatever the executor's own filesystem holds, and this protocol has described none of it.
 
 **The scheme is the kind.**
@@ -225,7 +245,7 @@ That is why the two paths in this exchange are so often the same one — and why
 A URL and not a tagged object, because there is one thing this protocol does with it: hand it to whatever realizes that kind.
 A tagged object would grow the wire schema with every provider anyone adds; a string leaves the schema alone and leaves each kind's spelling to the kind — so a peer that has never heard of a scheme still parses the frame, and refuses it for the reason it actually has.
 
-That reason is [`UNSUPPORTED_WORKFS`](#errors), and unlike the failures below it is **`init`'s own**.
+That reason is [`UNSUPPORTED_CONTEXT`](#errors) — or `UNSUPPORTED_ARTIFACTS`, or `UNSUPPORTED_SCRATCH`, because a client that named three trees has to hear which one the build cannot take — and unlike the failures below it is **`init`'s own**.
 Which kinds a server can realize is a fact about the build, knowable the moment the frame is read — and answering a path for a tree that can never be there would make every later path in the session a lie.
 
 A URL is a name, so a kind that has to be authorized rather than opened will need a member beside it to carry that; `file://` needs none, which is why there is none yet.
@@ -257,10 +277,10 @@ What the kinds are and how one tree is assembled from several stores is [`fs/ARC
 A notification could say none of that, which is the whole reason this one method is answered.
 
 Which is also why the asking side sends it when a console is *constructed* rather than leaving it to a caller to remember: a `Console` that exists is one that got this answer back. See [Session](#session).
-A workfs answered without a path is a server that took a tree and left the client no way to name a file in it, so that is a console that does not exist rather than one that guesses.
+A tree answered without a path is a server that took it and left the client no way to name a file in it, so that is a console that does not exist rather than one that guesses — whichever of the three it was.
 
 A second `init` replaces the first and takes whatever was booted under it with it.
-The workfs is built into what booting produced — a mounted tree — so a session that changes it has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived. Its answer may name a different path, and that path is the session's from then on.
+The context is built into what booting produced — a mounted tree — so a session that changes it has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived. Its answer may name a different path, and that path is the session's from then on.
 
 ### `start` — boot now, to hide the cold start
 
@@ -321,14 +341,14 @@ Asking would therefore re-encode base64 at exactly the point the byte type was t
 A session has a current directory, and **the far end is what keeps it**.
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"init","result":{"workfs":{"path":"/mnt/workfs"},"cwd":"/mnt/workfs"}}
+{"jsonrpc":"2.0","id":0,"method":"init","result":{"scratch":{"path":"/mnt/scratch"},"cwd":"/mnt/scratch"}}
 {"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["cd","work"]}}
 {"jsonrpc":"2.0","id":2,"method":"exec","result":{"code":0,"stdout":…,"stderr":…,"truncated":false}}
 {"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":["ls"]}}
 ```
 
-The `ls` lists `/mnt/workfs/work`, and nothing in any of these frames said so.
-`init` answered where the session started, the `cd` moved it, and the next command inherited that — which is the whole of the mechanism: **a server is a state machine, and `init`'s answer is the only reading of it a client is given.**
+The `ls` lists `/mnt/scratch/work`, and nothing in any of these frames said so.
+`init` answered where the session started — its scratch, when it has one, because that is the tree a command may write in freely — the `cd` moved it, and the next command inherited that — which is the whole of the mechanism: **a server is a state machine, and `init`'s answer is the only reading of it a client is given.**
 
 #### Nothing reports the move, and `pwd` is why
 
@@ -355,7 +375,7 @@ That is the trade, and it is worth taking: a shell has the same one, and an agen
 ### `read` — hand back part of a file
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"read","params":{"path":"/mnt/workfs/out/log.txt","offset":4096,"len":1024}}
+{"jsonrpc":"2.0","id":5,"method":"read","params":{"path":"/mnt/scratch/out/log.txt","offset":4096,"len":1024}}
 {"jsonrpc":"2.0","id":5,"method":"read","result":{"data":{"$binary":{"base64":"aGkK","subType":"00"}},"size":10000}}
 ```
 
@@ -377,7 +397,7 @@ Comparing what arrived against `size` is the only thing that says there is more,
 ### `write` — put these bytes in a file
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"write","params":{"path":"/mnt/workfs/in/data","data":{"$binary":{"base64":"aGkK","subType":"00"}}}}
+{"jsonrpc":"2.0","id":6,"method":"write","params":{"path":"/mnt/scratch/in/data","data":{"$binary":{"base64":"aGkK","subType":"00"}}}}
 {"jsonrpc":"2.0","id":6,"method":"write","result":{"size":3}}
 ```
 
@@ -447,11 +467,11 @@ sequenceDiagram
         participant sh
     end
 
-    client->>server: id:0 init {workfs:{url:"file:///srv/project"}}
-    server-->>client: id:0 method:init result {workfs:{path:"/mnt/workfs"}}
+    client->>server: id:0 init {context:{url:"file:///srv/project"}, scratch:{url:"file:///srv/scratch"}}
+    server-->>client: id:0 method:init result {context:{path:"/mnt/context"}, scratch:{path:"/mnt/scratch"}, cwd:"/mnt/scratch"}
 
     client->>server: id:1 exec {cmd:["sh","-c","echo hi"]}
-    Note over server: nothing is booted yet, so this boots it:<br/>the workfs is mounted at the path init answered with
+    Note over server: nothing is booted yet, so this boots it:<br/>every tree is mounted at the path init answered with
     server->>sh: spawn
     activate sh
     sh-->>server: writes its output, exits
@@ -495,14 +515,16 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
 | `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
-| `-32008` | `init` | **unsupported workfs** — a URL whose scheme this server has no provider for, named in the message. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and a path answered for a tree that can never be there would make every later path a lie. Distinct from `BOOT_FAILED` because the fix is different: the workfs is well formed and the *build* is wrong for it — a different binary, or a different URL. |
-| `-32009` | `exec`, `read`, `write` | **mount failed** — the workfs could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
+| `-32008` | `init` | **unsupported context** — a URL whose scheme this server has no provider for, named in the message. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and a path answered for a tree that can never be there would make every later path a lie. Distinct from `BOOT_FAILED` because the fix is different: the context is well formed and the *build* is wrong for it — a different binary, or a different URL. |
+| `-32009` | `exec`, `read`, `write` | **mount failed** — a tree could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
+| `-32013` | `init` | **unsupported artifacts** — as `-32008`, for the tree a session leaves its output in. A code of its own because a session names up to three trees and a refusal has to say which, and because the fix differs: a session with no context has nothing to work on, where one with nowhere to put its output can often be asked for again without it. |
+| `-32014` | `init` | **unsupported scratch** — as `-32013`, for the tree a session works in. |
 | `-32600` | any | invalid request. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty argv `cmd`, or a `workfs` URL that is not one. Apart from `UNSUPPORTED_WORKFS` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
+| `-32602` | any | invalid params — an empty argv `cmd`, or a tree URL that is not one. Apart from `UNSUPPORTED_CONTEXT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
 | `-32603` | any | internal error |
 
-`-32003` and `-32004` are unassigned and stay that way.
+`-32010` through `-32012` are taken by parts of this protocol the document above does not yet describe, which is why they are not in the table; `-32003` and `-32004` are unassigned and stay that way.
 A code is a wire contract, so a gap is left as a gap rather than filled by the next thing that needs a number: a peer holding an older table should find nothing there rather than something else.
 
 `-32000`…`-32099` is the range the spec reserves for implementation-defined server errors.
@@ -566,4 +588,4 @@ Each of these is a capability given up on purpose, and each has one line of reas
 | cancel one execution | `stop` hands back the whole session's resources, not a command, and nothing answers it. Let the timeout expire. |
 | output larger than 64 MiB | one frame, one result. `truncated` says when it happened — and an agent cannot read 64 MiB either, so the bound is closer to a feature. A *file* larger than that is readable, because `read` is bounded on purpose and `size` says where to ask next. |
 | run one command somewhere else | there is no `cwd` on a request, because the session's own is the only authority on where a command runs — see [Where the session stands](#where-the-session-stands). `sh -c 'cd there && …'` is how, and moving back is the caller's. |
-| put two trees in one session | `workfs` is one URL and one path. A session that needs several trees gets them the way a session gets one tree of many stores: composed behind a single URL, where the composing is [`fs`](../fs/ARCHITECTURE.md)'s and not this protocol's. |
+| put a *fourth* tree in one session | the three members are fixed, and each says what its tree is for. A session that needs several workspaces gets them the way a session gets one tree of many stores: composed behind a single URL, where the composing is [`fs`](../fs/ARCHITECTURE.md)'s and not this protocol's. A fourth *role* would be a new member here, argued the way [the trees](#the-trees--what-can-be-reached-and-where-it-ends-up) argues these. |

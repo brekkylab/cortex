@@ -33,7 +33,7 @@ use super::{CommitCall, Method, utils::bytes};
 /// JSON has no spelling for:
 ///
 /// ```text
-/// {"method":"init","params":{"workfs":{"url":"file:///srv/project"}}}
+/// {"method":"init","params":{"context":{"url":"file:///srv/project"}}}
 /// {"method":"exec","params":{"cmd":["sh","-c","ls"],"timeout_ms":1000}}
 /// {"method":"read","params":{"path":"out/log.txt","offset":4096,"len":1024}}
 /// {"method":"write","params":{"path":"in/data","data":<Binary>}}
@@ -47,24 +47,24 @@ use super::{CommitCall, Method, utils::bytes};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum Call {
-    /// This is the session: the tree it works in, and what its commands run in and may reach.
+    /// This is the session: the trees it works in, and what its commands run in and may reach.
     ///
     /// The one exchange that is about the session rather than about work, and the one
     /// thing worth answering about it — because the answer is something a client can
     /// act on before it has asked for anything. A channel that answers this has a
     /// server on the far end that read the frame, speaks this protocol, and has taken
     /// what it was told; a notification could say none of that. The answer also carries
-    /// where the workfs went, which is what every later path in the session is spelled
+    /// where each tree went, which is what every later path in the session is spelled
     /// in — see [`InitResp`](super::InitResp).
     ///
     /// It carries no booting, and no mounting either. Bringing a backend up costs a kernel
     /// on one and nothing at all on another, and a session's shape is the same either way,
     /// so *when* to pay for it is [`Start`](super::Notification::Start)'s and not this
-    /// method's. The tree is put where this said it would be at the same moment.
+    /// method's. Each tree is put where this said it would be at the same moment.
     ///
     /// A second one replaces the first, and takes whatever was booted under it with it: the
-    /// tree is built into what booting produced, so a session that changes it has a boot that
-    /// no longer matches it.
+    /// trees are built into what booting produced, so a session that changes them has a boot
+    /// that no longer matches it.
     Init(InitCall),
 
     /// Run this command.
@@ -135,20 +135,95 @@ impl Call {
 /// What a session is. The `params` of `init`.
 ///
 /// What is here outlives any one execution, which is what it is doing here rather than on
-/// an [`ExecCall`]: the tree has to be somewhere before a path can name a file in
+/// an [`ExecCall`]: a tree has to be somewhere before a path can name a file in
 /// it, and the base and the reach are the environment a command runs in rather than
 /// anything a command says — so each is said once instead of on every command.
+///
+/// # Three trees, because they are three lifetimes
+///
+/// [`context`](Self::context), [`artifacts`](Self::artifacts) and [`scratch`](Self::scratch)
+/// are each a [`TreeSource`] and each answered with a [`TreeMount`](super::TreeMount), and
+/// what tells them apart is the member name rather than anything in the value.
+///
+/// | member | is | outlives the session |
+/// |---|---|---|
+/// | `context` | what the session is given to work **from**, and reads | yes — it was there before |
+/// | `artifacts` | what the session is to leave behind | yes — that is the point of it |
+/// | `scratch` | room to work in | no |
+///
+/// **Which is why they are three members and not one tree with three directories in it.**
+/// A single tree makes the three the same thing to everyone holding it: the same store
+/// behind them, the same lifetime, the same permissions, and a client that wants to keep
+/// what a session produced has to know which subdirectory that was and trust the session
+/// not to have written outside it. Naming them separately is what lets each be backed by
+/// what it should be — a project directory, a bucket the caller collects from, a tmpfs the
+/// host throws away — and it is the protocol's only way to say which of them a path is in.
+///
+/// It is a departure from [`ContextFs`](crate::fs::ContextFs)'s composition, which is how a
+/// session gets *many stores* in one tree, and the two answer different questions. Several
+/// stores under one root are one namespace a command walks; these are separate namespaces a
+/// client has separate intentions for.
+///
+/// Each of the three is independently optional, and a session with none of them is still a
+/// session.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitCall {
-    /// The tree this session works in, named by URL. `None` is a session with nothing
+    /// The tree this session works **from**, named by URL. `None` is a session with nothing
     /// mounted, which is still a session — a command then sees whatever the executor's own
     /// filesystem holds and nothing this protocol described.
     ///
-    /// Answered by a [`WorkFsMount`](super::WorkFsMount) saying where the server put it,
+    /// **What the session is given, as against what it makes.** It was there before the
+    /// session and outlives it, which is why the two trees beside it exist: a session that
+    /// wrote its output and its working files in here would be leaving them in somebody's
+    /// project, and the client would be left to work out which files were new.
+    ///
+    /// So this tree is for *reading*, which is what its name says and what the two members
+    /// beside it exist to make possible. That is the intent and not yet something enforced:
+    /// no server here refuses a write to it.
+    ///
+    /// Answered by a [`TreeMount`](super::TreeMount) saying where the server put it,
     /// which is what makes every later path in this protocol a path both ends can spell.
     /// See [`InitResp`](super::InitResp).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workfs: Option<WorkFsSource>,
+    pub context: Option<TreeSource>,
+
+    /// Where this session leaves what it produced, named by URL. `None` is a session that
+    /// produces nothing anybody collects.
+    ///
+    /// **Apart from the context because the client's intention for it is different.** What a
+    /// session was given and what it was asked to make are two sets of files with two
+    /// futures: the first is somebody's project and is read, the second is the result and is
+    /// collected. A session that wrote its output into the tree it was given leaves the
+    /// client to work out which files are new, which is a question the client should not
+    /// have to ask — and on a backend where the context is a store that is expensive or
+    /// unwise to write to, it is a question with no good answer at all.
+    ///
+    /// Answered in [`InitResp::artifacts`](super::InitResp::artifacts) with where it went.
+    /// A scheme this build has no provider for is refused at `init` with
+    /// [`UNSUPPORTED_ARTIFACTS`](crate::console::Error::UNSUPPORTED_ARTIFACTS), which is
+    /// [`UNSUPPORTED_CONTEXT`](crate::console::Error::UNSUPPORTED_CONTEXT)'s reasoning applied
+    /// to this member and a code of its own so that a client hears *which* tree the build
+    /// cannot take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<TreeSource>,
+
+    /// Room for this session to work in, named by URL. `None` is a session that works
+    /// wherever it can write.
+    ///
+    /// **Where the session stands, and the only one of the three meant to be thrown away.**
+    /// A command that unpacks an archive, builds something, or writes a file it will read
+    /// back needs somewhere to put it, and the two trees above are the wrong place for
+    /// different reasons: one is somebody's project and one is what the client will collect.
+    ///
+    /// So this is what [`InitResp::cwd`](super::InitResp::cwd) names when a session has one
+    /// — see there — which is what makes it the default destination of every relative path a
+    /// command writes without having to be told.
+    ///
+    /// Answered in [`InitResp::scratch`](super::InitResp::scratch), and refused with
+    /// [`UNSUPPORTED_SCRATCH`](crate::console::Error::UNSUPPORTED_SCRATCH) by a build with no
+    /// provider for its scheme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<TreeSource>,
 
     /// The base a session's commands run in, named as an OCI image. `None` leaves it to the
     /// server.
@@ -191,11 +266,26 @@ pub struct InitCall {
     pub committable: bool,
 }
 
-/// The tree a session works in, named by URL.
+/// A tree a session is given, named by URL.
 ///
-/// A *workfs* is `fs`'s word for it — a workspace, as against a rootfs — and this is the
-/// protocol's way of naming one: not the tree itself, which is a thing in some process, but
-/// where to get it.
+/// One type for all three of them — the [`context`](InitCall::context), the
+/// [`artifacts`](InitCall::artifacts) and the [`scratch`](InitCall::scratch) — because
+/// naming a tree is one operation and reading that name is one rule. **What a tree is
+/// *for* is the member it arrives under**, and nothing about that changes how a URL is
+/// read, which kinds a build can realize, or what a server does with the answer.
+///
+/// Three types here would have been three copies of [`scheme`](Self::scheme) and
+/// [`file_path`](Self::file_path), and therefore three chances for two servers to disagree
+/// about what one URL names — which is the failure a shared protocol type exists to
+/// prevent.
+///
+/// A *context* is the first of them: what the session is given to work from, as against the
+/// rootfs its commands run on. This is the protocol's way of naming one — not the tree
+/// itself, which is a thing in some process, but where to get it.
+///
+/// The work is not done in it: a session writes in its [`scratch`](InitCall::scratch) and
+/// leaves its result in its [`artifacts`](InitCall::artifacts), and what this tree is for is
+/// being *read*.
 ///
 /// # The scheme is the kind
 ///
@@ -204,9 +294,12 @@ pub struct InitCall {
 /// | `file:///srv/project` | a directory on the server's own filesystem |
 /// | `http://…`, `https://…` | a tree reached over HTTP — **on the wire, implemented nowhere** |
 ///
-/// A scheme this build has no provider for is refused at `init` with
-/// [`UNSUPPORTED_WORKFS`](crate::console::Error::UNSUPPORTED_WORKFS) naming it, which is
-/// what `http` and `https` get everywhere today.
+/// A scheme this build has no provider for is refused at `init`, naming it — with the code
+/// belonging to the member it arrived under, so that a client asking for three trees hears
+/// which one the build cannot take: [`UNSUPPORTED_CONTEXT`](crate::console::Error::UNSUPPORTED_CONTEXT),
+/// [`UNSUPPORTED_ARTIFACTS`](crate::console::Error::UNSUPPORTED_ARTIFACTS),
+/// [`UNSUPPORTED_SCRATCH`](crate::console::Error::UNSUPPORTED_SCRATCH). That is what `http`
+/// and `https` get everywhere today.
 ///
 /// **A URL and not a tagged object**, because there is exactly one thing this protocol does
 /// with it: hand it to whatever realizes that kind. A tagged object would put every kind's
@@ -220,25 +313,25 @@ pub struct InitCall {
 /// A kind that has to be *reached* rather than opened needs more than a name for it — an
 /// HTTP tree needs whatever authorizes the request, and a secret does not belong in a URL
 /// that gets logged, quoted in an error and written into a config file. So the URL is a
-/// member rather than the whole of a workfs, and what carries a credential is a member
+/// member rather than the whole of a tree, and what carries a credential is a member
 /// beside it, added when there is a provider that reads one. `file://` needs none, which is
 /// why there is none here yet.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkFsSource {
+pub struct TreeSource {
     /// `file:///srv/project`, `https://example.com/share`.
     pub url: String,
 }
 
-impl WorkFsSource {
+impl TreeSource {
     pub fn new(url: impl Into<String>) -> Self {
-        WorkFsSource { url: url.into() }
+        TreeSource { url: url.into() }
     }
 
     /// The scheme, which is the kind — `"file"`, `"https"`, or the whole URL when it has
     /// no `://` in it and so names no kind at all.
     ///
     /// What a server branches on to decide whether it has a provider, and what it names in
-    /// an [`UNSUPPORTED_WORKFS`](crate::console::Error::UNSUPPORTED_WORKFS) when it has not.
+    /// the refusal when it has not — see the type's docs for which code that is.
     pub fn scheme(&self) -> &str {
         self.url.split_once("://").map_or(&self.url, |(s, _)| s)
     }
@@ -256,6 +349,58 @@ impl WorkFsSource {
     /// type exists to prevent.
     pub fn file_path(&self) -> Option<&Path> {
         self.url.strip_prefix("file://").map(Path::new)
+    }
+}
+
+/// Which of a session's trees a [`TreeSource`] arrived as.
+///
+/// The member name and the code that refuses a scheme the build cannot realize, as one
+/// value — because a server that realizes trees does the same work three times and differs
+/// only in what it calls the tree and what it refuses it with. Passing this is what lets
+/// that be one function.
+///
+/// Here rather than in each server for the reason [`file_path`](TreeSource::file_path) is
+/// here: which code answers which member is a fact about the protocol, and two servers that
+/// spelled it separately could disagree about it — leaving a client to branch on a code that
+/// means one thing on one backend and another on the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TreeRole {
+    /// [`InitCall::context`] — what the session is given to work from.
+    Context,
+
+    /// [`InitCall::artifacts`] — what it is to leave behind.
+    Artifacts,
+
+    /// [`InitCall::scratch`] — room to work in, and where it stands.
+    Scratch,
+}
+
+impl TreeRole {
+    /// The member this tree travels under, which is also what an error calls it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TreeRole::Context => "context",
+            TreeRole::Artifacts => "artifacts",
+            TreeRole::Scratch => "scratch",
+        }
+    }
+
+    /// What a scheme this build has no provider for is refused with.
+    ///
+    /// One code per member, so a client that named three trees hears which of them the
+    /// build cannot take — see [`UNSUPPORTED_CONTEXT`](super::Error::UNSUPPORTED_CONTEXT).
+    pub fn unsupported(self) -> i64 {
+        match self {
+            TreeRole::Context => super::Error::UNSUPPORTED_CONTEXT,
+            TreeRole::Artifacts => super::Error::UNSUPPORTED_ARTIFACTS,
+            TreeRole::Scratch => super::Error::UNSUPPORTED_SCRATCH,
+        }
+    }
+}
+
+impl std::fmt::Display for TreeRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -279,7 +424,7 @@ impl WorkFsSource {
 /// # What is asked for is what is given
 ///
 /// A server provides this base or refuses the session, the same way it treats a
-/// [`NetworkAccess`] or a [`WorkFsSource`]. A reference it can parse but not fetch is a
+/// [`NetworkAccess`] or a [`TreeSource`]. A reference it can parse but not fetch is a
 /// different matter: pulling an image is slow enough that it belongs to a boot rather than
 /// to `init`, so a name that resolves to nothing is heard from the first call that needs a
 /// guest. A client that wants it sooner calls
@@ -287,7 +432,7 @@ impl WorkFsSource {
 ///
 /// # Why an object holding one member
 ///
-/// The same reason [`WorkFsSource`] is one. A platform, a pull policy, a place to put
+/// The same reason [`TreeSource`] is one. A platform, a pull policy, a place to put
 /// credentials: each is a thing that could be said about an image, and each belongs beside the
 /// reference rather than encoded into it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,7 +480,7 @@ impl From<String> for ImageSource {
 ///
 /// A name this build has no answer for is refused at `init` with
 /// [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) naming it — the same
-/// treatment an unknown workfs scheme gets, and for the same reason: a peer that has never
+/// treatment an unknown context scheme gets, and for the same reason: a peer that has never
 /// heard of a name still parses the frame, and refuses it for the reason it actually has.
 ///
 /// **A name and not an enumeration**, so the wire schema does not grow every time a backend
@@ -363,7 +508,7 @@ impl From<String> for ImageSource {
 ///
 /// # Why an object and not a string
 ///
-/// The same reason [`WorkFsSource`] is one. A reach is not always a single word — the ports
+/// The same reason [`TreeSource`] is one. A reach is not always a single word — the ports
 /// below are the first proof of it, and a list of hosts would be the next — and those belong
 /// beside the name rather than encoded into it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,7 +628,7 @@ impl ExecCall {
 /// Part of a file to hand back. The `params` of `read`.
 ///
 /// A path is one in the executor's own filesystem, under the
-/// [`path`](super::WorkFsMount::path) `init` answered with — so the file this names is the
+/// [`path`](super::TreeMount::path) `init` answered with — so the file this names is the
 /// one a command would open by the same name, and reading it is how a requester sees what
 /// an execution left behind.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,7 +699,7 @@ mod tests {
     /// is a session — one whose commands see the executor's own filesystem, with this
     /// protocol having described none of it.
     #[test]
-    fn a_session_with_no_workfs_carries_no_workfs() {
+    fn a_session_with_no_context_carries_no_context() {
         let init = InitCall::default();
         let doc = bson::serialize_to_document(&init).unwrap();
         assert_eq!(doc, doc! {});
@@ -564,21 +709,88 @@ mod tests {
         );
     }
 
-    /// The workfs is the URL, which is half of what the two ends have to agree on about
+    /// The context is the URL, which is half of what the two ends have to agree on about
     /// files; where it went is [`InitResp`](super::super::InitResp)'s half.
     #[test]
-    fn a_workfs_is_a_url() {
+    fn a_context_is_a_url() {
         let init = InitCall {
-            workfs: Some(WorkFsSource::new("file:///srv/project")),
+            context: Some(TreeSource::new("file:///srv/project")),
+            artifacts: None,
+            scratch: None,
             image: None,
             network: None,
             committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
-        assert_eq!(doc, doc! {"workfs": {"url": "file:///srv/project"}},);
+        assert_eq!(doc, doc! {"context": {"url": "file:///srv/project"}},);
         assert_eq!(
             bson::deserialize_from_document::<InitCall>(doc).unwrap(),
             init
+        );
+    }
+
+    /// Three trees, each under its own name and each spelled the same way — which is the
+    /// whole of what one [`TreeSource`] for all of them means on the wire.
+    #[test]
+    fn the_three_trees_are_three_members_of_one_kind() {
+        let init = InitCall {
+            context: Some(TreeSource::new("file:///srv/project")),
+            artifacts: Some(TreeSource::new("file:///srv/out")),
+            scratch: Some(TreeSource::new("file:///srv/scratch")),
+            image: None,
+            network: None,
+            committable: false,
+        };
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(
+            doc,
+            doc! {
+                "context": {"url": "file:///srv/project"},
+                "artifacts": {"url": "file:///srv/out"},
+                "scratch": {"url": "file:///srv/scratch"},
+            },
+        );
+        assert_eq!(
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
+        );
+    }
+
+    /// **Each is independently optional**, and a session that names only the two new ones
+    /// says only those — which is what lets a client take a context away later without the
+    /// frame becoming a shape nothing reads.
+    #[test]
+    fn a_session_may_name_any_of_the_trees_and_not_the_others() {
+        let init = InitCall {
+            context: None,
+            artifacts: Some(TreeSource::new("file:///srv/out")),
+            scratch: Some(TreeSource::new("file:///srv/scratch")),
+            image: None,
+            network: None,
+            committable: false,
+        };
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(
+            doc,
+            doc! {
+                "artifacts": {"url": "file:///srv/out"},
+                "scratch": {"url": "file:///srv/scratch"},
+            },
+        );
+        assert_eq!(
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
+        );
+
+        // And a session that names neither still serializes to what it always did, which is
+        // what lets a client of this build talk to a server that predates both members.
+        assert_eq!(
+            bson::serialize_to_document(&InitCall {
+                context: Some(TreeSource::new("file:///srv/project")),
+                ..InitCall::default()
+            })
+            .unwrap(),
+            doc! {"context": {"url": "file:///srv/project"}},
         );
     }
 
@@ -587,7 +799,9 @@ mod tests {
     #[test]
     fn an_image_is_a_reference() {
         let init = InitCall {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             image: Some(ImageSource::new("python:3.13-slim")),
             network: None,
             committable: false,
@@ -611,7 +825,9 @@ mod tests {
 
         // A session that says nothing about a base still serializes to what it always did.
         let quiet = InitCall {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             image: None,
             network: None,
             committable: false,
@@ -628,7 +844,9 @@ mod tests {
     #[test]
     fn a_network_is_a_name() {
         let init = InitCall {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             image: None,
             network: Some(NetworkAccess::public()),
             committable: false,
@@ -644,7 +862,9 @@ mod tests {
         // did**, which is what lets a client of this build talk to a server that predates the
         // member — and a server of this build answer a client that does.
         let quiet = InitCall {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             image: None,
             network: None,
             committable: false,
@@ -661,7 +881,9 @@ mod tests {
     #[test]
     fn a_host_port_grant_is_said_beside_the_reach() {
         let init = InitCall {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             image: None,
             network: Some(NetworkAccess::host().with_host_ports([8080, 3000])),
             committable: false,
@@ -705,24 +927,24 @@ mod tests {
     /// The two things a server reads off a URL, and the one it can act on.
     #[test]
     fn a_url_names_a_kind_and_sometimes_a_directory() {
-        let file = WorkFsSource::new("file:///srv/project");
+        let file = TreeSource::new("file:///srv/project");
         assert_eq!(file.scheme(), "file");
         assert_eq!(file.file_path(), Some(Path::new("/srv/project")));
 
-        let http = WorkFsSource::new("https://example.com/share");
+        let http = TreeSource::new("https://example.com/share");
         assert_eq!(http.scheme(), "https");
         assert_eq!(http.file_path(), None);
 
         // No scheme at all names no kind, and the whole of it is what a server has to put
         // in the message — there is nothing shorter that would say what arrived.
-        let bare = WorkFsSource::new("/srv/project");
+        let bare = TreeSource::new("/srv/project");
         assert_eq!(bare.scheme(), "/srv/project");
         assert_eq!(bare.file_path(), None);
 
         // An authority is not decoded away: what follows the scheme is the path, so this
         // one is relative and the caller is the end that refuses it.
         assert_eq!(
-            WorkFsSource::new("file://srv/project").file_path(),
+            TreeSource::new("file://srv/project").file_path(),
             Some(Path::new("srv/project"))
         );
     }

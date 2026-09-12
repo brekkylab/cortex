@@ -8,16 +8,20 @@
 //!   nothing there can drift. It is also the whole of what they say to each other: a boot is
 //!   started, told, and never asked anything, which is what made `cortex-uvm-boot` a separate
 //!   binary rather than a rewrite.
-//! - **the boot process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`SHARE_ENV`],
-//!   [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]). The other end of
-//!   that one is `cortex-uvm-guest`'s `contract` module, which **has to change with this
+//! - **the boot process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`CONTEXT_ENV`],
+//!   [`ARTIFACTS_ENV`], [`SCRATCH_ENV`], [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]).
+//!   The other end of that one is `cortex-uvm-guest`'s `contract` module, which **has to change with this
 //!   file** — that crate is built for a different target and takes nothing it does not need,
 //!   so the compiler will not notice a mismatch.
 //!
-//! Where the tree lands inside the guest is **the host's own path for it**, carried in
-//! [`SHARE_ENV`] like any other share. Not a constant of this crate's choosing: one spelling
-//! on both sides of the hypervisor is what lets a `cwd` the guest reports be a path the
-//! client can open, with nothing in the middle translating and nothing to disagree about.
+//! Where a tree lands inside the guest is **the host's own path for it**, carried in that
+//! tree's env like any other share. Not a constant of this crate's choosing: one spelling on
+//! both sides of the hypervisor is what lets a `cwd` the guest reports be a path the client
+//! can open, with nothing in the middle translating and nothing to disagree about.
+//!
+//! Three of them, one per tree a session can name, and three envs rather than one list
+//! because the guest does something different with one of them: it **stands** in the scratch.
+//! A list would carry the same three strings and leave the guest to work out which was which.
 //!
 //! The **guest** half is environment because that is the only channel libkrun's `exec` has:
 //! an argv and an env value alike become part of the guest's kernel command line, which is
@@ -71,23 +75,40 @@ pub const LOWER_ENV: &str = "CORTEX_UVM_LOWER";
 /// Told to the guest as `CORTEX_UVM_UPPER`.
 pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 
-/// Told to the guest as `CORTEX_UVM_SHARE`, spelled `tag:/guest/path`.
-pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
+/// Told to the guest as `CORTEX_UVM_CONTEXT`, spelled `tag:/guest/path`.
+pub const CONTEXT_ENV: &str = "CORTEX_UVM_CONTEXT";
+
+/// The artifacts tree, spelled the same way. Absent for a session that named none.
+pub const ARTIFACTS_ENV: &str = "CORTEX_UVM_ARTIFACTS";
+
+/// The scratch tree, spelled the same way, and **where the guest stands** when there is one.
+pub const SCRATCH_ENV: &str = "CORTEX_UVM_SCRATCH";
 
 /// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
 /// which is a guest with no `/abin` at all rather than an empty one.
 pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
 
-/// The virtio-fs tag the tree is attached under. Never seen by a caller: it is an
+/// The virtio-fs tag the context is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
-pub const WORKFS_TAG: &str = "cortexws";
+pub const CONTEXT_TAG: &str = "cortexctx";
+
+/// The tag the artifacts tree is attached under.
+pub const ARTIFACTS_TAG: &str = "cortexart";
+
+/// The tag the scratch tree is attached under.
+///
+/// One device per tree rather than one device with three directories under it, because the
+/// host has three directories and no common parent to serve: each is somewhere the caller
+/// mounted it, and inventing a parent would mean the host arranging its own filesystem around
+/// what this protocol happens to carry.
+pub const SCRATCH_TAG: &str = "cortexscratch";
 
 /// The virtio-fs tag a committable session's scratch directory is shared under.
 pub const COMMIT_TAG: &str = "cortexcommit";
 
 /// Where the guest finds that scratch, and where it writes a commit's layer.
 ///
-/// A fixed path rather than the host's own, unlike the workfs: nothing outside this
+/// A fixed path rather than the host's own, unlike the context: nothing outside this
 /// workspace names it, so there is no second speller for it to have to agree with.
 pub const COMMIT_PATH: &str = "/.cortex-commit";
 
@@ -170,8 +191,16 @@ pub struct BootArgs {
     pub abin: Option<PathBuf>,
 
     /// The host directory to put in front of the guest, and `None` for a session that declared
-    /// no tree. Mounted in the guest at **this same path** — see [`SHARE_ENV`].
-    pub workfs: Option<PathBuf>,
+    /// no tree. Mounted in the guest at **this same path** — see [`CONTEXT_ENV`].
+    pub context: Option<PathBuf>,
+
+    /// Where the session leaves what it produces, and `None` for a session that named none.
+    /// Shared and mounted exactly as the context is, at this same host path.
+    pub artifacts: Option<PathBuf>,
+
+    /// Room for the session to work in, and `None` for a session that named none. Shared as
+    /// the two above are, and additionally **where the guest stands** — see [`SCRATCH_ENV`].
+    pub scratch: Option<PathBuf>,
 
     /// How much of a network the session gets. Decided by the server, because it decides a
     /// *device*, which is attached before a kernel comes up.
@@ -205,8 +234,8 @@ impl BootArgs {
     /// The arguments a server spawns a boot with, after [`BOOT_ARG`](crate::server::BOOT_ARG).
     ///
     /// `OsString` throughout: a path that is not UTF-8 is still a path, and nothing here has to
-    /// read one as text. The one exception is `workfs`, which the guest is told about as a
-    /// string, and that is refused where it is used rather than here.
+    /// read one as text. The exceptions are the three trees, which the guest is told about as
+    /// strings, and that is refused where it is used rather than here.
     pub fn to_args(&self) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
 
@@ -233,8 +262,14 @@ impl BootArgs {
         for port in &self.host_ports {
             put("--host-port", OsStr::new(&port.to_string()));
         }
-        if let Some(workfs) = &self.workfs {
-            put("--workfs", workfs.as_os_str());
+        if let Some(context) = &self.context {
+            put("--context", context.as_os_str());
+        }
+        if let Some(artifacts) = &self.artifacts {
+            put("--artifacts", artifacts.as_os_str());
+        }
+        if let Some(scratch) = &self.scratch {
+            put("--scratch", scratch.as_os_str());
         }
         if let Some(abin) = &self.abin {
             put("--abin", abin.as_os_str());
@@ -265,7 +300,9 @@ impl BootArgs {
         let mut session = None;
         let mut network = None;
         let mut host_ports = Vec::new();
-        let mut workfs = None;
+        let mut context = None;
+        let mut artifacts = None;
+        let mut scratch = None;
         let mut abin = None;
         let mut committable = false;
         let mut commit_out = None;
@@ -290,7 +327,9 @@ impl BootArgs {
                 "--session" => session = Some(PathBuf::from(value()?)),
                 "--network" => network = Some(text(&flag, value()?)?),
                 "--host-port" => host_ports.push(number(&flag, value()?)?),
-                "--workfs" => workfs = Some(PathBuf::from(value()?)),
+                "--context" => context = Some(PathBuf::from(value()?)),
+                "--artifacts" => artifacts = Some(PathBuf::from(value()?)),
+                "--scratch" => scratch = Some(PathBuf::from(value()?)),
                 "--abin" => abin = Some(PathBuf::from(value()?)),
                 "--committable" => committable = true,
                 "--commit-out" => commit_out = Some(PathBuf::from(value()?)),
@@ -319,7 +358,9 @@ impl BootArgs {
                 None => anyhow::bail!("--network is missing — a boot is started by a server"),
             },
             host_ports,
-            workfs,
+            context,
+            artifacts,
+            scratch,
             committable,
             commit_out,
             abin,
@@ -493,7 +534,9 @@ mod tests {
             session: "/tmp/session.ext4".into(),
             network: Network::Public,
             host_ports: vec![8080, 3000],
-            workfs: Some("/Users/someone/project".into()),
+            context: Some("/Users/someone/project".into()),
+            artifacts: Some("/Users/someone/out".into()),
+            scratch: Some("/Users/someone/scratch".into()),
             abin: Some("/cache/layers/sha256_2b91c4.erofs".into()),
             committable: true,
             commit_out: Some("/tmp/cortex-uvm-commit".into()),
@@ -561,18 +604,27 @@ mod tests {
 
     /// The optional ones are absent rather than empty, and come back absent.
     ///
-    /// A session with no tree is the case that matters: an empty `--workfs` would be a
-    /// directory named by the empty string, and the boot would try to share it.
+    /// A session with no tree is the case that matters: an empty `--context` would be a
+    /// directory named by the empty string, and the boot would try to share it. The same goes
+    /// for the two trees beside it, which are shared by exactly the same mechanism.
     #[test]
     fn what_was_not_said_is_not_sent() {
         let bare = BootArgs {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             vcpus: None,
             memory_mib: None,
             ..args()
         };
         let spelled = bare.to_args();
-        for flag in ["--workfs", "--vcpus", "--memory-mib"] {
+        for flag in [
+            "--context",
+            "--artifacts",
+            "--scratch",
+            "--vcpus",
+            "--memory-mib",
+        ] {
             assert!(
                 !spelled.iter().any(|arg| arg == flag),
                 "{flag} was sent anyway"

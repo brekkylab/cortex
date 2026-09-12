@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-use crate::console::{Client, CommitCall, ExecCall, ExecResp, ImageSource, WorkFsSource};
+use crate::console::{Client, CommitCall, ExecCall, ExecResp, ImageSource, TreeSource};
 
 use super::{BuildId, Recipe, Step, digest};
 
@@ -39,7 +39,7 @@ pub struct Rootfs {
     /// The half that can be written down and read back somewhere else.
     recipe: Recipe,
     /// What a `COPY` source is relative to, and what is mounted as the build session's
-    /// workfs. Defaults to the current directory, which is what a caller writing
+    /// context. Defaults to the current directory, which is what a caller writing
     /// `.copy("app", …)` means by `app`.
     ///
     /// Beside the recipe rather than in it: an absolute path on one machine means nothing on
@@ -149,7 +149,7 @@ impl Rootfs {
     ///
     /// # This directory is writable, and it is the real one
     ///
-    /// Not a copy. It is shared into the session the way any workfs is — the same directory,
+    /// Not a copy. It is shared into the session the way any context is — the same directory,
     /// at the same path, over virtio-fs — so a `RUN rm -rf *` or a `RUN make` deletes and
     /// writes **the caller's own files**, and what it leaves behind changes the next build's
     /// [`id`](Self::id). `docker build` uploads a snapshot and cannot do this; nothing here
@@ -274,8 +274,8 @@ pub(crate) struct Plan {
     pub image: ImageSource,
     /// The base to build over, as the caller spelled it.
     pub base: ImageSource,
-    /// The build context, as the workfs a build session works in.
-    pub workfs: WorkFsSource,
+    /// The build context, named as the tree a build session works in.
+    pub context: TreeSource,
     /// What the built image should state, accumulated from the steps.
     pub env: Vec<String>,
     pub working_dir: Option<String>,
@@ -292,14 +292,14 @@ pub(crate) struct Plan {
 pub(crate) fn plan(recipe: &Recipe, context: &Path) -> anyhow::Result<Plan> {
     let id = digest(recipe, context)?;
 
-    // Absolute, because a workfs is named to the server as a `file://` URL and a relative
+    // Absolute, because a context is named to the server as a `file://` URL and a relative
     // path after `file://` reads as a host. Resolved here rather than in `context` so that a
     // caller can name a directory that does not exist yet and be told when it is used.
     let context = std::path::absolute(context)
         .with_context(|| format!("resolving the build context at {}", context.display()))?;
     let context = context.to_str().with_context(|| {
         format!(
-            "a build context that is not UTF-8 cannot be named as a workfs: {:?}",
+            "a build context that is not UTF-8 cannot be named as one: {:?}",
             context
         )
     })?;
@@ -309,7 +309,7 @@ pub(crate) fn plan(recipe: &Recipe, context: &Path) -> anyhow::Result<Plan> {
         image: ImageSource::new(reference(&id)),
         id,
         base: ImageSource::new(recipe.base.clone()),
-        workfs: WorkFsSource::new(format!("file://{context}")),
+        context: TreeSource::new(format!("file://{context}")),
         env,
         working_dir,
     })
@@ -454,7 +454,7 @@ mod tests {
     use crate::BoxFuture;
     use crate::console::{
         Call, Client, CommitResp, Console, ConsoleBuilder, Error, Failure, ImageSource, InitCall,
-        InitResp, Notification, Response, WorkFsMount,
+        InitResp, Notification, Response, TreeMount,
     };
 
     /// Every call a build made, in order.
@@ -504,10 +504,10 @@ mod tests {
         (builder, log)
     }
 
-    /// A session taken, with the workfs put where the build said it was.
+    /// A session taken, with the context put where the build said it was.
     fn took_the_session(at: &Path) -> Response {
         Response::Init(InitResp {
-            workfs: Some(WorkFsMount {
+            context: Some(TreeMount {
                 path: at.to_str().unwrap().to_string(),
             }),
             ..InitResp::default()
@@ -620,7 +620,7 @@ mod tests {
         // Neither asked for by this caller, and neither borrowed from the build: a build is
         // committable and mounts its context, and this session is not and does not.
         assert!(!init.committable, "the build's commit right leaked");
-        assert!(init.workfs.is_none(), "the build's context leaked");
+        assert!(init.context.is_none(), "the build's context leaked");
     }
 
     /// An image nobody has built is built, and then the session is asked for again.
@@ -695,11 +695,11 @@ mod tests {
     async fn each_step_goes_on_the_wire_as_the_design_says() {
         let context = tempfile::tempdir().unwrap();
         std::fs::write(context.path().join("app.py"), b"x").unwrap();
-        let workfs = context.path().to_path_buf();
+        let at = context.path().to_path_buf();
 
         let (builder, log) = answering(vec![
             unknown_image(),
-            took_the_session(&workfs),
+            took_the_session(&at),
             ran(0), // RUN
             ran(0), // COPY
             ran(0), // WORKDIR
@@ -731,7 +731,7 @@ mod tests {
                     "-c",
                     "mkdir -p -- \"$(dirname -- \"$2\")\" && cp -a -- \"$1\" \"$2\"",
                     "cp",
-                    workfs.join("app.py").to_str().unwrap(),
+                    at.join("app.py").to_str().unwrap(),
                     "/srv/app.py"
                 ],
                 vec!["cd", "/srv"],
@@ -740,7 +740,7 @@ mod tests {
     }
 
     /// A build session says what it is at `init`: committable, with the context as its
-    /// workfs, on the base the caller named rather than the image being built, and reaching
+    /// context, on the base the caller named rather than the image being built, and reaching
     /// the internet because this session asked for nothing.
     #[tokio::test]
     async fn a_build_session_declares_itself() {
@@ -766,7 +766,7 @@ mod tests {
         let init = inits(&log).remove(1);
         assert!(init.committable, "a build session cannot commit");
         assert_eq!(init.image.as_ref().unwrap().reference, "alpine:3.20");
-        assert!(init.workfs.is_some(), "the context was not mounted");
+        assert!(init.context.is_some(), "the context was not mounted");
         // Said without being asked for: a build's first step is usually a fetch, so a
         // server default of "the host and no further" would fail nearly every build.
         assert_eq!(

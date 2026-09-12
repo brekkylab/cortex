@@ -63,7 +63,7 @@
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
-//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) |
+//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_CONTEXT`](Error::UNSUPPORTED_CONTEXT), [`UNSUPPORTED_ARTIFACTS`](Error::UNSUPPORTED_ARTIFACTS), [`UNSUPPORTED_SCRATCH`](Error::UNSUPPORTED_SCRATCH) |
 //! | `exec` | [`ExecCall`] | [`ExecResp`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `write` | [`WriteCall`] | [`WriteResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
@@ -100,12 +100,12 @@
 //! asked for that call, as [`BOOT_FAILED`](Error::BOOT_FAILED).
 //!
 //! `init` is the exception and is a call, because it is not about resources. It says what
-//! the session *is* — the tree it works in, and what its commands run in and may reach —
-//! and its response is
+//! the session *is* — the trees it works in, leaves its output in and stands in, and what
+//! its commands run in and may reach — and its response is
 //! the one thing a client can act on before it has asked for any work: that there is a
 //! server on the far end, that it speaks this protocol, that it has taken what it was told,
-//! and where it will put the tree. That last part is why the answer is read rather than
-//! merely awaited: every path in the session afterwards is spelled under it.
+//! and where it will put each tree. That last part is why the answer is read rather than
+//! merely awaited: every path in the session afterwards is spelled under one of them.
 //!
 //! # Why the codec is BSON
 //!

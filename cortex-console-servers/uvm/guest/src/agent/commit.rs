@@ -18,7 +18,7 @@
 //! being written into, and the mount points of anything shared in. None of it is the session's
 //! work, and one of them is this binary — over a megabyte of it.
 //!
-//! **A mount point's ancestors go too, when they were only ever the way to it.** The workfs is
+//! **A mount point's ancestors go too, when they were only ever the way to it.** The context is
 //! mounted at the host's own path, so a session on `/private/var/folders/…/T/x` has every
 //! directory along that path in its upper, created for no other reason. Dropping the first
 //! component would be wrong in general — a tree at `/home/me/proj` must not take `/home` with
@@ -325,7 +325,7 @@ mod tests {
         );
     }
 
-    /// The workfs case: every directory on the way to the mount point was created for it and
+    /// The context case: every directory on the way to the mount point was created for it and
     /// goes with it, but a directory that holds something else stays.
     #[test]
     fn a_mount_points_ancestors_go_only_when_they_held_nothing_else() {
