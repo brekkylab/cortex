@@ -207,15 +207,19 @@ Up to three of them, each named by URL going out and by a path coming back, and 
 ← {"context":{"path":"/mnt/context"},"artifacts":{"path":"/mnt/artifacts"},"scratch":{"path":"/mnt/scratch"}}
 ```
 
-| member | is | outlives the session |
-|---|---|---|
-| `context` | what the session is given to work **from**, and reads | yes — it was there before |
-| `artifacts` | what the session is to leave behind | yes — that is the point of it |
-| `scratch` | room to work in, and **where the session stands** | no |
+| member | is | writable | outlives the session |
+|---|---|---|---|
+| `context` | what the session is given to work **from**, and reads | **no** | yes — it was there before |
+| `artifacts` | what the session is to leave behind | yes | yes — that is the point of it |
+| `scratch` | room to work in, and **where the session stands** | yes | no |
 
 A *context* is what the session is given to work from, as against the rootfs its commands run on.
 **The work is not done here**: a session writes in its scratch and leaves its result in its artifacts, so what this tree is for is being read.
-That is the intent rather than something enforced today — no server refuses a write to it yet — and it is what the other two members exist to make possible.
+That is what the other two members exist to make possible, and it is enforced rather than merely meant: a `write` naming a path in the context comes back `-32007`, the code a read-only filesystem answers one with.
+
+How far it reaches is the backend's, because read-only-ness is a property of what the tree was mounted as and this protocol mounts nothing.
+A backend with a kernel of its own mounts the context `MS_RDONLY` and every write into it fails, a command's included.
+A backend that runs commands on the host has nothing mounted to be read-only, so it answers for the `write` calls it performs itself and leaves a spawned command the reach the host gives it — which is the same thing that makes the host backend's paths a place to stand rather than a confinement.
 
 [`fs`](../fs/ARCHITECTURE.md) spells it the same way (`ContextFs`), so one word means one thing on both sides of the seam.
 

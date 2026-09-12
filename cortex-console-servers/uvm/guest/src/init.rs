@@ -110,9 +110,23 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
     // Every tree the session named, each at the host's own path for it. The artifacts tree is
     // mounted and nothing else is done with it: what it is *for* is the client's, and a
     // command reaches it by the path `init` answered.
-    let context = share(CONTEXT_ENV)?;
-    share(ARTIFACTS_ENV)?;
-    let scratch = share(SCRATCH_ENV)?;
+    //
+    // **The context read-only**, which is the one way the three differ here. It is the tree
+    // the session was given rather than one it was given to fill — what it produces belongs
+    // in the artifacts and what it needs room for belongs in the scratch — so a write into it
+    // is a mistake, and the mount is where a mistake can still be answered with `EROFS`
+    // rather than with somebody's project already edited.
+    //
+    // A guard rail and not a boundary, and the difference is worth being exact about: a
+    // virtio-fs share has no read-only option on the host side and the guest is root inside
+    // itself, so a command that sets out to `mount -o remount,rw` this can. That is the same
+    // reasoning `/abin` is a disk for — see the boot role — and the conclusion differs only
+    // because the context is a host directory and cannot be attached as one. What is left is
+    // worth having on its own: every write that did not mean to land here fails, and the ones
+    // that did are a session doing something it would have to have gone out of its way to do.
+    let context = share(CONTEXT_ENV, libc::MS_RDONLY)?;
+    share(ARTIFACTS_ENV, 0)?;
+    let scratch = share(SCRATCH_ENV, 0)?;
 
     // Where a command runs is the session's, and the agent sets it per command — but this
     // process has to stand somewhere, and a session with no tree stands here.
@@ -300,7 +314,11 @@ fn pivot(new_root: &str) -> anyhow::Result<()> {
 ///
 /// The mountpoint is the host's own path for it, which is what makes a `cwd` this end
 /// reports a name the client can open — see [`contract`](crate::contract).
-fn share(env: &str) -> anyhow::Result<Option<PathBuf>> {
+///
+/// `flags` is what separates the three: they are otherwise the same mount, and the only one
+/// that differs is the context, which goes up [`MS_RDONLY`](libc::MS_RDONLY) — see the caller
+/// for why that is a guard rail rather than a boundary.
+fn share(env: &str, flags: libc::c_ulong) -> anyhow::Result<Option<PathBuf>> {
     let Ok(spec) = std::env::var(env) else {
         return Ok(None);
     };
@@ -310,7 +328,7 @@ fn share(env: &str) -> anyhow::Result<Option<PathBuf>> {
         anyhow::bail!("{env} is `{spec}`, which is not `tag:/mountpoint`");
     };
 
-    mount(tag, mountpoint, "virtiofs", 0)
+    mount(tag, mountpoint, "virtiofs", flags)
         .map_err(|e| anyhow::anyhow!("mounting {env} at {mountpoint}: {e}"))?;
     Ok(Some(PathBuf::from(mountpoint)))
 }

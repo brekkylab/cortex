@@ -30,9 +30,13 @@
 //! read — see [`tree`], which is that check for all three of them.
 //!
 //! The three are the same work here and differ only in what the client means by them, so
-//! this server holds each as a path and treats them alike — with one exception: a session
-//! **starts in its scratch** when it has one, and in its context otherwise. See
-//! [`home`](Session::home) for why the scratch comes first.
+//! this server holds each as a path and treats them alike — with two exceptions. A session
+//! **starts in its scratch** when it has one, and in its context otherwise; see
+//! [`home`](Session::home) for why the scratch comes first. And **the context is read-only**:
+//! a `write` that lands in it is refused rather than performed, because that tree is the one
+//! the session was given and not one it was given to fill. See
+//! [`read_only`](Session::read_only), which is also where the limit of that is written down —
+//! a spawned command runs on this host and writes wherever this host lets it.
 //!
 //! Where the session *stands* starts there and moves only through [`cd`](Session::change_dir),
 //! which this server answers itself: it is a shell builtin rather than a program, so an
@@ -52,7 +56,9 @@
 //! name the same file. See [`at`], which is the whole of that agreement.
 //!
 //! It is a place to stand and not a confinement: an absolute path, or one with enough `..`,
-//! still leaves the tree.
+//! still leaves the tree. What a path *is* checked for is the context, which a `write` may
+//! not land in — and the check resolves the path first ([`resolved`]), so leaving the tree
+//! that way is leaving it rather than a way around the rule.
 //!
 //! Both boot the session first, because that rule is the protocol's rather than this
 //! backend's — and here it is also what checks that the directory they resolve in is there
@@ -193,7 +199,7 @@ pub async fn run() -> anyhow::Result<()> {
 
                 Call::Write(write) => {
                     let answered = match session.boot() {
-                        Ok(()) => write_file(session.cwd(), &write).await,
+                        Ok(()) => write_file(&session, &write).await,
                         Err(e) => Response::Error(e),
                     };
                     server.respond(id, answered).await?;
@@ -239,6 +245,16 @@ struct Session {
     /// being the same path the first time a command runs `cd`: this one is the tree, and
     /// [`home`](Self::home) is what `cd` with no argument goes back to.
     context: Option<PathBuf>,
+
+    /// The context as this host resolves it, and `None` until a boot has found it.
+    ///
+    /// What a write is checked against, and a second path rather than a use of
+    /// [`context`](Self::context) because the two answer different questions. That one is
+    /// the spelling the client was told and has to stay exactly as it arrived; this one is
+    /// the directory that spelling reaches, which is the only form a `..` or a symlink can
+    /// be compared through. It is taken at the boot that canonicalizes the tree anyway —
+    /// see [`boot`](Self::boot) — so the check costs a boot and not a write.
+    context_real: Option<PathBuf>,
 
     /// The directory a `file://` artifacts named, or `None` for a session that leaves
     /// nothing anybody collects.
@@ -348,7 +364,38 @@ impl Session {
     /// It is still not a no-op: the next call that needs a session checks again, which is
     /// what a client that sent `stop` because the tree might go away is asking for.
     fn release(&mut self) {
+        self.context_real = None;
         self.booted = false;
+    }
+
+    /// Refuse `path` if it is in the context, which is the tree this session reads and does
+    /// not write.
+    ///
+    /// **The context is read-only**, and this is where that is true of a file call: what a
+    /// session produces belongs in its artifacts and what it needs room for belongs in its
+    /// scratch, so a `write` landing in the tree the client was already keeping is a mistake
+    /// to answer rather than to carry out. The uvm backend says the same thing with a mount
+    /// flag and the guest kernel answers `EROFS`; this backend mounts nothing, so the check
+    /// is here and the code is the one that arrives from there —
+    /// [`IO_FAILED`](Error::IO_FAILED), which is what a read-only filesystem refusing a write
+    /// already came back as. A client hears one answer from both backends.
+    ///
+    /// **Only the file calls, and only this backend's honesty about it.** A command this
+    /// server spawns runs on the host with the session's own privileges, so `sh -c 'echo x >
+    /// ctx/f'` writes — there is no mount to be read-only and no confinement here (see
+    /// [`at`]). What this stops is the protocol being the thing that did it.
+    fn read_only(&self, path: &Path) -> Option<Error> {
+        let context = self.context_real.as_deref()?;
+        resolved(path).starts_with(context).then(|| {
+            refused(
+                Error::IO_FAILED,
+                format!(
+                    "{}: read-only file system — the context is the tree this session was \
+                     given, and what it writes belongs in its artifacts or its scratch",
+                    path.display()
+                ),
+            )
+        })
     }
 
     /// Where this session starts, and what `cd` with no argument goes back to — `None` for
@@ -395,9 +442,14 @@ impl Session {
         // send afterwards — an artifacts directory that is not there fails the first write
         // into it rather than here, which is the same wrong moment a missing context used to
         // fail at. The message names which tree it was: one code, three places it can be.
+        let mut context_real = None;
         for (role, at) in self.trees() {
             match at.canonicalize() {
-                Ok(physical) if physical.is_dir() => {}
+                Ok(physical) if physical.is_dir() => {
+                    if role == TreeRole::Context {
+                        context_real = Some(physical);
+                    }
+                }
                 Ok(_) => {
                     return Err(refused(
                         Error::MOUNT_FAILED,
@@ -413,6 +465,7 @@ impl Session {
             }
         }
 
+        self.context_real = context_real;
         self.booted = true;
         Ok(())
     }
@@ -653,6 +706,37 @@ fn at(root: Option<&Path>, path: &str) -> PathBuf {
     }
 }
 
+/// `path` with as much of it resolved as exists, and the rest left as it came.
+///
+/// [`Path::canonicalize`] needs every component to be there, and the path a `write` names is
+/// the file it is about to create — so canonicalizing the whole of one answers `NotFound` for
+/// exactly the call this is asked about. Resolving the deepest ancestor that *does* exist and
+/// putting the rest back answers the question instead: which tree the file will land in, for a
+/// file that is not in one yet.
+///
+/// A `..` in the part that was resolved is gone, which is the point — it is how a path that
+/// walks out of the context stops looking like one that is in it. A `..` left in the tail is a
+/// path whose parent is not there either, so it names nothing a write could reach.
+fn resolved(path: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            let mut out = real;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                at = parent;
+            }
+            // Nothing left to climb: the path is as resolved as this host can make it.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Run one command, and answer with everything it produced.
 ///
 /// One request, one answer: the command is spawned, both of its pipes are drained, and
@@ -811,9 +895,18 @@ async fn read_file(root: Option<&Path>, read: &ReadCall) -> Response {
 /// was not there, cut to nothing if it was. An offset means only those bytes are being
 /// spoken for, so the file is opened without truncating and whatever lies past them
 /// stays.
-async fn write_file(root: Option<&Path>, write: &WriteCall) -> Response {
-    let path = at(root, &write.path);
+///
+/// A path in the context is refused before either happens — see
+/// [`Session::read_only`].
+async fn write_file(session: &Session, write: &WriteCall) -> Response {
+    let path = at(session.cwd(), &write.path);
     let path = path.as_path();
+
+    // Before the file is opened, because a refusal that has already truncated something is
+    // not a refusal. See [`Session::read_only`].
+    if let Some(refusal) = session.read_only(path) {
+        return Response::Error(refusal);
+    }
 
     let file = match write.offset {
         None => tokio::fs::File::create(path).await,

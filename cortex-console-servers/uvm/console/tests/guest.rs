@@ -235,6 +235,10 @@ async fn an_artifacts_tree_that_is_not_there_is_refused_before_a_vm_is_started()
 /// The three trees are three shares, each at the host's own path for it, and **the session
 /// stands in the scratch** — so a relative path a command writes lands there rather than in
 /// the tree the client was working on.
+///
+/// And the context is mounted read-only, which is the one thing the guest does differently
+/// with the three. Asserted here rather than in a boot of its own for the reason at the top
+/// of this file: it is the same session a client performs, one step further along.
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
 async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
@@ -287,6 +291,33 @@ async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
         std::fs::read_to_string(artifacts.join("report.txt")).unwrap(),
         "kept\n"
     );
+
+    // The context is read-only, and here that is the guest kernel's answer rather than a
+    // rule the protocol applies: the share went up `MS_RDONLY`, so the command's own
+    // redirection fails and the client's project is as it was.
+    let refused = fx
+        .output(&format!("echo edited > {}/given.txt", context.display()))
+        .await;
+    assert_ne!(refused.code, 0, "a command wrote into a read-only context");
+    assert_eq!(
+        std::fs::read_to_string(context.join("given.txt")).unwrap(),
+        "from the client\n",
+        "the tree the client gave the session came back edited"
+    );
+
+    // And the file plane says the same, with the code a read-only filesystem refusing a
+    // write comes back as — which is what `cortex-local-console` answers for the same call,
+    // where there is no mount to be read-only and the server checks the path itself.
+    let refused = fx
+        .console
+        .write(
+            context.join("given.txt").to_str().unwrap(),
+            &b"edited"[..],
+            None,
+        )
+        .await
+        .expect_err("writing into the context");
+    assert_eq!(refused.code(), Some(cortex::console::Error::IO_FAILED));
 }
 
 /// A session, from the outside: commands run somewhere that is not this host, on a

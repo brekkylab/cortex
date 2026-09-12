@@ -177,9 +177,16 @@ pub struct InitCall {
     /// wrote its output and its working files in here would be leaving them in somebody's
     /// project, and the client would be left to work out which files were new.
     ///
-    /// So this tree is for *reading*, which is what its name says and what the two members
-    /// beside it exist to make possible. That is the intent and not yet something enforced:
-    /// no server here refuses a write to it.
+    /// So this tree is for *reading*, which is what its name says, what the two members
+    /// beside it exist to make possible, and what a server is expected to hold a client to:
+    /// a `write` naming a path in here is refused with
+    /// [`IO_FAILED`](crate::console::Error::IO_FAILED), the code a read-only filesystem
+    /// already answers one with.
+    ///
+    /// How far that reaches is the backend's, because it is a property of what the tree is
+    /// mounted as rather than of this protocol. A backend with a kernel of its own mounts it
+    /// read-only and every write fails, a command's included; a backend running commands on
+    /// the host can only answer for the calls it performs itself, and says so.
     ///
     /// Answered by a [`TreeMount`](super::TreeMount) saying where the server put it,
     /// which is what makes every later path in this protocol a path both ends can spell.

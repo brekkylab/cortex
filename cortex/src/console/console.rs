@@ -191,6 +191,12 @@ impl ConsoleBuilder {
     /// the host already has: there is nothing to put up for one, and nothing this end takes
     /// down at the end of the session.
     ///
+    /// **The session reads this tree and does not write in it.** A [`write`](Console::write)
+    /// naming a path inside it is refused, and a server with a kernel of its own mounts it
+    /// read-only so that a command cannot write there either — which is what
+    /// [`artifacts`](Self::artifacts) and [`scratch`](Self::scratch) are for, and how a
+    /// caller gets a tree back unchanged rather than a promise that it was not touched.
+    ///
     /// Leaving it out is a console with nothing mounted; see the field this fills.
     pub fn context(mut self, mount: impl Mount + 'static) -> Self {
         self.context = Some(Box::new(mount));
@@ -632,6 +638,35 @@ impl Console {
     /// [`exec`](Self::exec).
     pub fn scratch_path(&self) -> Option<&Path> {
         self.scratch.as_ref().map(|tree| tree.path.as_path())
+    }
+
+    /// Whether this session has a tree at all, which is whether a path this console sends
+    /// can name one of the caller's files.
+    ///
+    /// The same answer as [`context_path`](Self::context_path) being `Some`, for a caller
+    /// that wants the question and not the path: a [`read`](Self::read) or a
+    /// [`write`](Self::write) has nowhere to join onto without one, so this is what to ask
+    /// before building a path rather than after failing to.
+    pub fn has_context(&self) -> bool {
+        self.context.is_some()
+    }
+
+    /// Whether this session has somewhere to leave what the caller came for.
+    ///
+    /// A session without one still runs commands; what it does not have is a tree whose
+    /// contents outlive it on the caller's terms. Worth asking before running the work that
+    /// would write there — see [`artifacts_path`](Self::artifacts_path) for where it goes.
+    pub fn has_artifacts(&self) -> bool {
+        self.artifacts.is_some()
+    }
+
+    /// Whether this session has a tree to work in, and so whether it stands in one.
+    ///
+    /// Without it the session starts wherever the server puts a session with nothing
+    /// mounted, and writes that go nowhere named go nowhere the caller can reach — see
+    /// [`scratch_path`](Self::scratch_path).
+    pub fn has_scratch(&self) -> bool {
+        self.scratch.is_some()
     }
 
     /// The base this session's commands run in, as the server answered.
