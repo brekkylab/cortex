@@ -36,7 +36,7 @@ use std::{
 
 use clap::Parser as _;
 
-use crate::{memory::Memory, store::Store};
+use crate::{memory::Memory, store::{Record, Store}};
 
 /// The name every message this program writes about itself is spelled with.
 ///
@@ -171,6 +171,32 @@ struct Search {
 /// path they typed is the one thing in the message they can act on.
 fn refused(store: &Path, said: impl std::fmt::Display) -> String {
     format!("{NAME}: {}: {said}\n", store.display())
+}
+
+/// 레코드들, 한 줄에 하나 — 본문, 또는 `--json`이 주어졌을 때 그 줄의 JSON.
+///
+/// **기본 포맷은 지금까지와 같은 본문 한 줄이다.** `index`가 같은 모양으로 답하고,
+/// 파이프로 읽는 쪽이 기대하는 것도 그것이다. 그 포맷이 말할 수 없는 것이 두 가지 있어
+/// `--json`이 있다: 행의 id와, 줄바꿈이 든 본문. 메모리 본문은 마크다운이므로 여러 줄일
+/// 수 있고, 그러면 "한 줄에 하나"가 모호해진다.
+///
+/// JSON 배열이 아니라 한 줄에 객체 하나(JSONL)인 것은 기본 포맷의 모양을 그대로 잇기
+/// 위해서다. 읽는 쪽은 줄 단위로 처리하면 되고 전체를 버퍼링할 필요가 없다.
+///
+/// `to_string`은 여기서 실패할 수 없다. 모든 필드가 `String`이고, `serde_json`이 구조체에
+/// 대해 갖는 실패는 문자열이 아닌 맵 키와 수가 아닌 부동소수뿐이다. 둘 다 닿을 수 없으므로
+/// 그것이 될 뻔한 실패는 버그로 적지, 모든 호출자의 시그니처로 옮기지 않는다.
+fn lines(records: &[Record], json: bool) -> String {
+    let mut said = String::new();
+    for record in records {
+        if json {
+            said.push_str(&serde_json::to_string(record).expect("a record of three strings"));
+        } else {
+            said.push_str(&record.text);
+        }
+        said.push('\n');
+    }
+    said
 }
 
 /// The command, done: what to say on stdout, or the line to say on stderr instead.
@@ -510,5 +536,37 @@ mod tests {
         for command in ["init", "insert", "search"] {
             assert!(said.contains(command), "{command} is missing from: {said}");
         }
+    }
+
+    /// 한 레코드는 한 줄이고, 그 줄은 파싱되는 JSON이다.
+    #[test]
+    fn a_record_is_one_line_of_json() {
+        let record = Record {
+            id: "018f".into(),
+            text: "줄이\n두 개인 \"메모리\"".into(),
+            written_at: "2026-09-14T06:12:03Z".into(),
+        };
+
+        let said = lines(std::slice::from_ref(&record), true);
+
+        // 여러 줄짜리 본문이라도 출력은 한 줄이다 — 그것이 JSONL의 요점이다.
+        assert_eq!(said.lines().count(), 1, "one record is one line: {said:?}");
+
+        let back: serde_json::Value = serde_json::from_str(said.trim_end()).expect("a JSON line");
+        assert_eq!(back["id"], "018f");
+        assert_eq!(back["text"], "줄이\n두 개인 \"메모리\"");
+        assert_eq!(back["written_at"], "2026-09-14T06:12:03Z");
+    }
+
+    /// `--json` 없이는 지금까지의 포맷 그대로 — 본문만, 한 줄에 하나.
+    #[test]
+    fn without_json_a_record_is_its_text() {
+        let record = Record {
+            id: "018f".into(),
+            text: "오트밀크로 바꿨다".into(),
+            written_at: "2026-09-14T06:12:03Z".into(),
+        };
+
+        assert_eq!(lines(std::slice::from_ref(&record), false), "오트밀크로 바꿨다\n");
     }
 }

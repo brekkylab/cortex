@@ -59,6 +59,25 @@ use crate::memory::Memory;
 /// [`cortex_exec_storebase::sqlite`].
 const KIND: &str = "mem";
 
+/// 스토어가 들고 있는 대로의 메모리 하나.
+///
+/// [`Memory`](crate::memory::Memory)와 나뉘어 있는 것은 이 크레이트의 원칙 그대로다 —
+/// 메모리는 행이 아니고, id도 날짜도 스토어의 것이다. 그래서 쓰기는 [`Memory`]를 받고
+/// 읽기는 이것을 돌려준다.
+///
+/// `id`가 이 프로세스를 떠나는 유일한 이유는 나중에 그것으로 [`Store::delete`]나
+/// [`Store::update`]가 불리기 때문이다. rowid가 아니라 UUID인 것도 그 때문이고, 그
+/// 판단은 이 크레이트가 처음부터 내려둔 것이다.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Record {
+    /// 행의 id — `item.id`의 UUID.
+    pub id: String,
+    /// 메모리 본문, 쓰인 그대로.
+    pub text: String,
+    /// 이 행이 스토어에 도착한 때, RFC 3339.
+    pub written_at: String,
+}
+
 /// A memory as a row is [`sqlite::UPSERT`] with a null `path`, which is what makes it a memory
 /// rather than a document: nulls do not collide, so every call inserts and the same sentence can
 /// be remembered twice. `index` binds a path into the same statement and gets an upsert.
