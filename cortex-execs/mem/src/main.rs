@@ -88,6 +88,13 @@ enum Command {
     /// the memories nearest <query>, nearest first
     #[command(long_about = None)]
     Search(Search),
+
+    /// the memories in <store>, newest first
+    ///
+    /// `search`와 달리 기본 상한이 없다: 목록에는 랭킹이 없으므로 스토어가 들고 있는 것이
+    /// 곧 답이고, 자르는 것은 `-n`으로 말한다.
+    #[command(long_about = None)]
+    List(List),
 }
 
 /// `mem init <store>` — a store where there was no file.
@@ -173,6 +180,22 @@ struct Search {
     /// a longer one rather than a way to switch a limit on.
     #[arg(short = 'n', long, default_value_t = 10, long_help = None)]
     limit: usize,
+}
+
+/// `mem list <store>` — 스토어가 들고 있는 전부, 최신 먼저.
+#[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
+struct List {
+    /// the store to read
+    #[arg(long_help = None)]
+    store: PathBuf,
+
+    /// how many memories to answer with; every one of them when not given
+    #[arg(short = 'n', long, long_help = None)]
+    limit: Option<usize>,
+
+    /// answer with one line of JSON per memory: its id, its text, and when it was written
+    #[arg(long, long_help = None)]
+    json: bool,
 }
 
 /// The line a command that could not be carried out leaves on stderr.
@@ -281,6 +304,11 @@ fn run(command: Command) -> Result<String, String> {
                 said.push('\n');
             }
             Ok(said)
+        }
+        Command::List(List { store, limit, json }) => {
+            let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
+            let found = opened.list(limit).map_err(|e| refused(&store, e))?;
+            Ok(lines(&found, json))
         }
     }
 }
@@ -538,7 +566,7 @@ mod tests {
         // caller a command they actually have.
         let said = e.render().to_string();
         assert!(said.contains(&format!("Usage: {NAME}")), "{said}");
-        for command in ["init", "insert", "search"] {
+        for command in ["init", "insert", "search", "list"] {
             assert!(said.contains(command), "{command} is missing from: {said}");
         }
     }
@@ -574,6 +602,31 @@ mod tests {
 
         assert_eq!(
             lines(std::slice::from_ref(&record), false),
+            "오트밀크로 바꿨다\n"
+        );
+    }
+
+    /// 스토어만 있으면 목록은 전부를 뜻한다.
+    #[test]
+    fn a_list_needs_only_a_store() {
+        let Command::List(list) = parse(&["list", "notes.mem"]).expect("the line parses") else {
+            panic!("a list");
+        };
+        assert_eq!(list.store, PathBuf::from("notes.mem"));
+        assert_eq!(list.limit, None);
+        assert!(!list.json);
+    }
+
+    /// 쓰이고 나면 목록에 있다.
+    #[test]
+    fn a_memory_that_was_written_is_on_the_list() {
+        let dir = TempDir::new().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+        run_line(&["insert", &store, "오트밀크로 바꿨다"]).expect("written");
+
+        assert_eq!(
+            run_line(&["list", &store]).expect("a listing"),
             "오트밀크로 바꿨다\n"
         );
     }

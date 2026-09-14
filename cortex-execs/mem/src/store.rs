@@ -99,6 +99,15 @@ pub struct Record {
 /// of `item` is needed to answer — a memory is its text.
 const SEARCH: &str = include_str!("../queries/search.sql");
 
+/// 스토어가 들고 있는 전부, 최신 먼저 — `queries/list.sql`.
+///
+/// [`SEARCH`]와 달리 조인이 있다. 목록은 행을 답하므로 id가 필요하고, id는 `item`에 있다.
+///
+/// 두 번째 정렬 키가 있는 이유는 [`Store::insert`]가 한 배치에 하나의 `written_at`을 주기
+/// 때문이다 — 같이 쓰인 다섯 줄은 그 열로 갈리지 않는다. rowid 역순이 그 안에서 나중에 쓴
+/// 것을 위로 올리고, 그래야 목록이 두 번 물었을 때 같은 답을 한다.
+const LIST: &str = include_str!("../queries/list.sql");
+
 /// An open memory store.
 ///
 /// Every method here is synchronous and blocks — this is SQLite. Nothing here hides that: the
@@ -236,6 +245,36 @@ impl Store {
             .query_map((&expression, limit), |row| row.get(0))
             .map_err(sql_error)?
             .collect::<Result<Vec<String>, _>>()
+            .map_err(sql_error)?;
+        Ok(found)
+    }
+
+    /// 스토어가 들고 있는 전부, 최신 먼저, 많아야 `limit`개.
+    ///
+    /// **`limit`이 없으면 전부다.** [`Store::search`]가 기본 상한을 갖는 것과 다르고, 다른
+    /// 것이 맞다. 검색의 상한은 근접도가 아래로 갈수록 형식이 된다는 사실에 대한 답이지만,
+    /// 목록에는 랭킹이 없다 — 스토어가 들고 있는 것이 곧 답이고, 그것을 자르는 것은
+    /// 호출자가 자르고 싶을 때 할 일이다.
+    ///
+    /// SQLite는 음수 `limit`을 "제한 없음"으로 읽으므로 `None`은 `-1`로 간다.
+    pub fn list(&self, limit: Option<usize>) -> io::Result<Vec<Record>> {
+        let limit = match limit {
+            Some(n) => i64::try_from(n).unwrap_or(i64::MAX),
+            None => -1,
+        };
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(LIST).map_err(sql_error)?;
+        let found = stmt
+            .query_map((limit,), |row| {
+                Ok(Record {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    written_at: row.get(2)?,
+                })
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<Record>, _>>()
             .map_err(sql_error)?;
         Ok(found)
     }
@@ -712,7 +751,60 @@ mod tests {
         assert!(!path.try_exists().unwrap(), "opening made nothing");
     }
 
+    /// 최신순. 한 배치는 `written_at`을 공유하므로 그 안에서는 rowid 역순 — 나중에 쓴 것이 위다.
+    #[test]
+    fn list_answers_newest_first() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
 
+        store
+            .insert(&[Memory {
+                text: "첫째".into(),
+            }])
+            .expect("written");
+        store
+            .insert(&[
+                Memory {
+                    text: "둘째".into(),
+                },
+                Memory {
+                    text: "셋째".into(),
+                },
+            ])
+            .expect("written");
+
+        let all = store.list(None).expect("a listing");
+
+        // 두 번째 배치가 먼저, 그 안에서는 나중 행이 먼저.
+        assert_eq!(
+            all.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+            ["셋째", "둘째", "첫째"]
+        );
+    }
+
+    /// 상한이 없으면 전부. `search`와 다른 점이고, `list`에는 랭킹이 없으므로 전부가 곧 답이다.
+    #[test]
+    fn list_without_a_limit_answers_with_everything() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        let many: Vec<Memory> = (0..50)
+            .map(|n| Memory {
+                text: format!("메모리 {n}"),
+            })
+            .collect();
+        store.insert(&many).expect("written");
+
+        assert_eq!(store.list(None).expect("a listing").len(), 50);
+        assert_eq!(store.list(Some(3)).expect("a listing").len(), 3);
+    }
+
+    /// 빈 스토어는 빈 목록이고 실패가 아니다.
+    #[test]
+    fn list_of_an_empty_store_is_empty() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        assert!(store.list(None).expect("a listing").is_empty());
+    }
 
     /// A name that is taken is an ambiguity, and the existing file is left exactly as it was.
     #[test]
