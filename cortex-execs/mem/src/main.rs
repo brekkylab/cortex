@@ -95,6 +95,13 @@ enum Command {
     /// 곧 답이고, 자르는 것은 `-n`으로 말한다.
     #[command(long_about = None)]
     List(List),
+
+    /// forget the memories with these <ids>
+    ///
+    /// id는 `list --json`과 `search --json`이 답하는 것이다. 없는 id는 거절이 아니다 —
+    /// 그것이 스토어에 없다는 것이 이 명령이 요구하는 상태다.
+    #[command(long_about = None)]
+    Delete(Delete),
 }
 
 /// `mem init <store>` — a store where there was no file.
@@ -194,6 +201,22 @@ struct List {
     limit: Option<usize>,
 
     /// answer with one line of JSON per memory: its id, its text, and when it was written
+    #[arg(long, long_help = None)]
+    json: bool,
+}
+
+/// `mem delete <store> <ids>...` — 잊을 메모리들, id로.
+#[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
+struct Delete {
+    /// the store to write to
+    #[arg(long_help = None)]
+    store: PathBuf,
+
+    /// which memories to forget: one id per argument
+    #[arg(long_help = None, value_name = "IDS")]
+    ids: Vec<String>,
+
+    /// answer with one line of JSON per id
     #[arg(long, long_help = None)]
     json: bool,
 }
@@ -309,6 +332,22 @@ fn run(command: Command) -> Result<String, String> {
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
             let found = opened.list(limit).map_err(|e| refused(&store, e))?;
             Ok(lines(&found, json))
+        }
+        Command::Delete(Delete { store, ids, json }) => {
+            let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
+            let gone = opened.delete(&ids).map_err(|e| refused(&store, e))?;
+            // 지운 id들, 한 줄에 하나 — `insert`가 쓴 것을 찍는 것과 같은 규약. 여기서는
+            // 답할 본문이 없으므로 `--json`이든 아니든 실리는 것은 id다.
+            let mut said = String::new();
+            for id in &gone {
+                if json {
+                    said.push_str(&serde_json::json!({ "id": id }).to_string());
+                } else {
+                    said.push_str(id);
+                }
+                said.push('\n');
+            }
+            Ok(said)
         }
     }
 }
@@ -629,5 +668,26 @@ mod tests {
             run_line(&["list", &store]).expect("a listing"),
             "오트밀크로 바꿨다\n"
         );
+    }
+
+    /// 지워진 메모리는 목록에 없다.
+    #[test]
+    fn a_deleted_memory_leaves_the_list() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+        let written =
+            run_line(&["insert", &store, "오트밀크로 바꿨다", "--json"]).expect("written");
+        let id = serde_json::from_str::<serde_json::Value>(written.trim_end())
+            .expect("a JSON line")["id"]
+            .as_str()
+            .expect("an id")
+            .to_owned();
+
+        assert_eq!(
+            run_line(&["delete", &store, &id]).expect("deleted"),
+            format!("{id}\n")
+        );
+        assert_eq!(run_line(&["list", &store]).expect("a listing"), "");
     }
 }

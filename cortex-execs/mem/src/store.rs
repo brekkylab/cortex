@@ -49,6 +49,7 @@
 use std::{collections::HashSet, io, path::Path, sync::Mutex};
 
 use cortex_exec_storebase::sqlite::{self, sql_error};
+use rusqlite::OptionalExtension as _;
 
 use crate::memory::Memory;
 
@@ -107,6 +108,16 @@ const SEARCH: &str = include_str!("../queries/search.sql");
 /// 때문이다 — 같이 쓰인 다섯 줄은 그 열로 갈리지 않는다. rowid 역순이 그 안에서 나중에 쓴
 /// 것을 위로 올리고, 그래야 목록이 두 번 물었을 때 같은 답을 한다.
 const LIST: &str = include_str!("../queries/list.sql");
+
+/// 행 하나를 id로 지우고, 그 텍스트를 어디서 지울지 답한다 — `queries/delete.sql`.
+///
+/// `returning rowid`인 이유는 `item_fts`가 rowid로 이어져 있고 FTS5에는 cascade가 없기
+/// 때문이다. 텍스트를 지우는 쪽은 `storebase`의 [`sqlite::FTS_CLEAR`]다 — `index`가
+/// 재-ingest 때 쓰는 바로 그 문장이고, 한 종류의 스토어가 다른 종류와 다르게 텍스트를
+/// 지우면 파일 포맷이 하나이기를 그만둔다.
+///
+/// `where id = ?`인 것이 이 문장이 `mem`의 것인 이유다. `index`라면 `path`로 지운다.
+const DELETE: &str = include_str!("../queries/delete.sql");
 
 /// An open memory store.
 ///
@@ -277,6 +288,39 @@ impl Store {
             .collect::<Result<Vec<Record>, _>>()
             .map_err(sql_error)?;
         Ok(found)
+    }
+
+    /// 이 id들의 메모리를 지운다. 돌려주는 것은 실제로 지워진 id들.
+    ///
+    /// **없는 id는 실패가 아니다.** 삭제의 사후 조건은 "그것이 스토어에 없다"이고, 없는
+    /// id로 불렸다면 그것은 이미 참이다. 돌려주는 목록이 인자보다 짧은 것이 호출자가 읽을
+    /// 답이고, 그것으로 충분하다.
+    ///
+    /// 한 트랜잭션이다 — [`Store::insert`]와 같은 이유로, 다섯을 지우라는 한 번의 호출에
+    /// 셋만 지워진 스토어는 아무도 원한 적이 없는 상태다.
+    pub fn delete(&self, ids: &[String]) -> io::Result<Vec<String>> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(sql_error)?;
+
+        let mut gone = Vec::new();
+        {
+            let mut row = tx.prepare(DELETE).map_err(sql_error)?;
+            let mut text = tx.prepare(sqlite::FTS_CLEAR).map_err(sql_error)?;
+
+            for id in ids {
+                let rowid: Option<i64> = row
+                    .query_row((id,), |r| r.get(0))
+                    .optional()
+                    .map_err(sql_error)?;
+                if let Some(rowid) = rowid {
+                    text.execute((rowid,)).map_err(sql_error)?;
+                    gone.push(id.clone());
+                }
+            }
+        }
+
+        tx.commit().map_err(sql_error)?;
+        Ok(gone)
     }
 }
 
@@ -853,5 +897,84 @@ mod tests {
         let e = refused.expect_err("nothing can be written here");
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
         assert!(!path.try_exists().unwrap(), "nothing was made");
+    }
+
+    /// 지워진 메모리는 목록에 없고, **검색에도 없다** — `item_fts`까지 지워졌다는 증거다.
+    /// `item` 행만 지웠다면 이 테스트가 잡는다.
+    #[test]
+    fn a_deleted_memory_is_gone_from_the_index_too() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        let written = store
+            .insert(&[
+                Memory {
+                    text: "oat milk in the fridge".into(),
+                },
+                Memory {
+                    text: "tea in the cupboard".into(),
+                },
+            ])
+            .expect("written");
+
+        let gone = store.delete(&[written[0].id.clone()]).expect("deleted");
+
+        assert_eq!(gone, vec![written[0].id.clone()]);
+        assert_eq!(store.list(None).expect("a listing").len(), 1);
+        assert!(
+            store.search("oat", 10).expect("a search").is_empty(),
+            "the text left the index with the row"
+        );
+    }
+
+    /// 없는 id는 실패가 아니다. 삭제의 사후 조건은 "그것이 없다"이고, 이미 만족되어 있다.
+    #[test]
+    fn deleting_what_is_not_there_is_not_a_failure() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        store
+            .insert(&[Memory {
+                text: "차를 마신다".into(),
+            }])
+            .expect("written");
+
+        let gone = store.delete(&["없는-id".to_string()]).expect("no failure");
+
+        assert!(
+            gone.is_empty(),
+            "nothing was deleted, and that is an answer"
+        );
+        assert_eq!(store.list(None).expect("a listing").len(), 1);
+    }
+
+    /// 배치는 전부 아니면 전무 — `insert`와 같은 규약. 여기서는 한 id를 두 번 주어도
+    /// 두 번째가 못 찾을 뿐 실패가 아니므로, 커밋이 통째로 일어났는지를 본다.
+    #[test]
+    fn a_batch_delete_is_one_transaction() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        let written = store
+            .insert(&[
+                Memory {
+                    text: "하나".into(),
+                },
+                Memory { text: "둘".into() },
+                Memory { text: "셋".into() },
+            ])
+            .expect("written");
+
+        let gone = store
+            .delete(&[written[0].id.clone(), written[2].id.clone()])
+            .expect("deleted");
+
+        assert_eq!(gone.len(), 2);
+        assert_eq!(
+            store
+                .list(None)
+                .expect("a listing")
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            ["둘"]
+        );
     }
 }
