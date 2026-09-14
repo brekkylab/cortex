@@ -119,6 +119,13 @@ const LIST: &str = include_str!("../queries/list.sql");
 /// `where id = ?`인 것이 이 문장이 `mem`의 것인 이유다. `index`라면 `path`로 지운다.
 const DELETE: &str = include_str!("../queries/delete.sql");
 
+/// id가 가리키는 행 — 그 rowid와 그 날짜 — `queries/row_of.sql`.
+///
+/// 수정이 이것으로 시작하는 이유는 두 가지다. 텍스트는 `item_fts`에 rowid로 걸려 있으므로
+/// 다시 쓰려면 그 번호가 필요하고, 돌려줄 레코드에는 원래의 `written_at`이 필요하다 —
+/// 수정은 도착이 아니므로 그 열은 바뀌지 않는다.
+const ROW_OF: &str = include_str!("../queries/row_of.sql");
+
 /// An open memory store.
 ///
 /// Every method here is synchronous and blocks — this is SQLite. Nothing here hides that: the
@@ -321,6 +328,59 @@ impl Store {
 
         tx.commit().map_err(sql_error)?;
         Ok(gone)
+    }
+
+    /// 이 id의 메모리를 `text`로 고친다. 그런 id가 없으면 `None`.
+    ///
+    /// # `item`은 바뀌지 않는다
+    ///
+    /// 메모리의 본문은 `item`이 아니라 `item_fts.body`에 있다 — [`Store::search`]가 조인
+    /// 없이 답할 수 있었던 것이 그 때문이다. 그래서 수정은 FTS 행 하나를 다시 쓰는 것이
+    /// 전부이고, FTS5에는 upsert가 없으므로 지우고 쓴다. 두 문장 다 `storebase`의 것이다 —
+    /// `index`의 멱등한 재-ingest가 필요로 했던 바로 그 쌍이다.
+    ///
+    /// `mem`이 `path`·`title`·`mtime`·`len`을 기본값으로 두므로 `item` 쪽에 손댈 것이 없다.
+    ///
+    /// # `written_at`은 바뀌지 않는다
+    ///
+    /// **수정은 도착이 아니라 정정이다.** 그 열은 이 행이 스토어에 *도착한* 때를 말하고,
+    /// 고칠 때마다 밀린다면 "이 스토어가 이것을 언제 알게 됐나"에 답할 수 있는 곳이 없어진다.
+    /// 고쳐진 때를 따로 적으려면 컬럼이 하나 더 있어야 하는데, 그 스키마는 `index`와
+    /// 공유하는 것이라 [`SCHEMA_VERSION`](cortex_exec_storebase::sqlite::SCHEMA_VERSION)이
+    /// 올라간다 — 편의 하나에 치를 값이 아니다.
+    ///
+    /// 목록이 최신순이므로 부수 효과가 하나 따라오고, 그쪽이 오히려 원하는 것이다:
+    /// 고쳐도 행이 위로 튀지 않는다.
+    pub fn update(&self, id: &str, text: &str) -> io::Result<Option<Record>> {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.transaction().map_err(sql_error)?;
+
+        let found: Option<(i64, String)> = tx
+            .prepare(ROW_OF)
+            .map_err(sql_error)?
+            .query_row((id,), |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .map_err(sql_error)?;
+
+        let Some((rowid, written_at)) = found else {
+            return Ok(None);
+        };
+
+        tx.prepare(sqlite::FTS_CLEAR)
+            .map_err(sql_error)?
+            .execute((rowid,))
+            .map_err(sql_error)?;
+        tx.prepare(sqlite::FTS_WRITE)
+            .map_err(sql_error)?
+            .execute((rowid, "", text))
+            .map_err(sql_error)?;
+
+        tx.commit().map_err(sql_error)?;
+        Ok(Some(Record {
+            id: id.to_owned(),
+            text: text.to_owned(),
+            written_at,
+        }))
     }
 }
 
@@ -975,6 +1035,67 @@ mod tests {
                 .map(|r| r.text.as_str())
                 .collect::<Vec<_>>(),
             ["둘"]
+        );
+    }
+
+    /// 수정 뒤에는 옛 용어로 못 찾고 새 용어로 찾는다 — `item_fts`가 실제로 다시 쓰였다는
+    /// 증거다. `item`만 건드렸다면 이 테스트가 잡는다.
+    #[test]
+    fn an_updated_memory_is_reindexed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        let written = store
+            .insert(&[Memory {
+                text: "oat milk in the fridge".into(),
+            }])
+            .expect("written");
+
+        store
+            .update(&written[0].id, "almond milk in the fridge")
+            .expect("updated")
+            .expect("the row is there");
+
+        assert!(
+            store.search("oat", 10).expect("a search").is_empty(),
+            "the old terms left"
+        );
+        assert_eq!(
+            store.search("almond", 10).expect("a search")[0],
+            "almond milk in the fridge"
+        );
+    }
+
+    /// 수정은 도착이 아니라 정정이다 — id도 날짜도 그대로다.
+    #[test]
+    fn an_update_keeps_the_id_and_the_date() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        let written = store
+            .insert(&[Memory {
+                text: "첫 문장".into(),
+            }])
+            .expect("written");
+
+        let after = store
+            .update(&written[0].id, "고친 문장")
+            .expect("updated")
+            .expect("there");
+
+        assert_eq!(after.id, written[0].id);
+        assert_eq!(after.written_at, written[0].written_at);
+        assert_eq!(after.text, "고친 문장");
+    }
+
+    /// 없는 id에 대한 수정은 `delete`와 달리 아무것도 하지 않았다고 말해야 한다. 사후 조건이
+    /// "그것이 이렇게 말한다"이고, 그것은 만족되지 않았다.
+    #[test]
+    fn updating_what_is_not_there_answers_with_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+
+        assert_eq!(
+            store.update("없는-id", "무엇이든").expect("no failure"),
+            None
         );
     }
 }

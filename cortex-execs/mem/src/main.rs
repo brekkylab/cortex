@@ -102,6 +102,13 @@ enum Command {
     /// 그것이 스토어에 없다는 것이 이 명령이 요구하는 상태다.
     #[command(long_about = None)]
     Delete(Delete),
+
+    /// correct the memory with <id> so that it says <text>
+    ///
+    /// 한 번에 하나다. id와 텍스트의 쌍을 여럿 늘어놓는 것은 리스트 두 개를 엇갈려 넣는
+    /// 것이고, 이 프로그램이 구분자를 인자 안에 넣지 않는 것과 같은 이유로 하지 않는다.
+    #[command(visible_alias = "edit", long_about = None)]
+    Update(Update),
 }
 
 /// `mem init <store>` — a store where there was no file.
@@ -217,6 +224,28 @@ struct Delete {
     ids: Vec<String>,
 
     /// answer with one line of JSON per id
+    #[arg(long, long_help = None)]
+    json: bool,
+}
+
+/// `mem update <store> <id> <text>` — 한 메모리를 지금 말해야 하는 대로 고친다.
+#[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
+struct Update {
+    /// the store to write to
+    #[arg(long_help = None)]
+    store: PathBuf,
+
+    /// which memory to correct
+    #[arg(long_help = None)]
+    id: String,
+
+    /// what it should say now
+    ///
+    /// `insert`와 같은 파서를 지난다: 빈 것은 메모리가 아니고, 파일이 열리기 전에 거절된다.
+    #[arg(long_help = None, value_parser = trimmed)]
+    text: String,
+
+    /// answer with one line of JSON: the memory's id, its text, and when it was written
     #[arg(long, long_help = None)]
     json: bool,
 }
@@ -348,6 +377,26 @@ fn run(command: Command) -> Result<String, String> {
                 said.push('\n');
             }
             Ok(said)
+        }
+        Command::Update(Update {
+            store,
+            id,
+            text,
+            json,
+        }) => {
+            let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
+            match opened.update(&id, &text).map_err(|e| refused(&store, e))? {
+                Some(record) => Ok(lines(std::slice::from_ref(&record), json)),
+                // `delete`가 없는 id를 넘기는 것과 대비되는 자리다. 삭제가 요구하는 상태는
+                // 이미 참이지만, 수정이 요구하는 상태 — 그 메모리가 이렇게 말한다 — 는
+                // 참이 되지 않았다. 조용히 성공하면 호출자는 고쳐졌다고 믿는다.
+                None => Err(refused(
+                    &store,
+                    format_args!(
+                        "no memory with id `{id}`; `{NAME} list` says which ids there are"
+                    ),
+                )),
+            }
         }
     }
 }
@@ -689,5 +738,26 @@ mod tests {
             format!("{id}\n")
         );
         assert_eq!(run_line(&["list", &store]).expect("a listing"), "");
+    }
+
+    /// 빈 텍스트는 파일이 열리기 전에 거절된다 — `insert`와 같다.
+    #[test]
+    fn an_update_to_nothing_is_not_understood() {
+        let line = parse(&["update", "notes.mem", "some-id", "   "]);
+        assert_eq!(
+            line.expect_err("a refusal").kind(),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    /// `edit`은 `update`의 두 번째 철자다.
+    #[test]
+    fn edit_is_update() {
+        let Command::Update(update) =
+            parse(&["edit", "notes.mem", "some-id", "고친 문장"]).expect("the line parses")
+        else {
+            panic!("an update");
+        };
+        assert_eq!(update.text, "고친 문장");
     }
 }
