@@ -620,7 +620,7 @@ mod tests {
     /// 쓰이고 나면 목록에 있다.
     #[test]
     fn a_memory_that_was_written_is_on_the_list() {
-        let dir = TempDir::new().expect("a temporary directory");
+        let dir = tempfile::tempdir().expect("a temporary directory");
         let store = at(&dir, "notes.mem");
         run_line(&["init", &store]).expect("a store");
         run_line(&["insert", &store, "오트밀크로 바꿨다"]).expect("written");
