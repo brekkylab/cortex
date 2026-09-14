@@ -22,8 +22,8 @@ rusqlite = { workspace = true }
 # Item identity. Ids leave this process — they are what a later `delete` or `history` would be
 # given back — so they cannot be rowids that a re-import renumbers.
 uuid = { workspace = true, features = ["v4"] }
-# `--json`이 싣는 것. 손으로 쓴 이스케이프는 버그가 사는 곳이고, 한 메모리의 본문은
-# 마크다운이라 따옴표도 줄바꿈도 역슬래시도 들어 있을 수 있다.
+# What `--json` is carried by. Escaping written by hand is where bugs live, and a memory's text is
+# Markdown, so it may hold quotes, newlines and backslashes.
 serde = { workspace = true }
 serde_json = { workspace = true }
 

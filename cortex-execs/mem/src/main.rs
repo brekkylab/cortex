@@ -91,22 +91,23 @@ enum Command {
 
     /// the memories in <store>, newest first
     ///
-    /// `search`와 달리 기본 상한이 없다: 목록에는 랭킹이 없으므로 스토어가 들고 있는 것이
-    /// 곧 답이고, 자르는 것은 `-n`으로 말한다.
+    /// Unlike `search`, there is no default bound: a listing has no ranking, so what the store
+    /// holds is the answer, and cutting it is said with `-n`.
     #[command(long_about = None)]
     List(List),
 
     /// forget the memories with these <ids>
     ///
-    /// id는 `list --json`과 `search --json`이 답하는 것이다. 없는 id는 거절이 아니다 —
-    /// 그것이 스토어에 없다는 것이 이 명령이 요구하는 상태다.
+    /// An id is what `list --json` and `search --json` answer with. An id that is not there is not
+    /// a refusal — its not being in the store is the state this command asks for.
     #[command(long_about = None)]
     Delete(Delete),
 
     /// correct the memory with <id> so that it says <text>
     ///
-    /// 한 번에 하나다. id와 텍스트의 쌍을 여럿 늘어놓는 것은 리스트 두 개를 엇갈려 넣는
-    /// 것이고, 이 프로그램이 구분자를 인자 안에 넣지 않는 것과 같은 이유로 하지 않는다.
+    /// One at a time. Laying out several id-and-text pairs is interleaving two lists into one,
+    /// and this program does not do that for the same reason it does not put a separator inside
+    /// an argument.
     #[command(visible_alias = "edit", long_about = None)]
     Update(Update),
 }
@@ -152,8 +153,8 @@ struct Insert {
 
     /// answer with one line of JSON per memory: its id, its text, and when it was written
     ///
-    /// 기본 출력은 본문 한 줄이고, 그것이 말할 수 없는 것이 두 가지다 — 행의 id와, 줄바꿈이
-    /// 든 본문. 본문이 마크다운일 수 있는 호출자는 이것을 쓴다.
+    /// The default output is one line of text, and there are two things it cannot spell — the
+    /// row's id, and text with a newline in it. A caller whose memories may be Markdown uses this.
     #[arg(long, long_help = None)]
     json: bool,
 }
@@ -200,7 +201,7 @@ struct Search {
     json: bool,
 }
 
-/// `mem list <store>` — 스토어가 들고 있는 전부, 최신 먼저.
+/// `mem list <store>` — everything the store holds, newest first.
 #[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
 struct List {
     /// the store to read
@@ -216,7 +217,7 @@ struct List {
     json: bool,
 }
 
-/// `mem delete <store> <ids>...` — 잊을 메모리들, id로.
+/// `mem delete <store> <ids>...` — the memories to forget, by id.
 #[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
 struct Delete {
     /// the store to write to
@@ -232,7 +233,7 @@ struct Delete {
     json: bool,
 }
 
-/// `mem update <store> <id> <text>` — 한 메모리를 지금 말해야 하는 대로 고친다.
+/// `mem update <store> <id> <text>` — correct one memory to what it should say now.
 #[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
 struct Update {
     /// the store to write to
@@ -245,7 +246,8 @@ struct Update {
 
     /// what it should say now
     ///
-    /// `insert`와 같은 파서를 지난다: 빈 것은 메모리가 아니고, 파일이 열리기 전에 거절된다.
+    /// Through the same parser `insert` uses: an empty one is not a memory, and is refused before
+    /// the file is opened.
     #[arg(long_help = None, value_parser = trimmed)]
     text: String,
 
@@ -262,19 +264,21 @@ fn refused(store: &Path, said: impl std::fmt::Display) -> String {
     format!("{NAME}: {}: {said}\n", store.display())
 }
 
-/// 레코드들, 한 줄에 하나 — 본문, 또는 `--json`이 주어졌을 때 그 줄의 JSON.
+/// The records, one per line — the text, or that line as JSON when `--json` was given.
 ///
-/// **기본 포맷은 지금까지와 같은 본문 한 줄이다.** `index`가 같은 모양으로 답하고,
-/// 파이프로 읽는 쪽이 기대하는 것도 그것이다. 그 포맷이 말할 수 없는 것이 두 가지 있어
-/// `--json`이 있다: 행의 id와, 줄바꿈이 든 본문. 메모리 본문은 마크다운이므로 여러 줄일
-/// 수 있고, 그러면 "한 줄에 하나"가 모호해진다.
+/// **The default format is the same one line of text it has always been.** `index` answers in the
+/// same shape, and it is what something reading out of a pipe expects. `--json` exists because
+/// there are two things that format cannot spell: the row's id, and text with a newline in it. A
+/// memory's text is Markdown, so it may be several lines, and then "one per line" stops meaning
+/// anything.
 ///
-/// JSON 배열이 아니라 한 줄에 객체 하나(JSONL)인 것은 기본 포맷의 모양을 그대로 잇기
-/// 위해서다. 읽는 쪽은 줄 단위로 처리하면 되고 전체를 버퍼링할 필요가 없다.
+/// One object per line (JSONL) rather than a JSON array, so that the shape of the default format
+/// carries straight over. A reader works line by line and never has to buffer the whole answer.
 ///
-/// `to_string`은 여기서 실패할 수 없다. 모든 필드가 `String`이고, `serde_json`이 구조체에
-/// 대해 갖는 실패는 문자열이 아닌 맵 키와 수가 아닌 부동소수뿐이다. 둘 다 닿을 수 없으므로
-/// 그것이 될 뻔한 실패는 버그로 적지, 모든 호출자의 시그니처로 옮기지 않는다.
+/// `to_string` cannot fail here. Every field is a `String`, and the failures `serde_json` has for
+/// a struct are map keys that are not strings and floats that are not numbers. Neither is
+/// reachable, so what would have been that failure is written down as a bug rather than moved into
+/// every caller's signature.
 fn lines(records: &[Record], json: bool) -> String {
     let mut said = String::new();
     for record in records {
@@ -366,8 +370,8 @@ fn run(command: Command) -> Result<String, String> {
         Command::Delete(Delete { store, ids, json }) => {
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
             let gone = opened.delete(&ids).map_err(|e| refused(&store, e))?;
-            // 지운 id들, 한 줄에 하나 — `insert`가 쓴 것을 찍는 것과 같은 규약. 여기서는
-            // 답할 본문이 없으므로 `--json`이든 아니든 실리는 것은 id다.
+            // The ids that went, one per line — the same rule as printing what `insert` wrote.
+            // There is no text to answer with here, so what is carried is the id, `--json` or not.
             let mut said = String::new();
             for id in &gone {
                 if json {
@@ -388,9 +392,10 @@ fn run(command: Command) -> Result<String, String> {
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
             match opened.update(&id, &text).map_err(|e| refused(&store, e))? {
                 Some(record) => Ok(lines(std::slice::from_ref(&record), json)),
-                // `delete`가 없는 id를 넘기는 것과 대비되는 자리다. 삭제가 요구하는 상태는
-                // 이미 참이지만, 수정이 요구하는 상태 — 그 메모리가 이렇게 말한다 — 는
-                // 참이 되지 않았다. 조용히 성공하면 호출자는 고쳐졌다고 믿는다.
+                // The place that contrasts with `delete` letting an unknown id pass. The state a
+                // delete asks for is already true, but the state an update asks for — that this
+                // memory says this — did not come to be. Succeeding quietly would leave the
+                // caller believing it was corrected.
                 None => Err(refused(
                     &store,
                     format_args!(
@@ -662,7 +667,7 @@ mod tests {
         }
     }
 
-    /// 한 레코드는 한 줄이고, 그 줄은 파싱되는 JSON이다.
+    /// One record is one line, and that line is JSON that parses.
     #[test]
     fn a_record_is_one_line_of_json() {
         let record = Record {
@@ -673,7 +678,7 @@ mod tests {
 
         let said = lines(std::slice::from_ref(&record), true);
 
-        // 여러 줄짜리 본문이라도 출력은 한 줄이다 — 그것이 JSONL의 요점이다.
+        // Even text of several lines comes out as one line — that is the point of JSONL.
         assert_eq!(said.lines().count(), 1, "one record is one line: {said:?}");
 
         let back: serde_json::Value = serde_json::from_str(said.trim_end()).expect("a JSON line");
@@ -682,7 +687,7 @@ mod tests {
         assert_eq!(back["written_at"], "2026-09-14T06:12:03Z");
     }
 
-    /// `--json` 없이는 지금까지의 포맷 그대로 — 본문만, 한 줄에 하나.
+    /// Without `--json`, the format it has always been — the text alone, one per line.
     #[test]
     fn without_json_a_record_is_its_text() {
         let record = Record {
@@ -697,7 +702,7 @@ mod tests {
         );
     }
 
-    /// 스토어만 있으면 목록은 전부를 뜻한다.
+    /// A store is all a listing needs to be told, and it means all of them.
     #[test]
     fn a_list_needs_only_a_store() {
         let Command::List(list) = parse(&["list", "notes.mem"]).expect("the line parses") else {
@@ -708,7 +713,7 @@ mod tests {
         assert!(!list.json);
     }
 
-    /// 쓰이고 나면 목록에 있다.
+    /// Once written, it is on the listing.
     #[test]
     fn a_memory_that_was_written_is_on_the_list() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -722,7 +727,7 @@ mod tests {
         );
     }
 
-    /// 지워진 메모리는 목록에 없다.
+    /// A deleted memory leaves the listing.
     #[test]
     fn a_deleted_memory_leaves_the_list() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -743,9 +748,10 @@ mod tests {
         assert_eq!(run_line(&["list", &store]).expect("a listing"), "");
     }
 
-    /// `delete --json`이 싣는 것은 id 하나뿐이다 — 지운 것에는 답할 본문이 없다. `lines`를
-    /// 지나는 다른 모든 `--json`과 달리 `run`이 직접 조립하는 유일한 모양이므로, 그 모양이
-    /// 한 줄의 `{"id": ...}`이고 `text`나 `written_at`을 싣지 않는다는 것을 따로 고정한다.
+    /// All `delete --json` carries is the id — what was deleted has no text to answer with. It is
+    /// the one shape `run` assembles itself, unlike every other `--json` that goes through
+    /// `lines`, so that it is one line of `{"id": ...}` carrying neither `text` nor `written_at`
+    /// is pinned separately.
     #[test]
     fn deleted_json_carries_only_the_id() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -770,7 +776,8 @@ mod tests {
         );
     }
 
-    /// 없는 id를 지우는 것은 실패가 아니다 — 사후 조건이 이미 참이므로 빈 줄로 답한다.
+    /// Deleting an id that is not there is not a failure — the post-condition is already true, so
+    /// the answer is no lines at all.
     #[test]
     fn deleting_an_unknown_id_answers_with_nothing() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -783,9 +790,9 @@ mod tests {
         );
     }
 
-    /// `update`가 없는 id를 받으면 `delete`와 달리 거절한다 — 이 크레이트에서 가장 무거운
-    /// 뜻을 지닌 비대칭이다: 알려지지 않은 id에 대해 `update`는 `1`로, `delete`는 `0`으로
-    /// 끝난다. 메시지는 스토어를 이름으로 담고, id도 언급한다.
+    /// Given an id that is not there, `update` refuses where `delete` does not — the asymmetry
+    /// that carries the most weight in this crate: against an unknown id `update` ends with `1`
+    /// and `delete` with `0`. The message names the store and mentions the id.
     #[test]
     fn updating_an_unknown_id_is_refused() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -798,7 +805,7 @@ mod tests {
         assert!(said.contains("없는-id"), "{said}");
     }
 
-    /// 빈 텍스트는 파일이 열리기 전에 거절된다 — `insert`와 같다.
+    /// Empty text is refused before the file is opened — the same as `insert`.
     #[test]
     fn an_update_to_nothing_is_not_understood() {
         let line = parse(&["update", "notes.mem", "some-id", "   "]);
@@ -808,7 +815,7 @@ mod tests {
         );
     }
 
-    /// `edit`은 `update`의 두 번째 철자다.
+    /// `edit` is the second spelling of `update`.
     #[test]
     fn edit_is_update() {
         let Command::Update(update) =

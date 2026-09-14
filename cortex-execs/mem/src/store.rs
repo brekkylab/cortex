@@ -60,22 +60,22 @@ use crate::memory::Memory;
 /// [`cortex_exec_storebase::sqlite`].
 const KIND: &str = "mem";
 
-/// 스토어가 들고 있는 대로의 메모리 하나.
+/// One memory, as the store holds it.
 ///
-/// [`Memory`](crate::memory::Memory)와 나뉘어 있는 것은 이 크레이트의 원칙 그대로다 —
-/// 메모리는 행이 아니고, id도 날짜도 스토어의 것이다. 그래서 쓰기는 [`Memory`]를 받고
-/// 읽기는 이것을 돌려준다.
+/// Kept apart from [`Memory`](crate::memory::Memory) by this crate's own rule — a memory is not a
+/// row, and neither the id nor the date is the memory's to carry. So a write takes [`Memory`] and
+/// a read answers with this.
 ///
-/// `id`가 이 프로세스를 떠나는 유일한 이유는 나중에 그것으로 [`Store::delete`]나
-/// [`Store::update`]가 불리기 때문이다. rowid가 아니라 UUID인 것도 그 때문이고, 그
-/// 판단은 이 크레이트가 처음부터 내려둔 것이다.
+/// The only reason `id` leaves this process is that [`Store::delete`] or [`Store::update`] will
+/// later be called with it. That is also why it is a UUID rather than a rowid, and that judgement
+/// is one this crate made from the start.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Record {
-    /// 행의 id — `item.id`의 UUID.
+    /// The row's id — the UUID in `item.id`.
     pub id: String,
-    /// 메모리 본문, 쓰인 그대로.
+    /// The memory itself, as it was written.
     pub text: String,
-    /// 이 행이 스토어에 도착한 때, RFC 3339.
+    /// When this row arrived in the store, RFC 3339.
     pub written_at: String,
 }
 
@@ -96,37 +96,38 @@ pub struct Record {
 /// them, and a search that answers the same question two ways is one nobody can test or script
 /// against. Oldest first among equals, since that is what a rowid is.
 ///
-/// **조인이 있고, 한때 없었다.** 텍스트는 `item_fts`에 있으므로 검색이 답하는 *문장*에는
-/// `item`이 필요 없다. 필요해진 것은 행의 id이고, 그것은 `item`에 있다 — 찾은 메모리를
-/// 그 자리에서 고치거나 지우려면 그것을 부를 이름이 있어야 하며, 텍스트는 중복을 허용하므로
-/// 이름이 될 수 없다. rowid로 거는 조인은 SQLite가 하는 가장 싼 일이고, `limit`이 그것을
-/// 도는 행의 수를 이미 묶어 두고 있다.
+/// **There is a join, and there once was not.** The text is in `item_fts`, so the *sentence* a
+/// search answers with needs nothing of `item`. What came to be needed is the row's id, and that
+/// is in `item` — correcting or forgetting a memory where it was found means having a name to
+/// call it by, and the text cannot be that name, since it allows duplicates. A join on rowid is
+/// the cheapest thing SQLite does, and `limit` already bounds how many rows it walks.
 const SEARCH: &str = include_str!("../queries/search.sql");
 
-/// 스토어가 들고 있는 전부, 최신 먼저 — `queries/list.sql`.
+/// Everything the store holds, newest first — `queries/list.sql`.
 ///
-/// [`SEARCH`]와 달리 조인이 있다. 목록은 행을 답하므로 id가 필요하고, id는 `item`에 있다.
+/// Unlike [`SEARCH`], there is a join. A listing answers with rows, so it needs the id, and the id
+/// is in `item`.
 ///
-/// 두 번째 정렬 키가 있는 이유는 [`Store::insert`]가 한 배치에 하나의 `written_at`을 주기
-/// 때문이다 — 같이 쓰인 다섯 줄은 그 열로 갈리지 않는다. rowid 역순이 그 안에서 나중에 쓴
-/// 것을 위로 올리고, 그래야 목록이 두 번 물었을 때 같은 답을 한다.
+/// The second sort key is there because [`Store::insert`] gives one batch a single `written_at` —
+/// five lines written together are not separated by that column. Descending rowid puts the later
+/// of them on top, and that is what makes a listing answer the same way when it is asked twice.
 const LIST: &str = include_str!("../queries/list.sql");
 
-/// 행 하나를 id로 지우고, 그 텍스트를 어디서 지울지 답한다 — `queries/delete.sql`.
+/// Delete one row by id, and answer with where to delete its text — `queries/delete.sql`.
 ///
-/// `returning rowid`인 이유는 `item_fts`가 rowid로 이어져 있고 FTS5에는 cascade가 없기
-/// 때문이다. 텍스트를 지우는 쪽은 `storebase`의 [`sqlite::FTS_CLEAR`]다 — `index`가
-/// 재-ingest 때 쓰는 바로 그 문장이고, 한 종류의 스토어가 다른 종류와 다르게 텍스트를
-/// 지우면 파일 포맷이 하나이기를 그만둔다.
+/// It is `returning rowid` because `item_fts` is joined by rowid and FTS5 has no cascade. What
+/// deletes the text is `storebase`'s [`sqlite::FTS_CLEAR`] — the very statement `index` uses when
+/// it re-ingests, and a store of one kind deleting text differently from a store of the other is
+/// the file format ceasing to be one format.
 ///
-/// `where id = ?`인 것이 이 문장이 `mem`의 것인 이유다. `index`라면 `path`로 지운다.
+/// That it is `where id = ?` is what makes this statement `mem`'s. `index` would delete by `path`.
 const DELETE: &str = include_str!("../queries/delete.sql");
 
-/// id가 가리키는 행 — 그 rowid와 그 날짜 — `queries/row_of.sql`.
+/// The row an id points at — its rowid and its date — `queries/row_of.sql`.
 ///
-/// 수정이 이것으로 시작하는 이유는 두 가지다. 텍스트는 `item_fts`에 rowid로 걸려 있으므로
-/// 다시 쓰려면 그 번호가 필요하고, 돌려줄 레코드에는 원래의 `written_at`이 필요하다 —
-/// 수정은 도착이 아니므로 그 열은 바뀌지 않는다.
+/// An update begins here for two reasons. The text hangs off `item_fts` by rowid, so rewriting it
+/// needs that number; and the record to answer with needs the original `written_at` — an update is
+/// not an arrival, so that column does not change.
 const ROW_OF: &str = include_str!("../queries/row_of.sql");
 
 /// An open memory store.
@@ -178,9 +179,10 @@ impl Store {
     /// and a batch written in one call happened at one moment. Ordering two rows of it by a
     /// microsecond would be recording the order this loop ran in.
     ///
-    /// 돌려주는 것은 쓰인 행들이며, 인자의 순서 그대로다. 이 함수가 만든 id는 호출자가
-    /// 다시 얻을 방법이 없다 — 텍스트는 중복을 허용하므로 나중에 찾아낼 수도 없다 — 그래서
-    /// 버리지 않고 돌려준다. `--json`이 싣는 것이 이것이다.
+    /// What comes back is the rows that were written, in the order they were given. A caller has
+    /// no other way to learn the ids this function made — the text allows duplicates, so they
+    /// could not be found afterwards either — so they are answered with rather than dropped.
+    /// This is what `--json` carries.
     pub fn insert(&self, memories: &[Memory]) -> io::Result<Vec<Record>> {
         // A poisoned lock is a panic that happened while somebody held this connection, and it
         // is not a reason to refuse the file: what a poisoned lock protects is data whose
@@ -276,14 +278,15 @@ impl Store {
         Ok(found)
     }
 
-    /// 스토어가 들고 있는 전부, 최신 먼저, 많아야 `limit`개.
+    /// Everything the store holds, newest first, and at most `limit` of them.
     ///
-    /// **`limit`이 없으면 전부다.** [`Store::search`]가 기본 상한을 갖는 것과 다르고, 다른
-    /// 것이 맞다. 검색의 상한은 근접도가 아래로 갈수록 형식이 된다는 사실에 대한 답이지만,
-    /// 목록에는 랭킹이 없다 — 스토어가 들고 있는 것이 곧 답이고, 그것을 자르는 것은
-    /// 호출자가 자르고 싶을 때 할 일이다.
+    /// **No `limit` means all of them.** That is unlike [`Store::search`], which has a default
+    /// bound, and being unlike it is right. A search's bound is an answer to the fact that
+    /// nearness becomes a formality further down the list, but a listing has no ranking — what
+    /// the store holds *is* the answer, and cutting it is for the caller to do when they want it
+    /// cut.
     ///
-    /// SQLite는 음수 `limit`을 "제한 없음"으로 읽으므로 `None`은 `-1`로 간다.
+    /// SQLite reads a negative `limit` as "no limit", so `None` goes down as `-1`.
     pub fn list(&self, limit: Option<usize>) -> io::Result<Vec<Record>> {
         let limit = match limit {
             Some(n) => i64::try_from(n).unwrap_or(i64::MAX),
@@ -306,14 +309,15 @@ impl Store {
         Ok(found)
     }
 
-    /// 이 id들의 메모리를 지운다. 돌려주는 것은 실제로 지워진 id들.
+    /// Forget the memories with these ids. What comes back is the ids that were actually deleted.
     ///
-    /// **없는 id는 실패가 아니다.** 삭제의 사후 조건은 "그것이 스토어에 없다"이고, 없는
-    /// id로 불렸다면 그것은 이미 참이다. 돌려주는 목록이 인자보다 짧은 것이 호출자가 읽을
-    /// 답이고, 그것으로 충분하다.
+    /// **An id that is not there is not a failure.** A delete's post-condition is "that memory is
+    /// not in the store", and being called with an id that is not there means it is already true.
+    /// The answer a caller reads is that the returned list is shorter than what they passed, and
+    /// that is enough.
     ///
-    /// 한 트랜잭션이다 — [`Store::insert`]와 같은 이유로, 다섯을 지우라는 한 번의 호출에
-    /// 셋만 지워진 스토어는 아무도 원한 적이 없는 상태다.
+    /// One transaction — for [`Store::insert`]'s reason: a store where one call to forget five
+    /// left three of them forgotten is a state nobody ever asked for.
     pub fn delete(&self, ids: &[String]) -> io::Result<Vec<String>> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction().map_err(sql_error)?;
@@ -339,27 +343,29 @@ impl Store {
         Ok(gone)
     }
 
-    /// 이 id의 메모리를 `text`로 고친다. 그런 id가 없으면 `None`.
+    /// Correct the memory with this id so that it says `text`. `None` when there is no such id.
     ///
-    /// # `item`은 바뀌지 않는다
+    /// # `item` does not change
     ///
-    /// 메모리의 본문은 `item`이 아니라 `item_fts.body`에 있다 — [`Store::search`]가 조인
-    /// 없이 답할 수 있었던 것이 그 때문이다. 그래서 수정은 FTS 행 하나를 다시 쓰는 것이
-    /// 전부이고, FTS5에는 upsert가 없으므로 지우고 쓴다. 두 문장 다 `storebase`의 것이다 —
-    /// `index`의 멱등한 재-ingest가 필요로 했던 바로 그 쌍이다.
+    /// A memory's text is in `item_fts.body` and not in `item` — that is what let
+    /// [`Store::search`] answer without a join. So an update is nothing more than rewriting one
+    /// FTS row, and since FTS5 has no upsert, it deletes and writes. Both statements are
+    /// `storebase`'s — the very pair `index`'s idempotent re-ingest needed.
     ///
-    /// `mem`이 `path`·`title`·`mtime`·`len`을 기본값으로 두므로 `item` 쪽에 손댈 것이 없다.
+    /// `mem` leaves `path`, `title`, `mtime` and `len` at their defaults, so there is nothing on
+    /// the `item` side to touch.
     ///
-    /// # `written_at`은 바뀌지 않는다
+    /// # `written_at` does not change
     ///
-    /// **수정은 도착이 아니라 정정이다.** 그 열은 이 행이 스토어에 *도착한* 때를 말하고,
-    /// 고칠 때마다 밀린다면 "이 스토어가 이것을 언제 알게 됐나"에 답할 수 있는 곳이 없어진다.
-    /// 고쳐진 때를 따로 적으려면 컬럼이 하나 더 있어야 하는데, 그 스키마는 `index`와
-    /// 공유하는 것이라 [`SCHEMA_VERSION`](cortex_exec_storebase::sqlite::SCHEMA_VERSION)이
-    /// 올라간다 — 편의 하나에 치를 값이 아니다.
+    /// **An update is a correction, not an arrival.** That column says when this row *arrived* in
+    /// the store, and pushing it forward on every correction would leave nowhere to answer "when
+    /// did this store come to know this" from. Recording the correction time separately would take
+    /// one more column, and that schema is shared with `index`, so
+    /// [`SCHEMA_VERSION`](cortex_exec_storebase::sqlite::SCHEMA_VERSION) goes up — not a price
+    /// worth paying for one convenience.
     ///
-    /// 목록이 최신순이므로 부수 효과가 하나 따라오고, 그쪽이 오히려 원하는 것이다:
-    /// 고쳐도 행이 위로 튀지 않는다.
+    /// A listing is newest first, so one side effect follows, and it is the one worth having: a
+    /// corrected memory does not jump to the top.
     pub fn update(&self, id: &str, text: &str) -> io::Result<Option<Record>> {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.transaction().map_err(sql_error)?;
@@ -741,7 +747,8 @@ mod tests {
         );
     }
 
-    /// 검색이 답하는 것은 이제 행이다 — id가 실려 나오고, 그 id로 지울 수 있다.
+    /// What a search answers with is a row now — the id comes out with it, and that id can be
+    /// deleted by.
     #[test]
     fn a_search_answers_with_rows_that_can_be_addressed() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -760,8 +767,8 @@ mod tests {
         assert_eq!(found[0].written_at, written[0].written_at);
     }
 
-    /// 쓴 것이 그대로 돌아오고, 순서는 인자의 순서다. id는 서로 다르고 날짜는 같다 —
-    /// 한 배치는 한 순간이라는 `insert`의 규약 그대로.
+    /// What was written comes back as it was, in the order it was given. The ids differ and the
+    /// dates match — `insert`'s rule that one batch is one moment.
     #[test]
     fn insert_answers_with_what_it_wrote() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -904,7 +911,8 @@ mod tests {
         assert!(!path.try_exists().unwrap(), "opening made nothing");
     }
 
-    /// 최신순. 한 배치는 `written_at`을 공유하므로 그 안에서는 rowid 역순 — 나중에 쓴 것이 위다.
+    /// Newest first. A batch shares one `written_at`, so within it the order is descending rowid
+    /// — the later line is the higher one.
     #[test]
     fn list_answers_newest_first() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -928,14 +936,15 @@ mod tests {
 
         let all = store.list(None).expect("a listing");
 
-        // 두 번째 배치가 먼저, 그 안에서는 나중 행이 먼저.
+        // The second batch first, and within it the later row first.
         assert_eq!(
             all.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
             ["셋째", "둘째", "첫째"]
         );
     }
 
-    /// 상한이 없으면 전부. `search`와 다른 점이고, `list`에는 랭킹이 없으므로 전부가 곧 답이다.
+    /// No bound means all of them. That is where it differs from `search`, and `list` has no
+    /// ranking, so all of them *is* the answer.
     #[test]
     fn list_without_a_limit_answers_with_everything() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -951,7 +960,7 @@ mod tests {
         assert_eq!(store.list(Some(3)).expect("a listing").len(), 3);
     }
 
-    /// 빈 스토어는 빈 목록이고 실패가 아니다.
+    /// An empty store is an empty listing, and not a failure.
     #[test]
     fn list_of_an_empty_store_is_empty() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1008,8 +1017,8 @@ mod tests {
         assert!(!path.try_exists().unwrap(), "nothing was made");
     }
 
-    /// 지워진 메모리는 목록에 없고, **검색에도 없다** — `item_fts`까지 지워졌다는 증거다.
-    /// `item` 행만 지웠다면 이 테스트가 잡는다.
+    /// A deleted memory is off the listing, and **out of the search too** — the evidence that
+    /// `item_fts` went with it. If only the `item` row had been deleted, this test catches it.
     #[test]
     fn a_deleted_memory_is_gone_from_the_index_too() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1035,7 +1044,8 @@ mod tests {
         );
     }
 
-    /// 없는 id는 실패가 아니다. 삭제의 사후 조건은 "그것이 없다"이고, 이미 만족되어 있다.
+    /// An id that is not there is not a failure. A delete's post-condition is "it is not there",
+    /// and it is already satisfied.
     #[test]
     fn deleting_what_is_not_there_is_not_a_failure() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1055,8 +1065,9 @@ mod tests {
         assert_eq!(store.list(None).expect("a listing").len(), 1);
     }
 
-    /// 배치는 전부 아니면 전무 — `insert`와 같은 규약. 여기서는 한 id를 두 번 주어도
-    /// 두 번째가 못 찾을 뿐 실패가 아니므로, 커밋이 통째로 일어났는지를 본다.
+    /// A batch is all of it or none — `insert`'s rule. Giving one id twice is not a failure here
+    /// either, only a second lookup that finds nothing, so what this looks at is that the commit
+    /// happened whole.
     #[test]
     fn a_batch_delete_is_one_transaction() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1087,17 +1098,18 @@ mod tests {
         );
     }
 
-    /// `a_batch_delete_is_one_transaction`이 잡지 못하는 것: 그 테스트는 두 id를 지우고
-    /// 둘 다 갔는지만 본다 — `delete`의 트랜잭션을 통째로 들어내도 각 문장이 그저
-    /// 자동커밋되어 똑같이 통과한다. 여기서는 `a_batch_that_cannot_be_finished_writes_none_of_itself`가
-    /// `insert`에 한 것과 같은 수법을 쓴다: 배치 중간에 실패를 강제로 일으키는 트리거를
-    /// 심고, 스토어가 그 실패 이전으로 고스란히 돌아가는지를 본다.
+    /// What `a_batch_delete_is_one_transaction` cannot catch: that test deletes two ids and only
+    /// looks at whether both went — lift `delete`'s transaction out entirely and each statement
+    /// simply autocommits, and it passes just the same. This one uses the same trick
+    /// `a_batch_that_cannot_be_finished_writes_none_of_itself` uses on `insert`: plant a trigger
+    /// that forces a failure partway through the batch, and look at whether the store comes back
+    /// exactly as it was before it.
     ///
-    /// 트리거는 `item`의 행이 2개로 줄었을 때 발동한다 — 세 줄짜리 스토어에서 첫 번째
-    /// 삭제(3 → 2)는 통과시키고, 같은 트랜잭션 안에서 두 번째 삭제를 시도하는 순간
-    /// (지우기 전 개수가 이미 2) 막는다. `delete`가 트랜잭션 없이 문장마다 커밋한다면
-    /// 첫 번째 삭제는 이미 디스크에 남고, 이 테스트는 목록이 3개가 아니라 2개인 것을
-    /// 보고 실패한다.
+    /// The trigger fires once `item` is down to two rows — in a three-line store it lets the
+    /// first delete through (3 → 2) and blocks the moment the second is attempted inside the same
+    /// transaction (the count before that removal being already 2). If `delete` committed per
+    /// statement with no transaction, the first delete would already be on disk, and this test
+    /// would fail on seeing a listing of two rather than three.
     #[test]
     fn a_batch_delete_that_cannot_be_finished_undoes_none_of_itself() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1148,8 +1160,8 @@ mod tests {
         assert_eq!(indexed, 3, "what was indexed came back with what named it");
     }
 
-    /// 수정 뒤에는 옛 용어로 못 찾고 새 용어로 찾는다 — `item_fts`가 실제로 다시 쓰였다는
-    /// 증거다. `item`만 건드렸다면 이 테스트가 잡는다.
+    /// After a correction the old terms no longer find it and the new ones do — the evidence that
+    /// `item_fts` was actually rewritten. If only `item` had been touched, this test catches it.
     #[test]
     fn an_updated_memory_is_reindexed() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1175,7 +1187,7 @@ mod tests {
         );
     }
 
-    /// 수정은 도착이 아니라 정정이다 — id도 날짜도 그대로다.
+    /// An update is a correction and not an arrival — the id and the date both stay.
     #[test]
     fn an_update_keeps_the_id_and_the_date() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1196,8 +1208,8 @@ mod tests {
         assert_eq!(after.text, "고친 문장");
     }
 
-    /// 없는 id에 대한 수정은 `delete`와 달리 아무것도 하지 않았다고 말해야 한다. 사후 조건이
-    /// "그것이 이렇게 말한다"이고, 그것은 만족되지 않았다.
+    /// An update against an id that is not there has to say it did nothing, unlike `delete`. The
+    /// post-condition is "that memory says this", and it was not satisfied.
     #[test]
     fn updating_what_is_not_there_answers_with_nothing() {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -1209,10 +1221,10 @@ mod tests {
         );
     }
 
-    /// 여러 줄 마크다운이 바이트 단위로 그대로 왕복한다.
+    /// Multi-line Markdown makes the round trip byte for byte.
     ///
-    /// 이 크레이트가 본문에 대해 하는 일이 없다는 것 — 정규화도, 살균도, 줄 다듬기도 —
-    /// 을 고정한다. 이것이 깨지면 이 스토어를 읽고 쓰는 편집기가 깨진다.
+    /// This pins that the crate does nothing to the text — no normalizing, no sanitizing, no
+    /// tidying of lines. An editor that reads and writes this store breaks when this breaks.
     #[test]
     fn markdown_survives_a_round_trip_byte_for_byte() {
         let dir = tempfile::tempdir().expect("a temporary directory");
