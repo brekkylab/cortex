@@ -94,14 +94,29 @@ async fn abin_is_a_read_only_disk_first_on_path() {
     );
 }
 
-/// The control: without the override there is no `/abin` at all, so finding one anywhere
-/// above is finding something the test put there.
+/// The control: with nothing to put in it there is no `/abin` at all, so finding one
+/// anywhere above is finding something the test put there.
+///
+/// "Nothing" takes three denials now that releases exist. No override, a base URL with no
+/// pointer under it, and a home of its own so that a release this host downloaded earlier is
+/// not sitting in the cache — miss any one and the server finds a perfectly good `/abin`.
+///
+/// Which makes this the test for the rule that a session is never refused over `/abin`: every
+/// way of getting one has failed here, and a session still starts.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots a micro-VM"]
 async fn without_executables_there_is_no_abin() {
+    let nowhere = tempfile::tempdir().expect("an empty directory");
+    let home = tempfile::tempdir().expect("a home");
+
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
     server.stderr(Stdio::inherit());
     server.env_remove("CORTEX_ABIN_DIR");
+    server.env("CORTEX_UVM_HOME", home.path());
+    server.env(
+        "CORTEX_ABIN_BASE_URL",
+        format!("file://{}", nowhere.path().display()),
+    );
     let client = cortex::console::stdio::StdioClient::new(server).unwrap();
     let mut console = Console::builder()
         .client(client)
