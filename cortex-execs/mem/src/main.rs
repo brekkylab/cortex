@@ -194,6 +194,10 @@ struct Search {
     /// a longer one rather than a way to switch a limit on.
     #[arg(short = 'n', long, default_value_t = 10, long_help = None)]
     limit: usize,
+
+    /// answer with one line of JSON per memory: its id, its text, and when it was written
+    #[arg(long, long_help = None)]
+    json: bool,
 }
 
 /// `mem list <store>` — 스토어가 들고 있는 전부, 최신 먼저.
@@ -339,6 +343,7 @@ fn run(command: Command) -> Result<String, String> {
             store,
             query,
             limit,
+            json,
         }) => {
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
             let found = opened
@@ -350,12 +355,7 @@ fn run(command: Command) -> Result<String, String> {
             // query is no lines and a zero: the store was read and it holds nothing near this,
             // which is an answer and not a failure. A caller that wants to act on emptiness reads
             // no lines, which is the same test they would make of any command that lists things.
-            let mut said = String::new();
-            for text in &found {
-                said.push_str(text);
-                said.push('\n');
-            }
-            Ok(said)
+            Ok(lines(&found, json))
         }
         Command::List(List { store, limit, json }) => {
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;

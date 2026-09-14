@@ -96,8 +96,11 @@ pub struct Record {
 /// them, and a search that answers the same question two ways is one nobody can test or script
 /// against. Oldest first among equals, since that is what a rowid is.
 ///
-/// No join: the text is in `item_fts`, which is the point of it not being contentless. Nothing
-/// of `item` is needed to answer — a memory is its text.
+/// **조인이 있고, 한때 없었다.** 텍스트는 `item_fts`에 있으므로 검색이 답하는 *문장*에는
+/// `item`이 필요 없다. 필요해진 것은 행의 id이고, 그것은 `item`에 있다 — 찾은 메모리를
+/// 그 자리에서 고치거나 지우려면 그것을 부를 이름이 있어야 하며, 텍스트는 중복을 허용하므로
+/// 이름이 될 수 없다. rowid로 거는 조인은 SQLite가 하는 가장 싼 일이고, `limit`이 그것을
+/// 도는 행의 수를 이미 묶어 두고 있다.
 const SEARCH: &str = include_str!("../queries/search.sql");
 
 /// 스토어가 들고 있는 전부, 최신 먼저 — `queries/list.sql`.
@@ -248,7 +251,7 @@ impl Store {
     /// here for the index to answer, and "no memories are near this" is a true answer to it.
     /// Refusing instead would be this function deciding that the caller made a mistake, on the
     /// evidence of a string it cannot read the intent of.
-    pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<String>> {
+    pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<Record>> {
         let Some(expression) = as_expression(query) else {
             return Ok(Vec::new());
         };
@@ -260,9 +263,15 @@ impl Store {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(SEARCH).map_err(sql_error)?;
         let found = stmt
-            .query_map((&expression, limit), |row| row.get(0))
+            .query_map((&expression, limit), |row| {
+                Ok(Record {
+                    id: row.get(0)?,
+                    text: row.get(1)?,
+                    written_at: row.get(2)?,
+                })
+            })
             .map_err(sql_error)?
-            .collect::<Result<Vec<String>, _>>()
+            .collect::<Result<Vec<Record>, _>>()
             .map_err(sql_error)?;
         Ok(found)
     }
@@ -533,7 +542,13 @@ mod tests {
 
         let found = |query: &str| store.search(query, 10).expect("the store answers");
 
-        assert_eq!(found("oat milk"), ["User switched to oat milk"]);
+        assert_eq!(
+            found("oat milk")
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            ["User switched to oat milk"]
+        );
         // A term of both is both, and a term of neither is nothing: what is being asked of the
         // index is which memories hold the terms, not which hold the string.
         assert_eq!(found("User").len(), 2, "lowercased on both sides");
@@ -558,7 +573,7 @@ mod tests {
             .search("oat milk in coffee", 10)
             .expect("the store answers");
         assert_eq!(
-            found,
+            found.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
             [
                 "User switched to oat milk in coffee after an almond allergy",
                 "User switched to oat milk",
@@ -583,7 +598,7 @@ mod tests {
             .search("which friend did the user meet in 서울", 10)
             .expect("the store answers");
         assert_eq!(
-            found.first().map(String::as_str),
+            found.first().map(|r| r.text.as_str()),
             Some("User met a friend 서울에서 last Tuesday"),
             "not one memory holds every term of that question: {found:?}"
         );
@@ -610,7 +625,7 @@ mod tests {
 
         let found = store.search("coffee", 1).expect("the store answers");
         assert_eq!(
-            found,
+            found.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
             ["User drinks coffee"],
             "one memory, and the nearest of the two that hold the term"
         );
@@ -629,7 +644,12 @@ mod tests {
 
         for _ in 0..4 {
             assert_eq!(
-                store.search("tea", 10).expect("the store answers"),
+                store
+                    .search("tea", 10)
+                    .expect("the store answers")
+                    .iter()
+                    .map(|r| r.text.as_str())
+                    .collect::<Vec<_>>(),
                 ["User drinks tea", "User drinks tea"]
             );
         }
@@ -652,7 +672,7 @@ mod tests {
 
         let once = store.search("oat milk", 10).expect("the store answers");
         assert_eq!(
-            once,
+            once.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
             ["oat milk", "milk chocolate bar", "oat porridge bowl"]
         );
         assert_eq!(
@@ -691,7 +711,12 @@ mod tests {
         );
 
         assert_eq!(
-            store.search("NOT almond", 10).expect("the store answers"),
+            store
+                .search("NOT almond", 10)
+                .expect("the store answers")
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
             ["User said NOT to recommend almond milk"]
         );
         // Nothing here matches; what is being asserted is that asking does not fail.
@@ -714,6 +739,25 @@ mod tests {
                 .expect("a store answers")
                 .is_empty()
         );
+    }
+
+    /// 검색이 답하는 것은 이제 행이다 — id가 실려 나오고, 그 id로 지울 수 있다.
+    #[test]
+    fn a_search_answers_with_rows_that_can_be_addressed() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+        let written = store
+            .insert(&[Memory {
+                text: "oat milk in the fridge".into(),
+            }])
+            .expect("written");
+
+        let found = store.search("oat", 10).expect("a search");
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, written[0].id);
+        assert_eq!(found[0].text, "oat milk in the fridge");
+        assert_eq!(found[0].written_at, written[0].written_at);
     }
 
     /// 쓴 것이 그대로 돌아오고, 순서는 인자의 순서다. id는 서로 다르고 날짜는 같다 —
@@ -837,7 +881,12 @@ mod tests {
         let store = holding(dir.path(), &[written]);
 
         assert_eq!(
-            store.search("friend", 10).expect("the store answers"),
+            store
+                .search("friend", 10)
+                .expect("the store answers")
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
             [written],
             "case and punctuation survive"
         );
@@ -1060,7 +1109,7 @@ mod tests {
             "the old terms left"
         );
         assert_eq!(
-            store.search("almond", 10).expect("a search")[0],
+            store.search("almond", 10).expect("a search")[0].text,
             "almond milk in the fridge"
         );
     }
