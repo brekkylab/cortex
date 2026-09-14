@@ -1,0 +1,82 @@
+# Publish `/abin` — cortex's own executables, built for the guest.
+#
+# The release is named by the commit this runs on, so what gets checked out is what gets
+# published: a release event checks out the tagged commit, a dispatch checks out whatever ref
+# was chosen. `scripts/abin-release.sh` is the whole of the work; this file only arranges for
+# it to have a toolchain and credentials.
+name: abin release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build both architectures and stop, uploading nothing
+        type: boolean
+        default: false
+
+# Never two at once. The last thing a release writes is `abin/latest`, so overlapping runs
+# could land their pointers in the opposite order to their uploads and leave `latest` naming
+# the older of the two. Queued rather than cancelled: a run interrupted between its tarballs
+# and its pointer leaves the bucket in a state that is safe but untidy.
+concurrency:
+  group: abin-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # For the OIDC token `configure-aws-credentials` exchanges for a role. No long-lived key is
+  # stored anywhere for this.
+  id-token: write
+
+env:
+  # Pinned by digest, checked below. This job holds credentials that can write what every
+  # cortex guest executes, so what it runs is not left to whatever a mirror serves today.
+  ZIG_VERSION: 0.16.0
+  ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The script warns when the commit is on no remote branch, and a shallow clone has
+          # no remote-tracking branches to look in — it would warn on every run and mean
+          # nothing by it.
+          fetch-depth: 0
+
+      - name: Install zig
+        run: |
+          set -euo pipefail
+          url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$url" -o /tmp/zig.tar.xz
+          echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c -
+          mkdir -p /opt/zig
+          tar -xJf /tmp/zig.tar.xz -C /opt/zig --strip-components=1
+          echo /opt/zig >> "$GITHUB_PATH"
+
+      - name: Install cargo-zigbuild and the musl targets
+        run: |
+          set -euo pipefail
+          cargo install --locked cargo-zigbuild
+          rustup target add aarch64-unknown-linux-musl x86_64-unknown-linux-musl
+
+      # Skipped on a dry run, so the workflow itself can be exercised before the role below
+      # exists — and so a build-only run never holds credentials it has no use for.
+      - name: Assume the publishing role
+        if: ${{ !inputs.dry_run }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Publish
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ./scripts/abin-release.sh --dry-run
+          else
+            ./scripts/abin-release.sh
+          fi

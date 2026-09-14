@@ -8,11 +8,19 @@
 set -euo pipefail
 
 BUCKET="${ABIN_BUCKET:-cortex-dist-044443350235-us-east-1-an}"
-PROFILE="${AWS_PROFILE:-brekkylab}"
 DRY_RUN=0
 [ "${1:-}" = "--dry-run" ] && DRY_RUN=1
 
 die() { echo "abin-release: $*" >&2; exit 1; }
+
+# Credentials come from wherever the aws CLI normally finds them. On a laptop that is a
+# named profile and there is one obvious choice; in CI it is the environment, and naming a
+# profile that does not exist there is an error rather than a default. So this fills in the
+# laptop case and otherwise keeps out of the way — `--profile` is never passed explicitly,
+# because doing so would override the environment it is trying to defer to.
+if [ -z "${AWS_PROFILE:-}" ] && [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+  export AWS_PROFILE=brekkylab
+fi
 
 # Prerequisites, said as sentences rather than left to fail as tool errors.
 command -v zig >/dev/null || die "zig is not on PATH (brew install zig)"
@@ -56,7 +64,7 @@ if [ "$DRY_RUN" = 1 ]; then
 fi
 
 for arch in aarch64 x86_64; do
-  aws s3 cp --profile "$PROFILE" \
+  aws s3 cp \
     --cache-control "public, max-age=31536000, immutable" \
     "$OUT/abin-linux-$arch.tar.gz" \
     "s3://$BUCKET/abin/$SHA/abin-linux-$arch.tar.gz"
@@ -64,7 +72,7 @@ done
 
 # Last, so there is no window in which the pointer names a half-uploaded release.
 printf '%s\n' "$SHA" > "$OUT/latest"
-aws s3 cp --profile "$PROFILE" --cache-control "no-cache" \
+aws s3 cp --cache-control "no-cache" \
   "$OUT/latest" "s3://$BUCKET/abin/latest"
 
 echo "abin-release: published $SHA" >&2
