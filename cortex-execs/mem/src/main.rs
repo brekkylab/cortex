@@ -128,6 +128,13 @@ struct Insert {
     // been opened on behalf of an argument that was never usable.
     #[arg(long_help = None, value_name = "TEXTS", value_parser = trimmed)]
     texts: Vec<String>,
+
+    /// 메모리마다 한 줄의 JSON으로 답한다: id, 본문, 쓰인 때
+    ///
+    /// 기본 출력은 본문 한 줄이고, 그것이 말할 수 없는 것이 두 가지다 — 행의 id와, 줄바꿈이
+    /// 든 본문. 본문이 마크다운일 수 있는 호출자는 이것을 쓴다.
+    #[arg(long, long_help = None)]
+    json: bool,
 }
 
 /// `text` without its edges, or the refusal to take it as a memory.
@@ -225,38 +232,13 @@ fn run(command: Command) -> Result<String, String> {
             )),
             Err(e) => Err(refused(&store, e)),
         },
-        Command::Insert(Insert { store, texts }) => {
-            // The store before anything else: `insert` writes to a store that exists, and a
-            // caller who named the wrong file should learn it from the file.
+        Command::Insert(Insert { store, texts, json }) => {
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
-
-            // Straight through: what the caller wrote is what is written. There is nothing
-            // between the argument and the row — no reading of it, no store consulted about what
-            // it already holds — because the deciding this command does not do is the whole of
-            // what it is for.
-            //
-            // Which also means it does not deduplicate. Told the same thing twice, the store
-            // holds it twice, and that is the caller's to know rather than something to be
-            // quietly saved from: two callers writing the same sentence about different things is
-            // a case no comparison of text could tell from a repeat.
             let memories: Vec<Memory> = texts.into_iter().map(|text| Memory { text }).collect();
-
             // Written before anything is said about them, so that what a caller reads on stdout
-            // is what the store holds: a write that failed after the lines were printed would
-            // have told them the opposite of what happened.
-            opened.insert(&memories).map_err(|e| refused(&store, e))?;
-
-            // The memories back, one per line — the same lines `search` prints, and the same
-            // shape `index` answers in, so that something driving either reads one kind of
-            // output. What it adds over the arguments the caller already had is that these are
-            // the ones the store now holds. Nothing to write is no output at all, which is the
-            // answer a script producing an empty list wants.
-            let mut said = String::new();
-            for memory in &memories {
-                said.push_str(&memory.text);
-                said.push('\n');
-            }
-            Ok(said)
+            // is what the store holds.
+            let written = opened.insert(&memories).map_err(|e| refused(&store, e))?;
+            Ok(lines(&written, json))
         }
         Command::Search(Search {
             store,

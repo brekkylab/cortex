@@ -147,7 +147,11 @@ impl Store {
     /// They share a `written_at` for the same reason: what is being timestamped is the call,
     /// and a batch written in one call happened at one moment. Ordering two rows of it by a
     /// microsecond would be recording the order this loop ran in.
-    pub fn insert(&self, memories: &[Memory]) -> io::Result<()> {
+    ///
+    /// 돌려주는 것은 쓰인 행들이며, 인자의 순서 그대로다. 이 함수가 만든 id는 호출자가
+    /// 다시 얻을 방법이 없다 — 텍스트는 중복을 허용하므로 나중에 찾아낼 수도 없다 — 그래서
+    /// 버리지 않고 돌려준다. `--json`이 싣는 것이 이것이다.
+    pub fn insert(&self, memories: &[Memory]) -> io::Result<Vec<Record>> {
         // A poisoned lock is a panic that happened while somebody held this connection, and it
         // is not a reason to refuse the file: what a poisoned lock protects is data whose
         // invariants a panic may have left half-applied, and the invariants here are SQLite's
@@ -157,15 +161,17 @@ impl Store {
         let tx = conn.transaction().map_err(sql_error)?;
 
         let written_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let mut written = Vec::with_capacity(memories.len());
         {
             let mut row = tx.prepare(sqlite::UPSERT).map_err(sql_error)?;
             let mut text = tx.prepare(sqlite::FTS_WRITE).map_err(sql_error)?;
 
             for memory in memories {
+                let id = uuid::Uuid::new_v4().to_string();
                 let rowid: i64 = row
                     .query_row(
                         (
-                            uuid::Uuid::new_v4().to_string(),
+                            &id,
                             // The null that says "this is a memory": no path, so nothing to
                             // conflict with, so no update — see `sqlite::UPSERT`.
                             None::<&str>,
@@ -179,12 +185,17 @@ impl Store {
                     .map_err(sql_error)?;
                 // The empty `title`: a memory has no name, and an FTS5 column with no tokens
                 // in it contributes nothing to `bm25` and matches nothing.
-                text.execute((rowid, "", &memory.text))
-                    .map_err(sql_error)?;
+                text.execute((rowid, "", &memory.text)).map_err(sql_error)?;
+                written.push(Record {
+                    id,
+                    text: memory.text.clone(),
+                    written_at: written_at.clone(),
+                });
             }
         }
 
-        tx.commit().map_err(sql_error)
+        tx.commit().map_err(sql_error)?;
+        Ok(written)
     }
 
     /// The memories nearest `query`, nearest first, and at most `limit` of them.
@@ -559,6 +570,34 @@ mod tests {
                 .search("oat milk", 10)
                 .expect("a store answers")
                 .is_empty()
+        );
+    }
+
+    /// 쓴 것이 그대로 돌아오고, 순서는 인자의 순서다. id는 서로 다르고 날짜는 같다 —
+    /// 한 배치는 한 순간이라는 `insert`의 규약 그대로.
+    #[test]
+    fn insert_answers_with_what_it_wrote() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+
+        let written = store
+            .insert(&[
+                Memory {
+                    text: "오트밀크로 바꿨다".into(),
+                },
+                Memory {
+                    text: "차를 마신다".into(),
+                },
+            ])
+            .expect("the batch is written");
+
+        assert_eq!(written.len(), 2);
+        assert_eq!(written[0].text, "오트밀크로 바꿨다");
+        assert_eq!(written[1].text, "차를 마신다");
+        assert_ne!(written[0].id, written[1].id, "each row has its own id");
+        assert_eq!(
+            written[0].written_at, written[1].written_at,
+            "one call is one moment"
         );
     }
 
