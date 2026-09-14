@@ -1147,4 +1147,24 @@ mod tests {
             None
         );
     }
+
+    /// 여러 줄 마크다운이 바이트 단위로 그대로 왕복한다.
+    ///
+    /// 이 크레이트가 본문에 대해 하는 일이 없다는 것 — 정규화도, 살균도, 줄 다듬기도 —
+    /// 을 고정한다. 이것이 깨지면 이 스토어를 읽고 쓰는 편집기가 깨진다.
+    #[test]
+    fn markdown_survives_a_round_trip_byte_for_byte() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = Store::try_new(dir.path().join("notes.mem")).expect("a new store");
+
+        let body = "## 마감\n\n분기 마감은 **11월 15일**.\n\n| 채널 | NCNR |\n|---|---|\n| Luxshare | 80% |\n\n```sh\nmem list notes.mem\n```";
+
+        let written = store
+            .insert(&[Memory { text: body.into() }])
+            .expect("written");
+        assert_eq!(written[0].text, body);
+
+        let back = store.list(None).expect("a listing");
+        assert_eq!(back[0].text, body, "what came back is what went in");
+    }
 }
