@@ -36,7 +36,10 @@ use std::{
 
 use clap::Parser as _;
 
-use crate::{memory::Memory, store::{Record, Store}};
+use crate::{
+    memory::Memory,
+    store::{Record, Store},
+};
 
 /// The name every message this program writes about itself is spelled with.
 ///
@@ -567,6 +570,9 @@ mod tests {
             written_at: "2026-09-14T06:12:03Z".into(),
         };
 
-        assert_eq!(lines(std::slice::from_ref(&record), false), "오트밀크로 바꿨다\n");
+        assert_eq!(
+            lines(std::slice::from_ref(&record), false),
+            "오트밀크로 바꿨다\n"
+        );
     }
 }
