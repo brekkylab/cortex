@@ -611,6 +611,8 @@ dependencies = [
  "clap",
  "cortex-exec-storebase",
  "rusqlite",
+ "serde",
+ "serde_json",
  "tempfile",
  "uuid",
 ]
