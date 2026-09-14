@@ -1087,6 +1087,67 @@ mod tests {
         );
     }
 
+    /// `a_batch_delete_is_one_transaction`이 잡지 못하는 것: 그 테스트는 두 id를 지우고
+    /// 둘 다 갔는지만 본다 — `delete`의 트랜잭션을 통째로 들어내도 각 문장이 그저
+    /// 자동커밋되어 똑같이 통과한다. 여기서는 `a_batch_that_cannot_be_finished_writes_none_of_itself`가
+    /// `insert`에 한 것과 같은 수법을 쓴다: 배치 중간에 실패를 강제로 일으키는 트리거를
+    /// 심고, 스토어가 그 실패 이전으로 고스란히 돌아가는지를 본다.
+    ///
+    /// 트리거는 `item`의 행이 2개로 줄었을 때 발동한다 — 세 줄짜리 스토어에서 첫 번째
+    /// 삭제(3 → 2)는 통과시키고, 같은 트랜잭션 안에서 두 번째 삭제를 시도하는 순간
+    /// (지우기 전 개수가 이미 2) 막는다. `delete`가 트랜잭션 없이 문장마다 커밋한다면
+    /// 첫 번째 삭제는 이미 디스크에 남고, 이 테스트는 목록이 3개가 아니라 2개인 것을
+    /// 보고 실패한다.
+    #[test]
+    fn a_batch_delete_that_cannot_be_finished_undoes_none_of_itself() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("notes.sqlite");
+        let store = Store::try_new(&path).expect("a store can be made");
+        let written = store
+            .insert(&[
+                Memory {
+                    text: "하나".into(),
+                },
+                Memory { text: "둘".into() },
+                Memory { text: "셋".into() },
+            ])
+            .expect("written");
+
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute_batch(
+                "create trigger no_second_delete before delete on item
+                 when (select count(*) from item) <= 2
+                 begin select raise(abort, 'no'); end",
+            )
+            .unwrap();
+        }
+
+        store
+            .delete(&[written[0].id.clone(), written[2].id.clone()])
+            .expect_err("the second row of the batch is refused");
+
+        let remaining = store.list(None).expect("a listing");
+        assert_eq!(
+            remaining.len(),
+            3,
+            "the first row's delete went back with the second: {remaining:?}"
+        );
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["하나", "둘", "셋"].into_iter().collect(),
+        );
+
+        let conn = sqlite::connect(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let indexed: i64 = conn
+            .query_row("select count(*) from item_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(indexed, 3, "what was indexed came back with what named it");
+    }
+
     /// 수정 뒤에는 옛 용어로 못 찾고 새 용어로 찾는다 — `item_fts`가 실제로 다시 쓰였다는
     /// 증거다. `item`만 건드렸다면 이 테스트가 잡는다.
     #[test]

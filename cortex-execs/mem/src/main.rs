@@ -150,7 +150,7 @@ struct Insert {
     #[arg(long_help = None, value_name = "TEXTS", value_parser = trimmed)]
     texts: Vec<String>,
 
-    /// 메모리마다 한 줄의 JSON으로 답한다: id, 본문, 쓰인 때
+    /// answer with one line of JSON per memory: its id, its text, and when it was written
     ///
     /// 기본 출력은 본문 한 줄이고, 그것이 말할 수 없는 것이 두 가지다 — 행의 id와, 줄바꿈이
     /// 든 본문. 본문이 마크다운일 수 있는 호출자는 이것을 쓴다.
@@ -332,11 +332,12 @@ fn run(command: Command) -> Result<String, String> {
             // have told them the opposite of what happened.
             let written = opened.insert(&memories).map_err(|e| refused(&store, e))?;
 
-            // The memories back, one per line — the same lines `search` prints, and the same
-            // shape `index` answers in, so that something driving either reads one kind of
-            // output. What it adds over the arguments the caller already had is that these are
-            // the ones the store now holds. Nothing to write is no output at all, which is the
-            // answer a script producing an empty list wants.
+            // The memories back, one per line by default — the same lines `search` prints, and
+            // the same shape `index` answers in, so that something driving either reads one kind
+            // of output (under `--json` the shape is `lines`'s own, not `search`'s or `index`'s).
+            // What it adds over the arguments the caller already had is that these are the ones
+            // the store now holds. Nothing to write is no output at all, which is the answer a
+            // script producing an empty list wants.
             Ok(lines(&written, json))
         }
         Command::Search(Search {
@@ -654,7 +655,9 @@ mod tests {
         // caller a command they actually have.
         let said = e.render().to_string();
         assert!(said.contains(&format!("Usage: {NAME}")), "{said}");
-        for command in ["init", "insert", "search", "list"] {
+        for command in [
+            "init", "insert", "search", "list", "delete", "update", "edit",
+        ] {
             assert!(said.contains(command), "{command} is missing from: {said}");
         }
     }
@@ -738,6 +741,61 @@ mod tests {
             format!("{id}\n")
         );
         assert_eq!(run_line(&["list", &store]).expect("a listing"), "");
+    }
+
+    /// `delete --json`이 싣는 것은 id 하나뿐이다 — 지운 것에는 답할 본문이 없다. `lines`를
+    /// 지나는 다른 모든 `--json`과 달리 `run`이 직접 조립하는 유일한 모양이므로, 그 모양이
+    /// 한 줄의 `{"id": ...}`이고 `text`나 `written_at`을 싣지 않는다는 것을 따로 고정한다.
+    #[test]
+    fn deleted_json_carries_only_the_id() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+        let written =
+            run_line(&["insert", &store, "오트밀크로 바꿨다", "--json"]).expect("written");
+        let id = serde_json::from_str::<serde_json::Value>(written.trim_end())
+            .expect("a JSON line")["id"]
+            .as_str()
+            .expect("an id")
+            .to_owned();
+
+        let said = run_line(&["delete", &store, &id, "--json"]).expect("the memory is deleted");
+
+        assert_eq!(said.lines().count(), 1, "one id, one line: {said:?}");
+        let back: serde_json::Value = serde_json::from_str(said.trim_end()).expect("a JSON line");
+        assert_eq!(back["id"], id);
+        assert!(
+            back.get("text").is_none() && back.get("written_at").is_none(),
+            "delete has no body to answer with: {back:?}"
+        );
+    }
+
+    /// 없는 id를 지우는 것은 실패가 아니다 — 사후 조건이 이미 참이므로 빈 줄로 답한다.
+    #[test]
+    fn deleting_an_unknown_id_answers_with_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+
+        assert_eq!(
+            run_line(&["delete", &store, "없는-id"]).expect("no failure"),
+            ""
+        );
+    }
+
+    /// `update`가 없는 id를 받으면 `delete`와 달리 거절한다 — 이 크레이트에서 가장 무거운
+    /// 뜻을 지닌 비대칭이다: 알려지지 않은 id에 대해 `update`는 `1`로, `delete`는 `0`으로
+    /// 끝난다. 메시지는 스토어를 이름으로 담고, id도 언급한다.
+    #[test]
+    fn updating_an_unknown_id_is_refused() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+
+        let said = run_line(&["update", &store, "없는-id", "고친 문장"])
+            .expect_err("there is no such memory");
+        assert!(said.contains(&store), "{said}");
+        assert!(said.contains("없는-id"), "{said}");
     }
 
     /// 빈 텍스트는 파일이 열리기 전에 거절된다 — `insert`와 같다.
