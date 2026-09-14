@@ -5,21 +5,28 @@
 //! by all of them**, held in the layer store like any other layer and attached as it stands.
 //! There is nothing to assemble per session and nothing to stitch.
 //!
-//! # Why cortex's own are a pinned tarball
+//! # Why a release is named by commit
 //!
-//! One per architecture, by URL and SHA-256, exactly as the base rootfs is — and for the
-//! same reason: what is downloaded decides what a command in a guest runs, so it is a digest
-//! and not a tag.
+//! One tarball per OS and architecture, under the sha of the commit its executables were
+//! built from. A build is therefore named by its source rather than by a version somebody
+//! remembered to bump, and `abin/latest` is how a session finds the newest one without being
+//! told.
 //!
-//! **One tarball rather than a file per executable.** Adding one then costs no new constant,
-//! and a version is atomic: there is no state in which half a release is here.
+//! **One tarball rather than a file per executable.** Adding one costs no new constant, and a
+//! release is atomic: there is no state in which half of it is here.
 //!
-//! # There is no release yet
+//! **The bytes are not pinned**, unlike the base rootfs, which carries a SHA-256. What that
+//! trades away is argued in the design note rather than here; what it means for this file is
+//! that `abin/<sha>/` says what it says only as far as write access to the bucket is
+//! controlled, and that [`valid_sha`] is the only check anything performs.
 //!
-//! Cortex's executables need a C cross-compiler that its guest crate's pure-Rust
-//! configuration does not provide, and publishing them is its own piece of work. Until then
-//! [`DIR_ENV`] is how a build gets an `/abin` at all, and [`Builtin::fetch`] says so rather
-//! than pretending otherwise.
+//! # Getting one without the network
+//!
+//! [`DIR_ENV`] short-circuits everything: it names a directory somebody just built, nothing
+//! is downloaded, and nothing is checked. [`VERSION_ENV`] pins a release instead of following
+//! the pointer. Failing both, a machine that has downloaded a release before keeps using the
+//! newest one it has — see [`newest_cached`]. Only a machine with none of the three boots
+//! without `/abin`, which is what every session did before there was anything to fetch.
 
 use std::path::{Path, PathBuf};
 
