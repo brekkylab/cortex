@@ -5,13 +5,15 @@
 # was chosen. `scripts/abin-release.sh` is the whole of the work; this file only arranges for
 # it to have a toolchain and credentials, and splits it across a matrix.
 #
-# # Why the pointer is a job of its own
+# # Why moving `abin/latest` is a job of its own
 #
-# `abin/latest` is what a session follows when it is told nothing, so it must name a release
-# that is *completely* uploaded. Each `build` job uploads only its own OS's tarballs and is
-# told `--no-pointer`; `pointer` runs after all of them and moves it once. A build that fails
-# leaves its siblings' tarballs under a sha nothing refers to, which is inert rather than
-# broken — that is what makes the split safe.
+# `abin/latest` holds the sha of the release a session uses when it has been told nothing —
+# the **latest-pointer**. It must name a release that is *completely* uploaded, so each
+# `build` job uploads only its own OS's tarballs and is told `--no-latest-pointer`, and the
+# `latest-pointer` job runs after all of them and moves it once.
+#
+# A build that fails leaves its siblings' tarballs under a sha nothing refers to, which is
+# inert rather than broken — that is what makes the split safe.
 name: abin release
 
 on:
@@ -24,9 +26,9 @@ on:
         type: boolean
         default: false
 
-# Never two releases at once: the second could move the pointer while the first is still
-# uploading. Queued rather than cancelled, because a run stopped between its tarballs and its
-# pointer leaves a state that is safe but untidy.
+# Never two releases at once: the second could move the latest-pointer while the first is
+# still uploading. Queued rather than cancelled, because a run stopped between its tarballs
+# and its latest-pointer leaves a state that is safe but untidy.
 concurrency:
   group: abin-release
   cancel-in-progress: false
@@ -61,7 +63,7 @@ jobs:
             # what zig supplies and what the host toolchain cannot.
             zig: true
       # Deliberate: one OS failing should not leave the others racing to finish uploads that
-      # no pointer will ever refer to.
+      # the latest-pointer will never refer to.
       fail-fast: true
 
     runs-on: ${{ matrix.runner }}
@@ -114,14 +116,14 @@ jobs:
       - name: Build and upload
         run: |
           set -euo pipefail
-          # `--no-pointer` always: moving it is the `pointer` job's, once every OS is in.
-          args=(--os "${{ matrix.os }}" --no-pointer)
+          # `--no-latest-pointer` always: moving it is the `latest-pointer` job's, once every OS is in.
+          args=(--os "${{ matrix.os }}" --no-latest-pointer)
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
           fi
           ./scripts/abin-release.sh "${args[@]}"
 
-  pointer:
+  latest-pointer:
     needs: build
     # Nothing was uploaded, so there is nothing to point at.
     if: ${{ !inputs.dry_run }}
@@ -140,5 +142,5 @@ jobs:
 
       # No toolchain: this writes 41 bytes and compiles nothing, which is why the script
       # checks for zig only when it is going to build.
-      - name: Move latest
-        run: ./scripts/abin-release.sh --pointer-only
+      - name: Move the latest-pointer
+        run: ./scripts/abin-release.sh --latest-pointer-only

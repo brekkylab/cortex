@@ -7,8 +7,8 @@
 //! **Most of the executables here are shell scripts.** What those tests are about is the
 //! delivery — the disk, the mount, the ordering, the refusals — and a script exercises all
 //! of it without making the test depend on a musl cross-compiler or on anything published.
-//! The last test in the file is the other half: no override, so the server resolves the
-//! pointer and downloads the real release.
+//! The last test in the file is the other half: no override, so the server reads
+//! `abin/latest` and downloads the real release.
 //!
 //! `#[ignore]`, like `guest.rs` and for the same reasons: this needs libkrunfw installed, a
 //! hypervisor the OS will let the process create, and on a cold cache a rootfs download.
@@ -98,7 +98,7 @@ async fn abin_is_a_read_only_disk_first_on_path() {
 /// anywhere above is finding something the test put there.
 ///
 /// "Nothing" takes three denials now that releases exist. No override, a base URL with no
-/// pointer under it, and a home of its own so that a release this host downloaded earlier is
+/// latest-pointer under it, and a home of its own so a release this host downloaded earlier is
 /// not sitting in the cache — miss any one and the server finds a perfectly good `/abin`.
 ///
 /// Which makes this the test for the rule that a session is never refused over `/abin`: every
@@ -154,8 +154,8 @@ async fn an_image_keeps_its_own_commands() {
     );
 }
 
-/// The published release, end to end: no `CORTEX_ABIN_DIR`, so the server resolves the
-/// pointer, downloads the tarball, and the executables in it run in the guest.
+/// The published release, end to end: no `CORTEX_ABIN_DIR`, so the server reads the
+/// latest-pointer, downloads the tarball, and the executables in it run in the guest.
 ///
 /// Reaches the network on purpose — it is the only test that proves the bucket, the key
 /// layout and the client agree. A home of its own, so it proves a cold download rather than

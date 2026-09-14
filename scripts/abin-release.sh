@@ -1,25 +1,33 @@
 #!/usr/bin/env bash
 # Build cortex's own executables for the guest and publish them.
 #
-#   scripts/abin-release.sh                     build every OS below, upload, move the pointer
-#   scripts/abin-release.sh --dry-run           build and stop
-#   scripts/abin-release.sh --os linux          just that OS's architectures
-#   scripts/abin-release.sh --no-pointer        upload, but leave `latest` where it is
-#   scripts/abin-release.sh --pointer-only      move `latest` to HEAD and do nothing else
+#   scripts/abin-release.sh
+#       Build every OS below, upload, and move `abin/latest` to this commit.
+#   scripts/abin-release.sh --dry-run
+#       Build and stop.
+#   scripts/abin-release.sh --os linux
+#       Just that OS's architectures.
+#   scripts/abin-release.sh --no-latest-pointer
+#       Upload, but leave `abin/latest` naming whatever it named before.
+#   scripts/abin-release.sh --latest-pointer-only
+#       Move `abin/latest` to this commit and do nothing else.
 #
 # The git sha of HEAD names the release. That is the whole of its identity — nothing
 # downstream verifies the bytes — which is why a dirty tree is refused below.
 #
-# # Why uploading and moving the pointer are separable
+# # The latest-pointer, and why moving it is separable
 #
-# `abin/latest` is what a session follows when it is told nothing, so it has to name a
-# release that is *completely* uploaded. In one run that is just "write it last". Across a
-# matrix of OSes building in parallel it cannot be: every job would write its own pointer,
-# and the one that finished last would win regardless of whether the others had. So the
-# builders run with `--no-pointer` and a single job afterwards runs `--pointer-only`.
+# `abin/latest` holds one line: the sha of the release a session should use when it has been
+# told nothing. Everything below calls it the **latest-pointer**.
 #
-# A release whose pointer never arrives is inert rather than broken: the tarballs sit under
-# a sha nothing refers to. That is the same property that makes `--no-pointer` safe.
+# It has to name a release that is *completely* uploaded. In one run that is just "write it
+# last". Across a matrix of OSes building in parallel it cannot be: every job would move the
+# latest-pointer itself, and whichever finished last would win regardless of whether the
+# others had. So the builders run with `--no-latest-pointer`, and one job afterwards runs
+# `--latest-pointer-only`.
+#
+# A release the latest-pointer never reaches is inert rather than broken: its tarballs sit
+# under a sha nothing refers to. That is the property that makes the split safe.
 set -euo pipefail
 
 BUCKET="${ABIN_BUCKET:-cortex-dist-044443350235-us-east-1-an}"
@@ -42,15 +50,15 @@ targets_for() {
 }
 
 DRY_RUN=0
-POINTER_ONLY=0
-POINTER=1
+LATEST_POINTER_ONLY=0
+LATEST_POINTER=1
 OSES=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
-    --no-pointer) POINTER=0 ;;
-    --pointer-only) POINTER_ONLY=1 ;;
+    --no-latest-pointer) LATEST_POINTER=0 ;;
+    --latest-pointer-only) LATEST_POINTER_ONLY=1 ;;
     --os)
       shift
       [ $# -gt 0 ] || die "--os needs a value"
@@ -60,8 +68,8 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-[ "$POINTER_ONLY" = 0 ] || [ "$POINTER" = 1 ] \
-  || die "--pointer-only and --no-pointer ask for opposite things"
+[ "$LATEST_POINTER_ONLY" = 0 ] || [ "$LATEST_POINTER" = 1 ] \
+  || die "--latest-pointer-only and --no-latest-pointer ask for opposite things"
 [ ${#OSES[@]} -gt 0 ] || OSES=("${ALL_OSES[@]}")
 # Validated before anything is built, so a typo is a sentence rather than a surprise after
 # the first architecture has already been compiled and uploaded.
@@ -77,9 +85,9 @@ if [ -z "${AWS_PROFILE:-}" ] && [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
 fi
 
 # Prerequisites, said as sentences rather than left to fail as tool errors — and only the
-# ones this invocation will actually reach. A pointer move compiles nothing.
+# ones this invocation will actually reach. Moving the latest-pointer compiles nothing.
 [ "$DRY_RUN" = 1 ] || command -v aws >/dev/null || die "the aws CLI is not on PATH"
-if [ "$POINTER_ONLY" = 0 ]; then
+if [ "$LATEST_POINTER_ONLY" = 0 ]; then
   command -v zig >/dev/null || die "zig is not on PATH (brew install zig)"
   command -v cargo-zigbuild >/dev/null \
     || die "cargo-zigbuild is not installed (cargo install cargo-zigbuild)"
@@ -105,18 +113,18 @@ fi
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
-move_pointer() {
+move_latest_pointer() {
   printf '%s\n' "$SHA" > "$OUT/latest"
   aws s3 cp --cache-control "no-cache" "$OUT/latest" "s3://$BUCKET/abin/latest"
-  echo "abin-release: latest is now $SHA" >&2
+  echo "abin-release: the latest-pointer is now $SHA" >&2
 }
 
-if [ "$POINTER_ONLY" = 1 ]; then
+if [ "$LATEST_POINTER_ONLY" = 1 ]; then
   if [ "$DRY_RUN" = 1 ]; then
-    echo "abin-release: would move latest to $SHA" >&2
+    echo "abin-release: would move the latest-pointer to $SHA" >&2
     exit 0
   fi
-  move_pointer
+  move_latest_pointer
   exit 0
 fi
 
@@ -152,11 +160,11 @@ for name in "${built[@]}"; do
     "s3://$BUCKET/abin/$SHA/$name"
 done
 
-# Last, so there is no window in which the pointer names a half-uploaded release. Suppressed
-# by `--no-pointer`, which is how a matrix leaves it to the job that knows every other one
-# finished.
-if [ "$POINTER" = 1 ]; then
-  move_pointer
+# Last, so there is no window in which the latest-pointer names a half-uploaded release.
+# Suppressed by `--no-latest-pointer`, which is how a matrix leaves the move to the one job
+# that knows every other has finished.
+if [ "$LATEST_POINTER" = 1 ]; then
+  move_latest_pointer
 fi
 
 echo "abin-release: published $SHA (${built[*]})" >&2

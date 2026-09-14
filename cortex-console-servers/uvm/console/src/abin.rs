@@ -23,8 +23,8 @@
 //! # Getting one without the network
 //!
 //! [`DIR_ENV`] short-circuits everything: it names a directory somebody just built, nothing
-//! is downloaded, and nothing is checked. [`VERSION_ENV`] pins a release instead of following
-//! the pointer. Failing both, a machine that has downloaded a release before keeps using the
+//! is downloaded, and nothing is checked. [`VERSION_ENV`] pins a release instead of reading
+//! `abin/latest` — the **latest-pointer**, one line naming the release to use. Failing both, a machine that has downloaded a release before keeps using the
 //! newest one it has — see [`newest_cached`]. Only a machine with none of the three boots
 //! without `/abin`, which is what every session did before there was anything to fetch.
 
@@ -130,11 +130,11 @@ fn newest_cached(dir: &Path) -> Option<PathBuf> {
     best.map(|(_, path)| path)
 }
 
-/// How long the pointer lookup may take before a session stops waiting for it.
+/// How long reading the latest-pointer may take before a session stops waiting for it.
 ///
 /// Short on purpose: this is one small object, it is on the path of every boot that needs
 /// `/abin`, and the answer to not getting it is the cache rather than a failure.
-const POINTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const LATEST_POINTER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long a tarball download may take. Generous — it is megabytes — and present only so
 /// that a hung connection cannot hold a boot open indefinitely.
@@ -155,7 +155,7 @@ async fn resolve(base: &str) -> Option<String> {
         // orphan per boot, forever.
         .kill_on_drop(true)
         .output();
-    let out = tokio::time::timeout(POINTER_TIMEOUT, read)
+    let out = tokio::time::timeout(LATEST_POINTER_TIMEOUT, read)
         .await
         .ok()?
         .ok()?;
@@ -169,7 +169,7 @@ async fn resolve(base: &str) -> Option<String> {
 /// This host's tarball for the release it should be running, downloading it if needed.
 ///
 /// The order is [`DIR_ENV`] (handled by the caller, not here), then [`VERSION_ENV`], then
-/// the pointer, then whatever is already downloaded.
+/// the latest-pointer, then whatever is already downloaded.
 async fn fetch() -> anyhow::Result<PathBuf> {
     let dir = cache_dir()?;
     std::fs::create_dir_all(&dir)?;
@@ -392,11 +392,11 @@ fn digest(tree: &FileTree) -> anyhow::Result<LayerId> {
 mod tests {
     use super::*;
 
-    /// A pointer is 40 lowercase hex and nothing else. It arrives over the network and is
+    /// A latest-pointer is 40 lowercase hex and nothing else. It arrives over the network and is
     /// then put into a URL and a filename, so it is the one value here that is not taken at
     /// its word — and with no digest behind the tarball, this is the only check there is.
     #[test]
-    fn only_a_real_sha_is_accepted_as_a_pointer() {
+    fn only_a_real_sha_is_accepted_as_a_latest_pointer() {
         let good = "0123456789abcdef0123456789abcdef01234567";
         assert_eq!(valid_sha(good), Some(good));
         assert_eq!(valid_sha(&format!("{good}\n")), Some(good));
@@ -426,18 +426,18 @@ mod tests {
 
     /// A cached tarball is named for its release *and* for this host, so two architectures
     /// sharing a home directory do not overwrite each other.
-    /// A pointer nobody can reach is not an error — it is the cache's turn. This is the
+    /// A latest-pointer nobody can reach is not an error — it is the cache's turn. This is the
     /// rule that keeps a machine that has booted once working on a plane.
     #[tokio::test]
-    async fn an_unreachable_pointer_is_not_an_error() {
+    async fn an_unreachable_latest_pointer_is_not_an_error() {
         // A port nothing is listening on, so this fails fast rather than timing out.
         assert_eq!(resolve("http://127.0.0.1:1").await, None);
     }
 
-    /// And a pointer that answers with something that is not a sha is treated the same way
+    /// And a latest-pointer that answers with something that is not a sha is treated the same
     /// — an S3 error document is still a 200 to something.
     #[tokio::test]
-    async fn a_pointer_that_is_not_a_sha_is_ignored() {
+    async fn a_latest_pointer_that_is_not_a_sha_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("abin")).unwrap();
         std::fs::write(
@@ -449,11 +449,11 @@ mod tests {
         assert_eq!(resolve(&base).await, None);
     }
 
-    /// A pointer that answers properly is the release to use. `file://` works because the
+    /// A latest-pointer that answers properly is the release to use. `file://` works because the
     /// download is `curl`, which reads it like any other URL — which is also what makes
     /// this path testable without a bucket or an HTTP server.
     #[tokio::test]
-    async fn a_pointer_that_names_a_sha_is_used() {
+    async fn a_latest_pointer_that_names_a_sha_is_used() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("abin")).unwrap();
@@ -471,7 +471,7 @@ mod tests {
         assert!(name.ends_with(&tarball_name()), "{name}");
     }
 
-    /// With no pointer to resolve, the newest download is what a session gets — which is
+    /// With no latest-pointer to resolve, the newest download is what a session gets — which is
     /// what keeps a machine that has booted once working with no network at all.
     #[test]
     fn the_newest_download_is_the_offline_fallback() {
