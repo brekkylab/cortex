@@ -150,6 +150,10 @@ async fn resolve(base: &str) -> Option<String> {
     let read = tokio::process::Command::new("curl")
         .arg("-fsSL")
         .arg(&url)
+        // Without this the timeout below drops the future and leaves the `curl` running:
+        // tokio reaps a dropped child but does not signal it. On a slow network that is one
+        // orphan per boot, forever.
+        .kill_on_drop(true)
         .output();
     let out = tokio::time::timeout(POINTER_TIMEOUT, read)
         .await
@@ -199,7 +203,14 @@ async fn fetch() -> anyhow::Result<PathBuf> {
 
     // To a temporary name and renamed, so an interrupted download is never mistaken for a
     // complete one — the rule `assets::Rootfs::fetch` follows for the base rootfs.
-    let tmp = dest.with_extension("download");
+    //
+    // **The pid is in that name, and it has to be.** Two console servers starting at once on
+    // a cold cache resolve the same release and both download it; sharing one temporary path
+    // means two `curl -o` truncating and writing the same file, and then renaming the
+    // interleaved result into the cache. The rootfs survives that because it is verified
+    // against a digest afterwards. A release is not, so nothing would ever notice — every
+    // later boot would find the corrupt tarball, fail to read it, and go without `/abin`.
+    let tmp = dest.with_extension(format!("download.{}", std::process::id()));
     let url = tarball_url(&base, &sha);
     eprintln!("cortex-uvm-console: downloading {url}");
     let run = tokio::process::Command::new("curl")
@@ -207,11 +218,24 @@ async fn fetch() -> anyhow::Result<PathBuf> {
         .arg(&url)
         .arg("-o")
         .arg(&tmp)
+        // As in `resolve`: the timeout below drops this future, and a `curl` that was not
+        // killed would carry on writing to `tmp` after this function has given up on it.
+        .kill_on_drop(true)
         .status();
-    let status = tokio::time::timeout(DOWNLOAD_TIMEOUT, run)
-        .await
-        .map_err(|_| anyhow::anyhow!("downloading {url} took longer than {DOWNLOAD_TIMEOUT:?}"))?
-        .map_err(|e| anyhow::anyhow!("running curl: {e}"))?;
+    let timed_out = tokio::time::timeout(DOWNLOAD_TIMEOUT, run).await;
+    // Every way out of here that is not a rename removes the temporary — including the
+    // timeout, which used to leave a partial file behind under a name nothing collects.
+    let status = match timed_out {
+        Err(_) => {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::bail!("downloading {url} took longer than {DOWNLOAD_TIMEOUT:?}");
+        }
+        Ok(Err(e)) => {
+            let _ = std::fs::remove_file(&tmp);
+            anyhow::bail!("running curl: {e}");
+        }
+        Ok(Ok(status)) => status,
+    };
     if !status.success() {
         let _ = std::fs::remove_file(&tmp);
         anyhow::bail!("downloading {url} failed ({status})");
@@ -266,7 +290,21 @@ async fn disk_from_tarball(tarball: &Path, store: &LayerStore) -> anyhow::Result
     if store.has(&id) {
         return Ok(store.get(&id)?.erofs);
     }
-    let tree = crate::assets::ingest(tarball).await?;
+    // A tarball that will not read is thrown away rather than kept. Nothing verifies a
+    // release, so a file that arrived damaged looks exactly like a good one to every later
+    // boot: `fetch` would find it cached, hand it back, and this would fail again. Deleting
+    // it is what turns "no `/abin` on this host, permanently" into "no `/abin` this once".
+    let tree = match crate::assets::ingest(tarball).await {
+        Ok(tree) => tree,
+        Err(e) => {
+            let _ = std::fs::remove_file(tarball);
+            return Err(e.context(format!(
+                "{} could not be read and has been discarded; the next session will fetch it \
+                 again",
+                tarball.display()
+            )));
+        }
+    };
     Ok(store.put(&id, &tree)?.erofs)
 }
 
@@ -511,6 +549,34 @@ mod tests {
         // And through the entry point a boot uses, which is the one that has to stay async.
         let disk = disk(Some(builtin.path()), &store).await.unwrap();
         assert_eq!(disk, layer.erofs);
+    }
+
+    /// A tarball that will not read is deleted, so the next session downloads it again.
+    ///
+    /// The one that matters most, because nothing verifies a release: a file that arrived
+    /// damaged is indistinguishable from a good one to `fetch`, which would hand the same
+    /// broken bytes back on every boot from here on. Deleting it is the whole of the
+    /// recovery.
+    #[tokio::test]
+    async fn a_tarball_that_will_not_read_is_not_kept() {
+        let work = tempfile::tempdir().unwrap();
+        let store = store_in(work.path());
+
+        let cache = tempfile::tempdir().unwrap();
+        let tarball = cached_path(cache.path(), "3333333333333333333333333333333333333333");
+        std::fs::write(&tarball, b"this is not a gzipped tar").unwrap();
+
+        let refused = disk_from_tarball(&tarball, &store)
+            .await
+            .expect_err("a layer came out of nonsense");
+        assert!(
+            format!("{refused:#}").contains("discarded"),
+            "the caller is not told it was thrown away: {refused:#}"
+        );
+        assert!(
+            !tarball.exists(),
+            "a tarball that cannot be read was left in the cache to fail again"
+        );
     }
 
     /// A release tarball becomes a layer, and the same tarball twice is the same layer —

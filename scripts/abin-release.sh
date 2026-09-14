@@ -35,13 +35,18 @@ fi
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
+# Where cargo actually writes. Hardcoding `target` is wrong wherever CARGO_TARGET_DIR is
+# set, which is most CI and any shared-cache setup — and it would fail at the `tar` below
+# with a missing path rather than anywhere informative.
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+
 for pair in "aarch64:aarch64-unknown-linux-musl" "x86_64:x86_64-unknown-linux-musl"; do
   arch="${pair%%:*}"
   triple="${pair##*:}"
   echo "abin-release: building $triple" >&2
   cargo zigbuild -p cortex-exec-mem -p cortex-exec-index --release --target "$triple"
   # Flat: `mem` and `index` at the top level, which is exactly what /abin holds.
-  tar czf "$OUT/abin-linux-$arch.tar.gz" -C "target/$triple/release" mem index
+  tar czf "$OUT/abin-linux-$arch.tar.gz" -C "$TARGET_DIR/$triple/release" mem index
 done
 
 if [ "$DRY_RUN" = 1 ]; then

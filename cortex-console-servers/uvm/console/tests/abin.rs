@@ -112,6 +112,7 @@ async fn without_executables_there_is_no_abin() {
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
     server.stderr(Stdio::inherit());
     server.env_remove("CORTEX_ABIN_DIR");
+    server.env_remove("CORTEX_ABIN_VERSION");
     server.env("CORTEX_UVM_HOME", home.path());
     server.env(
         "CORTEX_ABIN_BASE_URL",
@@ -167,7 +168,12 @@ async fn the_published_release_runs_in_a_guest() {
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
     server.stderr(Stdio::inherit());
     server.env("CORTEX_UVM_HOME", home.path());
+    // All three, not just the first. This is the one test whose subject is the *published*
+    // release; a developer with either of the others exported would silently be testing
+    // their staging bucket or a pinned old build, and it would still pass.
     server.env_remove("CORTEX_ABIN_DIR");
+    server.env_remove("CORTEX_ABIN_BASE_URL");
+    server.env_remove("CORTEX_ABIN_VERSION");
 
     let mut console = Console::builder()
         .client(cortex::console::stdio::StdioClient::new(server).expect("a server"))
