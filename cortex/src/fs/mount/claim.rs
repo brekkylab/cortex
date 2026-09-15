@@ -127,12 +127,23 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
 #[cfg(any(feature = "fuse", feature = "fuse-t"))]
 impl Drop for Claim {
     fn drop(&mut self) {
+        // Dropped unconditionally, unlike the record below: this is the list a signal
+        // unmounts, and an entry no guard stands behind is a path this process would
+        // take down whatever ends up mounted there later.
         if let Ok(mut live) = LIVE.lock()
             && let Some(at) = live.iter().position(|p| p == &self.mountpoint)
         {
             live.swap_remove(at);
         }
-        if let Some(record) = &self.record {
+        // The record outlives the guard when the mount does, so a later run meets it
+        // again rather than forgetting a mount that is still in the way. Both exits
+        // that report a mount they could not take down reach this with it still up.
+        //
+        // Asked of the mount table rather than passed in: the guard knows what it
+        // attempted, the table knows what is there.
+        if let Some(record) = &self.record
+            && mounts_under(&self.mountpoint).is_empty()
+        {
             let _ = fs::remove_file(record);
         }
     }
@@ -318,6 +329,44 @@ mod tests {
             "a record whose owner is running is not somebody else's to clear"
         );
         drop(held);
+    }
+
+    /// Both guards have an exit reached with the mount still up, and after it the
+    /// record is all that lets a later run meet that mount again. Dropping the
+    /// claim must not be what forgets it.
+    #[test]
+    #[ignore = "mounts a real filesystem"]
+    fn a_record_outlives_a_claim_dropped_over_a_live_mount() {
+        #[cfg(feature = "fuse")]
+        use crate::fs::FuseMount as HostMount;
+        #[cfg(feature = "fuse-t")]
+        use crate::fs::FuseTMount as HostMount;
+        use crate::fs::{FileSystem, InMemFs};
+
+        let path =
+            std::env::temp_dir().join(format!("cortex-claim-live-mount-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("temp dir is writable");
+
+        let volume = InMemFs::new();
+        let rt = tokio::runtime::Runtime::new().expect("a runtime to seed the volume");
+        rt.block_on(async { volume.create(Path::new("greeting.txt")).await })
+            .expect("fresh store");
+        let mount = HostMount::try_new(volume, &path).expect("the volume mounts");
+
+        // A second claim on the same point, so dropping it leaves the mount up —
+        // which is the state the guards' failure exits hand to `Claim::drop`.
+        let held = claim(&path);
+        let record = held.record.clone().expect("a record was written");
+        drop(held);
+        assert!(
+            record.exists(),
+            "a record whose mount is still up is what a later run reclaims"
+        );
+
+        drop(mount);
+        let _ = fs::remove_file(&record);
+        let _ = fs::remove_dir_all(&path);
     }
 
     /// A record left by a pid that cannot exist is abandoned by definition, and
