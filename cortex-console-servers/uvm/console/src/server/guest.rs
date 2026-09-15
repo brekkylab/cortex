@@ -148,22 +148,19 @@ impl Guest {
         let helper = boot_helper()?;
 
         // `/abin` is the same disk for every session — cortex's own executables and no
-        // others — so this is a store lookup that finds it already there after the first
-        // session on this host. On a blocking thread all the same: the first one reads every
-        // executable and writes them back out as an EROFS, which is the same reason
-        // `SessionImage::create` below is not on the runtime's own thread.
+        // others — so after the first session on this host this is a store lookup that finds
+        // it already there. The first one is a download and an encode, which is why this is
+        // awaited rather than called: the release has to arrive before there is a disk.
         let store = layer_store()?;
         // **The one place this variable is read.** Here rather than inside `disk`, where the
         // rest of this server's configuration is read, and so that building the disk is a
         // function of its arguments and a test can call it twice.
         let builtin = std::env::var_os(abin::DIR_ENV).map(PathBuf::from);
-        let found = tokio::task::spawn_blocking(move || abin::disk(builtin.as_deref(), &store))
-            .await
-            .map_err(|e| anyhow::anyhow!("preparing /abin: {e}"))?;
+        let found = abin::disk(builtin.as_deref(), &store).await;
 
-        // Cortex has published no executables yet, so the strict reading would mean no
-        // session boots at all. A session without them costs its `/abin` and not its
-        // existence — said on the way past so it is not silent.
+        // A session that cannot get one costs its `/abin` and not its existence — an
+        // unreachable release, or a host that has never downloaded one, is not a reason to
+        // refuse a session. Said on the way past so it is not silent.
         let abin = match found {
             Ok(disk) => Some(disk),
             Err(e) => {

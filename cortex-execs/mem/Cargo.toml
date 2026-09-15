@@ -22,6 +22,10 @@ rusqlite = { workspace = true }
 # Item identity. Ids leave this process — they are what a later `delete` or `history` would be
 # given back — so they cannot be rowids that a re-import renumbers.
 uuid = { workspace = true, features = ["v4"] }
+# What `--json` is carried by. Escaping written by hand is where bugs live, and a memory's text is
+# Markdown, so it may hold quotes, newlines and backslashes.
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

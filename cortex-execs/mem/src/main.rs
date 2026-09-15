@@ -36,7 +36,10 @@ use std::{
 
 use clap::Parser as _;
 
-use crate::{memory::Memory, store::Store};
+use crate::{
+    memory::Memory,
+    store::{Record, Store},
+};
 
 /// The name every message this program writes about itself is spelled with.
 ///
@@ -48,7 +51,7 @@ const NAME: &str = env!("CARGO_BIN_NAME");
 #[derive(Debug, clap::Parser)]
 #[command(
     about = "mem — a store that is one file, written by whoever calls it",
-    after_help = "<store> is a path like any other this program is given, so a relative one resolves against the working directory. `init` creates it; every other command expects it to be there already.",
+    after_help = "<store> is a path like any other this program is given, so a relative one resolves against the working directory. `init` creates it; every other command expects it to be there already.\n\nThe default output is one memory per line, which a memory containing a newline cannot be spelled in. A caller whose memories may be multi-line — Markdown, say — should ask for `--json`, which is one JSON object per line and carries the id as well.",
     // The doc comments here are for whoever reads this file. What a caller of the command sees is
     // `about` and the first line of each item's; nothing below argues a design decision at
     // somebody who typed `--help`.
@@ -85,6 +88,28 @@ enum Command {
     /// the memories nearest <query>, nearest first
     #[command(long_about = None)]
     Search(Search),
+
+    /// the memories in <store>, newest first
+    ///
+    /// Unlike `search`, there is no default bound: a listing has no ranking, so what the store
+    /// holds is the answer, and cutting it is said with `-n`.
+    #[command(long_about = None)]
+    List(List),
+
+    /// forget the memories with these <ids>
+    ///
+    /// An id is what `list --json` and `search --json` answer with. An id that is not there is not
+    /// a refusal — its not being in the store is the state this command asks for.
+    #[command(long_about = None)]
+    Delete(Delete),
+
+    /// correct the memory with <id> so that it says <text>
+    ///
+    /// One at a time. Laying out several id-and-text pairs is interleaving two lists into one,
+    /// and this program does not do that for the same reason it does not put a separator inside
+    /// an argument.
+    #[command(visible_alias = "edit", long_about = None)]
+    Update(Update),
 }
 
 /// `mem init <store>` — a store where there was no file.
@@ -125,6 +150,13 @@ struct Insert {
     // been opened on behalf of an argument that was never usable.
     #[arg(long_help = None, value_name = "TEXTS", value_parser = trimmed)]
     texts: Vec<String>,
+
+    /// answer with one line of JSON per memory: its id, its text, and when it was written
+    ///
+    /// The default output is one line of text, and there are two things it cannot spell — the
+    /// row's id, and text with a newline in it. A caller whose memories may be Markdown uses this.
+    #[arg(long, long_help = None)]
+    json: bool,
 }
 
 /// `text` without its edges, or the refusal to take it as a memory.
@@ -163,6 +195,65 @@ struct Search {
     /// a longer one rather than a way to switch a limit on.
     #[arg(short = 'n', long, default_value_t = 10, long_help = None)]
     limit: usize,
+
+    /// answer with one line of JSON per memory: its id, its text, and when it was written
+    #[arg(long, long_help = None)]
+    json: bool,
+}
+
+/// `mem list <store>` — everything the store holds, newest first.
+#[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
+struct List {
+    /// the store to read
+    #[arg(long_help = None)]
+    store: PathBuf,
+
+    /// how many memories to answer with; every one of them when not given
+    #[arg(short = 'n', long, long_help = None)]
+    limit: Option<usize>,
+
+    /// answer with one line of JSON per memory: its id, its text, and when it was written
+    #[arg(long, long_help = None)]
+    json: bool,
+}
+
+/// `mem delete <store> <ids>...` — the memories to forget, by id.
+#[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
+struct Delete {
+    /// the store to write to
+    #[arg(long_help = None)]
+    store: PathBuf,
+
+    /// which memories to forget: one id per argument
+    #[arg(long_help = None, value_name = "IDS")]
+    ids: Vec<String>,
+
+    /// answer with one line of JSON per id
+    #[arg(long, long_help = None)]
+    json: bool,
+}
+
+/// `mem update <store> <id> <text>` — correct one memory to what it should say now.
+#[derive(Clone, Debug, PartialEq, Eq, clap::Args)]
+struct Update {
+    /// the store to write to
+    #[arg(long_help = None)]
+    store: PathBuf,
+
+    /// which memory to correct
+    #[arg(long_help = None)]
+    id: String,
+
+    /// what it should say now
+    ///
+    /// Through the same parser `insert` uses: an empty one is not a memory, and is refused before
+    /// the file is opened.
+    #[arg(long_help = None, value_parser = trimmed)]
+    text: String,
+
+    /// answer with one line of JSON: the memory's id, its text, and when it was written
+    #[arg(long, long_help = None)]
+    json: bool,
 }
 
 /// The line a command that could not be carried out leaves on stderr.
@@ -171,6 +262,34 @@ struct Search {
 /// path they typed is the one thing in the message they can act on.
 fn refused(store: &Path, said: impl std::fmt::Display) -> String {
     format!("{NAME}: {}: {said}\n", store.display())
+}
+
+/// The records, one per line — the text, or that line as JSON when `--json` was given.
+///
+/// **The default format is the same one line of text it has always been.** `index` answers in the
+/// same shape, and it is what something reading out of a pipe expects. `--json` exists because
+/// there are two things that format cannot spell: the row's id, and text with a newline in it. A
+/// memory's text is Markdown, so it may be several lines, and then "one per line" stops meaning
+/// anything.
+///
+/// One object per line (JSONL) rather than a JSON array, so that the shape of the default format
+/// carries straight over. A reader works line by line and never has to buffer the whole answer.
+///
+/// `to_string` cannot fail here. Every field is a `String`, and the failures `serde_json` has for
+/// a struct are map keys that are not strings and floats that are not numbers. Neither is
+/// reachable, so what would have been that failure is written down as a bug rather than moved into
+/// every caller's signature.
+fn lines(records: &[Record], json: bool) -> String {
+    let mut said = String::new();
+    for record in records {
+        if json {
+            said.push_str(&serde_json::to_string(record).expect("a record of three strings"));
+        } else {
+            said.push_str(&record.text);
+        }
+        said.push('\n');
+    }
+    said
 }
 
 /// The command, done: what to say on stdout, or the line to say on stderr instead.
@@ -196,7 +315,7 @@ fn run(command: Command) -> Result<String, String> {
             )),
             Err(e) => Err(refused(&store, e)),
         },
-        Command::Insert(Insert { store, texts }) => {
+        Command::Insert(Insert { store, texts, json }) => {
             // The store before anything else: `insert` writes to a store that exists, and a
             // caller who named the wrong file should learn it from the file.
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
@@ -215,24 +334,21 @@ fn run(command: Command) -> Result<String, String> {
             // Written before anything is said about them, so that what a caller reads on stdout
             // is what the store holds: a write that failed after the lines were printed would
             // have told them the opposite of what happened.
-            opened.insert(&memories).map_err(|e| refused(&store, e))?;
+            let written = opened.insert(&memories).map_err(|e| refused(&store, e))?;
 
-            // The memories back, one per line — the same lines `search` prints, and the same
-            // shape `index` answers in, so that something driving either reads one kind of
-            // output. What it adds over the arguments the caller already had is that these are
-            // the ones the store now holds. Nothing to write is no output at all, which is the
-            // answer a script producing an empty list wants.
-            let mut said = String::new();
-            for memory in &memories {
-                said.push_str(&memory.text);
-                said.push('\n');
-            }
-            Ok(said)
+            // The memories back, one per line by default — the same lines `search` prints, and
+            // the same shape `index` answers in, so that something driving either reads one kind
+            // of output (under `--json` the shape is `lines`'s own, not `search`'s or `index`'s).
+            // What it adds over the arguments the caller already had is that these are the ones
+            // the store now holds. Nothing to write is no output at all, which is the answer a
+            // script producing an empty list wants.
+            Ok(lines(&written, json))
         }
         Command::Search(Search {
             store,
             query,
             limit,
+            json,
         }) => {
             let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
             let found = opened
@@ -244,12 +360,49 @@ fn run(command: Command) -> Result<String, String> {
             // query is no lines and a zero: the store was read and it holds nothing near this,
             // which is an answer and not a failure. A caller that wants to act on emptiness reads
             // no lines, which is the same test they would make of any command that lists things.
+            Ok(lines(&found, json))
+        }
+        Command::List(List { store, limit, json }) => {
+            let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
+            let found = opened.list(limit).map_err(|e| refused(&store, e))?;
+            Ok(lines(&found, json))
+        }
+        Command::Delete(Delete { store, ids, json }) => {
+            let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
+            let gone = opened.delete(&ids).map_err(|e| refused(&store, e))?;
+            // The ids that went, one per line — the same rule as printing what `insert` wrote.
+            // There is no text to answer with here, so what is carried is the id, `--json` or not.
             let mut said = String::new();
-            for text in &found {
-                said.push_str(text);
+            for id in &gone {
+                if json {
+                    said.push_str(&serde_json::json!({ "id": id }).to_string());
+                } else {
+                    said.push_str(id);
+                }
                 said.push('\n');
             }
             Ok(said)
+        }
+        Command::Update(Update {
+            store,
+            id,
+            text,
+            json,
+        }) => {
+            let opened = Store::try_from_file(&store).map_err(|e| refused(&store, e))?;
+            match opened.update(&id, &text).map_err(|e| refused(&store, e))? {
+                Some(record) => Ok(lines(std::slice::from_ref(&record), json)),
+                // The place that contrasts with `delete` letting an unknown id pass. The state a
+                // delete asks for is already true, but the state an update asks for — that this
+                // memory says this — did not come to be. Succeeding quietly would leave the
+                // caller believing it was corrected.
+                None => Err(refused(
+                    &store,
+                    format_args!(
+                        "no memory with id `{id}`; `{NAME} list` says which ids there are"
+                    ),
+                )),
+            }
         }
     }
 }
@@ -507,8 +660,169 @@ mod tests {
         // caller a command they actually have.
         let said = e.render().to_string();
         assert!(said.contains(&format!("Usage: {NAME}")), "{said}");
-        for command in ["init", "insert", "search"] {
+        for command in [
+            "init", "insert", "search", "list", "delete", "update", "edit",
+        ] {
             assert!(said.contains(command), "{command} is missing from: {said}");
         }
+    }
+
+    /// One record is one line, and that line is JSON that parses.
+    #[test]
+    fn a_record_is_one_line_of_json() {
+        let record = Record {
+            id: "018f".into(),
+            text: "줄이\n두 개인 \"메모리\"".into(),
+            written_at: "2026-09-14T06:12:03Z".into(),
+        };
+
+        let said = lines(std::slice::from_ref(&record), true);
+
+        // Even text of several lines comes out as one line — that is the point of JSONL.
+        assert_eq!(said.lines().count(), 1, "one record is one line: {said:?}");
+
+        let back: serde_json::Value = serde_json::from_str(said.trim_end()).expect("a JSON line");
+        assert_eq!(back["id"], "018f");
+        assert_eq!(back["text"], "줄이\n두 개인 \"메모리\"");
+        assert_eq!(back["written_at"], "2026-09-14T06:12:03Z");
+    }
+
+    /// Without `--json`, the format it has always been — the text alone, one per line.
+    #[test]
+    fn without_json_a_record_is_its_text() {
+        let record = Record {
+            id: "018f".into(),
+            text: "오트밀크로 바꿨다".into(),
+            written_at: "2026-09-14T06:12:03Z".into(),
+        };
+
+        assert_eq!(
+            lines(std::slice::from_ref(&record), false),
+            "오트밀크로 바꿨다\n"
+        );
+    }
+
+    /// A store is all a listing needs to be told, and it means all of them.
+    #[test]
+    fn a_list_needs_only_a_store() {
+        let Command::List(list) = parse(&["list", "notes.mem"]).expect("the line parses") else {
+            panic!("a list");
+        };
+        assert_eq!(list.store, PathBuf::from("notes.mem"));
+        assert_eq!(list.limit, None);
+        assert!(!list.json);
+    }
+
+    /// Once written, it is on the listing.
+    #[test]
+    fn a_memory_that_was_written_is_on_the_list() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+        run_line(&["insert", &store, "오트밀크로 바꿨다"]).expect("written");
+
+        assert_eq!(
+            run_line(&["list", &store]).expect("a listing"),
+            "오트밀크로 바꿨다\n"
+        );
+    }
+
+    /// A deleted memory leaves the listing.
+    #[test]
+    fn a_deleted_memory_leaves_the_list() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+        let written =
+            run_line(&["insert", &store, "오트밀크로 바꿨다", "--json"]).expect("written");
+        let id = serde_json::from_str::<serde_json::Value>(written.trim_end())
+            .expect("a JSON line")["id"]
+            .as_str()
+            .expect("an id")
+            .to_owned();
+
+        assert_eq!(
+            run_line(&["delete", &store, &id]).expect("deleted"),
+            format!("{id}\n")
+        );
+        assert_eq!(run_line(&["list", &store]).expect("a listing"), "");
+    }
+
+    /// All `delete --json` carries is the id — what was deleted has no text to answer with. It is
+    /// the one shape `run` assembles itself, unlike every other `--json` that goes through
+    /// `lines`, so that it is one line of `{"id": ...}` carrying neither `text` nor `written_at`
+    /// is pinned separately.
+    #[test]
+    fn deleted_json_carries_only_the_id() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+        let written =
+            run_line(&["insert", &store, "오트밀크로 바꿨다", "--json"]).expect("written");
+        let id = serde_json::from_str::<serde_json::Value>(written.trim_end())
+            .expect("a JSON line")["id"]
+            .as_str()
+            .expect("an id")
+            .to_owned();
+
+        let said = run_line(&["delete", &store, &id, "--json"]).expect("the memory is deleted");
+
+        assert_eq!(said.lines().count(), 1, "one id, one line: {said:?}");
+        let back: serde_json::Value = serde_json::from_str(said.trim_end()).expect("a JSON line");
+        assert_eq!(back["id"], id);
+        assert!(
+            back.get("text").is_none() && back.get("written_at").is_none(),
+            "delete has no body to answer with: {back:?}"
+        );
+    }
+
+    /// Deleting an id that is not there is not a failure — the post-condition is already true, so
+    /// the answer is no lines at all.
+    #[test]
+    fn deleting_an_unknown_id_answers_with_nothing() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+
+        assert_eq!(
+            run_line(&["delete", &store, "없는-id"]).expect("no failure"),
+            ""
+        );
+    }
+
+    /// Given an id that is not there, `update` refuses where `delete` does not — the asymmetry
+    /// that carries the most weight in this crate: against an unknown id `update` ends with `1`
+    /// and `delete` with `0`. The message names the store and mentions the id.
+    #[test]
+    fn updating_an_unknown_id_is_refused() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = at(&dir, "notes.mem");
+        run_line(&["init", &store]).expect("a store");
+
+        let said = run_line(&["update", &store, "없는-id", "고친 문장"])
+            .expect_err("there is no such memory");
+        assert!(said.contains(&store), "{said}");
+        assert!(said.contains("없는-id"), "{said}");
+    }
+
+    /// Empty text is refused before the file is opened — the same as `insert`.
+    #[test]
+    fn an_update_to_nothing_is_not_understood() {
+        let line = parse(&["update", "notes.mem", "some-id", "   "]);
+        assert_eq!(
+            line.expect_err("a refusal").kind(),
+            ErrorKind::ValueValidation
+        );
+    }
+
+    /// `edit` is the second spelling of `update`.
+    #[test]
+    fn edit_is_update() {
+        let Command::Update(update) =
+            parse(&["edit", "notes.mem", "some-id", "고친 문장"]).expect("the line parses")
+        else {
+            panic!("an update");
+        };
+        assert_eq!(update.text, "고친 문장");
     }
 }
