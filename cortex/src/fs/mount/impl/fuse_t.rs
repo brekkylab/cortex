@@ -527,12 +527,15 @@ pub struct FuseTMount {
     /// and the serving thread dereferences that on every request, so something has to keep it
     /// alive for the life of the mount.
     ///
-    /// Dropped *after* the `destroy` in `Drop`, because a struct's fields go after its own
-    /// `drop` body — so no request can reach a freed filesystem.
+    /// A struct's fields go after its own `drop` body, so on the ordinary path this is freed
+    /// once `destroy` has returned and no request can reach it. `Drop` takes it out of the
+    /// `Option` and forgets it on the one path where the serving thread outlived its
+    /// deadline: the loop still holds the shim's pointer into this, and freeing it there is
+    /// the same use-after-free the leaked session avoids.
     ///
     /// `dyn Send + Sync` rather than `dyn Any`: the two erase equally well, and this one does
     /// not also advertise a downcast nothing should ever perform.
-    _fs: Box<dyn Send + Sync>,
+    _fs: Option<Box<dyn Send + Sync>>,
 
     /// This process's ownership of the mount point — what an opt-in
     /// [`unmount_on_signal`](crate::fs::unmount_on_signal) reads now, and what a later run's
@@ -630,7 +633,7 @@ impl FuseTMount {
             session,
             thread: Some(thread),
             mountpoint: mountpoint.to_path_buf(),
-            _fs: fs,
+            _fs: Some(fs),
             _claim: claim(mountpoint),
         };
         if !mount.wait_until_mounted(MOUNT_TIMEOUT) {
@@ -827,9 +830,12 @@ impl Drop for FuseTMount {
         if !collected {
             eprintln!(
                 "cortex: the thread serving {} did not stop within {LOOP_EXIT_TIMEOUT:?}; \
-                 leaving its session allocated",
+                 leaving its session and filesystem allocated",
                 self.mountpoint.display()
             );
+            // Leaked with it: the loop dereferences the shim's pointer into the filesystem on
+            // every request, and it is still running.
+            std::mem::forget(self._fs.take());
             return;
         }
         unsafe { cortex_fuse_t_destroy(session) };
