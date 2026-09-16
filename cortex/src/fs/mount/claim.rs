@@ -337,7 +337,7 @@ mod tests {
     #[test]
     #[ignore = "mounts a real filesystem"]
     fn a_record_outlives_a_claim_dropped_over_a_live_mount() {
-        #[cfg(feature = "fuse")]
+        #[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
         use crate::fs::FuseMount as HostMount;
         #[cfg(feature = "fuse-t")]
         use crate::fs::FuseTMount as HostMount;
