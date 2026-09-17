@@ -1022,3 +1022,76 @@ fn kill(pid: i32) {
         .arg(pid.to_string())
         .status();
 }
+
+/// A credential the guest never holds is on the request that leaves — end to end, against the
+/// real service.
+///
+/// The proof is two halves a client can see. Inside the guest the environment variable holds a
+/// placeholder and not the key, so the value never crossed into the VM. Then a request built
+/// from that placeholder is *accepted* by KOSIS: its `err:20` is "required parameters missing",
+/// the answer to a recognised key, where an un-substituted placeholder earns `err:11`, "invalid
+/// key". So the substitution happened on the way out, in the stack, where the key actually lives.
+///
+/// KOSIS and not OpenDART: OpenDART's server offers only RSA key-exchange TLS, which the
+/// interception stack's rustls upstream refuses, so that request never completes. KOSIS speaks
+/// TLS 1.3, which it does. The session is configured with the one via `CORTEX_UVM_SECRETS`.
+///
+/// `python:3.13-slim` because its `ssl` honours `SSL_CERT_FILE`, which is how the guest comes to
+/// trust the interception CA the boot installs; the pinned rootfs ships no HTTPS client worth the
+/// name. The key is the runner's, read from `KOSIS_API_KEY` — the boot inherits the same
+/// environment and reads the real value there, so it is never on a command line or in the guest.
+#[tokio::test]
+#[ignore = "boots a micro-VM and calls KOSIS: needs libkrunfw, a hypervisor, the internet, and KOSIS_API_KEY"]
+async fn a_credential_is_injected_outside_the_guest() {
+    let key = std::env::var("KOSIS_API_KEY")
+        .expect("set KOSIS_API_KEY to a real KOSIS key to run this test");
+
+    // The placeholder the guest is handed, derived from the variable name by `SecretSpec`.
+    const PLACEHOLDER: &str = "MSB_KOSIS_API_KEY";
+
+    let mut fx = Fixture::with_env(&[
+        ("CORTEX_UVM_NETWORK", "public"),
+        ("CORTEX_UVM_IMAGE", "python:3.13-slim"),
+        // What a deployment configures: the key goes to KOSIS, in the query. The value itself is
+        // read by the boot from the environment below, never from this line.
+        ("CORTEX_UVM_SECRETS", "KOSIS_API_KEY@kosis.kr:query"),
+        ("KOSIS_API_KEY", &key),
+    ])
+    .await;
+
+    // The guest holds the placeholder, and not the key. Compared here on the host: naming the
+    // real key inside a guest command would be the one way to actually put it in there.
+    let seen = fx.output(r#"printf '%s' "$KOSIS_API_KEY""#).await.stdout;
+    let seen = String::from_utf8(seen).expect("an environment value that is text");
+    assert_eq!(seen, PLACEHOLDER, "the guest did not get the placeholder");
+    assert_ne!(seen, key, "the real key reached the guest's environment");
+
+    // A request the guest builds from the placeholder, and the code KOSIS answers it with. `20`
+    // is a recognised key with the rest of the query missing; `11` is the code for a key it does
+    // not know, which is what an un-substituted placeholder would earn.
+    let script = r#"python3 - <<'PY'
+import json, os, urllib.request
+ph = os.environ["KOSIS_API_KEY"]
+url = "https://kosis.kr/openapi/statisticsData.do?method=getList&format=json&jsonVD=Y&apiKey=%s" % ph
+body = urllib.request.urlopen(url, timeout=20).read().decode()
+print("ERR", json.loads(body).get("err"), json.loads(body).get("errMsg"))
+PY"#;
+    let out = fx.output(script).await;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    eprintln!("guest saw KOSIS_API_KEY={seen}");
+    eprintln!("KOSIS answered: {}", stdout.trim());
+    eprintln!(
+        "probe stderr: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    assert_eq!(out.code, 0, "the probe did not run to completion");
+
+    let err = stdout
+        .split_whitespace()
+        .nth(1)
+        .expect("an ERR line from the probe");
+    assert_ne!(
+        err, "11",
+        "KOSIS answered err:11 (invalid key): the placeholder was not substituted on the way out"
+    );
+}

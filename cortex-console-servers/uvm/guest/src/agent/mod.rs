@@ -105,8 +105,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt a
 use tokio::process::{Child, Command};
 
 use crate::contract::{
-    ABIN_PATH, COMMIT_ENV, COMMIT_PATH, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec,
-    LAYER_TAR, UPPER_DIR,
+    ABIN_PATH, CA_BUNDLE_ENV_VARS, CA_BUNDLE_PATH, COMMIT_ENV, COMMIT_PATH, GUEST_BIN_PATH,
+    GUEST_PATH, HANDSHAKE, ImageSpec, LAYER_TAR, UPPER_DIR,
 };
 
 /// A command we found but could not start, and one we could not find at all.
@@ -772,6 +772,17 @@ fn environment(session: &Session) -> Vec<(OsString, OsString)> {
     // match, which is what a shell does for itself when it moves.
     if let Some(cwd) = session.cwd() {
         env.push(("PWD".into(), cwd.into()));
+    }
+
+    // Point the common TLS clients at the interception trust bundle when init wrote one.
+    // Cortex's over the image's, like `/abin` on `PATH`: the interception is cortex's doing, and
+    // a value the image set would send a command to a bundle that lacks the CA the stack signs
+    // with. Guarded on the file, so a session whose network intercepts nothing is untouched.
+    if std::path::Path::new(CA_BUNDLE_PATH).exists() {
+        for name in CA_BUNDLE_ENV_VARS {
+            env.retain(|(existing, _)| existing != name);
+            env.push((OsString::from(*name), OsString::from(CA_BUNDLE_PATH)));
+        }
     }
     env
 }

@@ -267,6 +267,12 @@ pub struct BootArgs {
     /// Guest vCPUs and memory, when the server was told to override them.
     pub vcpus: Option<u8>,
     pub memory_mib: Option<u32>,
+
+    /// Services whose credential the stack injects into the guest's requests — the metadata,
+    /// never the values. Empty for a session that injects nothing, which is the default. The
+    /// values are read by the boot from its own environment, by [`SecretSpec::env_var`]; see
+    /// there for why they are nowhere in here.
+    pub secrets: Vec<SecretSpec>,
 }
 
 impl BootArgs {
@@ -322,6 +328,9 @@ impl BootArgs {
         if let Some(memory) = self.memory_mib {
             put("--memory-mib", OsStr::new(&memory.to_string()));
         }
+        for secret in &self.secrets {
+            put("--secret", OsStr::new(&secret.to_arg()));
+        }
         args
     }
 
@@ -347,6 +356,7 @@ impl BootArgs {
         let mut commit_out = None;
         let mut vcpus = None;
         let mut memory_mib = None;
+        let mut secrets = Vec::new();
 
         let mut args = args.into_iter();
         while let Some(flag) = args.next() {
@@ -374,6 +384,7 @@ impl BootArgs {
                 "--commit-out" => commit_out = Some(PathBuf::from(value()?)),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
+                "--secret" => secrets.push(SecretSpec::parse(&text(&flag, value()?)?)?),
                 other => anyhow::bail!("{other} is not an argument a boot takes"),
             }
         }
@@ -405,6 +416,7 @@ impl BootArgs {
             abin,
             vcpus,
             memory_mib,
+            secrets,
         })
     }
 }
@@ -422,6 +434,117 @@ fn number<T: std::str::FromStr>(flag: &str, value: OsString) -> anyhow::Result<T
     text(flag, value)?
         .parse()
         .map_err(|_| anyhow::anyhow!("{flag} is not a number"))
+}
+
+/// Where in a request a service reads its credential.
+///
+/// A key that lives in the URL *path* has no variant here on purpose: the substitution engine
+/// rewrites the query, headers and body, and a path segment is none of those.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inject {
+    /// A query parameter, e.g. `?apiKey=<value>`.
+    Query,
+    /// A request header carrying the value, e.g. `Authorization: Bearer <value>`.
+    Header,
+    /// HTTP Basic credentials, the value substituted into the decoded `user:password`.
+    BasicAuth,
+}
+
+impl Inject {
+    fn as_str(self) -> &'static str {
+        match self {
+            Inject::Query => "query",
+            Inject::Header => "header",
+            Inject::BasicAuth => "basic",
+        }
+    }
+
+    fn parse(s: &str) -> anyhow::Result<Inject> {
+        match s {
+            "query" => Ok(Inject::Query),
+            "header" => Ok(Inject::Header),
+            "basic" => Ok(Inject::BasicAuth),
+            other => anyhow::bail!("{other:?} is not a location (query, header, basic)"),
+        }
+    }
+}
+
+/// One service whose credential the stack injects outside the guest — the metadata, never the
+/// value.
+///
+/// # What a session declares, and what it does not
+///
+/// A spec names the environment variable a value is read from, the host(s) that value may be
+/// sent to, and where in the request it goes. The **value itself is nowhere here**: the boot
+/// reads it from its own environment under [`env_var`](Self::env_var) at start, so it is never on
+/// a command line, in this struct, or in the guest. The guest is handed a
+/// [placeholder](Self::placeholder) under the same variable name instead.
+///
+/// # The spelling a session is configured with
+///
+/// `ENV_VAR@host[,host…][:location]`, which is what `CORTEX_UVM_SECRETS` carries one or more of,
+/// whitespace-separated. `location` is `query` (the default), `header`, or `basic`. So
+/// `OPENDART_API_KEY@opendart.fss.or.kr` and `TOKEN@api.example.com:header` are both specs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretSpec {
+    /// The environment variable the boot reads the real value from, and the name the guest sees
+    /// the placeholder under.
+    pub env_var: String,
+    /// The hosts the value may be sent to. Injection is refused for any other.
+    pub hosts: Vec<String>,
+    /// Where in the request the value goes.
+    pub inject: Inject,
+}
+
+impl SecretSpec {
+    /// The placeholder the guest is handed in the value's place: `MSB_<env_var>`.
+    ///
+    /// URL-safe by construction (no `$` or other reserved byte), so a client that percent-encodes
+    /// a query value still leaves it matchable byte for byte where the stack substitutes it.
+    pub fn placeholder(&self) -> String {
+        format!("MSB_{}", self.env_var)
+    }
+
+    /// Parse one `ENV_VAR@host[,host…][:location]`.
+    pub fn parse(entry: &str) -> anyhow::Result<SecretSpec> {
+        let (env_var, rest) = entry
+            .split_once('@')
+            .ok_or_else(|| anyhow::anyhow!("{entry:?} is not ENV_VAR@host[:location]"))?;
+        anyhow::ensure!(
+            !env_var.is_empty() && !env_var.contains('=') && !env_var.contains('\0'),
+            "{env_var:?} is not an environment variable name"
+        );
+        let (hosts, inject) = match rest.split_once(':') {
+            Some((hosts, location)) => (hosts, Inject::parse(location)?),
+            None => (rest, Inject::Query),
+        };
+        let hosts: Vec<String> = hosts
+            .split(',')
+            .filter(|host| !host.is_empty())
+            .map(str::to_owned)
+            .collect();
+        anyhow::ensure!(!hosts.is_empty(), "{entry:?} names no host for {env_var}");
+        Ok(SecretSpec {
+            env_var: env_var.to_owned(),
+            hosts,
+            inject,
+        })
+    }
+
+    /// Parse the whitespace-separated list `CORTEX_UVM_SECRETS` carries.
+    pub fn parse_list(value: &str) -> anyhow::Result<Vec<SecretSpec>> {
+        value.split_whitespace().map(SecretSpec::parse).collect()
+    }
+
+    /// The canonical one-entry spelling, for a `--secret` argument.
+    fn to_arg(&self) -> String {
+        format!(
+            "{}@{}:{}",
+            self.env_var,
+            self.hosts.join(","),
+            self.inject.as_str()
+        )
+    }
 }
 
 /// How the read-only base image is laid out on the host — the value of [`BASE_FORMAT_ENV`],
@@ -464,6 +587,15 @@ impl BaseFormat {
 /// already shared over virtio-fs, so a file in it costs nothing — and the guest reads it
 /// before the pivot detaches that root.
 pub const IMAGE_SPEC_PATH: &str = "/.cortex-image";
+
+/// The TLS interception CA as PEM, in the boot root — present only when the session's network
+/// injects credentials.
+///
+/// A file, not an environment value: PEM is multi-line, which the kernel-command-line environment
+/// (see [`IMAGE_SPEC_PATH`]) rejects outright. The guest reads and trusts it before the pivot,
+/// because every intercepted 443 connection is re-presented with a certificate this CA signed.
+/// Public, not secret: the private key stays in the boot process with the credentials it injects.
+pub const CA_PATH: &str = "/.cortex-tls-ca";
 
 /// What the base image says about running a process in it, as BSON at [`IMAGE_SPEC_PATH`].
 ///
@@ -581,6 +713,18 @@ mod tests {
             commit_out: Some("/tmp/cortex-uvm-commit".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
+            secrets: vec![
+                SecretSpec {
+                    env_var: "OPENDART_API_KEY".into(),
+                    hosts: vec!["opendart.fss.or.kr".into()],
+                    inject: Inject::Query,
+                },
+                SecretSpec {
+                    env_var: "TOKEN".into(),
+                    hosts: vec!["a.example.com".into(), "b.example.com".into()],
+                    inject: Inject::Header,
+                },
+            ],
         }
     }
 
@@ -627,6 +771,37 @@ mod tests {
         assert!(!written.iter().any(|arg| arg == "--abin"), "{written:?}");
         let back = BootArgs::parse(written).unwrap();
         assert_eq!(back.abin, None);
+    }
+
+    /// The secrets a session was configured with survive the spawn, location and host and all.
+    #[test]
+    fn secrets_survive_the_argument_round_trip() {
+        let back = BootArgs::parse(args().to_args()).unwrap();
+        assert_eq!(back.secrets, args().secrets);
+    }
+
+    /// The spelling `CORTEX_UVM_SECRETS` carries, including the `query` default and many hosts.
+    #[test]
+    fn a_secret_list_parses_the_configured_spelling() {
+        let specs = SecretSpec::parse_list(
+            "OPENDART_API_KEY@opendart.fss.or.kr  TOKEN@a.example.com,b.example.com:header",
+        )
+        .expect("a valid list");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].hosts, ["opendart.fss.or.kr"]);
+        assert_eq!(specs[0].inject, Inject::Query);
+        assert_eq!(specs[0].placeholder(), "MSB_OPENDART_API_KEY");
+        assert_eq!(specs[1].inject, Inject::Header);
+        assert_eq!(specs[1].hosts, ["a.example.com", "b.example.com"]);
+    }
+
+    /// A spec that names no host is refused: a value with nowhere it may go is a mistake, not a
+    /// secret that goes everywhere.
+    #[test]
+    fn a_secret_without_a_host_is_refused() {
+        assert!(SecretSpec::parse("OPENWEATHER_API_KEY").is_err());
+        assert!(SecretSpec::parse("@api.openweathermap.org").is_err());
+        assert!(SecretSpec::parse("TOKEN@host:sideways").is_err());
     }
 
     /// Everything this writes is something it reads. Both ends are this type, so the compiler

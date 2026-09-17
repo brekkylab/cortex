@@ -49,8 +49,8 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use crate::contract::{
-    ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, IMAGE_SPEC_PATH, ImageSpec,
-    ARTIFACTS_ENV, LOWER_ENV, PORT_NAME, SCRATCH_ENV, UPPER_ENV, CONTEXT_ENV,
+    ABIN_ENV, ABIN_PATH, ARTIFACTS_ENV, CA_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV,
+    CONTEXT_ENV, IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV, PORT_NAME, SCRATCH_ENV, UPPER_ENV,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
@@ -81,6 +81,10 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
 
     let image = image_spec()?;
 
+    // Read before the pivot, like the spec and for the same reason: the boot root it lives in is
+    // about to be replaced. `None` is the ordinary session, whose network intercepts nothing.
+    let ca = ca_pem();
+
     if let (Ok(lower), Ok(upper)) = (std::env::var(LOWER_ENV), std::env::var(UPPER_ENV)) {
         mount_root(&lower, &upper)?;
         // The overlay's `/proc`, `/dev` and `/sys` are the base image's empty
@@ -106,6 +110,12 @@ pub fn prepare() -> anyhow::Result<(File, ImageSpec)> {
     // see rather than on the one about to be detached. Does nothing when the boot attached no
     // network, which is the default.
     crate::net::configure()?;
+
+    // Installed after the pivot, from the PEM read before it: the trust bundle has to land on the
+    // root the commands read from. Only when the boot's stack is intercepting TLS.
+    if let Some(ca) = &ca {
+        crate::net::install_ca(ca)?;
+    }
 
     // Every tree the session named, each at the host's own path for it. The artifacts tree is
     // mounted and nothing else is done with it: what it is *for* is the client's, and a
@@ -165,6 +175,15 @@ fn image_spec() -> anyhow::Result<ImageSpec> {
 
     bson::deserialize_from_slice(&encoded)
         .map_err(|e| anyhow::anyhow!("decoding {IMAGE_SPEC_PATH}: {e}"))
+}
+
+/// The interception CA the boot left in the boot root, or `None` when it left none.
+///
+/// Absent is the ordinary session, whose network intercepts nothing — so, unlike the spec, an
+/// unreadable file is silence too: there is nothing here a session cannot run without, and the
+/// commands will fail at an untrusted certificate rather than be denied a boot over it.
+fn ca_pem() -> Option<Vec<u8>> {
+    std::fs::read(CA_PATH).ok()
 }
 
 /// `mount(2)`, creating the target first.

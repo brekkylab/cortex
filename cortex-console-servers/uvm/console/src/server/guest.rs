@@ -59,7 +59,7 @@ use tokio::{
 use crate::{
     abin,
     assets::{self, BootRoot, CommitScratch, SessionImage},
-    contract::{BootArgs, HANDSHAKE, Network},
+    contract::{BootArgs, HANDSHAKE, Network, SecretSpec},
     helper::boot_helper,
 };
 
@@ -74,6 +74,11 @@ fn layer_store() -> anyhow::Result<LayerStore> {
 /// inherits: a value the boot is given is a value the server can be asked what it sent.
 const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
 const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
+
+/// The services whose credentials the boot injects, as a whitespace-separated list of
+/// `ENV_VAR@host[,host…][:location]` — see [`SecretSpec`](cortex_uvm_boot::SecretSpec). The real
+/// values are read from this process's environment by name; only the metadata is passed on.
+const SECRETS: &str = "CORTEX_UVM_SECRETS";
 
 /// An override read out of this server's environment, ignoring anything that is not a
 /// number: a caller who typed nonsense gets the boot's default and a guest that boots.
@@ -141,6 +146,16 @@ impl Guest {
         host_ports: &[u16],
         committable: bool,
     ) -> anyhow::Result<Guest> {
+        // This server's own setting, and the same for every session it spawns: which services'
+        // credentials the boot injects. The boot reads the values from the environment it
+        // inherits; only the metadata is passed to it. Malformed here rather than at the boot,
+        // because a server misconfiguration is not a session that failed to come up.
+        let secrets = match std::env::var(SECRETS) {
+            Ok(value) => SecretSpec::parse_list(&value)
+                .map_err(|e| anyhow::anyhow!("{SECRETS}: {e}"))?,
+            Err(_) => Vec::new(),
+        };
+
         let kernel = assets::resolve_kernel()?;
         // The layers come back with the disk because the session keeps them: a `commit`
         // stitches onto what its base was made of, and asking again would mean pulling twice.
@@ -201,6 +216,7 @@ impl Guest {
             abin,
             vcpus: number(VCPUS_ENV),
             memory_mib: number(MEMORY_ENV),
+            secrets,
         };
 
         let mut command = Command::new(&helper);

@@ -35,7 +35,14 @@ required-features = ["vm"]
 
 [features]
 # Everything the binary needs and the library must not have.
-vm = ["dep:msb_krun", "dep:microsandbox-network", "dep:libc", "dep:tokio"]
+vm = [
+    "dep:msb_krun",
+    "dep:microsandbox-network",
+    "dep:libc",
+    "dep:tokio",
+    "dep:rustls",
+    "dep:tracing-subscriber",
+]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -52,3 +59,11 @@ microsandbox-network = { workspace = true, optional = true }
 # The stack's poll loop is async and wants a runtime of its own, held for as long as the VM is
 # up. Nothing else in this binary waits for anything, which is why it is behind the feature.
 tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
+# Only to install a process-level default `CryptoProvider` for `microsandbox-network`'s TLS
+# interception: the crate builds rustls configs that read the default and installs none, and two
+# providers in the graph leave it ambiguous. `ring` is the one the crate itself uses.
+rustls = { version = "0.23", features = ["ring"], optional = true }
+# So the network stack's own diagnostics — a secret heading to a disallowed host, an upstream
+# that would not verify — reach this process's stderr under `RUST_LOG`. Nothing here logs
+# without it: the stack emits through `tracing`, which drops every event until a subscriber is set.
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

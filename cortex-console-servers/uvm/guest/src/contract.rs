@@ -170,3 +170,27 @@ pub const NET_IPV4_ENV: &str = "MSB_NET_IPV4";
 
 /// Where a resolver is named on any system a base image was built for.
 pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+
+/// The TLS interception CA, as PEM, in the boot root — present only when the boot's stack is
+/// intercepting HTTPS.
+///
+/// A file, not an environment value: PEM is multi-line, and the environment here is the kernel
+/// command line. The host end writes it; the guest reads it before the pivot detaches the boot
+/// root, then installs it onto the new root. Absent for the ordinary session, whose network
+/// intercepts nothing.
+pub const CA_PATH: &str = "/.cortex-tls-ca";
+
+/// Where the guest writes the trust bundle it assembles from [`CA_PATH`] and the image's own
+/// roots. On the writable overlay, so it survives for the commands that read it.
+pub const CA_BUNDLE_PATH: &str = "/etc/ssl/cortex-ca-bundle.crt";
+
+/// The environment variables set to [`CA_BUNDLE_PATH`] for every command, so the TLS clients a
+/// base image is likely to carry all trust the interception CA. `SSL_CERT_FILE` covers OpenSSL
+/// (curl, Python); the rest are the ones that read their own variable instead of the system store.
+pub const CA_BUNDLE_ENV_VARS: &[&str] = &[
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    "NODE_EXTRA_CA_CERTS",
+    "GIT_SSL_CAINFO",
+];

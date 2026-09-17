@@ -27,7 +27,9 @@
 //! also the process that dies with it, and so cannot leave a stack behind.
 
 use anyhow::Context as _;
-use cortex_uvm_boot::Network;
+use cortex_uvm_boot::{Inject, Network, SecretSpec};
+use microsandbox_network::builder::NetworkBuilder;
+use microsandbox_network::config::NetworkConfig;
 use microsandbox_network::network::SmoltcpNetwork;
 use microsandbox_network::policy::{
     Action, Destination, DestinationGroup, Direction, NetworkPolicy, PortRange, Protocol, Rule,
@@ -49,16 +51,10 @@ pub struct Stack {
 /// Never called for [`Network::Disabled`], which attaches no device at all: a policy that
 /// refuses everything and a guest with no interface are not the same thing, and the second is
 /// the one worth having when nothing was asked for.
-pub fn start(reach: Network, host_ports: &[u16]) -> anyhow::Result<Stack> {
+pub fn start(reach: Network, host_ports: &[u16], secrets: &[SecretSpec]) -> anyhow::Result<Stack> {
     debug_assert!(reach != Network::Disabled);
 
-    // Everything but the policy left as the stack's own default: the addresses, the MTU, the
-    // DNS timeouts. This process has an opinion about what a sandbox may reach and none about
-    // how the stack goes about it.
-    let config = microsandbox_network::config::NetworkConfig {
-        policy: policy(reach, host_ports),
-        ..Default::default()
-    };
+    let config = config(reach, host_ports, secrets)?;
 
     // Its own runtime rather than a handle from somewhere: this process has no other async
     // work, and the stack's poll loop wants threads that are not competing with a VM's vCPUs
@@ -96,6 +92,74 @@ impl Stack {
     pub fn guest_env(&self) -> Vec<(String, String)> {
         self.stack.guest_env_vars()
     }
+
+    /// The interception CA as PEM, or `None` when this stack is not intercepting TLS.
+    ///
+    /// The guest is handed this to trust — see [`CA_PATH`](cortex_uvm_boot::CA_PATH). The private
+    /// key it goes with never leaves this process, which is what keeps the injected credentials
+    /// in here rather than in the VM.
+    pub fn ca_cert_pem(&self) -> Option<Vec<u8>> {
+        self.stack.ca_cert_pem()
+    }
+}
+
+/// The whole config a session's network gets: the reach policy, plus TLS interception and
+/// credential injection for the session's `secrets`.
+///
+/// A secret is substituted into the request the stack opens on the guest's behalf, only when the
+/// intercepted TLS identity is an allowed host — so the value leaves this machine with the request
+/// and never enters the VM. Injection needs interception, so any secret turns it on for every 443
+/// connection, which is why the guest is also handed the CA to trust. A `secrets` entry whose
+/// value is absent from this process's environment is skipped, not an error.
+fn config(
+    reach: Network,
+    host_ports: &[u16],
+    secrets: &[SecretSpec],
+) -> anyhow::Result<NetworkConfig> {
+    // Policy stays the stack's own everywhere but here — the addresses, the MTU, the DNS
+    // timeouts are its opinion and not this process's.
+    let mut builder = NetworkBuilder::new().policy(policy(reach, host_ports));
+
+    let mut injected = Vec::new();
+    for spec in secrets {
+        let value = match std::env::var(&spec.env_var) {
+            Ok(value) if !value.is_empty() => value,
+            _ => continue,
+        };
+        injected.push(spec.env_var.as_str());
+        let placeholder = spec.placeholder();
+        builder = builder.secret(move |mut secret| {
+            secret = secret
+                .env(&spec.env_var)
+                .value(value)
+                .placeholder(placeholder)
+                // Substitute only over intercepted TLS whose SNI is an allowed host, never over
+                // plain HTTP a guest could point anywhere.
+                .require_tls_identity(true)
+                .inject_headers(matches!(spec.inject, Inject::Header))
+                .inject_query(matches!(spec.inject, Inject::Query))
+                .inject_basic_auth(matches!(spec.inject, Inject::BasicAuth))
+                .inject_body(false);
+            for host in &spec.hosts {
+                secret = secret.allow_host(host);
+            }
+            secret
+        });
+    }
+
+    if !injected.is_empty() {
+        // `verify_upstream` keeps the real server's certificate checked against the host's roots;
+        // `block_quic` forces an HTTP/3 client back onto the TCP/TLS path interception can see.
+        builder = builder.tls(|tls| tls.enabled(true).verify_upstream(true).block_quic(true));
+        eprintln!(
+            "cortex-uvm-boot: injecting credentials for {} outside the guest",
+            injected.join(", ")
+        );
+    }
+
+    builder
+        .build()
+        .map_err(|e| anyhow::anyhow!("building the network config: {e:?}"))
 }
 
 /// The policy a reach and a grant mean.

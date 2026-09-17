@@ -31,7 +31,16 @@ use std::io;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::time::{Duration, Instant};
 
-use crate::contract::{NET_ENV, NET_IPV4_ENV, RESOLV_CONF};
+use crate::contract::{CA_BUNDLE_PATH, NET_ENV, NET_IPV4_ENV, RESOLV_CONF};
+
+/// The system trust bundles a base image is built with, newest-common first. The interception
+/// CA is appended to whichever exists, so an intercepted host and a bypassed one both verify.
+const SYSTEM_CA_BUNDLES: &[&str] = &[
+    "/etc/ssl/certs/ca-certificates.crt", // Debian, Ubuntu, Alpine
+    "/etc/pki/tls/certs/ca-bundle.crt",   // RHEL, Fedora, CentOS
+    "/etc/ssl/ca-bundle.pem",             // openSUSE
+    "/etc/ssl/cert.pem",                  // Alpine (libressl), BSD-derived
+];
 
 /// How long to wait for the interface to be probed.
 ///
@@ -74,6 +83,36 @@ pub fn configure() -> anyhow::Result<()> {
     apply(&interface, &network)?;
     resolver(&network)?;
     Ok(())
+}
+
+/// Trust the boot's TLS interception CA, given the PEM the boot left in the boot root.
+///
+/// The stack terminates every 443 connection and presents a certificate it signed, so a guest
+/// that did not trust the signer would reject every HTTPS host. The CA is *appended* to the
+/// image's own roots rather than replacing them — a bundle of only the intercept CA would break
+/// the hosts the stack lets through untouched. The commands read it because
+/// [`environment`](crate::agent) points the usual variables at [`CA_BUNDLE_PATH`].
+///
+/// `ca` is read before the pivot, by [`init`](crate::init), because the boot root it lives in is
+/// gone by the time this writes to the new one. Not called at all for the ordinary session,
+/// whose network intercepts nothing.
+pub fn install_ca(ca: &[u8]) -> anyhow::Result<()> {
+    // The image's roots first, so a bypassed host still verifies against them. An image that
+    // ships none is a base with no HTTPS of its own; the CA alone is then the whole bundle.
+    let mut bundle = SYSTEM_CA_BUNDLES
+        .iter()
+        .find_map(|path| std::fs::read(path).ok())
+        .unwrap_or_default();
+    if bundle.last().is_some_and(|byte| *byte != b'\n') {
+        bundle.push(b'\n');
+    }
+    bundle.extend_from_slice(ca);
+
+    if let Some(parent) = std::path::Path::new(CA_BUNDLE_PATH).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(CA_BUNDLE_PATH, bundle)
+        .map_err(|e| anyhow::anyhow!("writing the trust bundle {CA_BUNDLE_PATH}: {e}"))
 }
 
 /// The two variables the stack sends, each a comma-separated list of `key=value`.

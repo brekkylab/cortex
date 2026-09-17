@@ -66,8 +66,8 @@ use std::{
 use msb_krun::{DiskImageFormat, VmBuilder};
 
 use cortex_uvm_boot::{
-    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, COMMIT_ENV,
-    COMMIT_PATH, COMMIT_TAG, COMMITTABLE_ENV, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG,
+    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, CA_PATH,
+    COMMIT_ENV, COMMIT_PATH, COMMIT_TAG, COMMITTABLE_ENV, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG,
     GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
     PORT_NAME, SCRATCH_ENV, SCRATCH_PATH, SCRATCH_TAG, UPPER_ENV,
 };
@@ -126,9 +126,17 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // the stack, its runtime, and the policy it enforces — and all three have to outlive
     // `enter` below, which never returns, so the guard is held to the end of the function that
     // does not end.
+    // Before a stack that might intercept TLS: its rustls configs read the process-level default
+    // CryptoProvider, and `microsandbox-network` installs none. Two providers are in this graph,
+    // so the default is ambiguous until one is named — `ring` is the one the crate itself uses.
+    // Idempotent and harmless for a session that turns out to intercept nothing.
+    if args.network != Network::Disabled {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let mut stack = match args.network {
         Network::Disabled => None,
-        reach => Some(net::start(reach, &args.host_ports)?),
+        reach => Some(net::start(reach, &args.host_ports, &args.secrets)?),
     };
     if let Some(stack) = &mut stack {
         let (mac, backend) = stack.device();
@@ -188,6 +196,16 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // process is not a party to what they mean. The guest reads them; see its `net` module.
     let guest_net = stack.as_ref().map(|s| s.guest_env()).unwrap_or_default();
 
+    // The interception CA, when the stack made one — the guest cannot reach an intercepted HTTPS
+    // host without trusting it. Written into the boot root as a file, not carried in the guest
+    // environment: PEM is multi-line, and that environment is the kernel command line. The guest
+    // reads it before the pivot; the private key it goes with stayed in the stack above.
+    if let Some(pem) = stack.as_ref().and_then(|s| s.ca_cert_pem()) {
+        let ca = args.boot_root.join(CA_PATH.trim_start_matches('/'));
+        std::fs::write(&ca, pem)
+            .map_err(|e| anyhow::anyhow!("writing the interception CA to {}: {e}", ca.display()))?;
+    }
+
     let vm = builder
         .exec(|e| {
             let e = e
@@ -223,6 +241,14 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
 /// Not async, and not multi-threaded. This process assembles a VM and hands itself to the
 /// VMM; everything it waits for after that it waits for by not existing.
 fn main() -> std::process::ExitCode {
+    // On stderr, which is this process's diagnostics channel — stdout is the guest's console.
+    // Off unless `RUST_LOG` asks: silent by default, and `RUST_LOG=microsandbox_network=debug`
+    // to watch the stack decide about a connection.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+
     match BootArgs::parse(std::env::args_os().skip(1)).and_then(run) {
         // `enter` only returns on success by not returning at all: the `Ok` holds an
         // `Infallible`, and the empty match is what says so.
