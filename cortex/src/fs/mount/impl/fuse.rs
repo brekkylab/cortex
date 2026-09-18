@@ -33,6 +33,7 @@ use fuser::{
 
 use super::super::{
     claim::{Claim, claim, reclaim_abandoned},
+    sigchld::Sigchld,
     table::{resolved, unmount_under},
 };
 use crate::fs::{
@@ -115,7 +116,15 @@ impl FuseMount {
         // outside `fuser` — start from the default and assign.
         let mut config = Config::default();
         config.mount_options = options;
-        let session = fuser::spawn_mount2(Posix::new(fs), mountpoint, &config)?;
+        // Held across the mount for the reason in `sigchld`: on macOS this goes
+        // through the same libfuse2 mount ABI FUSE-T exports, which resets the
+        // process's SIGCHLD handling before forking its helper. On Linux `fuser`
+        // opens `/dev/fuse` itself and forks nothing, and the guard finds nothing
+        // to put back.
+        let session = {
+            let _sigchld = Sigchld::held();
+            fuser::spawn_mount2(Posix::new(fs), mountpoint, &config)?
+        };
         Ok(FuseMount {
             session: Some(session),
             mountpoint: mountpoint.to_path_buf(),

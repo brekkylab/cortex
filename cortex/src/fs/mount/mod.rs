@@ -35,6 +35,9 @@
 mod claim;
 mod r#impl;
 mod mount;
+// Only a binding mounts, and only mounting disturbs what this puts back.
+#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+mod sigchld;
 mod signal;
 mod table;
 
