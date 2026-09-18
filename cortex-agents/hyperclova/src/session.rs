@@ -494,7 +494,7 @@ async fn run_inner(cfg: Config, sink: Sink) -> anyhow::Result<()> {
         .any(|e| e.tool == "write_report" && e.allowed)
     {
         sink(Event::Notice {
-            text: "write_report 가 호출되지 않았다 — 저장을 요청한다".into(),
+            text: "보고서가 저장되지 않아 저장을 다시 요청합니다".into(),
         });
         turn(&mut agent, SAVE_NUDGE).await?;
     }

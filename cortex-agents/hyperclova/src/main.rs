@@ -194,7 +194,7 @@ fn print_event(ev: Event, verbose: bool, workspace: &str) {
             println!();
             println!("{BOLD}대조{RESET}  트리가 거절한 자료가 보고서에 적혀 있는가");
             if report.is_none() {
-                println!("  {RED}보고서 없음 — write_report 가 성공한 기록이 없다{RESET}");
+                println!("  {RED}저장된 보고서가 없습니다{RESET}");
             }
             if denied.is_empty() {
                 println!("  거절된 자료 없음");
