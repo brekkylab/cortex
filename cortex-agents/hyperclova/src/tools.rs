@@ -48,7 +48,10 @@ pub struct Ctx {
 
 pub struct Mem {
     pub bin: PathBuf,
+    /// Where `mem` finds the store: a host path, since `mem` is a program and not a tool.
     pub store: PathBuf,
+    /// The same store as the tree spells it, which is what the audit log names.
+    pub label: PathBuf,
 }
 
 impl Ctx {
@@ -410,8 +413,8 @@ fn remember(ctx: Arc<Ctx>) -> ToolFunc {
         let mem = ctx.mem.as_ref().expect("remember is registered only with mem");
         let store = mem.store.display().to_string();
         let out = match mem_run(mem, &["insert", &store, &text]).await {
-            Ok(_) => { ctx.audit.record(ctx.actor(), "remember", &mem.store, true, text.clone()); json!({ "remembered": text }) }
-            Err(e) => { ctx.audit.record(ctx.actor(), "remember", &mem.store, false, e.to_string()); json!({ "error": e.to_string() }) }
+            Ok(_) => { ctx.audit.record(ctx.actor(), "remember", &mem.label, true, text.clone()); json!({ "remembered": text }) }
+            Err(e) => { ctx.audit.record(ctx.actor(), "remember", &mem.label, false, e.to_string()); json!({ "error": e.to_string() }) }
         };
         out.into()
     })
@@ -425,10 +428,10 @@ fn recall(ctx: Arc<Ctx>) -> ToolFunc {
         let out = match mem_run(mem, &["search", &store, &query]).await {
             Ok(text) => {
                 let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-                ctx.audit.record(ctx.actor(), "recall", &mem.store, true, format!("q={query:?} {} memories", lines.len()));
+                ctx.audit.record(ctx.actor(), "recall", &mem.label, true, format!("q={query:?} {} memories", lines.len()));
                 json!({ "query": query, "memories": lines })
             }
-            Err(e) => { ctx.audit.record(ctx.actor(), "recall", &mem.store, false, e.to_string()); json!({ "error": e.to_string() }) }
+            Err(e) => { ctx.audit.record(ctx.actor(), "recall", &mem.label, false, e.to_string()); json!({ "error": e.to_string() }) }
         };
         out.into()
     })

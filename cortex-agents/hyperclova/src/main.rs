@@ -411,7 +411,8 @@ async fn resolve_mem(args: &Args) -> anyhow::Result<Option<Mem>> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    Ok(Some(Mem { bin, store }))
+    let label = Path::new("산출물").join(&args.actor).join(".memory.sqlite");
+    Ok(Some(Mem { bin, store, label }))
 }
 
 fn show(msg: &Message, verbose: bool) {
