@@ -321,7 +321,7 @@ async fn tree_snapshot(fs: &AclFs<WorkFs>) -> anyhow::Result<String> {
         if n.kind == "dir" {
             if n.access == "locked" {
                 out.push_str(&format!(
-                    "- {}/  [🔒 폴더 전체가 권한 밖 — {} 전용 · 안에 무엇이 있는지도 보이지 않음]\n",
+                    "- {}/  [🔒 {} 전용 폴더 — 내용 비공개]\n",
                     n.path, n.readers
                 ));
             }
@@ -329,9 +329,9 @@ async fn tree_snapshot(fs: &AclFs<WorkFs>) -> anyhow::Result<String> {
         }
         let access = match n.access {
             "open" => "열람 가능".to_string(),
-            "inherited" => "🔒 권한 밖 — 인용 자료의 권한을 따름".to_string(),
+            "inherited" => "🔒 열람 불가 — 인용 자료 기준".to_string(),
             _ => format!(
-                "🔒 권한 밖 — {} 전용 · 질문과 관련되면 read 를 시도해 거절 사유를 받을 것",
+                "🔒 {} 전용 — 필요하면 read 를 호출해 거절 사유를 확인",
                 n.readers
             ),
         };
@@ -594,7 +594,7 @@ async fn check(fs: &AclFs<WorkFs>, audit: &Audit) -> Event {
     };
     let mut paths: Vec<&str> = entries
         .iter()
-        .filter(|e| e.tool == "read" && !e.allowed && e.detail.contains("닫혀 있음"))
+        .filter(|e| e.tool == "read" && !e.allowed && e.detail.contains("열람 불가"))
         .map(|e| e.path.as_str())
         .collect();
     paths.sort_unstable();

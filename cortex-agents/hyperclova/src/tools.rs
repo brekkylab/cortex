@@ -130,7 +130,7 @@ fn arg_strs(args: &ailoy::datatype::Value, key: &str) -> Vec<String> {
 
 fn denied(e: &io::Error) -> serde_json::Value {
     json!({ "error": "permission_denied", "message": e.to_string(),
-            "hint": "이 자료는 현재 사용자에게 닫혀 있다. 우회하지 말고 보고서에 '권한 밖'으로 표시한다." })
+            "hint": "현재 사용자가 열람할 수 없는 자료입니다. 우회하지 말고 보고서에 '권한 밖'으로 표시하세요." })
 }
 
 async fn access_ko(ctx: &Ctx, path: &Path) -> String {
@@ -139,7 +139,7 @@ async fn access_ko(ctx: &Ctx, path: &Path) -> String {
         return format!("🔒 {} — {} 전용", v.label, readers_ko(&v.readers));
     }
     if !ctx.fs.may_read(path).await {
-        return format!("🔒 {} — 인용 자료의 권한에 따라 닫혀 있음", v.label);
+        return format!("🔒 {} — 인용 자료 기준 열람 불가", v.label);
     }
     format!("열람 가능 ({})", v.label)
 }
@@ -147,21 +147,21 @@ async fn access_ko(ctx: &Ctx, path: &Path) -> String {
 pub fn descs(with_mem: bool) -> Vec<ToolDesc> {
     let mut v = vec![
         ToolDescBuilder::new("ls")
-            .description("조직 트리의 한 디렉터리를 나열한다. 루트는 \"\" 또는 \"/\". 각 항목에 현재 사용자의 열람 가능 여부가 붙어 온다.")
+            .description("디렉터리의 항목을 나열한다. 루트는 \"\" 또는 \"/\". 항목마다 현재 사용자의 열람 가능 여부가 함께 반환된다.")
             .parameters(json!({"type":"object","properties":{"path":{"type":"string","description":"루트 기준 경로, 예: 구매팀/협력사평가"}},"required":["path"]}))
             .build(),
         ToolDescBuilder::new("read")
-            .description("파일 하나의 내용을 읽는다. 열람 권한이 없으면 permission_denied 가 온다.")
+            .description("파일 내용을 읽는다. 열람 권한이 없으면 permission_denied 를 반환한다.")
             .parameters(json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}))
             .build(),
         ToolDescBuilder::new("search")
-            .description("트리 전체(또는 path 아래)에서 문자열을 찾는다. 열람 가능한 파일만 검색되고, 권한 밖 파일은 개수와 경로만 locked 로 온다.")
+            .description("트리 전체(또는 path 아래)에서 문자열을 찾는다. 열람 가능한 파일만 검색하고, 권한 밖 파일은 locked 에 경로만 반환한다.")
             .parameters(json!({"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string","description":"생략하면 루트"}},"required":["query"]}))
             .build(),
         ToolDescBuilder::new("write_report")
-            .description("보고서를 산출물/ 아래에 저장한다. sources 에는 이 실행에서 read 로 읽은 원본 경로만 적을 수 있고(읽지 않은 파일은 거절), 산출물의 열람 권한은 인용 자료 중 가장 좁은 권한으로 정해진다.")
+            .description("보고서를 산출물/ 아래에 저장한다. sources 에는 이 실행에서 read 로 읽은 파일 경로만 넣을 수 있고, 산출물의 열람 권한은 인용 자료 중 가장 좁은 권한으로 정해진다.")
             .parameters(json!({"type":"object","properties":{
-                "path":{"type":"string","description":"파일명, 예: 위험거래처-리포트-2026-09-22.md. 산출물/<사용자>/ 아래에 저장된다."},
+                "path":{"type":"string","description":"파일명, 예: 협상-대상-선정안-2026-09.md. 산출물/<사용자>/ 아래에 저장된다."},
                 "content":{"type":"string","description":"마크다운 본문. 각 주장 옆에 근거 파일 경로를 적는다."},
                 "sources":{"type":"array","items":{"type":"string"},"description":"인용한 원본 경로 목록"}},
                 "required":["path","content","sources"]}))
@@ -170,13 +170,13 @@ pub fn descs(with_mem: bool) -> Vec<ToolDesc> {
     if with_mem {
         v.push(
             ToolDescBuilder::new("remember")
-                .description("이번 작업에서 얻은 결론 한 문장을 에이전트 메모리(cortex mem)에 기록한다. 다음 실행의 recall 로 꺼낼 수 있다.")
+                .description("이번 작업의 핵심 결론 한 문장을 메모리에 기록한다. 다음 실행에서 recall 로 확인할 수 있다.")
                 .parameters(json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]}))
                 .build(),
         );
         v.push(
             ToolDescBuilder::new("recall")
-                .description("에이전트 메모리(cortex mem)에서 질의에 가까운 기록을 찾는다. 작업을 시작할 때 한 번 호출해 이전 결론을 확인한다.")
+                .description("메모리에서 질의와 관련된 이전 결론을 찾는다. 작업을 시작할 때 한 번 호출한다.")
                 .parameters(json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}))
                 .build(),
         );
@@ -237,7 +237,7 @@ fn read(ctx: Arc<Ctx>) -> ToolFunc {
                 let total = text.chars().count();
                 if total > READ_CAP {
                     text = text.chars().take(READ_CAP).collect();
-                    text.push_str(&format!("\n… (총 {total}자 중 {READ_CAP}자까지)"));
+                    text.push_str(&format!("\n… (전체 {total}자 중 앞 {READ_CAP}자)"));
                 }
                 ctx.saw(&path);
                 ctx.audit.record(ctx.actor(), "read", &path, true, format!("{} bytes", bytes.len()));
@@ -252,7 +252,7 @@ fn read(ctx: Arc<Ctx>) -> ToolFunc {
                 // left off. Name the candidates, with what the caller may do with each.
                 let candidates = same_name(&ctx, &path).await;
                 ctx.audit.record(ctx.actor(), "read", &path, false, format!("not found; {} candidates", candidates.len()));
-                json!({ "error": "not_found", "message": format!("{} 은(는) 없다", path.display()), "did_you_mean": candidates })
+                json!({ "error": "not_found", "message": format!("{} 파일이 없습니다", path.display()), "did_you_mean": candidates })
             }
             Err(e) => {
                 ctx.audit.record(ctx.actor(), "read", &path, false, e.to_string());
@@ -326,7 +326,16 @@ fn write_report(ctx: Arc<Ctx>) -> ToolFunc {
         // Every actor writes into its own folder under 산출물/, whatever the model spelled: two
         // departments asking the same question on the same day must not overwrite each other.
         let given = normalize(Path::new(arg_str(&args, "path")));
-        let name = given.file_name().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("보고서.md"));
+        // A file name the model spelled with spaces becomes one word per hyphen, so a path is one
+        // token wherever it is quoted.
+        let name = given
+            .file_name()
+            .map(|n| {
+                let n = n.to_string_lossy();
+                let joined = n.split_whitespace().collect::<Vec<_>>().join("-");
+                PathBuf::from(if joined.ends_with(".md") { joined } else { format!("{joined}.md") })
+            })
+            .unwrap_or_else(|| PathBuf::from("보고서.md"));
         let dir = Path::new("산출물").join(ctx.actor());
         let path = dir.join(name);
         let content = arg_str(&args, "content").to_string();
@@ -341,19 +350,19 @@ fn write_report(ctx: Arc<Ctx>) -> ToolFunc {
 
         // A report rests on files that were opened in this run, and on nothing else.
         if sources.is_empty() {
-            let msg = "인용할 원본이 없다. 먼저 read 로 파일을 읽고, 그 경로를 sources 에 적는다".to_string();
+            let msg = "인용할 파일이 없습니다. 먼저 read 로 읽은 뒤 그 경로를 sources 에 넣으세요".to_string();
             ctx.audit.record(ctx.actor(), "write_report", &path, false, msg.clone());
             return json!({ "error": "no_sources", "message": msg }).into();
         }
         if let Some(unread) = sources.iter().find(|s| !ctx.has_seen(s)) {
-            let msg = format!("{} 은(는) 이 실행에서 읽지 않았다. read 로 확인한 뒤 인용한다", unread.display());
+            let msg = format!("{} 은(는) 이 실행에서 읽지 않은 파일입니다. read 로 읽은 뒤 인용하세요", unread.display());
             ctx.audit.record(ctx.actor(), "write_report", &path, false, msg.clone());
             return json!({ "error": "unread_source", "message": msg }).into();
         }
         // …and only on files its author could open.
         if let Some(bad) = sources.iter().find(|s| !ctx.fs.verdict(s).readable) {
             let v = ctx.fs.verdict(bad);
-            let msg = format!("{} 은(는) {} 전용이라 {} 이(가) 인용할 수 없다", bad.display(), readers_ko(&v.readers), ctx.actor());
+            let msg = format!("{} 은(는) {} 전용 자료라 {} 은(는) 인용할 수 없습니다", bad.display(), readers_ko(&v.readers), ctx.actor());
             ctx.audit.record(ctx.actor(), "write_report", &path, false, msg.clone());
             return json!({ "error": "permission_denied", "message": msg }).into();
         }
@@ -361,7 +370,7 @@ fn write_report(ctx: Arc<Ctx>) -> ToolFunc {
         let readers: Vec<String> = ctx.fs.acl().derive(&sources).into_iter().collect();
         let now = Local::now();
         let footer = format!(
-            "\n\n---\n작성: {} 담당 에이전트 · 모델 {} · {}\n열람 권한: {} (인용 자료 기준 최소 권한)\n인용: {}\n",
+            "\n\n---\n작성: {} · {} · {}\n열람 권한: {} — 인용 자료 기준\n인용: {}\n",
             ctx.actor(), ctx.model, now.format("%Y-%m-%d %H:%M"),
             readers_ko(&readers),
             sources.iter().map(|s| s.display().to_string()).collect::<Vec<_>>().join(", "),

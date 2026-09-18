@@ -154,7 +154,7 @@ export default function AgentTab(props: Props) {
             <div className="picker">
               {props.resources.length === 0 && (
                 <div className="pick">
-                  <span style={{ color: "var(--text-faint)" }}>워크스페이스 탭에서 memory 또는 docset 을 먼저 만듭니다.</span>
+                  <span style={{ color: "var(--text-faint)" }}>워크스페이스 탭에서 memory 나 docset 을 먼저 만드세요.</span>
                 </div>
               )}
               {props.resources.map((resource) => (

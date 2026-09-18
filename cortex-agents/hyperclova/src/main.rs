@@ -1,7 +1,7 @@
 //! `cortex-hyperclova` — HyperCLOVA X working over a Cortex tree, inside one actor's permissions.
 //!
 //! ```text
-//! cortex-hyperclova --actor 구매팀 "이번 주 위험 거래처와 대체 후보를 정리해 주세요"
+//! cortex-hyperclova --actor 구매팀 "3분기 단가 협상 대상 선정안을 만들어 주세요"
 //! cortex-hyperclova --actor 인사팀 --tree-only
 //! cortex-hyperclova --actor 재무팀 --model HCX-007 --s3 my-bucket/finance --s3-at 재무팀 "…"
 //! ```
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
                 _ => {
                     let mark = match n.access {
                         "open" => format!("{GREEN}열람{RESET}"),
-                        "inherited" => format!("{RED}🔒 인용 자료의 권한을 따름{RESET}"),
+                        "inherited" => format!("{RED}🔒 인용 자료 기준 열람 불가{RESET}"),
                         _ => format!("{RED}🔒 {} 전용{RESET}", n.readers),
                     };
                     println!("{indent}{}  {mark}", n.name);
@@ -166,7 +166,7 @@ fn print_event(ev: Event, verbose: bool, workspace: &str) {
             }
             println!("{BOLD}actor{RESET}       {actor}    {BOLD}model{RESET} {model}");
             println!();
-            println!("{DIM}질문{RESET}  {question}");
+            println!("{DIM}요청{RESET}  {question}");
             println!();
         }
         Event::Assistant { text, calls } => {
@@ -192,12 +192,12 @@ fn print_event(ev: Event, verbose: bool, workspace: &str) {
         Event::Audit { .. } => {}
         Event::Check { report, denied } => {
             println!();
-            println!("{BOLD}대조{RESET}  트리가 거절한 자료가 보고서에 적혀 있는가");
+            println!("{BOLD}권한 대조{RESET}  거절된 자료가 보고서에 명시되었는지");
             if report.is_none() {
                 println!("  {RED}저장된 보고서가 없습니다{RESET}");
             }
             if denied.is_empty() {
-                println!("  거절된 자료 없음");
+                println!("  거절된 자료가 없습니다");
             }
             for d in denied {
                 let mark = if d.mentioned {

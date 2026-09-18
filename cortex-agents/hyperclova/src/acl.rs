@@ -197,7 +197,7 @@ impl<F: FileSystem> AclFs<F> {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(
-                "{}: {}은(는) {} 열람 — {}에는 닫혀 있음",
+                "{}: {} — {} 열람 가능, {} 열람 불가",
                 path.display(),
                 v.label,
                 readers_ko(&v.readers),
@@ -209,10 +209,7 @@ impl<F: FileSystem> AclFs<F> {
     fn deny_write(&self, path: &Path) -> io::Error {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!(
-                "{}: 쓰기는 산출물/ 아래에서만 — 원본은 Source of Truth 로 남는다",
-                path.display()
-            ),
+            format!("{}: 산출물/ 아래에만 쓸 수 있습니다", path.display()),
         )
     }
 
@@ -243,7 +240,7 @@ impl<F: FileSystem> AclFs<F> {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "{}: 인용 자료의 권한에 따라 {} 열람 — {}에는 닫혀 있음",
+                    "{}: 인용 자료 기준 — {} 열람 가능, {} 열람 불가",
                     path.display(),
                     readers_ko(&readers),
                     self.actor

@@ -125,7 +125,7 @@ function describe(step: Step): { icon: ReactElement; doing: string; done: string
     }
     case "write_report": {
       const readers = str(v.readers);
-      return { icon: <DocIcon />, doing: "보고서 쓰는 중", done: v.error ? "보고서 저장 실패" : `보고서 저장${readers ? ` · 열람 ${readers}` : ""}` };
+      return { icon: <DocIcon />, doing: "보고서 작성 중", done: v.error ? "보고서 저장 실패" : `보고서 저장${readers ? ` · 열람 ${readers}` : ""}` };
     }
     case "recall": {
       const n = Array.isArray(v.memories) ? v.memories.length : 0;
@@ -141,7 +141,7 @@ function describe(step: Step): { icon: ReactElement; doing: string; done: string
 function deniedReason(step: Step): string {
   const v = (step.result?.value ?? {}) as Record<string, unknown>;
   const m = str(v.message);
-  const who = /은\(는\) (.+?) 열람/.exec(m)?.[1];
+  const who = /— (.+?) 열람 가능/.exec(m)?.[1];
   return who ? `${who} 전용` : m;
 }
 
@@ -157,9 +157,14 @@ export default function HyperclovaTab(props: Props) {
   const [view, setView] = useState<"actor" | "admin">("actor");
   const [tree, setTree] = useState<HcxNode[]>([]);
   const [runs, setRuns] = useState<HcxRunSummary[]>([]);
-  const [current, setCurrent] = useState<RunState | null>(null);
-  const [selectedRun, setSelectedRun] = useState<string | null>(null);
+  // The live run, if one is going, and what the screen shows: the live run, a past run, or
+  // nothing yet. Browsing a past run never waits for the live one.
+  const [live, setLive] = useState<RunState | null>(null);
+  const [opened, setOpened] = useState<{ id: string; state: RunState } | null>(null);
+  const [viewing, setViewing] = useState<"live" | "opened" | "new">("new");
   const [running, setRunning] = useState(false);
+  const current: RunState | null = viewing === "live" ? live : viewing === "opened" ? (opened?.state ?? null) : null;
+  const selectedRun = viewing === "opened" ? (opened?.id ?? null) : null;
   const [startedAt, setStartedAt] = useState<number | null>(null);
   const [now, setNow] = useState(Date.now());
   const [report, setReport] = useState<{ path: string; text: string } | null>(null);
@@ -214,15 +219,17 @@ export default function HyperclovaTab(props: Props) {
   }, []);
 
   // Live events, one subscription for the life of the window.
-  const currentRef = useRef(current);
-  currentRef.current = current;
+  const liveRef = useRef(live);
+  liveRef.current = live;
+  const viewingRef = useRef(viewing);
+  viewingRef.current = viewing;
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     let cancelled = false;
     onHcxEvent((ev: HcxEvent) => {
       if (cancelled) return;
-      setCurrent((prev) => (prev ? reduce(prev, ev) : prev));
-      if (ev.kind === "check") showReport(currentRef.current?.actor ?? actor, ev.report);
+      setLive((prev) => (prev ? reduce(prev, ev) : prev));
+      if (ev.kind === "check" && viewingRef.current === "live") showReport(liveRef.current?.actor ?? actor, ev.report);
       if (ev.kind === "finished" || ev.kind === "failed") {
         setRunning(false);
         void loadTree(viewerRef.current);
@@ -240,8 +247,8 @@ export default function HyperclovaTab(props: Props) {
   }, [loadTree, loadRuns, onFinished, showReport, actor]);
 
   useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
-  }, [current?.log.length]);
+    if (viewing === "live") logRef.current?.scrollTo({ top: logRef.current.scrollHeight, behavior: "smooth" });
+  }, [live?.log.length, viewing]);
   useEffect(() => {
     if (!running) return;
     const t = setInterval(() => setNow(Date.now()), 500);
@@ -250,8 +257,8 @@ export default function HyperclovaTab(props: Props) {
 
   const start = useCallback(async () => {
     if (running || !request.trim()) return;
-    setCurrent(empty(actor, model, request));
-    setSelectedRun(null);
+    setLive(empty(actor, model, request));
+    setViewing("live");
     setReport(null);
     setFile(null);
     setPane("report");
@@ -271,10 +278,12 @@ export default function HyperclovaTab(props: Props) {
         (rec) => {
           let state = empty(rec.actor, rec.model, rec.question);
           for (const ev of rec.events) state = reduce(state, ev);
-          setCurrent(state);
-          setSelectedRun(id);
-          setActor(rec.actor);
-          setModel(rec.model);
+          setOpened({ id, state });
+          setViewing("opened");
+          if (!running) {
+            setActor(rec.actor);
+            setModel(rec.model);
+          }
           setRequest(rec.question);
           setPane("report");
           setFile(null);
@@ -283,16 +292,22 @@ export default function HyperclovaTab(props: Props) {
         (err) => notify(messageOf(err), "error"),
       );
     },
-    [notify, showReport],
+    [notify, showReport, running],
   );
 
   const fresh = () => {
-    if (running) return;
-    setCurrent(null);
-    setSelectedRun(null);
+    setViewing("new");
     setReport(null);
     setFile(null);
     setRequest(config?.default_question ?? "");
+  };
+
+  const backToLive = () => {
+    if (!live) return;
+    setViewing("live");
+    setPane("report");
+    setFile(null);
+    showReport(live.actor, live.check?.report ?? null);
   };
 
   const openFile = useCallback(
@@ -338,7 +353,7 @@ export default function HyperclovaTab(props: Props) {
     return out;
   }, [shown, collapsed]);
   const readable = files.filter((n) => n.access === "open").length;
-  const live = startedAt ? Math.max(0, Math.round((now - startedAt) / 1000)) : 0;
+  const elapsedLive = startedAt ? Math.max(0, Math.round((now - startedAt) / 1000)) : 0;
   const canRun = !running && request.trim().length > 0 && (config?.api_key_present ?? true);
   const recent = useMemo(() => runs.slice(0, 6), [runs]);
 
@@ -347,20 +362,20 @@ export default function HyperclovaTab(props: Props) {
       <aside className="run-side">
         <section className="runs">
           <h4>실행</h4>
-          <button className={`run-row new ${current === null ? "on" : ""}`} onClick={fresh} disabled={running}>
+          <button className={`run-row new ${viewing === "new" ? "on" : ""}`} onClick={fresh} disabled={running}>
             <PenIcon /> 새 실행
           </button>
-          {running && current && (
-            <div className="run-row on live">
-              <span className="title">{current.log[0]?.kind === "request" ? current.log[0].text : ""}</span>
+          {running && live && (
+            <button className={`run-row live ${viewing === "live" ? "on" : ""}`} onClick={backToLive}>
+              <span className="title">{live.log[0]?.kind === "request" ? live.log[0].text : ""}</span>
               <span className="meta">
-                {current.actor} · {current.model} · 실행 중
+                {live.actor} · {live.model} · 실행 중
               </span>
               <span className="dot" />
-            </div>
+            </button>
           )}
           {runs.map((r) => (
-            <button key={r.id} className={`run-row ${selectedRun === r.id ? "on" : ""}`} onClick={() => openRun(r.id)} disabled={running} title={r.question}>
+            <button key={r.id} className={`run-row ${selectedRun === r.id ? "on" : ""}`} onClick={() => openRun(r.id)} title={r.question}>
               <span className="title">{r.question}</span>
               <span className="meta">
                 {r.actor} · {r.model} · {ago(r.started)}
@@ -409,7 +424,7 @@ export default function HyperclovaTab(props: Props) {
           <div className="who-row">
             <div className="chips" role="radiogroup" aria-label="사용자">
               {(config?.actors ?? Object.keys(SCOPE)).map((a) => (
-                <button key={a} role="radio" aria-checked={a === actor} className="chip-actor" disabled={running || selectedRun !== null} title={SCOPE[a] ?? ""} onClick={() => setActor(a)}>
+                <button key={a} role="radio" aria-checked={a === actor} className="chip-actor" disabled={running || viewing === "opened"} title={SCOPE[a] ?? ""} onClick={() => setActor(a)}>
                   <span className="avatar">{a[0]}</span>
                   {a}
                 </button>
@@ -418,21 +433,27 @@ export default function HyperclovaTab(props: Props) {
             <span className="spacer" />
             <div className="segmented mini" role="radiogroup" aria-label="모델">
               {(config?.models ?? ["HCX-007", "HCX-005"]).map((m) => (
-                <button key={m} aria-pressed={m === model} disabled={running || selectedRun !== null} onClick={() => setModel(m)}>
+                <button key={m} aria-pressed={m === model} disabled={running || viewing === "opened"} onClick={() => setModel(m)}>
                   {m}
                 </button>
               ))}
             </div>
           </div>
-          <textarea rows={2} value={request} disabled={running || selectedRun !== null} placeholder="요청" onChange={(e) => setRequest(e.target.value)} />
+          <textarea rows={2} value={request} disabled={running || viewing === "opened"} placeholder="요청" onChange={(e) => setRequest(e.target.value)} />
           <div className="bar">
-            <span className={`status ${running ? "live" : ""}`}>
-              {running && <span className="dot" />}
-              {running ? `${fmtSeconds(live)} 작업 중` : current?.seconds != null ? `${fmtSeconds(current.seconds)} 작업` : config && !config.api_key_present ? "CLOVASTUDIO_API_KEY 없음" : ""}
+            <span className={`status ${running && viewing === "live" ? "live" : ""}`}>
+              {running && viewing === "live" && <span className="dot" />}
+              {running && viewing === "live"
+                ? `${fmtSeconds(elapsedLive)} 작업 중`
+                : current?.seconds != null
+                  ? `${fmtSeconds(current.seconds)} 작업`
+                  : config && !config.api_key_present
+                    ? "API 키가 설정되지 않았습니다"
+                    : ""}
             </span>
             <span className="spacer" />
-            {selectedRun !== null ? (
-              <button onClick={fresh}>새 실행</button>
+            {viewing === "opened" ? (
+              <button onClick={running ? backToLive : fresh}>{running ? "실행 중으로" : "새 실행"}</button>
             ) : (
               <button className="primary" disabled={!canRun} title="⌘↩" onClick={() => void start()}>
                 실행
@@ -572,7 +593,7 @@ export default function HyperclovaTab(props: Props) {
             {!current?.check && <div className="empty">실행이 끝나면 거절된 자료가 보고서에 명시되었는지 대조합니다.</div>}
             {current?.check && (
               <>
-                <p className="lead">트리가 거절한 자료가 보고서에 적혀 있는지 경로로 확인한 결과입니다.</p>
+                <p className="lead">거절된 자료가 보고서에 명시되었는지 경로 기준으로 확인한 결과입니다.</p>
                 {!current.check.report && (
                   <div className="check-row no">
                     <CrossIcon /> 저장된 보고서가 없습니다.

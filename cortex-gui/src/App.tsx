@@ -46,6 +46,18 @@ export default function App() {
     setStatus({ text, tone: tone ?? "" });
   }, []);
 
+  // A failure anywhere in the window lands in the status line rather than nowhere.
+  useEffect(() => {
+    const onError = (e: ErrorEvent) => notify(e.message, "error");
+    const onRejection = (e: PromiseRejectionEvent) => notify(messageOf(e.reason), "error");
+    window.addEventListener("error", onError);
+    window.addEventListener("unhandledrejection", onRejection);
+    return () => {
+      window.removeEventListener("error", onError);
+      window.removeEventListener("unhandledrejection", onRejection);
+    };
+  }, [notify]);
+
   const refreshMounts = useCallback(() => {
     listMounts().then(setMounts, (err) => notify(messageOf(err), "error"));
   }, [notify]);
@@ -107,7 +119,7 @@ export default function App() {
             <MoonIcon />
           </button>
         </div>
-        <span className="session" title="이 창은 관리자 세션입니다. 실행은 실행 탭에서 고른 사용자의 권한으로 이루어집니다.">
+        <span className="session" title="관리자 세션 — 실행은 선택한 사용자의 권한으로 이루어집니다.">
           관리자 세션
         </span>
       </header>
