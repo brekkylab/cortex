@@ -9,12 +9,13 @@ import { listAgents, listMounts, listResources, messageOf } from "./api";
 import AgentTab from "./components/AgentTab";
 import HyperclovaTab from "./components/HyperclovaTab";
 import WorkspaceTab from "./components/WorkspaceTab";
+import { MoonIcon, SunIcon } from "./components/icons";
 import type { Agent, MountInfo, Resource } from "./types";
 
 type Tab = "run" | "workspace" | "agents";
-type Theme = "system" | "light" | "dark";
-const THEME_LABEL: Record<Theme, string> = { system: "시스템", light: "라이트", dark: "다크" };
-const NEXT_THEME: Record<Theme, Theme> = { system: "light", light: "dark", dark: "system" };
+type Theme = "light" | "dark";
+/** Until the person picks one, the scheme is the system's. */
+const systemTheme = (): Theme => (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
 type Status = { text: string; tone: "ok" | "error" | "" };
 
 export default function App() {
@@ -27,19 +28,17 @@ export default function App() {
   const [theme, setTheme] = useState<Theme>(() => {
     try {
       const saved = localStorage.getItem("theme");
-      return saved === "light" || saved === "dark" ? saved : "system";
+      return saved === "light" || saved === "dark" ? saved : systemTheme();
     } catch {
-      return "system";
+      return systemTheme();
     }
   });
   useEffect(() => {
-    const root = document.documentElement;
-    if (theme === "system") delete root.dataset.theme;
-    else root.dataset.theme = theme;
+    document.documentElement.dataset.theme = theme;
     try {
       localStorage.setItem("theme", theme);
     } catch {
-      /* per-viewer convenience only */
+      /* a per-window convenience only */
     }
   }, [theme]);
 
@@ -100,9 +99,14 @@ export default function App() {
           </button>
         </div>
         <span className="spacer" />
-        <button className="ghost theme" title="테마" onClick={() => setTheme(NEXT_THEME[theme])}>
-          {THEME_LABEL[theme]}
-        </button>
+        <div className="segmented theme-pill" role="radiogroup" aria-label="테마">
+          <button role="radio" aria-pressed={theme === "light"} title="라이트" onClick={() => setTheme("light")}>
+            <SunIcon />
+          </button>
+          <button role="radio" aria-pressed={theme === "dark"} title="다크" onClick={() => setTheme("dark")}>
+            <MoonIcon />
+          </button>
+        </div>
         <span className="session" title="이 창은 관리자 세션입니다. 실행은 실행 탭에서 고른 사용자의 권한으로 이루어집니다.">
           관리자 세션
         </span>
@@ -127,10 +131,6 @@ export default function App() {
 
       <footer className="statusbar">
         <span>연결 {Math.max(mounts.length - 1, 0)}</span>
-        <span>·</span>
-        <span>리소스 {resources.length}</span>
-        <span>·</span>
-        <span>에이전트 {agents.length}</span>
         <span className="spacer" />
         <span className={`msg ${status.tone}`}>{status.text}</span>
       </footer>

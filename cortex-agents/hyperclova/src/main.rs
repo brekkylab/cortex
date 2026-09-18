@@ -62,6 +62,10 @@ struct Args {
     #[arg(long)]
     reasoning_effort: Option<String>,
 
+    /// Do not write the run down under `<workspace>/.runs/`.
+    #[arg(long)]
+    no_record: bool,
+
     /// Print the tree as the actor sees it and exit without calling the model.
     #[arg(long)]
     tree_only: bool,
@@ -128,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|_| session::DEFAULT_URL.to_string()),
         mem_bin: args.mem_bin.clone(),
         reasoning_effort: args.reasoning_effort.clone(),
+        record_dir: (!args.no_record).then(|| args.workspace.join(".runs")),
     };
     let verbose = args.verbose;
     let workspace = args.workspace.display().to_string();

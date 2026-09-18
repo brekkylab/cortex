@@ -70,6 +70,8 @@ pub fn run() {
             hyperclova::hcx_tree,
             hyperclova::hcx_read,
             hyperclova::hcx_run,
+            hyperclova::hcx_runs,
+            hyperclova::hcx_run_detail,
         ])
         .run(tauri::generate_context!())
         .expect("the window could not be created");

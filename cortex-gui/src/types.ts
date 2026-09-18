@@ -83,6 +83,8 @@ export interface HcxConfig {
   s3: string | null;
   api_key_present: boolean;
   mem_present: boolean;
+  /** Open the most recent run when the window opens. */
+  open_latest: boolean;
 }
 
 export interface HcxNode {
@@ -118,3 +120,21 @@ export type HcxEvent =
   | { kind: "check"; report: string | null; denied: { path: string; mentioned: boolean }[] }
   | { kind: "finished"; seconds: number; log: string }
   | { kind: "failed"; message: string };
+
+/** A recorded run as the history list shows it — `session::Summary`. */
+export interface HcxRunSummary {
+  id: string;
+  actor: string;
+  model: string;
+  question: string;
+  started: string;
+  finished: string | null;
+  ok: boolean;
+  report: string | null;
+  seconds: number | null;
+}
+
+/** A recorded run whole — `session::Record`. */
+export interface HcxRunRecord extends Omit<HcxRunSummary, "report" | "seconds"> {
+  events: HcxEvent[];
+}

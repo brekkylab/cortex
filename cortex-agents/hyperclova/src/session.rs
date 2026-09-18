@@ -18,10 +18,10 @@ use ailoy::{
     tool::get_tool_providers_mut,
 };
 use anyhow::Context as _;
-use chrono::Local;
+use chrono::{DateTime, Local};
 use cortex::fs::{DirentKind, FileSystem as _, WorkFs};
 use futures::StreamExt as _;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     acl::{self, Acl, AclFs, readers_ko},
@@ -33,7 +33,7 @@ use crate::{
 pub const DEFAULT_URL: &str = "https://clovastudio.stream.ntruss.com/v1/openai/chat/completions";
 const PROVIDER: &str = "clovastudio";
 
-pub const DEFAULT_QUESTION: &str = "다음 주 구매팀 주간회의에 올릴 3분기 단가 협상 대상 선정안을 만들어 주세요. 협력사별 우선순위와 근거(납기 이력·신용등급 변동·여신 한도·2분기 실적의 단가 영향)를 정리하고, 권한이 없어 확인하지 못한 자료는 재무팀에 요청할 목록으로 따로 적어 주세요.";
+pub const DEFAULT_QUESTION: &str = "다음 주 주간회의에 올릴 3분기 단가 협상 대상 선정안을 만들어 주세요. 협력사별 우선순위와 근거를 정리해 주세요.";
 
 pub const INSTRUCTION: &str = "\
 당신은 회사 내부 데이터 트리 위에서 일하는 업무 에이전트다. 트리는 부서 폴더(구매팀·재무팀·인사팀·회의록·정책)로 되어 있고, \
@@ -72,6 +72,8 @@ pub struct Config {
     pub mem_bin: Option<PathBuf>,
     /// `None` picks the model's default: `"none"` on HCX-007, nothing elsewhere.
     pub reasoning_effort: Option<String>,
+    /// Where the run is written down as a [`Record`] when it ends; `None` keeps nothing.
+    pub record_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -87,14 +89,14 @@ impl Config {
 }
 
 /// One function the model asked for.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Call {
     pub name: String,
     pub arguments: serde_json::Value,
 }
 
 /// What a run reports, in order.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
     Started {
@@ -131,13 +133,13 @@ pub enum Event {
     },
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mount {
     pub name: String,
     pub source: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Denied {
     pub path: String,
     pub mentioned: bool,
@@ -157,6 +159,85 @@ pub struct Node {
 }
 
 pub type Sink = Arc<dyn Fn(Event) + Send + Sync>;
+
+/// One run, written down whole: what was asked, by whom, of which model, and every event.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Record {
+    pub id: String,
+    pub actor: String,
+    pub model: String,
+    pub question: String,
+    pub started: DateTime<Local>,
+    pub finished: Option<DateTime<Local>>,
+    /// `false` when the run ended in an error; the last event then says which.
+    pub ok: bool,
+    pub events: Vec<Event>,
+}
+
+/// A run as a list shows it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Summary {
+    pub id: String,
+    pub actor: String,
+    pub model: String,
+    pub question: String,
+    pub started: DateTime<Local>,
+    pub finished: Option<DateTime<Local>>,
+    pub ok: bool,
+    /// The report the run wrote, if it wrote one.
+    pub report: Option<String>,
+    pub seconds: Option<f64>,
+}
+
+impl Record {
+    pub fn summary(&self) -> Summary {
+        let mut report = None;
+        let mut seconds = None;
+        for e in &self.events {
+            match e {
+                Event::Check { report: r, .. } => report = r.clone(),
+                Event::Finished { seconds: s, .. } => seconds = Some(*s),
+                _ => {}
+            }
+        }
+        Summary {
+            id: self.id.clone(),
+            actor: self.actor.clone(),
+            model: self.model.clone(),
+            question: self.question.clone(),
+            started: self.started,
+            finished: self.finished,
+            ok: self.ok,
+            report,
+            seconds,
+        }
+    }
+}
+
+/// Every record under `dir`, newest first.
+pub fn list_records(dir: &Path) -> Vec<Summary> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Summary> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .filter_map(|b| serde_json::from_slice::<Record>(&b).ok())
+        .map(|r| r.summary())
+        .collect();
+    out.sort_by_key(|s| std::cmp::Reverse(s.started));
+    out
+}
+
+pub fn load_record(dir: &Path, id: &str) -> anyhow::Result<Record> {
+    anyhow::ensure!(
+        !id.is_empty() && id.chars().all(|c| c.is_alphanumeric() || c == '-'),
+        "not a record id"
+    );
+    let bytes = std::fs::read(dir.join(format!("{id}.json")))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
 
 /// Build the tree for one actor.
 pub fn open_tree(
@@ -293,8 +374,56 @@ async fn resolve_mem(cfg: &Config) -> anyhow::Result<Option<Mem>> {
     Ok(Some(Mem { bin, store, label }))
 }
 
-/// Run the agent once, reporting to `sink` as it goes.
+/// Run the agent once, reporting to `sink` as it goes, and writing the run down afterwards
+/// when `cfg.record_dir` says where.
 pub async fn run(cfg: Config, sink: Sink) -> anyhow::Result<()> {
+    let Some(dir) = cfg.record_dir.clone() else {
+        return run_inner(cfg, sink).await;
+    };
+    let started_at = Local::now();
+    let id = format!(
+        "{}-{}",
+        started_at.format("%Y%m%d-%H%M%S"),
+        cfg.actor_slug()
+    );
+    let events: Arc<std::sync::Mutex<Vec<Event>>> = Default::default();
+    let recording = {
+        let events = events.clone();
+        Arc::new(move |ev: Event| {
+            events.lock().unwrap().push(ev.clone());
+            sink(ev);
+        }) as Sink
+    };
+    let outcome = run_inner(cfg.clone(), recording).await;
+    let record = Record {
+        id,
+        actor: cfg.actor.clone(),
+        model: cfg.model.clone(),
+        question: cfg.question.clone(),
+        started: started_at,
+        finished: Some(Local::now()),
+        ok: outcome.is_ok(),
+        events: std::mem::take(&mut *events.lock().unwrap()),
+    };
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join(format!("{}.json", record.id)),
+        serde_json::to_vec_pretty(&record)?,
+    )?;
+    outcome
+}
+
+impl Config {
+    /// The actor as a file name can carry it: letters stay, separators do not.
+    fn actor_slug(&self) -> String {
+        self.actor
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+            .collect()
+    }
+}
+
+async fn run_inner(cfg: Config, sink: Sink) -> anyhow::Result<()> {
     let started = Instant::now();
     let (fs, mounts) = open_tree(&cfg.workspace, &cfg.actor, cfg.s3.as_ref())?;
     sink(Event::Started {

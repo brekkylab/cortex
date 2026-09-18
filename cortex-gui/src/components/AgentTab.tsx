@@ -17,7 +17,7 @@ interface Props {
 }
 
 const MODELS: { group: string; items: string[] }[] = [
-  { group: "CLOVA Studio", items: ["HCX-007", "HCX-005"] },
+  { group: "API", items: ["HCX-007", "HCX-005", "HCX-DASH-002"] },
   {
     group: "로컬 AI",
     items: [
@@ -34,7 +34,7 @@ const MODELS: { group: string; items: string[] }[] = [
     ],
   },
 ];
-const runsOn = (model: string) => (model.startsWith("HCX") ? "CLOVA Studio" : "로컬 AI");
+const runsOn = (model: string) => (model.startsWith("HCX") ? "API" : "로컬 AI");
 
 const BLANK = { name: "", model: "HCX-007", system_message: "" };
 

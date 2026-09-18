@@ -1,22 +1,14 @@
 @font-face {
-  font-family: "Geist";
-  src: url("/fonts/Geist-Regular.ttf") format("truetype");
+  font-family: "NanumSquare Neo";
+  src: url("/fonts/NanumSquareNeo-Variable.woff2") format("woff2");
+  font-weight: 300 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: "D2Coding";
+  src: url("/fonts/D2Coding.ttf") format("truetype");
   font-weight: 400;
-}
-@font-face {
-  font-family: "Geist";
-  src: url("/fonts/Geist-Medium.ttf") format("truetype");
-  font-weight: 500;
-}
-@font-face {
-  font-family: "Geist";
-  src: url("/fonts/Geist-SemiBold.ttf") format("truetype");
-  font-weight: 600;
-}
-@font-face {
-  font-family: "Geist";
-  src: url("/fonts/Geist-Bold.ttf") format("truetype");
-  font-weight: 700;
+  font-display: swap;
 }
 
 /* Tokens. Semantic names, two schemes: the light one by default, the dark one under
@@ -51,8 +43,8 @@
   --radius-sm: 8px;
   --radius: 10px;
   --radius-lg: 14px;
-  --sans: "Geist", -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo", "Segoe UI", sans-serif;
-  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  --sans: "NanumSquare Neo", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Segoe UI", sans-serif;
+  --mono: "D2Coding", ui-monospace, "SF Mono", Menlo, monospace;
   color-scheme: light;
 
   /* aliases kept for the older panes */
@@ -148,7 +140,8 @@ body,
 body {
   background: var(--bg);
   color: var(--text);
-  font: 13px/1.5 var(--sans);
+  font: 13.5px/1.5 var(--sans);
+  font-weight: 400;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
   user-select: none;
@@ -1127,7 +1120,7 @@ button.primary:disabled kbd {
   padding: 8px 0;
 }
 .record-body .path {
-  font: 11px var(--mono);
+  font-size: 11.5px;
   color: var(--text-faint);
   word-break: break-all;
   margin-bottom: 8px;
@@ -1247,10 +1240,15 @@ button.primary:disabled kbd {
   margin: 4px 0;
 }
 .md code.path {
+  font-family: inherit;
+  font-size: inherit;
   background: transparent;
   padding: 0;
   color: var(--text-dim);
-  font-size: 11.5px;
+}
+.md li > ul,
+.md li > ol {
+  margin: 2px 0 4px;
 }
 .md ul,
 .md ol {
@@ -1277,4 +1275,303 @@ button.primary:disabled kbd {
   background: var(--bg-raised);
   color: var(--text-dim);
   font-weight: 500;
+}
+
+/* ── theme pill ─────────────────────────────────────────────────────────── */
+
+.theme-pill {
+  border-radius: 999px;
+  padding: 2px;
+}
+.theme-pill button {
+  width: 26px;
+  height: 22px;
+  padding: 0;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  color: var(--fg-muted);
+}
+.theme-pill button[aria-pressed="true"] {
+  color: var(--fg);
+}
+
+/* ── runs ───────────────────────────────────────────────────────────────── */
+
+.run-side section.runs {
+  max-height: 34%;
+  overflow: auto;
+}
+.run-row {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  width: 100%;
+  text-align: left;
+  padding: 6px 9px;
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: var(--radius-sm);
+  position: relative;
+}
+.run-row:hover:not(:disabled) {
+  background: var(--control-subtle-hover);
+  border-color: transparent;
+}
+.run-row.on {
+  background: var(--surface-primary);
+  border-color: var(--border);
+}
+.run-row.new {
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  color: var(--fg-secondary);
+  font-size: 12.5px;
+}
+.run-row .title {
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-right: 14px;
+}
+.run-row .meta {
+  font-size: 11px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-row .dot {
+  position: absolute;
+  right: 10px;
+  top: 11px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.run-row .dot.bad {
+  background: var(--invalid);
+}
+.run-row.live .dot {
+  animation: breathe 1.2s ease-in-out infinite;
+}
+
+.recent h3 {
+  margin: 8px 4px 10px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-secondary);
+}
+.recent .cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 10px;
+}
+.run-card {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  text-align: left;
+  padding: 12px 14px 12px;
+  border-radius: var(--radius-lg);
+  background: var(--surface-primary);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-subtle);
+}
+.run-card:hover:not(:disabled) {
+  background: var(--surface-primary);
+  border-color: var(--border-strong);
+}
+.run-card .when {
+  font-size: 11px;
+  color: var(--fg-muted);
+}
+.run-card .title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: keep-all;
+}
+.run-card .row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--fg-secondary);
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.run-card .row .icon {
+  flex: none;
+}
+.run-card .avatar {
+  width: 16px;
+  height: 16px;
+  border-radius: 5px;
+  font-size: 10px;
+  display: grid;
+  place-items: center;
+  background: var(--surface-tertiary);
+}
+
+/* ── steps ──────────────────────────────────────────────────────────────── */
+
+.entry.step {
+  border-radius: var(--radius-sm);
+}
+.entry.step summary {
+  list-style: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 10px;
+  min-height: 30px;
+  color: var(--fg-secondary);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.entry.step summary::-webkit-details-marker {
+  display: none;
+}
+.entry.step summary:hover {
+  background: var(--control-subtle-hover);
+}
+.entry.step .glyph {
+  width: 16px;
+  display: inline-flex;
+  justify-content: center;
+  color: var(--fg-muted);
+  flex: none;
+}
+.entry.step .label {
+  color: var(--fg);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.entry.step.pending .label {
+  color: var(--fg-secondary);
+}
+.entry.step .why {
+  font-size: 12px;
+  color: var(--invalid);
+  white-space: nowrap;
+}
+.entry.step.denied .glyph {
+  color: var(--invalid);
+}
+.entry.step .wait {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-strong);
+  border-top-color: var(--fg-secondary);
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.entry.step summary > .icon:last-child {
+  color: var(--fg-muted);
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.entry.step summary:hover > .icon:last-child {
+  opacity: 1;
+}
+.entry.step[open] summary > .icon:last-child {
+  transform: rotate(90deg);
+  opacity: 1;
+}
+.entry.step .raw {
+  margin: 2px 0 6px 35px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-primary);
+  border: 1px solid var(--border);
+  font: 11.5px/1.5 var(--mono);
+  color: var(--fg-secondary);
+  user-select: text;
+}
+.entry.step .raw .fn {
+  color: var(--fg);
+}
+.entry.step .raw pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow: auto;
+}
+
+/* ── composer: who asks, which model ───────────────────────────────────── */
+
+.who-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 2px 8px;
+}
+.chips {
+  display: inline-flex;
+  gap: 4px;
+}
+.chip-actor {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px 4px;
+  border-radius: 999px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg-secondary);
+  font-size: 12.5px;
+}
+.chip-actor:hover:not(:disabled) {
+  background: var(--control-subtle-hover);
+  border-color: transparent;
+}
+.chip-actor[aria-checked="true"] {
+  background: var(--surface-primary);
+  border-color: var(--border);
+  color: var(--fg);
+  box-shadow: var(--shadow-subtle);
+}
+.chip-actor .avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-size: 10.5px;
+  font-weight: 600;
+  background: var(--surface-tertiary);
+  color: var(--fg-secondary);
+}
+.chip-actor[aria-checked="true"] .avatar {
+  background: var(--control-prominent-bg);
+  color: var(--control-prominent-fg);
+}
+.run-side section.runs {
+  max-height: 46%;
+}
+.tree-list .node.dir {
+  cursor: default;
+}
+.tree-list .node.dir .glyph .icon {
+  transition: transform 0.15s;
 }

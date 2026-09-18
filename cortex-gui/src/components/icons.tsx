@@ -70,3 +70,54 @@ export function ToolIcon() {
     </svg>
   );
 }
+
+export function SearchIcon() {
+  return (
+    <svg className="icon" width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" strokeWidth="1.8" />
+      <path d="M10.5 10.5 14 14" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function SparkIcon() {
+  return (
+    <svg className="icon" width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
+      <path fill="currentColor" d="M8 1.5 9.6 6.4 14.5 8 9.6 9.6 8 14.5 6.4 9.6 1.5 8l4.9-1.6Z" />
+    </svg>
+  );
+}
+
+export function DocIcon() {
+  return (
+    <svg className="icon" width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
+      <path fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" d="M4 1.5h5.5L13 5v9.5H4Z" />
+      <path d="M6 8h5M6 10.5h5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function PenIcon() {
+  return (
+    <svg className="icon" width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">
+      <path fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" d="M2.5 13.5 3 10.5 11 2.5l2.5 2.5-8 8Z" />
+    </svg>
+  );
+}
+
+export function SunIcon() {
+  return (
+    <svg className="icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="3.2" fill="none" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M8 1.5v1.8M8 12.7v1.8M1.5 8h1.8M12.7 8h1.8M3.4 3.4l1.3 1.3M11.3 11.3l1.3 1.3M3.4 12.6l1.3-1.3M11.3 4.7l1.3-1.3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+export function MoonIcon() {
+  return (
+    <svg className="icon" width="14" height="14" viewBox="0 0 16 16" aria-hidden="true">
+      <path fill="currentColor" d="M9.5 1.8a6.3 6.3 0 1 0 4.7 9.6 5.2 5.2 0 0 1-4.7-9.6Z" />
+    </svg>
+  );
+}

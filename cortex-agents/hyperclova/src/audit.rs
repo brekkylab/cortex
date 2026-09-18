@@ -11,9 +11,9 @@ use std::{
 };
 
 use chrono::{DateTime, Local};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub at: DateTime<Local>,
     pub actor: String,

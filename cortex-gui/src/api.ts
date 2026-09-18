@@ -54,7 +54,7 @@ export function messageOf(err: unknown): string {
 
 // ── HyperCLOVA X over the tree ──────────────────────────────────────────────
 
-import type { HcxConfig, HcxEvent, HcxNode } from "./types";
+import type { HcxConfig, HcxEvent, HcxNode, HcxRunRecord, HcxRunSummary } from "./types";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export const hcxConfig = () => invoke<HcxConfig>("hcx_config");
@@ -66,3 +66,5 @@ export const hcxRun = (actor: string, model: string, question: string) =>
   invoke<void>("hcx_run", { actor, model, question });
 export const onHcxEvent = (handler: (event: HcxEvent) => void): Promise<UnlistenFn> =>
   listen<HcxEvent>("hcx", (e) => handler(e.payload));
+export const hcxRuns = () => invoke<HcxRunSummary[]>("hcx_runs");
+export const hcxRunDetail = (id: string) => invoke<HcxRunRecord>("hcx_run_detail", { id });

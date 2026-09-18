@@ -15,7 +15,7 @@ use std::{
 };
 
 use cortex_agent_hyperclova::{
-    session::{self, Config, Event, Node},
+    session::{self, Config, Event, Node, Record, Summary},
     tools,
     tree::S3Source,
 };
@@ -34,6 +34,12 @@ pub struct Hcx {
 }
 
 impl Hcx {
+    /// Where runs are written down: a hidden folder at the workspace root, which the tree
+    /// listing skips like every other dot-entry.
+    pub fn record_dir(&self) -> PathBuf {
+        self.workspace.join(".runs")
+    }
+
     pub fn from_env() -> Self {
         let workspace = std::env::var_os("CORTEX_HCX_WORKSPACE")
             .map(PathBuf::from)
@@ -70,6 +76,8 @@ pub struct HcxConfig {
     pub s3: Option<String>,
     pub api_key_present: bool,
     pub mem_present: bool,
+    /// `CORTEX_HCX_OPEN_LATEST=1`: the window opens on the most recent run rather than empty.
+    pub open_latest: bool,
 }
 
 #[tauri::command]
@@ -82,6 +90,7 @@ pub async fn hcx_config(state: State<'_, Hcx>) -> Result<HcxConfig> {
         s3: state.s3.as_ref().map(|(_, s)| s.describe()),
         api_key_present: std::env::var("CLOVASTUDIO_API_KEY").is_ok_and(|k| !k.is_empty()),
         mem_present: session::find_mem_bin(None).is_some(),
+        open_latest: std::env::var("CORTEX_HCX_OPEN_LATEST").is_ok_and(|v| v == "1"),
     })
 }
 
@@ -98,6 +107,16 @@ pub async fn hcx_read(state: State<'_, Hcx>, actor: String, path: String) -> Res
         session::open_tree(&state.workspace, &actor, state.s3.as_ref()).map_err(anyhow_err)?;
     let bytes = tools::read_all(fs.as_ref(), Path::new(&path)).await?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tauri::command]
+pub async fn hcx_runs(state: State<'_, Hcx>) -> Result<Vec<Summary>> {
+    Ok(session::list_records(&state.record_dir()))
+}
+
+#[tauri::command]
+pub async fn hcx_run_detail(state: State<'_, Hcx>, id: String) -> Result<Record> {
+    session::load_record(&state.record_dir(), &id).map_err(anyhow_err)
 }
 
 #[tauri::command]
@@ -129,6 +148,7 @@ pub async fn hcx_run(
             .unwrap_or_else(|_| session::DEFAULT_URL.to_string()),
         mem_bin: None,
         reasoning_effort: None,
+        record_dir: Some(state.record_dir()),
     };
     let emitter = app.clone();
     let sink: session::Sink = Arc::new(move |ev: Event| {
