@@ -1,4 +1,4 @@
-//! End-to-end over the real binary: the tree a session works in, and where it stands in it.
+//! End-to-end over the real binary: the trees a session is given, and where it stands in them.
 //!
 //! Both are things only the far end can settle — it is the process that answers `init`,
 //! spawns the commands and holds the directory between them — so the only way to see what
@@ -9,26 +9,9 @@ use std::{
     process::Stdio,
 };
 
-use cortex::{
-    console::{Console, Error, ExecResp, stdio::StdioClient},
-    fs::Mount,
-};
+use cortex::console::{Console, Error, ExecResp, stdio::StdioClient};
 use tempfile::TempDir;
 use tokio::process::Command;
-
-/// A directory standing in for a mounted tree.
-///
-/// Not a mount this test made: putting one up needs a binding, a libfuse provider and a
-/// kernel, which is what `cortex/tests/host_mount.rs` is for. What is under test here is
-/// what the *server* does with the path it is told, and a plain directory answers one the
-/// same way a mount point does.
-struct Mounted(PathBuf);
-
-impl Mount for Mounted {
-    fn mountpoint(&self) -> &Path {
-        &self.0
-    }
-}
 
 /// A console over the real binary, with a tree under it.
 struct Fixture {
@@ -49,6 +32,32 @@ impl Fixture {
         let dir = tempfile::tempdir().expect("a temp directory");
         let root = dir.path().to_path_buf();
         let console = console_over(&root).await.expect("building the console");
+        Fixture {
+            console,
+            _dir: dir,
+            root,
+        }
+    }
+
+    /// A fixture whose one tree is a **scratch** rather than a context.
+    ///
+    /// What it buys is somewhere the file calls may write: the context is read-only, so a
+    /// session given only that one has nowhere the protocol will put a file — which is what
+    /// the tree means rather than something this fixture is working around. A test about
+    /// *where* a path lands needs a tree it is allowed to land in.
+    async fn writable() -> Fixture {
+        let dir = tempfile::tempdir().expect("a temp directory");
+        let root = dir.path().to_path_buf();
+
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+        server.stderr(Stdio::inherit());
+        let console = Console::builder()
+            .client(StdioClient::new(server).expect("starting the server"))
+            .scratch(root.clone())
+            .build()
+            .await
+            .expect("building the console");
+
         Fixture {
             console,
             _dir: dir,
@@ -95,13 +104,13 @@ async fn console_over(root: &Path) -> anyhow::Result<Console> {
 
     Console::builder()
         .client(client)
-        .mount(Mounted(root.to_path_buf()))
+        .context(root.to_path_buf())
         .build()
         .await
 }
 
 /// `init` names the tree by its mount point and the server answers where it put it — the
-/// same directory, since a `file://` workfs is one this host already has and there is
+/// same directory, since a `file://` context is one this host already has and there is
 /// nothing to interpose.
 ///
 /// And the session stands in it: a command runs there without anything on its own frame
@@ -110,7 +119,7 @@ async fn console_over(root: &Path) -> anyhow::Result<Console> {
 async fn a_session_stands_in_the_tree_it_was_given() {
     let mut fx = Fixture::new().await;
 
-    assert_eq!(fx.console.workfs_path(), Some(fx.root.as_path()));
+    assert_eq!(fx.console.context_path(), Some(fx.root.as_path()));
     assert_eq!(
         fx.output("pwd").await.stdout,
         format!("{}\n", fx.root.display()).into_bytes()
@@ -123,6 +132,197 @@ async fn a_session_stands_in_the_tree_it_was_given() {
         std::fs::read_to_string(fx.path("note.txt")).unwrap(),
         "written\n"
     );
+}
+
+/// A session given all three trees is placed in all three, and **stands in the scratch**.
+///
+/// Which is the whole reason the scratch is a member of its own: a relative path a command
+/// writes lands there, so the tree the client gave the session stops being the default
+/// destination for everything it produces.
+#[tokio::test]
+async fn a_session_with_three_trees_stands_in_the_scratch() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let (context, artifacts, scratch) = (
+        dir.path().join("project"),
+        dir.path().join("out"),
+        dir.path().join("scratch"),
+    );
+    for at in [&context, &artifacts, &scratch] {
+        std::fs::create_dir(at).unwrap();
+    }
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+    server.stderr(Stdio::inherit());
+    let mut console = Console::builder()
+        .client(StdioClient::new(server).unwrap())
+        .context(context.clone())
+        .artifacts(artifacts.clone())
+        .scratch(scratch.clone())
+        .build()
+        .await
+        .expect("building the console");
+
+    // Each tree is answered under its own name, at the directory it was named by.
+    assert_eq!(console.context_path(), Some(context.as_path()));
+    assert_eq!(console.artifacts_path(), Some(artifacts.as_path()));
+    assert_eq!(console.scratch_path(), Some(scratch.as_path()));
+
+    // And the session is standing in the scratch, which nothing on the `exec` frame says.
+    let stood = console.exec(["pwd"], None).await.expect("pwd");
+    assert_eq!(
+        stood.stdout,
+        format!("{}\n", scratch.display()).into_bytes()
+    );
+
+    // So a command writing a relative path writes into the scratch, and the other two trees
+    // are reached by naming them.
+    console
+        .exec(["sh", "-c", "echo working > note.txt"], None)
+        .await
+        .expect("writing in the scratch");
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("note.txt")).unwrap(),
+        "working\n"
+    );
+    assert!(!context.join("note.txt").exists());
+
+    let result = console
+        .exec(
+            [
+                "sh",
+                "-c",
+                &format!("echo kept > {}/report.txt", artifacts.display()),
+            ],
+            None,
+        )
+        .await
+        .expect("writing into the artifacts tree");
+    assert_eq!(result.code, 0);
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("report.txt")).unwrap(),
+        "kept\n"
+    );
+}
+
+/// A `write` into the context is refused, and the same bytes go into the artifacts fine.
+///
+/// The context is the tree the session was *given*: what it produces belongs in the artifacts
+/// and what it needs room for belongs in the scratch, so the protocol does not carry a write
+/// into it. `IO_FAILED` is the code because that is what a read-only filesystem answers a
+/// write with, which is what the uvm backend's guest kernel sends back for the same call —
+/// one answer from both ends of this protocol.
+#[tokio::test]
+async fn a_write_into_the_context_is_refused() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let (context, artifacts) = (dir.path().join("project"), dir.path().join("out"));
+    for at in [&context, &artifacts] {
+        std::fs::create_dir(at).unwrap();
+    }
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+    server.stderr(Stdio::inherit());
+    let mut console = Console::builder()
+        .client(StdioClient::new(server).unwrap())
+        .context(context.clone())
+        .artifacts(artifacts.clone())
+        .build()
+        .await
+        .expect("building the console");
+
+    // Named absolutely, which is how a client that read `context_path` would send it.
+    let refused = console
+        .write(context.join("edit.txt").to_str().unwrap(), &b"no"[..], None)
+        .await
+        .expect_err("writing into the context");
+    assert_eq!(refused.code(), Some(Error::IO_FAILED));
+    assert!(!context.join("edit.txt").exists());
+
+    // And through a path that only reaches it after the `..` are resolved — the check is
+    // about which tree the file lands in, not about how the path was spelled.
+    let sideways = artifacts.join("..").join("project").join("edit.txt");
+    let refused = console
+        .write(sideways.to_str().unwrap(), &b"no"[..], None)
+        .await
+        .expect_err("writing into the context the long way round");
+    assert_eq!(refused.code(), Some(Error::IO_FAILED));
+    assert!(!context.join("edit.txt").exists());
+
+    // And the everyday way to reach it: this session has no scratch, so it stands in its
+    // context and a relative path is already in the tree it may not write in.
+    let refused = console
+        .write("edit.txt", &b"no"[..], None)
+        .await
+        .expect_err("writing where the session stands");
+    assert_eq!(refused.code(), Some(Error::IO_FAILED));
+    assert!(!context.join("edit.txt").exists());
+
+    // The tree the session is *for* writing in takes it.
+    let written = console
+        .write(
+            artifacts.join("report.txt").to_str().unwrap(),
+            &b"kept"[..],
+            None,
+        )
+        .await
+        .expect("writing into the artifacts");
+    assert_eq!(written.size, 4);
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("report.txt")).unwrap(),
+        "kept"
+    );
+}
+
+/// Reading the context is the whole point of it, so the refusal above is about writing only.
+#[tokio::test]
+async fn the_context_is_read_only_and_not_closed() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let context = dir.path().join("project");
+    std::fs::create_dir(&context).unwrap();
+    std::fs::write(context.join("given.txt"), "from the caller").unwrap();
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+    server.stderr(Stdio::inherit());
+    let mut console = Console::builder()
+        .client(StdioClient::new(server).unwrap())
+        .context(context.clone())
+        .build()
+        .await
+        .expect("building the console");
+
+    let read = console
+        .read(context.join("given.txt").to_str().unwrap(), None, None)
+        .await
+        .expect("reading the context");
+    assert_eq!(read.data, b"from the caller");
+}
+
+/// A tree that is not there fails the boot whichever of the three it is, and the message
+/// says which — the same treatment a missing context gets, because the client will send paths
+/// into all of them.
+#[tokio::test]
+async fn an_artifacts_tree_that_is_not_there_fails_the_boot() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let context = dir.path().join("project");
+    std::fs::create_dir(&context).unwrap();
+    let gone = dir.path().join("never-created");
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-local-console"));
+    server.stderr(Stdio::inherit());
+    // The session is taken: both URLs are well formed and this build realizes `file://`.
+    let mut console = Console::builder()
+        .client(StdioClient::new(server).unwrap())
+        .context(context)
+        .artifacts(gone.clone())
+        .build()
+        .await
+        .expect("building the console");
+    assert_eq!(console.artifacts_path(), Some(gone.as_path()));
+
+    let refused = console
+        .exec(["true"], None)
+        .await
+        .expect_err("running with an artifacts tree that is not there");
+    assert_eq!(refused.code(), Some(Error::MOUNT_FAILED));
 }
 
 /// `cd` moves the session, and the command after it runs there.
@@ -191,9 +391,13 @@ async fn a_cd_that_cannot_happen_leaves_the_session_where_it_was() {
 /// The file plane stands in the same place: a relative path is resolved where the session
 /// is, so a `read` names the file a command would open by the same name — before and after
 /// a `cd`.
+///
+/// Over a scratch, because the writes are the half of it that says where the path landed and
+/// the context is a tree a `write` does not land in — see
+/// [`a_write_into_the_context_is_refused`].
 #[tokio::test]
 async fn a_file_call_lands_where_the_session_stands() {
-    let mut fx = Fixture::new().await;
+    let mut fx = Fixture::writable().await;
     std::fs::create_dir(fx.path("work")).unwrap();
 
     fx.console
@@ -241,7 +445,7 @@ async fn a_tree_that_is_not_there_fails_the_boot_and_not_the_init() {
 
     // The session is taken: the URL is well formed and this build realizes `file://`.
     let mut console = console_over(&gone).await.expect("building the console");
-    assert_eq!(console.workfs_path(), Some(gone.as_path()));
+    assert_eq!(console.context_path(), Some(gone.as_path()));
 
     let refused = console
         .exec(["true"], None)
@@ -290,7 +494,7 @@ async fn what_the_server_reports_is_spelled_the_way_init_answered() {
     );
 
     // `init`: what was asked for.
-    assert_eq!(fx.console.workfs_path(), Some(fx.root.as_path()));
+    assert_eq!(fx.console.context_path(), Some(fx.root.as_path()));
 
     // `cd`: normalized on paper, not canonicalized — so `pwd` in the command that follows
     // answers under the path the client was told, and not under `/private/…`.

@@ -129,11 +129,13 @@ impl Guest {
     /// Everything expensive happens before the child is spawned — provisioning the base
     /// image, formatting the session's — so a failure in any of it is reported as itself
     /// rather than as a boot that timed out.
-    /// `workfs` is a directory on this host, or `None` for a session with no tree. It is
-    /// shared into the guest **at its own path** — see [`boot`](crate::boot), which is where
-    /// that decision is argued.
+    /// `context`, `artifacts` and `scratch` are directories on this host, each `None` for a
+    /// tree the session did not name. Every one of them is shared into the guest **at its own
+    /// path** — see [`boot`](crate::boot), which is where that decision is argued.
     pub async fn boot(
-        workfs: Option<&Path>,
+        context: Option<&Path>,
+        artifacts: Option<&Path>,
+        scratch: Option<&Path>,
         image: Option<&str>,
         network: Network,
         host_ports: &[u16],
@@ -191,7 +193,9 @@ impl Guest {
             host_ports: host_ports.to_vec(),
             // Told rather than left to the child's inherited environment, which is what made
             // one of these names mean two things once already.
-            workfs: workfs.map(Path::to_path_buf),
+            context: context.map(Path::to_path_buf),
+            artifacts: artifacts.map(Path::to_path_buf),
+            scratch: scratch.map(Path::to_path_buf),
             committable,
             commit_out: commit.as_ref().map(|scratch| scratch.path().to_path_buf()),
             abin,

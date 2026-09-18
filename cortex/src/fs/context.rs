@@ -1,6 +1,6 @@
 //! A namespace that stitches several stores into one filesystem.
 //!
-//! A [`WorkFs`] is a longest-prefix mount table: each store is registered at a root-relative
+//! A [`ContextFs`] is a longest-prefix mount table: each store is registered at a root-relative
 //! path and serves every request that falls under it, with the path re-based onto the store's
 //! own root.
 //!
@@ -11,9 +11,9 @@
 //! through.
 //!
 //! **The `mount` here is the table's, not the operating system's.**
-//! [`mount`](WorkFs::mount) grafts a store onto a path in *this* tree and nothing outside the
+//! [`mount`](ContextFs::mount) grafts a store onto a path in *this* tree and nothing outside the
 //! process learns of it. Putting the result where a kernel can see it is
-//! [`Mount`](crate::fs::Mount), which is what a binding hands back — so a `WorkFs` with ten
+//! [`Mount`](crate::fs::Mount), which is what a binding hands back — so a `ContextFs` with ten
 //! mounts in it may still be mounted nowhere at all.
 
 use std::{
@@ -31,14 +31,21 @@ use crate::{
 
 /// A public API for using cortex's filesystem.
 ///
-/// The name denotes "workspace", as against "rootfs", a system's own tree.
-pub struct WorkFs {
+/// The name is the console protocol's: a session's *context* is the tree it is given to work
+/// from, as against its rootfs — the system's own tree — and this is what one is assembled
+/// out of. Several stores under one root, which is how a session sees five places at once
+/// without the protocol carrying five names for them.
+///
+/// Nothing here is context-specific, and a caller that has a tree to assemble for a session's
+/// [`artifacts`](crate::console::ConsoleBuilder::artifacts) or
+/// [`scratch`](crate::console::ConsoleBuilder::scratch) assembles it with this too.
+pub struct ContextFs {
     /// Mount points keyed by their normalized, root-relative path.
     ///
     /// `PathBuf`'s component-wise `Ord` guarantees that, among all keys that are a prefix of a
     /// request, the longest is also the lexicographically greatest — so a longest-prefix lookup
-    /// is a reverse range scan (see [`WorkFs::route`]), and all keys sharing a prefix form one
-    /// contiguous run (see [`WorkFs::descendant_mounts`]). A store mounted at the empty path is
+    /// is a reverse range scan (see [`ContextFs::route`]), and all keys sharing a prefix form one
+    /// contiguous run (see [`ContextFs::descendant_mounts`]). A store mounted at the empty path is
     /// the root and serves anything no deeper mount claims.
     mounts: BTreeMap<PathBuf, Box<dyn FileSystem>>,
 
@@ -52,15 +59,15 @@ pub struct WorkFs {
     born: SystemTime,
 }
 
-impl WorkFs {
-    /// An empty workspace with no mounts.
+impl ContextFs {
+    /// An empty tree with no mounts.
     ///
     /// The root is still a directory — an empty one, like a freshly mounted tmpfs — so an empty
-    /// workspace can be mounted and filled in rather than failing at the kernel's first
+    /// tree can be mounted and filled in rather than failing at the kernel's first
     /// `getattr`. Every other path is [`NotFound`](io::ErrorKind::NotFound) until something
     /// claims it.
     pub fn new() -> Self {
-        WorkFs {
+        ContextFs {
             mounts: BTreeMap::new(),
             born: SystemTime::now(),
         }
@@ -68,7 +75,7 @@ impl WorkFs {
 
     /// Builder-style mount that overwrites any store already at `path`.
     ///
-    /// Fails only if `path` escapes the workspace root.
+    /// Fails only if `path` escapes the tree's root.
     pub fn try_with_mount<M: FileSystem + 'static>(
         mut self,
         path: impl AsRef<Path>,
@@ -79,7 +86,7 @@ impl WorkFs {
         Ok(self)
     }
 
-    /// Mount `store` at `path` (root-relative). Fails if the path escapes the workspace root or
+    /// Mount `store` at `path` (root-relative). Fails if the path escapes the tree's root or
     /// another store is already mounted there.
     pub fn mount<M: FileSystem + 'static>(
         &mut self,
@@ -211,11 +218,11 @@ impl WorkFs {
     /// Whether `key` is a directory that exists only because of the mount table.
     ///
     /// Either mounts lie below it — so it is on the way to one and must present as a directory
-    /// whether or not a store knows about it — or it is the root of a workspace with no mounts
+    /// whether or not a store knows about it — or it is the root of a tree with no mounts
     /// at all, which is an *empty* directory rather than a missing one, the way a freshly
     /// mounted tmpfs is.
     ///
-    /// Deliberately not "the root, always": a workspace whose root store cannot stat its own
+    /// Deliberately not "the root, always": a tree whose root store cannot stat its own
     /// root is misconfigured, and there is no mount table to synthesize from, so that error
     /// surfaces instead of being papered over.
     fn is_synthesized_dir(&self, key: &Path) -> bool {
@@ -270,7 +277,7 @@ impl WorkFs {
     }
 }
 
-impl Default for WorkFs {
+impl Default for ContextFs {
     fn default() -> Self {
         Self::new()
     }
@@ -301,7 +308,7 @@ fn mount_key(path: &Path) -> io::Result<PathBuf> {
 
 /// Canonicalize a request into a root-relative path of `Normal` components only. `.` and a
 /// leading root are dropped and `..` pops the previous component; any `..` that would escape the
-/// workspace root, and OS prefixes, are rejected.
+/// tree's root, and OS prefixes, are rejected.
 fn normalize(path: &Path) -> io::Result<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -319,7 +326,7 @@ fn normalize(path: &Path) -> io::Result<PathBuf> {
     Ok(out)
 }
 
-impl FileSystem for WorkFs {
+impl FileSystem for ContextFs {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let key = normalize(path)?;

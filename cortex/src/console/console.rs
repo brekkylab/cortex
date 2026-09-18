@@ -53,7 +53,8 @@ use crate::{
         base::{Client, Failure},
         message::{
             Call, CommitCall, Error, ExecCall, ExecResp, ImageSource, InitCall, NetworkAccess,
-            Notification, ReadCall, ReadResp, Response, WorkFsSource, WriteCall, WriteResp,
+            Notification, ReadCall, ReadResp, Response, TreeMount, TreeRole, TreeSource, WriteCall,
+            WriteResp,
         },
         stdio::StdioClient,
     },
@@ -73,7 +74,7 @@ type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>
 ///
 /// A builder rather than arguments because a console is going to acquire more of them —
 /// limits, a backend of its own choosing — and each should be something a caller can leave
-/// out, as [`mount`](Self::mount) already is.
+/// out, as [`context`](Self::context) already is.
 ///
 /// Nothing here starts anything. The channel is described, not driven, until something
 /// is asked over it.
@@ -90,7 +91,16 @@ pub struct ConsoleBuilder {
     /// caller *has* or has not, and there is no empty one to substitute. Such a session's
     /// commands see whatever the server's own filesystem holds, and this protocol has
     /// described none of it.
-    mount: Option<Box<dyn Mount>>,
+    context: Option<Box<dyn Mount>>,
+
+    /// Where the session leaves what it produces, and `None` for a session whose output
+    /// nobody collects. Held on the same terms as [`context`](Self::context) — a tree the
+    /// caller mounted, kept alive for as long as the session is.
+    artifacts: Option<Box<dyn Mount>>,
+
+    /// Room for the session to work in, and `None` for a session that works wherever it
+    /// can write.
+    scratch: Option<Box<dyn Mount>>,
 
     /// The base the session's commands run in, and `None` to leave it to the server.
     image: Option<ImageSource>,
@@ -158,7 +168,7 @@ impl ConsoleBuilder {
         self
     }
 
-    /// Where this console's tree is mounted, which is what the session's workfs is.
+    /// Where this console's tree is mounted, which is what the session's context is.
     ///
     /// One per console and fixed for the session, because it is what every path in the
     /// session is spelled against: a `read` names a file under it, and so does the command
@@ -166,20 +176,65 @@ impl ConsoleBuilder {
     ///
     /// Mounting is the caller's, not the console's. Which binding puts a tree in front of a
     /// kernel is a build's business, and this is the whole of what the server is then told
-    /// about it: [`build`](Self::build) names this mount point as the session's workfs —
+    /// about it: [`build`](Self::build) names this mount point as the session's context —
     /// `file://` and the path — and the server answers where *it* plugged that in. The two
-    /// are usually the same path and nothing requires them to be, which is why the answer
-    /// is read rather than assumed; see [`WorkFsMount`](crate::console::WorkFsMount).
+    /// need not be the same path, and on a server that runs commands in a kernel of its own
+    /// they are not: what comes back is a path in there. Which is why the answer is read
+    /// rather than assumed; see [`TreeMount`](crate::console::TreeMount).
     ///
-    /// Takes the mount by value, so a console holds it and the mount lives at least as long
-    /// as the session does — dropping a mount unmounts it (see [`Mount`]). A caller that
-    /// needs it elsewhere as well hands over an `Arc<..>` of it, which is a [`Mount`] too:
-    /// how long a mount lives is the lifetime of the value, and whose lifetime that is, is
-    /// the caller's to decide rather than something this end arranges behind it.
+    /// Takes the mount by value, so a console holds it and the tree is there for at least as
+    /// long as the session is (see [`Mount`]). A caller that needs it elsewhere as well hands
+    /// over an `Arc<..>` of it, which is a [`Mount`] too: how long a mount is held is the
+    /// lifetime of the value, and whose lifetime that is, is the caller's to decide rather
+    /// than something this end arranges behind it.
+    ///
+    /// A plain [`PathBuf`] is a [`Mount`], which is what a caller hands over for a directory
+    /// the host already has: there is nothing to put up for one, and nothing this end takes
+    /// down at the end of the session.
+    ///
+    /// **The session reads this tree and does not write in it.** A [`write`](Console::write)
+    /// naming a path inside it is refused, and a server with a kernel of its own mounts it
+    /// read-only so that a command cannot write there either — which is what
+    /// [`artifacts`](Self::artifacts) and [`scratch`](Self::scratch) are for, and how a
+    /// caller gets a tree back unchanged rather than a promise that it was not touched.
     ///
     /// Leaving it out is a console with nothing mounted; see the field this fills.
-    pub fn mount(mut self, mount: impl Mount + 'static) -> Self {
-        self.mount = Some(Box::new(mount));
+    pub fn context(mut self, mount: impl Mount + 'static) -> Self {
+        self.context = Some(Box::new(mount));
+        self
+    }
+
+    /// Where this session leaves what it produces.
+    ///
+    /// A second tree, on the same terms as [`context`](Self::context): the caller mounts it, the
+    /// console names it at `init`, and the server answers where it put it — which is what
+    /// [`artifacts_path`](Console::artifacts_path) then spells.
+    ///
+    /// **What it buys is knowing which files are the result.** A session that writes its
+    /// output into the tree it was given leaves the caller to work out what is new, and that
+    /// is a diff against a directory somebody else may also be writing to. A session that
+    /// writes it here leaves the caller a tree whose whole contents are the answer.
+    ///
+    /// Leaving it out is a session whose output nobody collects, which is every session
+    /// written before this existed.
+    pub fn artifacts(mut self, mount: impl Mount + 'static) -> Self {
+        self.artifacts = Some(Box::new(mount));
+        self
+    }
+
+    /// Room for this session to work in, and where it starts.
+    ///
+    /// The third tree, and the one meant to be thrown away: a command that unpacks, builds,
+    /// or writes something it will read back needs somewhere to put it that is neither
+    /// somebody's project nor the output the caller will collect.
+    ///
+    /// **A session that has one starts in it** — the server answers this mount point as the
+    /// session's `cwd` — so every relative path a command writes lands here without any
+    /// command having to be told. That is the whole of what makes it worth passing rather
+    /// than letting commands find `/tmp`: the caller decides what backs it and when it goes
+    /// away.
+    pub fn scratch(mut self, mount: impl Mount + 'static) -> Self {
+        self.scratch = Some(Box::new(mount));
         self
     }
 
@@ -267,7 +322,7 @@ impl ConsoleBuilder {
     /// [`on_step`](Rootfs::on_step) is how to watch it happen.
     ///
     /// The build runs in a session of its own, with the recipe's context as its tree
-    /// rather than whatever [`mount`](Self::mount) names — a recipe says what it copies from,
+    /// rather than whatever [`context`](Self::context) names — a recipe says what it copies from,
     /// and that is not the session's business.
     ///
     /// [`network`](Self::network) is the exception, and it reaches both: the build asks for
@@ -319,25 +374,40 @@ async fn build_it(
     client: &mut dyn Client,
     rootfs: &mut Rootfs,
     plan: &crate::rootfs::Plan,
-    network: Option<NetworkAccess>,
 ) -> anyhow::Result<()> {
     let answered = client
         .init(InitCall {
-            workfs: Some(plan.workfs.clone()),
+            context: Some(plan.context.clone()),
+            // Neither belongs to a build. What a build produces is an image and not a tree of
+            // files somebody collects, and where its steps write is the root it is building —
+            // which is the whole of what a `commit` then keeps. Handing it either would be
+            // two places a step could write and one of them thrown away.
+            artifacts: None,
+            scratch: None,
             image: Some(plan.base.clone()),
-            // What the session asked for, and the internet when it asked for nothing. A
-            // session that said nothing gets the server's own default, which is the host and
-            // no further — and a build's first step is almost always a fetch, so that
-            // default would fail nearly every build at a refused connection. A session that
-            // *did* say is taken at its word: a caller who sandboxed the session meant the
-            // build too, and has no second knob here to contradict it with.
-            network: network.or_else(|| Some(NetworkAccess::public())),
+            // The internet, whatever the session asked for. A build's first step is
+            // almost always a fetch — the server's own default is the host and no
+            // further, which would fail nearly every recipe at a refused connection —
+            // and, unlike the session, this is not something the caller opened. A caller
+            // asks for a *session*; how the image that session runs on gets made is
+            // cortex's, and it is made the same way whatever the session may reach.
+            //
+            // The reach ends with the build. The session's own `init` follows this one
+            // and carries [`ConsoleBuilder::network`], so a recipe that fetched what the
+            // image is made of does not leave a session that can fetch anything.
+            //
+            // The thing this gives up: a caller cannot ask for a build that reaches
+            // nothing, and a caller who asked the session for more than `public` — a
+            // [`full`](NetworkAccess::full) reach, or host ports for a mirror on this
+            // machine — does not get it here. Neither has come up; both are a knob on
+            // the recipe when one does.
+            network: Some(NetworkAccess::public()),
             committable: true,
         })
         .await?;
 
     let at = answered
-        .workfs
+        .context
         .map(|at| at.path)
         .context("the console server took the build context and did not say where it put it")?;
 
@@ -381,37 +451,55 @@ async fn build_it(
 /// # Ok(())
 /// # }
 /// ```
+/// One of a session's trees: the mount this end holds, and where the server put it.
+///
+/// **The two are one value because they are one fact.** A tree this console named is a tree
+/// the server answered a path for — a console whose context went nowhere does not exist, see
+/// [`placed`] — so a mount with no path and a path with no mount are both states this end
+/// would have to decide what to do about, and neither can happen. Holding them apart was
+/// two `Option`s that had to agree, checked by a match; holding them together is the check.
+struct Tree {
+    /// **Never read, and that is the whole job.** A mount is only promised to be there for
+    /// as long as the value is (see [`Mount`]), so holding one here is what keeps the tree
+    /// up for as long as the session is: a console that let go of a mount it had put up
+    /// would go on naming paths at a directory the kernel no longer answers for. What the
+    /// protocol is *spelled* in is [`path`](Self::path), which is the server's answer and
+    /// not this.
+    ///
+    /// Whether this is the last holder is the caller's business — what arrives here is
+    /// whatever was passed to the builder, an `Arc<..>` included.
+    #[allow(dead_code)]
+    mount: Box<dyn Mount>,
+
+    /// Where the server put it, as it answered at `init`.
+    ///
+    /// **The paths this protocol speaks are these.** A [`read`](Console::read) names a file
+    /// under one, and so does a [`write`](Console::write). It is the server's answer and not
+    /// the mount point above: a host-local server answers the mount point itself, and one
+    /// with a guest answers where the tree is *in the guest*, which is not a path this host
+    /// has at all.
+    ///
+    /// Where the session *stands* is not here and is not kept anywhere on this side: the
+    /// current directory is the far end's state machine, `init` says where it starts, and
+    /// after that a caller asks with `pwd` like anyone at a terminal. A copy here would be
+    /// a second answer to a question that already has one — wrong from the first `cd`.
+    path: PathBuf,
+}
+
 pub struct Console {
     /// A console has one, always. What ending needs is not for this to become absent but
     /// for it to be *replaced* — see [`Console::drop`](Console#impl-Drop-for-Console).
     client: Box<dyn Client>,
 
     /// The tree this session works in — `None` when this console has nothing mounted.
-    ///
-    /// **Never read, and that is the whole job.** Dropping a mount unmounts it (see
-    /// [`Mount`]), so holding one here is what keeps the tree up for as long as the session
-    /// is: a console that let go of it would go on naming paths at a directory the kernel
-    /// no longer answers for. What the protocol is *spelled* in is
-    /// [`server_path`](Self::server_path), which is the server's answer and not this.
-    ///
-    /// Whether this is the last holder is the caller's business — what arrives here is
-    /// whatever was passed to [`ConsoleBuilder::mount`], an `Arc<..>` included.
-    #[allow(dead_code)]
-    mount: Option<Box<dyn Mount>>,
+    context: Option<Tree>,
 
-    /// Where the server put that same tree, as it answered at `init` — `None` alongside a
-    /// `mount` that is `None`, since there was no workfs to put anywhere.
-    ///
-    /// **The paths this protocol speaks are these.** A [`read`](Self::read) names a file
-    /// under this, and so does a [`write`](Self::write). It is the server's answer and not
-    /// the mount point above: the two are usually the same directory, and nothing requires
-    /// them to be.
-    ///
-    /// Where the session *stands* is not here and is not kept anywhere on this side: the
-    /// current directory is the far end's state machine, `init` says where it starts, and
-    /// after that a caller asks with `pwd` like anyone at a terminal. A copy here would be
-    /// a second answer to a question that already has one — wrong from the first `cd`.
-    server_path: Option<PathBuf>,
+    /// Where this session leaves what it produces — `None` when the caller named none.
+    artifacts: Option<Tree>,
+
+    /// Room for this session to work in, and where it starts — `None` when the caller
+    /// named none.
+    scratch: Option<Tree>,
 
     /// The base in force, as the server answered at `init`.
     image: Option<ImageSource>,
@@ -435,9 +523,9 @@ impl Console {
     /// that exists is one the server has heard from and answered — which is the one thing
     /// about a session a caller can act on before asking for work.
     ///
-    /// The answer is not only an acknowledgement: it says where the server put the workfs,
+    /// The answer is not only an acknowledgement: it says where the server put the context,
     /// and that path is what every later `read` and `write` is spelled in.
-    /// A server that takes a workfs and says nothing about where it went has left this end
+    /// A server that takes a context and says nothing about where it went has left this end
     /// with no way to name a file, so that is a console that does not exist rather than one
     /// that guesses.
     ///
@@ -451,7 +539,9 @@ impl Console {
     pub async fn new(builder: ConsoleBuilder) -> anyhow::Result<Self> {
         let ConsoleBuilder {
             client_factory,
-            mount,
+            context: context_mount,
+            artifacts: artifacts_mount,
+            scratch: scratch_mount,
             image,
             network,
             rootfs,
@@ -470,19 +560,12 @@ impl Console {
             client_factory.context("a console needs a client to drive its server")?;
         let mut client = client_factory()?;
 
-        // What the server is told about the tree is where this end has it. A mount point
+        // What the server is told about each tree is where this end has it. A mount point
         // with no URL to it is refused here rather than sent, by the rule the client factory
         // above follows: a console either exists or says what it lacked.
-        let workfs = match mount.as_deref() {
-            Some(mount) => Some(WorkFsSource::new(mount.url().with_context(|| {
-                format!(
-                    "a mount point that is not an absolute UTF-8 path cannot be named as a \
-                     workfs: {:?}",
-                    mount.mountpoint()
-                )
-            })?)),
-            None => None,
-        };
+        let context = named(TreeRole::Context, context_mount.as_deref())?;
+        let artifacts = named(TreeRole::Artifacts, artifacts_mount.as_deref())?;
+        let scratch = named(TreeRole::Scratch, scratch_mount.as_deref())?;
 
         // Worked out before anything is sent, and on a blocking thread because it reads
         // every file a `COPY` names. Its whole point is that the `init` below can *be* the
@@ -505,7 +588,9 @@ impl Console {
         };
 
         let session = InitCall {
-            workfs: workfs.clone(),
+            context: context.clone(),
+            artifacts: artifacts.clone(),
+            scratch: scratch.clone(),
             image: plan.as_ref().map(|plan| plan.image.clone()).or(image),
             network: network.clone(),
             committable,
@@ -519,26 +604,16 @@ impl Console {
             (&answered, &plan, rootfs.as_mut())
             && refusal.code == Error::UNKNOWN_IMAGE
         {
-            build_it(&mut *client, rootfs, plan, network.clone()).await?;
+            build_it(&mut *client, rootfs, plan).await?;
             answered = client.init(session).await;
         }
         let answered = answered?;
 
-        let server_path = match (&mount, answered.workfs) {
-            (Some(_), Some(at)) => Some(absolute(at.path)?),
-            (Some(mount), None) => anyhow::bail!(
-                "the console server took the workfs at {} and did not say where it put it",
-                mount.mountpoint().display()
-            ),
-            // Nothing was asked for, so a path that came back anyway is about a session
-            // this end did not describe, and there is nothing here it could name.
-            (None, _) => None,
-        };
-
         Ok(Console {
             client,
-            mount,
-            server_path,
+            context: placed(TreeRole::Context, context_mount, answered.context)?,
+            artifacts: placed(TreeRole::Artifacts, artifacts_mount, answered.artifacts)?,
+            scratch: placed(TreeRole::Scratch, scratch_mount, answered.scratch)?,
             image: answered.image,
             network: answered.network,
         })
@@ -548,11 +623,62 @@ impl Console {
     /// is relative to — `None` when nothing is mounted.
     ///
     /// A caller builds a [`read`](Self::read) or a [`write`](Self::write) path by joining
-    /// onto this. It is the server's answer and not the mount point this end passed in: the
-    /// two are usually the same directory, and which one the protocol speaks in is settled
-    /// rather than assumed.
-    pub fn workfs_path(&self) -> Option<&Path> {
-        self.server_path.as_deref()
+    /// onto this, and reaches the same files on this host by joining onto the mount point it
+    /// handed over instead. The two are not required to be the same directory and on a
+    /// server with a guest they are not — which is why the protocol settles which one it
+    /// speaks in rather than leaving it assumed.
+    pub fn context_path(&self) -> Option<&Path> {
+        self.context.as_ref().map(|tree| tree.path.as_path())
+    }
+
+    /// Where the server put this session's [`artifacts`](ConsoleBuilder::artifacts) tree —
+    /// `None` when the caller named none.
+    ///
+    /// What the session leaves here is what the caller asked for, so this is the path to
+    /// join a [`read`](Self::read) onto to collect it — and the mount this end holds is the
+    /// other way to reach the same files, since a mounted tree is a directory on this host.
+    pub fn artifacts_path(&self) -> Option<&Path> {
+        self.artifacts.as_ref().map(|tree| tree.path.as_path())
+    }
+
+    /// Where the server put this session's [`scratch`](ConsoleBuilder::scratch) tree —
+    /// `None` when the caller named none.
+    ///
+    /// Also where the session stands to begin with, which is the reason to pass one. That is
+    /// only the *beginning*: a command can move the session and nothing reports that it did,
+    /// so a caller that needs to know where it stands now runs `pwd` — see
+    /// [`exec`](Self::exec).
+    pub fn scratch_path(&self) -> Option<&Path> {
+        self.scratch.as_ref().map(|tree| tree.path.as_path())
+    }
+
+    /// Whether this session has a tree at all, which is whether a path this console sends
+    /// can name one of the caller's files.
+    ///
+    /// The same answer as [`context_path`](Self::context_path) being `Some`, for a caller
+    /// that wants the question and not the path: a [`read`](Self::read) or a
+    /// [`write`](Self::write) has nowhere to join onto without one, so this is what to ask
+    /// before building a path rather than after failing to.
+    pub fn has_context(&self) -> bool {
+        self.context.is_some()
+    }
+
+    /// Whether this session has somewhere to leave what the caller came for.
+    ///
+    /// A session without one still runs commands; what it does not have is a tree whose
+    /// contents outlive it on the caller's terms. Worth asking before running the work that
+    /// would write there — see [`artifacts_path`](Self::artifacts_path) for where it goes.
+    pub fn has_artifacts(&self) -> bool {
+        self.artifacts.is_some()
+    }
+
+    /// Whether this session has a tree to work in, and so whether it stands in one.
+    ///
+    /// Without it the session starts wherever the server puts a session with nothing
+    /// mounted, and writes that go nowhere named go nowhere the caller can reach — see
+    /// [`scratch_path`](Self::scratch_path).
+    pub fn has_scratch(&self) -> bool {
+        self.scratch.is_some()
     }
 
     /// The base this session's commands run in, as the server answered.
@@ -621,7 +747,7 @@ impl Console {
     /// The command is an argv — `["echo", "hi"]` — and nothing here consults a shell, so
     /// a caller that wants shell semantics asks for them outright: `["sh", "-c", ".."]`.
     ///
-    /// Where it runs is [where the session stands](Self::workfs_path), which is the far
+    /// Where it runs is [where the session stands](Self::context_path), which is the far
     /// end's to keep: this carries no directory, because a second answer to that question
     /// would disagree with the first the moment a command ran `cd`. A caller that wants one
     /// command somewhere else says so in the command — `sh -c 'cd there && ..'`.
@@ -649,7 +775,7 @@ impl Console {
 
     /// Read part of a file where commands run.
     ///
-    /// The path is the server's — under [`workfs_path`](Self::workfs_path), which is what a
+    /// The path is the server's — under [`context_path`](Self::context_path), which is what a
     /// caller joins onto — so this names the file a command would open by the same name, and
     /// is how a caller sees what an execution wrote to a file rather than to its output.
     ///
@@ -788,19 +914,58 @@ impl Drop for Console {
     }
 }
 
-/// The server's answer, as a path this end can join onto.
+/// A mount this end holds, as the URL the far end is told to realize — or `None` for a tree
+/// the caller named none of.
 ///
-/// A relative one is refused rather than resolved: it would be relative to a working
-/// directory the server never named, and every path built from it would name a file nobody
-/// meant.
-fn absolute(path: String) -> anyhow::Result<PathBuf> {
-    let path = PathBuf::from(path);
+/// `role` is the member it will travel under, and is here only so that a caller who mounted
+/// something unnameable is told *which* of its trees that was — the protocol's own name for
+/// it, so that this end and the server call it the same thing in a failure.
+fn named(role: TreeRole, mount: Option<&dyn Mount>) -> anyhow::Result<Option<TreeSource>> {
+    let Some(mount) = mount else {
+        return Ok(None);
+    };
+    let url = mount.url().with_context(|| {
+        format!(
+            "a mount point that is not an absolute UTF-8 path cannot be named as a {role}: {:?}",
+            mount.mountpoint()
+        )
+    })?;
+    Ok(Some(TreeSource::new(url)))
+}
+
+/// The tree this end holds and the path the server answered for it, paired — or `None` for a
+/// tree the caller named none of.
+///
+/// **A tree the server took and did not place is not a session.** Every path the caller would
+/// send for it afterwards would be a guess, so this is a console that does not exist rather
+/// than one that carries a mount it cannot name a file in. A path that is not absolute is
+/// refused for the same reason one step further on: it would be relative to a working
+/// directory the server never named.
+///
+/// A path answered for a tree that was never asked for is dropped. It describes a session
+/// this end did not name, and there is nothing here it could be a path to.
+fn placed(
+    role: TreeRole,
+    mount: Option<Box<dyn Mount>>,
+    at: Option<TreeMount>,
+) -> anyhow::Result<Option<Tree>> {
+    let Some(mount) = mount else {
+        return Ok(None);
+    };
+    let at = at.with_context(|| {
+        format!(
+            "the console server took the {role} at {} and did not say where it put it",
+            mount.mountpoint().display()
+        )
+    })?;
+
+    let path = PathBuf::from(at.path);
     anyhow::ensure!(
         path.is_absolute(),
-        "the console server put the workfs somewhere that is not an absolute path: {}",
+        "the console server put the {role} somewhere that is not an absolute path: {}",
         path.display()
     );
-    Ok(path)
+    Ok(Some(Tree { mount, path }))
 }
 
 #[cfg(test)]
@@ -811,7 +976,7 @@ mod tests {
 
     use super::*;
     use crate::console::message::{
-        Call, Error, InitResp, Method, Notification, Response, WorkFsMount,
+        Call, Error, InitResp, Method, Notification, Response, TreeMount,
     };
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.
@@ -879,16 +1044,16 @@ mod tests {
         )
     }
 
-    /// A session taken with nothing mounted, which is what a server answers a workfs-less
+    /// A session taken with nothing mounted, which is what a server answers a context-less
     /// `init` with.
     fn initialized() -> Response {
         Response::Init(InitResp::default())
     }
 
-    /// A session taken, with the workfs put at `path`.
+    /// A session taken, with the context put at `path`.
     fn initialized_at(path: &Path) -> Response {
         Response::Init(InitResp {
-            workfs: Some(WorkFsMount {
+            context: Some(TreeMount {
                 path: path.to_str().expect("a test path is UTF-8").to_string(),
             }),
             ..InitResp::default()
@@ -902,20 +1067,6 @@ mod tests {
             stdout: stdout.to_vec(),
             ..ExecResp::default()
         })
-    }
-
-    /// A directory that is already part of a filesystem, standing in for a mounted one.
-    ///
-    /// Not a mount these tests made: putting one up needs a binding, a libfuse provider and
-    /// a kernel, which is what `tests/host_mount.rs` is for. What is under test here is what
-    /// a *console* does with a mount — name it to the server, hold it for the session — and
-    /// a plain directory answers a path the same way a mount point does.
-    struct Mounted(std::path::PathBuf);
-
-    impl Mount for Mounted {
-        fn mountpoint(&self) -> &Path {
-            &self.0
-        }
     }
 
     /// A builder needs exactly one thing, and says which when it does not have it.
@@ -1029,7 +1180,7 @@ mod tests {
     #[tokio::test]
     async fn a_console_the_server_will_not_have_does_not_exist() {
         let (client, log) = recorder(vec![Response::Error(Error::new(
-            Error::UNSUPPORTED_WORKFS,
+            Error::UNSUPPORTED_CONTEXT,
             "s3: this server realizes file:// and nothing else",
         ))]);
         let Err(e) = Console::builder().client(client).build().await else {
@@ -1060,14 +1211,15 @@ mod tests {
     /// answer — which is the path every later call in the session is spelled in, and not
     /// the mount point that was sent.
     ///
-    /// The two are usually the same directory. They are different here so that the
-    /// difference is visible at all: what a caller joins onto is what came back.
+    /// The two need not be the same directory — a server with a guest of its own answers a
+    /// path in there — so they are different here, to make visible which of them a caller
+    /// joins onto: what came back.
     #[tokio::test]
     async fn a_console_names_its_mount_and_reads_back_where_it_went() {
         let (client, log) = recorder(vec![initialized_at(Path::new("/srv/served"))]);
         let console = Console::builder()
             .client(client)
-            .mount(Mounted("/mnt/here".into()))
+            .context(PathBuf::from("/mnt/here"))
             .build()
             .await
             .unwrap();
@@ -1075,23 +1227,23 @@ mod tests {
         let Call::Init(init) = log.call(0) else {
             panic!("{:?} is not an init", log.call(0));
         };
-        assert_eq!(init.workfs, Some(WorkFsSource::new("file:///mnt/here")));
-        assert_eq!(console.workfs_path(), Some(Path::new("/srv/served")));
+        assert_eq!(init.context, Some(TreeSource::new("file:///mnt/here")));
+        assert_eq!(console.context_path(), Some(Path::new("/srv/served")));
     }
 
-    /// A session with a workfs needs somewhere to have put it: a path is what every later
+    /// A session with a context needs somewhere to have put it: a path is what every later
     /// call is spelled in, so a server that answers without one has left this end with
     /// nothing it could name, and that is not a console.
     #[tokio::test]
-    async fn a_workfs_the_server_did_not_place_is_not_a_session() {
+    async fn a_context_the_server_did_not_place_is_not_a_session() {
         let (client, _) = recorder(vec![initialized()]);
         let Err(e) = Console::builder()
             .client(client)
-            .mount(Mounted("/mnt/here".into()))
+            .context(PathBuf::from("/mnt/here"))
             .build()
             .await
         else {
-            panic!("a console whose workfs went nowhere should not build");
+            panic!("a console whose context went nowhere should not build");
         };
         assert!(e.to_string().contains("did not say where"), "{e}");
 
@@ -1099,11 +1251,11 @@ mod tests {
         let (client, _) = recorder(vec![initialized_at(Path::new("relative/served"))]);
         let Err(e) = Console::builder()
             .client(client)
-            .mount(Mounted("/mnt/here".into()))
+            .context(PathBuf::from("/mnt/here"))
             .build()
             .await
         else {
-            panic!("a console whose workfs went to a relative path should not build");
+            panic!("a console whose context went to a relative path should not build");
         };
         assert!(e.to_string().contains("not an absolute path"), "{e}");
     }

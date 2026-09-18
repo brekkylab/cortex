@@ -290,7 +290,7 @@ mod tests {
             Message::Request {
                 id: 0,
                 call: Call::Init(InitCall {
-                    workfs: Some(super::super::WorkFsSource::new("file:///srv/project")),
+                    context: Some(super::super::TreeSource::new("file:///srv/project")),
                     ..InitCall::default()
                 }),
             },
@@ -509,7 +509,7 @@ mod tests {
             wire(&Message::Request {
                 id: 0,
                 call: Call::Init(InitCall {
-                    workfs: Some(super::super::WorkFsSource::new("file:///srv/project")),
+                    context: Some(super::super::TreeSource::new("file:///srv/project")),
                     ..InitCall::default()
                 }),
             }),
@@ -517,7 +517,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 0i64,
                 "method": "init",
-                "params": {"workfs": {"url": "file:///srv/project"}},
+                "params": {"context": {"url": "file:///srv/project"}},
             },
         );
     }

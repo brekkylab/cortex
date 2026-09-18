@@ -62,7 +62,7 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-# No *binding* by default. The crate's own layers — `FileSystem`, `WorkFs`, the
+# No *binding* by default. The crate's own layers — `FileSystem`, `ContextFs`, the
 # inode bookkeeping, the console — need nothing, and each interface binding brings
 # a libfuse provider with it: enabling one by default charges every consumer for
 # it. A consumer that mounts over HTTP has no reason to link libfuse.

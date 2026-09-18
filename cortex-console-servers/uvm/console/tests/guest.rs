@@ -28,28 +28,10 @@
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
-use std::{
-    path::{Path, PathBuf},
-    process::Stdio,
-};
+use std::{path::Path, process::Stdio};
 
-use cortex::{
-    console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp},
-    fs::Mount,
-};
+use cortex::console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp};
 use tokio::process::Command;
-
-/// A directory standing in for a mounted tree.
-///
-/// Not a mount this test made: what is under test is what the *backend* does with the path
-/// it is given, and a plain directory answers one the way a mount point does.
-struct Mounted(PathBuf);
-
-impl Mount for Mounted {
-    fn mountpoint(&self) -> &Path {
-        &self.0
-    }
-}
 
 /// A console over the real binary.
 struct Fixture {
@@ -131,8 +113,8 @@ impl Fixture {
     /// A fixture whose session works in `root`, which is a directory on this host.
     ///
     /// Over the channel and not through the server's environment: what a client says is a
-    /// tree it has, and the server answers where it put it. Here the answer is the same
-    /// path, because a `file://` tree is shared into the guest where the host has it.
+    /// tree it has, and the server answers where it put it — which here is `/context`, the
+    /// guest's name for that role, and not the host path this was handed.
     async fn with_tree(root: &Path) -> Fixture {
         let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
         server.stderr(Stdio::inherit());
@@ -141,7 +123,50 @@ impl Fixture {
 
         let console = Console::builder()
             .client(client)
-            .mount(Mounted(root.to_path_buf()))
+            .context(root.to_path_buf())
+            .build()
+            .await
+            .expect("building the console");
+
+        Fixture { console }
+    }
+
+    /// A fixture whose one tree is a **scratch**, standing in `root`.
+    ///
+    /// What it buys is a tree the session may write in: the context is mounted read-only, so
+    /// a session given only that one has nowhere to put a file — which is what the tree means
+    /// rather than something to work around here.
+    async fn with_scratch(root: &Path) -> Fixture {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client =
+            cortex::console::stdio::StdioClient::new(server).expect("starting the console server");
+
+        let console = Console::builder()
+            .client(client)
+            .scratch(root.to_path_buf())
+            .build()
+            .await
+            .expect("building the console");
+
+        Fixture { console }
+    }
+
+    /// A fixture with all three trees, each a directory on this host.
+    ///
+    /// The same exchange `with_tree` makes, three times over: what a client says is a tree it
+    /// has, and the server answers where it put each one.
+    async fn with_trees(context: &Path, artifacts: &Path, scratch: &Path) -> Fixture {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        let client =
+            cortex::console::stdio::StdioClient::new(server).expect("starting the console server");
+
+        let console = Console::builder()
+            .client(client)
+            .context(context.to_path_buf())
+            .artifacts(artifacts.to_path_buf())
+            .scratch(scratch.to_path_buf())
             .build()
             .await
             .expect("building the console");
@@ -196,6 +221,116 @@ async fn a_tree_that_is_not_there_is_refused_before_a_vm_is_started() {
         Some(cortex::console::Error::MOUNT_FAILED),
         "answered {err:?} — a tree that is missing is not a backend that would not come up"
     );
+}
+
+/// Every tree is checked before a VM is started, not just the context — a client will send
+/// paths into all of them, and a missing artifacts directory would otherwise fail at the
+/// first write into it rather than at the boot that could not be made.
+///
+/// **Not** `#[ignore]`d, for the reason above: nothing here boots.
+#[tokio::test]
+async fn an_artifacts_tree_that_is_not_there_is_refused_before_a_vm_is_started() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let context = dir.path().join("project");
+    std::fs::create_dir(&context).unwrap();
+
+    let mut fx = Fixture::with_trees(
+        &context,
+        &dir.path().join("not-created"),
+        &dir.path().join("scratch-not-created"),
+    )
+    .await;
+
+    let err = fx
+        .console
+        .exec(["true"], None)
+        .await
+        .expect_err("no session can leave output in a directory that is not there");
+    assert_eq!(
+        err.code(),
+        Some(cortex::console::Error::MOUNT_FAILED),
+        "answered {err:?} — a tree that is missing is not a backend that would not come up"
+    );
+}
+
+/// The three trees are three shares, each at the host's own path for it, and **the session
+/// stands in the scratch** — so a relative path a command writes lands there rather than in
+/// the tree the client was working on.
+///
+/// And the context is mounted read-only, which is the one thing the guest does differently
+/// with the three. Asserted here rather than in a boot of its own for the reason at the top
+/// of this file: it is the same session a client performs, one step further along.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
+async fn a_guest_mounts_every_tree_and_stands_in_the_scratch() {
+    let dir = tempfile::tempdir().expect("a temp directory");
+    let (context, artifacts, scratch) = (
+        dir.path().join("project"),
+        dir.path().join("out"),
+        dir.path().join("scratch"),
+    );
+    for at in [&context, &artifacts, &scratch] {
+        std::fs::create_dir(at).unwrap();
+    }
+    std::fs::write(context.join("given.txt"), b"from the client\n").unwrap();
+
+    let mut fx = Fixture::with_trees(&context, &artifacts, &scratch).await;
+
+    // Each tree is answered by the guest's name for its role, which is what the client
+    // sends paths in from here on. The host directory behind each stays the caller's own —
+    // it is the mount point this test handed over, and nothing in the guest is named after
+    // it.
+    assert_eq!(fx.console.context_path(), Some(Path::new("/context")));
+    assert_eq!(fx.console.artifacts_path(), Some(Path::new("/artifacts")));
+    assert_eq!(fx.console.scratch_path(), Some(Path::new("/scratch")));
+
+    // The guest stands in the scratch, which nothing on the `exec` frame said.
+    assert_eq!(
+        String::from_utf8_lossy(&fx.output("pwd").await.stdout).trim_end(),
+        "/scratch"
+    );
+
+    // The context is readable at the path the client was told it is at...
+    assert_eq!(
+        String::from_utf8_lossy(&fx.output("cat /context/given.txt").await.stdout),
+        "from the client\n"
+    );
+
+    // ...a relative write lands in the scratch...
+    fx.output("echo working > note.txt").await;
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("note.txt")).unwrap(),
+        "working\n"
+    );
+
+    // ...and what the session leaves in the artifacts tree is on this host, which is the
+    // whole reason for the tree: the client collects it without a `read`.
+    fx.output("echo kept > /artifacts/report.txt").await;
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("report.txt")).unwrap(),
+        "kept\n"
+    );
+
+    // The context is read-only, and here that is the guest kernel's answer rather than a
+    // rule the protocol applies: the share went up `MS_RDONLY`, so the command's own
+    // redirection fails and the client's project is as it was.
+    let refused = fx.output("echo edited > /context/given.txt").await;
+    assert_ne!(refused.code, 0, "a command wrote into a read-only context");
+    assert_eq!(
+        std::fs::read_to_string(context.join("given.txt")).unwrap(),
+        "from the client\n",
+        "the tree the client gave the session came back edited"
+    );
+
+    // And the file plane says the same, with the code a read-only filesystem refusing a
+    // write comes back as — which is what `cortex-local-console` answers for the same call,
+    // where there is no mount to be read-only and the server checks the path itself.
+    let refused = fx
+        .console
+        .write("/context/given.txt", &b"edited"[..], None)
+        .await
+        .expect_err("writing into the context");
+    assert_eq!(refused.code(), Some(cortex::console::Error::IO_FAILED));
 }
 
 /// A session, from the outside: commands run somewhere that is not this host, on a
@@ -758,36 +893,44 @@ async fn a_client_asks_for_its_reach_over_the_channel() {
     );
 }
 
-/// A tree the host has, in front of a guest — **at the same path on both sides**.
+/// A tree the host has, in front of a guest — **named by its role on the guest's side**.
 ///
 /// Which is the whole of what makes this backend usable through the protocol: the client is
 /// told where the tree is, the guest stands in a directory of that name, and neither end
-/// rewrites a path to talk to the other. A constant of this crate's choosing would have made
-/// every path crossing the boundary two paths.
+/// rewrites a path to talk to the other. The two names for one directory never meet, because
+/// only one of them is ever in a frame — the host's own is the caller's mount point, which is
+/// what this test uses to check the bytes and never sends.
+///
+/// Over a scratch, because half of what this asserts is writing: the context is read-only,
+/// and a session given only one has no tree the protocol will write in.
 #[tokio::test]
 #[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
-async fn a_tree_is_the_same_path_on_both_sides() {
+async fn a_tree_is_named_by_its_role_on_the_guests_side() {
     let dir = tempfile::tempdir().expect("a temp directory");
     let root = dir.path().canonicalize().expect("a real directory");
     std::fs::write(root.join("from-the-host"), b"hello from the host\n")
         .expect("writing a file for the guest to read");
 
-    let mut fx = Fixture::with_tree(&root).await;
+    let mut fx = Fixture::with_scratch(&root).await;
 
-    // What the server answered is the path this host has, and the session stands in it.
-    assert_eq!(fx.console.workfs_path(), Some(root.as_path()));
+    // What the server answered is the guest's name for the role, and the session stands in
+    // it — the host's own path for the same directory is not in the answer at all.
+    assert_eq!(fx.console.scratch_path(), Some(Path::new("/scratch")));
     assert_eq!(
         fx.output("pwd").await.stdout,
-        format!("{}\n", root.display()).into_bytes(),
-        "the guest stands where the host says the tree is"
+        b"/scratch\n",
+        "the guest stands in the tree it was given, by the name it has for it"
+    );
+    assert_ne!(
+        root.to_str(),
+        Some("/scratch"),
+        "the host path and the guest path are different strings, which is the point"
     );
 
-    // The guest reads what the host wrote, by the name the host would use and by a
-    // relative one from where it stands.
+    // The guest reads what the host wrote, by the name it was told and by a relative one
+    // from where it stands.
     assert_eq!(
-        fx.output(&format!("cat {}/from-the-host", root.display()))
-            .await
-            .stdout,
+        fx.output("cat /scratch/from-the-host").await.stdout,
         b"hello from the host\n"
     );
     assert_eq!(
@@ -806,9 +949,7 @@ async fn a_tree_is_the_same_path_on_both_sides() {
 
     // And the file plane names what a command names, through the same path.
     assert_eq!(
-        fx.read(root.join("from-the-guest").to_str().unwrap())
-            .await
-            .data,
+        fx.read("/scratch/from-the-guest").await.data,
         b"hello from the guest\n"
     );
 
@@ -824,10 +965,7 @@ async fn a_tree_is_the_same_path_on_both_sides() {
             .code,
         0
     );
-    assert_eq!(
-        fx.output("pwd").await.stdout,
-        format!("{}\n", root.join("work").display()).into_bytes()
-    );
+    assert_eq!(fx.output("pwd").await.stdout, b"/scratch/work\n");
 }
 
 /// A console server that is killed outright takes its guest with it.

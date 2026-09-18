@@ -45,7 +45,7 @@ use cortex::fs::FuseMount as HostMount;
 /// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
 #[cfg(feature = "fuse-t")]
 use cortex::fs::FuseTMount as HostMount;
-use cortex::fs::{FileSystem, InMemFs, WorkFs};
+use cortex::fs::{ContextFs, FileSystem, InMemFs};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {
@@ -117,7 +117,7 @@ fn the_operating_system_can_read_a_cortex_mount() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_multi_source_workspace() {
     let mnt = mountpoint("workspace");
-    let ws = WorkFs::new()
+    let ws = ContextFs::new()
         .try_with_mount("s3-like", volume())
         .expect("mount path stays inside the workspace")
         .try_with_mount("notes", volume())

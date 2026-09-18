@@ -69,7 +69,7 @@ pub struct CommitResp {
     /// The image, spelled the way a later session would name it.
     ///
     /// Answered rather than left for the client to build, for the reason
-    /// [`InitResp`](super::InitResp) answers where the workfs went: how a server spells
+    /// [`InitResp`](super::InitResp) answers where the context went: how a server spells
     /// something it made is the server's, and a client assembling the string itself would be
     /// a second place that has to agree.
     ///

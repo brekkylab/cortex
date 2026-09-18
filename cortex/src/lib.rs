@@ -8,7 +8,7 @@
 //!
 //! * **What it sees is a filesystem.** Whatever it should know about — a project directory,
 //!   an object store, a Notion workspace, a tree assembled in memory — implements
-//!   [`FileSystem`](fs::FileSystem) and is grafted into a [`WorkFs`](fs::WorkFs) at a path
+//!   [`FileSystem`](fs::FileSystem) and is grafted into a [`ContextFs`](fs::ContextFs) at a path
 //!   the caller chooses. A binding mounts that tree on the host, so what reads it is `cat`,
 //!   `grep`, and whatever else the agent thought to run.
 //! * **What it does is run commands.** A [`Console`](console::Console) runs them somewhere —
@@ -24,24 +24,24 @@
 //! use std::path::Path;
 //!
 //! use cortex::console::Console;
-//! use cortex::fs::{FuseMount, InMemFs, WorkFs};
+//! use cortex::fs::{ContextFs, FuseMount, InMemFs};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // What the agent can see. Each store is a `FileSystem`; a `WorkFs` is several of
+//!     // What the agent can see. Each store is a `FileSystem`; a `ContextFs` is several of
 //!     // them under one root, and is itself a `FileSystem`, so a binding drives it like
 //!     // any single store.
-//!     let workfs = WorkFs::new().try_with_mount("notes", InMemFs::new())?;
+//!     let context = ContextFs::new().try_with_mount("notes", InMemFs::new())?;
 //!
 //!     // Where the host can see it. Constructing the guard mounts, dropping it unmounts,
 //!     // and the console below holds it for the length of the session.
-//!     let mount = FuseMount::try_new(workfs, Path::new("/tmp/session"))?;
+//!     let mount = FuseMount::try_new(context, Path::new("/tmp/session"))?;
 //!
 //!     // What the agent can do: a server that runs its commands, against that tree. A
 //!     // session's shape is said once, when the console is built.
 //!     let mut console = Console::builder()
 //!         .stdio_client(&["cortex-local-console"])
-//!         .mount(mount)
+//!         .context(mount)
 //!         .build()
 //!         .await?;
 //!
@@ -65,9 +65,11 @@
 //!   `console/ARCHITECTURE.md` has the long form.
 //!
 //! Nothing in [`console`] builds a tree, calls [`FileSystem`](fs::FileSystem) or
-//! touches a binding. What it does take is a [`Mount`](fs::Mount) — a tree somebody else
-//! already mounted, which is what a session names as its workfs and what a `read` and a command
-//! then spell the same file under — and that is the whole of the seam. Nothing in [`fs`] knows a
+//! touches a binding. What it does take is [`Mount`](fs::Mount)s — trees somebody else
+//! already mounted, which a session names as its context, its artifacts and its scratch, and
+//! which a `read` and a command then spell the same file under — and that is the whole of the
+//! seam. Three of them because they are three intentions: what the session was given, what it
+//! is to leave behind, and room to work in, which is where it stands. Nothing in [`fs`] knows a
 //! console exists. There is not even an error type between them: both halves answer in
 //! [`std::io::Error`], classified by kind, so neither has a vocabulary the other has to learn.
 //!
