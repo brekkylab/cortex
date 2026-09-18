@@ -27,7 +27,7 @@ async fn console_over(root: &Path) -> anyhow::Result<Console> {
     let client = StdioClient::new(server)?;
     Console::builder()
         .client(client)
-        .mount(Mounted(root.to_path_buf()))
+        .context(Mounted(root.to_path_buf()))
         .build()
         .await
 }
