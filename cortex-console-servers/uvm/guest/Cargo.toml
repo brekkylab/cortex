@@ -29,7 +29,8 @@ bson = { version = "3", features = ["serde"] }
 # mounts nothing and boots nothing.
 cortex = { path = "../../../cortex", default-features = false }
 # `mount(2)`, `pivot_root`, `dup`. Every one of them is a syscall with no std
-# spelling, which is the whole reason the guest side is its own binary.
+# spelling, which is the whole reason the guest side is its own binary. And `killpg`,
+# to take a timed-out command's whole process group with it.
 libc = "0.2"
 # Deriving `contract::ImageSpec`, the one thing the host hands this end as a file
 # rather than as an environment value. Already in the tree via `bson`; named here
@@ -48,6 +49,8 @@ tokio = { version = "1", features = [
     "net",
     "process",
     "rt-multi-thread",
+    # `timeout`, which is what makes an `exec`'s `timeout_ms` a kill.
+    "time",
 ] }
 
 # The unit tests here build only for a linux target — the crate itself does not compile
