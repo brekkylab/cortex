@@ -1,0 +1,8 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+
+# The directory the workspace is mounted at while a store is being made — see
+# src-tauri/src/store.rs. Empty except while a `mem init` is running.
+.cortex-mnt

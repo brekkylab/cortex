@@ -3,7 +3,7 @@
 HyperCLOVA X working over a Cortex tree, inside one actor's read permissions.
 
 ```
-cortex-hyperclova --actor 구매팀 "협력사 신용등급 변동표·납기 이력·여신한도를 대조해 이번 주 위험 거래처와 대체 후보를 뽑아 주세요"
+cortex-hyperclova --actor 구매팀 "다음 주 주간회의에 올릴 3분기 단가 협상 대상 선정안을 만들어 주세요"
 cortex-hyperclova --actor 인사팀 --tree-only
 cortex-hyperclova --actor 재무팀 --model HCX-007 --s3 my-bucket/finance
 ```
@@ -41,6 +41,6 @@ cargo build -p cortex-agent-hyperclova -p cortex-exec-mem      # mem enables rem
 | `인사팀/*` | 🔒 | 🔒 | read |
 | `회의록/*`, `정책/*`, `구매팀/구매규정-v7.md` | read | read | read |
 
-The same question — cross-check credit-rating changes, delivery history and credit limits for this week's at-risk suppliers — therefore ends three ways: purchasing gets a report it alone may read (delivery history is purchasing-only), finance gets one with the credit-limit column filled and the delivery history marked out of reach, and HR is told the report cannot be written and who holds the data.
+The same question — a draft for next week's meeting naming which suppliers to renegotiate prices with this quarter, with the delivery history, rating changes, credit limits and the quarter's cost impact as grounds — therefore ends three ways: purchasing gets a draft it alone may read (delivery history is purchasing-only) with the finance figures listed as something to request, finance gets one with the credit-limit and cost-impact columns filled and the delivery history marked out of reach, and HR is told the draft cannot be written and who holds the data.
 
 All names, figures and companies in the example are fictional.

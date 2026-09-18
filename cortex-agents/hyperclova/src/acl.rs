@@ -3,8 +3,9 @@
 //! [`AclFs`] wraps any [`FileSystem`] and answers for one actor — a department, here. A read of
 //! a path the actor may not see is [`PermissionDenied`](io::ErrorKind::PermissionDenied) at the
 //! `read_at` the tool would have made, so the model never receives the bytes; there is no prompt
-//! to talk it out of a rule the filesystem enforces. Names stay listable: a file one may not open
-//! is still a file one can be told exists, which is how a shared drive already behaves.
+//! to talk it out of a rule the filesystem enforces. A folder the actor may not read is not
+//! listed either: its name is visible where it sits, what it holds is not, which is how a shared
+//! drive already behaves.
 //!
 //! The rules are `정책/acl.json` in the workspace: a longest-prefix match over root-relative
 //! paths. [`Acl::derive`] is the write side of the same rule — a file the agent writes inherits
@@ -67,9 +68,13 @@ pub struct Rule {
     pub writable: bool,
 }
 
+/// The actor every rule opens to: the tree as its administrator sees it, with every file and
+/// who may read each. Never an actor the agent runs as.
+pub const ADMIN: &str = "관리자";
+
 impl Rule {
     fn allows(&self, actor: &str) -> bool {
-        self.readers.iter().any(|r| r == "*" || r == actor)
+        actor == ADMIN || self.readers.iter().any(|r| r == "*" || r == actor)
     }
 }
 
@@ -231,13 +236,14 @@ impl<F: FileSystem> AclFs<F> {
         if !self.verdict(path).readable {
             return Err(self.deny(path));
         }
-        if let Some(readers) = self.inherited(path).await
+        if self.actor != ADMIN
+            && let Some(readers) = self.inherited(path).await
             && !readers.iter().any(|r| r == "*" || *r == self.actor)
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
-                    "{}: 인용한 원본의 권한을 물려받아 {} 열람 — {}에는 닫혀 있음",
+                    "{}: 인용 자료의 권한에 따라 {} 열람 — {}에는 닫혀 있음",
                     path.display(),
                     readers_ko(&readers),
                     self.actor
@@ -276,7 +282,13 @@ impl<F: FileSystem> FileSystem for AclFs<F> {
     }
 
     fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
-        self.inner.list(path)
+        Box::pin(async move {
+            // The root is everyone's: it is where the folders one may not open are seen to exist.
+            if !normalize(path).as_os_str().is_empty() && !self.verdict(path).readable {
+                return Err(self.deny(path));
+            }
+            self.inner.list(path).await
+        })
     }
 
     fn read_at<'a>(
@@ -429,11 +441,54 @@ mod tests {
     }
 
     #[test]
-    fn hr_may_list_but_not_read_credit_data() {
+    fn hr_may_not_read_credit_data_and_the_admin_may() {
         let acl = Acl::from_json(POLICY).unwrap();
-        let v = acl.verdict("인사팀", Path::new("구매팀/협력사평가/b.csv"));
-        assert!(!v.readable);
-        let v = acl.verdict("재무팀", Path::new("구매팀/협력사평가/b.csv"));
-        assert!(v.readable);
+        assert!(
+            !acl.verdict("인사팀", Path::new("구매팀/협력사평가/b.csv"))
+                .readable
+        );
+        assert!(
+            acl.verdict("재무팀", Path::new("구매팀/협력사평가/b.csv"))
+                .readable
+        );
+        assert!(acl.verdict(ADMIN, Path::new("재무팀/x.csv")).readable);
+    }
+
+    #[tokio::test]
+    async fn a_closed_folder_lists_nothing_but_the_root_lists_it() {
+        use cortex::fs::{InMemFs, WorkFs};
+        let acl = Arc::new(Acl::from_json(POLICY).unwrap());
+        let mut work = WorkFs::new();
+        work.mount("재무팀", InMemFs::new()).unwrap();
+        let fs = Arc::new(work);
+        fs.create(Path::new("재무팀/여신.csv")).await.unwrap();
+
+        let hr = AclFs::new(fs.clone(), acl.clone(), "인사팀");
+        let root: Vec<String> = hr
+            .list(Path::new(""))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(root, vec!["재무팀".to_string()]);
+        assert_eq!(
+            hr.list(Path::new("재무팀"))
+                .await
+                .map(drop)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let finance = AclFs::new(fs.clone(), acl.clone(), "재무팀");
+        assert_eq!(finance.list(Path::new("재무팀")).await.unwrap().len(), 1);
+        assert_eq!(
+            AclFs::new(fs, acl, ADMIN)
+                .list(Path::new("재무팀"))
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

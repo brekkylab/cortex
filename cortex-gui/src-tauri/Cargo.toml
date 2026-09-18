@@ -1,0 +1,56 @@
+[package]
+name = "cortex-gui"
+version = "0.1.0"
+edition = "2024"
+description = "A desktop window onto a cortex workspace"
+publish = false
+
+# Its own workspace root, and deliberately not a member of the one above.
+#
+# A Tauri app pulls in the whole desktop webview stack — several hundred crates that
+# nothing else here links — and a member is built by a bare `cargo build` at the root.
+# Charging every `cargo test` in this repository for a GUI's dependency tree buys
+# nothing: the only code shared with the workspace is `cortex` itself, which arrives
+# below as a path dependency and resolves its own `workspace = true` inheritance
+# against the root manifest exactly as it does for any other consumer.
+[workspace]
+
+[lib]
+# `cortex_gui_lib` rather than `cortex_gui`, so the library and the binary that runs it
+# can both exist under one package name.
+name = "cortex_gui_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The workspace, the stores mounted into it, and the errors all of it answers in. The two
+# network stores are named because the connectors in the UI are exactly them.
+#
+# `fuse-t` is the binding, and it is here for one reason: `mem` and `index` write a SQLite
+# file, SQLite opens files rather than paths in a `WorkFs`, so a store that is to live *in*
+# the workspace needs the workspace to be somewhere a kernel answers for while the program
+# runs. See `store.rs`. It needs FUSE-T installed at build time
+# (`brew install --cask fuse-t`), whose `fuse-t.pc` is already on pkg-config's default
+# search path — unlike the `fuse` feature, which needs the `fuse.pc` shim in
+# `cortex/contrib/pkgconfig` on `PKG_CONFIG_PATH`.
+cortex = { path = "../../cortex", features = ["notion", "s3"] }
+# The agent behind the HyperCLOVA tab: the tree for one actor, the tools over it, and the run
+# as a stream of events this window renders.
+cortex-agent-hyperclova = { path = "../../cortex-agents/hyperclova" }
+anyhow = "1"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
+# The "파일 추가" button's file chooser. Drag-and-drop arrives on the window itself and
+# needs no plugin; a picker is the same import for whoever would rather not drag.
+tauri-plugin-dialog = "2"
+# `sync` for the locks the workspace is held behind, `fs` for reading host files during
+# an import. `cortex`'s own features already put a multi-threaded runtime in the build.
+tokio = { version = "1", features = ["fs", "sync", "process"] }
+
+[dev-dependencies]
+# `macros` for `#[tokio::test]`. The resource commands are `async` over an async trait, so the
+# tests that drive them need a runtime to be on.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

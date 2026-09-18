@@ -42,17 +42,13 @@ impl S3Source {
     }
 
     pub fn describe(&self) -> String {
-        let where_ = match &self.endpoint {
-            Some(e) => format!(" @ {e}"),
-            None => String::new(),
-        };
         match &self.prefix {
-            Some(p) => format!("s3://{}/{}{}  (S3 호환 API)", self.bucket, p, where_),
-            None => format!("s3://{}{}  (S3 호환 API)", self.bucket, where_),
+            Some(p) => format!("Naver Cloud Storage · {}/{}", self.bucket, p),
+            None => format!("Naver Cloud Storage · {}", self.bucket),
         }
     }
 
-    fn open(&self) -> anyhow::Result<S3Fs> {
+    pub fn open(&self) -> anyhow::Result<S3Fs> {
         let access_key_id = std::env::var("AWS_ACCESS_KEY_ID").context(
             "AWS_ACCESS_KEY_ID is not set; `eval $(aws configure export-credentials --format env)`",
         )?;

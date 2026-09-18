@@ -91,7 +91,10 @@ pub async fn walk(fs: &dyn FileSystem, dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let mut entries = fs.list(&d).await?;
+        // A folder the actor may not open holds nothing the actor can be shown.
+        let Ok(mut entries) = fs.list(&d).await else {
+            continue;
+        };
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         for e in entries {
             if e.name.starts_with('.') {
@@ -136,7 +139,7 @@ async fn access_ko(ctx: &Ctx, path: &Path) -> String {
         return format!("🔒 {} — {} 전용", v.label, readers_ko(&v.readers));
     }
     if !ctx.fs.may_read(path).await {
-        return format!("🔒 {} — 인용한 원본의 권한을 물려받아 닫혀 있음", v.label);
+        return format!("🔒 {} — 인용 자료의 권한에 따라 닫혀 있음", v.label);
     }
     format!("열람 가능 ({})", v.label)
 }
@@ -156,7 +159,7 @@ pub fn descs(with_mem: bool) -> Vec<ToolDesc> {
             .parameters(json!({"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string","description":"생략하면 루트"}},"required":["query"]}))
             .build(),
         ToolDescBuilder::new("write_report")
-            .description("보고서를 산출물/ 아래에 저장한다. sources 에는 이 실행에서 read 로 읽은 원본 경로만 적을 수 있고(읽지 않은 파일은 거절), 산출물의 열람 권한은 인용한 원본 중 가장 좁은 권한을 물려받는다.")
+            .description("보고서를 산출물/ 아래에 저장한다. sources 에는 이 실행에서 read 로 읽은 원본 경로만 적을 수 있고(읽지 않은 파일은 거절), 산출물의 열람 권한은 인용 자료 중 가장 좁은 권한으로 정해진다.")
             .parameters(json!({"type":"object","properties":{
                 "path":{"type":"string","description":"파일명, 예: 위험거래처-리포트-2026-09-22.md. 산출물/<사용자>/ 아래에 저장된다."},
                 "content":{"type":"string","description":"마크다운 본문. 각 주장 옆에 근거 파일 경로를 적는다."},
@@ -211,6 +214,10 @@ fn ls(ctx: Arc<Ctx>) -> ToolFunc {
                 }
                 ctx.audit.record(ctx.actor(), "ls", &path, true, format!("{} entries", items.len()));
                 json!({ "path": path.display().to_string(), "entries": items })
+            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                ctx.audit.record(ctx.actor(), "ls", &path, false, e.to_string());
+                denied(&e)
             }
             Err(e) => {
                 ctx.audit.record(ctx.actor(), "ls", &path, false, e.to_string());
@@ -354,7 +361,7 @@ fn write_report(ctx: Arc<Ctx>) -> ToolFunc {
         let readers: Vec<String> = ctx.fs.acl().derive(&sources).into_iter().collect();
         let now = Local::now();
         let footer = format!(
-            "\n\n---\n작성: {} 담당 에이전트 · 모델 {} · {}\n열람 권한: {} — 인용한 원본 중 가장 좁은 권한을 물려받음\n인용: {}\n",
+            "\n\n---\n작성: {} 담당 에이전트 · 모델 {} · {}\n열람 권한: {} (인용 자료 기준 최소 권한)\n인용: {}\n",
             ctx.actor(), ctx.model, now.format("%Y-%m-%d %H:%M"),
             readers_ko(&readers),
             sources.iter().map(|s| s.display().to_string()).collect::<Vec<_>>().join(", "),
