@@ -4,10 +4,11 @@
 //! A session neither names executables nor adds any — `/abin` is what cortex ships and
 //! nothing else — so everything here is about delivering one fixed set.
 //!
-//! **The executables here are shell scripts.** What this tests is the delivery — the disk,
-//! the mount, the ordering, the refusals — and a script exercises all of it without making
-//! the test depend on a musl cross-compiler. That cortex's real executables run from here
-//! was measured separately while the design was being written.
+//! **Most of the executables here are shell scripts.** What those tests are about is the
+//! delivery — the disk, the mount, the ordering, the refusals — and a script exercises all
+//! of it without making the test depend on a musl cross-compiler or on anything published.
+//! The last test in the file is the other half: no override, so the server reads
+//! `abin/latest` and downloads the real release.
 //!
 //! `#[ignore]`, like `guest.rs` and for the same reasons: this needs libkrunfw installed, a
 //! hypervisor the OS will let the process create, and on a cold cache a rootfs download.
@@ -93,14 +94,30 @@ async fn abin_is_a_read_only_disk_first_on_path() {
     );
 }
 
-/// The control: without the override there is no `/abin` at all, so finding one anywhere
-/// above is finding something the test put there.
+/// The control: with nothing to put in it there is no `/abin` at all, so finding one
+/// anywhere above is finding something the test put there.
+///
+/// "Nothing" takes three denials now that releases exist. No override, a base URL with no
+/// latest-pointer under it, and a home of its own so a release this host downloaded earlier is
+/// not sitting in the cache — miss any one and the server finds a perfectly good `/abin`.
+///
+/// Which makes this the test for the rule that a session is never refused over `/abin`: every
+/// way of getting one has failed here, and a session still starts.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "boots a micro-VM"]
 async fn without_executables_there_is_no_abin() {
+    let nowhere = tempfile::tempdir().expect("an empty directory");
+    let home = tempfile::tempdir().expect("a home");
+
     let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
     server.stderr(Stdio::inherit());
     server.env_remove("CORTEX_ABIN_DIR");
+    server.env_remove("CORTEX_ABIN_VERSION");
+    server.env("CORTEX_UVM_HOME", home.path());
+    server.env(
+        "CORTEX_ABIN_BASE_URL",
+        format!("file://{}", nowhere.path().display()),
+    );
     let client = cortex::console::stdio::StdioClient::new(server).unwrap();
     let mut console = Console::builder()
         .client(client)
@@ -135,4 +152,64 @@ async fn an_image_keeps_its_own_commands() {
         say(&out(&mut console, "command -v sh").await).starts_with("/bin/"),
         "the image's own sh is gone"
     );
+}
+
+/// The published release, end to end: no `CORTEX_ABIN_DIR`, so the server reads the
+/// latest-pointer, downloads the tarball, and the executables in it run in the guest.
+///
+/// Reaches the network on purpose — it is the only test that proves the bucket, the key
+/// layout and the client agree. A home of its own, so it proves a cold download rather than
+/// finding whatever this host already had.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "boots a micro-VM and downloads the published /abin"]
+async fn the_published_release_runs_in_a_guest() {
+    let home = tempfile::tempdir().expect("a home");
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+    server.stderr(Stdio::inherit());
+    server.env("CORTEX_UVM_HOME", home.path());
+    // All three, not just the first. This is the one test whose subject is the *published*
+    // release; a developer with either of the others exported would silently be testing
+    // their staging bucket or a pinned old build, and it would still pass.
+    server.env_remove("CORTEX_ABIN_DIR");
+    server.env_remove("CORTEX_ABIN_BASE_URL");
+    server.env_remove("CORTEX_ABIN_VERSION");
+
+    let mut console = Console::builder()
+        .client(cortex::console::stdio::StdioClient::new(server).expect("a server"))
+        .build()
+        .await
+        .expect("a session");
+
+    for (script, expected) in [
+        ("command -v mem", "/abin/mem"),
+        ("command -v index", "/abin/index"),
+    ] {
+        let out = console
+            .exec(["sh", "-c", script], None)
+            .await
+            .expect("running it");
+        assert_eq!(
+            out.code,
+            0,
+            "{script}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), expected);
+    }
+
+    // And they are executables that work, not files that happen to be in the right place.
+    for name in ["mem", "index"] {
+        let out = console
+            .exec(["sh", "-c", &format!("{name} --help")], None)
+            .await
+            .expect("running it");
+        assert_eq!(
+            out.code,
+            0,
+            "{name} --help: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.stdout.is_empty(), "{name} --help said nothing");
+    }
 }

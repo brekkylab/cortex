@@ -6,28 +6,17 @@
 //! chooses.
 //!
 //! `#[ignore]` because it needs a mount provider and touches the real
-//! filesystem. **`--test-threads=1` is required**, not a preference — see below:
+//! filesystem.
 //!
 //! ```sh
 //! # macOS, no kernel extension (recommended). The pkg-config shim in
 //! # contrib/ is what lets fuser's macOS branch find FUSE-T.
 //! PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig" \
-//!     cargo test --features fuse-t --test host_mount \
-//!     -- --ignored --nocapture --test-threads=1
+//!     cargo test --features fuse-t --test host_mount -- --ignored --nocapture
 //!
 //! # Linux, or macOS with macFUSE:
-//! cargo test --features fuse --test host_mount -- --ignored --test-threads=1
+//! cargo test --features fuse --test host_mount -- --ignored
 //! ```
-//!
-//! # Why the tests must not run in parallel
-//!
-//! Each body mounts a real filesystem, and FUSE-T serves it through a `go-nfsv4`
-//! helper. Three of these coming up at once wedges: the run hangs with the mounts
-//! half-established and has to be killed and `umount`ed by hand. Two happened to
-//! survive, which is exactly the kind of margin that makes this look like a code
-//! bug the first time someone adds a third test.
-//!
-//! `cargo test` uses a thread per test by default, so the flag is not optional.
 //!
 //! # Which binding to use where
 //!
