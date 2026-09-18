@@ -92,8 +92,8 @@ use cortex::console::{
     WriteCall, WriteResp, stdio::StdioServer,
 };
 use tokio::{
-    io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
-    process::Command,
+    io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
+    process::{Child, Command},
 };
 
 /// A command we found but could not start, and one we could not find at all.
@@ -597,13 +597,15 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .envs(environment(session))
-        // Piped and then read by `wait_with_output`, which is what carries the output
-        // back. Input is at EOF from the start, since an `exec` carries none.
+        // Piped and then read by `run_to_end`, which is what carries the output back.
+        // Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // The future below owns the child; dropping it kills the direct child. The group
-        // kill before that drop reaches whatever that child spawned.
+        // Dropping `child` below kills and reaps the direct child, which is how a command
+        // that timed out is cleaned up after the group kill has reached what it spawned —
+        // and how one that ends this function early, by any other return, is not left
+        // running.
         .kill_on_drop(true);
     // Its own process group, so a `killpg` here reaches everything the command started —
     // `sh -c 'a & b'` leaves two children of its own — and so that the group is this
@@ -619,7 +621,7 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
         cmd.current_dir(dir);
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let code = match e.kind() {
@@ -632,41 +634,31 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
             ));
         }
     };
-    // Read before `wait_with_output` takes the child, which is the only other holder of it.
+    // Taken now: a reaped child has no id, and the kill below wants the one it was born
+    // with — which is also its group's, by `process_group(0)`.
     let pid = child.id();
 
-    // `wait_with_output` is what keeps both pipes draining while the command runs: a
-    // command that fills a pipe nobody is reading stops there, and neither of these is
-    // read anywhere else.
     let waited = match exec.timeout_ms {
-        None => child.wait_with_output().await,
+        None => run_to_end(&mut child).await,
         Some(ms) => {
-            // Pinned on the stack and borrowed into `timeout`, rather than handed to it by
-            // value: on expiry `timeout` drops only the borrow, so the future — and the
-            // child it owns — is still alive, unkilled and unreaped, while `killpg` runs
-            // below. Handed over by value it would be dropped on expiry instead, killing
-            // and reaping the group leader first and leaving `killpg` aiming at a pid the
-            // kernel had already freed.
-            let mut wait = std::pin::pin!(child.wait_with_output());
-            match tokio::time::timeout(Duration::from_millis(ms), &mut wait).await {
+            // `run_to_end` borrows the child rather than taking it, so expiry leaves
+            // `child` — alive, unkilled and unreaped — in this frame for the kill below.
+            match tokio::time::timeout(Duration::from_millis(ms), run_to_end(&mut child)).await {
                 Ok(output) => output,
                 Err(_elapsed) => {
                     // Everything the command started is in the group the spawn put it in,
-                    // so one signal to the group ends all of it — the direct child
-                    // included, which is why nothing here relies on `kill_on_drop`
-                    // (dropping `wait` on the way out is only the reaping).
+                    // so one signal to the group ends all of it, the direct child included.
+                    // `kill_on_drop` is not what does the killing here — dropping `child`
+                    // on the way out is what reaps the leader once the signal has landed.
                     #[cfg(unix)]
                     if let Some(pid) = pid {
-                        // SAFETY: a plain libc call, and `pid` is a group id this process
-                        // created (`process_group(0)`). While the direct child has not
-                        // exited, `wait` above still holds it unreaped, so the id names
-                        // this command's group and no other. The guarantee is only that
-                        // wide: `wait_with_output` reaps the direct child as soon as it
-                        // exits even while descendants keep the pipes open, so a command
-                        // shaped `sh -c 'a & exit'` can leave the leader reaped — and the
-                        // id free for the kernel to reuse — before the timeout fires. The
-                        // common shell shape (a foreground command) keeps the leader alive
-                        // until the kill.
+                        // SAFETY: a plain libc call, and `pid` names this command's process
+                        // group and no other. It is the group id this process created with
+                        // `process_group(0)`, and it is still that group's: `timeout` only
+                        // expires while `run_to_end` is pending, and while it is pending the
+                        // direct child — the group's leader — has not been reaped (see
+                        // `run_to_end`). An unreaped process keeps its pid, running or
+                        // zombie, so the kernel cannot have handed this id to anything else.
                         unsafe {
                             libc::killpg(pid as libc::pid_t, libc::SIGKILL);
                         }
@@ -681,6 +673,41 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
     };
 
     finished(waited)
+}
+
+/// Drain both pipes to EOF, then reap the child — in that order, and the order is the point.
+///
+/// This is what `std`'s `wait_with_output` does and tokio's does not: tokio's waits and
+/// reads concurrently, reaping the direct child the moment it exits while whatever it
+/// spawned may still hold the pipes open. Reaping last keeps the direct child unreaped — a
+/// zombie, once it has exited — for as long as anything is still writing, and an unreaped
+/// process keeps its pid. Since that pid is also the id of the process group the command
+/// was spawned into, the group id stays this command's until this future completes, which
+/// is what lets [`execute`] aim a `killpg` at it after a timeout: the timeout can only fire
+/// while this is pending, and while this is pending the leader is still there.
+///
+/// Both pipes are read at once because a command that fills a pipe nobody is reading stops
+/// there, and read to EOF rather than to some size because what to keep of the result is
+/// [`finished`]'s decision, not this function's.
+async fn run_to_end(child: &mut Child) -> io::Result<Output> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (stdout, stderr) = tokio::try_join!(read_to_end(&mut stdout), read_to_end(&mut stderr))?;
+    let status = child.wait().await?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Everything a pipe has to give, or nothing from a pipe that was never opened.
+async fn read_to_end<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    if let Some(pipe) = pipe {
+        pipe.read_to_end(&mut buf).await?;
+    }
+    Ok(buf)
 }
 
 /// The environment variables an execution is given, on top of the ones it inherits.

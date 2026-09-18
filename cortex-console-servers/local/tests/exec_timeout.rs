@@ -99,6 +99,60 @@ async fn the_kill_reaches_what_the_command_started() {
     panic!("`{MARKER}` outlived the timeout kill — the group it was in was not signalled");
 }
 
+/// The kill still lands when the direct child has already exited.
+///
+/// `sh -c 'sleep .. & exit'` is the shape that lets the shell go while a child of its own
+/// keeps both pipes open, so the server sits reading a pipe whose only writer is a
+/// grandchild — and the group's leader has been gone for the whole wait. The timeout must
+/// still fire, the grandchild must still die with the group, and the session must still
+/// answer afterwards.
+///
+/// Fails if the server reaps the direct child before the pipes close (tokio's
+/// `wait_with_output` does): the leader's pid — and with it the group id `killpg` aims
+/// at — would then be free for the kernel to reuse before the timeout fires.
+#[tokio::test]
+async fn the_kill_reaches_what_an_exited_command_left_behind() {
+    const MARKER: &str = "sleep 41.13";
+
+    assert!(
+        !marker_is_running(MARKER).await,
+        "a stray `{MARKER}` was already running — this test cannot tell it from its own"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut console = console_over(dir.path()).await.unwrap();
+
+    let started = Instant::now();
+    let err = console
+        .exec(["sh", "-c", &format!("{MARKER} & exit 0")], Some(300))
+        .await
+        .expect_err("a pipe held open by a 41s sleep under a 300ms timeout must be refused");
+    assert_eq!(err.code(), Some(Error::TIMED_OUT), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the kill must not wait for the grandchild: {:?}",
+        started.elapsed()
+    );
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        if !marker_is_running(MARKER).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        !marker_is_running(MARKER).await,
+        "`{MARKER}` outlived the timeout kill — the group it was in was not signalled"
+    );
+
+    let ok = console
+        .exec(["echo", "still-here"], Some(5_000))
+        .await
+        .unwrap();
+    assert_eq!(ok.stdout, b"still-here\n");
+}
+
 /// Whether any process whose command line contains `marker` is running.
 async fn marker_is_running(marker: &str) -> bool {
     Command::new("pgrep")
