@@ -1,0 +1,3 @@
+examples/procurement/산출물/*
+!examples/procurement/산출물/.gitkeep
+.env

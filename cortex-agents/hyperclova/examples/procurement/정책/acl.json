@@ -1,0 +1,62 @@
+{
+  "rules": [
+    {
+      "prefix": "구매팀/협력사평가",
+      "label": "협력사 신용 정보",
+      "readers": [
+        "구매팀",
+        "재무팀"
+      ]
+    },
+    {
+      "prefix": "구매팀/발주",
+      "label": "발주·납기 이력",
+      "readers": [
+        "구매팀"
+      ]
+    },
+    {
+      "prefix": "구매팀",
+      "label": "구매 규정",
+      "readers": [
+        "*"
+      ]
+    },
+    {
+      "prefix": "재무팀",
+      "label": "여신 한도·실적",
+      "readers": [
+        "재무팀"
+      ]
+    },
+    {
+      "prefix": "인사팀",
+      "label": "채용 자료",
+      "readers": [
+        "인사팀"
+      ]
+    },
+    {
+      "prefix": "회의록",
+      "label": "회의록",
+      "readers": [
+        "*"
+      ]
+    },
+    {
+      "prefix": "정책",
+      "label": "접근 정책",
+      "readers": [
+        "*"
+      ]
+    },
+    {
+      "prefix": "산출물",
+      "label": "에이전트 산출물",
+      "readers": [
+        "*"
+      ],
+      "writable": true
+    }
+  ]
+}

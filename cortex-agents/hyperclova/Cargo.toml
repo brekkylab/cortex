@@ -1,0 +1,27 @@
+[package]
+name = "cortex-agent-hyperclova"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[[bin]]
+name = "cortex-hyperclova"
+path = "src/main.rs"
+
+[dependencies]
+# The tree: local directories and an S3-compatible bucket under one root. `s3` is what maps
+# Ncloud Object Storage, which speaks the S3 API, onto the same mount as a local folder.
+cortex = { workspace = true, features = ["s3"] }
+# The agent loop and the wire to CLOVA Studio. Its `ChatCompletion` schema is the OpenAI-compatible
+# endpoint CLOVA Studio exposes, so HyperCLOVA X arrives as one more provider entry and nothing in
+# the loop is written for it. The pinned revision is `feat/reasoning-effort`: `develop` plus `LangModelOptions::reasoning_effort`,
+# which HCX-007 needs before CLOVA Studio accepts tools; it goes back to `develop` once that lands.
+ailoy = { git = "https://github.com/brekkylab/ailoy.git", rev = "7aec1d84f11605c0867d7d9569c638cf023ffdfa", default-features = false }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+# `StreamExt` for draining the agent's turn; ailoy hands a turn back as a stream of messages.
+futures = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "fs"] }
