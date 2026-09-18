@@ -252,6 +252,84 @@ async fn commands_run_in_a_guest_of_their_own() {
     assert_eq!(out.size, 16);
 }
 
+/// `timeout_ms` is a kill in the guest too, and the kill takes the command's process group.
+///
+/// The same claim `cortex-local-console`'s `exec_timeout` suite makes, in one session
+/// because each of these is a boot. The three shapes are the ones that differ in what the
+/// agent has to get right: a foreground command still running when the timeout fires; a
+/// shell that has already exited while a background child of its own holds the pipes, so
+/// the group's leader is a zombie when `killpg` runs; and a command that fits, which the
+/// timeout must not touch.
+///
+/// Whether the background `sleep` died is asked of the guest itself, through `/proc` rather
+/// than `pgrep`: the rootfs is not promised to have one, and `/proc` is what the agent
+/// mounted for exactly this kind of question.
+#[tokio::test]
+#[ignore = "boots a micro-VM: needs libkrunfw, a hypervisor, and possibly a download"]
+async fn a_command_past_its_timeout_is_killed_in_the_guest() {
+    use std::time::{Duration, Instant};
+
+    use cortex::console::Error;
+
+    let mut fx = Fixture::new().await;
+    // Boot first, so the timings below measure the kill and not the kernel.
+    assert_eq!(fx.output("true").await.code, 0);
+
+    // A foreground command.
+    let started = Instant::now();
+    let err = fx
+        .console
+        .exec(["sh", "-c", "sleep 10"], Some(300))
+        .await
+        .expect_err("a 10s sleep under a 300ms timeout must be refused");
+    assert_eq!(err.code(), Some(Error::TIMED_OUT), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the kill must not wait for the command: {:?}",
+        started.elapsed()
+    );
+
+    // A shell that exits at once, leaving a child that holds both pipes; then a shell that
+    // stays. Distinct durations, so each `sleep` can be told apart in `/proc` afterwards.
+    for script in ["sleep 37.31 & exit 0", "sleep 41.13 & sleep 41.13"] {
+        let err = fx
+            .console
+            .exec(["sh", "-c", script], Some(300))
+            .await
+            .expect_err("a backgrounded sleep under a 300ms timeout must be refused");
+        assert_eq!(err.code(), Some(Error::TIMED_OUT), "{script}: {err:?}");
+    }
+
+    // The signal and the exits are not synchronised with this end, so ask a few times —
+    // but for far less than the sleeps would otherwise serve.
+    const STILL_RUNNING: &str = r"for p in /proc/[0-9]*; do tr '\0' ' ' < $p/cmdline 2>/dev/null; echo; done | grep -c 'sleep [34][71]\.[13][13]'";
+    let started = Instant::now();
+    let mut left = String::new();
+    while started.elapsed() < Duration::from_secs(3) {
+        left = String::from_utf8_lossy(&fx.output(STILL_RUNNING).await.stdout)
+            .trim()
+            .to_string();
+        if left == "0" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        left, "0",
+        "background sleeps outlived the timeout kill — their group was not signalled"
+    );
+
+    // A command that fits is answered as if no timeout had been named, and the session has
+    // survived three kills.
+    let ok = fx
+        .console
+        .exec(["sh", "-c", "sleep 0.1; echo done"], Some(5_000))
+        .await
+        .expect("a command within its timeout");
+    assert_eq!(ok.code, 0);
+    assert_eq!(ok.stdout, b"done\n");
+}
+
 /// An OCI image off a registry is a base like any other, and what it says about running a
 /// process in it reaches the process.
 ///

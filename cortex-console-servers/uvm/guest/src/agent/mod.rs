@@ -73,9 +73,15 @@
 //! a client can name any file in the guest — which is a smaller claim than it sounds,
 //! since the guest is one session's overlay and the client is the one who asked for it.
 //!
-//! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
-//! the fallback, and this agent reads both and applies neither — so a command that never
-//! ends is one this agent waits on forever, and the client waits with it.
+//! `exec.timeout_ms` is enforced by a kill; `init` carries no default. An `exec` that
+//! names no timeout is therefore unbounded — a command that never ends is one this agent
+//! waits on forever, and the client waits with it.
+//!
+//! What a timed-out command started is killed with it, and this agent is the guest's
+//! PID 1: whatever those processes were parented to, their corpses come here, and nothing
+//! here reaps a child it did not spawn — a general `waitpid(-1)` would take statuses tokio
+//! is waiting on. A guest that times out many commands is a guest with that many zombie
+//! entries, which a session's lifetime bounds.
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
@@ -87,6 +93,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
+use std::time::Duration;
 
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
@@ -94,8 +101,8 @@ use cortex::console::{
     Notification, ReadCall, ReadResp, Response, Server, WorkFsMount, WorkFsSource, WriteCall,
     WriteResp,
 };
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::process::{Child, Command};
 
 use crate::contract::{
     ABIN_PATH, COMMIT_ENV, COMMIT_PATH, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec,
@@ -530,6 +537,11 @@ fn builtin_failed(message: impl Into<String>) -> Response {
 /// One request, one answer: the command is spawned, both of its pipes are drained, and
 /// what comes back is how it ended.
 ///
+/// `timeout_ms` is a kill, as the protocol promises: the command runs in a process group
+/// of its own so that what a shell spawned goes with it, and expiry answers
+/// [`TIMED_OUT`](Error::TIMED_OUT) with nothing of the partial output — a killed command
+/// has no result to report. No timeout is no limit, and the wait is the whole command's.
+///
 /// # Where it runs
 ///
 /// Where the session stands, set per command rather than inherited. A session moves — `cd`
@@ -545,17 +557,27 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .envs(environment(session))
-        // Piped and then read by `wait_with_output`, which is what carries the output
-        // back. Input is at EOF from the start, since an `exec` carries none.
+        // Piped and then read by `run_to_end`, which is what carries the output back.
+        // Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Dropping `child` below kills and reaps the direct child, which is how a command
+        // that timed out is cleaned up after the group kill has reached what it spawned —
+        // and how one that ends this function early, by any other return, is not left
+        // running.
+        .kill_on_drop(true)
+        // Its own process group, so a `killpg` here reaches everything the command started
+        // — `sh -c 'a & b'` leaves two children of its own — and so that the group is this
+        // command's alone: the `killpg` below never reaches this agent, which as the
+        // guest's PID 1 is not a process a stray signal may end.
+        .process_group(0);
 
     if let Some(dir) = session.cwd() {
         cmd.current_dir(dir);
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let code = match e.kind() {
@@ -568,11 +590,79 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
             ));
         }
     };
+    // Taken now: a reaped child has no id, and the kill below wants the one it was born
+    // with — which is also its group's, by `process_group(0)`.
+    let pid = child.id();
 
-    // `wait_with_output` is what keeps both pipes draining while the command runs: a
-    // command that fills a pipe nobody is reading stops there, and neither of these is
-    // read anywhere else.
-    finished(child.wait_with_output().await)
+    let waited = match exec.timeout_ms {
+        None => run_to_end(&mut child).await,
+        Some(ms) => {
+            // `run_to_end` borrows the child rather than taking it, so expiry leaves
+            // `child` — alive, unkilled and unreaped — in this frame for the kill below.
+            match tokio::time::timeout(Duration::from_millis(ms), run_to_end(&mut child)).await {
+                Ok(output) => output,
+                Err(_elapsed) => {
+                    // Everything the command started is in the group the spawn put it in,
+                    // so one signal to the group ends all of it, the direct child included.
+                    // `kill_on_drop` is not what does the killing here — dropping `child`
+                    // on the way out is what reaps the leader once the signal has landed.
+                    if let Some(pid) = pid {
+                        // SAFETY: a plain libc call, and `pid` names this command's process
+                        // group and no other. It is the group id this process created with
+                        // `process_group(0)`, and it is still that group's: `timeout` only
+                        // expires while `run_to_end` is pending, and while it is pending the
+                        // direct child — the group's leader — has not been reaped (see
+                        // `run_to_end`). An unreaped process keeps its pid, running or
+                        // zombie, so the kernel cannot have handed this id to anything else.
+                        unsafe {
+                            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                        }
+                    }
+                    return Response::Error(refused(
+                        Error::TIMED_OUT,
+                        format!("killed after {ms}ms"),
+                    ));
+                }
+            }
+        }
+    };
+
+    finished(waited)
+}
+
+/// Drain both pipes to EOF, then reap the child — in that order, and the order is the point.
+///
+/// This is what `std`'s `wait_with_output` does and tokio's does not: tokio's waits and
+/// reads concurrently, reaping the direct child the moment it exits while whatever it
+/// spawned may still hold the pipes open. Reaping last keeps the direct child unreaped — a
+/// zombie, once it has exited — for as long as anything is still writing, and an unreaped
+/// process keeps its pid. Since that pid is also the id of the process group the command
+/// was spawned into, the group id stays this command's until this future completes, which
+/// is what lets [`execute`] aim a `killpg` at it after a timeout: the timeout can only fire
+/// while this is pending, and while this is pending the leader is still there.
+///
+/// Both pipes are read at once because a command that fills a pipe nobody is reading stops
+/// there, and read to EOF rather than to some size because what to keep of the result is
+/// [`finished`]'s decision, not this function's.
+async fn run_to_end(child: &mut Child) -> io::Result<Output> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (stdout, stderr) = tokio::try_join!(read_to_end(&mut stdout), read_to_end(&mut stderr))?;
+    let status = child.wait().await?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Everything a pipe has to give, or nothing from a pipe that was never opened.
+async fn read_to_end<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    if let Some(pipe) = pipe {
+        pipe.read_to_end(&mut buf).await?;
+    }
+    Ok(buf)
 }
 
 /// The environment variables an execution is given: whatever the image stated, plus the two
