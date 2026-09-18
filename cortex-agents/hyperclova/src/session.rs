@@ -41,7 +41,8 @@ pub const INSTRUCTION: &str = "\
 
 작업 순서 — 반드시 이 순서로 도구를 호출한다:
 1. recall 도구가 있으면 질문으로 recall 을 한 번 호출해 이전 결론을 확인한다.
-2. 아래 '현재 트리' 에서 판단에 필요한 파일을 고른다. 폴더 안이 더 궁금하면 ls 로 확인한다.
+2. 아래 '현재 트리' 에서 판단에 필요한 파일을 고른다. 폴더 안이 더 궁금하면 ls 로 확인한다. \
+   산출물/ 아래는 이전 실행이 남긴 결과물이라 원본 자료가 아니다. 요청이 그것을 명시하지 않으면 읽지도 인용하지도 않는다.
 3. 고른 파일을 read 로 전부 읽는다. 규정 파일(구매팀/구매규정-v7.md)은 항상 읽는다. \
    질문이 요구하는 자료(예: 여신한도, 납기 이력, 신용등급)가 🔒 표시여도 반드시 read 를 호출한다 — 거절 응답(permission_denied) 자체가 보고서의 근거다. \
    시도하지 않은 자료를 '권한 밖' 이나 '확인하지 못한 자료 없음' 으로 적는 것은 금지다.
@@ -318,6 +319,11 @@ fn walk_nodes<'a>(
 async fn tree_snapshot(fs: &AclFs<WorkFs>) -> anyhow::Result<String> {
     let mut out = String::new();
     for n in tree_nodes(fs).await? {
+        // What earlier runs wrote is not source material; the model is told so and is not
+        // shown it here.
+        if n.path == "산출물" || n.path.starts_with("산출물/") {
+            continue;
+        }
         if n.kind == "dir" {
             if n.access == "locked" {
                 out.push_str(&format!(
