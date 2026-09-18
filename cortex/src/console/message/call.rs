@@ -453,9 +453,9 @@ pub struct ExecCall {
     /// that knows what running one means — see [`split`](Self::split).
     pub cmd: Vec<String>,
 
-    /// How long this may run before the executor kills it, in milliseconds. `None`
-    /// falls back to the default the session was announced with in [`InitCall`],
-    /// and if there is none there is no limit.
+    /// How long this may run before the executor kills it, in milliseconds. `None` is
+    /// no limit: an [`InitCall`] carries no default to fall back on, so a command that
+    /// never ends and was given no timeout is one nobody ends.
     ///
     /// Expiry is a kill: no grace period, no second signal, no negotiation. One
     /// rule is worth more here than a good one — a requester cannot reach into a
