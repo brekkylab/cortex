@@ -21,10 +21,6 @@ impl Layer {
         Layer(digest)
     }
 
-    pub fn digest(&self) -> &Digest {
-        &self.0
-    }
-
     pub fn path(&self) -> PathBuf {
         home()
             .join("blobs")

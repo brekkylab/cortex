@@ -36,14 +36,6 @@ impl Image {
         Ok(Digest::of(&self.bytes()?))
     }
 
-    pub fn current_layer(&self) -> Option<&Layer> {
-        self.layers.last()
-    }
-
-    pub fn current_layer_digest(&self) -> Option<&Digest> {
-        self.current_layer().map(Layer::digest)
-    }
-
     // This image as something a machine can attach: `<into>.fsmeta.erofs`, the merged
     // metadata, and `<into>.vmdk`, the descriptor naming it and every layer behind it.
     //
@@ -98,7 +90,10 @@ impl Image {
             // Not `display`, which replaces what is not UTF-8 and hands back a name that
             // opens some other file or none.
             let at = at.to_str().ok_or_else(|| {
-                anyhow::anyhow!("{} is not UTF-8, which a descriptor cannot spell", at.display())
+                anyhow::anyhow!(
+                    "{} is not UTF-8, which a descriptor cannot spell",
+                    at.display()
+                )
             })?;
             // The format puts one extent on one line and quotes the path, and offers no
             // escape for either delimiter: a quote ends the name early and a newline starts
