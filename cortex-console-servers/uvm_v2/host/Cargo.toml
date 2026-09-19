@@ -11,9 +11,14 @@ edition.workspace = true
 name = "cortex-uvm-v2-host"
 path = "src/main.rs"
 
+[build-dependencies]
+anyhow = { workspace = true }
+
 [dependencies]
 anyhow = { workspace = true }
 # The protocol, and the rootfs declaration a build is asked for.
+# What the host leaves in the boot root for the guest to read.
+bson = { workspace = true }
 cortex = { workspace = true }
 # `kill(pid, 0)`, to ask whether the pid a leftover scratch path is named for is still alive.
 libc = { workspace = true }
@@ -23,6 +28,12 @@ microsandbox-image = { workspace = true }
 # Canonical JSON, so that an image is the same bytes whatever order its fields are declared in
 # — and therefore the same digest.
 olpc-cjson = { workspace = true }
+# `blk` for the two disks the guest overlays into a root; `net` for the virtio-net device a
+# session with a network gets.
+msb_krun = { workspace = true, features = ["blk", "net"] }
+# The network a session with one gets. Its stack runs in this process, because what
+# `VmBuilder` takes is an in-process backend object and not a socket.
+microsandbox-network = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Digests: an image is named by one, and so is every layer.

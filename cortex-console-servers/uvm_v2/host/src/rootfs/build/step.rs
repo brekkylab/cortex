@@ -90,9 +90,24 @@ pub async fn step(
             image.layers.push(Layer::new(digest));
         }
 
-        Step::Run(command) => anyhow::bail!(
-            "RUN {command:?} is a command in a guest, and a guest is not something this starts yet"
-        ),
+        // A command in a guest, and the layer it left behind. The machine is booted on the
+        // image as it stands, so what a `RUN` sees is every step before it.
+        Step::Run(command) => {
+            let argv = vec!["sh".to_string(), "-c".to_string(), command.clone()];
+            // One session with one command in it: the machine is the same machine a session
+            // boots, and what makes this a step rather than a session is that nobody else
+            // gets to ask it anything before it goes down.
+            let mut uvm = crate::session::uvm::Uvm::boot(&image, &[], crate::contract::Network::Full).await?;
+            let exit = uvm.exec(&argv, None).await?;
+            let layer = uvm.commit().await?;
+            anyhow::ensure!(
+                exit.code == 0,
+                "RUN {command:?} exited with {}:\n{}",
+                exit.code,
+                String::from_utf8_lossy(&exit.stdout)
+            );
+            image.layers.push(Layer::new(layer));
+        }
     }
 
     let bytes = image.bytes()?;

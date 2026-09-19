@@ -725,9 +725,12 @@ name = "cortex-uvm-v2-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bson",
  "cortex",
  "libc",
  "microsandbox-image",
+ "microsandbox-network",
+ "msb_krun",
  "olpc-cjson",
  "serde",
  "serde_json",

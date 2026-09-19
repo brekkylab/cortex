@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use cortex::rootfs_v2::RootFsV2;
 
 pub use build::build;
+pub use build::pull::pull;
 pub use digest::Digest;
 pub use image::Image;
 pub use layer::Layer;

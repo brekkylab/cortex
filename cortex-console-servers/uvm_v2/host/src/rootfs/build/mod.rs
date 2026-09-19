@@ -11,7 +11,7 @@
 //!
 //! A `RUN` is a command in a guest, and what starts a guest is a session.
 
-mod pull;
+pub mod pull;
 mod step;
 
 use cortex::rootfs_v2::RootFsV2;
@@ -22,6 +22,16 @@ use cortex::rootfs_v2::RootFsV2;
 /// asking twice cost a file test — so whatever names a build has to be worked out before
 /// anything is pulled, out of the declaration and the files a `COPY` reads.
 pub async fn build(rootfs: RootFsV2) -> anyhow::Result<()> {
-    let base = pull::pull(rootfs.base.as_str()).await?;
-    todo!("{} step(s) over {}", rootfs.steps.len(), base.digest()?)
+    // Where the build is run from is what it is built against: a declaration names its
+    // `COPY` sources relative to a directory it deliberately does not carry.
+    let context = std::env::current_dir()?;
+
+    let mut image = pull::pull(rootfs.base.as_str()).await?;
+    for declared in rootfs.steps {
+        eprintln!("{}: {declared}", env!("CARGO_BIN_NAME"));
+        image = step::step(image, declared, &context).await?;
+    }
+
+    println!("{}", image.digest()?);
+    Ok(())
 }
