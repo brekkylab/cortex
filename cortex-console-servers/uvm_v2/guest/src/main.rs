@@ -15,8 +15,11 @@
 //! * `exec <argv>...` — build the root, run one command, leave what it wrote behind, exit
 //!   with its status. No port, no protocol: a build step wants one answer and no session.
 
+mod boot;
 mod contract;
+mod exec;
 mod init;
+mod layer;
 mod net;
 
 use std::process::ExitCode;
@@ -40,8 +43,8 @@ fn main() -> ExitCode {
     };
 
     let outcome = match mode.as_deref() {
-        Some("boot") => agent(image),
-        Some("exec") => return exec(image, argv),
+        Some("boot") => boot::run(image),
+        Some("exec") => exec::run(image, argv),
         None => Err(anyhow::anyhow!(
             "no mode: this is started as `boot` or `exec <argv>...`"
         )),
@@ -54,19 +57,4 @@ fn main() -> ExitCode {
             ExitCode::from(NOT_EXECUTABLE)
         }
     }
-}
-
-/// Answer the host on the port it is holding, until the session ends.
-fn agent(image: contract::ImageSpec) -> anyhow::Result<()> {
-    let port = init::open_port()?;
-    todo!("the wire on {port:?}, a child process per command, stating {:?}", image.env)
-}
-
-/// Run one command and exit with what it exited with.
-fn exec(image: contract::ImageSpec, argv: impl Iterator<Item = String>) -> ExitCode {
-    todo!(
-        "{:?} stating {:?}, and what it wrote left where a commit can find it",
-        argv.collect::<Vec<_>>(),
-        image.env
-    )
 }
