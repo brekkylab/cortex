@@ -1,0 +1,38 @@
+[package]
+name = "cortex-uvm-v2"
+version.workspace = true
+edition.workspace = true
+
+# The second take on the micro-VM console server. It lives beside `uvm/` rather than
+# replacing it so the two can be built and run against the same client while this one
+# is incomplete; nothing here is shared with the first, which is the point.
+#
+# Two binaries, one package: the host half answers a console session, the guest half runs
+# inside the VM that half brings up. They are two targets rather than two modes of one
+# because they are cross-compiled apart — the guest is built for `*-unknown-linux-musl`,
+# and a host half that links a hypervisor has nothing to be there. What they agree on —
+# the wire between them, and the names they call things by — belongs in a library here,
+# built for both, once there is any.
+#
+# Each half gets a directory rather than a file under `src/bin/`, so that its own modules
+# sit beside the `main.rs` that uses them and neither half can reach into the other's by
+# accident — only through that shared library, which is the point of having one.
+
+[[bin]]
+name = "cortex-uvm-v2-host"
+path = "src/host/main.rs"
+
+[[bin]]
+name = "cortex-uvm-v2-guest"
+path = "src/guest/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+# The protocol, and nothing else this crate has a use for yet: `StdioServer` is what
+# owns this process's stdin and stdout once they are the wire. No binding feature —
+# what goes in front of a guest is a host directory, not anything cortex mounts here.
+cortex = { workspace = true }
+# `io-std` for the two descriptors the protocol is, `macros` for `#[tokio::main]`,
+# and the multi-threaded runtime it defaults to — see `host/main.rs` for why that
+# and not a current-thread one.
+tokio = { workspace = true, features = ["io-std", "macros", "rt-multi-thread"] }

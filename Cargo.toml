@@ -9,6 +9,7 @@ members = [
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",
+    "cortex-console-servers/uvm_v2",
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
