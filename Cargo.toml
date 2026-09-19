@@ -69,6 +69,7 @@ msb_krun = "0.1"
 # hypervisor — so the tree it drags in is charged to the one consumer that boots
 # a guest at all.
 microsandbox-image = "0.6.7"
+olpc-cjson = "0.1"
 
 # The userspace network stack a session with a network gets: smoltcp behind a policy engine,
 # in this process rather than in a helper anyone has to install. Only `cortex-uvm-boot`'s `vm`
