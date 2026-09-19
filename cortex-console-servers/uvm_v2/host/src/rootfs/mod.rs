@@ -24,7 +24,7 @@ pub use digest::Digest;
 pub use image::Image;
 pub use layer::Layer;
 
-fn home() -> PathBuf {
+pub fn home() -> PathBuf {
     std::env::var_os("CORTEX_UVM_HOME")
         .map(PathBuf::from)
         .or_else(|| {

@@ -15,6 +15,10 @@
 //! * `exec <argv>...` — build the root, run one command, leave what it wrote behind, exit
 //!   with its status. No port, no protocol: a build step wants one answer and no session.
 
+mod contract;
+mod init;
+mod net;
+
 use std::process::ExitCode;
 
 /// A failure of ours, not a command's — the shell's code for "found it, could not run it".
@@ -25,17 +29,23 @@ fn main() -> ExitCode {
     let mode = argv.next();
 
     // The root both modes need, before either of them can be told apart: the overlay, the
-    // pseudo-filesystems, and the pivot onto them.
-    if let Err(e) = root() {
-        eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));
-        return ExitCode::from(NOT_EXECUTABLE);
-    }
+    // pseudo-filesystems, the shares, and the pivot onto them. What comes back is what the
+    // base image states, which both modes put in front of a command.
+    let image = match init::prepare() {
+        Ok(image) => image,
+        Err(e) => {
+            eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));
+            return ExitCode::from(NOT_EXECUTABLE);
+        }
+    };
 
     let outcome = match mode.as_deref() {
-        Some("boot") => agent(),
-        Some("exec") => return exec(argv),
-        None => Err("no mode: this is started as `boot` or `exec <argv>...`".into()),
-        Some(other) => Err(format!("{other:?} is not `boot` or `exec`")),
+        Some("boot") => agent(image),
+        Some("exec") => return exec(image, argv),
+        None => Err(anyhow::anyhow!(
+            "no mode: this is started as `boot` or `exec <argv>...`"
+        )),
+        Some(other) => Err(anyhow::anyhow!("{other:?} is not `boot` or `exec`")),
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
@@ -46,20 +56,17 @@ fn main() -> ExitCode {
     }
 }
 
-/// Mount what the commands will run on, and pivot onto it.
-fn root() -> Result<(), String> {
-    todo!("the overlay, the pseudo-filesystems, and the pivot onto them")
-}
-
 /// Answer the host on the port it is holding, until the session ends.
-fn agent() -> Result<(), String> {
-    todo!("the wire, and a child process per command")
+fn agent(image: contract::ImageSpec) -> anyhow::Result<()> {
+    let port = init::open_port()?;
+    todo!("the wire on {port:?}, a child process per command, stating {:?}", image.env)
 }
 
 /// Run one command and exit with what it exited with.
-fn exec(argv: impl Iterator<Item = String>) -> ExitCode {
+fn exec(image: contract::ImageSpec, argv: impl Iterator<Item = String>) -> ExitCode {
     todo!(
-        "{:?}, and what it wrote left where a commit can find it",
-        argv.collect::<Vec<_>>()
+        "{:?} stating {:?}, and what it wrote left where a commit can find it",
+        argv.collect::<Vec<_>>(),
+        image.env
     )
 }

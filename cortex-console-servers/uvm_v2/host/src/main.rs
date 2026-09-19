@@ -11,6 +11,7 @@
 //! means `run` rather than a usage message: the common case is the one a caller does not have
 //! to spell.
 
+mod contract;
 mod rootfs;
 mod session;
 

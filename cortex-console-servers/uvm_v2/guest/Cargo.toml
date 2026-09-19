@@ -1,0 +1,28 @@
+[package]
+name = "cortex-uvm-v2-guest"
+version = "0.1.0"
+edition = "2024"
+
+# The guest half, which runs inside the micro-VM. Its own workspace root rather than a member
+# of the one above: it is cross-compiled to `*-unknown-linux-musl`, and a member would be
+# built for the host by a bare `cargo build` — for a target that has no host to run on.
+
+[workspace]
+
+[[bin]]
+name = "cortex-uvm-v2-guest"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Decoding what the host left in the boot root about the base image.
+bson = { version = "3", features = ["serde"] }
+# `mount(2)` and `pivot_root(2)` are called directly: on most images `mount` is util-linux's,
+# which drives a mount through an API the libkrun kernel rejects.
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

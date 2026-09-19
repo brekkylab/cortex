@@ -721,17 +721,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortex-uvm-v2"
+name = "cortex-uvm-v2-host"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bson",
  "cortex",
  "libc",
  "microsandbox-image",
  "olpc-cjson",
  "serde",
- "serde_bytes",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",

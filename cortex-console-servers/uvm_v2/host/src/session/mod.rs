@@ -1,5 +1,7 @@
 //! Answering a console session: the wire, and what is run at the far end of it.
 
+#[cfg(target_os = "macos")]
+mod entitlement;
 mod uvm;
 
 use std::{io, path::PathBuf};

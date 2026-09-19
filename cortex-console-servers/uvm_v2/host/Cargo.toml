@@ -1,0 +1,39 @@
+[package]
+name = "cortex-uvm-v2-host"
+version.workspace = true
+edition.workspace = true
+
+# The host half of the second take on the micro-VM console server: it answers a console
+# session, and tends the images a session boots from. Its own package rather than a binary
+# beside the guest, because the two are cross-compiled apart and share no dependency.
+
+[[bin]]
+name = "cortex-uvm-v2-host"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+# The protocol, and the rootfs declaration a build is asked for.
+cortex = { workspace = true }
+# `kill(pid, 0)`, to ask whether the pid a leftover scratch path is named for is still alive.
+libc = { workspace = true }
+# What an image is made of: `erofs` writes a layer and reads one back, `tar` reads one out of
+# what a registry sent, `tree` is what passes between them, and `registry` pulls the base.
+microsandbox-image = { workspace = true }
+# Canonical JSON, so that an image is the same bytes whatever order its fields are declared in
+# — and therefore the same digest.
+olpc-cjson = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Digests: an image is named by one, and so is every layer.
+sha2 = { workspace = true }
+tokio = { workspace = true, features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "rt-multi-thread",
+] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
