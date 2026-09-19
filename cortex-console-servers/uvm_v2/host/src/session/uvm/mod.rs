@@ -210,7 +210,7 @@ fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<St
         artifacts: None,
         scratch: None,
         console: Some(console.clone()),
-        network: Network::Disabled,
+        network,
         host_ports: Vec::new(),
         vcpus: None,
         memory_mib: None,
@@ -298,11 +298,7 @@ impl Uvm {
     ///
     /// Returns once the guest has built its root and opened the port, not merely once the
     /// machine is running — there is nothing a caller can do with the time in between.
-    pub async fn boot(
-        image: &Image,
-        mounts: &[Mount],
-        network: Network,
-    ) -> anyhow::Result<Uvm> {
+    pub async fn boot(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<Uvm> {
         use std::io::Read as _;
 
         let Started {
