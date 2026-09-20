@@ -134,11 +134,16 @@ async fn run(image: &Image, command: &str, named: &Run) -> anyhow::Result<Layer>
 
     // Published only past this, so a command that failed is one that runs again rather than a
     // failure kept under a name that says nothing about it.
+    //
+    // Both streams, and stderr last: a build tool that failed says why on stderr and leaves
+    // stdout to whatever it had been producing, so a message carrying only the one is empty
+    // in exactly the case somebody is reading it.
     anyhow::ensure!(
         exit.code == 0,
-        "RUN {command:?} exited with {}:\n{}",
+        "RUN {command:?} exited with {}:\n{}{}",
         exit.code,
-        String::from_utf8_lossy(&exit.stdout)
+        String::from_utf8_lossy(&exit.stdout),
+        String::from_utf8_lossy(&exit.stderr)
     );
     named.publish(&layer)?;
     Ok(layer)
