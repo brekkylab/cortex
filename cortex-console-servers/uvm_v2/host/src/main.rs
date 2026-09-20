@@ -35,6 +35,8 @@ const NOT_EXECUTABLE: u8 = 126;
 /// ├── rootfs/                 the image store: shared, content-addressed, kept
 /// │   ├── layers/             one EROFS per layer, named by its diff_id
 /// │   ├── fsmeta/  vmdk/      merged metadata, and the descriptor naming a stack
+/// │   ├── manifests/  tmp/    what a pull kept of a registry, and what it writes on the way
+/// │   ├── flat/               the store's other output, which nothing here asks for
 /// │   ├── images/             what this end states: a base with steps over it
 /// │   └── runs/               what a RUN left, under the image and command asked for
 /// └── session/                one directory per live server process
