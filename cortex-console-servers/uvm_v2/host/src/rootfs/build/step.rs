@@ -1,23 +1,18 @@
 use std::path::Path;
 
+use crate::rootfs::{Image, Layer, cache};
 use cortex::rootfs_v2::Step;
 use microsandbox_image::erofs::write_erofs;
 use microsandbox_image::tree::{
     DirectoryNode, FileData, FileTree, InodeMetadata, RegularFileId, RegularFileNode, SymlinkNode,
     TreeNode,
 };
-use crate::rootfs::{Digest, Image, Layer, home};
 
 pub async fn step(
     mut image: Image,
     step: Step,
     context: impl AsRef<Path>,
 ) -> anyhow::Result<Image> {
-    let root = home();
-    let blobs = root.join("blobs");
-    let scratch = root.join("tmp");
-    std::fs::create_dir_all(&scratch)?;
-
     match step {
         // In the position it was first given: saying it again changes the value and leaves
         // the variable where it was.
@@ -76,18 +71,12 @@ pub async fn step(
             tree.insert(dst.as_bytes(), node(&context.as_ref().join(&src))?)
                 .map_err(|e| anyhow::anyhow!("adding {dst}: {e:?}"))?;
 
-            let written = scratch.join(format!("{}.erofs", std::process::id()));
+            let written = cache()
+                .tmp_dir()
+                .join(format!("{}.erofs", std::process::id()));
             write_erofs(&tree, &written)
                 .map_err(|e| anyhow::anyhow!("writing the layer: {e:?}"))?;
-
-            let digest = Digest::of_file(&written)?;
-            let kept = blobs.join(format!("{}.erofs", digest.file_stem()));
-            if kept.is_file() {
-                std::fs::remove_file(&written)?;
-            } else {
-                std::fs::rename(&written, &kept)?;
-            }
-            image.layers.push(Layer::new(digest));
+            image.layers.push(Layer::publish(&written)?);
         }
 
         // A command in a guest, and the layer it left behind. The machine is booted on the
@@ -97,7 +86,8 @@ pub async fn step(
             // One session with one command in it: the machine is the same machine a session
             // boots, and what makes this a step rather than a session is that nobody else
             // gets to ask it anything before it goes down.
-            let mut uvm = crate::session::uvm::Uvm::boot(&image, &[], crate::contract::Network::Full).await?;
+            let mut uvm =
+                crate::session::uvm::Uvm::boot(&image, &[], crate::contract::Network::Full).await?;
             let exit = uvm.exec(&argv, None).await?;
             let layer = uvm.commit().await?;
             anyhow::ensure!(
@@ -106,16 +96,11 @@ pub async fn step(
                 exit.code,
                 String::from_utf8_lossy(&exit.stdout)
             );
-            image.layers.push(Layer::new(layer));
+            image.layers.push(layer);
         }
     }
 
-    let bytes = image.bytes()?;
-    let digest = Digest::of(&bytes);
-    let part = scratch.join(format!("{}.json", std::process::id()));
-    std::fs::write(&part, &bytes)?;
-    std::fs::rename(&part, blobs.join(format!("{}.json", digest.file_stem())))?;
-
+    image.store()?;
     Ok(image)
 }
 

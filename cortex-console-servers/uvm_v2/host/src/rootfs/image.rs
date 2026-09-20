@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use microsandbox_image::erofs::write_fsmeta;
 use microsandbox_image::tree::merge_layers_with_provenance;
@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use super::digest::Digest;
 use super::layer::Layer;
+use super::{cache, images};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Image {
@@ -36,14 +37,69 @@ impl Image {
         Ok(Digest::of(&self.bytes()?))
     }
 
-    // This image as something a machine can attach: `<into>.fsmeta.erofs`, the merged
-    // metadata, and `<into>.vmdk`, the descriptor naming it and every layer behind it.
+    /// Write this image out under its digest, and say what that digest is.
+    ///
+    /// Written whether or not it is already there: the bytes are the same bytes either way,
+    /// and a rename over a file that holds them costs less than the test that would skip it.
+    pub fn store(&self) -> anyhow::Result<Digest> {
+        let bytes = self.bytes()?;
+        let digest = Digest::of(&bytes);
+
+        let images = images();
+        std::fs::create_dir_all(&images)?;
+        let part = cache()
+            .tmp_dir()
+            .join(format!("{}.image.json", std::process::id()));
+        std::fs::write(&part, &bytes)?;
+        std::fs::rename(&part, images.join(format!("{}.json", digest.path_safe())))?;
+
+        Ok(digest)
+    }
+
+    /// The image `digest` names, read back.
+    pub fn load(digest: &Digest) -> anyhow::Result<Image> {
+        let held = images().join(format!("{}.json", digest.path_safe()));
+        let bytes =
+            std::fs::read(&held).map_err(|e| anyhow::anyhow!("reading {}: {e}", held.display()))?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", held.display()))
+    }
+
+    /// The digest of the stack this image is: its layers, in order, and nothing else.
+    ///
+    /// What a disk is made of is the layers, so this and not [`Image::digest`] is what names
+    /// one — two images that differ in an `ENV` are one disk, and the second of them boots on
+    /// what the first already paid for.
+    fn stack(&self) -> Digest {
+        let mut named = String::new();
+        for layer in &self.layers {
+            named.push_str(layer.digest().as_str());
+            named.push('\n');
+        }
+        Digest::of(named.as_bytes())
+    }
+
+    // This image as something a machine can attach: the merged metadata as one EROFS under
+    // `fsmeta/`, and under `vmdk/` the descriptor naming it and every layer behind it.
     //
     // The layers stay where they are. A disk is a way of reading them, not a copy of them,
     // which is what makes two images on one base cost one copy of it — and why nothing here
     // reads a layer's file data.
-    pub fn disk(&self, into: &Path) -> anyhow::Result<PathBuf> {
+    //
+    // Named by the stack rather than by the image, and kept, so a second boot on those layers
+    // finds it made. A pull writes a pair of its own under the manifest digest; this does not
+    // reach for it, because an image with a step over it needs a pair no registry can have
+    // written, and one rule that covers both is worth more than the one merge it saves.
+    pub fn disk(&self) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(!self.layers.is_empty(), "a disk needs at least one layer");
+
+        let cache = cache();
+        let stack = self.stack().oci();
+        let fsmeta = cache.fsmeta_erofs_path(&stack);
+        let disk = cache.vmdk_path(&stack);
+        if fsmeta.is_file() && disk.is_file() {
+            return Ok(disk);
+        }
 
         let mut trees = Vec::with_capacity(self.layers.len());
         let mut maps = Vec::with_capacity(self.layers.len());
@@ -59,12 +115,14 @@ impl Image {
         // inode is pointed at the right extent below.
         let (merged, provenance) = merge_layers_with_provenance(trees);
 
-        let fsmeta = into.with_extension("fsmeta.erofs");
-        if let Some(parent) = fsmeta.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        write_fsmeta(&merged, &provenance, &maps, &fsmeta)
+        // Into place before the descriptor is written, because what the descriptor names is
+        // where the metadata ended up and not where it was made.
+        let part = cache
+            .tmp_dir()
+            .join(format!("{}.fsmeta.erofs", std::process::id()));
+        write_fsmeta(&merged, &provenance, &maps, &part)
             .map_err(|e| anyhow::anyhow!("writing the merged metadata: {e:?}"))?;
+        std::fs::rename(&part, &fsmeta)?;
 
         // The order is the whole scheme: the metadata first, then the layers it points into,
         // bottom first. An inode names its layer by the index it has here.
@@ -131,8 +189,9 @@ impl Image {
         text.push_str(&format!("ddb.geometry.sectors = \"{SECTORS_PER_TRACK}\"\n"));
         text.push_str("ddb.adapterType = \"ide\"\n");
 
-        let disk = into.with_extension("vmdk");
-        std::fs::write(&disk, text)?;
+        let part = cache.tmp_dir().join(format!("{}.vmdk", std::process::id()));
+        std::fs::write(&part, text)?;
+        std::fs::rename(&part, &disk)?;
         Ok(disk)
     }
 }

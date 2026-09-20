@@ -15,7 +15,7 @@ use cortex::console::{
 };
 
 use crate::contract::{ARTIFACTS_PATH, CONTEXT_PATH, Network, SCRATCH_PATH};
-use crate::rootfs::{Image, Layer, home, pull};
+use crate::rootfs::{Image, pull};
 use uvm::Mount;
 
 pub use uvm::Uvm;
@@ -221,14 +221,7 @@ impl Session {
 
         self.image = match init.image.as_ref().map(|named| named.reference.as_str()) {
             None => None,
-            Some(named) if named.starts_with("sha256:") => {
-                let held = home()
-                    .join("blobs")
-                    .join(format!("{}.json", &named["sha256:".len()..]));
-                Some(serde_json::from_slice(&std::fs::read(&held).map_err(|e| {
-                    anyhow::anyhow!("reading {}: {e}", held.display())
-                })?)?)
-            }
+            Some(named) if named.starts_with("sha256:") => Some(Image::load(&named.parse()?)?),
             Some(named) => Some(pull(named).await?),
         };
 
@@ -293,23 +286,11 @@ impl Session {
             .image
             .clone()
             .ok_or_else(|| anyhow::anyhow!("this session named no image to commit over"))?;
-        image.layers.push(Layer::new(layer));
+        image.layers.push(layer);
         image.env = env;
         image.workdir = working_dir;
 
-        let bytes = image.bytes()?;
-        let digest = crate::rootfs::Digest::of(&bytes);
-        let scratch = home().join("tmp");
-        std::fs::create_dir_all(&scratch)?;
-        let part = scratch.join(format!("{}.json", std::process::id()));
-        std::fs::write(&part, &bytes)?;
-        std::fs::rename(
-            &part,
-            home()
-                .join("blobs")
-                .join(format!("{}.json", digest.file_stem())),
-        )?;
-        Ok(digest.to_string())
+        Ok(image.store()?.to_string())
     }
 }
 

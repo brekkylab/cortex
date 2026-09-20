@@ -4,10 +4,4 @@ cortex에서 rootfs의 역할은 딱 rootfs를 정의하는 데까지, 나머지
 
 따라서 Recipe, Dockerfile 등은 다 불필요, cortex의 `RootFs`는 매우 간단한 형태로 가능
 
-Cache 구조
-<home>/
-  blobs/<digest>.erofs    레이어
-  blobs/<digest>.json     이미지
-  cache_key                     cache key, digest(이미지) pair line들, cache key에 alphabetical order로
-
-현재 erofs를 쓰는데, 모든 레이어를 후루룩 써서, 실제로 erofs를 쓰는 이유인 layer는 막상 아무것도 안되는 상황 해결을 위해 각 run마다 krun uvm을 실행시켜서 쌓는 구조로 변경
+Cache 구조 (microsandbox-image의 GlobalCache와 동일하게)

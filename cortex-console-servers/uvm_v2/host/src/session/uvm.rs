@@ -37,7 +37,7 @@ use crate::contract::{
 /// The guest half, cross-compiled and embedded by `build.rs`. Written into every boot root,
 /// which is why the guest crate optimises for size.
 const GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cortex-uvm-v2-guest"));
-use crate::rootfs::{Digest, Image, home};
+use crate::rootfs::{Digest, Image, Layer, cache, home};
 
 /// What a machine needs on disk, made, and the process holding it, started.
 ///
@@ -65,17 +65,17 @@ fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<St
     let exe = std::env::current_exe()?;
     let bytes =
         std::fs::read(&exe).map_err(|e| anyhow::anyhow!("reading {}: {e}", exe.display()))?;
-    let name = Digest::of(&bytes).file_stem()[..16].to_string();
+    let name = Digest::of(&bytes).hex()[..16].to_string();
 
-    let cache = home().join("boot");
-    std::fs::create_dir_all(&cache)?;
-    let machine = cache.join(&name);
+    let signed = home().join("boot");
+    std::fs::create_dir_all(&signed)?;
+    let machine = signed.join(&name);
     if !machine.is_file() {
         // Written, made executable and signed at a path nothing else will pick, then
         // renamed into place — two boots racing here both do the work and the rename
         // decides which copy survives, where sharing one path would mean signing a file
         // the other was still writing.
-        let part = cache.join(format!("{name}.{}.part", std::process::id()));
+        let part = signed.join(format!("{name}.{}.part", std::process::id()));
         std::fs::write(&part, &bytes)?;
         std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o755))?;
 
@@ -136,8 +136,7 @@ fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<St
             std::process::id()
         ))
     };
-    let (lower, upper, root, socket, commit, console) = (
-        mine("lower"),
+    let (upper, root, socket, commit, console) = (
         mine("session.ext4"),
         mine("boot"),
         mine("port.sock"),
@@ -150,13 +149,12 @@ fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<St
         socket.clone(),
         commit.clone(),
         console.clone(),
-        lower.with_extension("vmdk"),
-        lower.with_extension("fsmeta.erofs"),
     ];
 
-    // The base, as one disk. The layers behind it stay where they are — this writes the
-    // merged metadata and a descriptor naming them, and nothing else.
-    let base = image.disk(&lower)?;
+    // The base, as one disk. It is not scratch and is not made here if it was made once
+    // already: the layers, the metadata merged out of them and the descriptor naming both
+    // are the store's, and what this boot owns is only what it writes over them.
+    let base = image.disk()?;
 
     // Sparse, so this is a ceiling and not an allocation: a session that writes a
     // kilobyte occupies a kilobyte. What the number bounds is how much a runaway command
@@ -418,7 +416,7 @@ impl Uvm {
     /// The guest walks its own upperdir and leaves a tar in the scratch it was given; what
     /// is here is turning that into a layer, which is the one part of it that knows what an
     /// image is.
-    pub async fn commit(&mut self) -> anyhow::Result<Digest> {
+    pub async fn commit(&mut self) -> anyhow::Result<Layer> {
         match self
             .call(Call::Commit(CommitCall {
                 id: String::new(),
@@ -449,21 +447,12 @@ impl Uvm {
         .await
         .map_err(|e| anyhow::anyhow!("reading this session's layer: {e:?}"))?;
 
-        let written = home()
-            .join("tmp")
+        let written = cache()
+            .tmp_dir()
             .join(format!("{}.erofs", std::process::id()));
         microsandbox_image::erofs::write_erofs(&tree, &written)
             .map_err(|e| anyhow::anyhow!("writing this session's layer: {e:?}"))?;
-        let digest = Digest::of_file(&written)?;
-        let kept = home()
-            .join("blobs")
-            .join(format!("{}.erofs", digest.file_stem()));
-        if kept.is_file() {
-            std::fs::remove_file(&written)?;
-        } else {
-            std::fs::rename(&written, &kept)?;
-        }
-        Ok(digest)
+        Layer::publish(&written)
     }
 }
 

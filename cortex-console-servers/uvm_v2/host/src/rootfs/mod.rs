@@ -9,6 +9,13 @@
 //! What is under [`home`] is content-addressed, which is what makes a rebuild cheap: a layer
 //! whose digest is already there is not written again, and an image whose id is already
 //! there is not built again.
+//!
+//! The shape of it is `microsandbox-image`'s, because that crate writes most of what is in
+//! there: [`cache`] is a [`GlobalCache`] over [`home`] itself, so a pulled layer lands in
+//! `layers/` under its diff_id and stays there, and the merged metadata and the descriptor
+//! naming a stack of them land in `fsmeta/` and `vmdk/` beside it. What that layout has no
+//! shelf for is an image as *this* end states it — a base with steps over it, which no
+//! registry has heard of and nothing keys by a reference — so those go under [`images`].
 
 mod build;
 mod digest;
@@ -16,8 +23,10 @@ mod image;
 mod layer;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use cortex::rootfs_v2::RootFsV2;
+use microsandbox_image::GlobalCache;
 
 pub use build::pull::pull;
 pub use digest::Digest;
@@ -31,6 +40,23 @@ pub fn home() -> PathBuf {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/cortex/rootfs"))
         })
         .expect("neither CORTEX_UVM_HOME nor HOME is set")
+}
+
+/// The store under [`home`], as the crate that writes into it sees it.
+///
+/// Opened once and held, because opening it makes the directories and a second caller has
+/// nothing to say about a failure the first would already have died of — the same reason
+/// [`home`] resolves the way it does.
+pub fn cache() -> &'static GlobalCache {
+    static CACHE: OnceLock<GlobalCache> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        GlobalCache::new(&home()).unwrap_or_else(|e| panic!("opening {}: {e}", home().display()))
+    })
+}
+
+/// Where an image's manifest is kept, named by its digest.
+pub fn images() -> PathBuf {
+    home().join("images")
 }
 
 /// Dispatch `image <command>`, where `argv` is everything after `image`.

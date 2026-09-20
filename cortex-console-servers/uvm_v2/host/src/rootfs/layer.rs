@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::os::unix::fs::FileExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use microsandbox_image::erofs::{ErofsDataMap, ErofsEntryKind, ErofsReader};
 use microsandbox_image::tree::{
@@ -9,8 +9,8 @@ use microsandbox_image::tree::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::cache;
 use super::digest::Digest;
-use super::home;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -21,10 +21,29 @@ impl Layer {
         Layer(digest)
     }
 
+    /// An EROFS just written somewhere transient, moved under the name its own bytes give it.
+    ///
+    /// A layer built here has no diff_id — nothing decompressed a tar to arrive at it — so
+    /// what names it is the image itself, which is as content-addressed as a diff_id is and
+    /// belongs in the same directory: a layer is a layer once it is written, and where it
+    /// came from is the manifest's business rather than the store's.
+    pub fn publish(written: &Path) -> anyhow::Result<Layer> {
+        let digest = Digest::of_file(written)?;
+        let kept = cache().layer_erofs_path(&digest.oci());
+        if kept.is_file() {
+            std::fs::remove_file(written)?;
+        } else {
+            std::fs::rename(written, &kept)?;
+        }
+        Ok(Layer(digest))
+    }
+
+    pub fn digest(&self) -> &Digest {
+        &self.0
+    }
+
     pub fn path(&self) -> PathBuf {
-        home()
-            .join("blobs")
-            .join(format!("{}.erofs", self.0.file_stem()))
+        cache().layer_erofs_path(&self.0.oci())
     }
 
     // What an EROFS written here holds, read back out of the finished file.
