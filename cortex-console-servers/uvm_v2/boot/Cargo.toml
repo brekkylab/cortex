@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 # The process that becomes a micro-VM. A binary and nothing else: the host never links it, it
-# embeds it — so there is no library half for the two to share and no dependency edge between
-# the packages at all.
+# spawns the file next to itself — so there is no library half for the two to share and no
+# dependency edge between the packages at all.
 #
 # # Why it is not a mode of the host
 #
@@ -27,9 +27,9 @@ edition.workspace = true
 
 # `required-features` is why a bare `cargo build` at the workspace root builds nothing here.
 # What builds this is `cortex-uvm-v2-host`'s build script, which invokes cargo again with
-# `--features vm` and embeds the result — the same shape it already uses for the guest, and
-# for the same reason: a target whose dependencies have no business in anyone else's graph is
-# built by itself.
+# `--features vm`, signs what comes out and leaves it beside the host binary — the same shape
+# it already uses for the guest, and for the same reason: a target whose dependencies have no
+# business in anyone else's graph is built by itself.
 [[bin]]
 name = "cortex-uvm-v2-boot"
 path = "src/main.rs"

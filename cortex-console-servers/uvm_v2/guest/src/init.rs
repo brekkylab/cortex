@@ -150,8 +150,8 @@ pub fn prepare() -> anyhow::Result<ImageSpec> {
 /// What the base image expects, as the host left it in the boot root.
 ///
 /// An absent file is the default rather than a failure. The only way to have one is to drive
-/// the boot role by hand — a console server writes it on every boot, and the guest binary is
-/// embedded in that same server, so the two cannot be different builds — and the default is
+/// the boot role by hand — a console server writes it on every boot, and it copies this binary
+/// into that same root from beside itself, so the two are one build's — and the default is
 /// exactly the behaviour this end had before there was a spec to read.
 ///
 /// A file that *is* there and does not decode is the other case, and that one is reported:

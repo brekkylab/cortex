@@ -1,16 +1,16 @@
 //! Answering a console session: the wire, and what is run at the far end of it.
 
-#[cfg(target_os = "macos")]
-mod entitlement;
-mod helper;
+mod halves;
 pub mod uvm;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::{io, path::PathBuf};
 
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, CommitResp, Error, ImageSource, InitCall, InitResp, Message, Notification, Response,
-    Server, TreeMount, TreeSource,
+    Call, Error, InitResp, Message, Notification, Response, Server, SnapshotResp, TreeMount,
+    TreeSource,
 };
 
 use crate::contract::{ARTIFACTS_PATH, CONTEXT_PATH, Network, SCRATCH_PATH};
@@ -19,21 +19,6 @@ use uvm::Mount;
 
 pub use uvm::Uvm;
 
-/// Marks a path on the host as this server's, and is where the owning pid starts.
-///
-/// The shape the sweep below reads back is `{PREFIX}{pid}-{seq}-{what}`: the pid says who owns
-/// the path, and the counter keeps two boots of one server apart — a `stop` and the next
-/// `start` are two images, and the first is still being deleted while the second is being
-/// formatted. Whatever ends up creating these paths has to spell them that way, or the sweep
-/// leaks exactly the files it exists to reclaim.
-///
-/// Deliberately not `cortex-uvm-`, which is the first micro-VM console server's: the two can
-/// be running at once, and each should only ever reclaim its own. The prefixes do not collide
-/// in either direction — that one's sweep strips `cortex-uvm-` from these names and finds
-/// `v2` where it wants a pid, so it skips them, and these names are the only ones this prefix
-/// matches.
-const PREFIX: &str = "cortex-uvm-v2-";
-
 /// Answer a console session on stdin and stdout, until the client ends it.
 pub async fn run() -> anyhow::Result<()> {
     // Taken for the life of the process: from here on stdout carries frames and nothing
@@ -41,108 +26,194 @@ pub async fn run() -> anyhow::Result<()> {
     // rule, and this is where it starts applying.
     let mut server = StdioServer::stdio()?;
 
-    // Then delete what a server that was killed outright left behind.
-    //
-    // A session's own values remove their files when they drop, which covers a session
-    // ending any way that runs a destructor — a `stop`, a `quit`, a process exiting on
-    // its own. What no destructor covers is `SIGKILL`, and what is lost to it is a sparse
-    // image that may hold everything a session wrote.
-    //
-    // So this sweep is the only thing that ever reclaims those, and it runs at the start
-    // of every server rather than at the end of any: a process that was killed is not one
-    // that gets to clean up, and the next one is the first thing that can.
-    //
-    // Best-effort throughout, because none of it is this session's to succeed at: a path
-    // that cannot be removed is left for the next run, which is where it already was.
-    //
-    // Both directories, because the two differ on macOS: a socket has to live under
-    // `/tmp` for its path to fit in `sockaddr_un`, where everything else uses the
-    // per-user temp directory.
-    let mut dirs = vec![std::env::temp_dir()];
-    if !dirs.contains(&PathBuf::from("/tmp")) {
-        dirs.push(PathBuf::from("/tmp"));
-    }
-    for dir in dirs {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
+    // Clean up what an earlier run did not get to.
+    if let Ok(entries) = std::fs::read_dir(sessions()) {
         for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(pid) = name
+            let Some(pid) = entry
+                .file_name()
                 .to_str()
-                .and_then(|n| n.strip_prefix(PREFIX))
-                .and_then(|rest| rest.split('-').next())
-                .and_then(|pid| pid.parse::<i32>().ok())
+                .and_then(|name| name.parse::<i32>().ok())
             else {
                 continue;
             };
-            // `kill(pid, 0)` sends no signal and only reports whether the pid could be
-            // signalled: `ESRCH` — no such process — is the one answer that means the path
-            // is abandoned, where `EPERM` says the pid is alive under another user and its
-            // files are not ours to remove.
+            // A pid comes round again, so one named for this process is a dead
+            // predecessor's — and it is the one directory that must go, since this run is
+            // about to put a session in it.
+            //
+            // Otherwise `kill(pid, 0)` sends no signal and only reports whether the pid could
+            // be signalled: `ESRCH` — no such process — is the one answer that means the
+            // directory is abandoned, where `EPERM` says the pid is alive under another user
+            // and its files are not ours to remove.
             //
             // SAFETY: signal 0 performs only that permission and existence check; it
             // cannot affect this or any other process.
-            let gone = unsafe { libc::kill(pid, 0) } == -1
-                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-            if !gone {
-                continue;
+            let stale = pid == std::process::id() as i32
+                || (unsafe { libc::kill(pid, 0) } == -1
+                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH));
+            if stale {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
-            let path = entry.path();
-            let _ = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
-            } else {
-                std::fs::remove_file(&path)
-            };
         }
     }
 
+    // What booting this session takes, worked out once at `init` and held as the thing that
+    // does it. A boot is not the only one there will be — `stop` gives the machine back and
+    // the next call that needs one takes it again — so this is an `Fn` and not an `FnOnce`,
+    // and the client says what a session is exactly once however many machines answer it.
+    #[allow(clippy::type_complexity)]
+    let mut session_factory: Option<
+        Box<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<Uvm>>>>>,
+    > = None;
     // Whatever it holds is dropped on `stop` and on the way out of this function whichever
     // way it leaves, which takes the machine down and deletes what it wrote every time.
-    let mut session = Session::default();
+    let mut session: Option<Uvm> = None;
 
     while let Some(message) = server.recv().await? {
         match message {
-            // The session is over.
-            Message::Notification(Notification::Quit) => return Ok(()),
-
-            // Booting early rather than under whichever call would have paid for it. Nothing
-            // answers this, so a failure is only said here — the next call that needs a
-            // machine tries again and tells whoever asked for it.
-            Message::Notification(Notification::Start) => {
-                if let Err(e) = session.booted().await {
-                    eprintln!("{}: booting: {e}", env!("CARGO_BIN_NAME"));
-                }
+            // If already initialized
+            Message::Request {
+                id,
+                call: Call::Init(_),
+            } if session_factory.is_some() || session.is_some() => {
+                server
+                    .respond(
+                        id,
+                        Response::Error(Error::new(
+                            Error::INVALID_REQUEST,
+                            "this session has already been told what it is",
+                        )),
+                    )
+                    .await?;
             }
 
-            Message::Notification(Notification::Stop) => session.uvm = None,
-
-            // Answered here rather than forwarded. A session's shape outlives any one
-            // machine — that is why it is `init` and not something an `exec` carries — and
-            // the machine that will be told it may not exist yet.
+            // Initialize
             Message::Request {
                 id,
                 call: Call::Init(init),
             } => {
-                let answered = match session.configure(init).await {
-                    Ok(answer) => Response::Init(answer),
+                let answered = match async {
+                    let context = at(init.context.as_ref(), "context")?;
+                    let artifacts = at(init.artifacts.as_ref(), "artifacts")?;
+                    let scratch = at(init.scratch.as_ref(), "scratch")?;
+
+                    // What the client asked for, or nothing — and nothing means no device at
+                    // all, which is the setting a sandbox should have to ask its way out of.
+                    let network = match init.network.as_ref() {
+                        Some(asked) => Network::parse(Some(&asked.reach))
+                            .map_err(|_| anyhow::anyhow!("{}: no such reach", asked.reach))?,
+                        None => Network::Disabled,
+                    };
+
+                    // A digest names something already in the store; anything else is an OCI
+                    // reference and is pulled. Both end as an `Image`, which is the only thing
+                    // a boot takes — and a boot is what this end has instead of a way to run a
+                    // command, so a session that named no rootfs is refused here rather than
+                    // taken and then refused by everything asked of it.
+                    //
+                    // TODO: only the base is realized. The steps over it are what the
+                    // declaration is for, and a session asking for them gets the base alone.
+                    let declared = init
+                        .rootfs
+                        .as_ref()
+                        .map(|rootfs| rootfs.base.as_str())
+                        .filter(|base| !base.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "a session here runs in a micro-VM, which boots on a rootfs, \
+                                 and this one named none"
+                            )
+                        })?;
+                    let image = if declared.starts_with("sha256:") {
+                        Image::load(&declared.parse()?)?
+                    } else {
+                        pull(declared).await?
+                    };
+
+                    // Where each tree is on this side, against the one path in the guest that
+                    // names it. Fixed for the session, which is why the answer below can say
+                    // them before anything is mounted.
+                    let mounts: Vec<Mount> = [
+                        (CONTEXT_PATH, context.as_ref()),
+                        (ARTIFACTS_PATH, artifacts.as_ref()),
+                        (SCRATCH_PATH, scratch.as_ref()),
+                    ]
+                    .into_iter()
+                    .filter_map(|(at, from)| {
+                        from.map(|from| Mount {
+                            at: at.to_string(),
+                            from: from.clone(),
+                        })
+                    })
+                    .collect();
+
+                    // Cloned per boot rather than borrowed, because what this closure is for
+                    // is outliving the machine it makes — and the one after a `stop` has to
+                    // start on the same disk the client named here.
+                    let snapshot = init.snapshot;
+                    let boot: Box<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<Uvm>>>>> =
+                        Box::new(move || {
+                            let (image, mounts, snapshot) =
+                                (image.clone(), mounts.clone(), snapshot.clone());
+                            Box::pin(async move {
+                                Uvm::boot(&image, &mounts, network, snapshot.as_deref()).await
+                            })
+                        });
+                    let uvm = boot().await?;
+
+                    anyhow::Ok((
+                        boot,
+                        uvm,
+                        InitResp {
+                            context: context.as_ref().map(|_| TreeMount {
+                                path: CONTEXT_PATH.to_string(),
+                            }),
+                            artifacts: artifacts.as_ref().map(|_| TreeMount {
+                                path: ARTIFACTS_PATH.to_string(),
+                            }),
+                            scratch: scratch.as_ref().map(|_| TreeMount {
+                                path: SCRATCH_PATH.to_string(),
+                            }),
+                            // Where a command starts is the tree it may write in freely, and
+                            // the context when there is no scratch.
+                            cwd: scratch
+                                .as_ref()
+                                .map(|_| SCRATCH_PATH.to_string())
+                                .or_else(|| context.as_ref().map(|_| CONTEXT_PATH.to_string())),
+                        },
+                    ))
+                }
+                .await
+                {
+                    Ok((boot, uvm, answer)) => {
+                        session_factory = Some(boot);
+                        session = Some(uvm);
+                        Response::Init(answer)
+                    }
                     Err(e) => Response::Error(refused(&e)),
                 };
                 server.respond(id, answered).await?;
             }
 
-            // Relayed like everything else and then finished here. The guest writes the
-            // layer — only it can see the upperdir — and this end turns that into an image,
-            // because only it knows what one is.
+            // Relayed like everything else and then finished here. The guest flushes what
+            // the session wrote — only it can — and the disk that lands on is this end's, so
+            // only this end can read the blob back out of it.
             Message::Request {
                 id,
-                call: Call::Commit(commit),
+                call: Call::Snapshot(_),
             } => {
-                let answered = match session.commit(commit.env, commit.working_dir).await {
-                    Ok(named) => Response::Commit(CommitResp {
-                        size: 0,
-                        image: Some(ImageSource::new(named)),
-                    }),
+                let machine = if session.is_none() {
+                    match session_factory.as_ref() {
+                        Some(boot) => boot().await.map(|uvm| session.insert(uvm)),
+                        None => Err(anyhow::anyhow!("this session has not been told what it is")),
+                    }
+                } else {
+                    Ok(session.as_mut().expect("just checked"))
+                };
+                let answered = match machine {
+                    Ok(uvm) => match uvm.snapshot().await {
+                        Ok(blob) => Response::Snapshot(SnapshotResp { blob }),
+                        Err(e) => Response::Error(refused(&e)),
+                    },
                     Err(e) => Response::Error(refused(&e)),
                 };
                 server.respond(id, answered).await?;
@@ -150,7 +221,15 @@ pub async fn run() -> anyhow::Result<()> {
 
             // Everything else is the guest's to answer.
             Message::Request { id, call } => {
-                let answered = match session.booted().await {
+                let machine = if session.is_none() {
+                    match session_factory.as_ref() {
+                        Some(boot) => boot().await.map(|uvm| session.insert(uvm)),
+                        None => Err(anyhow::anyhow!("this session has not been told what it is")),
+                    }
+                } else {
+                    Ok(session.as_mut().expect("just checked"))
+                };
+                let answered = match machine {
                     Ok(uvm) => match uvm.call(call).await {
                         // Whatever the guest said, verbatim.
                         Ok(answer) => answer,
@@ -158,7 +237,7 @@ pub async fn run() -> anyhow::Result<()> {
                             // No answer is coming, and none will for anything else on this
                             // channel either. Releasing it is what makes the next call a
                             // fresh boot rather than a second failure.
-                            session.uvm = None;
+                            session = None;
                             Response::Error(refused(&e))
                         }
                     },
@@ -166,6 +245,30 @@ pub async fn run() -> anyhow::Result<()> {
                 };
                 server.respond(id, answered).await?;
             }
+
+            // Only ever after a `stop`, since `init` leaves a machine up: what this is worth
+            // is taking one back before the call that would otherwise have paid for it.
+            // Nothing answers this, so a failure is only said here — the next call that needs
+            // a machine tries again and tells whoever asked for it.
+            Message::Notification(Notification::Start) => {
+                if session.is_none() {
+                    match session_factory.as_ref() {
+                        Some(boot) => match boot().await {
+                            Ok(uvm) => session = Some(uvm),
+                            Err(e) => eprintln!("{}: booting: {e:#}", env!("CARGO_BIN_NAME")),
+                        },
+                        None => eprintln!(
+                            "{}: booting: this session has not been told what it is",
+                            env!("CARGO_BIN_NAME")
+                        ),
+                    }
+                }
+            }
+
+            Message::Notification(Notification::Stop) => session = None,
+
+            // The session is over.
+            Message::Notification(Notification::Quit) => break,
 
             // A response answers a request, and this end makes none of its own on the
             // channel it reads.
@@ -175,122 +278,20 @@ pub async fn run() -> anyhow::Result<()> {
             ),
         }
     }
+
+    // The machine first, because what it is holding is under what goes next, and then the
+    // session's own directory — the disk a `stop` was careful to leave. A session that ends
+    // any way that runs this leaves nothing behind; one killed outright is the next server's
+    // sweep to reclaim.
+    drop(session);
+    let _ = std::fs::remove_dir_all(sessions().join(std::process::id().to_string()));
     Ok(())
 }
 
-/// What a session is here: what the client announced, and whichever machine is up.
-///
-/// The two are apart because they are wanted at different moments. What `init` carries costs
-/// nothing to hold; a machine is a process, two disks and a couple of hundred megabytes, and
-/// the point of `start` and `stop` being optional is that it may come and go underneath a
-/// session that does not change.
-#[derive(Default)]
-struct Session {
-    context: Option<PathBuf>,
-    artifacts: Option<PathBuf>,
-    scratch: Option<PathBuf>,
-    /// What the session boots on, resolved once at `init`.
-    image: Option<Image>,
-    /// How much of the network a command may reach.
-    network: Network,
-    uvm: Option<Uvm>,
-}
-
-impl Session {
-    /// Take what the client announced, and say where each tree landed.
-    ///
-    /// Answered without a machine: the shape is the session's and the machine that will be
-    /// told it may not exist yet. A second `init` replaces the first and releases whatever
-    /// was booted on the old one.
-    async fn configure(&mut self, init: InitCall) -> anyhow::Result<InitResp> {
-        self.uvm = None;
-        self.context = at(init.context.as_ref(), "context")?;
-        self.artifacts = at(init.artifacts.as_ref(), "artifacts")?;
-        self.scratch = at(init.scratch.as_ref(), "scratch")?;
-
-        // A digest names something already in the store; anything else is an OCI reference
-        // and is pulled. Both end as an `Image`, which is the only thing a boot takes.
-        // What the client asked for, or nothing — and nothing means no device at all, which
-        // is the setting a sandbox should have to ask its way out of.
-        self.network = match init.network.as_ref() {
-            Some(asked) => Network::parse(Some(&asked.reach))
-                .map_err(|_| anyhow::anyhow!("{}: no such reach", asked.reach))?,
-            None => Network::Disabled,
-        };
-
-        self.image = match init.image.as_ref().map(|named| named.reference.as_str()) {
-            None => None,
-            Some(named) if named.starts_with("sha256:") => Some(Image::load(&named.parse()?)?),
-            Some(named) => Some(pull(named).await?),
-        };
-
-        Ok(InitResp {
-            context: self.context.as_ref().map(|_| TreeMount { path: CONTEXT_PATH.to_string() }),
-            artifacts: self.artifacts.as_ref().map(|_| TreeMount { path: ARTIFACTS_PATH.to_string() }),
-            scratch: self.scratch.as_ref().map(|_| TreeMount { path: SCRATCH_PATH.to_string() }),
-            // Where a command starts is the tree it may write in freely, and the context
-            // when there is no scratch.
-            cwd: self
-                .scratch
-                .as_ref()
-                .map(|_| SCRATCH_PATH.to_string())
-                .or_else(|| self.context.as_ref().map(|_| CONTEXT_PATH.to_string())),
-            image: self
-                .image
-                .as_ref()
-                .and_then(|image| image.digest().ok())
-                .map(|digest| ImageSource::new(digest.to_string())),
-            network: init.network,
-        })
-    }
-
-    /// The machine this session is running on, booted if it is not up.
-    async fn booted(&mut self) -> anyhow::Result<&mut Uvm> {
-        if self.uvm.is_none() {
-            let image = self
-                .image
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("this session named no image to boot"))?;
-
-            let mut mounts = Vec::new();
-            for (at, from) in [
-                (CONTEXT_PATH, self.context.as_ref()),
-                (ARTIFACTS_PATH, self.artifacts.as_ref()),
-                (SCRATCH_PATH, self.scratch.as_ref()),
-            ] {
-                if let Some(from) = from {
-                    mounts.push(Mount {
-                        at: at.to_string(),
-                        from: from.clone(),
-                    });
-                }
-            }
-            self.uvm = Some(Uvm::boot(image, &mounts, self.network).await?);
-        }
-        Ok(self.uvm.as_mut().expect("just booted"))
-    }
-
-    /// What the session wrote, as an image of its own.
-    ///
-    /// The layer is the guest's and the image is this end's: the two halves of a commit, and
-    /// neither knows what the other holds.
-    async fn commit(
-        &mut self,
-        env: Vec<String>,
-        working_dir: Option<String>,
-    ) -> anyhow::Result<String> {
-        let layer = self.booted().await?.commit().await?;
-
-        let mut image = self
-            .image
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("this session named no image to commit over"))?;
-        image.layers.push(layer);
-        image.env = env;
-        image.workdir = working_dir;
-
-        Ok(image.store()?.to_string())
-    }
+/// Where this server keeps its sessions: one directory apiece, named by the pid of the
+/// process that owns it. See [`crate::home`] for what is under one.
+fn sessions() -> PathBuf {
+    crate::home().join("session")
 }
 
 /// A host directory a tree names, and `None` for one the session did not name.

@@ -1,14 +1,24 @@
-//! Build the two halves this binary carries inside it, and leave them where it can
-//! `include_bytes!` them.
+//! Build the two halves this one cannot build itself, and leave them beside it.
 //!
-//! | | target | why it is embedded |
+//! | | target | what it is |
 //! |---|---|---|
 //! | `cortex-uvm-v2-guest` | `<arch>-unknown-linux-musl` | it runs *inside* the VM |
-//! | `cortex-uvm-v2-boot` | this host | it is what gets signed and run *as* the VM |
+//! | `cortex-uvm-v2-boot` | this host, signed here | it is what gets run *as* the VM |
 //!
-//! Embedding rather than shipping either alongside is what keeps the host a single file: it
-//! writes the guest into the boot root it just made, and the boot binary into a cache where it
-//! signs it, so there is nothing to install, find or version-match at run time.
+//! Both land next to the binary cargo is building — `target/<profile>/`, the directory
+//! `OUT_DIR` sits three levels under — so that a `cargo build` of the host produces all three
+//! files at once and the host can find either of them by looking next to itself. See
+//! [`session::halves`](../src/session/halves.rs) for the other end of that.
+//!
+//! # Beside rather than inside
+//!
+//! Both could be `include_bytes!`d instead, which would make the host one file. What that
+//! costs is a copy of each on the way to every boot, a host binary that carries two
+//! executables it never runs itself, and — for the boot half — a signature that cannot be
+//! applied until run time, because bytes in a `.rodata` section are not a file anything can
+//! `codesign`. Three files that ship together is the cheaper arrangement: the boot half is
+//! signed once, here, and a boot root gets the guest by copying a file rather than by
+//! writing a few megabytes out of this binary's own image.
 //!
 //! # A cargo of its own for each, and why
 //!
@@ -27,6 +37,18 @@
 //! Each nested build gets a target directory of its own under `OUT_DIR` and none of this
 //! build's flags. A shared target directory would deadlock on cargo's own lock, and inherited
 //! `RUSTFLAGS` or a `RUSTC_WRAPPER` would be applied to a target they were not chosen for.
+//!
+//! # What this needs installed
+//!
+//! The musl target, and nothing else:
+//!
+//! ```sh
+//! rustup target add aarch64-unknown-linux-musl   # or x86_64-…, matching the host
+//! ```
+//!
+//! A build without it fails here with that line in the message, rather than later with a
+//! guest that will not start. `CORTEX_UVM_V2_GUEST_BIN` and `CORTEX_UVM_V2_BOOT_BIN` name a
+//! file to place instead of building one, for a caller who builds either half some other way.
 
 use std::{
     path::{Path, PathBuf},
@@ -35,21 +57,39 @@ use std::{
 
 fn main() -> anyhow::Result<()> {
     println!("cargo::rerun-if-changed=build.rs");
-    guest()?;
-    boot()
+    let beside = beside()?;
+    guest(&beside)?;
+    boot(&beside)
 }
 
-/// Cross-compile the guest half and leave it in `OUT_DIR`.
-fn guest() -> anyhow::Result<()> {
-    let out = PathBuf::from(std::env::var("OUT_DIR")?).join("cortex-uvm-v2-guest");
+/// Where cargo is putting this crate's binaries: `OUT_DIR` is
+/// `<target>/<profile>/build/<pkg>-<hash>/out`, so the profile directory is three up.
+///
+/// Derived rather than asked for, because cargo tells a build script where its own output
+/// goes and nothing else — there is no variable naming the directory the linked binary lands
+/// in, and reconstructing it from `CARGO_TARGET_DIR`, the profile name and a `--target` that
+/// may or may not have been passed is the same answer with more ways to be wrong.
+fn beside() -> anyhow::Result<PathBuf> {
+    let out = PathBuf::from(std::env::var("OUT_DIR")?);
+    out.ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            anyhow::anyhow!("OUT_DIR {} is not inside a target directory", out.display())
+        })
+}
+
+/// Cross-compile the guest half and leave it beside this binary.
+fn guest(beside: &Path) -> anyhow::Result<()> {
+    let out = beside.join("cortex-uvm-v2-guest");
 
     // A binary already built, for anyone who would rather not wait for a nested build on
     // every change to this half.
-    println!("cargo::rerun-if-env-changed=CORTEX_UVM_GUEST_BIN");
-    if let Some(prebuilt) = std::env::var_os("CORTEX_UVM_GUEST_BIN") {
+    println!("cargo::rerun-if-env-changed=CORTEX_UVM_V2_GUEST_BIN");
+    if let Some(prebuilt) = std::env::var_os("CORTEX_UVM_V2_GUEST_BIN") {
         let prebuilt = PathBuf::from(prebuilt);
         println!("cargo::rerun-if-changed={}", prebuilt.display());
-        return place(&prebuilt, &out);
+        return place(&prebuilt, &out, false);
     }
 
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?)
@@ -76,8 +116,8 @@ fn guest() -> anyhow::Result<()> {
     };
     let target_dir = PathBuf::from(std::env::var("OUT_DIR")?).join("guest");
 
-    // `--release` because these bytes are embedded and then written into a boot root on the
-    // way to every boot, so their size is paid more than once.
+    // `--release` because this file is copied into a boot root on the way to every boot, so
+    // its size is paid more than once.
     let status = cargo(&crate_dir, &target_dir)
         .args(["build", "--release", "--target", target])
         .status()
@@ -89,21 +129,23 @@ fn guest() -> anyhow::Result<()> {
     );
 
     let built: &Path = &target_dir.join(format!("{target}/release/cortex-uvm-v2-guest"));
-    place(built, &out)
+    place(built, &out, false)
 }
 
-/// Build the boot half for *this* host and leave it in `OUT_DIR`.
+/// Build the boot half for *this* host, sign it, and leave it beside this binary.
 ///
-/// `--release` because these bytes are embedded and then written out and signed on the way to
-/// a boot, so their size is paid more than once.
-fn boot() -> anyhow::Result<()> {
-    let out = PathBuf::from(std::env::var("OUT_DIR")?).join("cortex-uvm-v2-boot");
+/// `--release` because it is spawned on the way to every boot and a debug VMM is slower to
+/// load for no gain in a half nothing steps through.
+fn boot(beside: &Path) -> anyhow::Result<()> {
+    let out = beside.join("cortex-uvm-v2-boot");
 
     println!("cargo::rerun-if-env-changed=CORTEX_UVM_V2_BOOT_BIN");
     if let Some(prebuilt) = std::env::var_os("CORTEX_UVM_V2_BOOT_BIN") {
         let prebuilt = PathBuf::from(prebuilt);
         println!("cargo::rerun-if-changed={}", prebuilt.display());
-        return place(&prebuilt, &out);
+        // Signed like a built one: what a boot needs is an entitlement, and where the file
+        // came from does not change that.
+        return place(&prebuilt, &out, true);
     }
 
     let crate_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?)
@@ -125,13 +167,76 @@ fn boot() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("running cargo in {}: {e}", crate_dir.display()))?;
     anyhow::ensure!(status.success(), "building cortex-uvm-v2-boot failed");
 
-    place(&target_dir.join("release/cortex-uvm-v2-boot"), &out)
+    place(&target_dir.join("release/cortex-uvm-v2-boot"), &out, true)
 }
 
-fn place(built: &Path, out: &Path) -> anyhow::Result<()> {
-    std::fs::copy(built, out)
-        .map(|_| ())
-        .map_err(|e| anyhow::anyhow!("copying {} to {}: {e}", built.display(), out.display()))
+/// Put `built` at `out`, signing it on the way if it is the half that needs it.
+///
+/// Through a temporary name in the same directory and a rename, for two reasons. A rename is
+/// atomic, so a host looking beside itself never finds a half-written file or one that is not
+/// signed yet; and it replaces the *name* rather than the bytes, so a boot spawned from the
+/// previous build goes on running its own inode instead of having a copy land on top of an
+/// executable that is currently mapped.
+fn place(built: &Path, out: &Path, sign_it: bool) -> anyhow::Result<()> {
+    let part = out.with_extension(format!("{}.part", std::process::id()));
+    std::fs::copy(built, &part)
+        .map_err(|e| anyhow::anyhow!("copying {} to {}: {e}", built.display(), part.display()))?;
+
+    if sign_it
+        && cfg!(target_os = "macos")
+        && let Err(e) = sign(&part)
+    {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+
+    std::fs::rename(&part, out)
+        .map_err(|e| anyhow::anyhow!("renaming {} to {}: {e}", part.display(), out.display()))
+}
+
+// Creating a VM through Hypervisor.framework needs `com.apple.security.hypervisor`, and
+// libkrun `dlopen`s libkrunfw, which needs library validation off. Both are carried by a code
+// signature, and `cargo build` produces an unsigned binary — so the boot half is signed here,
+// after the nested build that linked it and before anything can spawn it. Entitlements are
+// read at `exec`, so this has to happen to the file and cannot be done to a running process.
+const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.hypervisor</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
+"#;
+
+/// Sign `binary` ad-hoc with the entitlements a boot needs.
+///
+/// Ad-hoc — `-s -` — because the entitlements are what matters and who signed them is not
+/// checked on the machine that runs them. Which is also why signing belongs to whoever builds
+/// this and not to whoever runs it: a console server is started by a test, an agent runtime
+/// or a CLI, and an entitlement is a property of the process that calls `hv_vm_create` rather
+/// than of the product around it.
+fn sign(binary: &Path) -> anyhow::Result<()> {
+    let plist = binary.with_extension("entitlements.plist");
+    std::fs::write(&plist, ENTITLEMENTS)?;
+
+    let signed = Command::new("codesign")
+        .args(["-s", "-", "--force", "--entitlements"])
+        .arg(&plist)
+        .arg(binary)
+        .status();
+    let _ = std::fs::remove_file(&plist);
+
+    let signed = signed?;
+    anyhow::ensure!(
+        signed.success(),
+        "codesign of {} failed ({signed}) — without the hypervisor entitlement a boot cannot \
+         create a VM",
+        binary.display()
+    );
+    Ok(())
 }
 
 /// A cargo to run in `crate_dir`, with a target directory of its own and none of this build's

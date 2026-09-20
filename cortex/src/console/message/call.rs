@@ -396,69 +396,6 @@ impl std::fmt::Display for TreeRole {
     }
 }
 
-/// The base a session's commands run in, named as an OCI image.
-///
-/// # A reference, and nothing around it
-///
-/// ```
-/// # use cortex::console::ImageSource;
-/// ImageSource::from("python:3.13-slim");
-/// ImageSource::new("ghcr.io/org/tool@sha256:2f0e…");
-/// ```
-///
-/// A reference converts, so a caller with nothing to say beyond the name passes the name:
-/// `.image("python:3.13-slim")`.
-///
-/// The grammar is the registries' own: an optional host, a repository, and a tag or a digest.
-/// No scheme is put in front of it, because a reference already says where it comes from and
-/// `oci://` in front of a string everybody already types would be friction buying nothing.
-///
-/// # What is asked for is what is given
-///
-/// A server provides this base or refuses the session, the same way it treats a
-/// [`NetworkAccess`] or a [`TreeSource`]. A reference it can parse but not fetch is a
-/// different matter: pulling an image is slow enough that it belongs to a boot rather than
-/// to `init`, so a name that resolves to nothing is heard from the first call that needs a
-/// guest. A client that wants it sooner calls
-/// [`Console::start`](crate::console::Console::start).
-///
-/// # Why an object holding one member
-///
-/// The same reason [`TreeSource`] is one. A platform, a pull policy, a place to put
-/// credentials: each is a thing that could be said about an image, and each belongs beside the
-/// reference rather than encoded into it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ImageSource {
-    /// The OCI reference, as the registries spell one.
-    pub reference: String,
-}
-
-impl ImageSource {
-    pub fn new(reference: impl Into<String>) -> Self {
-        ImageSource {
-            reference: reference.into(),
-        }
-    }
-}
-
-/// So a caller who has a reference and nothing to say about it writes the reference.
-///
-/// Nothing is checked here, which is the same as [`new`](ImageSource::new) and for the same
-/// reason: whether a string is a reference is the server's to answer, and there is one place
-/// that answers it. A convenience that validated would be a second one, disagreeing with the
-/// first the day a registry's grammar moves.
-impl From<&str> for ImageSource {
-    fn from(reference: &str) -> Self {
-        ImageSource::new(reference)
-    }
-}
-
-impl From<String> for ImageSource {
-    fn from(reference: String) -> Self {
-        ImageSource::new(reference)
-    }
-}
-
 /// How much of a network a session's commands may reach.
 ///
 /// # The name is the reach

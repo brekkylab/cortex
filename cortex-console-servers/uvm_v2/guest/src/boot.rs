@@ -85,7 +85,6 @@
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
 
-
 use std::ffi::OsString;
 use std::io::{self, SeekFrom};
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -96,8 +95,8 @@ use std::time::Duration;
 
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, CommitResp, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message,
-    Notification, ReadCall, ReadResp, Response, Server, TreeMount, TreeRole, TreeSource, WriteCall,
+    Call, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message, Notification,
+    ReadCall, ReadResp, Response, Server, SnapshotResp, TreeMount, TreeRole, TreeSource, WriteCall,
     WriteResp,
 };
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
@@ -248,20 +247,25 @@ async fn serve(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
                     server.respond(id, answered).await?;
                 }
 
-                Call::Commit(_) => {
-                    // On a blocking thread: walking the upperdir and archiving it is as big
-                    // as what the session wrote, and doing it here would stop this task
-                    // reading the channel — so an `exec` already in flight could not be
-                    // answered and a `stop` could not even arrive.
+                // Answered with an empty blob, because the snapshot is a disk this end
+                // cannot read: the session's writes live on `/dev/vda`, and the file behind
+                // that device is the host's. What is this end's is getting them *onto* it —
+                // see [`SnapshotPlan`].
+                Call::Snapshot(_) => {
+                    // On a blocking thread: a sync waits on every dirty page the session
+                    // wrote, and archiving an upperdir is as big as what it holds. Either
+                    // one here would stop this task reading the channel — so an `exec`
+                    // already in flight could not be answered and a `stop` could not even
+                    // arrive.
                     let outcome = match session.boot() {
                         Ok(()) => {
-                            let plan = commit_plan(&session);
+                            let plan = snapshot_plan(&session);
                             tokio::task::spawn_blocking(move || plan.run())
                                 .await
                                 .unwrap_or_else(|e| {
                                     Response::Error(refused(
                                         Error::IO_FAILED,
-                                        format!("writing this session's layer: {e}"),
+                                        format!("flushing this session's writes: {e}"),
                                     ))
                                 })
                         }
@@ -373,13 +377,6 @@ impl Session {
             artifacts: self.artifacts.as_deref().map(placed),
             scratch: self.scratch.as_deref().map(placed),
             cwd: self.named_cwd(),
-            // Nothing to say: this agent is running *inside* the base and never heard which
-            // one it is. The answer the client sees is the console server's, one boot up.
-            image: None,
-            // Not this end's to say. What it has is an interface or no interface; which reach
-            // that interface is behind is a policy on the far side of the device, and the host
-            // is what answers the client about it.
-            network: None,
         })
     }
 
@@ -938,13 +935,14 @@ fn file_error(e: io::Error, path: &str) -> Error {
     refused(code, format!("{path}: {e}"))
 }
 
-/// Everything a commit needs to know, worked out while the session is still in hand.
+/// Everything flushing this session's writes needs to know, worked out while the session is
+/// still in hand.
 ///
-/// Separated from the writing so that the writing can be handed to a thread: what it takes is
-/// a few paths, where a [`Session`] is neither `Send` nor something to hold across one.
-enum CommitPlan {
-    /// Nothing was arranged for this at boot, so there is nothing to do but say so.
-    NotCommittable,
+/// Separated from the doing so that the doing can be handed to a thread: what it takes is a
+/// few paths, where a [`Session`] is neither `Send` nor something to hold across one.
+enum SnapshotPlan {
+    /// No layer was arranged for at boot, so the disk is the whole of what there is to flush.
+    DiskOnly,
     Write {
         into: PathBuf,
         excluded: Vec<PathBuf>,
@@ -952,43 +950,43 @@ enum CommitPlan {
     },
 }
 
-impl CommitPlan {
-    /// Write this session's layer where the host can read it.
+impl SnapshotPlan {
+    /// Put this session's writes where the host can read them.
     ///
-    /// The answer carries no image, because this end has no idea what one is: it has written a
-    /// tar and that is the whole of what it knows. The console server turns it into one.
+    /// The answer carries no blob, because what the host reads is the disk behind
+    /// `/dev/vda` and this end holds no file for it. What it can do is make sure every
+    /// write has reached that device, which is what a `sync` is for here.
     fn run(self) -> Response {
-        let CommitPlan::Write {
+        if let SnapshotPlan::Write {
             into,
             excluded,
             mount_points,
         } = self
-        else {
+            && let Err(e) =
+                crate::layer::write(Path::new(UPPER_DIR), &into, &excluded, &mount_points)
+        {
             return Response::Error(refused(
-                Error::INVALID_REQUEST,
-                "this session was not booted able to commit",
-            ));
-        };
-        match crate::layer::write(Path::new(UPPER_DIR), &into, &excluded, &mount_points) {
-            // No image: this end wrote a tar and has no idea what an image is. The console
-            // server fills that in on the way past — see `CommitResp`.
-            Ok(size) => Response::Commit(CommitResp { size, image: None }),
-            Err(e) => Response::Error(refused(
                 Error::IO_FAILED,
                 format!("writing this session's layer: {e}"),
-            )),
+            ));
         }
+
+        // Every dirty page down to the block device before anything on the other side of it
+        // reads the file it is backed by. Without this a snapshot is whatever of the session
+        // happened to have been written back.
+        unsafe { libc::sync() };
+        Response::Snapshot(SnapshotResp { blob: Vec::new() })
     }
 }
 
-/// What this session would commit, and where.
+/// What this session would leave behind, and where.
 ///
-/// A commit needs two things arranged while booting — the root holding this overlay's upper,
-/// and somewhere to write the result — and a session that did not say it might commit has
-/// neither. It cannot be given them now, so it is told rather than half-answered.
-fn commit_plan(session: &Session) -> CommitPlan {
+/// A layer needs two things arranged while booting — the root holding this overlay's upper,
+/// and somewhere to write the result — and a session that did not say it might be built into
+/// an image has neither. The disk is flushed either way, which is what a snapshot is.
+fn snapshot_plan(session: &Session) -> SnapshotPlan {
     let Ok(scratch) = std::env::var(COMMIT_ENV) else {
-        return CommitPlan::NotCommittable;
+        return SnapshotPlan::DiskOnly;
     };
 
     // Everything the console server and this agent put in the session's own filesystem. None
@@ -1013,7 +1011,7 @@ fn commit_plan(session: &Session) -> CommitPlan {
         .map(|path| vec![inside_upper(path)])
         .unwrap_or_default();
 
-    CommitPlan::Write {
+    SnapshotPlan::Write {
         into: Path::new(&scratch).join(LAYER_TAR),
         excluded,
         mount_points,

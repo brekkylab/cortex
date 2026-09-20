@@ -7,9 +7,9 @@
 //!
 //! The second is the signature. Creating a VM through Hypervisor.framework needs an
 //! entitlement, an entitlement is carried by a code signature, and a signature is read at
-//! `exec` — so the process that creates a VM can never be the process that decided to. The
-//! host writes this binary out of itself, signs the copy and spawns it; what gets signed is
-//! therefore this, which links a VMM and a network stack and nothing else, rather than the
+//! `exec` — so the process that creates a VM can never be the process that decided to. This
+//! binary is signed where it is built and spawned as a file beside the host; what gets signed
+//! is therefore this, which links a VMM and a network stack and nothing else, rather than the
 //! host, which links an image store, a registry client and a console server.
 //!
 //! Everything below comes off the command line, which [`contract::BootArgs`] spells out.

@@ -52,8 +52,8 @@ use crate::{
     console::{
         base::{Client, Failure},
         message::{
-            Call, ExecCall, ExecResp, ImageSource, InitCall, NetworkAccess, Notification, ReadCall,
-            ReadResp, Response, TreeMount, TreeRole, TreeSource, WriteCall, WriteResp,
+            Call, ExecCall, ExecResp, InitCall, NetworkAccess, Notification, ReadCall, ReadResp,
+            Response, TreeMount, TreeRole, TreeSource, WriteCall, WriteResp,
         },
         stdio::StdioClient,
     },
@@ -392,13 +392,6 @@ pub struct Console {
     /// Room for this session to work in, and where it starts — `None` when the caller
     /// named none.
     scratch: Option<Tree>,
-
-    /// The base in force, as the server answered at `init`.
-    image: Option<ImageSource>,
-
-    /// What the session's commands can reach, as the server answered at `init` — `None` from a
-    /// server that would not say.
-    network: Option<NetworkAccess>,
 }
 
 impl Console {
@@ -466,8 +459,6 @@ impl Console {
             context: placed(TreeRole::Context, context_mount, answered.context)?,
             artifacts: placed(TreeRole::Artifacts, artifacts_mount, answered.artifacts)?,
             scratch: placed(TreeRole::Scratch, scratch_mount, answered.scratch)?,
-            image: answered.image,
-            network: answered.network,
         })
     }
 
@@ -531,29 +522,6 @@ impl Console {
     /// [`scratch_path`](Self::scratch_path).
     pub fn has_scratch(&self) -> bool {
         self.scratch.is_some()
-    }
-
-    /// The base this session's commands run in, as the server answered.
-    ///
-    /// The [`ConsoleBuilder::image`] that was asked for, in the server's own spelling: a
-    /// reference naming no registry names a default one, and this is where a client sees which.
-    /// Worth reading when nothing was asked, since the base is then the server's own choice.
-    ///
-    /// `None` is a base with no reference to give — a server that will not say, or one whose
-    /// commands do not run in an image at all.
-    pub fn image(&self) -> Option<&ImageSource> {
-        self.image.as_ref()
-    }
-
-    /// What this session's commands can reach, as the server answered.
-    ///
-    /// The reach [`ConsoleBuilder::network`] asked for, when it asked — a server gives that or
-    /// refuses, so a console that exists is one that got it. Worth reading when nothing was
-    /// asked: the reach is then the server's own choice, and this is where it says which.
-    ///
-    /// `None` is a server that would not say, which is every server built before it could.
-    pub fn network(&self) -> Option<&NetworkAccess> {
-        self.network.as_ref()
     }
 
     /// Boot the far end now, to hide the cold start.

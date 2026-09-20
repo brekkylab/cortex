@@ -8,9 +8,10 @@ edition.workspace = true
 # beside the guest, because the two are cross-compiled apart and share nothing but the
 # contract in `cortex-uvm-v2-common`.
 #
-# It links no hypervisor. `cortex-uvm-v2-boot` is what holds one, and this package carries it
-# as embedded bytes rather than as a dependency — see `src/session/helper.rs`. So the VMM and
-# the network stack behind it are absent from this graph rather than merely unreached in it.
+# It links no hypervisor. `cortex-uvm-v2-boot` is what holds one, and this package's build
+# script builds it — and the guest — as separate files beside this binary rather than taking
+# either as a dependency. So the VMM and the network stack behind it are absent from this
+# graph rather than merely unreached in it. See `src/session/halves.rs`.
 
 [[bin]]
 name = "cortex-uvm-v2-host"

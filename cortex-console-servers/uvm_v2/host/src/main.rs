@@ -2,9 +2,9 @@
 //!
 //! Reads requests on stdin and writes answers on stdout, per [`cortex::console`]; what it
 //! does with one is to run it inside a micro-VM. The VM is not in this process: a session
-//! spawns `cortex-uvm-v2-boot`, a signed copy of a binary this one carries inside it, and
-//! talks to the guest down a socket that boot turns into a console port. See
-//! `session::helper` for why the hypervisor is somewhere else.
+//! spawns `cortex-uvm-v2-boot`, the signed binary sitting beside this one, and talks to the
+//! guest down a socket that boot turns into a console port. See `session::halves` for why
+//! the hypervisor is somewhere else and how the three files find each other.
 //!
 //! # Two things to be, and a session is the default
 //!
@@ -21,10 +21,41 @@ mod session;
 // module of its own.
 pub(crate) use cortex_uvm_v2_common::contract;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// A failure of ours, not a command's — the shell's code for "found it, could not run it".
 const NOT_EXECUTABLE: u8 = 126;
+
+/// Everything this server keeps on disk, under one root — `$CORTEX_UVM_HOME`, or
+/// `$HOME/.cache/cortex`.
+///
+/// ```text
+/// {home}/
+/// ├── rootfs/                 the image store: shared, content-addressed, kept
+/// │   ├── layers/             one EROFS per layer, named by its diff_id
+/// │   ├── fsmeta/  vmdk/      merged metadata, and the descriptor naming a stack
+/// │   └── images/             what this end states: a base with steps over it
+/// └── session/                one directory per live server process
+///     └── {pid}/
+///         ├── session.ext4    what the session wrote — outlives any one machine
+///         └── machine/        what only makes sense while one is up
+///             ├── boot/       the root libkrun hands over: guest binary, image spec
+///             ├── port.sock   the console channel
+///             ├── commit/     where the guest leaves a layer
+///             └── console.log the kernel's own output
+/// ```
+///
+/// Split by lifetime rather than by who wrote it, which is what makes each level's cleanup
+/// one call: a `stop` removes `machine/`, the end of a session removes `{pid}/`, and nothing
+/// removes `rootfs/` because a rebuild is what it exists to make cheap. One variable moves
+/// all of it, which is what a test that wants none of it near a real cache needs.
+pub(crate) fn home() -> PathBuf {
+    std::env::var_os("CORTEX_UVM_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/cortex")))
+        .expect("neither CORTEX_UVM_HOME nor HOME is set")
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {

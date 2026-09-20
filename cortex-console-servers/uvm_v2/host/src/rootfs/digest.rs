@@ -25,11 +25,6 @@ impl Digest {
         &self.0
     }
 
-    /// The hash on its own, without the algorithm that produced it.
-    pub fn hex(&self) -> &str {
-        self.0.split_once(':').map_or(&self.0, |(_, hex)| hex)
-    }
-
     /// The same digest as the image crate spells it.
     ///
     /// Nothing is converted: the two types hold the same two strings, and this exists because

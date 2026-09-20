@@ -87,7 +87,8 @@ pub async fn step(
             // boots, and what makes this a step rather than a session is that nobody else
             // gets to ask it anything before it goes down.
             let mut uvm =
-                crate::session::uvm::Uvm::boot(&image, &[], crate::contract::Network::Full).await?;
+                crate::session::uvm::Uvm::boot(&image, &[], crate::contract::Network::Full, None)
+                    .await?;
             let exit = uvm.exec(&argv, None).await?;
             let layer = uvm.commit().await?;
             anyhow::ensure!(

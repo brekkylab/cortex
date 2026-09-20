@@ -11,13 +11,13 @@
 //! **Nothing here holds a hypervisor.** What this module does is make what a machine needs on
 //! disk, spawn `cortex-uvm-v2-boot` over it, and talk to the guest down a socket that boot
 //! turned into a console port. The VMM, the network stack and the entitlement they need are
-//! all in that other binary — see [`helper`](super::helper) for what puts a copy of it
-//! somewhere runnable, and [`BootArgs`] for the whole of what this end tells it.
+//! all in that other binary — see [`halves`](super::halves) for where it and the guest are
+//! found, and [`BootArgs`] for the whole of what this end tells it.
 
 use std::path::{Path, PathBuf};
 
 use cortex::console::{
-    Call, CommitCall, ExecCall, Message, Response,
+    Call, ExecCall, Message, Response, SnapshotCall,
     stdio::{read, write},
 };
 use microsandbox_image::ext4::{Ext4FormatOptions, format_ext4};
@@ -26,10 +26,6 @@ use crate::contract::{
     ARTIFACTS_PATH, BaseFormat, BootArgs, CONTEXT_PATH, GUEST_BIN_PATH, HANDSHAKE, IMAGE_SPEC_PATH,
     ImageSpec, LAYER_TAR, Network, SCRATCH_PATH,
 };
-
-/// The guest half, cross-compiled and embedded by `build.rs`. Written into every boot root,
-/// which is why the guest crate optimises for size.
-const GUEST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cortex-uvm-v2-guest"));
 use crate::rootfs::{Image, Layer, cache};
 
 /// What a machine needs on disk, made, and the process holding it, started.
@@ -39,72 +35,80 @@ use crate::rootfs::{Image, Layer, cache};
 struct Started {
     machine: std::process::Child,
     listener: std::os::unix::net::UnixListener,
-    scratch: Vec<PathBuf>,
+    dir: PathBuf,
     commit: PathBuf,
     console: PathBuf,
 }
 
-fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<Started> {
-    use std::{
-        os::unix::fs::PermissionsExt as _,
-        sync::atomic::{AtomicU64, Ordering},
-    };
+fn start(
+    image: &Image,
+    mounts: &[Mount],
+    network: Network,
+    // TODO: what a previous session wrote, to start this one's disk on rather than the blank
+    // one formatted below. Nothing here reads it yet.
+    _snapshot: Option<&[u8]>,
+) -> anyhow::Result<Started> {
+    use std::os::unix::fs::PermissionsExt as _;
 
-    // The program a boot runs, written out of this binary and signed — see `helper`.
-    let machine = super::helper::boot_binary()?;
+    // The program a boot runs, signed when it was built — see `halves`.
+    let machine = super::halves::boot()?;
 
-    // Paths nothing else in this process or any other will pick, of the shape the sweep
-    // in `session` reads a pid back out of: the pid says who owns them, and the counter
-    // keeps two boots of one process apart.
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let mine = |what: &str| {
-        std::env::temp_dir().join(format!(
-            "{}{}-{seq}-{what}",
-            crate::session::PREFIX,
-            std::process::id()
-        ))
-    };
-    let (upper, root, socket, commit, console) = (
-        mine("session.ext4"),
-        mine("boot"),
-        mine("port.sock"),
-        mine("commit"),
-        mine("console.log"),
+    // Two directories, because two lifetimes. The session's is named by this process's pid,
+    // which is what the sweep in `session` reads back, and holds the one thing that outlives a
+    // machine — the disk. `machine/` under it holds what only makes sense while one is up, and
+    // is what a `stop` throws away.
+    //
+    // One name and not a counter per boot, because there is never more than one machine here
+    // at a time: dropping the last one kills it, reaps it and removes this directory before
+    // anything asks for another, all of it before the drop returns.
+    let owner = super::sessions().join(std::process::id().to_string());
+    let dir = owner.join("machine");
+    std::fs::create_dir_all(&dir)?;
+
+    let upper = owner.join("session.ext4");
+    let (root, socket, commit, console) = (
+        dir.join("boot"),
+        dir.join("port.sock"),
+        dir.join("commit"),
+        dir.join("console.log"),
     );
-    let scratch = vec![
-        upper.clone(),
-        root.clone(),
-        socket.clone(),
-        commit.clone(),
-        console.clone(),
-    ];
 
     // The base, as one disk. It is not scratch and is not made here if it was made once
     // already: the layers, the metadata merged out of them and the descriptor naming both
     // are the store's, and what this boot owns is only what it writes over them.
     let base = image.disk()?;
 
-    // Sparse, so this is a ceiling and not an allocation: a session that writes a
+    // Once per session and not once per boot: a `stop` hands the machine back and the call
+    // after it takes another, and what the session wrote has to still be there when it does.
+    // A disk already here is that session carrying on.
+    //
+    // Sparse, so the size is a ceiling and not an allocation: a session that writes a
     // kilobyte occupies a kilobyte. What the number bounds is how much a runaway command
     // can write before the guest reports a full disk.
-    format_ext4(
-        &upper,
-        &Ext4FormatOptions {
-            size_bytes: 2 << 30,
-            // 16 MiB of journal. The default is four times that, which is most of a small
-            // session's image spent on a log for writes about to be thrown away.
-            journal_blocks: 4096,
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("formatting the session's disk: {e:?}"))?;
+    if !upper.exists() {
+        format_ext4(
+            &upper,
+            &Ext4FormatOptions {
+                size_bytes: 2 << 30,
+                // 16 MiB of journal. The default is four times that, which is most of a small
+                // session's image spent on a log for writes about to be thrown away.
+                journal_blocks: 4096,
+            },
+        )
+        .map_err(|e| anyhow::anyhow!("formatting the session's disk: {e:?}"))?;
+    }
 
     // A real root only for the moment between the kernel handing over and the guest
     // pivoting onto the overlay — long enough to exec one file and read one other.
     std::fs::create_dir_all(&root)?;
     std::fs::create_dir_all(&commit)?;
+
+    // A copy and not a link: this tree is served to the guest over virtio-fs, and what it
+    // holds has to be a file under the root rather than a name pointing out of it.
     let binary = root.join(GUEST_BIN_PATH.trim_start_matches('/'));
-    std::fs::write(&binary, GUEST)?;
+    let from = super::halves::guest()?;
+    std::fs::copy(&from, &binary)
+        .map_err(|e| anyhow::anyhow!("copying {} into the boot root: {e}", from.display()))?;
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
     // Written even when it says nothing: a boot root has one shape either way, and a
     // guest reading a spec that states nothing is simpler than one reasoning about a
@@ -164,7 +168,7 @@ fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<St
     Ok(Started {
         machine: started,
         listener,
-        scratch,
+        dir,
         commit,
         console,
     })
@@ -178,6 +182,7 @@ pub struct Exit {
 }
 
 /// A host directory the guest can see, and where it sees it.
+#[derive(Clone)]
 pub struct Mount {
     pub at: String,
     pub from: PathBuf,
@@ -197,9 +202,9 @@ pub struct Uvm {
     outgoing: tokio::net::unix::OwnedWriteHalf,
     /// The next call's id. A number about the wire and nothing else.
     next: u64,
-    /// Everything this session made and nothing else reads: gone when this drops, which is
+    /// Everything this boot made and nothing else reads: gone when this drops, which is
     /// what keeps a session's writes inside the session.
-    scratch: Vec<PathBuf>,
+    dir: PathBuf,
     /// Where the guest leaves a layer, when it was booted able to.
     commit: PathBuf,
 }
@@ -208,13 +213,9 @@ impl Drop for Uvm {
     fn drop(&mut self) {
         let _ = self.machine.kill();
         let _ = self.machine.wait();
-        for path in &self.scratch {
-            let _ = if path.is_dir() {
-                std::fs::remove_dir_all(path)
-            } else {
-                std::fs::remove_file(path)
-            };
-        }
+        // This boot's, and only this boot's: the disk beside it is the session's, and a
+        // `stop` is what drops this.
+        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -223,16 +224,21 @@ impl Uvm {
     ///
     /// Returns once the guest has built its root and opened the port, not merely once the
     /// machine is running — there is nothing a caller can do with the time in between.
-    pub async fn boot(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<Uvm> {
+    pub async fn boot(
+        image: &Image,
+        mounts: &[Mount],
+        network: Network,
+        snapshot: Option<&[u8]>,
+    ) -> anyhow::Result<Uvm> {
         use std::io::Read as _;
 
         let Started {
             mut machine,
             listener,
-            scratch,
+            dir,
             commit,
             console,
-        } = start(image, mounts, network)?;
+        } = start(image, mounts, network, snapshot)?;
 
         // A virtio-console port discards what the host writes while no process in the guest
         // has it open, rather than queueing it — the socket is up long before the kernel is.
@@ -292,7 +298,7 @@ impl Uvm {
             incoming: tokio::io::BufReader::new(incoming),
             outgoing,
             next: 0,
-            scratch,
+            dir,
             commit,
         })
     }
@@ -338,21 +344,30 @@ impl Uvm {
         }
     }
 
+    /// Everything written since the boot, as a blob a later boot can start on.
+    ///
+    /// The guest is what flushes it: the writes are the guest kernel's until it syncs, and
+    /// the disk they land on is this end's file.
+    ///
+    /// TODO: the file is not read, so this is the empty blob. What belongs here is the
+    /// session's `session.ext4`, whole — a raw image today, which the protocol's frame
+    /// cannot carry at the size the disk is formatted to.
+    pub async fn snapshot(&mut self) -> anyhow::Result<Vec<u8>> {
+        match self.call(Call::Snapshot(SnapshotCall {})).await? {
+            Response::Snapshot(_) => Ok(Vec::new()),
+            Response::Error(e) => anyhow::bail!("snapshotting: {e:?}"),
+            other => anyhow::bail!("the guest answered a snapshot with {other:?}"),
+        }
+    }
+
     /// Everything written since the boot, kept as a layer.
     ///
     /// The guest walks its own upperdir and leaves a tar in the scratch it was given; what
     /// is here is turning that into a layer, which is the one part of it that knows what an
     /// image is.
     pub async fn commit(&mut self) -> anyhow::Result<Layer> {
-        match self
-            .call(Call::Commit(CommitCall {
-                id: String::new(),
-                env: Vec::new(),
-                working_dir: None,
-            }))
-            .await?
-        {
-            Response::Commit(_) => {}
+        match self.call(Call::Snapshot(SnapshotCall {})).await? {
+            Response::Snapshot(_) => {}
             Response::Error(e) => anyhow::bail!("committing: {e:?}"),
             other => anyhow::bail!("the guest answered a commit with {other:?}"),
         }

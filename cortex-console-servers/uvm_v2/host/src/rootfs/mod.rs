@@ -33,13 +33,9 @@ pub use digest::Digest;
 pub use image::Image;
 pub use layer::Layer;
 
+/// Where the images live: content-addressed, shared by every session, and kept.
 pub fn home() -> PathBuf {
-    std::env::var_os("CORTEX_UVM_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/cortex/rootfs"))
-        })
-        .expect("neither CORTEX_UVM_HOME nor HOME is set")
+    crate::home().join("rootfs")
 }
 
 /// The store under [`home`], as the crate that writes into it sees it.
