@@ -1,12 +1,11 @@
 //! A micro-VM, booted on an image built here.
 //!
-//! Two things start one, and they differ in how long it lives rather than in what it does.
-//! A session boots once and runs whatever its client asks for until the client is done; a
-//! build's `RUN` wants one command and the filesystem it left behind. So the long-lived one
-//! is a value, and the short one is a function over it.
+//! Two things want one, and they differ only in how long they hold it. A session boots once
+//! and asks whatever its client asks until the client is done; a build's `RUN` boots the same
+//! machine, asks it one command, keeps the layer and drops it. So there is one [`Uvm`] and no
+//! shorter shape beside it: a step is a session nobody else gets to ask anything.
 //!
-//! Either way the guest is `cortex-uvm-v2-guest`, which libkrun execs as the first userspace
-//! process — in `boot` mode for a session, `exec` mode for a build step.
+//! The guest is `cortex-uvm-v2-guest`, which libkrun execs as the first userspace process.
 //!
 //! **Nothing here holds a hypervisor.** What this module does is make what a machine needs on
 //! disk, spawn `cortex-uvm-v2-boot` over it, and talk to the guest down a socket that boot
@@ -27,152 +26,6 @@ use crate::contract::{
     ImageSpec, LAYER_TAR, Network, SCRATCH_PATH,
 };
 use crate::rootfs::{Image, Layer, cache};
-
-/// What a machine needs on disk, made, and the process holding it, started.
-///
-/// The two things that start one  only in what they tell the guest to be and in what they
-/// wait for afterwards, so everything before that is here and said once.
-struct Started {
-    machine: std::process::Child,
-    listener: std::os::unix::net::UnixListener,
-    dir: PathBuf,
-    commit: PathBuf,
-    console: PathBuf,
-}
-
-fn start(
-    image: &Image,
-    mounts: &[Mount],
-    network: Network,
-    // TODO: what a previous session wrote, to start this one's disk on rather than the blank
-    // one formatted below. Nothing here reads it yet.
-    _snapshot: Option<&[u8]>,
-) -> anyhow::Result<Started> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    // The program a boot runs, signed when it was built — see `halves`.
-    let machine = super::halves::boot()?;
-
-    // Two directories, because two lifetimes. The session's is named by this process's pid,
-    // which is what the sweep in `session` reads back, and holds the one thing that outlives a
-    // machine — the disk. `machine/` under it holds what only makes sense while one is up, and
-    // is what a `stop` throws away.
-    //
-    // One name and not a counter per boot, because there is never more than one machine here
-    // at a time: dropping the last one kills it, reaps it and removes this directory before
-    // anything asks for another, all of it before the drop returns.
-    let owner = super::sessions().join(std::process::id().to_string());
-    let dir = owner.join("machine");
-    std::fs::create_dir_all(&dir)?;
-
-    let upper = owner.join("session.ext4");
-    let (root, socket, commit, console) = (
-        dir.join("boot"),
-        dir.join("port.sock"),
-        dir.join("commit"),
-        dir.join("console.log"),
-    );
-
-    // The base, as one disk. It is not scratch and is not made here if it was made once
-    // already: the layers, the metadata merged out of them and the descriptor naming both
-    // are the store's, and what this boot owns is only what it writes over them.
-    let base = image.disk()?;
-
-    // Once per session and not once per boot: a `stop` hands the machine back and the call
-    // after it takes another, and what the session wrote has to still be there when it does.
-    // A disk already here is that session carrying on.
-    //
-    // Sparse, so the size is a ceiling and not an allocation: a session that writes a
-    // kilobyte occupies a kilobyte. What the number bounds is how much a runaway command
-    // can write before the guest reports a full disk.
-    if !upper.exists() {
-        format_ext4(
-            &upper,
-            &Ext4FormatOptions {
-                size_bytes: 2 << 30,
-                // 16 MiB of journal. The default is four times that, which is most of a small
-                // session's image spent on a log for writes about to be thrown away.
-                journal_blocks: 4096,
-            },
-        )
-        .map_err(|e| anyhow::anyhow!("formatting the session's disk: {e:?}"))?;
-    }
-
-    // A real root only for the moment between the kernel handing over and the guest
-    // pivoting onto the overlay — long enough to exec one file and read one other.
-    std::fs::create_dir_all(&root)?;
-    std::fs::create_dir_all(&commit)?;
-
-    // A copy and not a link: this tree is served to the guest over virtio-fs, and what it
-    // holds has to be a file under the root rather than a name pointing out of it.
-    let binary = root.join(GUEST_BIN_PATH.trim_start_matches('/'));
-    let from = super::halves::guest()?;
-    std::fs::copy(&from, &binary)
-        .map_err(|e| anyhow::anyhow!("copying {} into the boot root: {e}", from.display()))?;
-    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
-    // Written even when it says nothing: a boot root has one shape either way, and a
-    // guest reading a spec that states nothing is simpler than one reasoning about a
-    // missing file.
-    std::fs::write(
-        root.join(IMAGE_SPEC_PATH.trim_start_matches('/')),
-        bson::serialize_to_vec(&ImageSpec {
-            env: image.env.clone(),
-            working_dir: image.workdir.clone(),
-        })
-        .map_err(|e| anyhow::anyhow!("encoding the image spec: {e}"))?,
-    )?;
-
-    // Bound before the child is started, because the child connects to it as its first
-    // act and there is nothing to retry against if it is not there yet.
-    let listener = std::os::unix::net::UnixListener::bind(&socket)
-        .map_err(|e| anyhow::anyhow!("binding the console channel: {e}"))?;
-
-    let mut told = BootArgs {
-        boot_root: root.clone(),
-        channel: socket.clone(),
-        base,
-        base_format: BaseFormat::Vmdk,
-        session: upper.clone(),
-        committable: true,
-        commit_out: Some(commit.clone()),
-        abin: None,
-        context: None,
-        artifacts: None,
-        scratch: None,
-        console: Some(console.clone()),
-        network,
-        host_ports: Vec::new(),
-        vcpus: None,
-        memory_mib: None,
-    };
-    for mount in mounts {
-        match mount.at.as_str() {
-            CONTEXT_PATH => told.context = Some(mount.from.clone()),
-            ARTIFACTS_PATH => told.artifacts = Some(mount.from.clone()),
-            SCRATCH_PATH => told.scratch = Some(mount.from.clone()),
-            other => anyhow::bail!(
-                "{other} is not one of the three a session names: {CONTEXT_PATH}, \
-                 {ARTIFACTS_PATH}, {SCRATCH_PATH}"
-            ),
-        }
-    }
-
-    // Its stdio is this process's: the guest's console — kernel messages, a panic,
-    // whatever a boot that failed has to say — arrives there and nowhere else, and a
-    // caller looking at a machine that did not come up needs to be able to read it.
-    let started = std::process::Command::new(&machine)
-        .args(told.to_args())
-        .spawn()
-        .map_err(|e| anyhow::anyhow!("starting {}: {e}", machine.display()))?;
-
-    Ok(Started {
-        machine: started,
-        listener,
-        dir,
-        commit,
-        console,
-    })
-}
 
 /// A host directory the guest can see, and where it sees it.
 #[derive(Clone)]
@@ -221,17 +74,127 @@ impl Uvm {
         image: &Image,
         mounts: &[Mount],
         network: Network,
-        snapshot: Option<&[u8]>,
+        // TODO: what a previous session wrote, to start this one's disk on rather than the
+        // blank one formatted below. Nothing here reads it yet.
+        _snapshot: Option<&[u8]>,
     ) -> anyhow::Result<Uvm> {
         use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt as _;
 
-        let Started {
-            mut machine,
-            listener,
-            dir,
-            commit,
-            console,
-        } = start(image, mounts, network, snapshot)?;
+        // The program a boot runs, signed when it was built — see `halves`.
+        let program = super::halves::boot()?;
+
+        // Two directories, because two lifetimes. The session's is named by this process's
+        // pid, which is what the sweep in `session` reads back, and holds the one thing that
+        // outlives a machine — the disk. `machine/` under it holds what only makes sense
+        // while one is up, and is what a `stop` throws away.
+        //
+        // One name and not a counter per boot, because there is never more than one machine
+        // here at a time: dropping the last one kills it, reaps it and removes this directory
+        // before anything asks for another, all of it before the drop returns.
+        let owner = super::sessions().join(std::process::id().to_string());
+        let dir = owner.join("machine");
+        std::fs::create_dir_all(&dir)?;
+
+        let upper = owner.join("session.ext4");
+        let (root, socket, commit, console) = (
+            dir.join("boot"),
+            dir.join("port.sock"),
+            dir.join("commit"),
+            dir.join("console.log"),
+        );
+
+        // The base, as one disk. It is not scratch and is not made here if it was made once
+        // already: the layers, the metadata merged out of them and the descriptor naming both
+        // are the store's, and what this boot owns is only what it writes over them.
+        let base = image.disk()?;
+
+        // Once per session and not once per boot: a `stop` hands the machine back and the call
+        // after it takes another, and what the session wrote has to still be there when it
+        // does. A disk already here is that session carrying on.
+        //
+        // Sparse, so the size is a ceiling and not an allocation: a session that writes a
+        // kilobyte occupies a kilobyte. What the number bounds is how much a runaway command
+        // can write before the guest reports a full disk.
+        if !upper.exists() {
+            format_ext4(
+                &upper,
+                &Ext4FormatOptions {
+                    size_bytes: 2 << 30,
+                    // 16 MiB of journal. The default is four times that, which is most of a
+                    // small session's image spent on a log for writes about to be thrown away.
+                    journal_blocks: 4096,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("formatting the session's disk: {e:?}"))?;
+        }
+
+        // A real root only for the moment between the kernel handing over and the guest
+        // pivoting onto the overlay — long enough to exec one file and read one other.
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&commit)?;
+
+        // A copy and not a link: this tree is served to the guest over virtio-fs, and what it
+        // holds has to be a file under the root rather than a name pointing out of it.
+        let binary = root.join(GUEST_BIN_PATH.trim_start_matches('/'));
+        let from = super::halves::guest()?;
+        std::fs::copy(&from, &binary)
+            .map_err(|e| anyhow::anyhow!("copying {} into the boot root: {e}", from.display()))?;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
+        // Written even when it says nothing: a boot root has one shape either way, and a
+        // guest reading a spec that states nothing is simpler than one reasoning about a
+        // missing file.
+        std::fs::write(
+            root.join(IMAGE_SPEC_PATH.trim_start_matches('/')),
+            bson::serialize_to_vec(&ImageSpec {
+                env: image.env.clone(),
+                working_dir: image.workdir.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("encoding the image spec: {e}"))?,
+        )?;
+
+        // Bound before the child is started, because the child connects to it as its first
+        // act and there is nothing to retry against if it is not there yet.
+        let listener = std::os::unix::net::UnixListener::bind(&socket)
+            .map_err(|e| anyhow::anyhow!("binding the console channel: {e}"))?;
+
+        let mut told = BootArgs {
+            boot_root: root,
+            channel: socket,
+            base,
+            base_format: BaseFormat::Vmdk,
+            session: upper,
+            committable: true,
+            commit_out: Some(commit.clone()),
+            abin: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
+            console: Some(console.clone()),
+            network,
+            host_ports: Vec::new(),
+            vcpus: None,
+            memory_mib: None,
+        };
+        for mount in mounts {
+            match mount.at.as_str() {
+                CONTEXT_PATH => told.context = Some(mount.from.clone()),
+                ARTIFACTS_PATH => told.artifacts = Some(mount.from.clone()),
+                SCRATCH_PATH => told.scratch = Some(mount.from.clone()),
+                other => anyhow::bail!(
+                    "{other} is not one of the three a session names: {CONTEXT_PATH}, \
+                     {ARTIFACTS_PATH}, {SCRATCH_PATH}"
+                ),
+            }
+        }
+
+        // Its stdio is this process's: the guest's console — kernel messages, a panic,
+        // whatever a boot that failed has to say — arrives there and nowhere else, and a
+        // caller looking at a machine that did not come up needs to be able to read it.
+        let mut machine = std::process::Command::new(&program)
+            .args(told.to_args())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("starting {}: {e}", program.display()))?;
 
         // A virtio-console port discards what the host writes while no process in the guest
         // has it open, rather than queueing it — the socket is up long before the kernel is.
