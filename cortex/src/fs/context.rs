@@ -37,8 +37,7 @@ use crate::{
 /// without the protocol carrying five names for them.
 ///
 /// Nothing here is context-specific, and a caller that has a tree to assemble for a session's
-/// [`artifacts`](crate::console::ConsoleBuilder::artifacts) or
-/// [`scratch`](crate::console::ConsoleBuilder::scratch) assembles it with this too.
+/// [`artifacts`](crate::console::ConsoleBuilder::artifacts) assembles it with this too.
 pub struct ContextFs {
     /// Mount points keyed by their normalized, root-relative path.
     ///

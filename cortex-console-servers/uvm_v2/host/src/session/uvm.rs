@@ -23,7 +23,7 @@ use microsandbox_image::ext4::{Ext4FormatOptions, format_ext4};
 
 use crate::contract::{
     ARTIFACTS_PATH, BaseFormat, BootArgs, CONTEXT_PATH, GUEST_BIN_PATH, HANDSHAKE, IMAGE_SPEC_PATH,
-    ImageSpec, LAYER_TAR, Network, SCRATCH_PATH, SNAPSHOT_PATH,
+    ImageSpec, LAYER_TAR, Network, SNAPSHOT_PATH,
 };
 use crate::rootfs::{Image, Layer, cache};
 
@@ -209,7 +209,6 @@ impl Uvm {
             abin: None,
             context: None,
             artifacts: None,
-            scratch: None,
             console: Some(console.clone()),
             network,
             host_ports: host_ports.to_vec(),
@@ -220,10 +219,9 @@ impl Uvm {
             match mount.at.as_str() {
                 CONTEXT_PATH => told.context = Some(mount.from.clone()),
                 ARTIFACTS_PATH => told.artifacts = Some(mount.from.clone()),
-                SCRATCH_PATH => told.scratch = Some(mount.from.clone()),
                 other => anyhow::bail!(
-                    "{other} is not one of the three a session names: {CONTEXT_PATH}, \
-                     {ARTIFACTS_PATH}, {SCRATCH_PATH}"
+                    "{other} is neither of the two a session names: {CONTEXT_PATH}, \
+                     {ARTIFACTS_PATH}"
                 ),
             }
         }

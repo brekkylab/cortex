@@ -63,7 +63,7 @@
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
-//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_CONTEXT`](Error::UNSUPPORTED_CONTEXT), [`UNSUPPORTED_ARTIFACTS`](Error::UNSUPPORTED_ARTIFACTS), [`UNSUPPORTED_SCRATCH`](Error::UNSUPPORTED_SCRATCH) |
+//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_CONTEXT`](Error::UNSUPPORTED_CONTEXT), [`UNSUPPORTED_ARTIFACTS`](Error::UNSUPPORTED_ARTIFACTS) |
 //! | `exec` | [`ExecCall`] | [`ExecResp`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `write` | [`WriteCall`] | [`WriteResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |

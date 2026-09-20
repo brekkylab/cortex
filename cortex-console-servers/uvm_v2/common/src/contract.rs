@@ -17,17 +17,16 @@
 //!   a boot is started, told, and never asked anything, which is what lets it be a separate
 //!   binary rather than a mode of the host's.
 //! - **the boot to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`CONTEXT_ENV`],
-//!   [`ARTIFACTS_ENV`], [`SCRATCH_ENV`], [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]).
+//!   [`ARTIFACTS_ENV`], [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]).
 //!
 //! Where a tree lands inside the guest is **this module's constant for it** —
-//! [`CONTEXT_PATH`], [`ARTIFACTS_PATH`], [`SCRATCH_PATH`] — carried in that tree's env
-//! alongside the tag. One name per role, the same in every session, so what a guest reports
-//! and what a client sends are the same three strings no matter which host directory is
-//! behind them.
+//! [`CONTEXT_PATH`], [`ARTIFACTS_PATH`] — carried in that tree's env alongside the tag. One
+//! name per role, the same in every session, so what a guest reports and what a client sends
+//! are the same strings no matter which host directory is behind them.
 //!
-//! Three of them, one per tree a session can name, and three envs rather than one list
-//! because the guest does something different with one of them: it **stands** in the scratch.
-//! A list would carry the same three strings and leave the guest to work out which was which.
+//! One env per tree rather than one list of them, because a name that says which tree it is
+//! is a name the guest can act on: the context is mounted read-only and the artifacts tree is
+//! not. A list would carry the same paths and leave the guest to work out which was which.
 //!
 //! The **guest** half is environment because that is the only channel libkrun's `exec` has:
 //! an argv and an env value alike become part of the guest's kernel command line, which is
@@ -88,13 +87,10 @@ pub const CONTEXT_ENV: &str = "CORTEX_UVM_CONTEXT";
 /// The artifacts tree, spelled the same way. Absent for a session that named none.
 pub const ARTIFACTS_ENV: &str = "CORTEX_UVM_ARTIFACTS";
 
-/// The scratch tree, spelled the same way, and **where the guest stands** when there is one.
-pub const SCRATCH_ENV: &str = "CORTEX_UVM_SCRATCH";
-
 /// Where the context is mounted inside the guest.
 ///
 /// **A name for the role and not for the directory behind it.** What a session is given is a
-/// directory somewhere on the host, and what it is *called* in here says which of the three
+/// directory somewhere on the host, and what it is *called* in here says which of the two
 /// trees it is — so a command reads `/context/src/main.rs` and a client sends the same
 /// string, in a session that would have spelled it `/Users/someone/project/src/main.rs` on
 /// the other side of the hypervisor and in another one that would have spelled it `/srv/wt/9`.
@@ -121,10 +117,6 @@ pub const CONTEXT_PATH: &str = "/context";
 /// Where the artifacts tree is mounted inside the guest — see [`CONTEXT_PATH`].
 pub const ARTIFACTS_PATH: &str = "/artifacts";
 
-/// Where the scratch tree is mounted inside the guest, and where a session stands when it has
-/// one — see [`CONTEXT_PATH`].
-pub const SCRATCH_PATH: &str = "/scratch";
-
 /// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
 /// which is a guest with no `/abin` at all rather than an empty one.
 pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
@@ -137,15 +129,12 @@ pub const ABIN_PATH: &str = "/abin";
 pub const CONTEXT_TAG: &str = "cortexctx";
 
 /// The tag the artifacts tree is attached under.
-pub const ARTIFACTS_TAG: &str = "cortexart";
-
-/// The tag the scratch tree is attached under.
 ///
-/// One device per tree rather than one device with three directories under it, because the
-/// host has three directories and no common parent to serve: each is somewhere the caller
+/// One device per tree rather than one device with both directories under it, because the
+/// host has two directories and no common parent to serve: each is somewhere the caller
 /// mounted it, and inventing a parent would mean the host arranging its own filesystem around
 /// what this protocol happens to carry.
-pub const SCRATCH_TAG: &str = "cortexscratch";
+pub const ARTIFACTS_TAG: &str = "cortexart";
 
 /// The virtio-fs tag a committable session's scratch directory is shared under.
 pub const COMMIT_TAG: &str = "cortexcommit";
@@ -399,11 +388,6 @@ pub struct BootArgs {
     /// Shared exactly as the context is, and mounted at [`ARTIFACTS_PATH`].
     pub artifacts: Option<PathBuf>,
 
-    /// Room for the session to work in, and `None` for a session that named none. Shared as
-    /// the two above are, mounted at [`SCRATCH_PATH`], and additionally **where the guest
-    /// stands** — see [`SCRATCH_ENV`].
-    pub scratch: Option<PathBuf>,
-
     /// How much of a network the session gets. Decided by the server, because it decides a
     /// *device*, which is attached before a kernel comes up.
     /// Where the guest's own console goes — kernel messages, a panic, whatever a boot that
@@ -442,7 +426,7 @@ impl BootArgs {
     /// so there is nothing in front of these.
     ///
     /// `OsString` throughout: a path that is not UTF-8 is still a path, and nothing here has to
-    /// read one as text. The exceptions are the three trees, which the guest is told about as
+    /// read one as text. The exceptions are the trees, which the guest is told about as
     /// strings, and that is refused where it is used rather than here.
     pub fn to_args(&self) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
@@ -478,9 +462,6 @@ impl BootArgs {
         if let Some(artifacts) = &self.artifacts {
             put("--artifacts", artifacts.as_os_str());
         }
-        if let Some(scratch) = &self.scratch {
-            put("--scratch", scratch.as_os_str());
-        }
         if let Some(abin) = &self.abin {
             put("--abin", abin.as_os_str());
         }
@@ -512,7 +493,6 @@ impl BootArgs {
         let mut console = None;
         let mut context = None;
         let mut artifacts = None;
-        let mut scratch = None;
         let mut abin = None;
         let mut committable = false;
         let mut commit_out = None;
@@ -539,7 +519,6 @@ impl BootArgs {
                 "--host-port" => host_ports.push(number(&flag, value()?)?),
                 "--context" => context = Some(PathBuf::from(value()?)),
                 "--artifacts" => artifacts = Some(PathBuf::from(value()?)),
-                "--scratch" => scratch = Some(PathBuf::from(value()?)),
                 "--abin" => abin = Some(PathBuf::from(value()?)),
                 "--committable" => committable = true,
                 "--commit-out" => commit_out = Some(PathBuf::from(value()?)),
@@ -570,7 +549,6 @@ impl BootArgs {
             host_ports,
             context,
             artifacts,
-            scratch,
             committable,
             commit_out,
             abin,
@@ -643,7 +621,6 @@ mod tests {
             host_ports: vec![8080, 3000],
             context: Some("/Users/someone/project".into()),
             artifacts: Some("/Users/someone/out".into()),
-            scratch: Some("/Users/someone/scratch".into()),
             abin: Some("/cache/layers/sha256_2b91c4.erofs".into()),
             committable: true,
             commit_out: Some("/tmp/cortex-uvm-commit".into()),
@@ -713,13 +690,12 @@ mod tests {
     ///
     /// A session with no tree is the case that matters: an empty `--context` would be a
     /// directory named by the empty string, and the boot would try to share it. The same goes
-    /// for the two trees beside it, which are shared by exactly the same mechanism.
+    /// for the tree beside it, which is shared by exactly the same mechanism.
     #[test]
     fn what_was_not_said_is_not_sent() {
         let bare = BootArgs {
             context: None,
             artifacts: None,
-            scratch: None,
             vcpus: None,
             memory_mib: None,
             ..args()
@@ -728,7 +704,6 @@ mod tests {
         for flag in [
             "--context",
             "--artifacts",
-            "--scratch",
             "--vcpus",
             "--memory-mib",
         ] {

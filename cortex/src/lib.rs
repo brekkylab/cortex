@@ -66,10 +66,10 @@
 //!
 //! Nothing in [`console`] builds a tree, calls [`FileSystem`](fs::FileSystem) or
 //! touches a binding. What it does take is [`Mount`](fs::Mount)s — trees somebody else
-//! already mounted, which a session names as its context, its artifacts and its scratch, and
-//! which a `read` and a command then spell the same file under — and that is the whole of the
-//! seam. Three of them because they are three intentions: what the session was given, what it
-//! is to leave behind, and room to work in, which is where it stands. Nothing in [`fs`] knows a
+//! already mounted, which a session names as its context and its artifacts, and which a
+//! `read` and a command then spell the same file under — and that is the whole of the seam.
+//! Two of them because they are two intentions: what the session was given, and what it is
+//! to leave behind. Nothing in [`fs`] knows a
 //! console exists. There is not even an error type between them: both halves answer in
 //! [`std::io::Error`], classified by kind, so neither has a vocabulary the other has to learn.
 //!

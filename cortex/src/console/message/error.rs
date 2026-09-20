@@ -147,18 +147,11 @@ impl Error {
     ///
     /// [`UNSUPPORTED_CONTEXT`](Self::UNSUPPORTED_CONTEXT)'s reasoning, applied to the tree a
     /// session leaves its output in — and a code of its own rather than that one because a
-    /// session names up to three trees, and a client hearing that its session was refused
+    /// session names up to two trees, and a client hearing that its session was refused
     /// has to know *which* of them the build cannot take. The two failures also differ in
     /// what a client can do about them: a session with no context has nothing to work on,
     /// where one with nowhere to put its output can often be asked for again without it.
     pub const UNSUPPORTED_ARTIFACTS: i64 = -32013;
-
-    /// `init`: a [`scratch`](crate::console::InitCall::scratch) URL whose scheme this server
-    /// has no provider for, named in the message.
-    ///
-    /// The third of the set, for the reason
-    /// [`UNSUPPORTED_ARTIFACTS`](Self::UNSUPPORTED_ARTIFACTS) is the second.
-    pub const UNSUPPORTED_SCRATCH: i64 = -32014;
 
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -203,7 +196,6 @@ mod tests {
             ("UNSUPPORTED_IMAGE", Error::UNSUPPORTED_IMAGE),
             ("UNKNOWN_IMAGE", Error::UNKNOWN_IMAGE),
             ("UNSUPPORTED_ARTIFACTS", Error::UNSUPPORTED_ARTIFACTS),
-            ("UNSUPPORTED_SCRATCH", Error::UNSUPPORTED_SCRATCH),
             ("INVALID_REQUEST", Error::INVALID_REQUEST),
             ("METHOD_NOT_FOUND", Error::METHOD_NOT_FOUND),
             ("INVALID_PARAMS", Error::INVALID_PARAMS),

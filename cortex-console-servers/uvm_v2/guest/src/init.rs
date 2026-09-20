@@ -50,7 +50,7 @@ use std::ptr;
 
 use crate::contract::{
     ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, IMAGE_SPEC_PATH, ImageSpec,
-    ARTIFACTS_ENV, LOWER_ENV, PORT_NAME, SCRATCH_ENV, SNAPSHOT_PATH, UPPER_ENV, CONTEXT_ENV,
+    ARTIFACTS_ENV, LOWER_ENV, PORT_NAME, SNAPSHOT_PATH, UPPER_ENV, CONTEXT_ENV,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
@@ -111,11 +111,11 @@ pub fn prepare() -> anyhow::Result<ImageSpec> {
     // mounted and nothing else is done with it: what it is *for* is the client's, and a
     // command reaches it by the path `init` answered.
     //
-    // **The context read-only**, which is the one way the three differ here. It is the tree
+    // **The context read-only**, which is the one way the two differ here. It is the tree
     // the session was given rather than one it was given to fill — what it produces belongs
-    // in the artifacts and what it needs room for belongs in the scratch — so a write into it
-    // is a mistake, and the mount is where a mistake can still be answered with `EROFS`
-    // rather than with somebody's project already edited.
+    // in the artifacts and what it needs room for belongs on the session's own root — so a
+    // write into it is a mistake, and the mount is where a mistake can still be answered with
+    // `EROFS` rather than with somebody's project already edited.
     //
     // A guard rail and not a boundary, and the difference is worth being exact about: a
     // virtio-fs share has no read-only option on the host side and the guest is root inside
@@ -124,24 +124,27 @@ pub fn prepare() -> anyhow::Result<ImageSpec> {
     // because the context is a host directory and cannot be attached as one. What is left is
     // worth having on its own: every write that did not mean to land here fails, and the ones
     // that did are a session doing something it would have to have gone out of its way to do.
-    let context = share(CONTEXT_ENV, libc::MS_RDONLY)?;
+    share(CONTEXT_ENV, libc::MS_RDONLY)?;
     share(ARTIFACTS_ENV, 0)?;
-    let scratch = share(SCRATCH_ENV, 0)?;
 
     // Where a command runs is the session's, and the agent sets it per command — but this
-    // process has to stand somewhere, and a session with no tree stands here.
+    // process has to stand somewhere, and this is where.
     //
-    // **The scratch first**, because it is the tree a command may write in freely: standing
-    // in the context would make the tree the client gave the session the place every relative
-    // path a command writes lands in. The context when there is no scratch; otherwise where
-    // the image expects a process to be, and `/` when it said nothing or named a directory it
-    // never created.
-    match scratch.or(context) {
-        Some(root) => set_cwd(&root)?,
-        None => match image.working_dir.as_deref().map(Path::new) {
-            Some(stated) if set_cwd(stated).is_ok() => {}
-            _ => set_cwd(Path::new("/"))?,
-        },
+    // **Where the base image said**, because the image is what the session runs on: an image
+    // that states a working directory is describing the thing it was built to run, and a
+    // session standing anywhere else is one where those instructions are wrong. Standing in a
+    // tree the session was *given* would make it the place every relative path a command
+    // writes lands in — somebody's project, in the context's case, which is mounted read-only
+    // a few lines above for exactly that reason.
+    //
+    // Created if it is not there, which is what `WORKDIR` means in the image this came from —
+    // and what makes the host's answer to `init` true without the host having to know what is
+    // in the base. `/` is left for an image that said nothing, and for a directory that could
+    // not be made or entered: a session that boots standing somewhere is worth more than one
+    // that fails over where it started.
+    match image.working_dir.as_deref().map(Path::new) {
+        Some(stated) if make_dir(stated) && set_cwd(stated).is_ok() => {}
+        _ => set_cwd(Path::new("/"))?,
     }
 
     Ok(image)
@@ -328,15 +331,15 @@ fn pivot(new_root: &str) -> anyhow::Result<()> {
 /// mounted where — is cortex's business on the host side, and arrives here already
 /// assembled into one tree.
 ///
-/// The mountpoint is the boot's constant for that tree's role — `/context`, `/artifacts`,
-/// `/scratch` — and not the host's own path for the directory behind it. So a `cwd` this end
-/// reports is a name the client was already told at `init` and can send straight back, and
-/// nothing in here is named after the machine the session was started from. See
+/// The mountpoint is the boot's constant for that tree's role — `/context`, `/artifacts` —
+/// and not the host's own path for the directory behind it. So a path this end reports is a
+/// name the client was already told at `init` and can send straight back, and nothing in here
+/// is named after the machine the session was started from. See
 /// [`contract`](crate::contract).
 ///
-/// `flags` is what separates the three: they are otherwise the same mount, and the only one
-/// that differs is the context, which goes up [`MS_RDONLY`](libc::MS_RDONLY) — see the caller
-/// for why that is a guard rail rather than a boundary.
+/// `flags` is what separates the two: they are otherwise the same mount, and the one that
+/// differs is the context, which goes up [`MS_RDONLY`](libc::MS_RDONLY) — see the caller for
+/// why that is a guard rail rather than a boundary.
 fn share(env: &str, flags: libc::c_ulong) -> anyhow::Result<Option<PathBuf>> {
     let Ok(spec) = std::env::var(env) else {
         return Ok(None);
@@ -350,6 +353,14 @@ fn share(env: &str, flags: libc::c_ulong) -> anyhow::Result<Option<PathBuf>> {
     mount(tag, mountpoint, "virtiofs", flags)
         .map_err(|e| anyhow::anyhow!("mounting {env} at {mountpoint}: {e}"))?;
     Ok(Some(PathBuf::from(mountpoint)))
+}
+
+/// Make a directory and everything above it, reporting only whether it is now there.
+///
+/// An existing one is a success, which `create_dir_all` already says — and the caller has a
+/// fallback for every other answer, so what it needs is the fact and not the error.
+fn make_dir(dir: &Path) -> bool {
+    std::fs::create_dir_all(dir).is_ok()
 }
 
 fn set_cwd(dir: &Path) -> anyhow::Result<()> {

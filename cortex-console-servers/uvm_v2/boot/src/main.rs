@@ -22,7 +22,6 @@
 //! virtio-fs  root           the boot root, holding the guest binary and the image spec
 //! virtio-fs  cortexctx      the session's context, served straight out of this process
 //! virtio-fs  cortexart      its artifacts tree, when it named one
-//! virtio-fs  cortexscratch  its scratch tree, when it named one
 //! virtio-fs  cortexcommit   where a committable session leaves its layer
 //! virtio-blk /dev/vda       the session's ext4 image — the overlay's upper
 //! virtio-blk /dev/vdb       the base image, read-only — the overlay's lower
@@ -55,7 +54,7 @@ use contract::{
     ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, COMMIT_ENV,
     COMMIT_PATH, COMMIT_TAG, COMMITTABLE_ENV, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG,
     GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
-    PORT_NAME, SCRATCH_ENV, SCRATCH_PATH, SCRATCH_TAG, UPPER_ENV,
+    PORT_NAME, UPPER_ENV,
 };
 use msb_krun::{DiskImageFormat, VmBuilder};
 
@@ -142,7 +141,7 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
         builder = builder.net(move |n| n.mac(mac).custom(backend));
     }
 
-    // One device per tree the session named, each under its own tag, and all three the same
+    // One device per tree the session named, each under its own tag, and both the same
     // work: this has no opinion about what a tree is for, and the guest is told which is
     // which by the name it arrives under.
     let mut shares: Vec<(&str, String)> = Vec::new();
@@ -160,13 +159,6 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
             ARTIFACTS_TAG,
             ARTIFACTS_PATH,
             args.artifacts.as_deref(),
-        ),
-        (
-            "--scratch",
-            SCRATCH_ENV,
-            SCRATCH_TAG,
-            SCRATCH_PATH,
-            args.scratch.as_deref(),
         ),
     ] {
         let Some(path) = path else { continue };

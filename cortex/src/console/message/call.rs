@@ -137,33 +137,37 @@ impl Call {
 /// it, and the base and the reach are the environment a command runs in rather than
 /// anything a command says — so each is said once instead of on every command.
 ///
-/// # Three trees, because they are three lifetimes
+/// # Two trees, because they are two lifetimes
 ///
-/// [`context`](Self::context), [`artifacts`](Self::artifacts) and [`scratch`](Self::scratch)
-/// are each a [`TreeSource`] and each answered with a [`TreeMount`](super::TreeMount), and
-/// what tells them apart is the member name rather than anything in the value.
+/// [`context`](Self::context) and [`artifacts`](Self::artifacts) are each a [`TreeSource`]
+/// and each answered with a [`TreeMount`](super::TreeMount), and what tells them apart is
+/// the member name rather than anything in the value.
 ///
 /// | member | is | outlives the session |
 /// |---|---|---|
 /// | `context` | what the session is given to work **from**, and reads | yes — it was there before |
 /// | `artifacts` | what the session is to leave behind | yes — that is the point of it |
-/// | `scratch` | room to work in | no |
 ///
-/// **Which is why they are three members and not one tree with three directories in it.**
-/// A single tree makes the three the same thing to everyone holding it: the same store
+/// **Which is why they are two members and not one tree with two directories in it.**
+/// A single tree makes the two the same thing to everyone holding it: the same store
 /// behind them, the same lifetime, the same permissions, and a client that wants to keep
 /// what a session produced has to know which subdirectory that was and trust the session
 /// not to have written outside it. Naming them separately is what lets each be backed by
-/// what it should be — a project directory, a bucket the caller collects from, a tmpfs the
-/// host throws away — and it is the protocol's only way to say which of them a path is in.
+/// what it should be — a project directory, a bucket the caller collects from — and it is
+/// the protocol's only way to say which of them a path is in.
+///
+/// Room to work in is not a third of them. A session already stands on a filesystem it may
+/// write to and that goes away with it, so a command that unpacks an archive or builds
+/// something has somewhere to put it without the client naming a tree for it — and a tree
+/// named for that purpose would be one more thing to mount, place and answer for, in
+/// exchange for what the session's own root already gives.
 ///
 /// It is a departure from [`ContextFs`](crate::fs::ContextFs)'s composition, which is how a
 /// session gets *many stores* in one tree, and the two answer different questions. Several
 /// stores under one root are one namespace a command walks; these are separate namespaces a
 /// client has separate intentions for.
 ///
-/// Each of the three is independently optional, and a session with none of them is still a
-/// session.
+/// Both are independently optional, and a session with neither is still a session.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitCall {
     /// The base a session's commands run in.
@@ -246,36 +250,18 @@ pub struct InitCall {
     /// cannot take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<TreeSource>,
-
-    /// Room for this session to work in, named by URL. `None` is a session that works
-    /// wherever it can write.
-    ///
-    /// **Where the session stands, and the only one of the three meant to be thrown away.**
-    /// A command that unpacks an archive, builds something, or writes a file it will read
-    /// back needs somewhere to put it, and the two trees above are the wrong place for
-    /// different reasons: one is somebody's project and one is what the client will collect.
-    ///
-    /// So this is what [`InitResp::cwd`](super::InitResp::cwd) names when a session has one
-    /// — see there — which is what makes it the default destination of every relative path a
-    /// command writes without having to be told.
-    ///
-    /// Answered in [`InitResp::scratch`](super::InitResp::scratch), and refused with
-    /// [`UNSUPPORTED_SCRATCH`](crate::console::Error::UNSUPPORTED_SCRATCH) by a build with no
-    /// provider for its scheme.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scratch: Option<TreeSource>,
 }
 
 /// A tree a session is given, named by URL.
 ///
-/// One type for all three of them — the [`context`](InitCall::context), the
-/// [`artifacts`](InitCall::artifacts) and the [`scratch`](InitCall::scratch) — because
-/// naming a tree is one operation and reading that name is one rule. **What a tree is
-/// *for* is the member it arrives under**, and nothing about that changes how a URL is
-/// read, which kinds a build can realize, or what a server does with the answer.
+/// One type for both of them — the [`context`](InitCall::context) and the
+/// [`artifacts`](InitCall::artifacts) — because naming a tree is one operation and reading
+/// that name is one rule. **What a tree is *for* is the member it arrives under**, and
+/// nothing about that changes how a URL is read, which kinds a build can realize, or what a
+/// server does with the answer.
 ///
-/// Three types here would have been three copies of [`scheme`](Self::scheme) and
-/// [`file_path`](Self::file_path), and therefore three chances for two servers to disagree
+/// A type per member would have been a copy of [`scheme`](Self::scheme) and
+/// [`file_path`](Self::file_path) each, and therefore a chance for two servers to disagree
 /// about what one URL names — which is the failure a shared protocol type exists to
 /// prevent.
 ///
@@ -283,9 +269,9 @@ pub struct InitCall {
 /// rootfs its commands run on. This is the protocol's way of naming one — not the tree
 /// itself, which is a thing in some process, but where to get it.
 ///
-/// The work is not done in it: a session writes in its [`scratch`](InitCall::scratch) and
-/// leaves its result in its [`artifacts`](InitCall::artifacts), and what this tree is for is
-/// being *read*.
+/// The work is not done in it: a session writes on the root its commands run on and leaves
+/// its result in its [`artifacts`](InitCall::artifacts), and what this tree is for is being
+/// *read*.
 ///
 /// # The scheme is the kind
 ///
@@ -295,11 +281,11 @@ pub struct InitCall {
 /// | `http://…`, `https://…` | a tree reached over HTTP — **on the wire, implemented nowhere** |
 ///
 /// A scheme this build has no provider for is refused at `init`, naming it — with the code
-/// belonging to the member it arrived under, so that a client asking for three trees hears
-/// which one the build cannot take: [`UNSUPPORTED_CONTEXT`](crate::console::Error::UNSUPPORTED_CONTEXT),
-/// [`UNSUPPORTED_ARTIFACTS`](crate::console::Error::UNSUPPORTED_ARTIFACTS),
-/// [`UNSUPPORTED_SCRATCH`](crate::console::Error::UNSUPPORTED_SCRATCH). That is what `http`
-/// and `https` get everywhere today.
+/// belonging to the member it arrived under, so that a client asking for both trees hears
+/// which one the build cannot take:
+/// [`UNSUPPORTED_CONTEXT`](crate::console::Error::UNSUPPORTED_CONTEXT),
+/// [`UNSUPPORTED_ARTIFACTS`](crate::console::Error::UNSUPPORTED_ARTIFACTS). That is what
+/// `http` and `https` get everywhere today.
 ///
 /// **A URL and not a tagged object**, because there is exactly one thing this protocol does
 /// with it: hand it to whatever realizes that kind. A tagged object would put every kind's
@@ -355,7 +341,7 @@ impl TreeSource {
 /// Which of a session's trees a [`TreeSource`] arrived as.
 ///
 /// The member name and the code that refuses a scheme the build cannot realize, as one
-/// value — because a server that realizes trees does the same work three times and differs
+/// value — because a server that realizes trees does the same work per tree and differs
 /// only in what it calls the tree and what it refuses it with. Passing this is what lets
 /// that be one function.
 ///
@@ -370,9 +356,6 @@ pub enum TreeRole {
 
     /// [`InitCall::artifacts`] — what it is to leave behind.
     Artifacts,
-
-    /// [`InitCall::scratch`] — room to work in, and where it stands.
-    Scratch,
 }
 
 impl TreeRole {
@@ -381,19 +364,17 @@ impl TreeRole {
         match self {
             TreeRole::Context => "context",
             TreeRole::Artifacts => "artifacts",
-            TreeRole::Scratch => "scratch",
         }
     }
 
     /// What a scheme this build has no provider for is refused with.
     ///
-    /// One code per member, so a client that named three trees hears which of them the
+    /// One code per member, so a client that named both trees hears which of them the
     /// build cannot take — see [`UNSUPPORTED_CONTEXT`](super::Error::UNSUPPORTED_CONTEXT).
     pub fn unsupported(self) -> i64 {
         match self {
             TreeRole::Context => super::Error::UNSUPPORTED_CONTEXT,
             TreeRole::Artifacts => super::Error::UNSUPPORTED_ARTIFACTS,
-            TreeRole::Scratch => super::Error::UNSUPPORTED_SCRATCH,
         }
     }
 }

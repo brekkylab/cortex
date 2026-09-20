@@ -295,17 +295,16 @@ fn greet(outgoing: &mut std::fs::File) -> io::Result<()> {
     outgoing.flush()
 }
 
-/// What a session is in here: the tree it works in, where it stands in it, the root it
-/// runs on, and whether it has booted.
+/// What a session is in here: the trees it was given, where it stands, the root it runs on,
+/// and whether it has booted.
 ///
 /// The [`InitCall`] that produced it is not kept: everything in it that this end acts on is
-/// the three trees, and the base and the reach are answered one boot up by the server that
+/// the two trees, and the base and the reach are answered one boot up by the server that
 /// started this guest — see [`configure`](Self::configure).
 ///
 /// **The same shape the host-local backend has**, deliberately: a client cannot tell which
 /// one answered it, so what a session *is* must not depend on which one did. What differs
 /// between them is only where a command runs, which is the whole of what a backend is for.
-#[derive(Default)]
 struct Session {
     /// The tree the session works in, as `init` named it — and as it is mounted in here.
     ///
@@ -322,14 +321,13 @@ struct Session {
     /// boot can check it is there, which is the whole of this end's part in it.
     artifacts: Option<PathBuf>,
 
-    /// Room for the session to work in, mounted in here on the same terms — and where the
-    /// session stands, which is the one way this end treats it differently. See
-    /// [`home`](Self::home).
-    scratch: Option<PathBuf>,
-
     /// Where the session stands, which is what an execution runs in and what a relative
     /// path in a file call resolves against.
-    cwd: Option<PathBuf>,
+    ///
+    /// Never absent: a process stands somewhere whatever it was told, and [`home`] is where
+    /// this one starts. An `Option` here would have put a state that cannot happen into
+    /// every call that resolves a path.
+    cwd: PathBuf,
 
     /// What the base image stated. A property of the root rather than of the session, so an
     /// `init` neither sets it nor clears it.
@@ -346,11 +344,15 @@ struct Session {
 }
 
 impl Session {
-    /// A session on the root the image describes, with nothing configured yet.
+    /// A session on the root the image describes, standing where that image said, with no
+    /// tree configured yet.
     fn new(image: ImageSpec) -> Session {
         Session {
+            cwd: home(&image),
             image,
-            ..Session::default()
+            context: None,
+            artifacts: None,
+            booted: false,
         }
     }
 
@@ -362,39 +364,25 @@ impl Session {
     fn configure(&mut self, config: InitCall) -> Result<InitResp, Error> {
         let context = tree(config.context.as_ref(), TreeRole::Context)?;
         let artifacts = tree(config.artifacts.as_ref(), TreeRole::Artifacts)?;
-        let scratch = tree(config.scratch.as_ref(), TreeRole::Scratch)?;
 
         self.release();
         self.context = context;
         self.artifacts = artifacts;
-        self.scratch = scratch;
-        // A session with no tree stands where this process was put, which `init::prepare`
-        // set to `/`. Saying so beats leaving the client to guess what a relative path means.
-        self.cwd = self.home().or_else(|| std::env::current_dir().ok());
+        // Back to where the image said, because an `init` is the session starting over and a
+        // `cd` from the session before it is not something the new one asked for. The root is
+        // the same root, so this is the same answer [`init::prepare`] already stood in.
+        self.cwd = home(&self.image);
 
         Ok(InitResp {
             context: self.context.as_deref().map(placed),
             artifacts: self.artifacts.as_deref().map(placed),
-            scratch: self.scratch.as_deref().map(placed),
             cwd: self.named_cwd(),
         })
     }
 
     /// Where the session stands.
-    fn cwd(&self) -> Option<&Path> {
-        self.cwd.as_deref()
-    }
-
-    /// Where this session starts, and what `cd` with no argument goes back to — `None` for a
-    /// session that named no tree.
-    ///
-    /// **The scratch before the context**, which is the one thing this end does with the
-    /// difference between the three: a session handed room to work in starts in that room,
-    /// so a relative path a command writes does not land in the tree the client gave it.
-    /// `init::prepare` stands this process in the same place for the same reason, which is
-    /// what makes the two agree before an `init` has even arrived.
-    fn home(&self) -> Option<PathBuf> {
-        self.scratch.clone().or_else(|| self.context.clone())
+    fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     /// Every tree this session named, with what to call each in a failure.
@@ -402,15 +390,15 @@ impl Session {
         [
             (TreeRole::Context, self.context.as_deref()),
             (TreeRole::Artifacts, self.artifacts.as_deref()),
-            (TreeRole::Scratch, self.scratch.as_deref()),
         ]
         .into_iter()
         .filter_map(|(role, path)| path.map(|path| (role, path)))
     }
 
-    /// The same, as the protocol can carry it.
+    /// The same, as the protocol can carry it — `None` for a directory with no string form,
+    /// which is a path the client could not have been told about anyway.
     fn named_cwd(&self) -> Option<String> {
-        self.cwd().and_then(|cwd| cwd.to_str().map(str::to_owned))
+        self.cwd().to_str().map(str::to_owned)
     }
 
     /// Forget that the tree was checked for.
@@ -436,8 +424,8 @@ impl Session {
         }
 
         // Every tree the session named, because the boot shared every one of them and a
-        // client will send paths into all of them. The message says which: one code, three
-        // places it can be about.
+        // client will send paths into both. The message says which: one code, two places it
+        // can be about.
         for (role, at) in self.trees() {
             match std::fs::metadata(at) {
                 Ok(meta) if meta.is_dir() => {}
@@ -476,10 +464,7 @@ impl Session {
     /// the way the *host* spells it, since the tree is mounted at the host's own path.
     fn change_dir(&mut self, argv: &[String]) -> Response {
         let target = match argv {
-            [] => match self.home().or_else(|| self.cwd.clone()) {
-                Some(home) => home,
-                None => return builtin_failed("cd: this session stands nowhere to return to"),
-            },
+            [] => home(&self.image),
             [dir] => at(self.cwd(), dir),
             _ => return builtin_failed("cd: too many arguments"),
         };
@@ -497,7 +482,7 @@ impl Session {
             ));
         }
 
-        self.cwd = Some(moved);
+        self.cwd = moved;
         // Nothing on the result says where that was. A shell answers `cd` with nothing
         // either, and a client that wants to know runs `pwd` — see
         // [`ExecResp`](cortex::console::ExecResp).
@@ -523,9 +508,9 @@ fn cd_target(exec: &ExecCall) -> Option<&[String]> {
 /// host: whatever a tree is made of was realized before the VM started, and what reaches here
 /// is the directory it was mounted at.
 ///
-/// One function for all three, which is the same arrangement the host-local backend has and
-/// for the same reason: the trees differ in what the client means by them and not in how a
-/// URL is read. `role` is what makes a refusal name which of them it was about.
+/// One function for both, which is the same arrangement the host-local backend has and for
+/// the same reason: the trees differ in what the client means by them and not in how a URL is
+/// read. `role` is what makes a refusal name which of them it was about.
 fn tree(named: Option<&TreeSource>, role: TreeRole) -> Result<Option<PathBuf>, Error> {
     let Some(named) = named else {
         return Ok(None);
@@ -582,10 +567,23 @@ fn lexical(path: &Path) -> PathBuf {
 /// An absolute path is already the answer and `Path::join` says so by dropping the root it
 /// was given; a relative one lands where a command would have looked for it. **A join, not
 /// containment** — what it buys is that the two halves of the protocol name the same file.
-fn at(root: Option<&Path>, path: impl AsRef<Path>) -> PathBuf {
-    match root {
-        Some(root) => root.join(path),
-        None => path.as_ref().to_path_buf(),
+fn at(root: &Path, path: impl AsRef<Path>) -> PathBuf {
+    root.join(path)
+}
+
+/// Where a session on this image starts, and what `cd` with no argument goes back to.
+///
+/// **What the image stated**, which is what `init::prepare` stood this process in before any
+/// `init` arrived — so the two agree without either asking the other.
+///
+/// `/` for an image that said nothing, and for a directory that is not there: `init::prepare`
+/// creates the one the image named, the way `WORKDIR` does, so a name that is still not a
+/// directory by now is one this guest could not make — and answering it anyway would be a
+/// session whose every `exec` fails on a directory it was told it was standing in.
+fn home(image: &ImageSpec) -> PathBuf {
+    match image.working_dir.as_deref().map(PathBuf::from) {
+        Some(stated) if stated.is_dir() => stated,
+        _ => PathBuf::from("/"),
     }
 }
 
@@ -642,9 +640,7 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
         // guest's PID 1 is not a process a stray signal may end.
         .process_group(0);
 
-    if let Some(dir) = session.cwd() {
-        cmd.current_dir(dir);
-    }
+    cmd.current_dir(session.cwd());
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -780,9 +776,7 @@ fn environment(session: &Session) -> Vec<(OsString, OsString)> {
     // `PWD` is what a shell reads to answer `pwd`, and a command spawned in the session's
     // directory would otherwise be told it was standing wherever this process is. Set to
     // match, which is what a shell does for itself when it moves.
-    if let Some(cwd) = session.cwd() {
-        env.push(("PWD".into(), cwd.into()));
-    }
+    env.push(("PWD".into(), session.cwd().into()));
     env
 }
 
@@ -824,7 +818,7 @@ fn finished(output: io::Result<Output>) -> Response {
 /// reported as the shorter one it was — and one that shrinks is answered with however
 /// much was still there. Either way `data` is what was read and `size` is what the file
 /// measured, which is the pair a requester needs to know whether to ask again.
-async fn read_file(root: Option<&Path>, read: &ReadCall) -> Response {
+async fn read_file(root: &Path, read: &ReadCall) -> Response {
     let path = at(root, &read.path);
     let path = path.as_path();
 
@@ -878,7 +872,7 @@ async fn read_file(root: Option<&Path>, read: &ReadCall) -> Response {
 /// was not there, cut to nothing if it was. An offset means only those bytes are being
 /// spoken for, so the file is opened without truncating and whatever lies past them
 /// stays.
-async fn write_file(root: Option<&Path>, write: &WriteCall) -> Response {
+async fn write_file(root: &Path, write: &WriteCall) -> Response {
     let path = at(root, &write.path);
     let path = path.as_path();
 
@@ -985,7 +979,7 @@ impl SnapshotPlan {
 /// and somewhere to write the result — and a session that did not say it might be built into
 /// an image has neither. The disk is flushed either way, which is what a snapshot is.
 fn snapshot_plan(session: &Session) -> SnapshotPlan {
-    let Ok(scratch) = std::env::var(COMMIT_ENV) else {
+    let Ok(commit) = std::env::var(COMMIT_ENV) else {
         return SnapshotPlan::DiskOnly;
     };
 
@@ -1012,7 +1006,7 @@ fn snapshot_plan(session: &Session) -> SnapshotPlan {
         .unwrap_or_default();
 
     SnapshotPlan::Write {
-        into: Path::new(&scratch).join(LAYER_TAR),
+        into: Path::new(&commit).join(LAYER_TAR),
         excluded,
         mount_points,
     }

@@ -269,7 +269,7 @@ fn payload<T: DeserializeOwned, E: de::Error>(method: Method, result: Bson) -> R
 /// paths are what every later `read` and `write` is spelled in.
 ///
 /// One member per tree the call named, because they are the trees the call named — see
-/// [`InitCall`](super::InitCall) for why that is three members rather than one. A tree the
+/// [`InitCall`](super::InitCall) for why that is two members rather than one. A tree the
 /// server took and did not place is the failure each of them exists to prevent: the client
 /// would have nothing to spell a path with.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,24 +292,16 @@ pub struct InitResp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifacts: Option<TreeMount>,
 
-    /// Where the [`scratch`](super::InitCall::scratch) tree went, or `None` when none was
-    /// named.
+    /// Where the session stands to begin with — the working directory the base image
+    /// declared, and whatever the server stands a session in when it declared none.
     ///
-    /// Also [`cwd`](Self::cwd) whenever it is there — see below.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scratch: Option<TreeMount>,
-
-    /// Where the session stands to begin with — the [`scratch`](Self::scratch) mount point
-    /// when the session has one, the [`context`](Self::context) one when it has not, and never
-    /// required to be either.
-    ///
-    /// **The scratch first, because that is the tree a command may write in freely.** A
-    /// session stands somewhere before it is told anything, and every relative path a
-    /// command writes lands there — so standing in the context makes the tree the client
-    /// *gave* the session the default destination for everything it produces, which is the
-    /// arrangement [`artifacts`](Self::artifacts) and [`scratch`](super::InitCall::scratch)
-    /// exist to end. A session with a scratch starts in it and leaves the other two trees to
-    /// paths that name them.
+    /// **The image, because the image is what the session runs on.** An image that says
+    /// where a process starts is describing the thing it was built to run, and a session
+    /// that stood somewhere else would be one where that image's own instructions are
+    /// wrong. Standing in a tree the client named instead would make that tree the default
+    /// destination of every relative path a command writes — somebody's project, in the
+    /// [`context`](Self::context)'s case, which is the tree a session reads and does not
+    /// write.
     ///
     /// Which is a convention and not a rule this protocol enforces: it is one member saying
     /// one thing, and a server that stands somewhere else says so here and is read.

@@ -13,7 +13,7 @@ use cortex::console::{
     TreeSource,
 };
 
-use crate::contract::{ARTIFACTS_PATH, CONTEXT_PATH, Network, SCRATCH_PATH};
+use crate::contract::{ARTIFACTS_PATH, CONTEXT_PATH, Network};
 use crate::rootfs::build;
 use uvm::Mount;
 
@@ -104,7 +104,6 @@ pub async fn run() -> anyhow::Result<()> {
                         "artifacts",
                         Error::UNSUPPORTED_ARTIFACTS,
                     )?;
-                    let scratch = at(init.scratch.as_ref(), "scratch", Error::UNSUPPORTED_SCRATCH)?;
 
                     // How far this session may reach, and which doors on this host it is
                     // granted. Settled before anything is built, because it is the one part of
@@ -207,7 +206,6 @@ pub async fn run() -> anyhow::Result<()> {
                     let mounts: Vec<Mount> = [
                         (CONTEXT_PATH, context.as_ref()),
                         (ARTIFACTS_PATH, artifacts.as_ref()),
-                        (SCRATCH_PATH, scratch.as_ref()),
                     ]
                     .into_iter()
                     .filter_map(|(at, from)| {
@@ -217,6 +215,19 @@ pub async fn run() -> anyhow::Result<()> {
                         })
                     })
                     .collect();
+
+                    // Where a command starts is where the base image said, and `/` for an
+                    // image that said nothing. The guest stands there before an `init` has
+                    // even reached it — and creates the directory when the image named one it
+                    // never made, which is what `WORKDIR` means — so this is the guest's own
+                    // answer, read here because this end is the one holding the image.
+                    //
+                    // Never a tree the session was given. Standing in one would make it the
+                    // place every relative path a command writes lands in, and the context is
+                    // mounted read-only in the guest for exactly that reason.
+                    //
+                    // Taken before the closure below, which the image itself moves into.
+                    let cwd = image.workdir.clone().unwrap_or_else(|| "/".to_string());
 
                     // Cloned per boot rather than borrowed, because what this closure is for
                     // is outliving the machine it makes — and the one after a `stop` has to
@@ -253,15 +264,7 @@ pub async fn run() -> anyhow::Result<()> {
                             artifacts: artifacts.as_ref().map(|_| TreeMount {
                                 path: ARTIFACTS_PATH.to_string(),
                             }),
-                            scratch: scratch.as_ref().map(|_| TreeMount {
-                                path: SCRATCH_PATH.to_string(),
-                            }),
-                            // Where a command starts is the tree it may write in freely, and
-                            // the context when there is no scratch.
-                            cwd: scratch
-                                .as_ref()
-                                .map(|_| SCRATCH_PATH.to_string())
-                                .or_else(|| context.as_ref().map(|_| CONTEXT_PATH.to_string())),
+                            cwd: Some(cwd),
                         },
                     ))
                 }
@@ -396,8 +399,8 @@ fn sessions() -> PathBuf {
 /// A host directory a tree names, and `None` for one the session did not name.
 ///
 /// `unsupported` is the code for the tree in `role`, which the protocol gives one of each:
-/// a client refused at `init` has to know *which* of the three this server cannot take, and a
-/// session names up to three.
+/// a client refused at `init` has to know *which* of the two this server cannot take, and a
+/// session names up to two.
 fn at(named: Option<&TreeSource>, role: &str, unsupported: i64) -> anyhow::Result<Option<PathBuf>> {
     let Some(named) = named else {
         return Ok(None);

@@ -108,10 +108,6 @@ pub struct ConsoleBuilder {
     /// caller mounted, kept alive for as long as the session is.
     artifacts: Option<Box<dyn Mount>>,
 
-    /// Room for the session to work in, and `None` for a session that works wherever it
-    /// can write.
-    scratch: Option<Box<dyn Mount>>,
-
     /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
     network: Option<NetworkAccess>,
@@ -191,8 +187,8 @@ impl ConsoleBuilder {
     /// **The session reads this tree and does not write in it.** A [`write`](Console::write)
     /// naming a path inside it is refused, and a server with a kernel of its own mounts it
     /// read-only so that a command cannot write there either — which is what
-    /// [`artifacts`](Self::artifacts) and [`scratch`](Self::scratch) are for, and how a
-    /// caller gets a tree back unchanged rather than a promise that it was not touched.
+    /// [`artifacts`](Self::artifacts) is for, and how a caller gets a tree back unchanged
+    /// rather than a promise that it was not touched.
     ///
     /// Leaving it out is a console with nothing mounted; see the field this fills.
     pub fn context(mut self, mount: impl Mount + 'static) -> Self {
@@ -215,22 +211,6 @@ impl ConsoleBuilder {
     /// written before this existed.
     pub fn artifacts(mut self, mount: impl Mount + 'static) -> Self {
         self.artifacts = Some(Box::new(mount));
-        self
-    }
-
-    /// Room for this session to work in, and where it starts.
-    ///
-    /// The third tree, and the one meant to be thrown away: a command that unpacks, builds,
-    /// or writes something it will read back needs somewhere to put it that is neither
-    /// somebody's project nor the output the caller will collect.
-    ///
-    /// **A session that has one starts in it** — the server answers this mount point as the
-    /// session's `cwd` — so every relative path a command writes lands here without any
-    /// command having to be told. That is the whole of what makes it worth passing rather
-    /// than letting commands find `/tmp`: the caller decides what backs it and when it goes
-    /// away.
-    pub fn scratch(mut self, mount: impl Mount + 'static) -> Self {
-        self.scratch = Some(Box::new(mount));
         self
     }
 
@@ -389,9 +369,6 @@ pub struct Console {
     /// Where this session leaves what it produces — `None` when the caller named none.
     artifacts: Option<Tree>,
 
-    /// Room for this session to work in, and where it starts — `None` when the caller
-    /// named none.
-    scratch: Option<Tree>,
 }
 
 impl Console {
@@ -426,7 +403,6 @@ impl Console {
             client_factory,
             context: context_mount,
             artifacts: artifacts_mount,
-            scratch: scratch_mount,
             network,
             rootfs,
             snapshot,
@@ -441,12 +417,10 @@ impl Console {
         // above follows: a console either exists or says what it lacked.
         let context = named(TreeRole::Context, context_mount.as_deref())?;
         let artifacts = named(TreeRole::Artifacts, artifacts_mount.as_deref())?;
-        let scratch = named(TreeRole::Scratch, scratch_mount.as_deref())?;
 
         let session = InitCall {
             context: context.clone(),
             artifacts: artifacts.clone(),
-            scratch: scratch.clone(),
             rootfs,
             network: network.clone(),
             snapshot,
@@ -458,7 +432,6 @@ impl Console {
             client,
             context: placed(TreeRole::Context, context_mount, answered.context)?,
             artifacts: placed(TreeRole::Artifacts, artifacts_mount, answered.artifacts)?,
-            scratch: placed(TreeRole::Scratch, scratch_mount, answered.scratch)?,
         })
     }
 
@@ -484,17 +457,6 @@ impl Console {
         self.artifacts.as_ref().map(|tree| tree.path.as_path())
     }
 
-    /// Where the server put this session's [`scratch`](ConsoleBuilder::scratch) tree —
-    /// `None` when the caller named none.
-    ///
-    /// Also where the session stands to begin with, which is the reason to pass one. That is
-    /// only the *beginning*: a command can move the session and nothing reports that it did,
-    /// so a caller that needs to know where it stands now runs `pwd` — see
-    /// [`exec`](Self::exec).
-    pub fn scratch_path(&self) -> Option<&Path> {
-        self.scratch.as_ref().map(|tree| tree.path.as_path())
-    }
-
     /// Whether this session has a tree at all, which is whether a path this console sends
     /// can name one of the caller's files.
     ///
@@ -513,15 +475,6 @@ impl Console {
     /// would write there — see [`artifacts_path`](Self::artifacts_path) for where it goes.
     pub fn has_artifacts(&self) -> bool {
         self.artifacts.is_some()
-    }
-
-    /// Whether this session has a tree to work in, and so whether it stands in one.
-    ///
-    /// Without it the session starts wherever the server puts a session with nothing
-    /// mounted, and writes that go nowhere named go nowhere the caller can reach — see
-    /// [`scratch_path`](Self::scratch_path).
-    pub fn has_scratch(&self) -> bool {
-        self.scratch.is_some()
     }
 
     /// Boot the far end now, to hide the cold start.
