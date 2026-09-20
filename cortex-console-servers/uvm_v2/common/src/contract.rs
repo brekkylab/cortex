@@ -136,34 +136,30 @@ pub const CONTEXT_TAG: &str = "cortexctx";
 /// what this protocol happens to carry.
 pub const ARTIFACTS_TAG: &str = "cortexart";
 
-/// The virtio-fs tag a committable session's scratch directory is shared under.
-pub const COMMIT_TAG: &str = "cortexcommit";
-
-/// Where the guest finds that scratch, and where it writes a commit's layer.
+/// Where the guest finds the boot root once it is standing on the overlay instead.
 ///
-/// Not one of the three above and not reached the way they are: nothing outside this
-/// workspace names it, so it is a path the two halves of the commit agree on and no client
-/// ever sees.
-pub const COMMIT_PATH: &str = "/.cortex-commit";
+/// The root the kernel handed over is kept rather than detached, because everything a commit
+/// needs is under it: the upperdir at [`UPPER_DIR`], which the overlay offers under no other
+/// name, and the share itself, which is how the layer leaves the guest at all.
+pub const OLD_ROOT: &str = "/oldroot";
 
-/// Set for a guest that has one. Its value is [`COMMIT_PATH`].
-pub const COMMIT_ENV: &str = "CORTEX_UVM_COMMIT";
-
-/// Set for a guest that may commit at all.
+/// What a commit leaves in the boot root, and the name the host reads it back under.
 ///
-/// Separate from [`COMMIT_ENV`] because the two are read at different moments and decide
-/// different things: this one before `pivot_root`, to keep the old root rather than detach it,
-/// and that one after, to mount somewhere to write. A guest with the share and no kept root
-/// would have somewhere to put a layer and no way to see one.
-pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
-
-/// What a commit's layer is called inside the scratch. One name, said once.
-pub const LAYER_TAR: &str = "layer.tar";
+/// A bare name and not a path, because the two ends reach that root by different names: the
+/// host by the directory it made, the guest by [`OLD_ROOT`].
+///
+/// A file in the already-shared root and not a device of its own, for the reason
+/// [`SNAPSHOT_PATH`] is one — this is that file in the other direction. A layer is neither
+/// short nor bounded, so it cannot go back over the console channel, and a second virtio-fs
+/// share would be a device, a tag and an argument for a directory the guest can already
+/// write into at [`OLD_ROOT`].
+pub const LAYER_TAR: &str = ".cortex-layer.tar";
 
 /// Where a guest that kept its old root can reach the upperdir of the overlay it stands on.
 ///
 /// The host cannot read that ext4 itself and the overlay offers the upper under no other
-/// name, so this is the only way a commit sees what a session wrote.
+/// name, so this is the only way a commit sees what a session wrote. Under [`OLD_ROOT`],
+/// spelled in full because a `const` cannot be assembled out of one.
 pub const UPPER_DIR: &str = "/oldroot/mnt/upper/upper";
 
 /// Where a boot leaves the layer a session is to start on, and where the guest unpacks it
@@ -175,9 +171,9 @@ pub const UPPER_DIR: &str = "/oldroot/mnt/upper/upper";
 ///
 /// A file in the boot root rather than a disk or an argument, for the reason
 /// [`IMAGE_SPEC_PATH`] is one: the root is already shared, and a layer is neither short nor
-/// bounded. The guest reads it before the pivot, which is the one moment both this file and
-/// the bare upperdir under [`UPPER_DIR`] are reachable at once — afterwards the root holding
-/// it is gone and the upperdir has an overlay on top.
+/// bounded. The guest reads it before the pivot, which is the last moment the upperdir is a
+/// bare directory — afterwards it has an overlay on top, and [`UPPER_DIR`] is what reaches
+/// it.
 pub const SNAPSHOT_PATH: &str = "/.cortex-snapshot.tar";
 
 /// Where a boot writes [`ImageSpec`] in the boot root, and the path the guest reads it from.
@@ -359,19 +355,6 @@ pub struct BootArgs {
     /// The session's writable image, as a host path.
     pub session: PathBuf,
 
-    /// Whether this session may commit, which decides one thing at boot and nothing after:
-    /// the old root is kept rather than detached, so the guest can still reach the upperdir of
-    /// the overlay it is standing on.
-    pub committable: bool,
-
-    /// A directory on this host the guest may write a commit's layer into, shared in at
-    /// [`COMMIT_PATH`]. `None` for a session that cannot commit.
-    ///
-    /// Writable, unlike the `/abin` disk, and that is not a contradiction: `/abin` is a cache
-    /// every later session reads, where this is one session's scratch — made by the server,
-    /// thrown away with the session, and holding nothing but that session's own output.
-    pub commit_out: Option<PathBuf>,
-
     /// A read-only image of native executables to mount at `/abin`.
     ///
     /// `None` is a session that gets none. Always a raw EROFS and never a descriptor, so
@@ -431,14 +414,6 @@ impl BootArgs {
     pub fn to_args(&self) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
 
-        // First, before the closure below takes its borrow of `args`. This is the one flag
-        // that carries no value — it is a fact about the session rather than a thing with a
-        // spelling — so it cannot go through `put`, and where it sits does not matter to
-        // `parse`.
-        if self.committable {
-            args.push(OsString::from("--committable"));
-        }
-
         let mut put = |flag: &str, value: &OsStr| {
             args.push(OsString::from(flag));
             args.push(value.to_os_string());
@@ -464,9 +439,6 @@ impl BootArgs {
         }
         if let Some(abin) = &self.abin {
             put("--abin", abin.as_os_str());
-        }
-        if let Some(out) = &self.commit_out {
-            put("--commit-out", out.as_os_str());
         }
         if let Some(vcpus) = self.vcpus {
             put("--vcpus", OsStr::new(&vcpus.to_string()));
@@ -494,8 +466,6 @@ impl BootArgs {
         let mut context = None;
         let mut artifacts = None;
         let mut abin = None;
-        let mut committable = false;
-        let mut commit_out = None;
         let mut vcpus = None;
         let mut memory_mib = None;
 
@@ -520,8 +490,6 @@ impl BootArgs {
                 "--context" => context = Some(PathBuf::from(value()?)),
                 "--artifacts" => artifacts = Some(PathBuf::from(value()?)),
                 "--abin" => abin = Some(PathBuf::from(value()?)),
-                "--committable" => committable = true,
-                "--commit-out" => commit_out = Some(PathBuf::from(value()?)),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
                 other => anyhow::bail!("{other} is not an argument a boot takes"),
@@ -549,8 +517,6 @@ impl BootArgs {
             host_ports,
             context,
             artifacts,
-            committable,
-            commit_out,
             abin,
             vcpus,
             memory_mib,
@@ -622,43 +588,9 @@ mod tests {
             context: Some("/Users/someone/project".into()),
             artifacts: Some("/Users/someone/out".into()),
             abin: Some("/cache/layers/sha256_2b91c4.erofs".into()),
-            committable: true,
-            commit_out: Some("/tmp/cortex-uvm-commit".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
         }
-    }
-
-    /// A committable session says both things, and an ordinary one says neither.
-    ///
-    /// The pair matters. A kept root with nowhere to write is a guest that can see what the
-    /// session wrote and cannot hand it over; somewhere to write with no kept root is the
-    /// reverse.
-    #[test]
-    fn a_committable_boot_says_so_and_names_somewhere_to_write() {
-        let args = args();
-        let back = BootArgs::parse(args.to_args()).unwrap();
-        assert!(back.committable);
-        assert_eq!(back.commit_out, args.commit_out);
-    }
-
-    #[test]
-    fn an_ordinary_boot_says_neither() {
-        let plain = BootArgs {
-            committable: false,
-            commit_out: None,
-            ..args()
-        };
-        let written = plain.to_args();
-        assert!(
-            !written
-                .iter()
-                .any(|arg| arg == "--committable" || arg == "--commit-out"),
-            "{written:?}"
-        );
-        let back = BootArgs::parse(written).unwrap();
-        assert!(!back.committable);
-        assert_eq!(back.commit_out, None);
     }
 
     /// A session with no `/abin` says nothing about one, and reads back as having none.
@@ -701,12 +633,7 @@ mod tests {
             ..args()
         };
         let spelled = bare.to_args();
-        for flag in [
-            "--context",
-            "--artifacts",
-            "--vcpus",
-            "--memory-mib",
-        ] {
+        for flag in ["--context", "--artifacts", "--vcpus", "--memory-mib"] {
             assert!(
                 !spelled.iter().any(|arg| arg == flag),
                 "{flag} was sent anyway"
@@ -721,7 +648,7 @@ mod tests {
     #[test]
     fn a_boot_refuses_arguments_a_server_would_not_have_sent() {
         let mut short = args().to_args();
-        short.truncate(2); // `--committable`, then a flag with nothing to be
+        short.truncate(2); // `--boot-root` and its value, and nothing else a boot needs
         assert!(
             BootArgs::parse(short).is_err(),
             "a missing argument was accepted"

@@ -19,10 +19,10 @@
 //! # The devices, and what each one is for
 //!
 //! ```text
-//! virtio-fs  root           the boot root, holding the guest binary and the image spec
+//! virtio-fs  root           the boot root: the guest binary, the image spec, and the layer
+//!                           the guest leaves there on the way back out
 //! virtio-fs  cortexctx      the session's context, served straight out of this process
 //! virtio-fs  cortexart      its artifacts tree, when it named one
-//! virtio-fs  cortexcommit   where a committable session leaves its layer
 //! virtio-blk /dev/vda       the session's ext4 image — the overlay's upper
 //! virtio-blk /dev/vdb       the base image, read-only — the overlay's lower
 //! virtio-blk /dev/vdc       `/abin`, read-only, when the session has one
@@ -51,10 +51,9 @@ use std::{
 };
 
 use contract::{
-    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, COMMIT_ENV,
-    COMMIT_PATH, COMMIT_TAG, COMMITTABLE_ENV, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG,
-    GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
-    PORT_NAME, UPPER_ENV,
+    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, CONTEXT_ENV,
+    CONTEXT_PATH, CONTEXT_TAG, GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV,
+    LOWER_ENV, Network, PORT_NAME, UPPER_ENV,
 };
 use msb_krun::{DiskImageFormat, VmBuilder};
 
@@ -178,12 +177,6 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
         shares.push((env, format!("{tag}:{at}")));
     }
 
-    // A committable session's scratch. Shared rather than sent back over the channel: a layer
-    // can be hundreds of megabytes, and that channel is what the protocol itself runs on.
-    if let Some(out) = &args.commit_out {
-        builder = builder.fs(|fs| fs.tag(COMMIT_TAG).path(out));
-    }
-
     // What the stack wants the guest to know: its address, its gateway, its resolver. Passed
     // through as the stack spelled them.
     let guest_net = stack.as_ref().map(|s| s.guest_env()).unwrap_or_default();
@@ -197,18 +190,6 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
             let e = shares.iter().fold(e, |e, (env, share)| e.env(*env, share));
             let e = match &args.abin {
                 Some(_) => e.env(ABIN_ENV, GUEST_ABIN_DEV),
-                None => e,
-            };
-            // Two values and not one: the first is read before `pivot_root` and the second
-            // after, and a guest with only the second could write a layer it had no way to
-            // see.
-            let e = if args.committable {
-                e.env(COMMITTABLE_ENV, "1")
-            } else {
-                e
-            };
-            let e = match &args.commit_out {
-                Some(_) => e.env(COMMIT_ENV, COMMIT_PATH),
                 None => e,
             };
             guest_net

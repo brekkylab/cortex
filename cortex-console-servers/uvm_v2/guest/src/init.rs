@@ -49,8 +49,8 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 
 use crate::contract::{
-    ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, IMAGE_SPEC_PATH, ImageSpec,
-    ARTIFACTS_ENV, LOWER_ENV, PORT_NAME, SNAPSHOT_PATH, UPPER_ENV, CONTEXT_ENV,
+    ABIN_ENV, ABIN_PATH, ARTIFACTS_ENV, CONTEXT_ENV, IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV,
+    OLD_ROOT, PORT_NAME, SNAPSHOT_PATH, UPPER_ENV,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
@@ -95,16 +95,9 @@ pub fn prepare() -> anyhow::Result<ImageSpec> {
             .map_err(|e| anyhow::anyhow!("mounting {device} at {ABIN_PATH}: {e}"))?;
     }
 
-    // Somewhere for a commit to write its layer. Writable, unlike `/abin`: it is this
-    // session's own scratch, made by the server and thrown away with the session.
-    if let Ok(at) = std::env::var(COMMIT_ENV) {
-        mount(COMMIT_TAG, &at, "virtiofs", 0)
-            .map_err(|e| anyhow::anyhow!("mounting the commit scratch at {at}: {e}"))?;
-    }
-
     // After the pivot, because `/etc/resolv.conf` has to land on the root the commands will
-    // see rather than on the one about to be detached. Does nothing when the boot attached no
-    // network, which is the default.
+    // see rather than on the one it replaced. Does nothing when the boot attached no network,
+    // which is the default.
     crate::net::configure()?;
 
     // Every tree the session named, each at the host's own path for it. The artifacts tree is
@@ -244,9 +237,9 @@ fn mount_root(lower_dev: &str, upper_dev: &str) -> anyhow::Result<()> {
     let _ = std::fs::create_dir_all("/mnt/upper/work");
 
     // What a previous session left, put back before anything is stacked on top of it. Here
-    // and nowhere else: this is the one moment both the boot root holding the file and the
-    // bare upperdir are reachable, since the pivot below detaches the first and the overlay
-    // above claims the second.
+    // and nowhere else: the overlay below claims the upperdir, and afterwards the only name
+    // for it is the one a commit reaches through the old root — a directory with this
+    // session's own writes already in it.
     //
     // An absent file is a session starting on its base alone, which is the ordinary case and
     // not a failure. One that is there and does not unpack *is* a failure, because a session
@@ -278,22 +271,17 @@ fn mount_root(lower_dev: &str, upper_dev: &str) -> anyhow::Result<()> {
     pivot("/mnt/newroot")
 }
 
-/// Make `new_root` the root and detach what was there.
+/// Make `new_root` the root, with the one it replaces moved under [`OLD_ROOT`].
 fn pivot(new_root: &str) -> anyhow::Result<()> {
-    let _ = std::fs::create_dir_all(format!("{new_root}/oldroot"));
+    let old = OLD_ROOT.trim_start_matches('/');
+    let _ = std::fs::create_dir_all(format!("{new_root}/{old}"));
 
     // `pivot_root(".", "oldroot")` with the cwd at the new root — the spelling that does
     // not depend on the old root still being namable afterwards.
     if unsafe { libc::chdir(cstr(new_root).as_ptr()) } != 0 {
         anyhow::bail!("entering {new_root}: {}", io::Error::last_os_error());
     }
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_pivot_root,
-            cstr(".").as_ptr(),
-            cstr("oldroot").as_ptr(),
-        )
-    };
+    let rc = unsafe { libc::syscall(libc::SYS_pivot_root, cstr(".").as_ptr(), cstr(old).as_ptr()) };
     if rc != 0 {
         anyhow::bail!("pivoting onto {new_root}: {}", io::Error::last_os_error());
     }
@@ -304,24 +292,13 @@ fn pivot(new_root: &str) -> anyhow::Result<()> {
         anyhow::bail!("returning to /: {}", io::Error::last_os_error());
     }
 
-    // A committable session keeps it. `/oldroot/mnt/upper/upper` is then the upperdir of the
-    // overlay this process is standing on, and that is the only way a commit can see what the
-    // session wrote — the host cannot read the ext4 itself, and the overlay offers its upper
-    // under no other name.
+    // The old root is left mounted, and that is a decision rather than an omission. Both
+    // halves of a commit are under it: `/oldroot/mnt/upper/upper` is the upperdir of the
+    // overlay this process is now standing on — the only way to see what the session wrote,
+    // since the host cannot read the ext4 and the overlay offers its upper under no other
+    // name — and the boot root beside it is the share the layer leaves through.
     //
-    // Kept only when it was asked for. Leaving a detached root reachable in every session
-    // would be a surface added for the sessions that will never look at it.
-    if std::env::var_os(COMMITTABLE_ENV).is_some() {
-        return Ok(());
-    }
-
-    // Lazily, because the overlay holds its lower, upper and work directories through
-    // handles of its own — they keep working after the names they were mounted under
-    // leave the namespace.
-    if unsafe { libc::umount2(cstr("/oldroot").as_ptr(), libc::MNT_DETACH) } != 0 {
-        anyhow::bail!("detaching the boot root: {}", io::Error::last_os_error());
-    }
-    let _ = std::fs::remove_dir("/oldroot");
+    // In every session, because every session can be asked for a snapshot.
     Ok(())
 }
 

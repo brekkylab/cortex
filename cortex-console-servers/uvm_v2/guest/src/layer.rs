@@ -14,9 +14,9 @@
 //! # What is left out
 //!
 //! Everything the console server and this agent put in the session's own filesystem: this
-//! binary, the root kept so that this walk is possible at all, the shim directory, the scratch
-//! being written into, and the mount points of anything shared in. None of it is the session's
-//! work, and one of them is this binary — over a megabyte of it.
+//! binary, the root kept so that this walk is possible at all — which is also where the tar
+//! being written goes — the shim directory, and the mount points of anything shared in. None
+//! of it is the session's work, and one of them is this binary — over a megabyte of it.
 //!
 //! **A mount point's ancestors go too, when they were only ever the way to it.** The context is
 //! mounted at the host's own path, so a session on `/private/var/folders/…/T/x` has every

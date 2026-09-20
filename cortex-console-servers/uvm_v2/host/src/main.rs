@@ -41,9 +41,9 @@ const NOT_EXECUTABLE: u8 = 126;
 ///     └── {pid}/
 ///         ├── session.ext4    what the session wrote — outlives any one machine
 ///         └── machine/        what only makes sense while one is up
-///             ├── boot/       the root libkrun hands over: guest binary, image spec
+///             ├── boot/       the root libkrun hands over: guest binary, image spec, and
+///             │               the layer the guest leaves there for this end to read
 ///             ├── port.sock   the console channel
-///             ├── commit/     where the guest leaves a layer
 ///             └── console.log the kernel's own output
 /// ```
 ///

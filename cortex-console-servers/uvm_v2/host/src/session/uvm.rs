@@ -61,7 +61,7 @@ pub struct Mount {
 
 /// A booted micro-VM, held for as long as there is something to ask it.
 ///
-/// Dropping it takes the machine down and removes the scratch it was given, which is what
+/// Dropping it takes the machine down and removes everything the boot made, which is what
 /// makes a session's writes go no further than the session.
 pub struct Uvm {
     /// The signed copy holding the hypervisor. Killed when this drops, which is what takes
@@ -76,8 +76,8 @@ pub struct Uvm {
     /// Everything this boot made and nothing else reads: gone when this drops, which is
     /// what keeps a session's writes inside the session.
     dir: PathBuf,
-    /// Where the guest leaves a layer, when it was booted able to.
-    commit: PathBuf,
+    /// The file in the boot root the guest leaves a layer in — see [`LAYER_TAR`].
+    layer: PathBuf,
 }
 
 impl Drop for Uvm {
@@ -126,12 +126,14 @@ impl Uvm {
         std::fs::create_dir_all(&dir)?;
 
         let upper = owner.join("session.ext4");
-        let (root, socket, commit, console) = (
+        let (root, socket, console) = (
             dir.join("boot"),
             dir.join("port.sock"),
-            dir.join("commit"),
             dir.join("console.log"),
         );
+        // In the root and not beside it: the guest reaches that share after the pivot and
+        // writes the tar into it, which is one device fewer than a scratch of its own.
+        let layer = root.join(LAYER_TAR);
 
         // The base, as one disk. It is not scratch and is not made here if it was made once
         // already: the layers, the metadata merged out of them and the descriptor naming both
@@ -162,7 +164,6 @@ impl Uvm {
         // A real root only for the moment between the kernel handing over and the guest
         // pivoting onto the overlay — long enough to exec one file and read one other.
         std::fs::create_dir_all(&root)?;
-        std::fs::create_dir_all(&commit)?;
 
         // A copy and not a link: this tree is served to the guest over virtio-fs, and what it
         // holds has to be a file under the root rather than a name pointing out of it.
@@ -204,8 +205,6 @@ impl Uvm {
             base,
             base_format: BaseFormat::Vmdk,
             session: upper,
-            committable: true,
-            commit_out: Some(commit.clone()),
             abin: None,
             context: None,
             artifacts: None,
@@ -293,7 +292,7 @@ impl Uvm {
             outgoing,
             next: 0,
             dir,
-            commit,
+            layer,
         })
     }
 
@@ -353,10 +352,10 @@ impl Uvm {
     /// metadata — is not the session's work. The upperdir is the part that is.
     ///
     /// The guest is what produces it: the upperdir is a directory only it can see, and the
-    /// writes are its kernel's until it syncs. It leaves the tar in the shared scratch rather
-    /// than answering with it, because a layer can be far larger than the channel this
-    /// protocol runs on — so what comes back over the wire is an acknowledgement, and the
-    /// bytes are read from the file here.
+    /// writes are its kernel's until it syncs. It leaves the tar in the boot root — the share
+    /// it still holds after the pivot — rather than answering with it, because a layer can be
+    /// far larger than the channel this protocol runs on. So what comes back over the wire is
+    /// an acknowledgement, and the bytes are read from the file here.
     pub async fn snapshot(&mut self) -> anyhow::Result<Vec<u8>> {
         match self.call(Call::Snapshot(SnapshotCall {})).await? {
             Response::Snapshot(_) => {}
@@ -364,7 +363,7 @@ impl Uvm {
             other => anyhow::bail!("the guest answered a snapshot with {other:?}"),
         }
 
-        let tar = self.commit.join(LAYER_TAR);
+        let tar = &self.layer;
         anyhow::ensure!(
             tar.is_file(),
             "the guest left no layer at {}",
@@ -387,9 +386,8 @@ impl Uvm {
 
     /// Everything written since the boot, kept as a layer.
     ///
-    /// The guest walks its own upperdir and leaves a tar in the scratch it was given; what
-    /// is here is turning that into a layer, which is the one part of it that knows what an
-    /// image is.
+    /// The guest walks its own upperdir and leaves a tar in the boot root; what is here is
+    /// turning that into a layer, which is the one part of it that knows what an image is.
     pub async fn commit(&mut self) -> anyhow::Result<Layer> {
         match self.call(Call::Snapshot(SnapshotCall {})).await? {
             Response::Snapshot(_) => {}
@@ -397,7 +395,7 @@ impl Uvm {
             other => anyhow::bail!("the guest answered a commit with {other:?}"),
         }
 
-        let tar = self.commit.join(LAYER_TAR);
+        let tar = &self.layer;
         anyhow::ensure!(
             tar.is_file(),
             "the guest left no layer at {}",

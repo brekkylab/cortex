@@ -103,8 +103,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt a
 use tokio::process::{Child, Command};
 
 use crate::contract::{
-    ABIN_PATH, COMMIT_ENV, COMMIT_PATH, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec,
-    LAYER_TAR, UPPER_DIR,
+    ABIN_PATH, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec, LAYER_TAR, OLD_ROOT, UPPER_DIR,
 };
 
 /// A command we found but could not start, and one we could not find at all.
@@ -247,10 +246,9 @@ async fn serve(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
                     server.respond(id, answered).await?;
                 }
 
-                // Answered with an empty blob, because the snapshot is a disk this end
-                // cannot read: the session's writes live on `/dev/vda`, and the file behind
-                // that device is the host's. What is this end's is getting them *onto* it —
-                // see [`SnapshotPlan`].
+                // Answered with an empty blob, because what the host reads is the tar this
+                // end leaves in the boot root and not anything a frame could carry — see
+                // [`SnapshotPlan`].
                 Call::Snapshot(_) => {
                     // On a blocking thread: a sync waits on every dirty page the session
                     // wrote, and archiving an upperdir is as big as what it holds. Either
@@ -934,31 +932,25 @@ fn file_error(e: io::Error, path: &str) -> Error {
 ///
 /// Separated from the doing so that the doing can be handed to a thread: what it takes is a
 /// few paths, where a [`Session`] is neither `Send` nor something to hold across one.
-enum SnapshotPlan {
-    /// No layer was arranged for at boot, so the disk is the whole of what there is to flush.
-    DiskOnly,
-    Write {
-        into: PathBuf,
-        excluded: Vec<PathBuf>,
-        mount_points: Vec<PathBuf>,
-    },
+struct SnapshotPlan {
+    into: PathBuf,
+    excluded: Vec<PathBuf>,
+    mount_points: Vec<PathBuf>,
 }
 
 impl SnapshotPlan {
     /// Put this session's writes where the host can read them.
     ///
-    /// The answer carries no blob, because what the host reads is the disk behind
-    /// `/dev/vda` and this end holds no file for it. What it can do is make sure every
-    /// write has reached that device, which is what a `sync` is for here.
+    /// The answer carries no blob, because a layer is neither short nor bounded and the
+    /// channel this protocol runs on is framed: what goes back is an acknowledgement, and
+    /// the bytes are left in the boot root for the host to read out of the share.
     fn run(self) -> Response {
-        if let SnapshotPlan::Write {
+        let SnapshotPlan {
             into,
             excluded,
             mount_points,
-        } = self
-            && let Err(e) =
-                crate::layer::write(Path::new(UPPER_DIR), &into, &excluded, &mount_points)
-        {
+        } = self;
+        if let Err(e) = crate::layer::write(Path::new(UPPER_DIR), &into, &excluded, &mount_points) {
             return Response::Error(refused(
                 Error::IO_FAILED,
                 format!("writing this session's layer: {e}"),
@@ -975,17 +967,13 @@ impl SnapshotPlan {
 
 /// What this session would leave behind, and where.
 ///
-/// A layer needs two things arranged while booting — the root holding this overlay's upper,
-/// and somewhere to write the result — and a session that did not say it might be built into
-/// an image has neither. The disk is flushed either way, which is what a snapshot is.
+/// Both ends of it are the old root the boot kept: the overlay's upperdir is under it, and so
+/// is the share the tar is written into — which is also why the whole of it is excluded from
+/// the layer below rather than named again.
 fn snapshot_plan(session: &Session) -> SnapshotPlan {
-    let Ok(commit) = std::env::var(COMMIT_ENV) else {
-        return SnapshotPlan::DiskOnly;
-    };
-
     // Everything the console server and this agent put in the session's own filesystem. None
     // of it is the session's work, and one of them is this binary.
-    let mut excluded: Vec<PathBuf> = [GUEST_BIN_PATH, "/oldroot", ABIN_PATH, COMMIT_PATH]
+    let mut excluded: Vec<PathBuf> = [GUEST_BIN_PATH, OLD_ROOT, ABIN_PATH]
         .iter()
         .map(|path| PathBuf::from(path.trim_start_matches('/')))
         .collect();
@@ -1005,8 +993,8 @@ fn snapshot_plan(session: &Session) -> SnapshotPlan {
         .map(|path| vec![inside_upper(path)])
         .unwrap_or_default();
 
-    SnapshotPlan::Write {
-        into: Path::new(&commit).join(LAYER_TAR),
+    SnapshotPlan {
+        into: Path::new(OLD_ROOT).join(LAYER_TAR),
         excluded,
         mount_points,
     }
