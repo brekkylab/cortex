@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use microsandbox_image::erofs::write_fsmeta;
 use microsandbox_image::tree::merge_layers_with_provenance;
@@ -51,18 +51,31 @@ impl Image {
             .tmp_dir()
             .join(format!("{}.image.json", std::process::id()));
         std::fs::write(&part, &bytes)?;
-        std::fs::rename(&part, images.join(format!("{}.json", digest.path_safe())))?;
+        std::fs::rename(&part, Image::path(&digest))?;
 
         Ok(digest)
     }
 
     /// The image `digest` names, read back.
     pub fn load(digest: &Digest) -> anyhow::Result<Image> {
-        let held = images().join(format!("{}.json", digest.path_safe()));
+        Image::read(&Image::path(digest))
+    }
+
+    /// One manifest, read from where it lies.
+    ///
+    /// Beside [`load`](Self::load) because a listing walks the directory and so has the file
+    /// before it has a digest — and naming the file it failed on is the whole of what it can
+    /// say about one that does not parse.
+    pub fn read(held: &Path) -> anyhow::Result<Image> {
         let bytes =
-            std::fs::read(&held).map_err(|e| anyhow::anyhow!("reading {}: {e}", held.display()))?;
+            std::fs::read(held).map_err(|e| anyhow::anyhow!("reading {}: {e}", held.display()))?;
         serde_json::from_slice(&bytes)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", held.display()))
+    }
+
+    /// Where the manifest `digest` names lies, whether or not anything is there.
+    pub fn path(digest: &Digest) -> PathBuf {
+        images().join(format!("{}.json", digest.path_safe()))
     }
 
     /// The digest of the stack this image is: its layers, in order, and nothing else.
@@ -70,7 +83,7 @@ impl Image {
     /// What a disk is made of is the layers, so this and not [`Image::digest`] is what names
     /// one — two images that differ in an `ENV` are one disk, and the second of them boots on
     /// what the first already paid for.
-    fn stack(&self) -> Digest {
+    pub(super) fn stack(&self) -> Digest {
         let mut named = String::new();
         for layer in &self.layers {
             named.push_str(layer.digest().as_str());

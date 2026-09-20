@@ -49,8 +49,9 @@ const NOT_EXECUTABLE: u8 = 126;
 ///
 /// Split by lifetime rather than by who wrote it, which is what makes each level's cleanup
 /// one call: a `stop` removes `machine/`, the end of a session removes `{pid}/`, and nothing
-/// removes `rootfs/` because a rebuild is what it exists to make cheap. One variable moves
-/// all of it, which is what a test that wants none of it near a real cache needs.
+/// removes `rootfs/` on its own, because a rebuild is what it exists to make cheap — only
+/// `rootfs remove` does, for an image somebody said they are done with. One variable moves all
+/// of it, which is what a test that wants none of it near a real cache needs.
 pub(crate) fn home() -> PathBuf {
     std::env::var_os("CORTEX_UVM_HOME")
         .map(PathBuf::from)

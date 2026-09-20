@@ -19,6 +19,16 @@ use uvm::Mount;
 
 pub use uvm::Uvm;
 
+/// The reach a session gets when its client did not ask for one, and the host ports granted
+/// with it.
+///
+/// Read from this server's own environment, because a client that says nothing about a network
+/// is not asking for one setting over another — it is leaving the question to whoever started
+/// this process, who is the only party here that knows what the machine it runs on is allowed
+/// to talk to. A client that does have an opinion says so, and what it says wins.
+const NETWORK: &str = "CORTEX_UVM_NETWORK";
+const HOST_PORTS: &str = "CORTEX_UVM_HOST_PORTS";
+
 /// Answer a console session on stdin and stdout, until the client ends it.
 pub async fn run() -> anyhow::Result<()> {
     // Taken for the life of the process: from here on stdout carries frames and nothing
@@ -96,12 +106,82 @@ pub async fn run() -> anyhow::Result<()> {
                     let artifacts = at(init.artifacts.as_ref(), "artifacts")?;
                     let scratch = at(init.scratch.as_ref(), "scratch")?;
 
-                    // What the client asked for, or nothing — and nothing means no device at
-                    // all, which is the setting a sandbox should have to ask its way out of.
-                    let network = match init.network.as_ref() {
-                        Some(asked) => Network::parse(Some(&asked.reach))
-                            .map_err(|_| anyhow::anyhow!("{}: no such reach", asked.reach))?,
-                        None => Network::Disabled,
+                    // How far this session may reach, and which doors on this host it is
+                    // granted. Settled before anything is built, because it is the one part of
+                    // an `init` a client can be told it got wrong while the answer still costs
+                    // it nothing: a reach decides whether a virtio-net device is attached, and
+                    // a device is attached before a kernel comes up.
+                    //
+                    // Every name the protocol defines is one this backend can answer, so the
+                    // only refusals are a name nobody defined and a grant that cannot mean
+                    // anything.
+                    let (network, host_ports) = match init.network.as_ref() {
+                        // Nothing asked, so this server's own setting stands — see [`NETWORK`].
+                        // That there is a setting at all, rather than no device, is what makes
+                        // a name resolve: a command reaching for the internet under the default
+                        // fails at a refused connection instead of at a lookup that hangs, and
+                        // a session granted a host port talks to whatever the operator put
+                        // there without any of it being published.
+                        None => (
+                            Network::parse(std::env::var(NETWORK).ok().as_deref()).map_err(
+                                |_| {
+                                    refuse(
+                                        Error::UNSUPPORTED_NETWORK,
+                                        format!(
+                                            "{NETWORK}: no such reach — this server answers \
+                                             none, host, public and full"
+                                        ),
+                                    )
+                                },
+                            )?,
+                            // Parsed rather than passed on as the string it was written as: a
+                            // boot is told ports and not a spelling of them, so a typo is this
+                            // server's to report, by the name of the variable that carried it.
+                            std::env::var(HOST_PORTS)
+                                .unwrap_or_default()
+                                .split(',')
+                                .map(str::trim)
+                                .filter(|port| !port.is_empty())
+                                .map(|port| {
+                                    port.parse::<u16>().map_err(|_| {
+                                        refuse(
+                                            Error::INVALID_PARAMS,
+                                            format!("{HOST_PORTS}: {port} is not a port number"),
+                                        )
+                                    })
+                                })
+                                .collect::<anyhow::Result<_>>()?,
+                        ),
+                        Some(asked) => {
+                            let network = Network::parse(Some(&asked.reach)).map_err(|_| {
+                                refuse(
+                                    Error::UNSUPPORTED_NETWORK,
+                                    format!(
+                                        "{}: no such reach — this server answers none, host, \
+                                         public and full",
+                                        asked.reach
+                                    ),
+                                )
+                            })?;
+
+                            // A door onto a machine the guest has no way to send a packet to is
+                            // not a narrower session, it is two settings that cannot both have
+                            // been meant. Said now, while the client can still pick which one
+                            // it wanted.
+                            if network == Network::Disabled && !asked.host_ports.is_empty() {
+                                return Err(refuse(
+                                    Error::INVALID_PARAMS,
+                                    format!(
+                                        "host_ports {:?} were granted to a session that asked \
+                                         for no network — a port on this host needs a device to \
+                                         reach it through",
+                                        asked.host_ports
+                                    ),
+                                ));
+                            }
+
+                            (network, asked.host_ports.clone())
+                        }
                     };
 
                     // The whole declaration, built: the base resolved — a digest names
@@ -145,10 +225,21 @@ pub async fn run() -> anyhow::Result<()> {
                     let snapshot = init.snapshot;
                     let boot: Box<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<Uvm>>>>> =
                         Box::new(move || {
-                            let (image, mounts, snapshot) =
-                                (image.clone(), mounts.clone(), snapshot.clone());
+                            let (image, mounts, host_ports, snapshot) = (
+                                image.clone(),
+                                mounts.clone(),
+                                host_ports.clone(),
+                                snapshot.clone(),
+                            );
                             Box::pin(async move {
-                                Uvm::boot(&image, &mounts, network, snapshot.as_deref()).await
+                                Uvm::boot(
+                                    &image,
+                                    &mounts,
+                                    network,
+                                    &host_ports,
+                                    snapshot.as_deref(),
+                                )
+                                .await
                             })
                         });
                     let uvm = boot().await?;
@@ -303,10 +394,42 @@ fn at(named: Option<&TreeSource>, role: &str) -> anyhow::Result<Option<PathBuf>>
     Ok(Some(path.to_path_buf()))
 }
 
+/// A failure that names the code the protocol has for it.
+///
+/// Everything under an `init` hands back an `anyhow::Error`, so a code travels the way a
+/// message already does — carried by the failure itself and read off it where the response is
+/// made — rather than by a second return type every step in between would have to thread
+/// through. A failure that names none is [`INTERNAL_ERROR`](Error::INTERNAL_ERROR), which is
+/// what "something went wrong at this end" means on the wire.
+#[derive(Debug)]
+struct Refusal(i64, String);
+
+impl std::fmt::Display for Refusal {
+    /// The message and not the code: the code is read off the value, and a sentence with a
+    /// number in it would carry it twice wherever this is shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// A refusal naming `code`, as the type everything under an `init` hands back.
+fn refuse(code: i64, message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(Refusal(code, message.into()))
+}
+
 /// Anything that went wrong, as the one thing the protocol carries.
 fn refused(e: &anyhow::Error) -> Error {
+    // The whole chain and not the outermost failure, because a code is stated where the case
+    // that has one is recognised, and context added on the way out here is what makes the
+    // message readable rather than what decides which failure it is.
+    let code = e
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<Refusal>())
+        .map_or(Error::INTERNAL_ERROR, |named| named.0);
     Error {
-        code: Error::INTERNAL_ERROR,
+        code,
         message: format!("{e:#}"),
         data: None,
     }

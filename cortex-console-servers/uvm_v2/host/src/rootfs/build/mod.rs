@@ -26,6 +26,8 @@
 pub mod pull;
 mod step;
 
+pub use step::forget_runs;
+
 use cortex::rootfs_v2::RootFsV2;
 
 use crate::rootfs::Image;

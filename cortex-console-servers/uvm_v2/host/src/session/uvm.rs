@@ -34,6 +34,24 @@ use crate::rootfs::{Image, Layer, cache};
 /// times over.
 const MAX_BLOB: u64 = MAX_PAYLOAD as u64 - 1024;
 
+/// Guest vCPUs and memory, when this server was told to override what a boot would otherwise
+/// pick.
+///
+/// Read here and passed on the command line, rather than left for the boot to find in the
+/// environment it inherits: what a machine was given is then something this end can be asked,
+/// and the boot has one place it learns its shape from.
+const VCPUS_ENV: &str = "CORTEX_UVM_VCPUS";
+const MEMORY_ENV: &str = "CORTEX_UVM_MEMORY_MIB";
+
+/// An override read out of this server's environment, ignoring anything that is not a number.
+///
+/// A value nobody can act on is not a reason to refuse a session: these two are a knob for
+/// whoever started the process, and the boot's own default is a machine that works. What a
+/// typo costs is the override, which is the smallest thing it can cost.
+fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
 /// A host directory the guest can see, and where it sees it.
 #[derive(Clone)]
 pub struct Mount {
@@ -81,6 +99,10 @@ impl Uvm {
         image: &Image,
         mounts: &[Mount],
         network: Network,
+        // Ports on this host the guest may open, on top of whatever `network` allows. Beside
+        // it rather than folded into it because that is how the boot is told — see
+        // [`BootArgs`] — and because widening the one must never widen the other.
+        host_ports: &[u16],
         // What a previous session left, as the layer tar a `snapshot` answered with. Put in
         // the boot root below, for the guest to unpack onto the blank disk it is given.
         snapshot: Option<&[u8]>,
@@ -190,9 +212,9 @@ impl Uvm {
             scratch: None,
             console: Some(console.clone()),
             network,
-            host_ports: Vec::new(),
-            vcpus: None,
-            memory_mib: None,
+            host_ports: host_ports.to_vec(),
+            vcpus: number(VCPUS_ENV),
+            memory_mib: number(MEMORY_ENV),
         };
         for mount in mounts {
             match mount.at.as_str() {

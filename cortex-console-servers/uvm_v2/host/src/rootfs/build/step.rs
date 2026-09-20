@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
@@ -127,8 +128,18 @@ async fn run(image: &Image, command: &str, named: &Run) -> anyhow::Result<Layer>
     // and what makes this a step rather than a session is that nobody else gets to ask it
     // anything before it goes down.
     let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
-    let mut uvm =
-        crate::session::uvm::Uvm::boot(image, &[], crate::contract::Network::Full, None).await?;
+    let mut uvm = crate::session::uvm::Uvm::boot(
+        image,
+        &[],
+        // Everything, and no port on this host. A step is the declaration's own command run
+        // where the declaration said to run it — `apt-get`, `pip`, a `curl` of something the
+        // author named — so a build with no way out is a build that cannot install anything.
+        // What it is not given is a door back into the machine doing the building.
+        crate::contract::Network::Full,
+        &[],
+        None,
+    )
+    .await?;
     let exit = uvm.exec(&argv, None).await?;
     let layer = uvm.commit().await?;
 
@@ -376,6 +387,51 @@ impl Run {
             .join("refs")
             .join(format!("{}.json", self.asked.path_safe()))
     }
+}
+
+/// Forget every `RUN` filed under an image in `removed`, and say how many went.
+///
+/// A ref is keyed by the image the command ran over, so one whose image is gone can never be
+/// asked for again: the key is computed from a digest nothing will name. It is a note about
+/// something that no longer exists, and the layer it points at is swept by the same pass that
+/// removed the image.
+///
+/// Nothing here fails. A ref that cannot be read is one nothing can act on either, and a
+/// removal that stopped at it would leave the image half gone — so an unreadable ref is passed
+/// over and the rest is still forgotten.
+pub fn forget_runs(removed: &HashSet<String>) -> usize {
+    let refs = runs().join("refs");
+    let Ok(entries) = std::fs::read_dir(&refs) else {
+        return 0;
+    };
+
+    let mut forgotten = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kept) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(kept) = serde_json::from_str::<RunRef>(&kept) else {
+            continue;
+        };
+        if !removed.contains(&kept.image_digest) {
+            continue;
+        }
+
+        // The lock too, which is keyed by the derivation the ref carries — an empty file whose
+        // only purpose was to make two builds of this wait for each other.
+        if let Ok(derivation) = kept.derivation_digest.parse::<Digest>() {
+            let _ = std::fs::remove_file(
+                runs()
+                    .join("locks")
+                    .join(format!("{}.lock", derivation.path_safe())),
+            );
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            forgotten += 1;
+        }
+    }
+    forgotten
 }
 
 /// What a `RUN` left, and the locks that keep two builds from making it twice.
