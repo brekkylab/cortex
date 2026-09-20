@@ -137,13 +137,20 @@ async fn run(image: &Image, command: &str, named: &Run) -> anyhow::Result<Layer>
     //
     // Both streams, and stderr last: a build tool that failed says why on stderr and leaves
     // stdout to whatever it had been producing, so a message carrying only the one is empty
-    // in exactly the case somebody is reading it.
+    // in exactly the case somebody is reading it. And said when the guest cut them, because
+    // the end of a failing command is the part that says why, and that is the end this does
+    // not have.
     anyhow::ensure!(
         exit.code == 0,
-        "RUN {command:?} exited with {}:\n{}{}",
+        "RUN {command:?} exited with {}:\n{}{}{}",
         exit.code,
         String::from_utf8_lossy(&exit.stdout),
-        String::from_utf8_lossy(&exit.stderr)
+        String::from_utf8_lossy(&exit.stderr),
+        if exit.truncated {
+            "\n(output was cut off)"
+        } else {
+            ""
+        }
     );
     named.publish(&layer)?;
     Ok(layer)

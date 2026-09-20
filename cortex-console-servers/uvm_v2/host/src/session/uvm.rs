@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use cortex::console::{
-    Call, ExecCall, Message, Response, SnapshotCall,
+    Call, ExecCall, ExecResp, Message, Response, SnapshotCall,
     stdio::{read, write},
 };
 use microsandbox_image::ext4::{Ext4FormatOptions, format_ext4};
@@ -174,13 +174,6 @@ fn start(
     })
 }
 
-/// What a command exited with, and what it wrote.
-pub struct Exit {
-    pub code: i32,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-}
-
 /// A host directory the guest can see, and where it sees it.
 #[derive(Clone)]
 pub struct Mount {
@@ -326,7 +319,14 @@ impl Uvm {
     }
 
     /// Run one command, with what the image states already in front of it.
-    pub async fn exec(&mut self, argv: &[String], timeout_ms: Option<u64>) -> anyhow::Result<Exit> {
+    /// Answered with the protocol's own [`ExecResp`] rather than a shape of this end's: what
+    /// a command exited with is what the guest already said, and a copy of it here is a place
+    /// for a member to be dropped — which is what [`truncated`](ExecResp::truncated) was.
+    pub async fn exec(
+        &mut self,
+        argv: &[String],
+        timeout_ms: Option<u64>,
+    ) -> anyhow::Result<ExecResp> {
         match self
             .call(Call::Exec(ExecCall {
                 cmd: argv.to_vec(),
@@ -334,11 +334,7 @@ impl Uvm {
             }))
             .await?
         {
-            Response::Exec(done) => Ok(Exit {
-                code: done.code,
-                stdout: done.stdout,
-                stderr: done.stderr,
-            }),
+            Response::Exec(done) => Ok(done),
             Response::Error(e) => anyhow::bail!("{argv:?}: {e:?}"),
             other => anyhow::bail!("the guest answered an exec with {other:?}"),
         }
