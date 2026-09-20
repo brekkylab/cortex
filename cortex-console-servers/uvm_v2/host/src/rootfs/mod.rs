@@ -16,6 +16,11 @@
 //! naming a stack of them land in `fsmeta/` and `vmdk/` beside it. What that layout has no
 //! shelf for is an image as *this* end states it — a base with steps over it, which no
 //! registry has heard of and nothing keys by a reference — so those go under [`images`].
+//!
+//! One shelf here is not addressed by what it holds, and cannot be: what a `RUN` leaves has a
+//! fresh digest every time it runs, so it is filed under what was *asked* instead. That is
+//! `runs/`, and `build::step` is the whole of it — including why the shape is the one the crate next
+//! door already uses for the same problem.
 
 mod build;
 mod digest;
@@ -28,7 +33,7 @@ use std::sync::OnceLock;
 use cortex::rootfs_v2::RootFsV2;
 use microsandbox_image::GlobalCache;
 
-pub use build::pull::pull;
+pub use build::build;
 pub use digest::Digest;
 pub use image::Image;
 pub use layer::Layer;
@@ -106,7 +111,10 @@ pub async fn run(argv: impl IntoIterator<Item = impl AsRef<str>>) -> anyhow::Res
                 (None, Some(text)) => RootFsV2::from_dockerfile(text)?,
             };
 
-            build::build(rootfs).await?;
+            // The digest on stdout, because that is what this command is for: a client
+            // spawned it to learn what its declaration is called, and the answer is the one
+            // line it reads back.
+            println!("{}", build::build(rootfs).await?.digest()?);
             Ok(())
         }
         Some("list") => list(argv).await,

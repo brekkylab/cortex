@@ -3,7 +3,7 @@
 //! | | target | what it is |
 //! |---|---|---|
 //! | `cortex-uvm-v2-guest` | `<arch>-unknown-linux-musl` | it runs *inside* the VM |
-//! | `cortex-uvm-v2-boot` | this host, signed here | it is what gets run *as* the VM |
+//! | `cortex-uvm-v2-boot` | this host, signed here on macOS | it is what gets run *as* the VM |
 //!
 //! Both land next to the binary cargo is building — `target/<profile>/`, the directory
 //! `OUT_DIR` sits three levels under — so that a `cargo build` of the host produces all three
@@ -182,10 +182,7 @@ fn place(built: &Path, out: &Path, sign_it: bool) -> anyhow::Result<()> {
     std::fs::copy(built, &part)
         .map_err(|e| anyhow::anyhow!("copying {} to {}: {e}", built.display(), part.display()))?;
 
-    if sign_it
-        && cfg!(target_os = "macos")
-        && let Err(e) = sign(&part)
-    {
+    if sign_it && let Err(e) = sign(&part) {
         let _ = std::fs::remove_file(&part);
         return Err(e);
     }
@@ -199,6 +196,7 @@ fn place(built: &Path, out: &Path, sign_it: bool) -> anyhow::Result<()> {
 // signature, and `cargo build` produces an unsigned binary — so the boot half is signed here,
 // after the nested build that linked it and before anything can spawn it. Entitlements are
 // read at `exec`, so this has to happen to the file and cannot be done to a running process.
+#[cfg(target_os = "macos")]
 const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -218,6 +216,7 @@ const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// this and not to whoever runs it: a console server is started by a test, an agent runtime
 /// or a CLI, and an entitlement is a property of the process that calls `hv_vm_create` rather
 /// than of the product around it.
+#[cfg(target_os = "macos")]
 fn sign(binary: &Path) -> anyhow::Result<()> {
     let plist = binary.with_extension("entitlements.plist");
     std::fs::write(&plist, ENTITLEMENTS)?;
@@ -236,6 +235,14 @@ fn sign(binary: &Path) -> anyhow::Result<()> {
          create a VM",
         binary.display()
     );
+    Ok(())
+}
+
+/// Nothing to sign. Entitlements are how macOS grants access to Hypervisor.framework; every
+/// other host either lets a process open `/dev/kvm` or does not, and no property of the file
+/// changes that.
+#[cfg(not(target_os = "macos"))]
+fn sign(_binary: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 

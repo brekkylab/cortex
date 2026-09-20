@@ -14,7 +14,7 @@ use cortex::console::{
 };
 
 use crate::contract::{ARTIFACTS_PATH, CONTEXT_PATH, Network, SCRATCH_PATH};
-use crate::rootfs::{Image, pull};
+use crate::rootfs::build;
 use uvm::Mount;
 
 pub use uvm::Uvm;
@@ -104,30 +104,23 @@ pub async fn run() -> anyhow::Result<()> {
                         None => Network::Disabled,
                     };
 
-                    // A digest names something already in the store; anything else is an OCI
-                    // reference and is pulled. Both end as an `Image`, which is the only thing
-                    // a boot takes — and a boot is what this end has instead of a way to run a
-                    // command, so a session that named no rootfs is refused here rather than
+                    // The whole declaration, built: the base resolved — a digest names
+                    // something already in the store, anything else is pulled — and every step
+                    // over it realized. What comes back is an `Image`, which is the only thing
+                    // a boot takes, and a boot is what this end has instead of a way to run a
+                    // command; so a session that named no rootfs is refused here rather than
                     // taken and then refused by everything asked of it.
                     //
-                    // TODO: only the base is realized. The steps over it are what the
-                    // declaration is for, and a session asking for them gets the base alone.
-                    let declared = init
-                        .rootfs
-                        .as_ref()
-                        .map(|rootfs| rootfs.base.as_str())
-                        .filter(|base| !base.is_empty())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "a session here runs in a micro-VM, which boots on a rootfs, \
-                                 and this one named none"
-                            )
-                        })?;
-                    let image = if declared.starts_with("sha256:") {
-                        Image::load(&declared.parse()?)?
-                    } else {
-                        pull(declared).await?
-                    };
+                    // The same call `rootfs build` makes, which is what makes the two agree:
+                    // a client that built an image and a client that hands over the
+                    // declaration are naming one image, and the second one pays for it once.
+                    let declared = init.rootfs.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "a session here runs in a micro-VM, which boots on a rootfs, \
+                             and this one named none"
+                        )
+                    })?;
+                    let image = build(declared).await?;
 
                     // Where each tree is on this side, against the one path in the guest that
                     // names it. Fixed for the session, which is why the answer below can say
