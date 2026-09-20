@@ -617,6 +617,20 @@ impl Console {
         self.client.read(read).await
     }
 
+    /// Take everything this session has written, as a blob another session can start on.
+    ///
+    /// The other half of [`ConsoleBuilder::snapshot`]: what comes back is what that takes, so a
+    /// session is carried on by building a new one with these bytes in hand. What is in them
+    /// is the server's own encoding of the changes and not a caller's to read — keeping them
+    /// and handing them back is the whole of the contract.
+    ///
+    /// Everything since the session began, and not since the last time this was asked: a
+    /// snapshot is where a session *is*, so two taken in a row give the same thing twice and
+    /// the second is not the difference between them.
+    pub async fn snapshot(&mut self) -> Result<Vec<u8>, Failure> {
+        self.client.snapshot().await.map(|answer| answer.blob)
+    }
+
     /// Put bytes in a file where commands run, and hear how big it is afterwards.
     ///
     /// The other direction of [`read`](Self::read), and the way to put something where

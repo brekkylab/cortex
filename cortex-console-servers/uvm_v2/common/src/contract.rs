@@ -177,6 +177,20 @@ pub const LAYER_TAR: &str = "layer.tar";
 /// name, so this is the only way a commit sees what a session wrote.
 pub const UPPER_DIR: &str = "/oldroot/mnt/upper/upper";
 
+/// Where a boot leaves the layer a session is to start on, and where the guest unpacks it
+/// from. Absent for a session that starts on its base alone.
+///
+/// The same tar a commit produces, read the other way round. That tar *is* an upperdir — the
+/// files a session wrote, with its deletions as the whiteout nodes overlayfs left — so putting
+/// one back into a bare upperdir is what makes a session carry on where another stopped.
+///
+/// A file in the boot root rather than a disk or an argument, for the reason
+/// [`IMAGE_SPEC_PATH`] is one: the root is already shared, and a layer is neither short nor
+/// bounded. The guest reads it before the pivot, which is the one moment both this file and
+/// the bare upperdir under [`UPPER_DIR`] are reachable at once — afterwards the root holding
+/// it is gone and the upperdir has an overlay on top.
+pub const SNAPSHOT_PATH: &str = "/.cortex-snapshot.tar";
+
 /// Where a boot writes [`ImageSpec`] in the boot root, and the path the guest reads it from.
 ///
 /// A file rather than another argument, because what reaches the guest is the kernel

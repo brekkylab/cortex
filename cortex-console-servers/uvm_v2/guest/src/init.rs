@@ -50,7 +50,7 @@ use std::ptr;
 
 use crate::contract::{
     ABIN_ENV, ABIN_PATH, COMMIT_ENV, COMMIT_TAG, COMMITTABLE_ENV, IMAGE_SPEC_PATH, ImageSpec,
-    ARTIFACTS_ENV, LOWER_ENV, PORT_NAME, SCRATCH_ENV, UPPER_ENV, CONTEXT_ENV,
+    ARTIFACTS_ENV, LOWER_ENV, PORT_NAME, SCRATCH_ENV, SNAPSHOT_PATH, UPPER_ENV, CONTEXT_ENV,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
@@ -239,6 +239,21 @@ fn mount_root(lower_dev: &str, upper_dev: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("mounting {upper_dev} as the session image: {e}"))?;
     let _ = std::fs::create_dir_all("/mnt/upper/upper");
     let _ = std::fs::create_dir_all("/mnt/upper/work");
+
+    // What a previous session left, put back before anything is stacked on top of it. Here
+    // and nowhere else: this is the one moment both the boot root holding the file and the
+    // bare upperdir are reachable, since the pivot below detaches the first and the overlay
+    // above claims the second.
+    //
+    // An absent file is a session starting on its base alone, which is the ordinary case and
+    // not a failure. One that is there and does not unpack *is* a failure, because a session
+    // told to carry on from somewhere and silently started from nothing would look to its
+    // client like work that had been undone.
+    let snapshot = Path::new(SNAPSHOT_PATH);
+    if snapshot.exists() {
+        crate::layer::restore(snapshot, Path::new("/mnt/upper/upper"))
+            .map_err(|e| anyhow::anyhow!("restoring what this session starts from: {e}"))?;
+    }
 
     let options = cstr("lowerdir=/mnt/lower,upperdir=/mnt/upper/upper,workdir=/mnt/upper/work");
     let rc = unsafe {

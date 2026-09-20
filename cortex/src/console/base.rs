@@ -51,7 +51,7 @@ use futures_core::future::BoxFuture;
 
 use crate::console::{
     Call, Error, ExecCall, ExecResp, InitCall, InitResp, Message, Method, Notification, ReadCall,
-    ReadResp, RequestId, Response, WriteCall, WriteResp,
+    ReadResp, RequestId, Response, SnapshotCall, SnapshotResp, WriteCall, WriteResp,
 };
 
 /// Why a call produced no result.
@@ -197,6 +197,27 @@ pub trait Client: Send {
             match self.call(Call::Write(write)).await? {
                 Response::Write(answer) => Ok(answer),
                 other => Err(mismatched(Method::Write, other)),
+            }
+        })
+    }
+
+    /// Take everything this session has written, as a blob another can start on.
+    ///
+    /// The other half of [`InitCall::snapshot`]: what comes back is exactly what that
+    /// takes, so a session is carried on by opening a new one with this in hand. What is
+    /// in it is the far end's business — it is that executor's own encoding of the changes,
+    /// read back only by an executor of the same kind — and a caller's part is to keep the
+    /// bytes and hand them over.
+    ///
+    /// One message holds the answer, unlike [`read`](Self::read), which comes back in
+    /// pieces. A snapshot cannot: it is read back as a filesystem, and the front of one is
+    /// not a smaller session but a broken tree — so a session that has written more than a
+    /// message holds is refused rather than shortened.
+    fn snapshot(&mut self) -> BoxFuture<'_, Result<SnapshotResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::Snapshot(SnapshotCall {})).await? {
+                Response::Snapshot(answer) => Ok(answer),
+                other => Err(mismatched(Method::Snapshot, other)),
             }
         })
     }

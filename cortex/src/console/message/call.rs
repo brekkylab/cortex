@@ -172,10 +172,18 @@ pub struct InitCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rootfs: Option<RootFsV2>,
 
-    /// Optional snapshot of what the last run changed from the base rootfs.
+    /// Optional snapshot of what an earlier session changed from the base rootfs — what a
+    /// [`snapshot`](SnapshotCall) answered with, handed back.
     ///
-    /// Useful when a session does not start from scratch: the VM can be started with those
-    /// changes already in place. Currently an ext4 blob.
+    /// Useful when a session does not start from scratch: it starts with those changes already
+    /// in place, as though it were the same session carrying on.
+    ///
+    /// **A layer tar**: the files that session wrote, with the ones it deleted carried as OCI
+    /// whiteouts. Not an image of the filesystem they lived on, and the difference is what
+    /// makes this a thing a frame can hold — a filesystem image brings its own metadata, its
+    /// journal and all the room it was formatted to, none of which is the session's work. It
+    /// also costs an executor nothing to apply: a layer is what one already knows how to put
+    /// in front of a base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Vec<u8>>,
 

@@ -16,16 +16,23 @@
 use std::path::{Path, PathBuf};
 
 use cortex::console::{
-    Call, ExecCall, ExecResp, Message, Response, SnapshotCall,
+    Call, ExecCall, ExecResp, MAX_PAYLOAD, Message, Response, SnapshotCall,
     stdio::{read, write},
 };
 use microsandbox_image::ext4::{Ext4FormatOptions, format_ext4};
 
 use crate::contract::{
     ARTIFACTS_PATH, BaseFormat, BootArgs, CONTEXT_PATH, GUEST_BIN_PATH, HANDSHAKE, IMAGE_SPEC_PATH,
-    ImageSpec, LAYER_TAR, Network, SCRATCH_PATH,
+    ImageSpec, LAYER_TAR, Network, SCRATCH_PATH, SNAPSHOT_PATH,
 };
 use crate::rootfs::{Image, Layer, cache};
+
+/// How much of a snapshot one response may carry.
+///
+/// A frame is capped at [`MAX_PAYLOAD`], and a `snapshot`'s answer is its `blob` plus the
+/// members around it — `jsonrpc`, `id`, `method` and `result`. A kibibyte covers those several
+/// times over.
+const MAX_BLOB: u64 = MAX_PAYLOAD as u64 - 1024;
 
 /// A host directory the guest can see, and where it sees it.
 #[derive(Clone)]
@@ -74,9 +81,9 @@ impl Uvm {
         image: &Image,
         mounts: &[Mount],
         network: Network,
-        // TODO: what a previous session wrote, to start this one's disk on rather than the
-        // blank one formatted below. Nothing here reads it yet.
-        _snapshot: Option<&[u8]>,
+        // What a previous session left, as the layer tar a `snapshot` answered with. Put in
+        // the boot root below, for the guest to unpack onto the blank disk it is given.
+        snapshot: Option<&[u8]>,
     ) -> anyhow::Result<Uvm> {
         use std::io::Read as _;
         use std::os::unix::fs::PermissionsExt as _;
@@ -116,7 +123,8 @@ impl Uvm {
         // Sparse, so the size is a ceiling and not an allocation: a session that writes a
         // kilobyte occupies a kilobyte. What the number bounds is how much a runaway command
         // can write before the guest reports a full disk.
-        if !upper.exists() {
+        let formatted = !upper.exists();
+        if formatted {
             format_ext4(
                 &upper,
                 &Ext4FormatOptions {
@@ -152,6 +160,16 @@ impl Uvm {
             })
             .map_err(|e| anyhow::anyhow!("encoding the image spec: {e}"))?,
         )?;
+
+        // Onto a disk this boot formatted and onto no other. A snapshot says where the
+        // session *starts*, and a `stop` hands the machine back with the disk still holding
+        // everything the session has done since — so putting it there again on the next boot
+        // would undo the session's own work. The boot root is remade per boot, which is what
+        // makes leaving the file out the whole of the decision.
+        if let Some(blob) = snapshot.filter(|_| formatted) {
+            std::fs::write(root.join(SNAPSHOT_PATH.trim_start_matches('/')), blob)
+                .map_err(|e| anyhow::anyhow!("writing the snapshot into the boot root: {e}"))?;
+        }
 
         // Bound before the child is started, because the child connects to it as its first
         // act and there is nothing to retry against if it is not there yet.
@@ -305,18 +323,46 @@ impl Uvm {
 
     /// Everything written since the boot, as a blob a later boot can start on.
     ///
-    /// The guest is what flushes it: the writes are the guest kernel's until it syncs, and
-    /// the disk they land on is this end's file.
+    /// The same tar [`commit`](Self::commit) turns into a layer, handed back as bytes instead:
+    /// the overlay's upperdir, with the session's deletions as the whiteouts overlayfs left.
+    /// A [`boot`](Self::boot) given it back unpacks it into a fresh upperdir, which puts the
+    /// session where this one stopped.
     ///
-    /// TODO: the file is not read, so this is the empty blob. What belongs here is the
-    /// session's `session.ext4`, whole — a raw image today, which the protocol's frame
-    /// cannot carry at the size the disk is formatted to.
+    /// **Not the session's disk.** That ext4 is formatted to a ceiling no frame could carry,
+    /// and nearly all of what is in it — the journal, the free space, the filesystem's own
+    /// metadata — is not the session's work. The upperdir is the part that is.
+    ///
+    /// The guest is what produces it: the upperdir is a directory only it can see, and the
+    /// writes are its kernel's until it syncs. It leaves the tar in the shared scratch rather
+    /// than answering with it, because a layer can be far larger than the channel this
+    /// protocol runs on — so what comes back over the wire is an acknowledgement, and the
+    /// bytes are read from the file here.
     pub async fn snapshot(&mut self) -> anyhow::Result<Vec<u8>> {
         match self.call(Call::Snapshot(SnapshotCall {})).await? {
-            Response::Snapshot(_) => Ok(Vec::new()),
+            Response::Snapshot(_) => {}
             Response::Error(e) => anyhow::bail!("snapshotting: {e:?}"),
             other => anyhow::bail!("the guest answered a snapshot with {other:?}"),
         }
+
+        let tar = self.commit.join(LAYER_TAR);
+        anyhow::ensure!(
+            tar.is_file(),
+            "the guest left no layer at {}",
+            tar.display()
+        );
+
+        // Said here rather than left to the frame writer. A session can write more than one
+        // frame holds, and that end has no way to refuse a single answer — it would fail the
+        // write, which is the whole channel and so the whole session, over one call that could
+        // have been answered with an error.
+        let size = std::fs::metadata(&tar)?.len();
+        anyhow::ensure!(
+            size <= MAX_BLOB,
+            "this session has written {size} bytes, which is more than the {MAX_BLOB} a \
+             snapshot can carry"
+        );
+
+        std::fs::read(&tar).map_err(|e| anyhow::anyhow!("reading this session's snapshot: {e}"))
     }
 
     /// Everything written since the boot, kept as a layer.

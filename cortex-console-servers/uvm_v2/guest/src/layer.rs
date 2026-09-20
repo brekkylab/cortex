@@ -127,6 +127,135 @@ pub fn write(
     Ok(file.metadata()?.len())
 }
 
+/// Put a layer tar back into an upperdir, so that a session starts where another one stopped.
+///
+/// The inverse of [`write`], and it has the same two things to get right. A **deletion**
+/// arrives as the character device it left as, and is recreated with `mknod` rather than
+/// unpacked — what overlayfs acts on is the node, and an ordinary unpack makes an empty file
+/// that hides nothing. An **emptied directory** arrives as OCI's `.wh..wh..opq` marker, and
+/// goes back to the `trusted.overlay.opaque` xattr: the marker is a tar's way of carrying an
+/// xattr and means nothing to overlayfs itself, so leaving it as a file would both lose the
+/// emptying and put a stray name in the session's root.
+///
+/// Everything else is what `tar` already does, through [`tar::Entry::unpack_in`] — which is
+/// also what refuses a path reaching outside `upper`. The two cases above are handled here,
+/// so they are checked here: [`within`] is that check, and a path that does not pass it is
+/// skipped rather than refused, because `unpack_in` skips one too and one archive should not
+/// mean two things depending on which entry is bad.
+///
+/// `upper` is expected bare. A boot restores onto a disk it has just formatted, and an entry
+/// landing on something already there would be a merge nobody asked for.
+pub fn restore(tar: &Path, upper: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut archive = tar::Archive::new(std::fs::File::open(tar)?);
+    // The modes are the session's own: a file it made executable has to come back executable,
+    // and this is a root filesystem rather than a download.
+    archive.set_preserve_permissions(true);
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let named = |e: io::Error| {
+            io::Error::other(format!("restoring {}: {e}", path.display()))
+        };
+
+        // Not a file to create: it says the directory holding it hides everything below, which
+        // is a property of that directory and not an entry in it.
+        if path.file_name() == Some(std::ffi::OsStr::new(OPAQUE_MARKER)) {
+            let Some(dir) = within(upper, path.parent().unwrap_or(Path::new(""))) else {
+                continue;
+            };
+            std::fs::create_dir_all(&dir).map_err(named)?;
+            set_opaque(&dir).map_err(named)?;
+            continue;
+        }
+
+        match entry.header().entry_type() {
+            kind @ (tar::EntryType::Char | tar::EntryType::Block) => {
+                let Some(at) = within(upper, &path) else {
+                    continue;
+                };
+                // The archive lists a directory before what is under it, so this is a
+                // formality — but a whiteout with nowhere to go is the one entry whose loss
+                // would be silent, and it restores a deletion.
+                if let Some(parent) = at.parent() {
+                    std::fs::create_dir_all(parent).map_err(named)?;
+                }
+
+                let header = entry.header();
+                let (major, minor) = (
+                    header.device_major()?.unwrap_or(0),
+                    header.device_minor()?.unwrap_or(0),
+                );
+                let mode = header.mode()? & 0o7777;
+                let kind = if kind == tar::EntryType::Block {
+                    libc::S_IFBLK
+                } else {
+                    libc::S_IFCHR
+                };
+
+                let at = std::ffi::CString::new(at.as_os_str().as_bytes())
+                    .map_err(|e| named(io::Error::other(e)))?;
+                // SAFETY: `at` is NUL-terminated and outlives the call, and the mode names
+                // exactly one file type.
+                let rc = unsafe {
+                    libc::mknod(at.as_ptr(), kind | mode, libc::makedev(major, minor))
+                };
+                if rc != 0 {
+                    return Err(named(io::Error::last_os_error()));
+                }
+            }
+            _ => {
+                entry.unpack_in(upper).map_err(named)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `upper` joined with a relative `path` that stays under it, and `None` for one that does not.
+///
+/// An archive is bytes from somewhere else, so an absolute path or a `..` is a thing to refuse
+/// rather than a thing to normalise — either one would write outside the disk this session was
+/// given.
+fn within(upper: &Path, path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut at = upper.to_path_buf();
+    for part in path.components() {
+        match part {
+            Component::Normal(name) => at.push(name),
+            // Harmless where it appears — `./x` names `x` — and the rest are the refusal.
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(at)
+}
+
+/// Mark a directory as hiding what is below it — the inverse of [`is_opaque`].
+fn set_opaque(dir: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: `path` is NUL-terminated and outlives the call, `OPAQUE_XATTR` is a NUL-
+    // terminated literal, and the length matches the value handed over.
+    let rc = unsafe {
+        libc::lsetxattr(
+            path.as_ptr(),
+            OPAQUE_XATTR.as_ptr() as *const libc::c_char,
+            b"y".as_ptr() as *const libc::c_void,
+            1,
+            0,
+        )
+    };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Everything under `dir`, in name order, skipping `skip`.
 ///
 /// Sorted so that one upperdir gives one tar: the layer is named by the digest of these bytes,
@@ -325,6 +454,58 @@ mod tests {
         );
     }
 
+    /// The round trip, for everything that does not need privileges to make. A whiteout and
+    /// an opaque directory are the two that do — `mknod` and a `trusted.*` xattr both want
+    /// `CAP_SYS_ADMIN`, which a guest has inside its own VM and a test runner does not — so
+    /// what is checked here is that the ordinary tree survives being taken apart and put back.
+    #[test]
+    fn what_a_layer_carries_comes_back_out_of_it() {
+        let upper = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(upper.path().join("etc/nested")).unwrap();
+        std::fs::write(upper.path().join("etc/nested/added"), b"new\n").unwrap();
+        let exe = upper.path().join("runnable");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("etc/nested/added", upper.path().join("alias")).unwrap();
+
+        let out = tempfile::tempdir().unwrap();
+        let tar = out.path().join("layer.tar");
+        super::write(upper.path(), &tar, &[], &[]).unwrap();
+
+        let back = tempfile::tempdir().unwrap();
+        super::restore(&tar, back.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(back.path().join("etc/nested/added")).unwrap(),
+            b"new\n"
+        );
+        assert_eq!(
+            std::fs::read_link(back.path().join("alias")).unwrap(),
+            Path::new("etc/nested/added"),
+            "the symlink came back as its target's contents"
+        );
+        let mode = std::fs::metadata(back.path().join("runnable"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "the executable bit did not survive");
+    }
+
+    /// An archive is bytes from somewhere else, and the two paths that would write outside the
+    /// disk the session was given are the two this refuses.
+    #[test]
+    fn a_path_that_leaves_the_upperdir_is_refused() {
+        let upper = Path::new("/mnt/upper/upper");
+        assert_eq!(
+            within(upper, Path::new("etc/./added")),
+            Some(upper.join("etc/added")),
+            "a relative path is what this is for"
+        );
+        assert_eq!(within(upper, Path::new("../escaped")), None);
+        assert_eq!(within(upper, Path::new("etc/../../escaped")), None);
+        assert_eq!(within(upper, Path::new("/etc/absolute")), None);
+    }
+
     /// The context case: every directory on the way to the mount point was created for it and
     /// goes with it, but a directory that holds something else stays.
     #[test]
@@ -405,20 +586,62 @@ mod tests {
         );
     }
 
+    /// The production one, with the skip a test needs: `true` when the mark is on, `false`
+    /// when this runner is not allowed to make one.
+    /// The two entries [`restore`] cannot simply unpack, checked the whole way round. A
+    /// deletion is a node rather than a name, and an emptied directory is an xattr rather than
+    /// a file — so an ordinary unpack would give back an empty file that hides nothing and a
+    /// stray `.wh..wh..opq` sitting in the session's root.
+    ///
+    /// Needs `CAP_MKNOD` and `CAP_SYS_ADMIN`, which a guest has inside its own VM. Skipped
+    /// rather than failed where they are absent.
+    #[test]
+    fn a_deletion_and_an_emptying_come_back_as_themselves() {
+        use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+
+        let upper = tempfile::tempdir().unwrap();
+        let emptied = upper.path().join("media");
+        std::fs::create_dir(&emptied).unwrap();
+        if !set_opaque(&emptied) || !whiteout(&upper.path().join("etc/gone")) {
+            eprintln!("skipping: a whiteout and an opaque mark need CAP_MKNOD and CAP_SYS_ADMIN");
+            return;
+        }
+
+        let out = tempfile::tempdir().unwrap();
+        let tar = out.path().join("layer.tar");
+        super::write(upper.path(), &tar, &[], &[]).unwrap();
+
+        let back = tempfile::tempdir().unwrap();
+        super::restore(&tar, back.path()).unwrap();
+
+        let gone = back.path().join("etc/gone").symlink_metadata().unwrap();
+        assert!(
+            gone.file_type().is_char_device() && gone.rdev() == 0,
+            "the deletion came back as something other than a whiteout"
+        );
+        assert!(
+            is_opaque(&back.path().join("media")),
+            "the emptied directory came back without its mark"
+        );
+        assert!(
+            !back.path().join("media/.wh..wh..opq").exists(),
+            "the marker was left behind as a file in the session's root"
+        );
+    }
+
     fn set_opaque(dir: &Path) -> bool {
+        super::set_opaque(dir).is_ok()
+    }
+
+    /// What overlayfs leaves where a session deleted something: a character device `0:0`.
+    /// `false` when this runner may not make device nodes.
+    fn whiteout(at: &Path) -> bool {
         use std::os::unix::ffi::OsStrExt as _;
 
-        let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
-        // SAFETY: both strings are NUL-terminated and outlive the call.
-        let rc = unsafe {
-            libc::lsetxattr(
-                path.as_ptr(),
-                OPAQUE_XATTR.as_ptr() as *const libc::c_char,
-                b"y".as_ptr() as *const libc::c_void,
-                1,
-                0,
-            )
-        };
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        let path = std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path` is NUL-terminated and outlives the call.
+        let rc = unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR | 0o644, 0) };
         rc == 0
     }
 }
