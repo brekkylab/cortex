@@ -23,7 +23,7 @@
 //! that is remembered, and remembering it is what makes a declaration built twice one image
 //! rather than two that differ in a timestamp.
 
-pub mod pull;
+mod pull;
 mod step;
 
 pub use step::forget_runs;
