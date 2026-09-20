@@ -66,11 +66,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // What booting this session takes, worked out once at `init` and held as the thing that
-    // does it. A boot is not the only one there will be — `stop` gives the machine back and
-    // the next call that needs one takes it again — so this is an `Fn` and not an `FnOnce`,
-    // and the client says what a session is exactly once however many machines answer it.
-    #[allow(clippy::type_complexity)]
+    // Initialized when init called.
     let mut session_factory: Option<
         Box<dyn Fn() -> Pin<Box<dyn Future<Output = anyhow::Result<Uvm>>>>>,
     > = None;
@@ -84,7 +80,7 @@ pub async fn run() -> anyhow::Result<()> {
             Message::Request {
                 id,
                 call: Call::Init(_),
-            } if session_factory.is_some() || session.is_some() => {
+            } if session_factory.is_some() => {
                 server
                     .respond(
                         id,
@@ -188,33 +184,21 @@ pub async fn run() -> anyhow::Result<()> {
                         }
                     };
 
-                    // The whole declaration, built: the base resolved — a digest names
-                    // something already in the store, anything else is pulled — and every step
-                    // over it realized. What comes back is an `Image`, which is the only thing
-                    // a boot takes, and a boot is what this end has instead of a way to run a
-                    // command; so a session that named no rootfs is refused here rather than
-                    // taken and then refused by everything asked of it.
-                    //
-                    // The same call `rootfs build` makes, which is what makes the two agree:
-                    // a client that built an image and a client that hands over the
-                    // declaration are naming one image, and the second one pays for it once.
-                    let declared = init.rootfs.clone().ok_or_else(|| {
+                    // Parse rootfs
+                    let rootfs = init.rootfs.clone().ok_or_else(|| {
                         refuse(
                             Error::INVALID_PARAMS,
                             "a session here runs in a micro-VM, which boots on a rootfs, and \
                              this one named none",
                         )
                     })?;
-                    // Two kinds of failure, and the difference is what a client does next. A
-                    // base named by a digest nobody built here is a file test this end just
-                    // made, and whoever asked can go and build the thing. Everything else — a
-                    // registry that could not be reached, a `RUN` that exited non-zero — is
-                    // this session failing to come up, which is what a boot failing is.
-                    let image = build(declared).await.map_err(|e| match e
-                        .downcast_ref::<crate::rootfs::Unknown>()
-                    {
-                        Some(_) => coded(Error::UNKNOWN_IMAGE, e),
-                        None => coded(Error::BOOT_FAILED, e),
+
+                    // Build rootfs image
+                    let image = build(rootfs).await.map_err(|e| {
+                        match e.downcast_ref::<crate::rootfs::Unknown>() {
+                            Some(_) => coded(Error::UNKNOWN_IMAGE, e),
+                            None => coded(Error::BOOT_FAILED, e),
+                        }
                     })?;
 
                     // Where each tree is on this side, against the one path in the guest that
