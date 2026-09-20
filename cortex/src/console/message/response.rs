@@ -23,7 +23,7 @@ use serde::{
     ser::SerializeMap,
 };
 
-use super::{Error, Method, NetworkAccess, utils::bytes};
+use super::{Error, Method, utils::bytes};
 
 /// What a request was answered with: the method's own result, or why there is none.
 ///
