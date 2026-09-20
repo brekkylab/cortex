@@ -228,7 +228,7 @@ struct RunRef {
 }
 
 /// One `RUN`, as the store names it.
-pub struct Run {
+struct Run {
     asked: Digest,
     derivation: Digest,
     image: String,
@@ -237,7 +237,7 @@ pub struct Run {
 
 impl Run {
     /// Name what is about to be asked: this command, over this image.
-    pub fn of(image: &Image, command: &str) -> anyhow::Result<Run> {
+    fn of(image: &Image, command: &str) -> anyhow::Result<Run> {
         let image_digest = image.digest()?.to_string();
 
         // The key: what a caller has in hand, and nothing else.
@@ -277,7 +277,7 @@ impl Run {
     /// a ref that does not parse, name the image it is filed under, or point at a layer of the
     /// size it claims: a note nobody can act on is not an answer, and running the command
     /// again is. Nothing here fails, for that reason.
-    pub fn current(&self) -> Option<Layer> {
+    fn current(&self) -> Option<Layer> {
         let kept = std::fs::read_to_string(self.ref_path()).ok()?;
         let kept: RunRef = serde_json::from_str(&kept).ok()?;
 
@@ -306,7 +306,7 @@ impl Run {
     ///
     /// Keyed by the derivation and not by what was asked, so that two builds that would
     /// produce *different* answers do not wait on each other.
-    pub fn lock(&self) -> anyhow::Result<Held> {
+    fn lock(&self) -> anyhow::Result<Held> {
         let locks = runs().join("locks");
         std::fs::create_dir_all(&locks)?;
         let path = locks.join(format!("{}.lock", self.derivation.path_safe()));
@@ -330,7 +330,7 @@ impl Run {
     /// Written beside and renamed, then both the file and the directory entry flushed, because
     /// what this points at is expensive to make again and a ref that survives a crash half
     /// written would be read as one that points nowhere.
-    pub fn publish(&self, layer: &Layer) -> anyhow::Result<()> {
+    fn publish(&self, layer: &Layer) -> anyhow::Result<()> {
         let refs = runs().join("refs");
         std::fs::create_dir_all(&refs)?;
 
@@ -372,7 +372,7 @@ fn runs() -> PathBuf {
 }
 
 /// A derivation held. Releasing it is closing the file, which is what `flock` unlocks on.
-pub struct Held(#[allow(dead_code)] File);
+struct Held(#[allow(dead_code)] File);
 
 fn write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     use std::io::Write as _;
