@@ -6,6 +6,10 @@ edition.workspace = true
 # The host half of the second take on the micro-VM console server: it answers a console
 # session, and tends the images a session boots from. Its own package rather than a binary
 # beside the guest, because the two are cross-compiled apart and share no dependency.
+#
+# It links no hypervisor. `cortex-uvm-v2-boot` is what holds one, and this package carries it
+# as embedded bytes rather than as a dependency — see `src/session/helper.rs`. So the VMM and
+# the network stack behind it are absent from this graph rather than merely unreached in it.
 
 [[bin]]
 name = "cortex-uvm-v2-host"
@@ -28,12 +32,6 @@ microsandbox-image = { workspace = true }
 # Canonical JSON, so that an image is the same bytes whatever order its fields are declared in
 # — and therefore the same digest.
 olpc-cjson = { workspace = true }
-# `blk` for the two disks the guest overlays into a root; `net` for the virtio-net device a
-# session with a network gets.
-msb_krun = { workspace = true, features = ["blk", "net"] }
-# The network a session with one gets. Its stack runs in this process, because what
-# `VmBuilder` takes is an in-process backend object and not a socket.
-microsandbox-network = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Digests: an image is named by one, and so is every layer.

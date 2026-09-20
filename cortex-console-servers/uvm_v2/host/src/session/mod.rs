@@ -2,9 +2,8 @@
 
 #[cfg(target_os = "macos")]
 mod entitlement;
+mod helper;
 pub mod uvm;
-
-pub use uvm::boot;
 
 use std::{io, path::PathBuf};
 

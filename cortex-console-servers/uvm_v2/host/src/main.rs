@@ -1,8 +1,10 @@
 //! `cortex-uvm-v2-host` — the half that answers a console session.
 //!
 //! Reads requests on stdin and writes answers on stdout, per [`cortex::console`]; what it
-//! does with one is to run it inside a micro-VM this process brings up. None of that is
-//! here yet — so far this owns the wire and reclaims what an earlier run abandoned.
+//! does with one is to run it inside a micro-VM. The VM is not in this process: a session
+//! spawns `cortex-uvm-v2-boot`, a signed copy of a binary this one carries inside it, and
+//! talks to the guest down a socket that boot turns into a console port. See
+//! `session::helper` for why the hypervisor is somewhere else.
 //!
 //! # Two things to be, and a session is the default
 //!
@@ -10,12 +12,6 @@
 //! A client spawns this binary to be its server and passes nothing, which is why no arguments
 //! means `run` rather than a usage message: the common case is the one a caller does not have
 //! to spell.
-//!
-//! There is a third, and **nobody calls it.** `boot` is this binary holding a hypervisor, and
-//! it is reached only by a session spawning a signed copy of itself — the entitlements a VM
-//! needs are read at `exec`, so the process that creates one can never be the process that
-//! decided to. It is left out of the refusal below for that reason: a mode a caller cannot
-//! usefully type is not one to offer them.
 
 mod contract;
 mod rootfs;
@@ -26,20 +22,9 @@ use std::process::ExitCode;
 /// A failure of ours, not a command's — the shell's code for "found it, could not run it".
 const NOT_EXECUTABLE: u8 = 126;
 
-fn main() -> ExitCode {
-    // Before any runtime of ours. The VMM drives one of its own and blocks on it, which is
-    // what tokio refuses to let a thread already inside a runtime do — so the mode that
-    // holds a hypervisor cannot be started from within one.
-    let outcome = if std::env::args().nth(1).as_deref() == Some("boot") {
-        session::boot(std::env::args_os().skip(2))
-    } else {
-        match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-            Ok(runtime) => runtime.block_on(run(std::env::args().skip(1))),
-            Err(e) => Err(anyhow::anyhow!("building a runtime: {e}")),
-        }
-    };
-
-    match outcome {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(std::env::args().skip(1)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}: {e}", env!("CARGO_BIN_NAME"));

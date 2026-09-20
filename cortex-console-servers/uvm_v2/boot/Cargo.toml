@@ -1,0 +1,58 @@
+[package]
+name = "cortex-uvm-v2-boot"
+version.workspace = true
+edition.workspace = true
+
+# The process that becomes a micro-VM. A binary and nothing else: the host never links it, it
+# embeds it — so there is no library half for the two to share and no dependency edge between
+# the packages at all.
+#
+# # Why it is not a mode of the host
+#
+# Two reasons, and either alone would be enough.
+#
+# **It has to be signed.** On macOS, creating a VM through Hypervisor.framework needs an
+# entitlement, an entitlement is carried by a code signature, and a signature is read at
+# `exec` — so the process that creates a VM can never be the process that decided to.
+# Something is written and signed on the way to every boot however this is arranged, and
+# making that something this binary keeps the signed artifact to a VMM and a network stack
+# rather than the whole of a console server.
+#
+# **It becomes the VM.** `Vm::enter` does not return and the VMM `_exit`s when the guest
+# stops, so whatever holds a hypervisor stops being able to answer anything else.
+#
+# What crosses between them is `src/contract.rs`, which is the same file in both packages and
+# in the guest's — see its module docs. Nothing else does: a boot is told what to do entirely
+# through its command line.
+
+# `required-features` is why a bare `cargo build` at the workspace root builds nothing here.
+# What builds this is `cortex-uvm-v2-host`'s build script, which invokes cargo again with
+# `--features vm` and embeds the result — the same shape it already uses for the guest, and
+# for the same reason: a target whose dependencies have no business in anyone else's graph is
+# built by itself.
+[[bin]]
+name = "cortex-uvm-v2-boot"
+path = "src/main.rs"
+required-features = ["vm"]
+
+[features]
+# Everything this binary is, behind one name — so that the package can be a workspace member,
+# resolved against the one lockfile, without a hypervisor entering the graph of a `cargo
+# build` that was not asking for one.
+vm = ["dep:msb_krun", "dep:microsandbox-network", "dep:tokio"]
+
+[dependencies]
+anyhow = { workspace = true }
+# `contract.rs` carries the image spec the host writes and the guest reads. This half writes
+# neither and still holds the type, because the three copies of that file are one file.
+serde = { workspace = true }
+# `blk` for the two disks the guest overlays into a root; `net` for the virtio-net device a
+# session with a network gets.
+msb_krun = { workspace = true, features = ["blk", "net"], optional = true }
+# The network a session with one gets. Its stack runs here rather than in the host, because
+# what `VmBuilder` takes is an in-process backend object and not a socket — so whatever owns
+# the VM is what has to own the stack.
+microsandbox-network = { workspace = true, optional = true }
+# The stack's poll loop is async and wants a runtime of its own, held for as long as the VM is
+# up. Nothing else in this binary waits for anything, which is why it is behind the feature.
+tokio = { workspace = true, features = ["rt-multi-thread"], optional = true }
