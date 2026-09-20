@@ -9,6 +9,23 @@ use super::digest::Digest;
 use super::layer::Layer;
 use super::{cache, images};
 
+/// A digest naming an image this store does not have.
+///
+/// A type of its own because what a caller does about it differs from every other way a
+/// manifest fails to be read: nothing is wrong here, and the name is one nobody built. A
+/// client hearing it can build the thing; a client hearing that a manifest will not parse has
+/// a store to repair.
+#[derive(Clone, Debug)]
+pub struct Unknown(pub Digest);
+
+impl std::fmt::Display for Unknown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no image here is called {}", self.0)
+    }
+}
+
+impl std::error::Error for Unknown {}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Image {
     pub v: u32,
@@ -57,8 +74,16 @@ impl Image {
     }
 
     /// The image `digest` names, read back.
+    ///
+    /// An image that is not here comes back as [`Unknown`] and not as the failure to open a
+    /// file, because the two are different answers to whoever asked: one says the store does
+    /// not have this and can be built, the other says the store is damaged.
     pub fn load(digest: &Digest) -> anyhow::Result<Image> {
-        Image::read(&Image::path(digest))
+        let held = Image::path(digest);
+        if !held.is_file() {
+            return Err(Unknown(digest.clone()).into());
+        }
+        Image::read(&held)
     }
 
     /// One manifest, read from where it lies.

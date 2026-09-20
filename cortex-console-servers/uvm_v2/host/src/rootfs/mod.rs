@@ -36,7 +36,7 @@ use microsandbox_image::GlobalCache;
 
 pub use build::build;
 pub use digest::Digest;
-pub use image::Image;
+pub use image::{Image, Unknown};
 pub use layer::Layer;
 
 /// Where the images live: content-addressed, shared by every session, and kept.
@@ -230,8 +230,7 @@ async fn remove(argv: impl IntoIterator<Item = impl AsRef<str>>) -> anyhow::Resu
         // Read before anything is deleted, so a call naming one image that is not here removes
         // none of the others: a client that mistyped the second of three digests is told so,
         // rather than told so after two are gone.
-        let image = Image::load(&digest)
-            .map_err(|e| anyhow::anyhow!("no image here is called {digest}: {e}"))?;
+        let image = Image::load(&digest)?;
         removing.push((digest, image));
     }
     anyhow::ensure!(

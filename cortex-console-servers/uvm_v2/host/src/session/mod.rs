@@ -102,9 +102,13 @@ pub async fn run() -> anyhow::Result<()> {
                 call: Call::Init(init),
             } => {
                 let answered = match async {
-                    let context = at(init.context.as_ref(), "context")?;
-                    let artifacts = at(init.artifacts.as_ref(), "artifacts")?;
-                    let scratch = at(init.scratch.as_ref(), "scratch")?;
+                    let context = at(init.context.as_ref(), "context", Error::UNSUPPORTED_CONTEXT)?;
+                    let artifacts = at(
+                        init.artifacts.as_ref(),
+                        "artifacts",
+                        Error::UNSUPPORTED_ARTIFACTS,
+                    )?;
+                    let scratch = at(init.scratch.as_ref(), "scratch", Error::UNSUPPORTED_SCRATCH)?;
 
                     // How far this session may reach, and which doors on this host it is
                     // granted. Settled before anything is built, because it is the one part of
@@ -195,12 +199,23 @@ pub async fn run() -> anyhow::Result<()> {
                     // a client that built an image and a client that hands over the
                     // declaration are naming one image, and the second one pays for it once.
                     let declared = init.rootfs.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "a session here runs in a micro-VM, which boots on a rootfs, \
-                             and this one named none"
+                        refuse(
+                            Error::INVALID_PARAMS,
+                            "a session here runs in a micro-VM, which boots on a rootfs, and \
+                             this one named none",
                         )
                     })?;
-                    let image = build(declared).await?;
+                    // Two kinds of failure, and the difference is what a client does next. A
+                    // base named by a digest nobody built here is a file test this end just
+                    // made, and whoever asked can go and build the thing. Everything else — a
+                    // registry that could not be reached, a `RUN` that exited non-zero — is
+                    // this session failing to come up, which is what a boot failing is.
+                    let image = build(declared).await.map_err(|e| match e
+                        .downcast_ref::<crate::rootfs::Unknown>()
+                    {
+                        Some(_) => coded(Error::UNKNOWN_IMAGE, e),
+                        None => coded(Error::BOOT_FAILED, e),
+                    })?;
 
                     // Where each tree is on this side, against the one path in the guest that
                     // names it. Fixed for the session, which is why the answer below can say
@@ -242,7 +257,7 @@ pub async fn run() -> anyhow::Result<()> {
                                 .await
                             })
                         });
-                    let uvm = boot().await?;
+                    let uvm = boot().await.map_err(|e| coded(Error::BOOT_FAILED, e))?;
 
                     anyhow::Ok((
                         boot,
@@ -287,8 +302,16 @@ pub async fn run() -> anyhow::Result<()> {
             } => {
                 let machine = if session.is_none() {
                     match session_factory.as_ref() {
-                        Some(boot) => boot().await.map(|uvm| session.insert(uvm)),
-                        None => Err(anyhow::anyhow!("this session has not been told what it is")),
+                        Some(boot) => boot()
+                            .await
+                            .map_err(|e| coded(Error::BOOT_FAILED, e))
+                            .map(|uvm| session.insert(uvm)),
+                        // Nothing to boot, because nothing said what to boot. A call out of
+                        // order and not a failure of this end's.
+                        None => Err(refuse(
+                            Error::INVALID_REQUEST,
+                            "this session has not been told what it is",
+                        )),
                     }
                 } else {
                     Ok(session.as_mut().expect("just checked"))
@@ -307,8 +330,16 @@ pub async fn run() -> anyhow::Result<()> {
             Message::Request { id, call } => {
                 let machine = if session.is_none() {
                     match session_factory.as_ref() {
-                        Some(boot) => boot().await.map(|uvm| session.insert(uvm)),
-                        None => Err(anyhow::anyhow!("this session has not been told what it is")),
+                        Some(boot) => boot()
+                            .await
+                            .map_err(|e| coded(Error::BOOT_FAILED, e))
+                            .map(|uvm| session.insert(uvm)),
+                        // Nothing to boot, because nothing said what to boot. A call out of
+                        // order and not a failure of this end's.
+                        None => Err(refuse(
+                            Error::INVALID_REQUEST,
+                            "this session has not been told what it is",
+                        )),
                     }
                 } else {
                     Ok(session.as_mut().expect("just checked"))
@@ -379,44 +410,83 @@ fn sessions() -> PathBuf {
 }
 
 /// A host directory a tree names, and `None` for one the session did not name.
-fn at(named: Option<&TreeSource>, role: &str) -> anyhow::Result<Option<PathBuf>> {
+///
+/// `unsupported` is the code for the tree in `role`, which the protocol gives one of each:
+/// a client refused at `init` has to know *which* of the three this server cannot take, and a
+/// session names up to three.
+fn at(named: Option<&TreeSource>, role: &str, unsupported: i64) -> anyhow::Result<Option<PathBuf>> {
     let Some(named) = named else {
         return Ok(None);
     };
-    let path = named
-        .file_path()
-        .ok_or_else(|| anyhow::anyhow!("{role}: a guest is handed a directory, so this server realizes file:// and nothing else"))?;
-    anyhow::ensure!(
-        path.is_absolute(),
-        "{role}: a file:// tree needs an absolute path, and {} is not",
-        path.display()
-    );
+    // A scheme and not a spelling: which kinds of tree can be realized is a fact about this
+    // build, and no path written any other way would make this one of them.
+    let path = named.file_path().ok_or_else(|| {
+        refuse(
+            unsupported,
+            format!(
+                "{role}: a guest is handed a directory, so this server realizes \
+                 file:// and nothing else"
+            ),
+        )
+    })?;
+    // Where the scheme is one this server has, and the URL is not one it can act on. The fix
+    // is the client's spelling rather than a different server, which is what parts it from the
+    // refusal above.
+    if !path.is_absolute() {
+        return Err(refuse(
+            Error::INVALID_PARAMS,
+            format!(
+                "{role}: a file:// tree needs an absolute path, and {} is not",
+                path.display()
+            ),
+        ));
+    }
     Ok(Some(path.to_path_buf()))
 }
 
 /// A failure that names the code the protocol has for it.
 ///
-/// Everything under an `init` hands back an `anyhow::Error`, so a code travels the way a
+/// Everything under a request hands back an `anyhow::Error`, so a code travels the way a
 /// message already does — carried by the failure itself and read off it where the response is
 /// made — rather than by a second return type every step in between would have to thread
 /// through. A failure that names none is [`INTERNAL_ERROR`](Error::INTERNAL_ERROR), which is
 /// what "something went wrong at this end" means on the wire.
+///
+/// # Which code is which is this end's to decide, and only this end's
+///
+/// The store below builds images for a `rootfs build` that has no protocol at all, and the
+/// machine below that boots for a build step that answers nobody. Neither has a client to say
+/// a code to, so neither names one: what they hand back is the failure, and the mapping from a
+/// kind of failure to a number a client branches on is made here, at the one place that is
+/// talking to a client.
 #[derive(Debug)]
-struct Refusal(i64, String);
+struct Refusal {
+    code: i64,
+    said: anyhow::Error,
+}
 
 impl std::fmt::Display for Refusal {
-    /// The message and not the code: the code is read off the value, and a sentence with a
-    /// number in it would carry it twice wherever this is shown.
+    /// What was said, and not the code: the code is read off the value, and a sentence with
+    /// the number in it would carry it twice wherever this is shown.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.1)
+        write!(f, "{:#}", self.said)
     }
 }
 
 impl std::error::Error for Refusal {}
 
-/// A refusal naming `code`, as the type everything under an `init` hands back.
+/// A refusal naming `code`, said here.
 fn refuse(code: i64, message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(Refusal(code, message.into()))
+    coded(code, anyhow::Error::msg(message.into()))
+}
+
+/// `said`, named as `code` — the failure kept whole and only labelled.
+///
+/// What a client reads is still the sentence written where the thing went wrong. A code says
+/// which kind of failure this is, and nothing this end could add about it would be a better
+/// sentence than the one the layer that hit it already wrote.
+fn coded(code: i64, said: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(Refusal { code, said })
 }
 
 /// Anything that went wrong, as the one thing the protocol carries.
@@ -427,7 +497,7 @@ fn refused(e: &anyhow::Error) -> Error {
     let code = e
         .chain()
         .find_map(|cause| cause.downcast_ref::<Refusal>())
-        .map_or(Error::INTERNAL_ERROR, |named| named.0);
+        .map_or(Error::INTERNAL_ERROR, |named| named.code);
     Error {
         code,
         message: format!("{e:#}"),
