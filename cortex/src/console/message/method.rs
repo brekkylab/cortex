@@ -17,7 +17,7 @@ pub enum Method {
     Exec,
     Read,
     Write,
-    Commit,
+    Snapshot,
     Start,
     Stop,
     Quit,
@@ -27,7 +27,7 @@ impl Method {
     /// The name as it appears in a `method` member.
     pub fn as_str(&self) -> &'static str {
         match self {
-            Method::Commit => "commit",
+            Method::Snapshot => "snapshot",
             Method::Init => "init",
             Method::Exec => "exec",
             Method::Read => "read",
@@ -49,7 +49,7 @@ impl Method {
 
     pub fn parse(name: &str) -> Option<Method> {
         Some(match name {
-            "commit" => Method::Commit,
+            "snapshot" => Method::Snapshot,
             "init" => Method::Init,
             "exec" => Method::Exec,
             "read" => Method::Read,

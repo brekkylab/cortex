@@ -12,10 +12,14 @@
 //! with: the channel it did without was the thing that carried the answer.
 
 mod boot;
-mod contract;
 mod init;
 mod layer;
 mod net;
+
+// The cross-process contract, in the library all three halves of this take. Imported at
+// the root so that the rest of the crate names it `crate::contract`, the way it would a
+// module of its own.
+pub(crate) use cortex_uvm_v2_common::contract;
 
 use std::process::ExitCode;
 

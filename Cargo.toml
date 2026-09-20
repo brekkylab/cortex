@@ -6,10 +6,8 @@ members = [
     "cortex-execs/mem",
     "cortex-execs/index",
     "cortex-execs/docread",
-    "cortex-console-servers/local",
-    "cortex-console-servers/uvm/console",
-    "cortex-console-servers/uvm/boot",
     "cortex-console-servers/uvm_v2/boot",
+    "cortex-console-servers/uvm_v2/common",
     "cortex-console-servers/uvm_v2/host",
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
@@ -39,6 +37,9 @@ cortex-exec-storebase = { path = "cortex-execs/storebase" }
 # The boot process, and — as its library half — the strings a console server starts one with.
 # A server takes it without the `vm` feature and so links no VMM; see its own manifest.
 cortex-uvm-boot = { path = "cortex-console-servers/uvm/boot", default-features = false }
+# What the second take's host, boot and guest say to each other. The guest is a workspace of
+# its own and names the path itself; these two inherit it from here.
+cortex-uvm-v2-common = { path = "cortex-console-servers/uvm_v2/common" }
 futures-core = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -291,7 +291,7 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let tar = out.path().join("layer.tar");
-        let size = write_layer(upper.path(), &tar, &[], &[]).unwrap();
+        let size = super::write(upper.path(), &tar, &[], &[]).unwrap();
         assert!(size > 0);
 
         let kinds = kinds(&tar);
@@ -315,7 +315,7 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let tar = out.path().join("layer.tar");
-        write_layer(upper.path(), &tar, &[PathBuf::from("oldroot")], &[]).unwrap();
+        super::write(upper.path(), &tar, &[PathBuf::from("oldroot")], &[]).unwrap();
 
         let names = names(&tar);
         assert!(names.iter().any(|name| name == "keep"), "{names:?}");
@@ -336,7 +336,7 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let tar = out.path().join("layer.tar");
-        write_layer(
+        super::write(
             upper.path(),
             &tar,
             &[],
@@ -373,7 +373,7 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let tar = out.path().join("layer.tar");
-        write_layer(upper.path(), &tar, &[], &[]).unwrap();
+        super::write(upper.path(), &tar, &[], &[]).unwrap();
 
         assert!(names(&tar).iter().any(|name| name == "srv"));
     }
@@ -396,7 +396,7 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let tar = out.path().join("layer.tar");
-        write_layer(upper.path(), &tar, &[], &[]).unwrap();
+        super::write(upper.path(), &tar, &[], &[]).unwrap();
 
         let names = names(&tar);
         assert!(

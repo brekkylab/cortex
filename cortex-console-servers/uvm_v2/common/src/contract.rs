@@ -1,12 +1,12 @@
 //! What a host tells a boot, and what a boot tells the guest.
 //!
-//! Two cross-process contracts live in one file because they are written and read by three
-//! binaries, and **every copy of this file has to be the same file**. `cortex-uvm-v2-host`,
-//! `cortex-uvm-v2-boot` and `cortex-uvm-v2-guest` are built for two targets by three cargos
-//! and share no dependency, so nothing but this sentence and a `diff` notices a mismatch —
-//! and a mismatch fails at a mount or a parse, seconds and a kernel log away from the change
-//! that caused it. The guest's copy carries what only the guest needs on the end of it;
-//! everything above that is the same text.
+//! Two cross-process contracts in one module because three binaries speak them and every one
+//! of them takes this crate: `cortex-uvm-v2-host` writes what `cortex-uvm-v2-boot` parses, and
+//! the boot in turn writes what `cortex-uvm-v2-guest` reads. The three are built for two
+//! targets by three cargos and agree on nothing else, so a name that only they share is a name
+//! nothing checks — and a mismatch fails at a mount or a parse, seconds and a kernel log away
+//! from the change that caused it. One definition of each, in a library all three link, is what
+//! turns that into a compile error.
 //!
 //! The two are not the same kind of thing:
 //!
@@ -19,7 +19,7 @@
 //! - **the boot to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`CONTEXT_ENV`],
 //!   [`ARTIFACTS_ENV`], [`SCRATCH_ENV`], [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]).
 //!
-//! Where a tree lands inside the guest is **this file's constant for it** —
+//! Where a tree lands inside the guest is **this module's constant for it** —
 //! [`CONTEXT_PATH`], [`ARTIFACTS_PATH`], [`SCRATCH_PATH`] — carried in that tree's env
 //! alongside the tag. One name per role, the same in every session, so what a guest reports
 //! and what a client sends are the same three strings no matter which host directory is
@@ -34,9 +34,6 @@
 //! size-limited and rejects a newline. Nothing that could grow is there — the session itself
 //! arrives on [`PORT_NAME`] as protocol frames, and what the base image said arrives as a file
 //! ([`IMAGE_SPEC_PATH`]). None of that constrains [`BootArgs`], which is an ordinary spawn.
-
-// The whole contract, whether or not this half reads every part of it.
-#![allow(dead_code)]
 
 use std::{
     ffi::{OsStr, OsString},
@@ -78,7 +75,7 @@ pub const GUEST_ABIN_DEV: &str = "/dev/vdc";
 /// The overlay's upper, as the guest sees it.
 pub const GUEST_UPPER_DEV: &str = "/dev/vda";
 
-/// Told to the guest as `CORTEX_UVM_LOWER`, which is the name its `contract` module reads.
+/// Told to the guest as `CORTEX_UVM_LOWER`.
 pub const LOWER_ENV: &str = "CORTEX_UVM_LOWER";
 
 /// Told to the guest as `CORTEX_UVM_UPPER`.
@@ -131,6 +128,9 @@ pub const SCRATCH_PATH: &str = "/scratch";
 /// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
 /// which is a guest with no `/abin` at all rather than an empty one.
 pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
+
+/// Where it is mounted, and what goes first on `PATH`.
+pub const ABIN_PATH: &str = "/abin";
 
 /// The virtio-fs tag the context is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
@@ -188,9 +188,7 @@ pub const IMAGE_SPEC_PATH: &str = "/.cortex-image";
 
 /// What the base image says about running a process in it, as BSON at [`IMAGE_SPEC_PATH`].
 ///
-/// The far end is `cortex-uvm-guest`'s `contract::ImageSpec`, which **has to change with
-/// this one** — the two crates are built for different targets, so the compiler cannot see a
-/// mismatch. BSON because it is the codec both ends already carry for the console wire.
+/// BSON because it is the codec both ends already carry for the console wire.
 ///
 /// Two fields of an OCI config, and deliberately not the rest. `Entrypoint` and `Cmd` have
 /// nobody to instruct: a command's argv comes from the client. `ExposedPorts` and `Volumes`
@@ -208,6 +206,26 @@ pub struct ImageSpec {
 
     /// Where the image expects a process to stand, if it said so.
     pub working_dir: Option<String>,
+}
+
+/// `PATH` for everything an execution spawns when the base image did not say — see
+/// [`ImageSpec::env`].
+///
+/// Set here rather than inherited, because there is nothing to inherit it from: libkrun
+/// hands the guest's first process the environment the boot named and nothing else, so a
+/// guest without this line is one where `sh` cannot find `ls`.
+pub const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// What a guest answers a `commit` with: the layer is written, and this big.
+///
+/// Not a [`CommitResp`](https://docs.rs/cortex/latest/cortex/console/struct.CommitResp.html),
+/// which names an image — something only the host can make, and only after reading what this
+/// wrote. The console server replaces this with one before the client sees anything, which is
+/// what it already does with `init`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestCommit {
+    /// The tar's size, so the host can tell an empty layer from a missing one.
+    pub size: u64,
 }
 
 /// How much of the network a session may reach.
@@ -280,6 +298,29 @@ impl Network {
     }
 }
 
+/// The interface the boot attached, as `iface=<name>,mac=<addr>,mtu=<n>`. Absent for a guest
+/// with no network, which is the default.
+///
+/// **Not this project's spelling.** These are `microsandbox-network`'s own variable names, and
+/// they arrive from the stack that assigned the values — passed through by the boot rather than
+/// translated, so there is one description of the network and not two. Its guest agent reads
+/// the same names to do the same job, which is what makes this the shape to match rather than
+/// invent.
+///
+/// The `mac=` field is the one that is not description: it is how the guest tells the attached
+/// interface from the others the kernel brought up on its own.
+pub const NET_ENV: &str = "MSB_NET";
+
+/// The addresses on that interface, as `addr=<ip>/<prefix>,gw=<ip>,dns=<ip>`.
+///
+/// A separate variable from [`NET_ENV`] because a stack with no IPv4 route to offer sends no
+/// IPv4 — and one that has both sends `MSB_NET_IPV6` beside it, which this end does not read
+/// yet.
+pub const NET_IPV4_ENV: &str = "MSB_NET_IPV4";
+
+/// Where a resolver is named on any system a base image was built for.
+pub const RESOLV_CONF: &str = "/etc/resolv.conf";
+
 /// Everything a console server tells a boot, as the boot's own command line.
 ///
 /// # Why arguments and not the environment
@@ -299,9 +340,6 @@ impl Network {
 /// replaced were shared names read in two places, which is a weaker promise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootArgs {
-    /// The libkrunfw kernel the child boots.
-    pub kernel: PathBuf,
-
     /// A directory served as the guest's virtio-fs root, holding the guest binary and the
     /// image spec and nothing else.
     pub boot_root: PathBuf,
@@ -386,7 +424,8 @@ pub struct BootArgs {
 }
 
 impl BootArgs {
-    /// The arguments a server spawns a boot with, after [`BOOT_ARG`](crate::server::BOOT_ARG).
+    /// The whole of a boot's argv, less the binary itself — the boot has no mode to select,
+    /// so there is nothing in front of these.
     ///
     /// `OsString` throughout: a path that is not UTF-8 is still a path, and nothing here has to
     /// read one as text. The exceptions are the three trees, which the guest is told about as
@@ -407,7 +446,6 @@ impl BootArgs {
             args.push(value.to_os_string());
         };
 
-        put("--kernel", self.kernel.as_os_str());
         put("--boot-root", self.boot_root.as_os_str());
         put("--channel", self.channel.as_os_str());
         put("--base", self.base.as_os_str());
@@ -450,7 +488,6 @@ impl BootArgs {
     /// mismatch between two halves of one binary rather than a caller to be lenient with. It is
     /// refused before a hypervisor is touched, which is the cheapest place it can be.
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<BootArgs> {
-        let mut kernel = None;
         let mut boot_root = None;
         let mut channel = None;
         let mut base = None;
@@ -479,7 +516,6 @@ impl BootArgs {
             };
             match flag.as_str() {
                 "--console" => console = Some(PathBuf::from(value()?)),
-                "--kernel" => kernel = Some(PathBuf::from(value()?)),
                 "--boot-root" => boot_root = Some(PathBuf::from(value()?)),
                 "--channel" => channel = Some(PathBuf::from(value()?)),
                 "--base" => base = Some(PathBuf::from(value()?)),
@@ -504,7 +540,6 @@ impl BootArgs {
                 .ok_or_else(|| anyhow::anyhow!("{name} is missing — a boot is started by a server"))
         };
         Ok(BootArgs {
-            kernel: required("--kernel", kernel)?,
             boot_root: required("--boot-root", boot_root)?,
             channel: required("--channel", channel)?,
             base: required("--base", base)?,
@@ -584,7 +619,6 @@ mod tests {
 
     fn args() -> BootArgs {
         BootArgs {
-            kernel: "/opt/lib/libkrunfw.dylib".into(),
             boot_root: "/tmp/boot-root".into(),
             channel: "/tmp/sock".into(),
             base: "/cache/oci/vmdk/sha256_7e6269.vmdk".into(),
@@ -698,7 +732,7 @@ mod tests {
     #[test]
     fn a_boot_refuses_arguments_a_server_would_not_have_sent() {
         let mut short = args().to_args();
-        short.truncate(2); // just `--kernel <path>`
+        short.truncate(2); // `--committable`, then a flag with nothing to be
         assert!(
             BootArgs::parse(short).is_err(),
             "a missing argument was accepted"

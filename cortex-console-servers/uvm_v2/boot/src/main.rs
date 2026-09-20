@@ -38,13 +38,17 @@
 //! knows or asks: it attaches a path. Where it lands in the guest is a constant per role —
 //! see [`contract::CONTEXT_PATH`].
 
-mod contract;
 mod net;
+
+// The cross-process contract, in the library all three halves of this take. Imported at
+// the root so that the rest of the crate names it `crate::contract`, the way it would a
+// module of its own.
+pub(crate) use cortex_uvm_v2_common::contract;
 
 use std::{
     convert::Infallible,
     os::{fd::AsRawFd, unix::net::UnixStream},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use contract::{
@@ -90,6 +94,8 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
         .map_err(|e| anyhow::anyhow!("connecting to the console channel: {e}"))?;
     let port = channel.as_raw_fd();
 
+    let kernel = kernel()?;
+
     let lower_format = match args.base_format {
         BaseFormat::Raw => DiskImageFormat::Raw,
         BaseFormat::Vmdk => DiskImageFormat::Vmdk,
@@ -99,7 +105,7 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
             m.vcpus(args.vcpus.unwrap_or(DEFAULT_VCPUS))
                 .memory_mib(args.memory_mib.unwrap_or(DEFAULT_MEMORY_MIB) as usize)
         })
-        .kernel(|k| k.krunfw_path(&args.kernel))
+        .kernel(|k| k.krunfw_path(&kernel))
         .fs(|fs| fs.root(&args.boot_root))
         // Attach order is what fixes the names: the session's own image is `/dev/vda` and the
         // base is `/dev/vdb`, which is the promise the guest mounts against.
@@ -220,4 +226,47 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
         .build()?;
 
     Ok(vm.enter()?)
+}
+
+/// The libkrunfw to load a guest kernel out of: the one `CORTEX_UVM_KERNEL` names, or the one
+/// this host has installed.
+///
+/// Neither downloaded nor shipped. libkrun `dlopen`s this library, and a `dlopen`ed library
+/// has to be signed compatibly with the process loading it — this one. So which copy is usable
+/// is a property of this binary and its installation, which is why the override is read here
+/// rather than anywhere a server could have answered it.
+///
+/// Resolved before the VM is built, because a name that is missing or wrong otherwise fails
+/// inside the VMM, well past the point where a message saying what to install is easy to
+/// give.
+fn kernel() -> anyhow::Result<PathBuf> {
+    if let Some(named) = std::env::var_os("CORTEX_UVM_KERNEL") {
+        return Ok(PathBuf::from(named));
+    }
+
+    // Both spellings of the name: the versioned one a release ships, and the plain one a
+    // package manager symlinks.
+    let (versioned, plain) = match std::env::consts::OS {
+        "macos" => ("libkrunfw.5.dylib", "libkrunfw.dylib"),
+        _ => ("libkrunfw.so.5", "libkrunfw.so"),
+    };
+    let mut looked = Vec::new();
+    if let Some(user) = std::env::var_os("HOME") {
+        looked.push(PathBuf::from(&user).join(".microsandbox/lib"));
+    }
+    looked.extend(
+        ["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"]
+            .into_iter()
+            .map(PathBuf::from),
+    );
+    looked
+        .into_iter()
+        .flat_map(|dir| [dir.join(versioned), dir.join(plain)])
+        .find(|at| at.exists())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no libkrunfw found. Install it (`brew install libkrunfw`, or microsandbox), \
+                 or set CORTEX_UVM_KERNEL"
+            )
+        })
 }

@@ -50,8 +50,8 @@ use std::io;
 use futures_core::future::BoxFuture;
 
 use crate::console::{
-    Call, CommitCall, CommitResp, Error, ExecCall, ExecResp, InitCall, InitResp, Message, Method,
-    Notification, ReadCall, ReadResp, RequestId, Response, WriteCall, WriteResp,
+    Call, Error, ExecCall, ExecResp, InitCall, InitResp, Message, Method, Notification, ReadCall,
+    ReadResp, RequestId, Response, WriteCall, WriteResp,
 };
 
 /// Why a call produced no result.
@@ -197,20 +197,6 @@ pub trait Client: Send {
             match self.call(Call::Write(write)).await? {
                 Response::Write(answer) => Ok(answer),
                 other => Err(mismatched(Method::Write, other)),
-            }
-        })
-    }
-
-    /// Keep what this session has written, as a base a later session can name.
-    ///
-    /// The one call whose answer outlives the session: everything else here is about work
-    /// inside one. A server with nothing to keep — one whose commands run on its own
-    /// filesystem — refuses it, and so does a session that did not say it might.
-    fn commit(&mut self, commit: CommitCall) -> BoxFuture<'_, Result<CommitResp, Failure>> {
-        Box::pin(async move {
-            match self.call(Call::Commit(commit)).await? {
-                Response::Commit(answer) => Ok(answer),
-                other => Err(mismatched(Method::Commit, other)),
             }
         })
     }

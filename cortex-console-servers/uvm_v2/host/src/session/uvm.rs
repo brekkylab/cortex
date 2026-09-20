@@ -53,42 +53,6 @@ fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<St
     // The program a boot runs, written out of this binary and signed — see `helper`.
     let machine = super::helper::boot_binary()?;
 
-    // Not downloaded. A kernel is loaded into the guest's memory by a `dlopen`ed library
-    // that has to be signed compatibly with the process loading it, so where it came from
-    // is a property of the installation rather than something this decides — and getting
-    // it wrong fails deep inside the VMM, well after the point where a helpful message is
-    // easy to give.
-    let kernel = match std::env::var_os("CORTEX_UVM_KERNEL") {
-        Some(named) => PathBuf::from(named),
-        None => {
-            // Both spellings of the name: the versioned one a release ships, and the
-            // plain one a package manager symlinks.
-            let (versioned, plain) = match std::env::consts::OS {
-                "macos" => ("libkrunfw.5.dylib", "libkrunfw.dylib"),
-                _ => ("libkrunfw.so.5", "libkrunfw.so"),
-            };
-            let mut looked = Vec::new();
-            if let Some(user) = std::env::var_os("HOME") {
-                looked.push(PathBuf::from(&user).join(".microsandbox/lib"));
-            }
-            looked.extend(
-                ["/opt/homebrew/lib", "/usr/local/lib", "/usr/lib"]
-                    .into_iter()
-                    .map(PathBuf::from),
-            );
-            looked
-                .into_iter()
-                .flat_map(|dir| [dir.join(versioned), dir.join(plain)])
-                .find(|at| at.exists())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no libkrunfw found. Install it (`brew install libkrunfw`, or \
-                         microsandbox) or set CORTEX_UVM_KERNEL to the library's path"
-                    )
-                })?
-        }
-    };
-
     // Paths nothing else in this process or any other will pick, of the shape the sweep
     // in `session` reads a pid back out of: the pid says who owns them, and the counter
     // keeps two boots of one process apart.
@@ -160,7 +124,6 @@ fn start(image: &Image, mounts: &[Mount], network: Network) -> anyhow::Result<St
         .map_err(|e| anyhow::anyhow!("binding the console channel: {e}"))?;
 
     let mut told = BootArgs {
-        kernel,
         boot_root: root.clone(),
         channel: socket.clone(),
         base,

@@ -225,7 +225,6 @@
 //! would have made them base64 at best (1.37×) or `[104,105,10]` at worst (4×).
 
 mod call;
-mod commit;
 mod error;
 mod message;
 mod method;
@@ -234,7 +233,6 @@ mod response;
 mod utils;
 
 pub use call::*;
-pub use commit::*;
 pub use error::*;
 pub use message::*;
 pub use method::*;

@@ -61,8 +61,11 @@ fn guest() -> anyhow::Result<()> {
             crate_dir.join(source).display()
         );
     }
-    // The guest links cortex, so a change to the protocol is a change to the guest.
-    println!("cargo::rerun-if-changed=../../../../cortex/src");
+    // The guest links cortex and the contract, so a change to either is a change to the
+    // guest. Cargo would rebuild them inside the nested build; what this buys is that the
+    // nested build is run at all.
+    println!("cargo::rerun-if-changed=../../../cortex/src");
+    println!("cargo::rerun-if-changed=../common/src");
 
     // A libkrun guest runs the host's architecture: there is no emulation in the middle to
     // make anything else work.
@@ -112,6 +115,8 @@ fn boot() -> anyhow::Result<()> {
             crate_dir.join(source).display()
         );
     }
+    // The contract the boot parses its command line with — the same reason as the guest's.
+    println!("cargo::rerun-if-changed=../common/src");
 
     let target_dir = PathBuf::from(std::env::var("OUT_DIR")?).join("boot");
     let status = cargo(&crate_dir, &target_dir)

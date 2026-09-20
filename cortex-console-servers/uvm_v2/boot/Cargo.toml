@@ -21,9 +21,9 @@ edition.workspace = true
 # **It becomes the VM.** `Vm::enter` does not return and the VMM `_exit`s when the guest
 # stops, so whatever holds a hypervisor stops being able to answer anything else.
 #
-# What crosses between them is `src/contract.rs`, which is the same file in both packages and
-# in the guest's — see its module docs. Nothing else does: a boot is told what to do entirely
-# through its command line.
+# What crosses between them is `cortex-uvm-v2-common`'s contract, which the host, this half
+# and the guest all link — see its module docs. Nothing else does: a boot is told what to do
+# entirely through its command line.
 
 # `required-features` is why a bare `cargo build` at the workspace root builds nothing here.
 # What builds this is `cortex-uvm-v2-host`'s build script, which invokes cargo again with
@@ -43,9 +43,9 @@ vm = ["dep:msb_krun", "dep:microsandbox-network", "dep:tokio"]
 
 [dependencies]
 anyhow = { workspace = true }
-# `contract.rs` carries the image spec the host writes and the guest reads. This half writes
-# neither and still holds the type, because the three copies of that file are one file.
-serde = { workspace = true }
+# The command line this binary is told everything through, and the names it passes on to the
+# guest.
+cortex-uvm-v2-common = { workspace = true }
 # `blk` for the two disks the guest overlays into a root; `net` for the virtio-net device a
 # session with a network gets.
 msb_krun = { workspace = true, features = ["blk", "net"], optional = true }

@@ -20,10 +20,12 @@ bson = { version = "3", features = ["serde"] }
 # `mount(2)` and `pivot_root(2)` are called directly: on most images `mount` is util-linux's,
 # which drives a mount through an API the libkrun kernel rejects.
 libc = "0.2"
-serde = { version = "1", features = ["derive"] }
 # The protocol the agent answers. No default features: the guest wants the console and
 # nothing that binds a filesystem to a host.
 cortex = { path = "../../../cortex", default-features = false }
+# The names the boot tells this half, and the shapes it answers with. A path rather than a
+# workspace dependency, because this package is a workspace root of its own.
+cortex-uvm-v2-common = { path = "../common" }
 # A commit's layer leaves here as a tar, which is what the host ingests.
 tar = "0.4"
 tokio = { version = "1", features = [
@@ -36,6 +38,11 @@ tokio = { version = "1", features = [
     # `timeout`, which is what makes an `exec`'s `timeout_ms` a kill.
     "time",
 ] }
+
+[dev-dependencies]
+# The layer tests build an upper directory and write a tar out of it — both real trees on a
+# real filesystem, because what is being tested is what `walk` and `tar` do with one.
+tempfile = "3"
 
 [profile.release]
 opt-level = "z"

@@ -154,8 +154,9 @@ pub fn prepare() -> anyhow::Result<ImageSpec> {
 /// embedded in that same server, so the two cannot be different builds — and the default is
 /// exactly the behaviour this end had before there was a spec to read.
 ///
-/// A file that *is* there and does not decode is the other case, and that one is reported: it
-/// means the two `contract` modules have drifted, which nothing else would catch.
+/// A file that *is* there and does not decode is the other case, and that one is reported:
+/// both ends derive the shape from [`ImageSpec`], so what is left for it to be is a truncated
+/// write or a boot root from another build.
 fn image_spec() -> anyhow::Result<ImageSpec> {
     let encoded = match std::fs::read(IMAGE_SPEC_PATH) {
         Ok(encoded) => encoded,

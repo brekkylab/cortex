@@ -13,9 +13,13 @@
 //! means `run` rather than a usage message: the common case is the one a caller does not have
 //! to spell.
 
-mod contract;
 mod rootfs;
 mod session;
+
+// The cross-process contract, in the library all three halves of this take. Imported at
+// the root so that the rest of the crate names it `crate::contract`, the way it would a
+// module of its own.
+pub(crate) use cortex_uvm_v2_common::contract;
 
 use std::process::ExitCode;
 

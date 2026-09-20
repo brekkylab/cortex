@@ -96,7 +96,7 @@
 pub mod console;
 pub mod fs;
 mod lock;
-pub mod rootfs;
+// pub mod rootfs;
 pub mod rootfs_v2;
 
 /// What every method that waits hands back — a [`Client`] or a [`Server`].
