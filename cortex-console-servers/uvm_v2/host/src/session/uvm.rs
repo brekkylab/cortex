@@ -52,6 +52,21 @@ fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.parse().ok()
 }
 
+/// The executables to put at `/abin`, or `None` for a host that has none.
+///
+/// One well-known place under [`home`](crate::home) and no variable naming another: where the
+/// cache is, is already something [`home`](crate::home) answers, so a second way to point
+/// somewhere else would be two answers to one question. What is there is put there by
+/// `scripts/build-abin.sh`, and later by a release this host downloaded.
+///
+/// **A host with none is a session with no `/abin` and not a session that fails.** These are
+/// cortex's own executables, which a session is better off with and can run without — the
+/// guest guards on the directory being there, and an image's own `PATH` is what is left.
+fn abin() -> Option<PathBuf> {
+    let dir = crate::home().join("abin");
+    dir.is_dir().then_some(dir)
+}
+
 /// A host directory the guest can see, and where it sees it.
 #[derive(Clone)]
 pub struct Mount {
@@ -205,7 +220,7 @@ impl Uvm {
             base,
             base_format: BaseFormat::Vmdk,
             session: upper,
-            abin: None,
+            abin: abin(),
             context: None,
             artifacts: None,
             console: Some(console.clone()),

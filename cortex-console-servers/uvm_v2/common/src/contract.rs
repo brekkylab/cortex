@@ -117,16 +117,36 @@ pub const CONTEXT_PATH: &str = "/context";
 /// Where the artifacts tree is mounted inside the guest — see [`CONTEXT_PATH`].
 pub const ARTIFACTS_PATH: &str = "/artifacts";
 
-/// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
-/// which is a guest with no `/abin` at all rather than an empty one.
+/// Where the guest is told to find `/abin`. Absent for a session that has none, which is a
+/// guest with no `/abin` at all rather than an empty one.
+///
+/// Two spellings, told apart by the `:` that only one of them can hold: a bare device path is
+/// the read-only disk, and `tag:/abin` is the share. Which one a boot sends follows from what
+/// [`BootArgs::abin`] named — a file or a directory — and a guest path may not contain a `:`,
+/// so the two can never be read for each other.
 pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
 
 /// Where it is mounted, and what goes first on `PATH`.
 pub const ABIN_PATH: &str = "/abin";
 
+/// What to mount `/abin` from, and as what, given whatever [`ABIN_ENV`] says.
+///
+/// Here rather than in the guest that calls it, because the boot writes this variable and the
+/// guest reads it: a rule for telling two spellings apart belongs beside the constant they are
+/// spellings of, where one change moves both ends.
+pub fn abin_mount(spec: &str) -> (&str, &str) {
+    match spec.split_once(':') {
+        Some((tag, _)) => (tag, "virtiofs"),
+        None => (spec, "erofs"),
+    }
+}
+
 /// The virtio-fs tag the context is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
 pub const CONTEXT_TAG: &str = "cortexctx";
+
+/// The tag a shared `/abin` is attached under, when [`BootArgs::abin`] named a directory.
+pub const ABIN_TAG: &str = "cortexabin";
 
 /// The tag the artifacts tree is attached under.
 ///
@@ -355,11 +375,21 @@ pub struct BootArgs {
     /// The session's writable image, as a host path.
     pub session: PathBuf,
 
-    /// A read-only image of native executables to mount at `/abin`.
+    /// The native executables to put at `/abin`, and `None` for a session that gets none.
     ///
-    /// `None` is a session that gets none. Always a raw EROFS and never a descriptor, so
-    /// there is no format to say alongside it: `/abin` is cortex's own executables and no
-    /// others, which is one layer attached as it stands rather than anything stitched.
+    /// **A file or a directory, and the boot tells them apart by asking the filesystem.** A
+    /// file is a raw EROFS attached as a read-only disk — never a descriptor, so there is no
+    /// format to say alongside it: `/abin` is cortex's own executables and no others, which is
+    /// one layer attached as it stands rather than anything stitched. A directory is shared
+    /// over virtio-fs instead, which is what a host whose executables were just built has
+    /// rather than an image of them.
+    ///
+    /// The two are one field because which one this is is a fact about the path rather than a
+    /// choice to be stated twice. They are not the same offer, though: a virtio-fs share has
+    /// no host-side read-only option and the guest is root inside itself, so a session can
+    /// write back into a shared directory that every later session on this host will mount.
+    /// The disk cannot be written to at all, which is why it is what a session gets when
+    /// nobody is standing there rebuilding the executables.
     pub abin: Option<PathBuf>,
 
     /// The host directory to put in front of the guest, and `None` for a session that declared
@@ -604,6 +634,32 @@ mod tests {
         assert!(!written.iter().any(|arg| arg == "--abin"), "{written:?}");
         let back = BootArgs::parse(written).unwrap();
         assert_eq!(back.abin, None);
+    }
+
+    /// A directory travels as the same argument an image does: which one a path is, is the
+    /// filesystem's answer and not something either end spells differently.
+    #[test]
+    fn a_directory_of_executables_is_the_same_argument_as_an_image() {
+        let built = BootArgs {
+            abin: Some("/Users/someone/.cache/cortex/abin".into()),
+            ..args()
+        };
+        let back = BootArgs::parse(built.to_args()).unwrap();
+        assert_eq!(back, built);
+    }
+
+    /// The two spellings of [`ABIN_ENV`], told apart by the `:` a guest path cannot hold.
+    ///
+    /// Reading one for the other is a mount that fails at boot with a filesystem type the
+    /// source is not — so the rule is tested where it is written rather than trusted at the
+    /// two call sites that are in different binaries.
+    #[test]
+    fn a_tag_is_a_share_and_a_device_is_a_disk() {
+        assert_eq!(
+            abin_mount(&format!("{ABIN_TAG}:{ABIN_PATH}")),
+            (ABIN_TAG, "virtiofs")
+        );
+        assert_eq!(abin_mount(GUEST_ABIN_DEV), (GUEST_ABIN_DEV, "erofs"));
     }
 
     /// Everything this writes is something it reads. Both ends are this type, so the compiler

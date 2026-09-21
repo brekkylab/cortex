@@ -51,7 +51,8 @@ use std::{
 };
 
 use contract::{
-    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, CONTEXT_ENV,
+    ABIN_ENV, ABIN_PATH, ABIN_TAG, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat,
+    BootArgs, CONTEXT_ENV,
     CONTEXT_PATH, CONTEXT_TAG, GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV,
     LOWER_ENV, Network, PORT_NAME, UPPER_ENV,
 };
@@ -121,10 +122,16 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
         });
 
     // `/abin`, third and so `/dev/vdc`. Read-only **at the device**, which is the whole reason
-    // it is a disk and not a share: a virtio-fs share has no such option, and the guest is
-    // root inside itself, so a guest-side mount flag would be a guard rail rather than a
-    // boundary.
-    if let Some(abin) = &args.abin {
+    // an image of the executables is a disk and not a share: a virtio-fs share has no such
+    // option, and the guest is root inside itself, so a guest-side mount flag would be a guard
+    // rail rather than a boundary.
+    //
+    // A directory is the other thing `--abin` can name, and it has no image to attach — so it
+    // is shared like the session's trees are, below, and the guest is told a tag instead of a
+    // device. That form gives up the boundary above, which is why what decides between them is
+    // a fact about the path rather than anything this process chooses.
+    let abin_dir = args.abin.as_deref().filter(|abin| abin.is_dir());
+    if let Some(abin) = args.abin.as_deref().filter(|_| abin_dir.is_none()) {
         builder = builder.disk(|d| d.path(abin).read_only(true).format(DiskImageFormat::Raw));
     }
 
@@ -159,6 +166,7 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
             ARTIFACTS_PATH,
             args.artifacts.as_deref(),
         ),
+        ("--abin", ABIN_ENV, ABIN_TAG, ABIN_PATH, abin_dir),
     ] {
         let Some(path) = path else { continue };
         // UTF-8 because it has to be written into that tree's env as `tag:path` and read back
@@ -188,9 +196,11 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
                 .env(LOWER_ENV, GUEST_LOWER_DEV)
                 .env(UPPER_ENV, GUEST_UPPER_DEV);
             let e = shares.iter().fold(e, |e, (env, share)| e.env(*env, share));
+            // Only for the disk form: a shared `/abin` is in `shares` above, and its tag has
+            // already gone into the same variable.
             let e = match &args.abin {
-                Some(_) => e.env(ABIN_ENV, GUEST_ABIN_DEV),
-                None => e,
+                Some(_) if abin_dir.is_none() => e.env(ABIN_ENV, GUEST_ABIN_DEV),
+                _ => e,
             };
             guest_net
                 .iter()

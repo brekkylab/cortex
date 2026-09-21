@@ -50,7 +50,7 @@ use std::ptr;
 
 use crate::contract::{
     ABIN_ENV, ABIN_PATH, ARTIFACTS_ENV, CONTEXT_ENV, IMAGE_SPEC_PATH, ImageSpec, LOWER_ENV,
-    OLD_ROOT, PORT_NAME, SNAPSHOT_PATH, UPPER_ENV,
+    OLD_ROOT, PORT_NAME, SNAPSHOT_PATH, UPPER_ENV, abin_mount,
 };
 
 /// How long to wait for the virtio-console port to appear. The device is probed while
@@ -88,11 +88,16 @@ pub fn prepare() -> anyhow::Result<ImageSpec> {
         mount_pseudo();
     }
 
-    // After the pivot, so it lands on the root the commands will see. `MS_RDONLY` here is a
-    // courtesy — the device itself is attached read-only and that is what actually holds.
-    if let Ok(device) = std::env::var(ABIN_ENV) {
-        mount(&device, ABIN_PATH, "erofs", libc::MS_RDONLY)
-            .map_err(|e| anyhow::anyhow!("mounting {device} at {ABIN_PATH}: {e}"))?;
+    // After the pivot, so it lands on the root the commands will see.
+    //
+    // A `:` is what tells the two forms apart — see [`ABIN_ENV`]. A device is the image of the
+    // executables, and `MS_RDONLY` on it is a courtesy: the disk is attached read-only and
+    // that is what actually holds. A tag is a host directory somebody is rebuilding, where the
+    // same flag is all there is, and a command that sets out to `mount -o remount,rw` it can.
+    if let Ok(spec) = std::env::var(ABIN_ENV) {
+        let (source, fstype) = abin_mount(&spec);
+        mount(source, ABIN_PATH, fstype, libc::MS_RDONLY)
+            .map_err(|e| anyhow::anyhow!("mounting {source} at {ABIN_PATH}: {e}"))?;
     }
 
     // After the pivot, because `/etc/resolv.conf` has to land on the root the commands will
