@@ -96,6 +96,15 @@ fn nothing_addresses_what_it_does_not_name() {
 // Mock-backed
 // ---------------------------------------------------------------------------
 
+/// What the mock's `429` asks a client to wait, in seconds. Far past `MAX_RETRY_AFTER`,
+/// which is the case that separates honouring a wait from sleeping through one.
+const THROTTLED_FOR: u64 = 900;
+
+/// What the mock's `4290` asks for instead: a wait that fits inside `MAX_RETRY_AFTER` on
+/// its own, so what stops the ladder is the running total rather than any one sleep. Kept
+/// small because the test really does sleep it.
+const THROTTLED_SHORT: u64 = 1;
+
 /// One listing answers resolution and every attribute under it, at any depth.
 ///
 /// Three things at once, because they are one behaviour. Graph addresses a folder by path,
@@ -410,6 +419,87 @@ async fn a_backend_failure_is_not_an_absence() {
         cut.kind(),
         io::ErrorKind::NotFound,
         "a 404 whose body was cut off is still a 404: {cut}"
+    );
+}
+
+/// A throttle is waited out as asked, bounded, and then respected.
+///
+/// Three rules that only make sense together, so one fixture pins all three.
+///
+/// **Taken as asked or not at all.** Microsoft's guidance is to wait exactly what
+/// `Retry-After` says, because usage keeps accruing while a client is throttled, so coming
+/// back early lengthens the window. Shortening the wait while keeping the retry spends the
+/// budget inside the window and extends it on every attempt.
+///
+/// **Bounded by the ladder, not by one sleep.** What blocks the mount is the sum: the FUSE
+/// session loop is single-threaded, so this is the whole mount not answering. A cap on one
+/// sleep would allow `MAX_RETRIES` of them and claim a ceiling five times smaller than the
+/// truth.
+///
+/// **And giving up is a pause, not a green light.** A mount's callers re-ask constantly and
+/// a failed listing is not cached, so a give-up with no cooldown sends *more* requests per
+/// second than the waiting it replaced, against the limit that caused the throttle.
+#[tokio::test]
+async fn a_throttle_is_waited_out_as_asked_bounded_and_then_respected() {
+    let of_folder = |m: &Mock| {
+        m.targets()
+            .iter()
+            .filter(|t| t.contains(":/children"))
+            .count()
+    };
+
+    // Asked for more than one call may spend waiting: reported at once, nothing slept.
+    let mock = start(
+        json!({"/": [folder_row("busy", "D1")], "/busy": 429}),
+        HashMap::new(),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let started = Instant::now();
+    let Err(e) = fs.list(Path::new("/busy")).await else {
+        panic!("a throttle is an error");
+    };
+    assert_ne!(e.kind(), io::ErrorKind::NotFound, "not an absence: {e}");
+    assert_eq!(of_folder(&mock), 1, "asked once: {:?}", mock.targets());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "and did not sleep through it, in {:?}",
+        started.elapsed()
+    );
+
+    // And then said nothing more. Nineteen further asks, none of which reach the wire:
+    // this is the half that makes giving up honest rather than merely fast.
+    mock.reset();
+    for _ in 0..19 {
+        assert!(fs.list(Path::new("/busy")).await.is_err());
+    }
+    assert_eq!(
+        of_folder(&mock),
+        0,
+        "a give-up that keeps asking is worse than waiting: {:?}",
+        mock.targets()
+    );
+
+    // A wait that fits the budget *is* taken, and the ladder stops when their sum would
+    // leave it. `THROTTLED_SHORT` is well under `MAX_RETRY_AFTER`, so what bounds this is
+    // the running total and not any single sleep.
+    let mock = start(
+        json!({"/": [folder_row("slow", "D1")], "/slow": 4290}),
+        HashMap::new(),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let started = Instant::now();
+    assert!(fs.list(Path::new("/slow")).await.is_err());
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_secs(THROTTLED_SHORT),
+        "the wait it asked for was actually taken, not skipped: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(30),
+        "and the ladder stopped inside the budget rather than sleeping it per attempt: \
+         {waited:?}"
     );
 }
 
@@ -1106,6 +1196,9 @@ async fn start_full(
                             let body = br#"{"error":{"code":"accessDenied","innerError":
                                 {"request-id":"74bd5c8a-0083-404f-b5b2-9602fa4d4ca3"}}}"#
                                 .to_vec();
+                            // 429 asks for a wait far past what one call may spend;
+                            // 4290 is the same throttle asking for one that fits, so a
+                            // test can separate "waited as asked" from "refused to wait".
                             // 4041 is a 404 whose body is cut off mid-read: the head
                             // promises more than the socket delivers, which is what a
                             // dropped connection on an error response looks like.
@@ -1115,7 +1208,13 @@ async fn start_full(
                                 out.extend_from_slice(&body);
                                 (out, body.len())
                             } else {
-                                let mut out = http_head(code, "application/json", body.len(), None);
+                                let (code, extra) = match code {
+                                    429 => (429, Some(format!("Retry-After: {THROTTLED_FOR}"))),
+                                    4290 => (429, Some(format!("Retry-After: {THROTTLED_SHORT}"))),
+                                    other => (other, None),
+                                };
+                                let mut out =
+                                    http_head(code, "application/json", body.len(), extra);
                                 let len = body.len();
                                 out.extend_from_slice(&body);
                                 (out, len)

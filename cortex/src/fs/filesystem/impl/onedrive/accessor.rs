@@ -135,10 +135,34 @@ const MAX_PAGES: usize = 50;
 
 /// Retry budget for a throttled or 5xx request.
 const MAX_RETRIES: u32 = 5;
-/// Ceiling on one wait, including one Graph asked for by `Retry-After`.
+/// Ceiling on the *base* of a backoff this code computed, which is ours to shorten. Jitter
+/// rides on top of it rather than being clamped away by it; see [`backoff_delay`].
 const MAX_BACKOFF: Duration = Duration::from_secs(16);
 /// Jitter added to a backoff, so two callers throttled together do not wake together.
 const JITTER_MAX_MS: u64 = 1000;
+
+/// How long one call may spend *waiting* across the whole retry ladder.
+///
+/// A different kind of number from [`MAX_BACKOFF`], and not interchangeable with it.
+/// Microsoft's guidance is to wait exactly what `Retry-After` says, because usage keeps
+/// accruing while a client is throttled: coming back early makes the throttle last longer.
+/// So there is no "retry sooner" option, only waiting as told or giving up — and shortening
+/// the wait while keeping the retry is the one combination worse than either, since it
+/// spends the retry budget inside the window and extends it on every attempt.
+///
+/// Waiting cannot be unbounded either. A FUSE op is a synchronous callback and the session
+/// loop is single-threaded, so a sleep here is not one blocked process but the whole mount
+/// not answering anybody.
+///
+/// A budget for the ladder rather than a cap on one sleep, because what blocks the mount is
+/// their **sum**: `MAX_RETRIES` waits of 30 s each is 150 s, which is what a per-sleep cap
+/// would permit while claiming a 30 s ceiling. Measured before this was a budget, a header
+/// of 2 s produced 6 requests over 10.0 s.
+///
+/// It bounds the waiting and not the whole call: each attempt may still spend up to the
+/// `reqwest` request timeout set in [`OnedriveAccessor::new`] on the wire. Requests are
+/// progress; sleeping is not.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Ceiling on a response body read into memory.
 ///
@@ -187,6 +211,9 @@ pub struct OnedriveAccessor {
     config: OnedriveConfig,
     urls: Endpoints,
     access_token: Mutex<Option<(String, Instant)>>,
+    /// When the service last said to stop asking, and until when. See
+    /// [`refuse_while_throttled`](Self::refuse_while_throttled).
+    throttled_until: Mutex<Option<Instant>>,
 }
 
 impl OnedriveAccessor {
@@ -203,6 +230,7 @@ impl OnedriveAccessor {
             config: config.clone(),
             urls: endpoints(&config.origins),
             access_token: Mutex::new(None),
+            throttled_until: Mutex::new(None),
         })
     }
 
@@ -275,9 +303,11 @@ impl OnedriveAccessor {
         build: impl Fn(&str) -> reqwest::RequestBuilder,
         max_retries: u32,
     ) -> anyhow::Result<reqwest::Response> {
+        self.refuse_while_throttled().await?;
         let mut token = self.token().await?;
         let mut refreshed = false;
         let mut retries = 0u32;
+        let mut slept = Duration::ZERO;
         loop {
             let resp = build(&token).send().await?;
             let status = resp.status();
@@ -287,18 +317,59 @@ impl OnedriveAccessor {
                 refreshed = true;
                 continue;
             }
-            let retryable =
-                status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
-            if retryable && retries < max_retries {
-                let wait = match retry_after(&resp) {
-                    Some(d) => d.min(MAX_BACKOFF),
-                    None => backoff_delay(retries),
+            let throttled = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            let asked = retry_after(resp.headers());
+            if (throttled || status.is_server_error()) && retries < max_retries {
+                let Some(wait) = next_wait(asked, slept, retries) else {
+                    // More than this call may spend waiting. Reported rather than slept
+                    // through, and the service told to expect nothing from us meanwhile.
+                    self.pause_until(Instant::now() + asked.unwrap_or_default())
+                        .await;
+                    return Ok(resp);
                 };
                 retries += 1;
+                slept += wait;
                 tokio::time::sleep(wait).await;
                 continue;
             }
+            // Out of retries on a throttle is the same answer as refusing to wait one: what
+            // follows must not be more requests.
+            if throttled && let Some(d) = asked {
+                self.pause_until(Instant::now() + d).await;
+            }
             return Ok(resp);
+        }
+    }
+
+    /// Refuse to send at all while the service has told us to wait.
+    ///
+    /// Giving up on a throttle is only half of what Microsoft asks for. Its instruction is
+    /// to *pause the client* — "failure to honor Retry-After may result in more throttling
+    /// ... even though the calls fail, they still count toward usage limits" — so a
+    /// give-up that leaves the next call free to fire immediately is worse than the waiting
+    /// it replaced. Measured without this gate: twenty listings under a 900 s throttle sent
+    /// twenty requests in 14 ms, where the old clamp-and-retry ladder would have sent 120
+    /// over about 1600 s. Fewer per operation, four orders of magnitude more per second,
+    /// against the very limit that caused the throttle.
+    ///
+    /// A mount is the hostile case for this. Its callers re-ask constantly — Finder, the
+    /// NFS client under FUSE-T, a `find` walking a thousand directories — and a failed
+    /// listing is deliberately not cached, so every re-ask would be a fresh request.
+    async fn refuse_while_throttled(&self) -> anyhow::Result<()> {
+        let until = *self.throttled_until.lock().await;
+        if let Some(until) = until
+            && let Some(left) = until.checked_duration_since(Instant::now())
+        {
+            anyhow::bail!("onedrive: throttled, {} s left to wait", left.as_secs());
+        }
+        Ok(())
+    }
+
+    /// Hold every request until `until`. Never shortens a pause already in force.
+    async fn pause_until(&self, until: Instant) {
+        let mut guard = self.throttled_until.lock().await;
+        if guard.is_none_or(|current| until > current) {
+            *guard = Some(until);
         }
     }
 
@@ -561,6 +632,23 @@ fn encode_segment(seg: &str) -> String {
     out
 }
 
+/// The wait to take before retrying, or `None` when this call has no more waiting to give.
+///
+/// Kept apart from [`OnedriveAccessor::send_retrying`] because it is the whole of the
+/// policy and it is arithmetic: the ladder around it only sleeps and counts.
+///
+/// `slept` is what the call has already spent, which is what makes [`MAX_RETRY_AFTER`] a
+/// budget for the ladder rather than a cap on one sleep. The two agree on a single long
+/// wait and diverge on a run of short ones — five waits of seven seconds is thirty-five,
+/// which a per-sleep cap permits while claiming a thirty-second ceiling.
+fn next_wait(asked: Option<Duration>, slept: Duration, retries: u32) -> Option<Duration> {
+    match asked {
+        Some(d) if slept + d > MAX_RETRY_AFTER => None,
+        Some(d) => Some(d),
+        None => Some(backoff_delay(retries)),
+    }
+}
+
 /// `2^n` seconds plus jitter, capped.
 ///
 /// The jitter comes from the clock rather than a random-number crate: it only has to keep
@@ -571,23 +659,33 @@ fn backoff_delay(n: u32) -> Duration {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()) % (JITTER_MAX_MS + 1))
         .unwrap_or(0);
+    // The cap applies to the base, then jitter rides on top. Capping the sum instead
+    // discards the jitter exactly when two callers are most likely to collide: at
+    // `MAX_RETRIES`, `base` already equals `MAX_BACKOFF`, so `(base + jitter).min(cap)` is
+    // `cap` for every caller and they wake together — which is what this exists to prevent.
     Duration::from_secs(base)
-        .saturating_add(Duration::from_millis(jitter))
         .min(MAX_BACKOFF)
+        .saturating_add(Duration::from_millis(jitter))
 }
 
-/// `Retry-After` as a duration. Delta-seconds only — the HTTP-date form is legal and
-/// Graph does not send it, and a date parsed against a skewed clock is worse than a
-/// backoff.
-fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    resp.headers()
+/// `Retry-After` as a duration, or `None` when the header states no wait worth taking.
+///
+/// Delta-seconds only. The HTTP-date form is legal and Graph does not send it, and a date
+/// parsed against a skewed clock is worse than a backoff.
+///
+/// A zero is `None` rather than a zero wait. "Avoid immediate retries, because all requests
+/// accrue against your usage limits" is the one thing the guidance names outright, and a
+/// header of `0` from a gateway would otherwise produce exactly that: a full ladder of
+/// requests with no delay between them at all.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
         .get(reqwest::header::RETRY_AFTER)?
         .to_str()
         .ok()?
         .trim()
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
+        .parse()
+        .ok()?;
+    (secs > 0).then(|| Duration::from_secs(secs))
 }
 
 #[cfg(test)]
@@ -645,6 +743,77 @@ mod tests {
             assert!(!shown.contains(secret), "{shown} leaks {secret}");
         }
         assert!(shown.contains("origins_overridden: false"));
+    }
+
+    /// The whole retry policy, as the arithmetic it is.
+    ///
+    /// The ceiling is a budget for the ladder and not a cap on one sleep, and the two are
+    /// only told apart by a *run* of waits that each fit while their sum does not. Pinned
+    /// here rather than through the ladder because pinning it there means sleeping it:
+    /// five sevens is thirty-five seconds of real time to prove one comparison.
+    #[test]
+    fn a_wait_is_taken_only_while_the_ladder_can_still_afford_it() {
+        let s = Duration::from_secs;
+        assert_eq!(next_wait(Some(s(10)), s(0), 0), Some(s(10)), "as asked");
+        assert_eq!(
+            next_wait(Some(MAX_RETRY_AFTER), s(0), 0),
+            Some(MAX_RETRY_AFTER),
+            "the whole budget in one wait is still affordable"
+        );
+        assert_eq!(
+            next_wait(Some(MAX_RETRY_AFTER + s(1)), s(0), 0),
+            None,
+            "a single wait past the budget is refused outright"
+        );
+        // The case a per-sleep cap gets wrong: each of these fits on its own.
+        assert_eq!(next_wait(Some(s(7)), s(21), 0), Some(s(7)), "28 <= 30");
+        assert_eq!(next_wait(Some(s(7)), s(28), 0), None, "35 > 30");
+
+        // No header, so the delay is ours. At the last retry the base already equals the
+        // cap, so clamping the *sum* would hand every caller exactly `MAX_BACKOFF` and they
+        // would wake together — the herd this jitter exists to break. Sampled rather than
+        // asserted once, because a single draw may legitimately be zero.
+        let last: Vec<Duration> = (0..20)
+            .map(|_| next_wait(None, s(0), MAX_RETRIES - 1).unwrap())
+            .collect();
+        assert!(
+            last.iter().any(|d| *d > MAX_BACKOFF),
+            "the cap applies to the base and jitter rides on top: {last:?}"
+        );
+        assert!(
+            last.iter()
+                .all(|d| *d <= MAX_BACKOFF + Duration::from_millis(JITTER_MAX_MS)),
+            "and no more than the jitter: {last:?}"
+        );
+    }
+
+    /// `Retry-After`, and the one value that is not a wait.
+    #[test]
+    fn a_retry_after_of_zero_is_not_a_wait() {
+        let header = |v: &str| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert(
+                reqwest::header::RETRY_AFTER,
+                reqwest::header::HeaderValue::from_str(v).unwrap(),
+            );
+            retry_after(&h)
+        };
+        assert_eq!(
+            retry_after(&reqwest::header::HeaderMap::new()),
+            None,
+            "no header, no wait"
+        );
+        assert_eq!(header("5"), Some(Duration::from_secs(5)));
+        assert_eq!(header(" 5 "), Some(Duration::from_secs(5)), "padded");
+        // Taken as a wait, this is a full ladder of requests with nothing between them,
+        // which is the one thing the guidance names outright. Treated as absent it falls
+        // to a backoff that actually delays.
+        assert_eq!(header("0"), None, "zero is not a wait");
+        assert_eq!(
+            header("Wed, 21 Oct 2026 07:28:00 GMT"),
+            None,
+            "the date form is legal, unsent by Graph, and not parsed against our clock"
+        );
     }
 
     /// The header a `206` states its own start in.
