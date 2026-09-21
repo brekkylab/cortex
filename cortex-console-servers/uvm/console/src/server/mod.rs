@@ -61,14 +61,15 @@ use std::path::{Path, PathBuf};
 
 use cortex::console::{
     Call, CommitCall, CommitResp, Error, ImageSource, InitCall, InitResp, Message, NetworkAccess,
-    Notification, RequestId, Response, Server, TreeMount, TreeRole, TreeSource, stdio::StdioServer,
+    Notification, RequestId, Response, SecretAccess, SecretLocation, Server, TreeMount, TreeRole,
+    TreeSource, stdio::StdioServer,
 };
 use cortex_uvm_console::built::{self, LOCAL_HOST};
 use microsandbox_image::Reference;
 
 use crate::{
     assets,
-    contract::{ARTIFACTS_PATH, CONTEXT_PATH, Network, SCRATCH_PATH},
+    contract::{ARTIFACTS_PATH, CONTEXT_PATH, Inject, Network, SCRATCH_PATH, SecretSpec},
 };
 use guest::Guest;
 
@@ -81,6 +82,12 @@ use guest::Guest;
 /// `i64::MAX` and not `RequestId::MAX`, because the wire is BSON and BSON has no unsigned
 /// integer: an id above `i64::MAX` is a frame that will not serialize.
 const REPLAYED_INIT: RequestId = i64::MAX as RequestId;
+
+/// The services whose credentials the boot injects, when a client declared none: this server's
+/// own setting, as a whitespace-separated list of `ENV_VAR@host[,host…][:location]`. The code way
+/// to set them is [`SecretAccess`] over the channel, which is what a client that says any of its
+/// own uses; this is the default under it.
+const SECRETS: &str = "CORTEX_UVM_SECRETS";
 
 /// Answer requests until the client says `quit` or closes the channel.
 pub async fn run() -> anyhow::Result<()> {
@@ -220,6 +227,10 @@ struct Session {
     /// axis and not a wider reach: see [`HOST_PORTS`](cortex_uvm_boot::HOST_PORTS).
     host_ports: Vec<u16>,
 
+    /// Services whose credentials the boot injects, translated from the [`SecretAccess`] the
+    /// client declared at `init`. The boot reads the values from its own environment by name.
+    secrets: Vec<SecretSpec>,
+
     /// `None` until something boots one: a `start`, or the first call that needs it.
     guest: Option<Guest>,
 }
@@ -243,6 +254,7 @@ impl Session {
         let scratch = tree(config.scratch.as_ref(), TreeRole::Scratch)?;
         let image = base(config.image.as_ref())?;
         let (network, host_ports) = reach(config.network.as_ref())?;
+        let secrets = secrets(&config.secrets)?;
         already_built(config.image.as_ref())?;
 
         self.guest = None;
@@ -252,6 +264,7 @@ impl Session {
         self.image = image;
         self.network = network;
         self.host_ports = host_ports.clone();
+        self.secrets = secrets;
         self.config = config;
 
         Ok(InitResp {
@@ -355,6 +368,7 @@ impl Session {
                 image.as_deref(),
                 self.network,
                 &self.host_ports,
+                &self.secrets,
                 self.config.committable,
             )
             .await
@@ -508,6 +522,46 @@ fn parse_host_ports(value: Option<&str>) -> anyhow::Result<Vec<u16>> {
                 .map_err(|_| anyhow::anyhow!("{HOST_PORTS}: {port} is not a port number"))
         })
         .collect()
+}
+
+/// The secrets a session gets: the ones its client declared over the channel, or this server's
+/// own setting from [`SECRETS`] when it declared none — the same shape as [`reach`], the channel
+/// over the environment default.
+///
+/// Translated to the boot's [`SecretSpec`] here, and refused now rather than at the boot for a
+/// location no backend spells or a secret with nowhere to go: a client told at `init` can ask for
+/// something else, where one told at its first command has already paid for a boot.
+fn secrets(asked: &[SecretAccess]) -> Result<Vec<SecretSpec>, Error> {
+    if !asked.is_empty() {
+        return asked.iter().map(secret_spec).collect();
+    }
+    match std::env::var(SECRETS) {
+        Ok(value) => SecretSpec::parse_list(&value)
+            .map_err(|e| refused(Error::INVALID_PARAMS, format!("{SECRETS}: {e}"))),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// One client-declared [`SecretAccess`] as the boot's [`SecretSpec`], or why it is not one.
+///
+/// The location maps total, not parses: both ends are the same closed set, so a value the wire
+/// carried is always one of them. Only an empty host can still be wrong.
+fn secret_spec(asked: &SecretAccess) -> Result<SecretSpec, Error> {
+    if asked.host.is_empty() {
+        return Err(refused(
+            Error::INVALID_PARAMS,
+            format!("secret {} names no host to send to", asked.env_var),
+        ));
+    }
+    let inject = match asked.location {
+        SecretLocation::Query => Inject::Query,
+        SecretLocation::Header => Inject::Header,
+    };
+    Ok(SecretSpec::new(
+        asked.env_var.clone(),
+        asked.host.clone(),
+        inject,
+    ))
 }
 
 /// The reach a session asked for, or this server's own when it asked for nothing — and the host

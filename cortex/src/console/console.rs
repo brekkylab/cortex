@@ -53,7 +53,8 @@ use crate::{
         base::{Client, Failure},
         message::{
             Call, CommitCall, Error, ExecCall, ExecResp, ImageSource, InitCall, NetworkAccess,
-            Notification, ReadCall, ReadResp, Response, TreeMount, TreeRole, TreeSource, WriteCall,
+            Notification, ReadCall, ReadResp, Response, SecretAccess, TreeMount, TreeRole,
+            TreeSource, WriteCall,
             WriteResp,
         },
         stdio::StdioClient,
@@ -108,6 +109,10 @@ pub struct ConsoleBuilder {
     /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
     network: Option<NetworkAccess>,
+
+    /// Credentials the session's requests carry without its commands holding them, and empty to
+    /// leave it to the server's own setting.
+    secrets: Vec<SecretAccess>,
 
     /// A rootfs to build and then run in, and `None` for a session on an image that
     /// already exists somewhere.
@@ -297,6 +302,34 @@ impl ConsoleBuilder {
         self
     }
 
+    /// Add a credential the session's requests carry without its commands ever holding it.
+    ///
+    /// ```no_run
+    /// # use cortex::console::{Console, NetworkAccess, SecretAccess};
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .network(NetworkAccess::public())
+    ///     .secret(SecretAccess::query("OPENWEATHER_API_KEY", "api.openweathermap.org"))
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// See [`SecretAccess`] for why only the variable name travels. A server that cannot intercept
+    /// the request refuses a session that asks it to, with
+    /// [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK).
+    pub fn secret(mut self, secret: SecretAccess) -> Self {
+        self.secrets.push(secret);
+        self
+    }
+
+    /// Add several credentials at once — [`secret`](Self::secret) for each.
+    pub fn secrets(mut self, secrets: impl IntoIterator<Item = SecretAccess>) -> Self {
+        self.secrets.extend(secrets);
+        self
+    }
+
     /// Build a rootfs, and run this session's commands in what it makes.
     ///
     /// ```no_run
@@ -402,6 +435,9 @@ async fn build_it(
             // machine — does not get it here. Neither has come up; both are a knob on
             // the recipe when one does.
             network: Some(NetworkAccess::public()),
+            // A build fetches packages and holds no credential of the session's; the secrets a
+            // session was configured with are for the commands it runs, not for making its image.
+            secrets: Vec::new(),
             committable: true,
         })
         .await?;
@@ -544,6 +580,7 @@ impl Console {
             scratch: scratch_mount,
             image,
             network,
+            secrets,
             rootfs,
             committable,
         } = builder;
@@ -593,6 +630,7 @@ impl Console {
             scratch: scratch.clone(),
             image: plan.as_ref().map(|plan| plan.image.clone()).or(image),
             network: network.clone(),
+            secrets,
             committable,
         };
 

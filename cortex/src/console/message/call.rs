@@ -260,6 +260,14 @@ pub struct InitCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkAccess>,
 
+    /// Credentials the session's requests carry without its commands holding them — see
+    /// [`SecretAccess`]. Said here and not per `exec` because what a request may carry is fixed
+    /// with the environment the commands run in, before the guest comes up. Empty leaves it to
+    /// the server; a backend that runs commands on the host has no interception seam and refuses
+    /// a session that asks for one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<SecretAccess>,
+
     /// Whether this session may [`commit`](super::CommitCall) what it writes.
     ///
     /// **Said here and not on `commit` because a backend may have to arrange for it while
@@ -588,6 +596,81 @@ impl NetworkAccess {
     }
 }
 
+/// A credential a session's requests carry without the session's commands ever holding it.
+///
+/// The client names an environment variable the *server* holds the value of, the one host it may
+/// be sent to, and where in the request it goes; the server substitutes the real value on the way
+/// out and the commands see only a placeholder. The value never leaves the server, which is the
+/// point. A backend that runs commands on the server's own machine has no interception seam and
+/// refuses it.
+///
+/// One host per secret: a credential for several hosts is declared once each, and a family of
+/// subdomains is a `*.suffix` wildcard [`host`](Self::host), not a list.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretAccess {
+    /// The environment variable whose value is injected — held by the server, seen by the
+    /// commands only as a placeholder.
+    pub env_var: String,
+
+    /// The host the value may be sent to. A request to any other never receives it.
+    ///
+    /// An exact hostname, or a `*.suffix` wildcard (`*.googleapis.com`) covering its subdomains.
+    pub host: String,
+
+    /// Where in the request the value goes.
+    pub location: SecretLocation,
+}
+
+/// Where in a request a [`SecretAccess`] is injected.
+///
+/// A fixed HTTP vocabulary, not a backend's own set — so it is a closed enum here rather than a
+/// string a server has to recognise. On the wire it is its own lower-case name (`query`, `header`).
+///
+/// No `Default`: a caller always picks, and it is what bounds where a secret may land. The one
+/// place a location is *omitted* is the terse `CORTEX_UVM_SECRETS` string, and that falls back to
+/// `header` — the common one, since most auth is a header — in the parser, not here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretLocation {
+    /// A URL query parameter, e.g. `?apiKey=<value>`.
+    Query,
+    /// A request header — a plain value like `Authorization: Bearer <value>`, or HTTP Basic
+    /// credentials, where the value is substituted into the base64-decoded `user:password`. Basic
+    /// is a header, so it is this location rather than one of its own.
+    Header,
+}
+
+impl SecretAccess {
+    /// A credential named by the variable the server holds it in, sent to `host` (an exact
+    /// hostname or a `*.suffix` wildcard), injected at `location`.
+    pub fn new(
+        env_var: impl Into<String>,
+        host: impl Into<String>,
+        location: SecretLocation,
+    ) -> Self {
+        SecretAccess {
+            env_var: env_var.into(),
+            host: host.into(),
+            location,
+        }
+    }
+
+    /// Injected into a URL query parameter, e.g. `?apiKey=<value>`.
+    ///
+    /// ```
+    /// # use cortex::console::SecretAccess;
+    /// SecretAccess::query("OPENWEATHER_API_KEY", "api.openweathermap.org");
+    /// ```
+    pub fn query(env_var: impl Into<String>, host: impl Into<String>) -> Self {
+        SecretAccess::new(env_var, host, SecretLocation::Query)
+    }
+
+    /// Injected into a request header (a bearer value, or HTTP Basic).
+    pub fn header(env_var: impl Into<String>, host: impl Into<String>) -> Self {
+        SecretAccess::new(env_var, host, SecretLocation::Header)
+    }
+}
+
 /// One execution, and everything it needs. The `params` of `exec`.
 ///
 /// A command and a bound on how long it may take, and nothing else — because nothing else
@@ -726,6 +809,7 @@ mod tests {
             scratch: None,
             image: None,
             network: None,
+            secrets: Vec::new(),
             committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
@@ -811,6 +895,7 @@ mod tests {
             scratch: None,
             image: Some(ImageSource::new("python:3.13-slim")),
             network: None,
+            secrets: Vec::new(),
             committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
@@ -837,6 +922,7 @@ mod tests {
             scratch: None,
             image: None,
             network: None,
+            secrets: Vec::new(),
             committable: false,
         };
         assert_eq!(bson::serialize_to_document(&quiet).unwrap(), doc! {},);
@@ -856,6 +942,7 @@ mod tests {
             scratch: None,
             image: None,
             network: Some(NetworkAccess::public()),
+            secrets: Vec::new(),
             committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
@@ -874,12 +961,47 @@ mod tests {
             scratch: None,
             image: None,
             network: None,
+            secrets: Vec::new(),
             committable: false,
         };
         assert_eq!(bson::serialize_to_document(&quiet).unwrap(), doc! {},);
         assert_eq!(
             bson::deserialize_from_document::<InitCall>(doc! {}).unwrap(),
             quiet,
+        );
+    }
+
+    /// A declared secret travels as the variable, its host and where it goes — never a value —
+    /// and a session with none serializes to what it always did, so the member arrives without
+    /// every existing peer noticing.
+    #[test]
+    fn a_secret_is_named_and_never_valued() {
+        let init = InitCall {
+            secrets: vec![SecretAccess::query(
+                "OPENWEATHER_API_KEY",
+                "api.openweathermap.org",
+            )],
+            ..InitCall::default()
+        };
+        let doc = bson::serialize_to_document(&init).unwrap();
+        assert_eq!(
+            doc,
+            doc! {"secrets": [{
+                "env_var": "OPENWEATHER_API_KEY",
+                "host": "api.openweathermap.org",
+                "location": "query",
+            }]}
+        );
+        assert_eq!(
+            bson::deserialize_from_document::<InitCall>(doc).unwrap(),
+            init
+        );
+
+        // No secrets is no member, so a client that lends none is a frame a server predating
+        // this cannot tell from one it already answered.
+        assert_eq!(
+            bson::serialize_to_document(&InitCall::default()).unwrap(),
+            doc! {}
         );
     }
 
@@ -893,6 +1015,7 @@ mod tests {
             scratch: None,
             image: None,
             network: Some(NetworkAccess::host().with_host_ports([8080, 3000])),
+            secrets: Vec::new(),
             committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
@@ -1055,6 +1178,7 @@ mod tests {
     #[test]
     fn a_session_that_might_commit_says_so() {
         let init = InitCall {
+            secrets: Vec::new(),
             committable: true,
             ..InitCall::default()
         };

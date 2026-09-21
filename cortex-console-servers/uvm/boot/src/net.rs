@@ -128,22 +128,27 @@ fn config(
         };
         injected.push(spec.env_var.as_str());
         let placeholder = spec.placeholder();
-        builder = builder.secret(move |mut secret| {
-            secret = secret
+        let wildcard = spec.is_wildcard();
+        builder = builder.secret(move |secret| {
+            let secret = secret
                 .env(&spec.env_var)
                 .value(value)
                 .placeholder(placeholder)
                 // Substitute only over intercepted TLS whose SNI is an allowed host, never over
                 // plain HTTP a guest could point anywhere.
                 .require_tls_identity(true)
+                // `Header` covers both a plain header value and HTTP Basic, whose value is inside
+                // base64 that a literal header substitution would not find — so it turns on both.
                 .inject_headers(matches!(spec.inject, Inject::Header))
+                .inject_basic_auth(matches!(spec.inject, Inject::Header))
                 .inject_query(matches!(spec.inject, Inject::Query))
-                .inject_basic_auth(matches!(spec.inject, Inject::BasicAuth))
                 .inject_body(false);
-            for host in &spec.hosts {
-                secret = secret.allow_host(host);
+            // A `*.suffix` host is a wildcard pattern; anything else is an exact hostname.
+            if wildcard {
+                secret.allow_host_pattern(&spec.host)
+            } else {
+                secret.allow_host(&spec.host)
             }
-            secret
         });
     }
 

@@ -45,6 +45,9 @@ serde = { version = "1", features = ["derive"] }
 # not optional and a `shasum` binary that may or may not be spelled that way is not a
 # dependency worth having.
 sha2 = "0.10"
+# Deriving a `FromStr`/`Display` for the closed set an enum already is, so a `--secret`
+# location round-trips through text without a hand-written match on each side.
+strum = { version = "0.27", features = ["derive"] }
 tempfile = "3"
 tokio = "1"
 

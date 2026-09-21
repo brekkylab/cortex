@@ -6,8 +6,9 @@ edition.workspace = true
 # The process that becomes a micro-VM, and the contract a console server starts it with.
 #
 # **Two targets with very different dependencies, on purpose.** The library is the handful of
-# strings the server and the boot process agree on and takes nothing but `anyhow` and `serde`;
-# the binary is the only thing in this workspace that links a VMM. A server depends on this
+# strings the server and the boot process agree on and takes little but `anyhow`, `serde` and
+# `strum` (a derive for one enum's text form); the binary is the only thing in this workspace
+# that links a VMM. A server depends on this
 # package with `default-features = false` and so gets the contract without the hypervisor, the
 # TLS stack or the DNS stack behind it.
 #
@@ -47,6 +48,9 @@ vm = [
 [dependencies]
 anyhow = { workspace = true }
 serde = { workspace = true }
+# `Display` and `FromStr` for `Inject`, so a location round-trips through the `--secret` string
+# and `CORTEX_UVM_SECRETS` without a match written by hand on each side.
+strum = { workspace = true }
 # `dup(2)`, to hand the guest a copy of this process's stderr as its console.
 libc = { workspace = true, optional = true }
 # `blk` for the two disks the guest overlays into a root; `net` for the virtio-net device a

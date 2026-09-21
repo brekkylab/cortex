@@ -316,6 +316,18 @@ impl Session {
         base(config.image.as_ref())?;
         reach(config.network.as_ref())?;
 
+        // A credential injected into a request needs a request this backend can see, and a
+        // command here talks to the network directly — there is no interception seam. Like a
+        // narrowed reach, a secret is a promise this backend cannot keep, so it is refused
+        // rather than quietly dropped.
+        if !config.secrets.is_empty() {
+            return Err(refused(
+                Error::UNSUPPORTED_NETWORK,
+                "this backend runs commands on the host, where their requests cannot be \
+                 intercepted to inject a credential",
+            ));
+        }
+
         // Through `release` rather than nulling the field: what a boot has to give back
         // grows, and a re-`init` while a session is live has exactly as much reason to go
         // through the one ordered teardown as a `stop` does.

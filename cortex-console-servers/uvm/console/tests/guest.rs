@@ -30,7 +30,7 @@
 
 use std::{path::Path, process::Stdio};
 
-use cortex::console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp};
+use cortex::console::{Console, ExecResp, ImageSource, NetworkAccess, ReadResp, SecretAccess};
 use tokio::process::Command;
 
 /// A console over the real binary.
@@ -104,6 +104,33 @@ impl Fixture {
         let console = Console::builder()
             .client(client)
             .network(reach)
+            .build()
+            .await?;
+
+        Ok(Fixture { console })
+    }
+
+    /// A fixture that declares its whole shape over the channel — an image, a reach, and a
+    /// secret — with only the secret's *value* in the server's environment, the way a client
+    /// with credentials to lend but none to leak would.
+    async fn asking_with_secret(
+        image: &str,
+        reach: NetworkAccess,
+        secret: SecretAccess,
+        env: &[(&str, &str)],
+    ) -> anyhow::Result<Fixture> {
+        let mut server = Command::new(env!("CARGO_BIN_EXE_cortex-uvm-console"));
+        server.stderr(Stdio::inherit());
+        for (key, value) in env {
+            server.env(key, value);
+        }
+        let client = cortex::console::stdio::StdioClient::new(server)?;
+
+        let console = Console::builder()
+            .client(client)
+            .image(image)
+            .network(reach)
+            .secret(secret)
             .build()
             .await?;
 
@@ -1027,71 +1054,79 @@ fn kill(pid: i32) {
 /// real service.
 ///
 /// The proof is two halves a client can see. Inside the guest the environment variable holds a
-/// placeholder and not the key, so the value never crossed into the VM. Then a request built
-/// from that placeholder is *accepted* by KOSIS: its `err:20` is "required parameters missing",
-/// the answer to a recognised key, where an un-substituted placeholder earns `err:11`, "invalid
-/// key". So the substitution happened on the way out, in the stack, where the key actually lives.
+/// placeholder and not the key, so the value never crossed into the VM. Then a request built from
+/// that placeholder is *accepted* by the Brave Search API: it answers `200` to a request whose
+/// `X-Subscription-Token` header carries a valid key, where the un-substituted placeholder earns
+/// `422`. So the substitution happened on the way out, in the stack, where the key actually lives.
 ///
-/// KOSIS and not OpenDART: OpenDART's server offers only RSA key-exchange TLS, which the
-/// interception stack's rustls upstream refuses, so that request never completes. KOSIS speaks
-/// TLS 1.3, which it does. The session is configured with the one via `CORTEX_UVM_SECRETS`.
+/// This exercises `header` injection: Brave reads its key from a header, and the stack substitutes
+/// the placeholder in that header's value. Brave speaks TLS 1.3, which the interception stack's
+/// rustls upstream can, so the re-originated request completes.
 ///
 /// `python:3.13-slim` because its `ssl` honours `SSL_CERT_FILE`, which is how the guest comes to
 /// trust the interception CA the boot installs; the pinned rootfs ships no HTTPS client worth the
-/// name. The key is the runner's, read from `KOSIS_API_KEY` — the boot inherits the same
+/// name. The key is the runner's, read from `BRAVE_API_KEY` — the boot inherits the same
 /// environment and reads the real value there, so it is never on a command line or in the guest.
 #[tokio::test]
-#[ignore = "boots a micro-VM and calls KOSIS: needs libkrunfw, a hypervisor, the internet, and KOSIS_API_KEY"]
+#[ignore = "boots a micro-VM and calls the Brave Search API: needs libkrunfw, a hypervisor, the internet, and BRAVE_API_KEY"]
 async fn a_credential_is_injected_outside_the_guest() {
-    let key = std::env::var("KOSIS_API_KEY")
-        .expect("set KOSIS_API_KEY to a real KOSIS key to run this test");
+    let key = std::env::var("BRAVE_API_KEY")
+        .expect("set BRAVE_API_KEY to a real Brave Search key to run this test");
 
     // The placeholder the guest is handed, derived from the variable name by `SecretSpec`.
-    const PLACEHOLDER: &str = "MSB_KOSIS_API_KEY";
+    const PLACEHOLDER: &str = "MSB_BRAVE_API_KEY";
 
-    let mut fx = Fixture::with_env(&[
-        ("CORTEX_UVM_NETWORK", "public"),
-        ("CORTEX_UVM_IMAGE", "python:3.13-slim"),
-        // What a deployment configures: the key goes to KOSIS, in the query. The value itself is
-        // read by the boot from the environment below, never from this line.
-        ("CORTEX_UVM_SECRETS", "KOSIS_API_KEY@kosis.kr:query"),
-        ("KOSIS_API_KEY", &key),
-    ])
-    .await;
+    // The client declares the secret in code: the key goes to Brave, in a header. Only its value
+    // is in the server's environment, and the boot reads it there — never off this call.
+    let mut fx = Fixture::asking_with_secret(
+        "python:3.13-slim",
+        NetworkAccess::public(),
+        SecretAccess::header("BRAVE_API_KEY", "api.search.brave.com"),
+        &[("BRAVE_API_KEY", &key)],
+    )
+    .await
+    .expect("a session that declared a secret over the channel");
 
     // The guest holds the placeholder, and not the key. Compared here on the host: naming the
     // real key inside a guest command would be the one way to actually put it in there.
-    let seen = fx.output(r#"printf '%s' "$KOSIS_API_KEY""#).await.stdout;
+    let seen = fx.output(r#"printf '%s' "$BRAVE_API_KEY""#).await.stdout;
     let seen = String::from_utf8(seen).expect("an environment value that is text");
     assert_eq!(seen, PLACEHOLDER, "the guest did not get the placeholder");
     assert_ne!(seen, key, "the real key reached the guest's environment");
 
-    // A request the guest builds from the placeholder, and the code KOSIS answers it with. `20`
-    // is a recognised key with the rest of the query missing; `11` is the code for a key it does
-    // not know, which is what an un-substituted placeholder would earn.
+    // A request the guest builds from the placeholder, put in the `X-Subscription-Token` header,
+    // and the status Brave answers with. `200` is a recognised key; `422` is what an
+    // un-substituted placeholder — not a valid token — would earn.
     let script = r#"python3 - <<'PY'
-import json, os, urllib.request
-ph = os.environ["KOSIS_API_KEY"]
-url = "https://kosis.kr/openapi/statisticsData.do?method=getList&format=json&jsonVD=Y&apiKey=%s" % ph
-body = urllib.request.urlopen(url, timeout=20).read().decode()
-print("ERR", json.loads(body).get("err"), json.loads(body).get("errMsg"))
+import os, urllib.request, urllib.error
+ph = os.environ["BRAVE_API_KEY"]
+req = urllib.request.Request(
+    "https://api.search.brave.com/res/v1/web/search?q=hello&count=1",
+    headers={"X-Subscription-Token": ph, "Accept": "application/json"},
+)
+try:
+    code = urllib.request.urlopen(req, timeout=20).status
+except urllib.error.HTTPError as e:
+    code = e.code
+print("HTTP", code)
 PY"#;
     let out = fx.output(script).await;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    eprintln!("guest saw KOSIS_API_KEY={seen}");
-    eprintln!("KOSIS answered: {}", stdout.trim());
+    eprintln!("guest saw BRAVE_API_KEY={seen}");
+    eprintln!("Brave answered: {}", stdout.trim());
     eprintln!(
         "probe stderr: {}",
         String::from_utf8_lossy(&out.stderr).trim()
     );
     assert_eq!(out.code, 0, "the probe did not run to completion");
 
-    let err = stdout
+    let status = stdout
         .split_whitespace()
         .nth(1)
-        .expect("an ERR line from the probe");
-    assert_ne!(
-        err, "11",
-        "KOSIS answered err:11 (invalid key): the placeholder was not substituted on the way out"
+        .expect("an HTTP line from the probe");
+    assert_eq!(
+        status, "200",
+        "Brave answered {status} (not 200): the placeholder was not substituted into the header \
+         on the way out"
     );
 }
