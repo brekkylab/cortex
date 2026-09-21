@@ -106,6 +106,11 @@ struct HeldSpan {
 /// One resolved entry, as the mount means it.
 #[derive(Clone)]
 struct Child {
+    /// The item's own id, which is how anything asked of the service *after* the listing
+    /// addresses it. Opaque ASCII the service minted, so unlike a path it has one
+    /// spelling and it survives a rename. See
+    /// [`get_item_by_id`](OnedriveAccessor::get_item_by_id).
+    id: String,
     /// Listing name: the item's own name, sanitized into a single path segment.
     name: String,
     is_dir: bool,
@@ -177,6 +182,9 @@ impl OnedriveFs {
     /// A failed listing is *not* cached. Caching the failure would turn one throttled
     /// request into five minutes of an empty directory, which reads as "the folder is
     /// gone" rather than "ask again".
+    ///
+    /// This is the one call left that addresses the service by a path, and a path has two
+    /// Unicode spellings. See the fallback below.
     async fn list_dir(&self, folder: &str) -> io::Result<Arc<Vec<Child>>> {
         {
             let cache = self.dir_cache.lock().await;
@@ -186,11 +194,11 @@ impl OnedriveFs {
                 return Ok(children.clone());
             }
         }
-        let rows = self
-            .accessor
-            .list_children(folder, MAX_FOLDER_ITEMS)
-            .await
-            .map_err(not_found_or_backend)?;
+        let rows = match self.accessor.list_children(folder, MAX_FOLDER_ITEMS).await {
+            Ok(rows) => rows,
+            Err(e) if is_not_found(&e) => self.list_unspellable(folder, e).await?,
+            Err(e) => return Err(not_found_or_backend(e)),
+        };
         let children: Vec<Child> = rows.iter().filter_map(child_from_item).collect();
         let children = Arc::new(children);
         let mut cache = self.dir_cache.lock().await;
@@ -203,6 +211,74 @@ impl OnedriveFs {
         }
         cache.insert(folder.to_string(), (Instant::now(), children.clone()));
         Ok(children)
+    }
+
+    /// The folder a path names when the path, as spelled, names nothing.
+    ///
+    /// The service answers to the spelling it stored and 404s every other one. Measured
+    /// against it, on one folder under one name:
+    ///
+    ///     /me/drive/root:/문서:/children    composed    200
+    ///                                       decomposed  404
+    ///
+    /// and macOS hands a lookup the decomposed spelling of whatever the listing printed.
+    /// So two things are tried, cheapest first.
+    ///
+    /// **Composed.** One request, and it answers the ordinary case: a macOS reader asking
+    /// for a folder the service stored composed. As given was tried first because the two
+    /// spellings can name two different sibling folders, and only that order returns the
+    /// one the caller's bytes meant.
+    ///
+    /// **Then segment by segment.** Composing the whole path tries exactly two spellings,
+    /// all-decomposed and all-composed, and a tree touched by two clients has neither: a
+    /// folder made on the web under a child made by the macOS sync client is composed then
+    /// decomposed, and matches no single spelling of the path. That is not a hypothetical
+    /// shape, and the symptom is the one this store opened with — `stat` answers while
+    /// `list` says ENOENT, because [`resolve`](Self::resolve) matches a *name* against a
+    /// listing and normalizes per segment while a path does not.
+    ///
+    /// So the last resort is what the Google Drive store does by construction: resolve the
+    /// folder through its parent's listing, where `same_name` settles each segment on its
+    /// own, and list by the id that comes back. Drive has no paths at all, so it pays a
+    /// listing per level always and is immune to this; here that cost is paid only by a
+    /// path that was going to fail, and the parents are usually already cached because the
+    /// kernel looked each one up on the way down.
+    ///
+    /// The recursion terminates at the root, which is addressed as `/me/drive/root` and
+    /// has no spelling to get wrong.
+    async fn list_unspellable(
+        &self,
+        folder: &str,
+        as_given: anyhow::Error,
+    ) -> io::Result<Vec<Value>> {
+        let composed: String = folder.nfc().collect();
+        let decomposed: String = folder.nfd().collect();
+        // A path that normalizes to itself both ways has one spelling, and the service has
+        // just said that one is not there. Neither step below can change the answer, and a
+        // macOS mount generates a great many such lookups — every `.DS_Store` and `._*`
+        // probe — so they must keep costing the single request they already spent.
+        if composed == folder && decomposed == folder {
+            return Err(not_found_or_backend(as_given));
+        }
+        if composed != folder {
+            match self
+                .accessor
+                .list_children(&composed, MAX_FOLDER_ITEMS)
+                .await
+            {
+                Ok(rows) => return Ok(rows),
+                Err(e) if !is_not_found(&e) => return Err(not_found_or_backend(e)),
+                Err(_) => {}
+            }
+        }
+        let entry = Box::pin(self.resolve(folder)).await?;
+        if !entry.is_dir {
+            return Err(io::Error::from(io::ErrorKind::NotFound));
+        }
+        self.accessor
+            .list_children_of_id(&entry.id, MAX_FOLDER_ITEMS)
+            .await
+            .map_err(not_found_or_backend)
     }
 
     /// Resolve a path to its entry, by looking it up in its parent's listing.
@@ -289,7 +365,7 @@ impl OnedriveFs {
 
         let url = match child.download_url.as_deref() {
             Some(u) => u.to_string(),
-            None => self.fresh_download_url(path).await?,
+            None => self.fresh_download_url(child).await?,
         };
         let fetched = self.accessor.download(&url, Some(range.clone())).await;
         // One refetch, and only one. The URL the listing carried is short-lived by
@@ -298,7 +374,7 @@ impl OnedriveFs {
         let (at, bytes) = match fetched {
             Ok(v) => v,
             Err(_) => {
-                let url = self.fresh_download_url(path).await?;
+                let url = self.fresh_download_url(child).await?;
                 self.accessor
                     .download(&url, Some(range))
                     .await
@@ -361,14 +437,18 @@ impl OnedriveFs {
     /// Costs one request and does not disturb the listing: the rest of that snapshot is
     /// still good, and re-listing the folder to refresh one URL would throw away every
     /// other entry's.
-    async fn fresh_download_url(&self, path: &str) -> io::Result<String> {
+    ///
+    /// By the item's id and not by its path, because this runs in the middle of a read.
+    /// See [`get_item_by_id`](OnedriveAccessor::get_item_by_id).
+    async fn fresh_download_url(&self, child: &Child) -> io::Result<String> {
         let item = self
             .accessor
-            .get_item(path)
+            .get_item_by_id(&child.id)
             .await
             .map_err(not_found_or_backend)?;
-        download_url_of(&item)
-            .ok_or_else(|| io::Error::other(format!("onedrive: {path} has no download url")))
+        download_url_of(&item).ok_or_else(|| {
+            io::Error::other(format!("onedrive: {} has no download url", child.name))
+        })
     }
 
     /// One file's bytes, or one window of them.
@@ -392,12 +472,12 @@ impl OnedriveFs {
         let Some(r) = range else {
             let url = match child.download_url.as_deref() {
                 Some(u) => u.to_string(),
-                None => self.fresh_download_url(path).await?,
+                None => self.fresh_download_url(&child).await?,
             };
             let whole = match self.accessor.download(&url, None).await {
                 Ok((_, b)) => b,
                 Err(_) => {
-                    let url = self.fresh_download_url(path).await?;
+                    let url = self.fresh_download_url(&child).await?;
                     self.accessor
                         .download(&url, None)
                         .await
@@ -544,16 +624,23 @@ fn stat_of(c: &Child) -> Stat {
 /// list. A name that cannot be read is worse than an absence, so it is not shown.
 ///
 /// An item that is neither `file` nor `folder` is dropped for the same reason.
+///
+/// So is a row with no `id`, which is the same judgement one more time: an item that
+/// cannot be addressed after the listing is one whose read would fail the moment its
+/// download URL expired. Graph states an id on every driveItem and this code `$select`s
+/// it, so the case is a malformed row rather than a shape of the API.
 fn child_from_item(v: &Value) -> Option<Child> {
     if v.get("package").is_some() {
         return None;
     }
+    let id = v.get("id")?.as_str()?.to_string();
     let name = sanitize_name(v.get("name")?.as_str()?);
     let is_dir = v.get("folder").is_some();
     if !is_dir && v.get("file").is_none() {
         return None;
     }
     Some(Child {
+        id,
         name,
         is_dir,
         // A folder states a size too — the sum of what it contains — which is not a length
@@ -588,13 +675,34 @@ fn time_field(v: &Value, key: &str) -> Option<SystemTime> {
 
 /// An `anyhow` error from the accessor into an `io` one, keeping "not found" apart from
 /// everything else — a reader distinguishes them and a mount has to as well.
+///
+/// The distinction is what a caller acts on, and it only goes one way safely. `NotFound`
+/// on a path is a name that is gone, which a traversal skips; anything else is the backend
+/// failing, which it must not read as an absence. See [`is_not_found`].
 fn not_found_or_backend(e: anyhow::Error) -> io::Error {
-    let text = format!("{e:#}");
-    if text.contains("404") {
+    if is_not_found(&e) {
         io::Error::from(io::ErrorKind::NotFound)
     } else {
-        io::Error::other(text)
+        io::Error::other(format!("{e:#}"))
     }
+}
+
+/// Whether the service answered this request `404`.
+///
+/// Asked of the status the error carries rather than found in its message. A Graph error
+/// body states a correlation id, and a correlation id is hex: measured on a live token
+/// failure, `Correlation ID: 74bd5c8a-0083-434f-b5b2-9602fa4d4ca3`. About one in a hundred
+/// contains `404` and means nothing by it, so a substring search turns a backend failure
+/// into an absence, and the mount answers `ENOENT` for a file that is there. The Google
+/// Drive store classifies the same way, for the same reason.
+///
+/// Only a Graph error can be one: a failed download says its status without reqwest's
+/// error (see [`download`](OnedriveAccessor::download)), and a failed token exchange is a
+/// statement about a credential that nothing should be able to turn into a missing file.
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        == Some(reqwest::StatusCode::NOT_FOUND)
 }
 
 /// Sanitize an item name into a single path segment.

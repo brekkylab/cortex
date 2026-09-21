@@ -121,8 +121,8 @@ const ITEM_FIELDS: &[&str] = &[
 ///
 /// Asked for beside the fields above so a read does not cost a second round trip to learn
 /// where the bytes are. Getting it wrong does not degrade to that second trip either:
-/// [`OnedriveAccessor::get_item`] selects the same way, so a listing without the URL and
-/// the refetch meant to rescue it both come back without one.
+/// [`OnedriveAccessor::get_item_by_id`] selects the same way, so a listing without the URL
+/// and the refetch meant to rescue it both come back without one.
 const DOWNLOAD_URL_SELECT: &str = "content.downloadUrl";
 
 /// The instance annotation a download URL actually arrives under. See
@@ -266,9 +266,10 @@ impl OnedriveAccessor {
     /// retrying a 5xx is unconditionally safe.
     ///
     /// Unlike Drive, Graph reports throttling as `429` with `Retry-After` and means it —
-    /// there is no 403-that-is-really-a-rate-limit to classify. Microsoft's guidance is to
-    /// wait exactly what the header says, because usage keeps accruing while a client is
-    /// throttled, so a shorter wait makes the throttle last longer.
+    /// there is no 403-that-is-really-a-rate-limit to classify. A wait it asks for is
+    /// honoured as asked or not taken at all; see [`MAX_RETRY_AFTER`] for why there is no
+    /// third option. A backoff this code computed for itself is capped at [`MAX_BACKOFF`],
+    /// which is a different thing and safe to shorten.
     async fn send_retrying(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -309,17 +310,31 @@ impl OnedriveAccessor {
     }
 
     /// A GET whose body is JSON, bounded on the way in.
+    ///
+    /// A failure keeps reqwest's own error underneath, so the *status* survives as a
+    /// status and a caller can ask what it was rather than search the message for digits.
+    /// Graph's error body goes on top as context, because that is where the AADSTS code
+    /// and the correlation id are, and neither is recoverable from a status.
+    ///
+    /// Safe to let reqwest's message name the URL here: a Graph URL carries a path and a
+    /// `$select`, and the credential travels in a header. The download host is the other
+    /// way round, which is why [`download`](Self::download) does not do this.
     async fn get_json(&self, url: &str) -> anyhow::Result<Value> {
         let resp = self
             .send_with_refresh(|t| self.client.get(url).bearer_auth(t))
             .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = body_within(resp, MAX_BODY_BYTES, "error").await?;
-            anyhow::bail!(
-                "graph {status}: {}",
+        if let Err(failed) = resp.error_for_status_ref() {
+            // `unwrap_or_default` and not `?`: the status is what a caller classifies on,
+            // so it has to survive a body that will not read. Propagating the body's error
+            // instead would drop the status, and a 404 whose body was cut off would stop
+            // being an absence.
+            let body = body_within(resp, MAX_BODY_BYTES, "error")
+                .await
+                .unwrap_or_default();
+            return Err(anyhow::Error::new(failed).context(format!(
+                "graph: {}",
                 first_chars(&String::from_utf8_lossy(&body), 300)
-            );
+            )));
         }
         let raw = body_within(resp, MAX_BODY_BYTES, "listing").await?;
         Ok(serde_json::from_slice(&raw)?)
@@ -347,11 +362,30 @@ impl OnedriveAccessor {
         format!("{base}?$select={select}&$top=200")
     }
 
-    /// One folder's children, following `@odata.nextLink` until the folder ends or
-    /// `limit` is reached.
+    /// One folder's children, addressed by path.
     pub async fn list_children(&self, path: &str, limit: usize) -> anyhow::Result<Vec<Value>> {
+        self.pages_from(self.children_url(path), limit).await
+    }
+
+    /// The same listing addressed by the folder's id rather than by its path.
+    ///
+    /// The slow half of resolution, for the paths the fast half cannot spell. A path is
+    /// one string and the service answers to one normalization of it; an id is the
+    /// service's own. See [`OnedriveFs::list_dir`](super::OnedriveFs::list_dir).
+    pub async fn list_children_of_id(&self, id: &str, limit: usize) -> anyhow::Result<Vec<Value>> {
+        let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_SELECT);
+        let url = format!(
+            "{}/me/drive/items/{}/children?$select={select}&$top=200",
+            self.urls.graph,
+            encode_segment(id)
+        );
+        self.pages_from(url, limit).await
+    }
+
+    /// Follow `@odata.nextLink` from `url` until the folder ends or `limit` is reached.
+    async fn pages_from(&self, url: String, limit: usize) -> anyhow::Result<Vec<Value>> {
         let mut out: Vec<Value> = Vec::new();
-        let mut url = self.children_url(path);
+        let mut url = url;
         for _ in 0..MAX_PAGES {
             let v = self.get_json(&url).await?;
             if let Some(items) = v.get("value").and_then(|f| f.as_array()) {
@@ -371,19 +405,23 @@ impl OnedriveAccessor {
         Ok(out)
     }
 
-    /// One item by path, for the case a listing cannot answer: a fresh download URL after
+    /// One item by id, for the case a listing cannot answer: a fresh download URL after
     /// the cached one has expired.
-    pub async fn get_item(&self, path: &str) -> anyhow::Result<Value> {
+    ///
+    /// By id rather than by path, and that is load-bearing rather than tidy. A path has
+    /// two Unicode spellings and the service answers only to the one it stored — measured
+    /// against the live service, `root:/문서:/children` is `200` composed and `404`
+    /// decomposed — while an id is opaque ASCII the service itself minted. This refresh
+    /// happens mid-read, where a `404` would surface as a file that vanished halfway
+    /// through, so it is the last place that should depend on a spelling. It also survives
+    /// a rename between the listing and the read, which a path does not.
+    pub async fn get_item_by_id(&self, id: &str) -> anyhow::Result<Value> {
         let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_SELECT);
-        let url = if path.is_empty() || path == "/" {
-            format!("{}/me/drive/root?$select={select}", self.urls.graph)
-        } else {
-            format!(
-                "{}/me/drive/root:/{}?$select={select}",
-                self.urls.graph,
-                encode_path(path)
-            )
-        };
+        let url = format!(
+            "{}/me/drive/items/{}?$select={select}",
+            self.urls.graph,
+            encode_segment(id)
+        );
         self.get_json(&url).await
     }
 
@@ -418,7 +456,12 @@ impl OnedriveAccessor {
             }
             req = req.header("Range", format!("bytes={}-{}", r.start, r.end - 1));
         }
-        let resp = req.send().await?;
+        // `without_url`, for the same reason the status below is built by hand: reqwest
+        // attaches the request URL to a transport error and `Display` prints its query
+        // string, and *this* URL's query string is the grant. A refused connection or a
+        // timeout would otherwise put a token that hands over the file into whatever reads
+        // the error. The error's kind survives, so `is_timeout` and `is_connect` still work.
+        let resp = req.send().await.map_err(reqwest::Error::without_url)?;
         let status = resp.status();
         // Past the end of the file. A walk that runs off the end asks for this, and it is
         // an ordinary end rather than an error.
@@ -426,6 +469,11 @@ impl OnedriveAccessor {
             return Ok((range.map(|r| r.start).unwrap_or(0), Vec::new()));
         }
         if !status.is_success() {
+            // The status and nothing else, deliberately. `error_for_status` names the URL
+            // in its message, and *this* URL is preauthenticated: the token that grants
+            // the file is in its query string, so an error carrying it into a log hands
+            // the file to whoever reads the log. Graph's URLs have no such property, which
+            // is why [`get_json`](Self::get_json) can keep reqwest's error and this cannot.
             anyhow::bail!("onedrive download {status}");
         }
         let at = if range.is_some() {

@@ -43,6 +43,14 @@ fn a_row_becomes_the_entry_it_should() {
         "a file facet is enough"
     );
 
+    // A row that cannot be addressed after the listing is dropped, the same judgement one
+    // more time. It is the id every later request uses — the download-URL refresh runs in
+    // the middle of a read — so a `Child` carrying an empty one would not omit the file,
+    // it would break reading it, and only once the URL expired.
+    let mut idless = file_row("report.docx", "F1", 1234);
+    idless.as_object_mut().unwrap().remove("id");
+    assert!(child_from_item(&idless).is_none(), "no id, no entry");
+
     let file = child_from_item(&file_row("report.docx", "F1", 1234)).unwrap();
     assert_eq!(
         (file.size, file.etag.as_deref()),
@@ -166,6 +174,242 @@ async fn one_listing_answers_the_whole_directory() {
         mock.targets().is_empty(),
         "none of that cost a request: {:?}",
         mock.targets()
+    );
+}
+
+/// A path has two spellings and the service answers to one of them.
+///
+/// `same_name` covers half of this already: a *name* is matched against a listing under
+/// composition, so a lookup finds what `ls` printed. The other half is the path itself,
+/// which is how this store addresses a folder — and measured against the live service,
+/// `root:/문서:/children` is `200` composed and `404` decomposed, while macOS hands a
+/// lookup the decomposed spelling. So `ls` on a directory it has just listed answered
+/// `ENOENT`, and a read of anything under it went the same way through its parent.
+///
+/// A read of a file under that folder is the other half of the test rather than a second
+/// one: it resolves through the same listing, and it is where the failure hurt.
+#[tokio::test]
+async fn a_folder_is_found_under_the_spelling_the_kernel_hands_over() {
+    let composed = "문서";
+    let decomposed: String = composed.nfd().collect();
+    assert_ne!(composed.as_bytes(), decomposed.as_bytes(), "two spellings");
+
+    let mut tree = json!({ "/": [folder_row(composed, "D1")] });
+    tree.as_object_mut().unwrap().insert(
+        format!("/{composed}"),
+        json!([file_row("note.txt", "F1", 5)]),
+    );
+    let mock = start(tree, HashMap::from([("F1".to_string(), b"hello".to_vec())])).await;
+    let fs = mounted(&mock.config());
+
+    let listed = fs
+        .list(Path::new(&format!("/{decomposed}")))
+        .await
+        .expect("listed under the spelling the kernel hands over");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "note.txt");
+    assert_eq!(
+        fs.list(Path::new("/")).await.unwrap()[0].name,
+        composed,
+        "and a listing still prints the service's own spelling"
+    );
+
+    let got = fs
+        .read_window(Path::new(&format!("/{decomposed}/note.txt")), Some(0..5))
+        .await
+        .expect("and a file under it reads, through that same listing");
+    assert_eq!(got, b"hello");
+
+    // Two requests for the folder and not three: the spelling as given, then composed.
+    // The service's own spelling still costs one, so nothing pays for this twice.
+    let of_folder = |m: &Mock| {
+        m.targets()
+            .iter()
+            .filter(|t| t.contains(":/children"))
+            .count()
+    };
+    assert_eq!(of_folder(&mock), 2, "{:?}", mock.targets());
+    mock.reset();
+    fs.list(Path::new(&format!("/{composed}"))).await.unwrap();
+    assert_eq!(of_folder(&mock), 1, "{:?}", mock.targets());
+}
+
+/// A read that keeps failing is a fault, and its error says so without saying where.
+///
+/// Two things the byte path had no test for, and they are one scenario. A download that
+/// fails twice — once on the listing's URL, once on the fresh one — is not an absence: the
+/// item answered `get_item_by_id`, so it is there. And the error must not carry the URL,
+/// because a preauthenticated download URL's query string *is* the grant: reqwest attaches
+/// the URL to a transport error and prints its query, so a refused connection would put a
+/// token that hands over the file into whatever reads the error.
+///
+/// The fixture points at a closed port, which is the transport path rather than the status
+/// path. That is the half the hand-built status message does not cover.
+#[tokio::test]
+async fn a_read_that_keeps_failing_is_a_fault_and_says_so_without_the_url() {
+    const SENTINEL: &str = "SENTINEL-GRANT-DO-NOT-LOG";
+    let mut row = file_row("dead.bin", "P1", 4096);
+    row.as_object_mut().unwrap().insert(
+        DOWNLOAD_URL_KEY.into(),
+        json!(format!("http://127.0.0.1:1/blob?tempauth={SENTINEL}")),
+    );
+    let mock = start(json!({ "/": [row] }), HashMap::new()).await;
+    let fs = mounted(&mock.config());
+    fs.list(Path::new("/")).await.unwrap();
+
+    let Err(e) = fs.read_window(Path::new("/dead.bin"), Some(0..4096)).await else {
+        panic!("a download that never succeeds is an error");
+    };
+    assert_ne!(
+        e.kind(),
+        io::ErrorKind::NotFound,
+        "the item answered, so the bytes failing is a fault: {e}"
+    );
+    let shown = format!("{e}");
+    assert!(
+        !shown.contains(SENTINEL),
+        "the grant reached the error text: {shown}"
+    );
+    assert!(
+        mock.asked_for("/me/drive/items/P1?"),
+        "and it did try a fresh url first: {:?}",
+        mock.targets()
+    );
+}
+
+/// A tree spelled two ways at once still resolves, and costs nothing when it cannot.
+///
+/// Composing the whole path tries exactly two spellings, all-decomposed and all-composed.
+/// A drive touched by two clients has neither: a folder made on the web sits composed, a
+/// folder made under it by the macOS sync client sits decomposed, and no single spelling of
+/// `/parent/child` names them both. The symptom is the one this store opened with — `stat`
+/// answers and `list` says ENOENT — because resolution matches a *name* against a listing,
+/// segment by segment, while a path is one string.
+///
+/// So the last resort is what the Google Drive store does by construction: resolve through
+/// the parent's listing and list by the id it gives. The other half of this test is that
+/// the resort stays a resort — a name with one spelling is still one request, because a
+/// macOS mount probes for `.DS_Store` in every directory it touches.
+#[tokio::test]
+async fn a_tree_spelled_two_ways_at_once_still_resolves() {
+    let parent: String = "상위".nfc().collect();
+    let child: String = "하위".nfd().collect();
+    assert_ne!(
+        child,
+        "하위".nfc().collect::<String>(),
+        "the child is stored in the other form"
+    );
+
+    // A file beside it, also stored in the other form, so a `list` of *its* path fails
+    // both spellings too and reaches the walk.
+    let leaf: String = "쪽지.txt".nfd().collect();
+
+    let mut tree = json!({ "/": [folder_row(&parent, "D1")] });
+    let obj = tree.as_object_mut().unwrap();
+    obj.insert(
+        format!("/{parent}"),
+        json!([folder_row(&child, "D2"), file_row(&leaf, "F2", 3)]),
+    );
+    obj.insert(
+        format!("/{parent}/{child}"),
+        json!([file_row("note.txt", "F1", 5)]),
+    );
+    let mock = start(tree, HashMap::from([("F1".to_string(), b"hello".to_vec())])).await;
+    let fs = mounted(&mock.config());
+
+    // What the kernel hands over: the whole path decomposed. Neither all-decomposed nor
+    // all-composed names this folder.
+    let asked: String = format!("/{parent}/{child}").nfd().collect();
+    let listed = fs
+        .list(Path::new(&asked))
+        .await
+        .expect("a mixed-normalization tree is still a tree");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "note.txt");
+    assert!(
+        mock.asked_for("/me/drive/items/D2/children"),
+        "resolved through the parent and listed by id: {:?}",
+        mock.targets()
+    );
+
+    // A walk that lands on a file stops there. Asking Graph for the children of a file
+    // answers 404 too, so this is a round trip saved rather than a different answer.
+    mock.reset();
+    let file_path: String = format!("/{parent}/{leaf}").nfd().collect();
+    assert!(fs.list(Path::new(&file_path)).await.is_err());
+    assert!(
+        !mock
+            .targets()
+            .iter()
+            .any(|t| t.contains("/children") && t.contains("/items/")),
+        "a file has no children to ask for: {:?}",
+        mock.targets()
+    );
+
+    // And a name with one spelling never reaches any of that.
+    mock.reset();
+    assert!(fs.list(Path::new("/.DS_Store")).await.is_err());
+    assert_eq!(
+        mock.targets().len(),
+        1,
+        "one spelling, one request, one answer: {:?}",
+        mock.targets()
+    );
+}
+
+/// A backend failure is not an absence.
+///
+/// `NotFound` is the one error a traversal is entitled to skip, so everything else must
+/// stay distinguishable from it. Graph states the status in the status line and a
+/// correlation id in the body, and a correlation id is hex: measured on a live token
+/// failure, `Correlation ID: 74bd5c8a-0083-434f-b5b2-9602fa4d4ca3`. Roughly one in a
+/// hundred spells `404` and means nothing by it. Read out of the message rather than off
+/// the status, a folder you may not read becomes a folder that is not there.
+#[tokio::test]
+async fn a_backend_failure_is_not_an_absence() {
+    let mock = start(
+        json!({
+            "/": [folder_row("denied", "D1"), folder_row("gone", "D2")],
+            // Answers 403 with a correlation id that happens to contain `404`.
+            "/denied": 403,
+        }),
+        HashMap::new(),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+
+    let Err(denied) = fs.list(Path::new("/denied")).await else {
+        panic!("a 403 is an error");
+    };
+    assert_ne!(
+        denied.kind(),
+        io::ErrorKind::NotFound,
+        "a 403 is not an absence, whatever its correlation id spells: {denied}"
+    );
+    let Err(gone) = fs.list(Path::new("/gone")).await else {
+        panic!("a 404 is an error");
+    };
+    assert_eq!(
+        gone.kind(),
+        io::ErrorKind::NotFound,
+        "and a real 404 still is one"
+    );
+
+    // Even when its body does not arrive. The status is what a caller classifies on, so
+    // reading the body for the message must not be able to take the status with it.
+    let mock = start(
+        json!({"/": [folder_row("cut", "D3")], "/cut": 4041}),
+        HashMap::new(),
+    )
+    .await;
+    let fs = mounted(&mock.config());
+    let Err(cut) = fs.list(Path::new("/cut")).await else {
+        panic!("a truncated 404 is an error");
+    };
+    assert_eq!(
+        cut.kind(),
+        io::ErrorKind::NotFound,
+        "a 404 whose body was cut off is still a 404: {cut}"
     );
 }
 
@@ -491,8 +735,8 @@ async fn an_expired_download_url_is_refetched_once() {
         .unwrap();
     assert_eq!(got, body, "the read succeeded on the fresh url");
     assert!(
-        mock.asked_for("/me/drive/root:/stale.bin?"),
-        "by asking the service for the item again: {:?}",
+        mock.asked_for("/me/drive/items/P1?"),
+        "by asking the service for the item again, by id: {:?}",
         mock.targets()
     );
     assert_eq!(
@@ -834,22 +1078,64 @@ async fn start_full(
                         // What an expired preauthenticated URL answers.
                         reply(401, br#"{"error":"expired"}"#.to_vec())
                     } else {
-                        let blob = blobs.get(id).cloned().unwrap_or_default();
-                        serve_content(blob, range.as_deref(), range_mode)
+                        // A blob the fixture does not carry is a 404, not an empty file.
+                        // Serving empty bytes would make a download failure unreachable
+                        // from a test, which is the shape the read path classifies on.
+                        match blobs.get(id) {
+                            Some(blob) => serve_content(blob.clone(), range.as_deref(), range_mode),
+                            None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
+                        }
                     }
                 } else if let Some(folder) = graph_children_path(&tree, path) {
-                    match tree.get(&folder).and_then(|v| v.as_array()) {
-                        Some(rows) => {
+                    match tree.get(&folder) {
+                        Some(Value::Array(rows)) => {
                             let rows: Vec<Value> = rows
                                 .iter()
                                 .map(|r| with_host(r, &host, false, query))
                                 .collect();
                             reply(200, json!({"value": rows}).to_string().into_bytes())
                         }
-                        None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
+                        // A number in place of a folder's rows is the status it answers
+                        // with, so a test can ask for a failure that is *not* an absence.
+                        // The body is the shape Graph sends: an inner error carrying a
+                        // correlation id, which is hex and so sometimes spells `404` while
+                        // meaning nothing by it. A `429` carries `Retry-After` as the
+                        // service does, stating a wait far past what a mount may sleep.
+                        Some(Value::Number(n)) => {
+                            let code = n.as_u64().unwrap_or(500) as u16;
+                            let body = br#"{"error":{"code":"accessDenied","innerError":
+                                {"request-id":"74bd5c8a-0083-404f-b5b2-9602fa4d4ca3"}}}"#
+                                .to_vec();
+                            // 4041 is a 404 whose body is cut off mid-read: the head
+                            // promises more than the socket delivers, which is what a
+                            // dropped connection on an error response looks like.
+                            if code == 4041 {
+                                let mut out =
+                                    http_head(404, "application/json", body.len() + 64, None);
+                                out.extend_from_slice(&body);
+                                (out, body.len())
+                            } else {
+                                let mut out = http_head(code, "application/json", body.len(), None);
+                                let len = body.len();
+                                out.extend_from_slice(&body);
+                                (out, len)
+                            }
+                        }
+                        _ => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
                     }
-                } else if let Some(inner) = graph_item_inner(path) {
-                    match find_item(&tree, inner) {
+                } else if let Some(id) = graph_children_of_id(path) {
+                    match folder_path_of_id(&tree, id).and_then(|k| tree.get(&k)) {
+                        Some(Value::Array(rows)) => {
+                            let rows: Vec<Value> = rows
+                                .iter()
+                                .map(|r| with_host(r, &host, false, query))
+                                .collect();
+                            reply(200, json!({"value": rows}).to_string().into_bytes())
+                        }
+                        _ => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
+                    }
+                } else if let Some(id) = graph_item_id(path) {
+                    match find_item_by_id(&tree, id) {
                         // The item fetch hands out a URL marked fresh, so the refetch
                         // path can be told apart from the listing's.
                         Some(row) => reply(
@@ -933,30 +1219,63 @@ fn graph_children_path(tree: &Value, path: &str) -> Option<String> {
         .cloned()
 }
 
-/// The encoded path in `/graph/v1.0/me/drive/root:/A/B`, which addresses one item rather
+/// The encoded id in `/graph/v1.0/me/drive/items/{id}`, which addresses one item rather
 /// than a folder's children.
-fn graph_item_inner(path: &str) -> Option<&str> {
-    let inner = path.split_once("/me/drive/root")?.1.strip_prefix(":/")?;
-    (!inner.contains(':')).then_some(inner)
+fn graph_item_id(path: &str) -> Option<&str> {
+    let rest = path.split_once("/me/drive/items/")?.1;
+    (!rest.contains('/')).then_some(rest)
 }
 
-/// The row whose path encodes to `inner`.
+/// The encoded id in `/graph/v1.0/me/drive/items/{id}/children`, which addresses a
+/// folder's children without naming the folder.
+fn graph_children_of_id(path: &str) -> Option<&str> {
+    path.split_once("/me/drive/items/")?
+        .1
+        .strip_suffix("/children")
+}
+
+/// The tree key of the folder whose row carries `encoded`.
 ///
-/// Encoding the fixtures forwards rather than decoding the request: the accessor's own
-/// encoder is the definition of what a path becomes on the wire, so a mock that compares
-/// against it cannot disagree with the thing under test about what was asked for. A
-/// second, hand-written decoder here could.
-fn find_item(tree: &Value, inner: &str) -> Option<Value> {
-    for (folder, rows) in tree.as_object()? {
-        for row in rows.as_array()? {
-            let name = row.get("name")?.as_str()?;
-            let sep = if folder.ends_with('/') { "" } else { "/" };
-            if encode_path(&format!("{folder}{sep}{name}")) == inner {
-                return Some(row.clone());
+/// Found through the row rather than guessed from the id, so a folder is located by the
+/// same thing the service would use: the parent that lists it, plus its own name. Two
+/// folders of one name under different parents stay distinct.
+fn folder_path_of_id(tree: &Value, encoded: &str) -> Option<String> {
+    for (parent, rows) in tree.as_object()? {
+        for row in rows.as_array().into_iter().flatten() {
+            if row.get("folder").is_none() {
+                continue;
             }
+            let id = row.get("id")?.as_str()?;
+            if encode_path(id) != encoded {
+                continue;
+            }
+            let name = row.get("name")?.as_str()?;
+            let sep = if parent.ends_with('/') { "" } else { "/" };
+            return Some(format!("{parent}{sep}{name}"));
         }
     }
     None
+}
+
+/// The row whose id encodes to `encoded`.
+///
+/// Encoding the fixtures forwards rather than decoding the request: the accessor's own
+/// encoder is the definition of what an id becomes on the wire, so a mock that compares
+/// against it cannot disagree with the thing under test about what was asked for. A
+/// second, hand-written decoder here could.
+fn find_item_by_id(tree: &Value, encoded: &str) -> Option<Value> {
+    tree.as_object()?
+        .values()
+        .filter_map(|rows| rows.as_array())
+        .flatten()
+        .find(|row| {
+            row.get("id")
+                .and_then(|v| v.as_str())
+                .map(encode_path)
+                .as_deref()
+                == Some(encoded)
+        })
+        .cloned()
 }
 
 /// Point a row's download URL at this mock, marking it fresh when an item fetch hands it
