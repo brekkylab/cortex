@@ -83,12 +83,6 @@ use guest::Guest;
 /// integer: an id above `i64::MAX` is a frame that will not serialize.
 const REPLAYED_INIT: RequestId = i64::MAX as RequestId;
 
-/// The services whose credentials the boot injects, when a client declared none: this server's
-/// own setting, as a whitespace-separated list of `ENV_VAR@host[,host…][:location]`. The code way
-/// to set them is [`SecretAccess`] over the channel, which is what a client that says any of its
-/// own uses; this is the default under it.
-const SECRETS: &str = "CORTEX_UVM_SECRETS";
-
 /// Answer requests until the client says `quit` or closes the channel.
 pub async fn run() -> anyhow::Result<()> {
     let mut server = StdioServer::stdio()?;
@@ -524,22 +518,14 @@ fn parse_host_ports(value: Option<&str>) -> anyhow::Result<Vec<u16>> {
         .collect()
 }
 
-/// The secrets a session gets: the ones its client declared over the channel, or this server's
-/// own setting from [`SECRETS`] when it declared none — the same shape as [`reach`], the channel
-/// over the environment default.
+/// The secrets a session gets: the ones its client declared over the channel, translated to the
+/// boot's [`SecretSpec`]. A client that declares none gets none — a secret is a session's to ask
+/// for, not a server-wide setting.
 ///
-/// Translated to the boot's [`SecretSpec`] here, and refused now rather than at the boot for a
-/// location no backend spells or a secret with nowhere to go: a client told at `init` can ask for
+/// An empty host is refused here, at `init`, not at the boot: a client told now can still ask for
 /// something else, where one told at its first command has already paid for a boot.
 fn secrets(asked: &[SecretAccess]) -> Result<Vec<SecretSpec>, Error> {
-    if !asked.is_empty() {
-        return asked.iter().map(secret_spec).collect();
-    }
-    match std::env::var(SECRETS) {
-        Ok(value) => SecretSpec::parse_list(&value)
-            .map_err(|e| refused(Error::INVALID_PARAMS, format!("{SECRETS}: {e}"))),
-        Err(_) => Ok(Vec::new()),
-    }
+    asked.iter().map(secret_spec).collect()
 }
 
 /// One client-declared [`SecretAccess`] as the boot's [`SecretSpec`], or why it is not one.

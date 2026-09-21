@@ -438,45 +438,31 @@ fn number<T: std::str::FromStr>(flag: &str, value: OsString) -> anyhow::Result<T
 
 /// Where in a request a service reads its credential.
 ///
-/// A key that lives in the URL *path* has no variant here on purpose: the substitution engine
-/// rewrites the query, headers and body, and a path segment is none of those.
-///
-/// The `query`/`header` text form — what `--secret` and `CORTEX_UVM_SECRETS` carry — is the
-/// [`Display`](std::fmt::Display) and [`FromStr`](std::str::FromStr) `strum` derives, so it is one
-/// list rather than a match on each side.
+/// No variant for a key in the URL *path*: the substitution engine rewrites the query, headers
+/// and body, and a path segment is none of those. The wire spelling (`query`/`header`) is the
+/// `strum` [`Display`](std::fmt::Display)/[`FromStr`](std::str::FromStr).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, strum::Display, strum::EnumString)]
 #[strum(serialize_all = "snake_case")]
 pub enum Inject {
     /// A query parameter, e.g. `?apiKey=<value>`.
     Query,
-    /// A request header — a plain value like `Authorization: Bearer <value>`, or HTTP Basic, whose
-    /// value is substituted into the base64-decoded `user:password`. Basic is a header, so it is
-    /// this rather than a variant of its own.
+    /// A request header. Covers HTTP Basic too, whose value is substituted into the base64-decoded
+    /// `user:password` — Basic is a header, not a variant of its own.
     Header,
 }
 
 /// One service whose credential the stack injects outside the guest — the metadata, never the
 /// value.
 ///
-/// # What a session declares, and what it does not
+/// The boot reads the value from its own environment under [`env_var`](Self::env_var) at start, so
+/// it is never on a command line, in this struct, or in the guest — which gets the
+/// [placeholder](Self::placeholder) under the same name. One [`host`](Self::host) each (exact or a
+/// `*.suffix` wildcard); several hosts is several specs.
 ///
-/// A spec names the environment variable a value is read from, the host that value may be sent
-/// to, and where in the request it goes. The **value itself is nowhere here**: the boot reads it
-/// from its own environment under [`env_var`](Self::env_var) at start, so it is never on a command
-/// line, in this struct, or in the guest. The guest is handed a [placeholder](Self::placeholder)
-/// under the same variable name instead.
-///
-/// # One host each
-///
-/// A spec names a single [`host`](Self::host) — exact, or a `*.suffix` wildcard for a family of
-/// subdomains. A credential that legitimately goes to several unrelated hosts is more than one
-/// spec, not a list on one.
-///
-/// # The spelling a session is configured with
-///
-/// `ENV_VAR@host[:location]`, which is what `CORTEX_UVM_SECRETS` carries one or more of,
-/// whitespace-separated. `location` is `query` (the default), `header`, or `basic`. So
-/// `OPENDART_API_KEY@opendart.fss.or.kr` and `TOKEN@*.example.com:header` are both specs.
+/// On the wire to the boot, one `--secret ENV_VAR@host[:location]` per spec, `location` being
+/// `query` or `header` (`header` when omitted): `OPENAI_API_KEY@api.openai.com`,
+/// `OPENWEATHER_API_KEY@api.openweathermap.org:query`. The console assembles these from the
+/// client's `SecretAccess`; there is no server-environment list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretSpec {
     /// The environment variable the boot reads the real value from, and the name the guest sees
@@ -524,9 +510,9 @@ impl SecretSpec {
         let (host, inject) = match rest.split_once(':') {
             Some((host, location)) => (
                 host,
-                location
-                    .parse::<Inject>()
-                    .map_err(|_| anyhow::anyhow!("{location:?} is not a location (query, header)"))?,
+                location.parse::<Inject>().map_err(|_| {
+                    anyhow::anyhow!("{location:?} is not a location (query, header)")
+                })?,
             ),
             // `header` when the location is omitted: most auth is a header.
             None => (rest, Inject::Header),
@@ -537,11 +523,6 @@ impl SecretSpec {
             host: host.to_owned(),
             inject,
         })
-    }
-
-    /// Parse the whitespace-separated list `CORTEX_UVM_SECRETS` carries.
-    pub fn parse_list(value: &str) -> anyhow::Result<Vec<SecretSpec>> {
-        value.split_whitespace().map(SecretSpec::parse).collect()
     }
 
     /// The canonical one-entry spelling, for a `--secret` argument.
@@ -783,22 +764,20 @@ mod tests {
         assert_eq!(back.secrets, args().secrets);
     }
 
-    /// The spelling `CORTEX_UVM_SECRETS` carries: the `header` default when `:location` is left
-    /// off, an explicit `query`, and a wildcard host.
+    /// A `--secret` entry: the `header` default when `:location` is left off, an explicit `query`,
+    /// a wildcard host, and the derived placeholder.
     #[test]
-    fn a_secret_list_parses_the_configured_spelling() {
-        let specs = SecretSpec::parse_list(
-            "OPENAI_API_KEY@api.openai.com  GCP_KEY@*.googleapis.com:query",
-        )
-        .expect("a valid list");
-        assert_eq!(specs.len(), 2);
-        assert_eq!(specs[0].host, "api.openai.com");
-        assert_eq!(specs[0].inject, Inject::Header); // default
-        assert_eq!(specs[0].placeholder(), "MSB_OPENAI_API_KEY");
-        assert!(!specs[0].is_wildcard());
-        assert_eq!(specs[1].host, "*.googleapis.com");
-        assert_eq!(specs[1].inject, Inject::Query); // explicit
-        assert!(specs[1].is_wildcard());
+    fn a_secret_entry_parses_the_configured_spelling() {
+        let bearer = SecretSpec::parse("OPENAI_API_KEY@api.openai.com").expect("valid");
+        assert_eq!(bearer.host, "api.openai.com");
+        assert_eq!(bearer.inject, Inject::Header); // default
+        assert_eq!(bearer.placeholder(), "MSB_OPENAI_API_KEY");
+        assert!(!bearer.is_wildcard());
+
+        let wild = SecretSpec::parse("GCP_KEY@*.googleapis.com:query").expect("valid");
+        assert_eq!(wild.host, "*.googleapis.com");
+        assert_eq!(wild.inject, Inject::Query); // explicit
+        assert!(wild.is_wildcard());
     }
 
     /// A spec that names no host is refused: a value with nowhere it may go is a mistake, not a

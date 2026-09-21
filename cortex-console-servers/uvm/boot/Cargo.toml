@@ -49,7 +49,7 @@ vm = [
 anyhow = { workspace = true }
 serde = { workspace = true }
 # `Display` and `FromStr` for `Inject`, so a location round-trips through the `--secret` string
-# and `CORTEX_UVM_SECRETS` without a match written by hand on each side.
+# without a match written by hand on each side.
 strum = { workspace = true }
 # `dup(2)`, to hand the guest a copy of this process's stderr as its console.
 libc = { workspace = true, optional = true }

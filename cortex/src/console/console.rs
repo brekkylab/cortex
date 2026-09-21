@@ -54,8 +54,7 @@ use crate::{
         message::{
             Call, CommitCall, Error, ExecCall, ExecResp, ImageSource, InitCall, NetworkAccess,
             Notification, ReadCall, ReadResp, Response, SecretAccess, TreeMount, TreeRole,
-            TreeSource, WriteCall,
-            WriteResp,
+            TreeSource, WriteCall, WriteResp,
         },
         stdio::StdioClient,
     },

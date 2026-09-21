@@ -621,22 +621,15 @@ pub struct SecretAccess {
     pub location: SecretLocation,
 }
 
-/// Where in a request a [`SecretAccess`] is injected.
-///
-/// A fixed HTTP vocabulary, not a backend's own set — so it is a closed enum here rather than a
-/// string a server has to recognise. On the wire it is its own lower-case name (`query`, `header`).
-///
-/// No `Default`: a caller always picks, and it is what bounds where a secret may land. The one
-/// place a location is *omitted* is the terse `CORTEX_UVM_SECRETS` string, and that falls back to
-/// `header` — the common one, since most auth is a header — in the parser, not here.
+/// Where in a request a [`SecretAccess`] is injected. On the wire it is its own lower-case name
+/// (`query`, `header`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretLocation {
     /// A URL query parameter, e.g. `?apiKey=<value>`.
     Query,
-    /// A request header — a plain value like `Authorization: Bearer <value>`, or HTTP Basic
-    /// credentials, where the value is substituted into the base64-decoded `user:password`. Basic
-    /// is a header, so it is this location rather than one of its own.
+    /// A request header. Covers HTTP Basic too, whose value is substituted into the base64-decoded
+    /// `user:password` — Basic is a header, not a location of its own.
     Header,
 }
 
@@ -830,6 +823,7 @@ mod tests {
             scratch: Some(TreeSource::new("file:///srv/scratch")),
             image: None,
             network: None,
+            secrets: Vec::new(),
             committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
@@ -858,6 +852,7 @@ mod tests {
             scratch: Some(TreeSource::new("file:///srv/scratch")),
             image: None,
             network: None,
+            secrets: Vec::new(),
             committable: false,
         };
         let doc = bson::serialize_to_document(&init).unwrap();
