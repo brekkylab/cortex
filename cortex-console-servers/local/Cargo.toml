@@ -12,7 +12,8 @@ edition.workspace = true
 anyhow = { workspace = true }
 bson = { workspace = true }
 cortex = { workspace = true }
-# `kill(pid, 0)`, to tell an abandoned scratch directory from a live one.
+# `kill(pid, 0)`, to tell an abandoned scratch directory from a live one — and `killpg`,
+# to take a timed-out command's whole process group with it.
 libc = { workspace = true }
 tokio = { workspace = true, features = [
     "fs",
@@ -22,6 +23,8 @@ tokio = { workspace = true, features = [
     "net",
     "process",
     "rt-multi-thread",
+    # `timeout`, which is what makes an `exec`'s `timeout_ms` a kill.
+    "time",
 ] }
 
 [build-dependencies]

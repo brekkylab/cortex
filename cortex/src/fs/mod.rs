@@ -1,5 +1,5 @@
 //! Two traits and one type. [`FileSystem`] is what a store must provide, [`Mount`] is what the
-//! host has once one of those trees is attached to it, and [`WorkFs`] is the public API — the
+//! host has once one of those trees is attached to it, and [`ContextFs`] is the public API — the
 //! tree a caller actually assembles and hands to a binding.
 //!
 //! * [`FileSystem`] — the one contract a store implements, and the vocabulary it answers in: a
@@ -12,7 +12,7 @@
 //!   will answer. What implements it is the guard a binding hands back, and the bindings are
 //!   one per concrete filesystem interface, each doing nothing but translating that interface's
 //!   calls onto [`Posix`].
-//! * [`WorkFs`] — several stores grafted under one tree, and itself a [`FileSystem`], so it is
+//! * [`ContextFs`] — several stores grafted under one tree, and itself a [`FileSystem`], so it is
 //!   both a consumer of the trait and something the bindings can drive like any single store.
 //!   A caller that has one store still has a tree; a caller that has five has this.
 //!
@@ -32,20 +32,20 @@
 //! path, inside this process, and does not care whether anything outside can see it. A
 //! parameter typed [`Mount`] asks for a tree the host already has — the caller must have
 //! mounted it, and what arrives is a directory that `std::fs`, a spawned program or a guest can
-//! open by name. [`Executable`] takes the second: it is handed a path its caller used and has to
-//! open the file its caller meant, so its signature says "a tree plugged into this host" rather
-//! than "a tree".
+//! open by name. [`Console`] takes the second: what a session names as its context is what a
+//! command it runs will open by name, so its signature says "a tree plugged into this host"
+//! rather than "a tree".
 //!
 //! Errors are [`std::io::Error`], classified by kind. There is no error type here to
 //! learn: a store's own `std::fs` calls travel up unchanged, and `FileSystem`'s docs say
 //! which kind answers what.
 //!
-//! [`Executable`]: crate::exec::Executable
+//! [`Console`]: crate::console::Console
 
+mod context;
 mod filesystem;
 mod mount;
-mod workfs;
 
+pub use context::*;
 pub use filesystem::*;
 pub use mount::*;
-pub use workfs::*;

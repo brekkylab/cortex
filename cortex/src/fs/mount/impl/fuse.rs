@@ -31,6 +31,10 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
 };
 
+use super::super::{
+    claim::{Claim, claim, reclaim_abandoned},
+    table::{resolved, unmount_under},
+};
 use crate::fs::{
     DirentKind, FileSystem, Mount, Posix, SetAttr, Stat,
     filesystem::posix::{
@@ -65,6 +69,12 @@ pub struct FuseMount {
     session: Option<fuser::BackgroundSession>,
 
     mountpoint: PathBuf,
+
+    /// This process's ownership of the mount point — what an opt-in
+    /// [`unmount_on_signal`](crate::fs::unmount_on_signal) reads now, and what a later run's
+    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) reads if this one is killed. Held
+    /// rather than read: dropping it is what gives the mount point up.
+    _claim: Claim,
 }
 
 impl FuseMount {
@@ -96,6 +106,11 @@ impl FuseMount {
         mountpoint: &Path,
         options: Vec<MountOption>,
     ) -> io::Result<Self> {
+        // What a `SIGKILL`ed run left behind is nobody's but the next run's, and this
+        // is the next run. Only mounts whose owning process is gone are touched, so a
+        // sibling instance keeps its own.
+        reclaim_abandoned();
+
         // `Config` is `#[non_exhaustive]`, so it cannot be built with a struct literal from
         // outside `fuser` — start from the default and assign.
         let mut config = Config::default();
@@ -104,6 +119,7 @@ impl FuseMount {
         Ok(FuseMount {
             session: Some(session),
             mountpoint: mountpoint.to_path_buf(),
+            _claim: claim(mountpoint),
         })
     }
 
@@ -133,20 +149,38 @@ impl Mount for FuseMount {
 }
 
 impl Drop for FuseMount {
+    /// `fuser`'s own unmount, then the operating system's if that was refused.
+    ///
+    /// `umount_and_join` is `mount.umount()?` followed by the join, so a refused unmount
+    /// returns before the join and leaves the mount up — and a mount with readers on it *is*
+    /// refused, with `EBUSY`. Stopping there would leave the mount behind, which breaks the
+    /// contract rather than merely putting a message on stderr.
+    ///
+    /// So the refusal is not the end of it. A caller that has dropped the guard has said the
+    /// mount is over, and what follows is the escalation the FUSE-T binding and
+    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) also use — a bounded child per
+    /// attempt, ending in a lazy detach — so a busy mount comes down the same way whoever is
+    /// taking it down.
+    ///
+    /// Nothing here panics. A `Drop` that panics mid-unwind aborts the process, which in a
+    /// failing test replaces the real assertion with a bare abort.
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            // Reported rather than propagated, and never a panic: a `Drop` that panics
-            // mid-unwind aborts the process, which in a failing test replaces the real
-            // assertion with a bare abort. Not silent either — a mount that would not come
-            // down is left behind for someone to clear by hand, so saying so is the least this
-            // can do.
-            if let Err(err) = session.umount_and_join() {
-                eprintln!(
-                    "cortex: unmounting {} failed: {err}",
-                    self.mountpoint.display()
-                );
-            }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        let Err(refused) = session.umount_and_join() else {
+            return;
+        };
+
+        if unmount_under(&resolved(&self.mountpoint)) {
+            return;
         }
+        // Not silent: a mount that would not come down is left behind for someone to clear by
+        // hand, so saying so — and saying what `fuser` made of it — is the least this can do.
+        eprintln!(
+            "cortex: unmounting {} failed: {refused}",
+            self.mountpoint.display()
+        );
     }
 }
 

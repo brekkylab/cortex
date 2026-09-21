@@ -23,7 +23,7 @@ use serde::{
     ser::SerializeMap,
 };
 
-use super::{Error, ImageSource, Method, NetworkAccess, utils::bytes};
+use super::{CommitResp, Error, ImageSource, Method, NetworkAccess, utils::bytes};
 
 /// What a request was answered with: the method's own result, or why there is none.
 ///
@@ -40,7 +40,7 @@ use super::{Error, ImageSource, Method, NetworkAccess, utils::bytes};
 /// `<Binary>` standing in for a byte payload:
 ///
 /// ```text
-/// {"method":"init","result":{"workfs":{"mount":"/work"},"cwd":"/work"}}
+/// {"method":"init","result":{"context":{"mount":"/work"},"cwd":"/work"}}
 /// {"method":"exec","result":{"code":0,"stdout":<Binary>,"stderr":<Binary>,"truncated":false}}
 /// {"method":"read","result":{"data":<Binary>,"size":4096}}
 /// {"error":{"code":-32000,"message":"timed out after 1000ms"}}
@@ -83,6 +83,7 @@ pub enum Response {
     Exec(ExecResp),
     Read(ReadResp),
     Write(WriteResp),
+    Commit(CommitResp),
 
     /// Why the method produced no result. See [`Error`] for the codes.
     Error(Error),
@@ -93,6 +94,7 @@ impl Response {
     /// answers whichever one asked, and says so with a code rather than a name.
     pub fn method(&self) -> Option<Method> {
         Some(match self {
+            Response::Commit(_) => Method::Commit,
             Response::Init(_) => Method::Init,
             Response::Exec(_) => Method::Exec,
             Response::Read(_) => Method::Read,
@@ -167,6 +169,7 @@ impl Serialize for Response {
             Response::Exec(exec) => map.serialize_entry("result", exec)?,
             Response::Read(read) => map.serialize_entry("result", read)?,
             Response::Write(write) => map.serialize_entry("result", write)?,
+            Response::Commit(commit) => map.serialize_entry("result", commit)?,
             Response::Error(error) => map.serialize_entry("error", error)?,
         }
 
@@ -236,6 +239,7 @@ impl<'de> Visitor<'de> for ResponseVisitor {
 /// method it answers.
 fn typed_result<E: de::Error>(method: Method, result: Bson) -> Result<Response, E> {
     Ok(match method {
+        Method::Commit => Response::Commit(payload(method, result)?),
         Method::Init => Response::Init(payload(method, result)?),
         Method::Exec => Response::Exec(payload(method, result)?),
         Method::Read => Response::Read(payload(method, result)?),
@@ -261,21 +265,54 @@ fn payload<T: DeserializeOwned, E: de::Error>(method: Method, result: Bson) -> R
 /// Answered rather than left to a notification because this is the one thing about a
 /// session a client can hear before it asks for work — that there is a server on the far
 /// end, that it read the frame, that it speaks this protocol, and that it has taken what it
-/// was told. It is also *where*: a session with a workfs has a path in it, and that path is
-/// what every later `read` and `write` is spelled in.
+/// was told. It is also *where*: a session that named a tree has a path to it, and those
+/// paths are what every later `read` and `write` is spelled in.
+///
+/// One member per tree the call named, because they are the trees the call named — see
+/// [`InitCall`](super::InitCall) for why that is three members rather than one. A tree the
+/// server took and did not place is the failure each of them exists to prevent: the client
+/// would have nothing to spell a path with.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitResp {
-    /// Where the workfs [`InitCall::workfs`](super::InitCall::workfs) named went, or `None`
+    /// Where the context [`InitCall::context`](super::InitCall::context) named went, or `None`
     /// when none was named.
     ///
     /// A client that asked for one and is answered without this has been told nothing it
     /// can use: every path it would send afterwards would be a guess. That is a broken
     /// session rather than an empty one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workfs: Option<WorkFsMount>,
+    pub context: Option<TreeMount>,
 
-    /// Where the session stands to begin with — conventionally the
-    /// [`workfs`](Self::workfs) mount point, and never required to be.
+    /// Where the [`artifacts`](super::InitCall::artifacts) tree went, or `None` when none
+    /// was named.
+    ///
+    /// Owed for the same reason [`context`](Self::context) is: a client that asked for one and
+    /// is answered without this cannot name a file the session left it, which is what it
+    /// asked for the tree in order to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifacts: Option<TreeMount>,
+
+    /// Where the [`scratch`](super::InitCall::scratch) tree went, or `None` when none was
+    /// named.
+    ///
+    /// Also [`cwd`](Self::cwd) whenever it is there — see below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch: Option<TreeMount>,
+
+    /// Where the session stands to begin with — the [`scratch`](Self::scratch) mount point
+    /// when the session has one, the [`context`](Self::context) one when it has not, and never
+    /// required to be either.
+    ///
+    /// **The scratch first, because that is the tree a command may write in freely.** A
+    /// session stands somewhere before it is told anything, and every relative path a
+    /// command writes lands there — so standing in the context makes the tree the client
+    /// *gave* the session the default destination for everything it produces, which is the
+    /// arrangement [`artifacts`](Self::artifacts) and [`scratch`](super::InitCall::scratch)
+    /// exist to end. A session with a scratch starts in it and leaves the other two trees to
+    /// paths that name them.
+    ///
+    /// Which is a convention and not a rule this protocol enforces: it is one member saying
+    /// one thing, and a server that stands somewhere else says so here and is read.
     ///
     /// **A session has a current directory, and the server is what keeps it.** That is why
     /// an [`ExecCall`](super::ExecCall) asking for a command says nothing about where to run it:
@@ -320,7 +357,11 @@ pub struct InitResp {
     pub network: Option<NetworkAccess>,
 }
 
-/// Where a workfs is, in the server's filesystem.
+/// Where one of a session's trees is, in the server's filesystem.
+///
+/// [`TreeSource`](super::TreeSource)'s answer, and one type for the same reason that is one:
+/// where a tree went is where a tree went, and which tree it was is the member this arrived
+/// under.
 ///
 /// # Why the server says the path instead of both ends agreeing on a namespace
 ///
@@ -347,8 +388,8 @@ pub struct InitResp {
 /// `write` and `exec` each boot a session first — which is what makes a path answered
 /// before there is a directory at it useful rather than a promise.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkFsMount {
-    /// Absolute, and in the server's filesystem — `"/mnt/workfs"`.
+pub struct TreeMount {
+    /// Absolute, and in the server's filesystem — `"/mnt/context"`.
     ///
     /// A relative one would be relative to a working directory nobody named, and the client
     /// has no way to guess which.
@@ -441,7 +482,7 @@ mod tests {
     use bson::doc;
 
     use super::{
-        super::{InitCall, WorkFsSource},
+        super::{InitCall, TreeSource},
         *,
     };
 
@@ -449,7 +490,7 @@ mod tests {
     /// is absent rather than null, which is what leaves room for it to mean exactly one
     /// thing when it is there.
     #[test]
-    fn an_answer_with_no_workfs_carries_no_workfs() {
+    fn an_answer_with_no_context_carries_no_context() {
         let answered = InitResp::default();
         let doc = bson::serialize_to_document(&answered).unwrap();
         assert_eq!(doc, doc! {});
@@ -459,23 +500,25 @@ mod tests {
         );
     }
 
-    /// The answer to a workfs is where the tree went and where the session stands in it —
+    /// The answer to a context is where the tree went and where the session stands in it —
     /// the second conventionally the first, which is what the two members being apart
     /// allows to not be the case.
     #[test]
-    fn the_answer_to_a_workfs_is_where_it_went() {
+    fn the_answer_to_a_context_is_where_it_went() {
         let answered = InitResp {
-            workfs: Some(WorkFsMount {
-                path: "/mnt/workfs".into(),
+            context: Some(TreeMount {
+                path: "/mnt/context".into(),
             }),
-            cwd: Some("/mnt/workfs/work".into()),
+            artifacts: None,
+            scratch: None,
+            cwd: Some("/mnt/context/work".into()),
             image: None,
             network: None,
         };
         let doc = bson::serialize_to_document(&answered).unwrap();
         assert_eq!(
             doc,
-            doc! {"workfs": {"path": "/mnt/workfs"}, "cwd": "/mnt/workfs/work"},
+            doc! {"context": {"path": "/mnt/context"}, "cwd": "/mnt/context/work"},
         );
         assert_eq!(
             bson::deserialize_from_document::<InitResp>(doc).unwrap(),
@@ -487,13 +530,15 @@ mod tests {
         // session stands is answered without that member rather than with a guess.
         assert_eq!(
             bson::deserialize_from_document::<InitResp>(
-                doc! {"workfs": {"path": "/mnt/workfs", "kind": "local"}}
+                doc! {"context": {"path": "/mnt/context", "kind": "local"}}
             )
             .unwrap(),
             InitResp {
-                workfs: Some(WorkFsMount {
-                    path: "/mnt/workfs".into(),
+                context: Some(TreeMount {
+                    path: "/mnt/context".into(),
                 }),
+                artifacts: None,
+                scratch: None,
                 cwd: None,
                 image: None,
                 network: None,
@@ -504,13 +549,62 @@ mod tests {
         // two ends have to agree on.
         assert_eq!(
             InitCall {
-                workfs: Some(WorkFsSource::new("file:///srv/project")),
+                context: Some(TreeSource::new("file:///srv/project")),
                 ..InitCall::default()
             }
-            .workfs
+            .context
             .unwrap()
             .url,
             "file:///srv/project",
+        );
+    }
+
+    /// Every tree that was named is a tree that was placed, each under its own member — and
+    /// the session stands in the scratch, which is the one of the three a command may write
+    /// in freely.
+    #[test]
+    fn the_answer_places_each_tree_and_stands_in_the_scratch() {
+        let answered = InitResp {
+            context: Some(TreeMount {
+                path: "/mnt/context".into(),
+            }),
+            artifacts: Some(TreeMount {
+                path: "/mnt/artifacts".into(),
+            }),
+            scratch: Some(TreeMount {
+                path: "/mnt/scratch".into(),
+            }),
+            cwd: Some("/mnt/scratch".into()),
+            image: None,
+            network: None,
+        };
+        let doc = bson::serialize_to_document(&answered).unwrap();
+        assert_eq!(
+            doc,
+            doc! {
+                "context": {"path": "/mnt/context"},
+                "artifacts": {"path": "/mnt/artifacts"},
+                "scratch": {"path": "/mnt/scratch"},
+                "cwd": "/mnt/scratch",
+            },
+        );
+        assert_eq!(
+            bson::deserialize_from_document::<InitResp>(doc).unwrap(),
+            answered,
+        );
+
+        // A server that placed only the context answers only the context, which is the frame
+        // every server wrote before these members existed.
+        assert_eq!(
+            bson::serialize_to_document(&InitResp {
+                context: Some(TreeMount {
+                    path: "/mnt/context".into(),
+                }),
+                cwd: Some("/mnt/context".into()),
+                ..InitResp::default()
+            })
+            .unwrap(),
+            doc! {"context": {"path": "/mnt/context"}, "cwd": "/mnt/context"},
         );
     }
 
@@ -520,7 +614,9 @@ mod tests {
     #[test]
     fn the_answered_image_is_the_one_in_force() {
         let answered = InitResp {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             cwd: None,
             image: Some(ImageSource::new("docker.io/library/python:3.13-slim")),
             network: None,
@@ -541,7 +637,9 @@ mod tests {
     #[test]
     fn the_answered_network_is_the_one_in_force() {
         let answered = InitResp {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             cwd: None,
             image: None,
             network: Some(NetworkAccess::host()),

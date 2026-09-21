@@ -6,28 +6,17 @@
 //! chooses.
 //!
 //! `#[ignore]` because it needs a mount provider and touches the real
-//! filesystem. **`--test-threads=1` is required**, not a preference — see below:
+//! filesystem.
 //!
 //! ```sh
 //! # macOS, no kernel extension (recommended). The pkg-config shim in
 //! # contrib/ is what lets fuser's macOS branch find FUSE-T.
 //! PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig" \
-//!     cargo test --features fuse-t --test host_mount \
-//!     -- --ignored --nocapture --test-threads=1
+//!     cargo test --features fuse-t --test host_mount -- --ignored --nocapture
 //!
 //! # Linux, or macOS with macFUSE:
-//! cargo test --features fuse --test host_mount -- --ignored --test-threads=1
+//! cargo test --features fuse --test host_mount -- --ignored
 //! ```
-//!
-//! # Why the tests must not run in parallel
-//!
-//! Each body mounts a real filesystem, and FUSE-T serves it through a `go-nfsv4`
-//! helper. Three of these coming up at once wedges: the run hangs with the mounts
-//! half-established and has to be killed and `umount`ed by hand. Two happened to
-//! survive, which is exactly the kind of margin that makes this look like a code
-//! bug the first time someone adds a third test.
-//!
-//! `cargo test` uses a thread per test by default, so the flag is not optional.
 //!
 //! # Which binding to use where
 //!
@@ -56,7 +45,7 @@ use cortex::fs::FuseMount as HostMount;
 /// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
 #[cfg(feature = "fuse-t")]
 use cortex::fs::FuseTMount as HostMount;
-use cortex::fs::{FileSystem, InMemFs, WorkFs};
+use cortex::fs::{ContextFs, FileSystem, InMemFs};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {
@@ -128,7 +117,7 @@ fn the_operating_system_can_read_a_cortex_mount() {
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_multi_source_workspace() {
     let mnt = mountpoint("workspace");
-    let ws = WorkFs::new()
+    let ws = ContextFs::new()
         .try_with_mount("s3-like", volume())
         .expect("mount path stays inside the workspace")
         .try_with_mount("notes", volume())

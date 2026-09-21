@@ -59,9 +59,10 @@
 //! ## A note on what is duplicated
 //!
 //! `sanitize_name`, `same_name`, `vpath`, `split_last`, `slice` and the span policy are
-//! copies of the Google Drive store's, not shared with it. Neither store is merged yet, so
-//! a common module now would put two branches in each other's way. Worth extracting once
-//! both have landed.
+//! copies of the Google Drive store's, not shared with it: they were written while neither
+//! store was merged, when a common module would have put two branches in each other's way.
+//! Drive has landed, so this is the second and last of them, and extracting them is work
+//! this store's own landing unblocks rather than work it should carry.
 
 mod accessor;
 #[allow(clippy::module_inception)]

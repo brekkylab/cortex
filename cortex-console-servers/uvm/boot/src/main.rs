@@ -14,7 +14,9 @@
 //!
 //! ```text
 //! virtio-fs  root         the boot root, holding the guest binary and nothing else
-//! virtio-fs  cortexws     a cortex WorkFs, served straight out of this process
+//! virtio-fs  cortexctx    the session's context, served straight out of this process
+//! virtio-fs  cortexart    its artifacts tree, when it named one
+//! virtio-fs  cortexscratch  its scratch tree, when it named one
 //! virtio-blk /dev/vda     the session's ext4 image — the overlay's upper
 //! virtio-blk /dev/vdb     the base image, read-only — the overlay's lower
 //! virtio-con cortex-…     the console session, the other end of it a socket on the host
@@ -30,16 +32,19 @@
 //! detail that stops at the block layer.
 //!
 //! The tree is a **host directory**, shared over virtio-fs like any other. Whatever it is
-//! made of — a cortex `WorkFs` of several stores, a plain project directory — was realized
+//! made of — a cortex `ContextFs` of several stores, a plain project directory — was realized
 //! and mounted on the host before this process started, so nothing in here knows or asks:
 //! it attaches a path.
 //!
-//! Where it lands in the guest is **that same path**, and that is the one decision worth
-//! reading here. A constant of our own (`/workspace`, say) would mean a directory has two
-//! names, one per side of the hypervisor, and every path crossing between them would have
-//! to be rewritten — a `cwd` on the way out, a `read` on the way in, an argv nobody could
-//! rewrite safely. Mounting it where the host already has it makes the two spellings one
-//! string, and the translation problem does not exist.
+//! Where it lands in the guest is **a constant per role** — `/context`, `/artifacts`,
+//! `/scratch`, see [`CONTEXT_PATH`](cortex_uvm_boot::CONTEXT_PATH) — and that is the one
+//! decision worth reading here. A directory therefore has two names, one per side of the
+//! hypervisor, and nothing translates between them because nothing has to: the protocol
+//! speaks the guest's name and only that one. The console server answers `init` with it
+//! without asking anything, the guest stands in it and reports it, and a path arriving on a
+//! `read` is already spelled the way the guest has it. The host's own name for the directory
+//! belongs to whatever mounted it, which never needed the guest to tell it where its own
+//! files are.
 //!
 //! # Networking
 //!
@@ -61,8 +66,10 @@ use std::{
 use msb_krun::{DiskImageFormat, VmBuilder};
 
 use cortex_uvm_boot::{
-    ABIN_ENV, BaseFormat, BootArgs, GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV,
-    GUEST_UPPER_DEV, LOWER_ENV, Network, PORT_NAME, SHARE_ENV, UPPER_ENV, WORKFS_TAG,
+    ABIN_ENV, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat, BootArgs, COMMIT_ENV,
+    COMMIT_PATH, COMMIT_TAG, COMMITTABLE_ENV, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG,
+    GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
+    PORT_NAME, SCRATCH_ENV, SCRATCH_PATH, SCRATCH_TAG, UPPER_ENV,
 };
 
 /// Guest vCPUs when nothing says otherwise. Two rather than one because a command and the
@@ -132,13 +139,49 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
     // places: a device configuration and a `mount -t virtiofs`. The path is the second
     // agreement, and it is the host's own — see the module docs on why the guest mounts it
     // where this host has it.
-    let share = match workfs(args.workfs.as_deref())? {
-        Some(path) => {
-            builder = builder.fs(|fs| fs.tag(WORKFS_TAG).path(&path));
-            Some(format!("{WORKFS_TAG}:{path}"))
+    //
+    // One device per tree the session named, each under its own tag, and all three the same
+    // work: this process has no opinion about what a tree is for, and the guest is told which
+    // is which by the name it arrives under.
+    let mut shares: Vec<(&str, String)> = Vec::new();
+    for (flag, env, tag, at, path) in [
+        (
+            "--context",
+            CONTEXT_ENV,
+            CONTEXT_TAG,
+            CONTEXT_PATH,
+            args.context.as_deref(),
+        ),
+        (
+            "--artifacts",
+            ARTIFACTS_ENV,
+            ARTIFACTS_TAG,
+            ARTIFACTS_PATH,
+            args.artifacts.as_deref(),
+        ),
+        (
+            "--scratch",
+            SCRATCH_ENV,
+            SCRATCH_TAG,
+            SCRATCH_PATH,
+            args.scratch.as_deref(),
+        ),
+    ] {
+        if let Some(path) = shared(flag, path)? {
+            // The host's path names the device and the guest's names the mount point: the
+            // first is the directory to serve out of this process, and the second is what
+            // the tree is called on the other side of the hypervisor.
+            builder = builder.fs(|fs| fs.tag(tag).path(&path));
+            shares.push((env, format!("{tag}:{at}")));
         }
-        None => None,
-    };
+    }
+
+    // A committable session's scratch. Shared rather than sent back over the channel: a
+    // layer can be hundreds of megabytes, and that channel is bounded by `MAX_PAYLOAD` and is
+    // also what the protocol itself runs on.
+    if let Some(out) = &args.commit_out {
+        builder = builder.fs(|fs| fs.tag(COMMIT_TAG).path(out));
+    }
 
     // What the stack wants the guest to know: its address, its gateway, its resolver. Passed
     // through as the stack spelled them — the names are `microsandbox-network`'s own, and this
@@ -151,12 +194,21 @@ fn run(args: BootArgs) -> anyhow::Result<Infallible> {
                 .path(GUEST_BIN_PATH)
                 .env(LOWER_ENV, GUEST_LOWER_DEV)
                 .env(UPPER_ENV, GUEST_UPPER_DEV);
-            let e = match &share {
-                Some(share) => e.env(SHARE_ENV, share),
-                None => e,
-            };
+            let e = shares.iter().fold(e, |e, (env, share)| e.env(*env, share));
             let e = match &args.abin {
                 Some(_) => e.env(ABIN_ENV, GUEST_ABIN_DEV),
+                None => e,
+            };
+            // Two values and not one: the first is read before `pivot_root` and the second
+            // after, and a guest with only the second could write a layer it had no way to
+            // see. See `COMMITTABLE_ENV`.
+            let e = if args.committable {
+                e.env(COMMITTABLE_ENV, "1")
+            } else {
+                e
+            };
+            let e = match &args.commit_out {
+                Some(_) => e.env(COMMIT_ENV, COMMIT_PATH),
                 None => e,
             };
             guest_net
@@ -184,23 +236,27 @@ fn main() -> std::process::ExitCode {
     }
 }
 
-/// The host directory to share, and `None` for a session that declared no tree.
+/// A host directory to share, and `None` for a tree the session did not name.
 ///
-/// UTF-8 because it has to be written into [`SHARE_ENV`] as `tag:path` and read back by the
+/// UTF-8 because it has to be written into that tree's env as `tag:path` and read back by the
 /// guest — a directory with no string form is one the two ends could not agree on, and this
 /// is the last place that can say so. Which is why it is checked here and not in
 /// [`BootArgs::parse`]: everything else there is a path this process only ever opens.
-fn workfs(path: Option<&Path>) -> anyhow::Result<Option<String>> {
+///
+/// `flag` is which argument the path arrived as, and is here only so that a refusal names it:
+/// the three trees are the same check, and a session that named all of them would otherwise be
+/// told that one of three paths it sent was wrong.
+fn shared(flag: &str, path: Option<&Path>) -> anyhow::Result<Option<String>> {
     let Some(path) = path else {
         return Ok(None);
     };
     anyhow::ensure!(
         path.is_absolute(),
-        "--workfs has to be an absolute path, and is {}",
+        "{flag} has to be an absolute path, and is {}",
         path.display()
     );
     let path = path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("--workfs is not utf-8: {}", path.display()))?;
+        .ok_or_else(|| anyhow::anyhow!("{flag} is not utf-8: {}", path.display()))?;
     Ok(Some(path.to_string()))
 }

@@ -6,4 +6,5 @@
 //! will both put their layers in. The server itself stays in the binary — what a console
 //! does with a session is answered over a channel, not called.
 
+pub mod built;
 pub mod layer;

@@ -8,16 +8,21 @@
 //!   nothing there can drift. It is also the whole of what they say to each other: a boot is
 //!   started, told, and never asked anything, which is what made `cortex-uvm-boot` a separate
 //!   binary rather than a rewrite.
-//! - **the boot process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`SHARE_ENV`],
-//!   [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]). The other end of
-//!   that one is `cortex-uvm-guest`'s `contract` module, which **has to change with this
+//! - **the boot process to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`CONTEXT_ENV`],
+//!   [`ARTIFACTS_ENV`], [`SCRATCH_ENV`], [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]).
+//!   The other end of that one is `cortex-uvm-guest`'s `contract` module, which **has to change with this
 //!   file** — that crate is built for a different target and takes nothing it does not need,
 //!   so the compiler will not notice a mismatch.
 //!
-//! Where the tree lands inside the guest is **the host's own path for it**, carried in
-//! [`SHARE_ENV`] like any other share. Not a constant of this crate's choosing: one spelling
-//! on both sides of the hypervisor is what lets a `cwd` the guest reports be a path the
-//! client can open, with nothing in the middle translating and nothing to disagree about.
+//! Where a tree lands inside the guest is **this crate's constant for it** —
+//! [`CONTEXT_PATH`], [`ARTIFACTS_PATH`], [`SCRATCH_PATH`] — carried in that tree's env
+//! alongside the tag. One name per role, the same in every session, so what a guest reports
+//! and what a client sends are the same three strings no matter which host directory is
+//! behind them.
+//!
+//! Three of them, one per tree a session can name, and three envs rather than one list
+//! because the guest does something different with one of them: it **stands** in the scratch.
+//! A list would carry the same three strings and leave the guest to work out which was which.
 //!
 //! The **guest** half is environment because that is the only channel libkrun's `exec` has:
 //! an argv and an env value alike become part of the guest's kernel command line, which is
@@ -71,16 +76,98 @@ pub const LOWER_ENV: &str = "CORTEX_UVM_LOWER";
 /// Told to the guest as `CORTEX_UVM_UPPER`.
 pub const UPPER_ENV: &str = "CORTEX_UVM_UPPER";
 
-/// Told to the guest as `CORTEX_UVM_SHARE`, spelled `tag:/guest/path`.
-pub const SHARE_ENV: &str = "CORTEX_UVM_SHARE";
+/// Told to the guest as `CORTEX_UVM_CONTEXT`, spelled `tag:/guest/path` — the tag is
+/// [`CONTEXT_TAG`] and the path is [`CONTEXT_PATH`].
+pub const CONTEXT_ENV: &str = "CORTEX_UVM_CONTEXT";
+
+/// The artifacts tree, spelled the same way. Absent for a session that named none.
+pub const ARTIFACTS_ENV: &str = "CORTEX_UVM_ARTIFACTS";
+
+/// The scratch tree, spelled the same way, and **where the guest stands** when there is one.
+pub const SCRATCH_ENV: &str = "CORTEX_UVM_SCRATCH";
+
+/// Where the context is mounted inside the guest.
+///
+/// **A name for the role and not for the directory behind it.** What a session is given is a
+/// directory somewhere on the host, and what it is *called* in here says which of the three
+/// trees it is — so a command reads `/context/src/main.rs` and a client sends the same
+/// string, in a session that would have spelled it `/Users/someone/project/src/main.rs` on
+/// the other side of the hypervisor and in another one that would have spelled it `/srv/wt/9`.
+///
+/// Three consequences, and all three are the reason:
+///
+/// - **A guest's paths do not name the host.** Where a caller keeps its projects is that
+///   caller's, and a path is the easiest thing in the world to leak — into a command's
+///   output, a log, a build artifact, a model's transcript.
+/// - **Two sessions over different directories are the same session to look at**, which is
+///   what makes a transcript comparable and a command reproducible.
+/// - **The guest's root stays a root.** Mounting at the host's own path means a guest with
+///   `/Users/someone/project` in it, which is a directory tree invented inside an image to
+///   mirror a stranger's laptop.
+///
+/// What it costs is that a mount point has two names, one per side — and nothing has to
+/// translate between them, because the protocol only ever speaks this one. The host answers
+/// `init` with it, the replayed `init` names it, the guest stands in it and reports it, and a
+/// `read`'s path arrives already spelled the way the guest has it. The other name is the
+/// caller's own [`Mount`](https://docs.rs/cortex/latest/cortex/fs/trait.Mount.html), which is
+/// the thing that put the directory there and never needed the protocol to tell it where.
+pub const CONTEXT_PATH: &str = "/context";
+
+/// Where the artifacts tree is mounted inside the guest — see [`CONTEXT_PATH`].
+pub const ARTIFACTS_PATH: &str = "/artifacts";
+
+/// Where the scratch tree is mounted inside the guest, and where a session stands when it has
+/// one — see [`CONTEXT_PATH`].
+pub const SCRATCH_PATH: &str = "/scratch";
 
 /// Where the guest is told to find `/abin`, as a device. Absent for a session that has none,
 /// which is a guest with no `/abin` at all rather than an empty one.
 pub const ABIN_ENV: &str = "CORTEX_UVM_ABIN";
 
-/// The virtio-fs tag the tree is attached under. Never seen by a caller: it is an
+/// The virtio-fs tag the context is attached under. Never seen by a caller: it is an
 /// identifier two device configurations agree on, and the guest mounts it by this name.
-pub const WORKFS_TAG: &str = "cortexws";
+pub const CONTEXT_TAG: &str = "cortexctx";
+
+/// The tag the artifacts tree is attached under.
+pub const ARTIFACTS_TAG: &str = "cortexart";
+
+/// The tag the scratch tree is attached under.
+///
+/// One device per tree rather than one device with three directories under it, because the
+/// host has three directories and no common parent to serve: each is somewhere the caller
+/// mounted it, and inventing a parent would mean the host arranging its own filesystem around
+/// what this protocol happens to carry.
+pub const SCRATCH_TAG: &str = "cortexscratch";
+
+/// The virtio-fs tag a committable session's scratch directory is shared under.
+pub const COMMIT_TAG: &str = "cortexcommit";
+
+/// Where the guest finds that scratch, and where it writes a commit's layer.
+///
+/// Not one of the three above and not reached the way they are: nothing outside this
+/// workspace names it, so it is a path the two halves of the commit agree on and no client
+/// ever sees.
+pub const COMMIT_PATH: &str = "/.cortex-commit";
+
+/// Set for a guest that has one. Its value is [`COMMIT_PATH`].
+pub const COMMIT_ENV: &str = "CORTEX_UVM_COMMIT";
+
+/// Set for a guest that may commit at all.
+///
+/// Separate from [`COMMIT_ENV`] because the two are read at different moments and decide
+/// different things: this one before `pivot_root`, to keep the old root rather than detach it,
+/// and that one after, to mount somewhere to write. A guest with the share and no kept root
+/// would have somewhere to put a layer and no way to see one.
+pub const COMMITTABLE_ENV: &str = "CORTEX_UVM_COMMITTABLE";
+
+/// What a commit's layer is called inside the scratch. One name, said once.
+pub const LAYER_TAR: &str = "layer.tar";
+
+/// Where a guest that kept its old root can reach the upperdir of the overlay it stands on.
+///
+/// The host cannot read that ext4 itself and the overlay offers the upper under no other
+/// name, so this is the only way a commit sees what a session wrote.
+pub const UPPER_DIR: &str = "/oldroot/mnt/upper/upper";
 
 /// Everything a console server tells a boot, as the boot's own command line.
 ///
@@ -120,6 +207,19 @@ pub struct BootArgs {
     /// The session's writable image, as a host path.
     pub session: PathBuf,
 
+    /// Whether this session may commit, which decides one thing at boot and nothing after:
+    /// the old root is kept rather than detached, so the guest can still reach the upperdir of
+    /// the overlay it is standing on.
+    pub committable: bool,
+
+    /// A directory on this host the guest may write a commit's layer into, shared in at
+    /// [`COMMIT_PATH`]. `None` for a session that cannot commit.
+    ///
+    /// Writable, unlike the `/abin` disk, and that is not a contradiction: `/abin` is a cache
+    /// every later session reads, where this is one session's scratch — made by the server,
+    /// thrown away with the session, and holding nothing but that session's own output.
+    pub commit_out: Option<PathBuf>,
+
     /// A read-only image of native executables to mount at `/abin`.
     ///
     /// `None` is a session that gets none. Always a raw EROFS and never a descriptor, so
@@ -128,8 +228,18 @@ pub struct BootArgs {
     pub abin: Option<PathBuf>,
 
     /// The host directory to put in front of the guest, and `None` for a session that declared
-    /// no tree. Mounted in the guest at **this same path** — see [`SHARE_ENV`].
-    pub workfs: Option<PathBuf>,
+    /// no tree. Mounted in the guest at [`CONTEXT_PATH`], which is where it is named from
+    /// there on — see [`CONTEXT_ENV`].
+    pub context: Option<PathBuf>,
+
+    /// Where the session leaves what it produces, and `None` for a session that named none.
+    /// Shared exactly as the context is, and mounted at [`ARTIFACTS_PATH`].
+    pub artifacts: Option<PathBuf>,
+
+    /// Room for the session to work in, and `None` for a session that named none. Shared as
+    /// the two above are, mounted at [`SCRATCH_PATH`], and additionally **where the guest
+    /// stands** — see [`SCRATCH_ENV`].
+    pub scratch: Option<PathBuf>,
 
     /// How much of a network the session gets. Decided by the server, because it decides a
     /// *device*, which is attached before a kernel comes up.
@@ -163,10 +273,19 @@ impl BootArgs {
     /// The arguments a server spawns a boot with, after [`BOOT_ARG`](crate::server::BOOT_ARG).
     ///
     /// `OsString` throughout: a path that is not UTF-8 is still a path, and nothing here has to
-    /// read one as text. The one exception is `workfs`, which the guest is told about as a
-    /// string, and that is refused where it is used rather than here.
+    /// read one as text. The exceptions are the three trees, which the guest is told about as
+    /// strings, and that is refused where it is used rather than here.
     pub fn to_args(&self) -> Vec<OsString> {
         let mut args: Vec<OsString> = Vec::new();
+
+        // First, before the closure below takes its borrow of `args`. This is the one flag
+        // that carries no value — it is a fact about the session rather than a thing with a
+        // spelling — so it cannot go through `put`, and where it sits does not matter to
+        // `parse`.
+        if self.committable {
+            args.push(OsString::from("--committable"));
+        }
+
         let mut put = |flag: &str, value: &OsStr| {
             args.push(OsString::from(flag));
             args.push(value.to_os_string());
@@ -182,11 +301,20 @@ impl BootArgs {
         for port in &self.host_ports {
             put("--host-port", OsStr::new(&port.to_string()));
         }
-        if let Some(workfs) = &self.workfs {
-            put("--workfs", workfs.as_os_str());
+        if let Some(context) = &self.context {
+            put("--context", context.as_os_str());
+        }
+        if let Some(artifacts) = &self.artifacts {
+            put("--artifacts", artifacts.as_os_str());
+        }
+        if let Some(scratch) = &self.scratch {
+            put("--scratch", scratch.as_os_str());
         }
         if let Some(abin) = &self.abin {
             put("--abin", abin.as_os_str());
+        }
+        if let Some(out) = &self.commit_out {
+            put("--commit-out", out.as_os_str());
         }
         if let Some(vcpus) = self.vcpus {
             put("--vcpus", OsStr::new(&vcpus.to_string()));
@@ -211,8 +339,12 @@ impl BootArgs {
         let mut session = None;
         let mut network = None;
         let mut host_ports = Vec::new();
-        let mut workfs = None;
+        let mut context = None;
+        let mut artifacts = None;
+        let mut scratch = None;
         let mut abin = None;
+        let mut committable = false;
+        let mut commit_out = None;
         let mut vcpus = None;
         let mut memory_mib = None;
 
@@ -234,8 +366,12 @@ impl BootArgs {
                 "--session" => session = Some(PathBuf::from(value()?)),
                 "--network" => network = Some(text(&flag, value()?)?),
                 "--host-port" => host_ports.push(number(&flag, value()?)?),
-                "--workfs" => workfs = Some(PathBuf::from(value()?)),
+                "--context" => context = Some(PathBuf::from(value()?)),
+                "--artifacts" => artifacts = Some(PathBuf::from(value()?)),
+                "--scratch" => scratch = Some(PathBuf::from(value()?)),
                 "--abin" => abin = Some(PathBuf::from(value()?)),
+                "--committable" => committable = true,
+                "--commit-out" => commit_out = Some(PathBuf::from(value()?)),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
                 other => anyhow::bail!("{other} is not an argument a boot takes"),
@@ -261,7 +397,11 @@ impl BootArgs {
                 None => anyhow::bail!("--network is missing — a boot is started by a server"),
             },
             host_ports,
-            workfs,
+            context,
+            artifacts,
+            scratch,
+            committable,
+            commit_out,
             abin,
             vcpus,
             memory_mib,
@@ -433,11 +573,47 @@ mod tests {
             session: "/tmp/session.ext4".into(),
             network: Network::Public,
             host_ports: vec![8080, 3000],
-            workfs: Some("/Users/someone/project".into()),
+            context: Some("/Users/someone/project".into()),
+            artifacts: Some("/Users/someone/out".into()),
+            scratch: Some("/Users/someone/scratch".into()),
             abin: Some("/cache/layers/sha256_2b91c4.erofs".into()),
+            committable: true,
+            commit_out: Some("/tmp/cortex-uvm-commit".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
         }
+    }
+
+    /// A committable session says both things, and an ordinary one says neither.
+    ///
+    /// The pair matters. A kept root with nowhere to write is a guest that can see what the
+    /// session wrote and cannot hand it over; somewhere to write with no kept root is the
+    /// reverse.
+    #[test]
+    fn a_committable_boot_says_so_and_names_somewhere_to_write() {
+        let args = args();
+        let back = BootArgs::parse(args.to_args()).unwrap();
+        assert!(back.committable);
+        assert_eq!(back.commit_out, args.commit_out);
+    }
+
+    #[test]
+    fn an_ordinary_boot_says_neither() {
+        let plain = BootArgs {
+            committable: false,
+            commit_out: None,
+            ..args()
+        };
+        let written = plain.to_args();
+        assert!(
+            !written
+                .iter()
+                .any(|arg| arg == "--committable" || arg == "--commit-out"),
+            "{written:?}"
+        );
+        let back = BootArgs::parse(written).unwrap();
+        assert!(!back.committable);
+        assert_eq!(back.commit_out, None);
     }
 
     /// A session with no `/abin` says nothing about one, and reads back as having none.
@@ -467,18 +643,27 @@ mod tests {
 
     /// The optional ones are absent rather than empty, and come back absent.
     ///
-    /// A session with no tree is the case that matters: an empty `--workfs` would be a
-    /// directory named by the empty string, and the boot would try to share it.
+    /// A session with no tree is the case that matters: an empty `--context` would be a
+    /// directory named by the empty string, and the boot would try to share it. The same goes
+    /// for the two trees beside it, which are shared by exactly the same mechanism.
     #[test]
     fn what_was_not_said_is_not_sent() {
         let bare = BootArgs {
-            workfs: None,
+            context: None,
+            artifacts: None,
+            scratch: None,
             vcpus: None,
             memory_mib: None,
             ..args()
         };
         let spelled = bare.to_args();
-        for flag in ["--workfs", "--vcpus", "--memory-mib"] {
+        for flag in [
+            "--context",
+            "--artifacts",
+            "--scratch",
+            "--vcpus",
+            "--memory-mib",
+        ] {
             assert!(
                 !spelled.iter().any(|arg| arg == flag),
                 "{flag} was sent anyway"

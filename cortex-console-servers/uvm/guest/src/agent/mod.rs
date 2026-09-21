@@ -73,11 +73,19 @@
 //! a client can name any file in the guest — which is a smaller claim than it sounds,
 //! since the guest is one session's overlay and the client is the one who asked for it.
 //!
-//! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
-//! the fallback, and this agent reads both and applies neither — so a command that never
-//! ends is one this agent waits on forever, and the client waits with it.
+//! `exec.timeout_ms` is enforced by a kill; `init` carries no default. An `exec` that
+//! names no timeout is therefore unbounded — a command that never ends is one this agent
+//! waits on forever, and the client waits with it.
+//!
+//! What a timed-out command started is killed with it, and this agent is the guest's
+//! PID 1: whatever those processes were parented to, their corpses come here, and nothing
+//! here reaps a child it did not spawn — a general `waitpid(-1)` would take statuses tokio
+//! is waiting on. A guest that times out many commands is a guest with that many zombie
+//! entries, which a session's lifetime bounds.
 //!
 //! [`cortex-local-console`]: https://docs.rs/cortex-local-console
+
+mod commit;
 
 use std::ffi::OsString;
 use std::io::{self, SeekFrom};
@@ -85,16 +93,21 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output, Stdio};
+use std::time::Duration;
 
 use cortex::console::stdio::StdioServer;
 use cortex::console::{
-    Call, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message, Notification,
-    ReadCall, ReadResp, Response, Server, WorkFsMount, WorkFsSource, WriteCall, WriteResp,
+    Call, CommitResp, Error, ExecCall, ExecResp, InitCall, InitResp, MAX_PAYLOAD, Message,
+    Notification, ReadCall, ReadResp, Response, Server, TreeMount, TreeRole, TreeSource, WriteCall,
+    WriteResp,
 };
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+use tokio::process::{Child, Command};
 
-use crate::contract::{ABIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec};
+use crate::contract::{
+    ABIN_PATH, COMMIT_ENV, COMMIT_PATH, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec,
+    LAYER_TAR, UPPER_DIR,
+};
 
 /// A command we found but could not start, and one we could not find at all.
 ///
@@ -221,6 +234,28 @@ pub async fn run(port: std::fs::File, image: ImageSpec) -> anyhow::Result<()> {
                     };
                     server.respond(id, answered).await?;
                 }
+
+                Call::Commit(_) => {
+                    // On a blocking thread: walking the upperdir and archiving it is as big
+                    // as what the session wrote, and doing it here would stop this task
+                    // reading the channel — so an `exec` already in flight could not be
+                    // answered and a `stop` could not even arrive.
+                    let outcome = match session.boot() {
+                        Ok(()) => {
+                            let plan = commit_plan(&session);
+                            tokio::task::spawn_blocking(move || plan.run())
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Response::Error(refused(
+                                        Error::IO_FAILED,
+                                        format!("writing this session's layer: {e}"),
+                                    ))
+                                })
+                        }
+                        Err(refusal) => Response::Error(refusal),
+                    };
+                    server.respond(id, outcome).await?;
+                }
             },
 
             // A response answers a request, and this end makes none.
@@ -247,8 +282,8 @@ fn greet(outgoing: &mut std::fs::File) -> io::Result<()> {
 /// runs on, and whether it has booted.
 ///
 /// The [`InitCall`] that produced it is not kept: everything in it that this end acts on is
-/// [`workfs`](Self::workfs), and the base and the reach are answered one boot up by the
-/// server that started this guest — see [`configure`](Self::configure).
+/// the three trees, and the base and the reach are answered one boot up by the server that
+/// started this guest — see [`configure`](Self::configure).
 ///
 /// **The same shape the host-local backend has**, deliberately: a client cannot tell which
 /// one answered it, so what a session *is* must not depend on which one did. What differs
@@ -257,10 +292,23 @@ fn greet(outgoing: &mut std::fs::File) -> io::Result<()> {
 struct Session {
     /// The tree the session works in, as `init` named it — and as it is mounted in here.
     ///
-    /// The same path on both sides of the hypervisor: the boot shares the host's directory
-    /// at its own path, so what the client was told and what this end opens are one string.
-    /// See `crate::init::share`.
-    workfs: Option<PathBuf>,
+    /// One string, because the `init` this end hears is the console server's replay and
+    /// names the tree by the guest's own mount point rather than by the host directory
+    /// behind it. So what the client was told, what that replay says, and what this end
+    /// opens are all `/context`. See `crate::init::share`.
+    context: Option<PathBuf>,
+
+    /// Where the session leaves what it produces, mounted in here on the same terms.
+    ///
+    /// Nothing in this agent treats it differently from the context: both are directories a
+    /// command reaches by path, and what the tree is *for* is the client's. Held so that a
+    /// boot can check it is there, which is the whole of this end's part in it.
+    artifacts: Option<PathBuf>,
+
+    /// Room for the session to work in, mounted in here on the same terms — and where the
+    /// session stands, which is the one way this end treats it differently. See
+    /// [`home`](Self::home).
+    scratch: Option<PathBuf>,
 
     /// Where the session stands, which is what an execution runs in and what a relative
     /// path in a file call resolves against.
@@ -291,22 +339,26 @@ impl Session {
 
     /// Take a new shape, answering what the client has to know about it.
     ///
-    /// The URL is read before anything is let go of, so a session this agent cannot take is
-    /// one it has not taken. Otherwise the old boot goes: the tree is what a boot checked
+    /// Every URL is read before anything is let go of, so a session this agent cannot take is
+    /// one it has not taken. Otherwise the old boot goes: the trees are what a boot checked
     /// for, and a boot from before this is a boot that no longer matches.
     fn configure(&mut self, config: InitCall) -> Result<InitResp, Error> {
-        let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+        let context = tree(config.context.as_ref(), TreeRole::Context)?;
+        let artifacts = tree(config.artifacts.as_ref(), TreeRole::Artifacts)?;
+        let scratch = tree(config.scratch.as_ref(), TreeRole::Scratch)?;
 
         self.release();
+        self.context = context;
+        self.artifacts = artifacts;
+        self.scratch = scratch;
         // A session with no tree stands where this process was put, which `init::prepare`
         // set to `/`. Saying so beats leaving the client to guess what a relative path means.
-        self.cwd = workfs.clone().or_else(|| std::env::current_dir().ok());
-        self.workfs = workfs;
+        self.cwd = self.home().or_else(|| std::env::current_dir().ok());
 
         Ok(InitResp {
-            workfs: self.workfs.as_deref().map(|path| WorkFsMount {
-                path: path.to_string_lossy().into_owned(),
-            }),
+            context: self.context.as_deref().map(placed),
+            artifacts: self.artifacts.as_deref().map(placed),
+            scratch: self.scratch.as_deref().map(placed),
             cwd: self.named_cwd(),
             // Nothing to say: this agent is running *inside* the base and never heard which
             // one it is. The answer the client sees is the console server's, one boot up.
@@ -321,6 +373,29 @@ impl Session {
     /// Where the session stands.
     fn cwd(&self) -> Option<&Path> {
         self.cwd.as_deref()
+    }
+
+    /// Where this session starts, and what `cd` with no argument goes back to — `None` for a
+    /// session that named no tree.
+    ///
+    /// **The scratch before the context**, which is the one thing this end does with the
+    /// difference between the three: a session handed room to work in starts in that room,
+    /// so a relative path a command writes does not land in the tree the client gave it.
+    /// `init::prepare` stands this process in the same place for the same reason, which is
+    /// what makes the two agree before an `init` has even arrived.
+    fn home(&self) -> Option<PathBuf> {
+        self.scratch.clone().or_else(|| self.context.clone())
+    }
+
+    /// Every tree this session named, with what to call each in a failure.
+    fn trees(&self) -> impl Iterator<Item = (TreeRole, &Path)> {
+        [
+            (TreeRole::Context, self.context.as_deref()),
+            (TreeRole::Artifacts, self.artifacts.as_deref()),
+            (TreeRole::Scratch, self.scratch.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(role, path)| path.map(|path| (role, path)))
     }
 
     /// The same, as the protocol can carry it.
@@ -350,19 +425,22 @@ impl Session {
             return Ok(());
         }
 
-        if let Some(workfs) = &self.workfs {
-            match std::fs::metadata(workfs) {
+        // Every tree the session named, because the boot shared every one of them and a
+        // client will send paths into all of them. The message says which: one code, three
+        // places it can be about.
+        for (role, at) in self.trees() {
+            match std::fs::metadata(at) {
                 Ok(meta) if meta.is_dir() => {}
                 Ok(_) => {
                     return Err(refused(
                         Error::MOUNT_FAILED,
-                        format!("{}: not a directory in the guest", workfs.display()),
+                        format!("{role} {}: not a directory in the guest", at.display()),
                     ));
                 }
                 Err(e) => {
                     return Err(refused(
                         Error::MOUNT_FAILED,
-                        format!("{}: not mounted in the guest: {e}", workfs.display()),
+                        format!("{role} {}: not mounted in the guest: {e}", at.display()),
                     ));
                 }
             }
@@ -388,7 +466,7 @@ impl Session {
     /// the way the *host* spells it, since the tree is mounted at the host's own path.
     fn change_dir(&mut self, argv: &[String]) -> Response {
         let target = match argv {
-            [] => match self.workfs.clone().or_else(|| self.cwd.clone()) {
+            [] => match self.home().or_else(|| self.cwd.clone()) {
                 Some(home) => home,
                 None => return builtin_failed("cd: this session stands nowhere to return to"),
             },
@@ -428,29 +506,45 @@ fn cd_target(exec: &ExecCall) -> Option<&[String]> {
     }
 }
 
-/// The directory a workfs URL names, or why it names none this agent can use.
+/// The directory one of a session's tree URLs names, or why it names none this agent can use
+/// — and `None` for a tree the session did not name.
 ///
 /// `file://` and nothing else. Inside a guest that is not a limitation the way it is on the
-/// host: whatever the tree is made of was realized before the VM started, and what reaches
-/// here is the directory it was mounted at.
-fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
-    let Some(path) = workfs.file_path() else {
+/// host: whatever a tree is made of was realized before the VM started, and what reaches here
+/// is the directory it was mounted at.
+///
+/// One function for all three, which is the same arrangement the host-local backend has and
+/// for the same reason: the trees differ in what the client means by them and not in how a
+/// URL is read. `role` is what makes a refusal name which of them it was about.
+fn tree(named: Option<&TreeSource>, role: TreeRole) -> Result<Option<PathBuf>, Error> {
+    let Some(named) = named else {
+        return Ok(None);
+    };
+
+    let Some(path) = named.file_path() else {
         return Err(refused(
-            Error::UNSUPPORTED_WORKFS,
+            role.unsupported(),
             format!(
-                "{}: a guest is handed a mounted directory, so file:// is the only kind it \
-                 can be told about",
-                workfs.scheme()
+                "{role}: {}: a guest is handed a mounted directory, so file:// is the only \
+                 kind it can be told about",
+                named.scheme()
             ),
         ));
     };
     if !path.is_absolute() {
         return Err(refused(
             Error::INVALID_PARAMS,
-            format!("{}: a file:// workfs needs an absolute path", workfs.url),
+            format!("{}: a file:// {role} needs an absolute path", named.url),
         ));
     }
-    Ok(path.to_path_buf())
+    Ok(Some(path.to_path_buf()))
+}
+
+/// Where a tree went, as the protocol carries it.
+fn placed(at: &Path) -> TreeMount {
+    TreeMount {
+        path: at.to_string_lossy().into_owned(),
+    }
 }
 
 /// `path` with `.` dropped and `..` popped, on paper and without touching the filesystem.
@@ -502,6 +596,11 @@ fn builtin_failed(message: impl Into<String>) -> Response {
 /// One request, one answer: the command is spawned, both of its pipes are drained, and
 /// what comes back is how it ended.
 ///
+/// `timeout_ms` is a kill, as the protocol promises: the command runs in a process group
+/// of its own so that what a shell spawned goes with it, and expiry answers
+/// [`TIMED_OUT`](Error::TIMED_OUT) with nothing of the partial output — a killed command
+/// has no result to report. No timeout is no limit, and the wait is the whole command's.
+///
 /// # Where it runs
 ///
 /// Where the session stands, set per command rather than inherited. A session moves — `cd`
@@ -517,17 +616,27 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .envs(environment(session))
-        // Piped and then read by `wait_with_output`, which is what carries the output
-        // back. Input is at EOF from the start, since an `exec` carries none.
+        // Piped and then read by `run_to_end`, which is what carries the output back.
+        // Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Dropping `child` below kills and reaps the direct child, which is how a command
+        // that timed out is cleaned up after the group kill has reached what it spawned —
+        // and how one that ends this function early, by any other return, is not left
+        // running.
+        .kill_on_drop(true)
+        // Its own process group, so a `killpg` here reaches everything the command started
+        // — `sh -c 'a & b'` leaves two children of its own — and so that the group is this
+        // command's alone: the `killpg` below never reaches this agent, which as the
+        // guest's PID 1 is not a process a stray signal may end.
+        .process_group(0);
 
     if let Some(dir) = session.cwd() {
         cmd.current_dir(dir);
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let code = match e.kind() {
@@ -540,11 +649,79 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
             ));
         }
     };
+    // Taken now: a reaped child has no id, and the kill below wants the one it was born
+    // with — which is also its group's, by `process_group(0)`.
+    let pid = child.id();
 
-    // `wait_with_output` is what keeps both pipes draining while the command runs: a
-    // command that fills a pipe nobody is reading stops there, and neither of these is
-    // read anywhere else.
-    finished(child.wait_with_output().await)
+    let waited = match exec.timeout_ms {
+        None => run_to_end(&mut child).await,
+        Some(ms) => {
+            // `run_to_end` borrows the child rather than taking it, so expiry leaves
+            // `child` — alive, unkilled and unreaped — in this frame for the kill below.
+            match tokio::time::timeout(Duration::from_millis(ms), run_to_end(&mut child)).await {
+                Ok(output) => output,
+                Err(_elapsed) => {
+                    // Everything the command started is in the group the spawn put it in,
+                    // so one signal to the group ends all of it, the direct child included.
+                    // `kill_on_drop` is not what does the killing here — dropping `child`
+                    // on the way out is what reaps the leader once the signal has landed.
+                    if let Some(pid) = pid {
+                        // SAFETY: a plain libc call, and `pid` names this command's process
+                        // group and no other. It is the group id this process created with
+                        // `process_group(0)`, and it is still that group's: `timeout` only
+                        // expires while `run_to_end` is pending, and while it is pending the
+                        // direct child — the group's leader — has not been reaped (see
+                        // `run_to_end`). An unreaped process keeps its pid, running or
+                        // zombie, so the kernel cannot have handed this id to anything else.
+                        unsafe {
+                            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                        }
+                    }
+                    return Response::Error(refused(
+                        Error::TIMED_OUT,
+                        format!("killed after {ms}ms"),
+                    ));
+                }
+            }
+        }
+    };
+
+    finished(waited)
+}
+
+/// Drain both pipes to EOF, then reap the child — in that order, and the order is the point.
+///
+/// This is what `std`'s `wait_with_output` does and tokio's does not: tokio's waits and
+/// reads concurrently, reaping the direct child the moment it exits while whatever it
+/// spawned may still hold the pipes open. Reaping last keeps the direct child unreaped — a
+/// zombie, once it has exited — for as long as anything is still writing, and an unreaped
+/// process keeps its pid. Since that pid is also the id of the process group the command
+/// was spawned into, the group id stays this command's until this future completes, which
+/// is what lets [`execute`] aim a `killpg` at it after a timeout: the timeout can only fire
+/// while this is pending, and while this is pending the leader is still there.
+///
+/// Both pipes are read at once because a command that fills a pipe nobody is reading stops
+/// there, and read to EOF rather than to some size because what to keep of the result is
+/// [`finished`]'s decision, not this function's.
+async fn run_to_end(child: &mut Child) -> io::Result<Output> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (stdout, stderr) = tokio::try_join!(read_to_end(&mut stdout), read_to_end(&mut stderr))?;
+    let status = child.wait().await?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Everything a pipe has to give, or nothing from a pipe that was never opened.
+async fn read_to_end<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    if let Some(pipe) = pipe {
+        pipe.read_to_end(&mut buf).await?;
+    }
+    Ok(buf)
 }
 
 /// The environment variables an execution is given: whatever the image stated, plus the two
@@ -746,6 +923,93 @@ fn file_error(e: io::Error, path: &str) -> Error {
         _ => Error::IO_FAILED,
     };
     refused(code, format!("{path}: {e}"))
+}
+
+/// Everything a commit needs to know, worked out while the session is still in hand.
+///
+/// Separated from the writing so that the writing can be handed to a thread: what it takes is
+/// a few paths, where a [`Session`] is neither `Send` nor something to hold across one.
+enum CommitPlan {
+    /// Nothing was arranged for this at boot, so there is nothing to do but say so.
+    NotCommittable,
+    Write {
+        into: PathBuf,
+        excluded: Vec<PathBuf>,
+        mount_points: Vec<PathBuf>,
+    },
+}
+
+impl CommitPlan {
+    /// Write this session's layer where the host can read it.
+    ///
+    /// The answer carries no image, because this end has no idea what one is: it has written a
+    /// tar and that is the whole of what it knows. The console server turns it into one.
+    fn run(self) -> Response {
+        let CommitPlan::Write {
+            into,
+            excluded,
+            mount_points,
+        } = self
+        else {
+            return Response::Error(refused(
+                Error::INVALID_REQUEST,
+                "this session was not booted able to commit",
+            ));
+        };
+        match commit::write_layer(Path::new(UPPER_DIR), &into, &excluded, &mount_points) {
+            // No image: this end wrote a tar and has no idea what an image is. The console
+            // server fills that in on the way past — see `CommitResp`.
+            Ok(size) => Response::Commit(CommitResp { size, image: None }),
+            Err(e) => Response::Error(refused(
+                Error::IO_FAILED,
+                format!("writing this session's layer: {e}"),
+            )),
+        }
+    }
+}
+
+/// What this session would commit, and where.
+///
+/// A commit needs two things arranged while booting — the root holding this overlay's upper,
+/// and somewhere to write the result — and a session that did not say it might commit has
+/// neither. It cannot be given them now, so it is told rather than half-answered.
+fn commit_plan(session: &Session) -> CommitPlan {
+    let Ok(scratch) = std::env::var(COMMIT_ENV) else {
+        return CommitPlan::NotCommittable;
+    };
+
+    // Everything the console server and this agent put in the session's own filesystem. None
+    // of it is the session's work, and one of them is this binary.
+    let mut excluded: Vec<PathBuf> = [GUEST_BIN_PATH, "/oldroot", ABIN_PATH, COMMIT_PATH]
+        .iter()
+        .map(|path| PathBuf::from(path.trim_start_matches('/')))
+        .collect();
+    // Written into the session while it was up, by the network setup rather than by anything
+    // the session did. Docker leaves this file out of a commit too, and for the same reason.
+    //
+    // Named by the constant the writer uses rather than spelled again: two spellings of one
+    // path are two that drift, and the way this one would drift is silently — a committed
+    // image carrying a nameserver that belonged to a VM which no longer exists.
+    excluded.push(inside_upper(Path::new(crate::contract::RESOLV_CONF)));
+
+    // A mount point rather than a plain exclusion: the directories on the way to one exist
+    // only to reach it, and go with it.
+    let mount_points: Vec<PathBuf> = session
+        .context
+        .as_deref()
+        .map(|path| vec![inside_upper(path)])
+        .unwrap_or_default();
+
+    CommitPlan::Write {
+        into: Path::new(&scratch).join(LAYER_TAR),
+        excluded,
+        mount_points,
+    }
+}
+
+/// An absolute path in the guest, as the path it has inside the upperdir.
+fn inside_upper(path: &Path) -> PathBuf {
+    path.strip_prefix("/").unwrap_or(path).to_path_buf()
 }
 
 /// An execution that ended, as the answer to the `exec` that asked for it.

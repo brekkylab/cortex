@@ -970,7 +970,9 @@ mod tests {
     fn a_directory_name_says_which_kind_it_is() {
         let id = "2fd2589f-40ea-8115-95e3-c4970d29590c";
         assert!(matches!(node(&format!("자료실__{id}")), Node::Page(x) if x == id));
-        assert!(matches!(node(&format!("프로젝트_자료실__db__{id}")), Node::Database(x) if x == id));
+        assert!(
+            matches!(node(&format!("프로젝트_자료실__db__{id}")), Node::Database(x) if x == id)
+        );
     }
 
     /// The marker cannot be forged by a title, because `sanitize_name` folds runs of

@@ -81,7 +81,7 @@ impl Error {
     /// file is whatever it is, and a requester that needs to know asks with a `read`.
     pub const IO_FAILED: i64 = -32007;
 
-    /// `init`: a workfs URL whose scheme this server has no provider for, named in the
+    /// `init`: a context URL whose scheme this server has no provider for, named in the
     /// message.
     ///
     /// `init`'s own, and not deferred to the call that needs a session, because it is
@@ -89,12 +89,12 @@ impl Error {
     /// about the *build*, and answering a path for a tree that can never be there would be
     /// a session in which every later path is a lie.
     ///
-    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the workfs
+    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the context
     /// is well formed and the server is the wrong build for it — a different binary, or a
     /// different URL.
-    pub const UNSUPPORTED_WORKFS: i64 = -32008;
+    pub const UNSUPPORTED_CONTEXT: i64 = -32008;
 
-    /// `exec`, `read`, `write`: the workfs could not be put where `init` said it would be —
+    /// `exec`, `read`, `write`: the context could not be put where `init` said it would be —
     /// no mount binding compiled in, no FUSE provider installed, the mount point busy, the
     /// store itself unreachable.
     ///
@@ -106,7 +106,7 @@ impl Error {
 
     /// `init`: a network reach this server cannot provide, named in the message.
     ///
-    /// `init`'s own, for the reason [`UNSUPPORTED_WORKFS`](Self::UNSUPPORTED_WORKFS) is:
+    /// `init`'s own, for the reason [`UNSUPPORTED_CONTEXT`](Self::UNSUPPORTED_CONTEXT) is:
     /// which reaches a server can answer is a fact about the build and the machine, knowable
     /// the moment the frame is read.
     ///
@@ -130,6 +130,36 @@ impl Error {
 
     /// The four the spec defines that a peer of ours can hit. `-32700` (parse
     /// error) belongs to whoever reads the frame, not here.
+    /// The session named a built image this server does not have.
+    ///
+    /// Distinct from [`UNSUPPORTED_IMAGE`](Self::UNSUPPORTED_IMAGE), which says the backend
+    /// can swap no base at all: a client hearing this one can build the thing, where a client
+    /// hearing that one has to ask for something else.
+    ///
+    /// Said at `init`, unlike a reference that cannot be fetched — which is a boot that
+    /// failed. The difference is what finding out costs: whether an image built here is still
+    /// here is a file test, where whether a registry has one is a network round trip that
+    /// belongs to a boot.
+    pub const UNKNOWN_IMAGE: i64 = -32012;
+
+    /// `init`: an [`artifacts`](crate::console::InitCall::artifacts) URL whose scheme this
+    /// server has no provider for, named in the message.
+    ///
+    /// [`UNSUPPORTED_CONTEXT`](Self::UNSUPPORTED_CONTEXT)'s reasoning, applied to the tree a
+    /// session leaves its output in — and a code of its own rather than that one because a
+    /// session names up to three trees, and a client hearing that its session was refused
+    /// has to know *which* of them the build cannot take. The two failures also differ in
+    /// what a client can do about them: a session with no context has nothing to work on,
+    /// where one with nowhere to put its output can often be asked for again without it.
+    pub const UNSUPPORTED_ARTIFACTS: i64 = -32013;
+
+    /// `init`: a [`scratch`](crate::console::InitCall::scratch) URL whose scheme this server
+    /// has no provider for, named in the message.
+    ///
+    /// The third of the set, for the reason
+    /// [`UNSUPPORTED_ARTIFACTS`](Self::UNSUPPORTED_ARTIFACTS) is the second.
+    pub const UNSUPPORTED_SCRATCH: i64 = -32014;
+
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;
@@ -167,10 +197,13 @@ mod tests {
             ("NOT_FOUND", Error::NOT_FOUND),
             ("IS_A_DIRECTORY", Error::IS_A_DIRECTORY),
             ("IO_FAILED", Error::IO_FAILED),
-            ("UNSUPPORTED_WORKFS", Error::UNSUPPORTED_WORKFS),
+            ("UNSUPPORTED_CONTEXT", Error::UNSUPPORTED_CONTEXT),
             ("MOUNT_FAILED", Error::MOUNT_FAILED),
             ("UNSUPPORTED_NETWORK", Error::UNSUPPORTED_NETWORK),
             ("UNSUPPORTED_IMAGE", Error::UNSUPPORTED_IMAGE),
+            ("UNKNOWN_IMAGE", Error::UNKNOWN_IMAGE),
+            ("UNSUPPORTED_ARTIFACTS", Error::UNSUPPORTED_ARTIFACTS),
+            ("UNSUPPORTED_SCRATCH", Error::UNSUPPORTED_SCRATCH),
             ("INVALID_REQUEST", Error::INVALID_REQUEST),
             ("METHOD_NOT_FOUND", Error::METHOD_NOT_FOUND),
             ("INVALID_PARAMS", Error::INVALID_PARAMS),

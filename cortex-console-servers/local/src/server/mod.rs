@@ -21,13 +21,22 @@
 //! against a backend where they are *not* free — one with a kernel to bring up — talks to
 //! this one without changing.
 //!
-//! # The tree, and where the session stands in it
+//! # The trees, and where the session stands in them
 //!
-//! A `file://` workfs is a directory this host already has, so **realizing one is checking
-//! a claim rather than mounting anything**: `init` reads the URL and answers with the path
-//! it names, and the boot is what has to find a directory there. Any other scheme is
-//! [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) at `init`, because whether this build
-//! can realize a kind is knowable the moment the frame is read — see [`directory_url`].
+//! A `file://` tree is a directory this host already has, so **realizing one is checking a
+//! claim rather than mounting anything**: `init` reads the URL and answers with the path it
+//! names, and the boot is what has to find a directory there. Any other scheme is refused at
+//! `init`, because whether this build can realize a kind is knowable the moment the frame is
+//! read — see [`tree`], which is that check for all three of them.
+//!
+//! The three are the same work here and differ only in what the client means by them, so
+//! this server holds each as a path and treats them alike — with two exceptions. A session
+//! **starts in its scratch** when it has one, and in its context otherwise; see
+//! [`home`](Session::home) for why the scratch comes first. And **the context is read-only**:
+//! a `write` that lands in it is refused rather than performed, because that tree is the one
+//! the session was given and not one it was given to fill. See
+//! [`read_only`](Session::read_only), which is also where the limit of that is written down —
+//! a spawned command runs on this host and writes wherever this host lets it.
 //!
 //! Where the session *stands* starts there and moves only through [`cd`](Session::change_dir),
 //! which this server answers itself: it is a shell builtin rather than a program, so an
@@ -47,7 +56,9 @@
 //! name the same file. See [`at`], which is the whole of that agreement.
 //!
 //! It is a place to stand and not a confinement: an absolute path, or one with enough `..`,
-//! still leaves the tree.
+//! still leaves the tree. What a path *is* checked for is the context, which a `write` may
+//! not land in — and the check resolves the path first ([`resolved`]), so leaving the tree
+//! that way is leaving it rather than a way around the rule.
 //!
 //! Both boot the session first, because that rule is the protocol's rather than this
 //! backend's — and here it is also what checks that the directory they resolve in is there
@@ -73,10 +84,9 @@
 //! What that would take is a shell kept alive across executions, which is a different
 //! backend rather than a line of code.
 //!
-//! Neither timeout is enforced. An `exec` carries a `timeout_ms` and an `init` carries
-//! the `default_timeout_ms` to fall back on, and this server reads both and applies
-//! neither — so a command that never ends is a command this server waits on forever, and
-//! the client waits with it.
+//! `exec.timeout_ms` is enforced by a kill; `init` carries no default. An `exec` that
+//! names no timeout is therefore unbounded — a command that never ends is one this server
+//! waits on forever, and the client waits with it.
 
 use std::{
     ffi::OsString,
@@ -84,16 +94,17 @@ use std::{
     os::unix::process::ExitStatusExt as _,
     path::{Component, Path, PathBuf},
     process::{ExitStatus, Output, Stdio},
+    time::Duration,
 };
 
 use cortex::console::{
     Call, Error, ExecCall, ExecResp, ImageSource, InitCall, InitResp, MAX_PAYLOAD, Message,
-    NetworkAccess, Notification, ReadCall, ReadResp, Response, Server, WorkFsMount, WorkFsSource,
-    WriteCall, WriteResp, stdio::StdioServer,
+    NetworkAccess, Notification, ReadCall, ReadResp, Response, Server, TreeMount, TreeRole,
+    TreeSource, WriteCall, WriteResp, stdio::StdioServer,
 };
 use tokio::{
-    io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
-    process::Command,
+    io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _},
+    process::{Child, Command},
 };
 
 /// A command we found but could not start, and one we could not find at all.
@@ -147,7 +158,7 @@ pub async fn run() -> anyhow::Result<()> {
             Message::Notification(Notification::Stop) => session.release(),
 
             Message::Request { id, call } => match call {
-                // A session is taken or it is not: a workfs this server cannot put
+                // A session is taken or it is not: a context this server cannot put
                 // anywhere is refused rather than answered with a path, since a path is
                 // what every later call the client makes would be spelled in.
                 Call::Init(init) => {
@@ -188,10 +199,24 @@ pub async fn run() -> anyhow::Result<()> {
 
                 Call::Write(write) => {
                     let answered = match session.boot() {
-                        Ok(()) => write_file(session.cwd(), &write).await,
+                        Ok(()) => write_file(&session, &write).await,
                         Err(e) => Response::Error(e),
                     };
                     server.respond(id, answered).await?;
+                }
+
+                // Nothing to keep. Commands here run on this host's own filesystem, so a
+                // session writes into whatever was already there rather than over a base —
+                // there is no difference to hand back, and pretending otherwise would mean
+                // committing the host. The same refusal an image gets, for the same reason.
+                Call::Commit(_) => {
+                    let refusal = refused(
+                        Error::UNSUPPORTED_IMAGE,
+                        "commands here run on this host's own filesystem, so a session writes \
+                         over nothing and has nothing to keep — committing needs a backend that \
+                         runs them somewhere else",
+                    );
+                    server.respond(id, Response::Error(refusal)).await?;
                 }
             },
 
@@ -209,25 +234,51 @@ pub async fn run() -> anyhow::Result<()> {
 /// whether it has booted.
 ///
 /// The [`InitCall`] that produced it is not kept, because on this backend there is nothing left
-/// of it to keep: the tree becomes [`workfs`](Self::workfs), and the base and the reach are
+/// of it to keep: the tree becomes [`context`](Self::context), and the base and the reach are
 /// checked at `init` and refused there — a session that exists is one that asked for what
 /// this backend has, so holding the request would be holding an answer already given.
 #[derive(Default)]
 struct Session {
-    /// The directory a `file://` workfs named, or `None` for a session that has none.
+    /// The directory a `file://` context named, or `None` for a session that has none.
     ///
     /// Kept apart from [`cwd`](Self::cwd) because they answer different questions and stop
-    /// being the same path the first time a command runs `cd`: this one is the tree, and it
-    /// is what `cd` with no argument goes back to.
-    workfs: Option<PathBuf>,
+    /// being the same path the first time a command runs `cd`: this one is the tree, and
+    /// [`home`](Self::home) is what `cd` with no argument goes back to.
+    context: Option<PathBuf>,
+
+    /// The context as this host resolves it, and `None` until a boot has found it.
+    ///
+    /// What a write is checked against, and a second path rather than a use of
+    /// [`context`](Self::context) because the two answer different questions. That one is
+    /// the spelling the client was told and has to stay exactly as it arrived; this one is
+    /// the directory that spelling reaches, which is the only form a `..` or a symlink can
+    /// be compared through. It is taken at the boot that canonicalizes the tree anyway —
+    /// see [`boot`](Self::boot) — so the check costs a boot and not a write.
+    context_real: Option<PathBuf>,
+
+    /// The directory a `file://` artifacts named, or `None` for a session that leaves
+    /// nothing anybody collects.
+    ///
+    /// Nothing on this backend treats it differently from the context — both are directories
+    /// this host already has, and a command reaches either by path. What it is *for* is the
+    /// client's, and the whole of this server's part in it is to check that it is there and
+    /// say where.
+    artifacts: Option<PathBuf>,
+
+    /// The directory a `file://` scratch named, or `None` for a session that works wherever
+    /// it can write.
+    ///
+    /// Where the session starts, which is the one way this backend treats it differently
+    /// from the two above — see [`home`](Self::home).
+    scratch: Option<PathBuf>,
 
     /// Where the session stands, which is what an execution runs in and what a relative
     /// path in a file call is resolved against.
     ///
-    /// The workfs when there is one, this process's own directory when there is not, and
-    /// `None` when even that could not be read — a session that then names nothing and
-    /// leaves every path as it arrives, which is what this backend did before it had a tree
-    /// to stand in.
+    /// [`home`](Self::home) to begin with, this process's own directory when the session
+    /// named no tree at all, and `None` when even that could not be read — a session that
+    /// then names nothing and leaves every path as it arrives, which is what this backend
+    /// did before it had a tree to stand in.
     ///
     /// **Not part of what booting produced**, so a `stop` does not disturb it: a `PathBuf`
     /// is not occupancy, and a client that ran a `cd`, went idle and came back should not
@@ -237,7 +288,7 @@ struct Session {
     /// Whether the directory `init` named has been found where it said it would be.
     ///
     /// A flag and not a resource, because on this backend booting *is* the check: a
-    /// `file://` workfs is a directory this host already has, so there is nothing to bring
+    /// `file://` context is a directory this host already has, so there is nothing to bring
     /// up and nothing to hand back. What it earns is that the check happens once per boot
     /// rather than once per request, and that `stop` means the same thing here as on a
     /// backend where it costs something.
@@ -255,7 +306,13 @@ impl Session {
     /// from before this is a boot that no longer matches the session. Releasing it is
     /// enough — the next call that needs one boots again, against what has just arrived.
     fn configure(&mut self, config: InitCall) -> Result<InitResp, Error> {
-        let workfs = config.workfs.as_ref().map(directory_url).transpose()?;
+        // All three before anything is let go of, and each with the code its own member is
+        // refused by: a session this server cannot take whole is one it has not taken at
+        // all, so a client whose artifacts tree is a scheme this build has no provider for
+        // keeps the session it already had.
+        let context = tree(config.context.as_ref(), TreeRole::Context)?;
+        let artifacts = tree(config.artifacts.as_ref(), TreeRole::Artifacts)?;
+        let scratch = tree(config.scratch.as_ref(), TreeRole::Scratch)?;
         base(config.image.as_ref())?;
         reach(config.network.as_ref())?;
 
@@ -264,17 +321,18 @@ impl Session {
         // through the one ordered teardown as a `stop` does.
         self.release();
 
-        // A session with no tree still stands somewhere — this process's own directory,
-        // which is where a spawned command would have run anyway. Saying so is better than
-        // leaving the client to guess what a relative path would mean.
-        self.cwd = workfs.clone().or_else(|| std::env::current_dir().ok());
-        self.workfs = workfs;
+        self.context = context;
+        self.artifacts = artifacts;
+        self.scratch = scratch;
+        // A session with no tree at all still stands somewhere — this process's own
+        // directory, which is where a spawned command would have run anyway. Saying so is
+        // better than leaving the client to guess what a relative path would mean.
+        self.cwd = self.home().or_else(|| std::env::current_dir().ok());
 
         Ok(InitResp {
-            workfs: self.workfs.as_deref().map(|path| WorkFsMount {
-                // The URL it came from was a `String`, so this one round-trips.
-                path: path.to_string_lossy().into_owned(),
-            }),
+            context: self.context.as_deref().map(placed),
+            artifacts: self.artifacts.as_deref().map(placed),
+            scratch: self.scratch.as_deref().map(placed),
             // A directory with no `String` form is one the client could not have used, so
             // it is left unsaid rather than sent lossily — the rule a `cwd` follows
             // everywhere in this protocol.
@@ -306,12 +364,66 @@ impl Session {
     /// It is still not a no-op: the next call that needs a session checks again, which is
     /// what a client that sent `stop` because the tree might go away is asking for.
     fn release(&mut self) {
+        self.context_real = None;
         self.booted = false;
+    }
+
+    /// Refuse `path` if it is in the context, which is the tree this session reads and does
+    /// not write.
+    ///
+    /// **The context is read-only**, and this is where that is true of a file call: what a
+    /// session produces belongs in its artifacts and what it needs room for belongs in its
+    /// scratch, so a `write` landing in the tree the client was already keeping is a mistake
+    /// to answer rather than to carry out. The uvm backend says the same thing with a mount
+    /// flag and the guest kernel answers `EROFS`; this backend mounts nothing, so the check
+    /// is here and the code is the one that arrives from there —
+    /// [`IO_FAILED`](Error::IO_FAILED), which is what a read-only filesystem refusing a write
+    /// already came back as. A client hears one answer from both backends.
+    ///
+    /// **Only the file calls, and only this backend's honesty about it.** A command this
+    /// server spawns runs on the host with the session's own privileges, so `sh -c 'echo x >
+    /// ctx/f'` writes — there is no mount to be read-only and no confinement here (see
+    /// [`at`]). What this stops is the protocol being the thing that did it.
+    fn read_only(&self, path: &Path) -> Option<Error> {
+        let context = self.context_real.as_deref()?;
+        resolved(path).starts_with(context).then(|| {
+            refused(
+                Error::IO_FAILED,
+                format!(
+                    "{}: read-only file system — the context is the tree this session was \
+                     given, and what it writes belongs in its artifacts or its scratch",
+                    path.display()
+                ),
+            )
+        })
+    }
+
+    /// Where this session starts, and what `cd` with no argument goes back to — `None` for
+    /// a session that named no tree.
+    ///
+    /// **The scratch before the context**, which is the one thing this backend does with the
+    /// difference between the three. A session stands somewhere before it is told anything
+    /// and every relative path a command writes lands there, so standing in the context makes
+    /// the tree the client *gave* the session the default destination for everything it
+    /// produces. A session handed room to work in starts in that room.
+    fn home(&self) -> Option<PathBuf> {
+        self.scratch.clone().or_else(|| self.context.clone())
+    }
+
+    /// Every tree this session named, with what to call each in a failure.
+    fn trees(&self) -> impl Iterator<Item = (TreeRole, &Path)> {
+        [
+            (TreeRole::Context, self.context.as_deref()),
+            (TreeRole::Artifacts, self.artifacts.as_deref()),
+            (TreeRole::Scratch, self.scratch.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(role, path)| path.map(|path| (role, path)))
     }
 
     /// Bring the session up if nothing has: the tree where `init` said it would be.
     ///
-    /// Realizing a `file://` workfs is **checking a claim rather than mounting anything** —
+    /// Realizing a `file://` context is **checking a claim rather than mounting anything** —
     /// the directory is one this host already has — and it happens here rather than at
     /// `init` because that is where the protocol puts it: `init` says where the tree will
     /// be, and a boot is what has to find it there. A directory that is not there is the
@@ -325,24 +437,35 @@ impl Session {
         // Canonicalizing is the check: it fails for a directory that is not there, and
         // asking for the resolved path is what makes the failure specific rather than a
         // `stat` that could have been about anything on the way down.
-        if let Some(workfs) = &self.workfs {
-            match workfs.canonicalize() {
-                Ok(physical) if physical.is_dir() => {}
+        //
+        // Every tree the session named, because every one of them is a path the client will
+        // send afterwards — an artifacts directory that is not there fails the first write
+        // into it rather than here, which is the same wrong moment a missing context used to
+        // fail at. The message names which tree it was: one code, three places it can be.
+        let mut context_real = None;
+        for (role, at) in self.trees() {
+            match at.canonicalize() {
+                Ok(physical) if physical.is_dir() => {
+                    if role == TreeRole::Context {
+                        context_real = Some(physical);
+                    }
+                }
                 Ok(_) => {
                     return Err(refused(
                         Error::MOUNT_FAILED,
-                        format!("{}: not a directory", workfs.display()),
+                        format!("{role} {}: not a directory", at.display()),
                     ));
                 }
                 Err(e) => {
                     return Err(refused(
                         Error::MOUNT_FAILED,
-                        format!("{}: {e}", workfs.display()),
+                        format!("{role} {}: {e}", at.display()),
                     ));
                 }
             }
         }
 
+        self.context_real = context_real;
         self.booted = true;
         Ok(())
     }
@@ -371,9 +494,9 @@ impl Session {
     /// stats what it produced.
     fn change_dir(&mut self, argv: &[String]) -> Response {
         let target = match argv {
-            // `cd` with nothing is the tree it started in, which is this session's spelling
-            // of what `$HOME` is to a shell.
-            [] => match self.workfs.clone().or_else(|| self.cwd.clone()) {
+            // `cd` with nothing is where the session started, which is this session's
+            // spelling of what `$HOME` is to a shell.
+            [] => match self.home().or_else(|| self.cwd.clone()) {
                 Some(home) => home,
                 None => return builtin_failed("cd: this session stands nowhere to return to"),
             },
@@ -503,24 +626,34 @@ fn reach(asked: Option<&NetworkAccess>) -> Result<(), Error> {
     ))
 }
 
-/// The directory a workfs URL names, or why it names none this server can use.
+/// The directory one of a session's tree URLs names, or why it names none this server can
+/// use — and `None` for a tree the session did not name.
 ///
 /// `file://` and nothing else, which is the whole of what this build realizes — and the
-/// scheme is where that is decided, not the path, so anything else is
-/// [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) naming what was asked for.
+/// scheme is where that is decided, not the path, so anything else is refused with the code
+/// belonging to [`role`](TreeRole), naming what was asked for.
 ///
-/// Reading the URL is [`WorkFsSource`]'s, so that this server and any other realize the same
+/// **One function for all three**, because realizing a tree on this backend is the same work
+/// whichever it is: the three differ in what the client means by them, and this server's part
+/// is a directory that is there or is not. What `role` buys is that a refusal says which tree
+/// it was about — the client sent up to three URLs and has to know which one to change.
+///
+/// Reading the URL is [`TreeSource`]'s, so that this server and any other realize the same
 /// string the same way. What is left here is the two refusals, which are this build's: a
 /// scheme it has no provider for, and a path that is not absolute — `file://srv/x`, whose
 /// authority is not something this can honour and whose path two ends would resolve
 /// differently.
-fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
-    let Some(path) = workfs.file_path() else {
+fn tree(named: Option<&TreeSource>, role: TreeRole) -> Result<Option<PathBuf>, Error> {
+    let Some(named) = named else {
+        return Ok(None);
+    };
+
+    let Some(path) = named.file_path() else {
         return Err(refused(
-            Error::UNSUPPORTED_WORKFS,
+            role.unsupported(),
             format!(
-                "{}: this server realizes file:// and nothing else",
-                workfs.scheme()
+                "{role}: {}: this server realizes file:// and nothing else",
+                named.scheme()
             ),
         ));
     };
@@ -528,10 +661,19 @@ fn directory_url(workfs: &WorkFsSource) -> Result<PathBuf, Error> {
     if !path.is_absolute() {
         return Err(refused(
             Error::INVALID_PARAMS,
-            format!("{}: a file:// workfs needs an absolute path", workfs.url),
+            format!("{}: a file:// {role} needs an absolute path", named.url),
         ));
     }
-    Ok(path.to_path_buf())
+    Ok(Some(path.to_path_buf()))
+}
+
+/// Where a tree went, as the protocol carries it.
+///
+/// The URL it came from was a `String`, so this one round-trips.
+fn placed(at: &Path) -> TreeMount {
+    TreeMount {
+        path: at.to_string_lossy().into_owned(),
+    }
 }
 
 /// A builtin that ran and failed, the way the shell builtin it stands in for would: a code
@@ -564,12 +706,48 @@ fn at(root: Option<&Path>, path: &str) -> PathBuf {
     }
 }
 
+/// `path` with as much of it resolved as exists, and the rest left as it came.
+///
+/// [`Path::canonicalize`] needs every component to be there, and the path a `write` names is
+/// the file it is about to create — so canonicalizing the whole of one answers `NotFound` for
+/// exactly the call this is asked about. Resolving the deepest ancestor that *does* exist and
+/// putting the rest back answers the question instead: which tree the file will land in, for a
+/// file that is not in one yet.
+///
+/// A `..` in the part that was resolved is gone, which is the point — it is how a path that
+/// walks out of the context stops looking like one that is in it. A `..` left in the tail is a
+/// path whose parent is not there either, so it names nothing a write could reach.
+fn resolved(path: &Path) -> PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            let mut out = real;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name);
+                at = parent;
+            }
+            // Nothing left to climb: the path is as resolved as this host can make it.
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Run one command, and answer with everything it produced.
 ///
 /// One request, one answer: the command is spawned, both of its pipes are drained, and
 /// what comes back is how it ended. Nothing arrives on the channel in between, which is
 /// why this is a function of the request rather than something threaded through the
 /// server.
+///
+/// `timeout_ms` is a kill, as the protocol promises: the command runs in a process group
+/// of its own so that what a shell spawned goes with it, and expiry answers
+/// [`TIMED_OUT`](Error::TIMED_OUT) with nothing of the partial output — a killed command
+/// has no result to report. No timeout is no limit, and the wait is the whole command's.
 async fn execute(exec: &ExecCall, session: &Session) -> Response {
     let Some((program, args)) = exec.split() else {
         return Response::Error(refused(Error::INVALID_PARAMS, "an empty command"));
@@ -578,11 +756,23 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .envs(environment(session))
-        // Piped and then read by `wait_with_output`, which is what carries the output
-        // back. Input is at EOF from the start, since an `exec` carries none.
+        // Piped and then read by `run_to_end`, which is what carries the output back.
+        // Input is at EOF from the start, since an `exec` carries none.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Dropping `child` below kills and reaps the direct child, which is how a command
+        // that timed out is cleaned up after the group kill has reached what it spawned —
+        // and how one that ends this function early, by any other return, is not left
+        // running.
+        .kill_on_drop(true);
+    // Its own process group, so a `killpg` here reaches everything the command started —
+    // `sh -c 'a & b'` leaves two children of its own — and so that the group is this
+    // command's alone. It also detaches the command from *this* server's group: a signal
+    // sent to the server's group (a Ctrl-C in the terminal that started it, say) no longer
+    // reaches spawned commands, and the `killpg` below never reaches the server.
+    #[cfg(unix)]
+    cmd.process_group(0);
 
     // Where the session stands, which is what makes a relative path in a command mean the
     // same thing as one in a `read` — and what a `cd` before this one moved.
@@ -590,7 +780,7 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
         cmd.current_dir(dir);
     }
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
             let code = match e.kind() {
@@ -603,11 +793,80 @@ async fn execute(exec: &ExecCall, session: &Session) -> Response {
             ));
         }
     };
+    // Taken now: a reaped child has no id, and the kill below wants the one it was born
+    // with — which is also its group's, by `process_group(0)`.
+    let pid = child.id();
 
-    // `wait_with_output` is what keeps both pipes draining while the command runs: a
-    // command that fills a pipe nobody is reading stops there, and neither of these is
-    // read anywhere else.
-    finished(child.wait_with_output().await)
+    let waited = match exec.timeout_ms {
+        None => run_to_end(&mut child).await,
+        Some(ms) => {
+            // `run_to_end` borrows the child rather than taking it, so expiry leaves
+            // `child` — alive, unkilled and unreaped — in this frame for the kill below.
+            match tokio::time::timeout(Duration::from_millis(ms), run_to_end(&mut child)).await {
+                Ok(output) => output,
+                Err(_elapsed) => {
+                    // Everything the command started is in the group the spawn put it in,
+                    // so one signal to the group ends all of it, the direct child included.
+                    // `kill_on_drop` is not what does the killing here — dropping `child`
+                    // on the way out is what reaps the leader once the signal has landed.
+                    #[cfg(unix)]
+                    if let Some(pid) = pid {
+                        // SAFETY: a plain libc call, and `pid` names this command's process
+                        // group and no other. It is the group id this process created with
+                        // `process_group(0)`, and it is still that group's: `timeout` only
+                        // expires while `run_to_end` is pending, and while it is pending the
+                        // direct child — the group's leader — has not been reaped (see
+                        // `run_to_end`). An unreaped process keeps its pid, running or
+                        // zombie, so the kernel cannot have handed this id to anything else.
+                        unsafe {
+                            libc::killpg(pid as libc::pid_t, libc::SIGKILL);
+                        }
+                    }
+                    return Response::Error(refused(
+                        Error::TIMED_OUT,
+                        format!("killed after {ms}ms"),
+                    ));
+                }
+            }
+        }
+    };
+
+    finished(waited)
+}
+
+/// Drain both pipes to EOF, then reap the child — in that order, and the order is the point.
+///
+/// This is what `std`'s `wait_with_output` does and tokio's does not: tokio's waits and
+/// reads concurrently, reaping the direct child the moment it exits while whatever it
+/// spawned may still hold the pipes open. Reaping last keeps the direct child unreaped — a
+/// zombie, once it has exited — for as long as anything is still writing, and an unreaped
+/// process keeps its pid. Since that pid is also the id of the process group the command
+/// was spawned into, the group id stays this command's until this future completes, which
+/// is what lets [`execute`] aim a `killpg` at it after a timeout: the timeout can only fire
+/// while this is pending, and while this is pending the leader is still there.
+///
+/// Both pipes are read at once because a command that fills a pipe nobody is reading stops
+/// there, and read to EOF rather than to some size because what to keep of the result is
+/// [`finished`]'s decision, not this function's.
+async fn run_to_end(child: &mut Child) -> io::Result<Output> {
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+    let (stdout, stderr) = tokio::try_join!(read_to_end(&mut stdout), read_to_end(&mut stderr))?;
+    let status = child.wait().await?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Everything a pipe has to give, or nothing from a pipe that was never opened.
+async fn read_to_end<R: AsyncRead + Unpin>(pipe: &mut Option<R>) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    if let Some(pipe) = pipe {
+        pipe.read_to_end(&mut buf).await?;
+    }
+    Ok(buf)
 }
 
 /// The environment variables an execution is given, on top of the ones it inherits.
@@ -722,9 +981,18 @@ async fn read_file(root: Option<&Path>, read: &ReadCall) -> Response {
 /// was not there, cut to nothing if it was. An offset means only those bytes are being
 /// spoken for, so the file is opened without truncating and whatever lies past them
 /// stays.
-async fn write_file(root: Option<&Path>, write: &WriteCall) -> Response {
-    let path = at(root, &write.path);
+///
+/// A path in the context is refused before either happens — see
+/// [`Session::read_only`].
+async fn write_file(session: &Session, write: &WriteCall) -> Response {
+    let path = at(session.cwd(), &write.path);
     let path = path.as_path();
+
+    // Before the file is opened, because a refusal that has already truncated something is
+    // not a refusal. See [`Session::read_only`].
+    if let Some(refusal) = session.read_only(path) {
+        return Response::Error(refusal);
+    }
 
     let file = match write.offset {
         None => tokio::fs::File::create(path).await,
@@ -812,31 +1080,59 @@ mod tests {
     /// can only ever write `file://` and an absolute path — which is exactly why they are
     /// asserted here.
     #[test]
-    fn a_workfs_url_is_a_file_url_or_it_is_refused() {
+    fn a_context_url_is_a_file_url_or_it_is_refused() {
         assert_eq!(
-            directory_url(&WorkFsSource::new("file:///srv/project")).unwrap(),
-            PathBuf::from("/srv/project")
+            tree(
+                Some(&TreeSource::new("file:///srv/project")),
+                TreeRole::Context
+            )
+            .unwrap(),
+            Some(PathBuf::from("/srv/project"))
         );
+
+        // A tree the session did not name is not a refusal — it is a session with one fewer
+        // tree, which is a session.
+        assert_eq!(tree(None, TreeRole::Context).unwrap(), None);
 
         for (url, code, because) in [
             (
                 "https://example.com/share",
-                Error::UNSUPPORTED_WORKFS,
+                Error::UNSUPPORTED_CONTEXT,
                 "https",
             ),
-            ("s3://bucket/prefix", Error::UNSUPPORTED_WORKFS, "s3"),
+            ("s3://bucket/prefix", Error::UNSUPPORTED_CONTEXT, "s3"),
             // No scheme at all is not a path this server may fall back to reading: it is a
             // URL that names no kind, and the message says the whole of what arrived.
-            ("/srv/project", Error::UNSUPPORTED_WORKFS, "/srv/project"),
+            ("/srv/project", Error::UNSUPPORTED_CONTEXT, "/srv/project"),
             // An authority is not something this can honour, so what follows `file://` has
             // to be the path itself.
             ("file://srv/project", Error::INVALID_PARAMS, "absolute"),
         ] {
-            let Err(e) = directory_url(&WorkFsSource::new(url)) else {
+            let Err(e) = tree(Some(&TreeSource::new(url)), TreeRole::Context) else {
                 panic!("{url} was accepted");
             };
             assert_eq!(e.code, code, "{url}: {}", e.message);
             assert!(e.message.contains(because), "{url}: {}", e.message);
+        }
+    }
+
+    /// **The refusal is the member's own.** The three trees are read the same way and
+    /// refused with three codes, which is how a client that named all of them learns which
+    /// one this build cannot take.
+    #[test]
+    fn each_tree_is_refused_under_its_own_code() {
+        for (role, code) in [
+            (TreeRole::Context, Error::UNSUPPORTED_CONTEXT),
+            (TreeRole::Artifacts, Error::UNSUPPORTED_ARTIFACTS),
+            (TreeRole::Scratch, Error::UNSUPPORTED_SCRATCH),
+        ] {
+            let Err(e) = tree(Some(&TreeSource::new("s3://bucket/prefix")), role) else {
+                panic!("{role} took an s3 URL");
+            };
+            assert_eq!(e.code, code, "{role}: {}", e.message);
+            // And says which of the three it was about, since the code is the only other
+            // thing that could have.
+            assert!(e.message.contains(role.as_str()), "{role}: {}", e.message);
         }
     }
 

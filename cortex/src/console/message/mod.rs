@@ -63,7 +63,7 @@
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
-//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_WORKFS`](Error::UNSUPPORTED_WORKFS) |
+//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_CONTEXT`](Error::UNSUPPORTED_CONTEXT), [`UNSUPPORTED_ARTIFACTS`](Error::UNSUPPORTED_ARTIFACTS), [`UNSUPPORTED_SCRATCH`](Error::UNSUPPORTED_SCRATCH) |
 //! | `exec` | [`ExecCall`] | [`ExecResp`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `write` | [`WriteCall`] | [`WriteResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
@@ -100,12 +100,12 @@
 //! asked for that call, as [`BOOT_FAILED`](Error::BOOT_FAILED).
 //!
 //! `init` is the exception and is a call, because it is not about resources. It says what
-//! the session *is* — the tree it works in, and what its commands run in and may reach —
-//! and its response is
+//! the session *is* — the trees it works in, leaves its output in and stands in, and what
+//! its commands run in and may reach — and its response is
 //! the one thing a client can act on before it has asked for any work: that there is a
 //! server on the far end, that it speaks this protocol, that it has taken what it was told,
-//! and where it will put the tree. That last part is why the answer is read rather than
-//! merely awaited: every path in the session afterwards is spelled under it.
+//! and where it will put each tree. That last part is why the answer is read rather than
+//! merely awaited: every path in the session afterwards is spelled under one of them.
 //!
 //! # Why the codec is BSON
 //!
@@ -214,9 +214,8 @@
 //!
 //! The output on an [`ExecResp`] and the file contents on a [`ReadCall`] or a [`WriteCall`]
 //! are raw `Vec<u8>`, because those are program bytes and nothing may touch them. A
-//! command's name and arguments are required to be UTF-8: they have to become the
-//! `String`s an [`Executable`](crate::exec::Executable) takes, so a name that
-//! could not be one would have nowhere to go. A [`path`](ReadCall::path) is a `String` for
+//! command's name and arguments are required to be UTF-8: an argv is a list of `String`s by
+//! the time anything runs it, so a name that could not be one would have nowhere to go. A [`path`](ReadCall::path) is a `String` for
 //! the practical version of the same reason — the executor turns it into a path for
 //! whatever filesystem it has, and it is the one member of a file call that both ends
 //! have to read rather than carry.
@@ -226,6 +225,7 @@
 //! would have made them base64 at best (1.37×) or `[104,105,10]` at worst (4×).
 
 mod call;
+mod commit;
 mod error;
 mod message;
 mod method;
@@ -234,6 +234,7 @@ mod response;
 mod utils;
 
 pub use call::*;
+pub use commit::*;
 pub use error::*;
 pub use message::*;
 pub use method::*;
