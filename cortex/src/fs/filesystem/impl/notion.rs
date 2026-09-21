@@ -698,6 +698,7 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
     json!({
         "page_id": page.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "title": extract_title(page),
+        "icon": emoji_icon(page),
         "url": page.get("url").and_then(|v| v.as_str()).unwrap_or(""),
         "created_time": page.get("created_time").and_then(|v| v.as_str()).unwrap_or(""),
         "last_edited_time": page.get("last_edited_time").and_then(|v| v.as_str()).unwrap_or(""),
@@ -750,6 +751,7 @@ fn normalize_database(db: &Value, rows: &[Value], dirs: &[String]) -> Value {
     json!({
         "database_id": db.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "title": title,
+        "icon": emoji_icon(db),
         "url": db.get("url").and_then(|v| v.as_str()).unwrap_or(""),
         "is_inline": db.get("is_inline").and_then(|v| v.as_bool()).unwrap_or(false),
         "created_time": db.get("created_time").and_then(|v| v.as_str()).unwrap_or(""),
@@ -761,6 +763,21 @@ fn normalize_database(db: &Value, rows: &[Value], dirs: &[String]) -> Value {
         "row_count": rows.len(),
         "rows": rows,
     })
+}
+
+/// A page or database's icon, when it is an emoji, and `null` otherwise.
+///
+/// Notion's `icon` is one of three shapes: `{"type":"emoji","emoji":"\u{1f4dd}"}`, or an
+/// `external`/`file` image behind a URL. Only the emoji travels. A reader of this
+/// filesystem has no way to fetch the other two — a `file` icon sits behind a signed URL
+/// that expires — and an icon it cannot render is worth no more than the absence it would
+/// fall back to anyway.
+fn emoji_icon(obj: &Value) -> Option<&str> {
+    let icon = obj.get("icon")?;
+    if icon.get("type").and_then(|t| t.as_str()) != Some("emoji") {
+        return None;
+    }
+    icon.get("emoji").and_then(|e| e.as_str())
 }
 
 /// Sanitize a name for a virtual path segment.
@@ -962,6 +979,33 @@ mod tests {
 
     fn child(btype: &str, title: &str, id: &str) -> Value {
         json!({ "type": btype, "id": id, btype: { "title": title } })
+    }
+
+    /// The emoji is the only icon a reader of this filesystem can act on, so it is the
+    /// only one that is carried.
+    #[test]
+    fn an_emoji_icon_travels_and_an_image_does_not() {
+        let page = json!({ "icon": { "type": "emoji", "emoji": "\u{1f4dd}" } });
+        assert_eq!(emoji_icon(&page), Some("\u{1f4dd}"));
+
+        let uploaded = json!({
+            "icon": { "type": "file", "file": { "url": "https://example.invalid/i.png" } }
+        });
+        assert_eq!(emoji_icon(&uploaded), None);
+        let external = json!({ "icon": { "type": "external", "external": { "url": "x" } } });
+        assert_eq!(emoji_icon(&external), None);
+    }
+
+    /// A page with no icon is the common case, and it has to read as an absence rather
+    /// than as a missing key a reader would have to tell apart from a malformed one.
+    #[test]
+    fn a_page_without_an_icon_still_has_the_key() {
+        let rendered = normalize_page(&json!({ "id": "abc" }), &[]);
+        assert_eq!(rendered.get("icon"), Some(&Value::Null));
+
+        let icon = json!({ "type": "emoji", "emoji": "\u{1f4c1}" });
+        let rendered = normalize_page(&json!({ "id": "abc", "icon": icon }), &[]);
+        assert_eq!(rendered["icon"], json!("\u{1f4c1}"));
     }
 
     /// A page directory and a database directory are told apart by the name alone,
