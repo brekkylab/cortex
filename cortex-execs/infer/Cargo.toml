@@ -13,7 +13,7 @@ path = "src/main.rs"
 #
 # What it actually does is ask the host: a session is a few vCPUs with no accelerator, and the
 # weights are on the other side of the hypervisor. See this program's own docs for the wire,
-# and `cortex-uvm-v2-common`'s `contract::HOSTCALL_ENV` for the description both ends are
+# and `cortex-uvm-v2-common`'s `contract::DELEGATION_ENV` for the description both ends are
 # written against.
 #
 # # Why it takes no cortex crate

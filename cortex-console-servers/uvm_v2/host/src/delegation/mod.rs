@@ -1,22 +1,23 @@
 //! Answering what a process inside the guest asks this host to do for it.
 //!
-//! The other direction, and the other socket. [`uvm`](super::uvm) is this end asking the guest
-//! to run something; this is something the guest is already running asking back — because a
-//! model is here and a guest is a few vCPUs with no accelerator in front of them.
+//! The other direction, and the other socket. [`uvm`](crate::session::uvm) is this end asking
+//! the guest to run something; this is something the guest is already running asking back —
+//! because a model is here and a guest is a few vCPUs with no accelerator in front of them.
 //!
-//! **What crosses is [`HOSTCALL_ENV`]'s comment and not a type**, for the reason it gives: the
-//! asking end is an `/abin` executable that does not take this crate. So the frames below are
-//! written out by hand, against that description, and [`frames_are_what_the_contract_says`]
-//! pins them to it. The other end does the same against the same paragraphs.
+//! **What crosses is [`DELEGATION_ENV`](crate::contract::DELEGATION_ENV)'s comment and not
+//! a type**, for the reason it gives:
+//! the asking end is an `/abin` executable that does not take this crate. So the frames below
+//! are written out by hand, against that description, and `frames_are_what_the_contract_says`
+//! below pins them to it. The other end does the same against the same paragraphs.
 //!
 //! Two of that contract's obligations are this end's, and both are here rather than implied:
-//! an op this build does not know is answered with [`HOSTCALL_STATUS_ERROR`] rather than by
-//! closing, and a frame over [`HOSTCALL_MAX_FRAME`] is refused rather than allocated.
+//! an op this build does not know is answered with [`DELEGATION_STATUS_ERROR`] rather than
+//! by closing, and a frame over [`DELEGATION_MAX_FRAME`] is refused rather than allocated.
 //!
 //! # It is a task of its own, and that is not a preference
 //!
-//! The server's own loop is in [`session`](super::super::session), and when one of these
-//! questions arrives that loop is **inside** [`Uvm::call`](super::Uvm::call), waiting for the
+//! The server's own loop is in [`session`](crate::session), and when one of these questions
+//! arrives that loop is **inside** [`Uvm::call`](crate::session::Uvm::call), waiting for the
 //! answer to the `exec` that started the process now asking. A question answered there would
 //! be a question answered after the thing that depends on it, which is a deadlock rather than
 //! a slow reply. So the listener is spawned at boot and lives beside the session instead,
@@ -33,11 +34,10 @@
 //! by exiting. So there is nothing to pair here — no ids, no table — and a connection that
 //! ends is a caller that finished rather than anything to report.
 //!
-//! [`frames_are_what_the_contract_says`]: tests::frames_are_what_the_contract_says
 //! [`spawn_blocking`]: tokio::task::spawn_blocking
 
 use crate::contract::{
-    HOSTCALL_MAX_FRAME, HOSTCALL_OP_NN_INFERENCE, HOSTCALL_STATUS_ERROR, HOSTCALL_STATUS_OK,
+    DELEGATION_MAX_FRAME, DELEGATION_OP_NN_INFERENCE, DELEGATION_STATUS_ERROR, DELEGATION_STATUS_OK,
 };
 
 /// The length prefix: a big-endian `u32`.
@@ -45,8 +45,8 @@ const HEADER: usize = 4;
 
 /// Answer on `listener` until the task is dropped.
 ///
-/// The handle is the machine's: [`Uvm`](super::Uvm) aborts it on the way out, which is what
-/// makes this end go away with the guest that could reach it rather than outliving it.
+/// The handle is the machine's: [`Uvm`](crate::session::Uvm) aborts it on the way out, which
+/// is what makes this end go away with the guest that could reach it rather than outliving it.
 pub fn serve(listener: tokio::net::UnixListener) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -57,7 +57,7 @@ pub fn serve(listener: tokio::net::UnixListener) -> tokio::task::JoinHandle<()> 
                 // working, which the next caller reports as a connection refused.
                 Err(e) => {
                     eprintln!(
-                        "{}: the host-call listener stopped: {e}",
+                        "{}: the delegation listener stopped: {e}",
                         env!("CARGO_BIN_NAME")
                     );
                     return;
@@ -72,7 +72,7 @@ pub fn serve(listener: tokio::net::UnixListener) -> tokio::task::JoinHandle<()> 
             {
                 Ok(connection) => connection,
                 Err(e) => {
-                    eprintln!("{}: taking a host call: {e}", env!("CARGO_BIN_NAME"));
+                    eprintln!("{}: accepting a delegation: {e}", env!("CARGO_BIN_NAME"));
                     continue;
                 }
             };
@@ -82,7 +82,7 @@ pub fn serve(listener: tokio::net::UnixListener) -> tokio::task::JoinHandle<()> 
                     // Said and not answered: whatever went wrong here went wrong with the
                     // wire, so there is nowhere left to put a sentence. A caller sees its
                     // connection close, which is what it reports.
-                    eprintln!("{}: a host call: {e:#}", env!("CARGO_BIN_NAME"));
+                    eprintln!("{}: answering a delegation: {e:#}", env!("CARGO_BIN_NAME"));
                 }
             });
         }
@@ -97,12 +97,12 @@ fn converse(mut connection: std::os::unix::net::UnixStream) -> anyhow::Result<()
         // Never empty: `read_frame` refuses a frame that carries no op.
         let (op, argument) = (ask[0], &ask[1..]);
         let answered = match op {
-            HOSTCALL_OP_NN_INFERENCE => nn_inference(argument),
+            DELEGATION_OP_NN_INFERENCE => nn_inference(argument),
             // Answered rather than closed, which is the contract's own rule: a caller from a
             // build that knows an op this one does not gets a sentence it can print.
             unknown => Err(format!(
-                "op {unknown} is not one this host answers — it knows {HOSTCALL_OP_NN_INFERENCE} \
-                 (nn_inference)"
+                "op {unknown} is not one this host answers — it knows \
+                 {DELEGATION_OP_NN_INFERENCE} (nn_inference)"
             )),
         };
         write_frame(&mut connection, &answered)?;
@@ -113,7 +113,7 @@ fn converse(mut connection: std::os::unix::net::UnixStream) -> anyhow::Result<()
 /// Run a model on this host and say what it produced.
 ///
 /// `Err` is a sentence for the caller to print, carried back as
-/// [`HOSTCALL_STATUS_ERROR`] — a command that cannot have its inference is one that prints why
+/// [`DELEGATION_STATUS_ERROR`] — a command that cannot have its inference is one that prints why
 /// and exits, not a session that broke.
 fn nn_inference(argument: &[u8]) -> Result<Vec<u8>, String> {
     todo!(
@@ -130,17 +130,17 @@ fn write_frame(
     let mut body = Vec::new();
     match answered {
         Ok(result) => {
-            body.push(HOSTCALL_STATUS_OK);
+            body.push(DELEGATION_STATUS_OK);
             body.extend_from_slice(result);
         }
         Err(said) => {
-            body.push(HOSTCALL_STATUS_ERROR);
+            body.push(DELEGATION_STATUS_ERROR);
             body.extend_from_slice(said.as_bytes());
         }
     }
     anyhow::ensure!(
-        body.len() <= HOSTCALL_MAX_FRAME,
-        "an answer of {} bytes is more than the {HOSTCALL_MAX_FRAME} this wire agrees to send",
+        body.len() <= DELEGATION_MAX_FRAME,
+        "an answer of {} bytes is more than the {DELEGATION_MAX_FRAME} this wire agrees to send",
         body.len()
     );
     w.write_all(&(body.len() as u32).to_be_bytes())?;
@@ -158,8 +158,8 @@ fn read_frame(r: &mut impl std::io::Read) -> anyhow::Result<Option<Vec<u8>>> {
 
     let len = u32::from_be_bytes(header) as usize;
     anyhow::ensure!(
-        len <= HOSTCALL_MAX_FRAME,
-        "a frame of {len} bytes is more than the {HOSTCALL_MAX_FRAME} this wire agrees to accept"
+        len <= DELEGATION_MAX_FRAME,
+        "a frame of {len} bytes is more than the {DELEGATION_MAX_FRAME} this wire agrees to accept"
     );
     // Every frame carries at least its op, so this is a caller that has lost its place —
     // better said here than as an empty slice indexed a line later.
@@ -188,21 +188,21 @@ fn fill(r: &mut impl std::io::Read, buf: &mut [u8]) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
 
-    /// The bytes, against the worked example in [`HOSTCALL_ENV`]'s comment.
+    /// The bytes, against the worked example in [`DELEGATION_ENV`]'s comment.
     ///
     /// This is what a round-trip test would be if both ends were one type — they are not, and
     /// cannot be, so what is pinned here is this end against the **description**. The other end
     /// pins itself against the same paragraphs. A change to either that is not a change to
     /// those paragraphs is what this is here to fail on.
     ///
-    /// [`HOSTCALL_ENV`]: crate::contract::HOSTCALL_ENV
+    /// [`DELEGATION_ENV`]: crate::contract::DELEGATION_ENV
     #[test]
     fn frames_are_what_the_contract_says() {
         // ask nn_inference, no arguments
         let asked = read_frame(&mut [0x00, 0x00, 0x00, 0x01, 0x01].as_slice())
             .unwrap()
             .unwrap();
-        assert_eq!(asked, vec![HOSTCALL_OP_NN_INFERENCE]);
+        assert_eq!(asked, vec![DELEGATION_OP_NN_INFERENCE]);
 
         // ok, no result
         let mut wire = Vec::new();

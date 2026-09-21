@@ -103,8 +103,8 @@ use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt a
 use tokio::process::{Child, Command};
 
 use crate::contract::{
-    ABIN_PATH, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, HOSTCALL_ENV, ImageSpec, LAYER_TAR, OLD_ROOT,
-    UPPER_DIR,
+    ABIN_PATH, DELEGATION_ENV, GUEST_BIN_PATH, GUEST_PATH, HANDSHAKE, ImageSpec, LAYER_TAR,
+    OLD_ROOT, UPPER_DIR,
 };
 
 /// A command we found but could not start, and one we could not find at all.
@@ -773,12 +773,12 @@ fn environment(session: &Session) -> Vec<(OsString, OsString)> {
     }
 
     // Where the host is, for a command that has to delegate — see
-    // [`HOSTCALL_ENV`]. Passed on rather than acted on: this agent never dials
+    // [`DELEGATION_ENV`]. Passed on rather than acted on: this agent never dials
     // it, and the `/abin` executables that do are children of the command below. Absent when
     // the boot named no socket, which is a session where the delegation is refused with a
     // sentence rather than one where it is quietly not there.
-    if let Ok(spec) = std::env::var(HOSTCALL_ENV) {
-        env.push((HOSTCALL_ENV.into(), spec.into()));
+    if let Ok(spec) = std::env::var(DELEGATION_ENV) {
+        env.push((DELEGATION_ENV.into(), spec.into()));
     }
 
     // `PWD` is what a shell reads to answer `pwd`, and a command spawned in the session's

@@ -1,9 +1,9 @@
-//! The host-call channel, exercised once: a session boots, and something inside it dials out.
+//! The delegation channel, exercised once: a session boots, and something inside it dials out.
 //!
 //! ```sh
 //! scripts/build-abin.sh                       # `/abin`, this host's architecture
 //! cp -R target/abin "${CORTEX_UVM_HOME:-$HOME/.cache/cortex}/abin"
-//! cargo run -p cortex-uvm-v2-host --example hostcall
+//! cargo run -p cortex-uvm-v2-host --example delegation
 //! ```
 //!
 //! What is being answered is the one question the design rests on and the host cannot ask
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     // The plainest base there is: what is being exercised is underneath the session rather
     // than in it, and `infer` is static and needs nothing from the image. No network, which
-    // is also the point — the host-call channel is not the network, and a session that reaches
+    // is also the point — the delegation channel is not the network, and a session that reaches
     // nothing still reaches this.
     let mut console = Console::builder()
         .stdio_client(&[host.to_string_lossy().as_ref()])
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     // example anybody reads as having passed.
     anyhow::ensure!(
         resp.code == 0,
-        "infer exited with {} — the host-call channel did not come up",
+        "infer exited with {} — the delegation channel did not come up",
         resp.code
     );
     Ok(())

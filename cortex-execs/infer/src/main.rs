@@ -26,7 +26,7 @@
 //!
 //! # The wire, and why it is written out here
 //!
-//! The description this is written against is `contract::HOSTCALL_ENV` in
+//! The description this is written against is `contract::DELEGATION_ENV` in
 //! `cortex-uvm-v2-common`, and this program deliberately does not take that crate — see its
 //! manifest. So the bytes are repeated here, and [`frames_are_what_the_contract_says`] pins
 //! them; the host end does the same against the same paragraphs.
@@ -52,7 +52,7 @@ use std::process::ExitCode;
 
 /// Where this session's host is, as `vsock:<port>`. Spelled out rather than imported — see the
 /// module docs.
-const HOSTCALL_ENV: &str = "CORTEX_UVM_HOSTCALL";
+const DELEGATION_ENV: &str = "CORTEX_UVM_DELEGATION";
 
 /// The well-known context id of the host, as every vsock guest addresses it.
 const HOST_CID: libc::c_uint = 2;
@@ -86,10 +86,10 @@ fn main() -> ExitCode {
 
 #[cfg(target_os = "linux")]
 fn run() -> anyhow::Result<()> {
-    let spec = std::env::var(HOSTCALL_ENV).map_err(|_| {
-        anyhow::anyhow!("{HOSTCALL_ENV} is unset — this session was given no host to ask")
+    let spec = std::env::var(DELEGATION_ENV).map_err(|_| {
+        anyhow::anyhow!("{DELEGATION_ENV} is unset — this session was given no host to ask")
     })?;
-    println!("{HOSTCALL_ENV}={spec}");
+    println!("{DELEGATION_ENV}={spec}");
 
     let mut host = Host::dial(port(&spec)?)?;
     println!("connected: the guest has a vsock driver and the port reaches the server");
@@ -121,12 +121,12 @@ fn run() -> anyhow::Result<()> {
 fn port(spec: &str) -> anyhow::Result<u32> {
     let port = spec.strip_prefix("vsock:").ok_or_else(|| {
         anyhow::anyhow!(
-            "{HOSTCALL_ENV} is `{spec}`, which names no transport this build has — only \
+            "{DELEGATION_ENV} is `{spec}`, which names no transport this build has — only \
              `vsock:<port>`"
         )
     })?;
     port.parse()
-        .map_err(|_| anyhow::anyhow!("{HOSTCALL_ENV} is `{spec}`, and `{port}` is not a port"))
+        .map_err(|_| anyhow::anyhow!("{DELEGATION_ENV} is `{spec}`, and `{port}` is not a port"))
 }
 
 /// The host, as this process reaches it.
@@ -295,7 +295,7 @@ fn fill(r: &mut impl io::Read, buf: &mut [u8]) -> anyhow::Result<bool> {
 mod tests {
     use super::*;
 
-    /// The bytes, against the worked example in `contract::HOSTCALL_ENV`'s comment.
+    /// The bytes, against the worked example in `contract::DELEGATION_ENV`'s comment.
     ///
     /// This is what a round-trip test would be if both ends were one type — they are not, and
     /// deliberately cannot be, so what is pinned here is this end against the **description**.
@@ -342,7 +342,7 @@ mod tests {
         for spelling in [
             "",
             "1024",
-            "unix:/tmp/hostcall.sock",
+            "unix:/tmp/delegation.sock",
             "vsock:",
             "vsock:http",
         ] {

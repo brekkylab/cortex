@@ -33,7 +33,7 @@
 //! The last two are the two directions, and they are two devices because the asking end
 //! differs: the console port is where a server asks the guest for work, and the vsock port is
 //! where a command that guest is already running asks for something it cannot do in there —
-//! see [`contract::HOSTCALL_ENV`].
+//! see [`contract::DELEGATION_ENV`].
 //!
 //! The disks are attached in that order because attach order is what fixes the guest names,
 //! and the guest is told which is which by name — see [`contract::GUEST_UPPER_DEV`].
@@ -58,8 +58,8 @@ use std::{
 
 use contract::{
     ABIN_ENV, ABIN_PATH, ABIN_TAG, ARTIFACTS_ENV, ARTIFACTS_PATH, ARTIFACTS_TAG, BaseFormat,
-    BootArgs, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG, GUEST_ABIN_DEV, GUEST_BIN_PATH,
-    GUEST_LOWER_DEV, GUEST_UPPER_DEV, HOSTCALL_ENV, HOSTCALL_VSOCK_PORT, LOWER_ENV, Network,
+    BootArgs, CONTEXT_ENV, CONTEXT_PATH, CONTEXT_TAG, DELEGATION_ENV, DELEGATION_VSOCK_PORT,
+    GUEST_ABIN_DEV, GUEST_BIN_PATH, GUEST_LOWER_DEV, GUEST_UPPER_DEV, LOWER_ENV, Network,
     PORT_NAME, UPPER_ENV,
 };
 use msb_krun::{DiskImageFormat, VmBuilder};
@@ -145,8 +145,8 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
     // somewhere to reach. libkrun connects to this path once per guest connection, so all this
     // process does with it is name it: the socket is the server's, bound before this binary
     // started, and nothing here reads a byte that crosses it.
-    if let Some(at) = args.hostcall.as_deref() {
-        builder = builder.vsock(|v| v.unix_connect(HOSTCALL_VSOCK_PORT, at));
+    if let Some(at) = args.delegation.as_deref() {
+        builder = builder.vsock(|v| v.unix_connect(DELEGATION_VSOCK_PORT, at));
     }
 
     // The network, when the session asked for one. The stack, its runtime and the policy it
@@ -206,9 +206,9 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
     // How a command in the guest dials the vsock port attached above, spelled out here because
     // an exec's environment is borrowed rather than owned.
     let host = args
-        .hostcall
+        .delegation
         .as_ref()
-        .map(|_| format!("vsock:{HOSTCALL_VSOCK_PORT}"));
+        .map(|_| format!("vsock:{DELEGATION_VSOCK_PORT}"));
 
     let vm = builder
         .exec(|e| {
@@ -226,7 +226,7 @@ fn enter(args: BootArgs) -> anyhow::Result<Infallible> {
             // How a command in there dials the port attached above. The agent only passes it
             // on: the callers are the commands it spawns, not the agent itself.
             let e = match &host {
-                Some(spec) => e.env(HOSTCALL_ENV, spec),
+                Some(spec) => e.env(DELEGATION_ENV, spec),
                 None => e,
             };
             guest_net

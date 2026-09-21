@@ -13,6 +13,7 @@
 //! means `run` rather than a usage message: the common case is the one a caller does not have
 //! to spell.
 
+mod delegation;
 mod rootfs;
 mod session;
 
@@ -46,6 +47,7 @@ const NOT_EXECUTABLE: u8 = 126;
 ///             ├── boot/       the root libkrun hands over: guest binary, image spec, and
 ///             │               the layer the guest leaves there for this end to read
 ///             ├── port.sock   the console channel
+///             ├── delegation.sock  what a process in the guest reaches this host through
 ///             └── console.log the kernel's own output
 /// ```
 ///
