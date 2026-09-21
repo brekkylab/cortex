@@ -1,6 +1,7 @@
 //! Answering a console session: the wire, and what is run at the far end of it.
 
 mod halves;
+mod hostcall;
 pub mod uvm;
 
 use std::future::Future;

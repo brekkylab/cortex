@@ -1,0 +1,32 @@
+[package]
+name = "cortex-exec-infer"
+version.workspace = true
+edition.workspace = true
+
+# `infer` is what a caller types, and the package name is not it — the same split the other
+# three keep.
+[[bin]]
+name = "infer"
+path = "src/main.rs"
+
+# Running a model, from inside a guest that has no way to run one.
+#
+# What it actually does is ask the host: a session is a few vCPUs with no accelerator, and the
+# weights are on the other side of the hypervisor. See this program's own docs for the wire,
+# and `cortex-uvm-v2-common`'s `contract::HOSTCALL_ENV` for the description both ends are
+# written against.
+#
+# # Why it takes no cortex crate
+#
+# The obvious dependency would be the console server's contract crate, which is where that
+# description lives. It is not taken, on purpose: this program would then be *that backend's*
+# executable rather than one of cortex's, which is the wrong direction across this tree — and
+# it would charge a serialization crate and its tree for a message that is one byte long today.
+#
+# So the wire is written out below, against a comment, and what is given up is that a mismatch
+# is a frame that does not parse rather than a compile error. `libc` is here for the AF_VSOCK
+# socket there is no std type for, and is the whole of the cost.
+
+[dependencies]
+anyhow = { workspace = true }
+libc = { workspace = true }

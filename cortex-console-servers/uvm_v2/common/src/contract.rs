@@ -1,6 +1,7 @@
-//! What a host tells a boot, and what a boot tells the guest.
+//! What a host tells a boot, what a boot tells the guest, and what a process in the guest
+//! tells the host.
 //!
-//! Two cross-process contracts in one module because three binaries speak them and every one
+//! Three cross-process contracts in one module because three binaries speak them and every one
 //! of them takes this crate: `cortex-uvm-v2-host` writes what `cortex-uvm-v2-boot` parses, and
 //! the boot in turn writes what `cortex-uvm-v2-guest` reads. The three are built for two
 //! targets by three cargos and agree on nothing else, so a name that only they share is a name
@@ -18,6 +19,10 @@
 //!   binary rather than a mode of the host's.
 //! - **the boot to the guest** ([`LOWER_ENV`], [`UPPER_ENV`], [`CONTEXT_ENV`],
 //!   [`ARTIFACTS_ENV`], [`GUEST_BIN_PATH`], [`PORT_NAME`], [`HANDSHAKE`]).
+//! - **a process in the guest to the host** ([`HOSTCALL_ENV`], and the wire written out
+//!   there). The odd one out, and the only contract here that **nothing checks**: its asking
+//!   end is an `/abin` executable, which does not take this crate. See [`HOSTCALL_ENV`] for
+//!   why, and for the bytes both ends have to produce.
 //!
 //! Where a tree lands inside the guest is **this module's constant for it** —
 //! [`CONTEXT_PATH`], [`ARTIFACTS_PATH`] — carried in that tree's env alongside the tag. One
@@ -340,6 +345,131 @@ pub const NET_IPV4_ENV: &str = "MSB_NET_IPV4";
 /// Where a resolver is named on any system a base image was built for.
 pub const RESOLV_CONF: &str = "/etc/resolv.conf";
 
+/// Where a guest process learns to find the host, as `vsock:<port>` — and, in this comment,
+/// the whole of what it then says.
+///
+/// # What this is for
+///
+/// A command running in a session can meet work it cannot do where it is standing. The case
+/// this exists for is a model: a guest is a few vCPUs with no accelerator, and the weights are
+/// the host's — so `index`, whose `chunk.embedding` column is the reason this exists, asks for
+/// a vector rather than computing one.
+///
+/// # Why not the console channel
+///
+/// Because the console channel's asker is the host, and it is *already asking* when this
+/// question comes up. The host writes an `exec`, waits for its answer, and the command that
+/// `exec` started is what wants an inference — so the one end that could read the question is
+/// blocked on the answer that depends on it. That is a deadlock and not a busy moment: no
+/// ordering of a single channel avoids it, because the two are nested rather than interleaved.
+///
+/// # Why vsock and not a second console port
+///
+/// The virtio-console driver allows **one opener per port**, which makes a port something the
+/// agent holds and nothing else can. The callers here are not the agent — they are `/abin`
+/// executables, ordinary children of an `exec` — so a port would mean the agent standing in
+/// the middle: a socket of its own inside the guest, a multiplexer over the single port, and
+/// ids to pair answers with. A vsock port is dialled by whoever wants it, and libkrun gives
+/// each connection its own socket on the host.
+///
+/// So a caller's connection is its own, and **a caller's process is the request's scope**:
+/// `index ingest` opens one, asks for as many vectors as it has chunks, and closes it by
+/// exiting. One asker per connection and one question at a time on it is what leaves nothing
+/// to pair — no ids, no pending table, no multiplexer, on either side.
+///
+/// # This one is prose, and that is the trade
+///
+/// The two contracts above this are types: a value added to one side is a value the other
+/// side stops compiling without. This one cannot be, because **the asking end does not take
+/// this crate**. `mem`, `index` and `docread` live in `cortex-execs/`, take neither `cortex`
+/// nor this, and are built small and static because they run inside somebody's session. A
+/// dependency here would make them *this backend's* executables — the wrong direction across
+/// the tree — and would charge each of them a serialization crate and its tree for a message
+/// that is one byte long today.
+///
+/// So the guest end writes the twenty lines itself, and this comment is the only description
+/// of what those lines have to produce. What that costs is stated plainly: a mismatch is a
+/// frame that does not parse, inside a guest, in a program somebody is debugging for another
+/// reason — not a compile error. Two things are what keep it from rotting, and both are
+/// obligations on the **host** end, which does take this crate and does use the constants
+/// below:
+///
+/// - an op it does not know is answered with [`HOSTCALL_STATUS_ERROR`] and **not** by closing,
+///   so an older host and a newer caller meet in a sentence rather than in a dropped socket;
+/// - the layout is pinned by a test at each end.
+///
+/// Anything added here is owed to every end at once.
+///
+/// # Finding the host
+///
+/// This variable holds `vsock:<port>` — a scheme and not a bare number, because what a caller
+/// needs to know is *how* to reach the host, and vsock is only how it is reached from inside a
+/// VM. The same executables are worth running under a backend with no hypervisor in it, where
+/// the answer is a path, and a spelling that already says which kind it is can grow that
+/// second answer without every caller being told twice.
+///
+/// A caller dials `AF_VSOCK`, `SOCK_STREAM`, to CID **2** — the well-known context id of the
+/// host — on that port. The variable is absent for a session whose boot was given no socket,
+/// which is a guest where the delegation is refused rather than one where it hangs.
+///
+/// # The wire
+///
+/// A caller connects, then asks and is answered, one at a time, until it closes.
+///
+/// ```text
+/// ask     [u32 BE len][len bytes:  op u8     | argument bytes ]
+/// answer  [u32 BE len][len bytes:  status u8 | result bytes   ]
+/// ```
+///
+/// Big-endian, because that is what every other length on a wire is, and the same ceiling the
+/// console wire keeps ([`HOSTCALL_MAX_FRAME`]). `len` is never zero: every frame carries at
+/// least its op or its status, so a zero is a peer that has lost its place. End of stream
+/// before a header's first byte is the caller having finished and exited, which is how a
+/// conversation ends; end of stream part way through one is truncation.
+///
+/// `op` is [`HOSTCALL_OP_NN_INFERENCE`] and nothing else yet. `status` is
+/// [`HOSTCALL_STATUS_OK`] or [`HOSTCALL_STATUS_ERROR`], and an error's bytes are a UTF-8
+/// sentence for the caller to print — a refusal travels rather than closing the connection,
+/// because "the host has no model loaded" is something a command can exit on and a closed
+/// socket is not.
+///
+/// **The argument and result bytes are empty**, and that is the whole of what is settled. An
+/// inference is to take a tensor and answer with one; what a tensor looks like on this wire is
+/// the next thing to decide, and the frame above carries it whenever it is decided, because a
+/// length and an opaque payload carry anything under the ceiling. A tensor *over* the ceiling
+/// is the one thing this shape has no answer for, and the day one appears is the day to settle
+/// chunking.
+///
+/// ```text
+/// ask  nn_inference    00 00 00 01  01
+/// ok   (no result)     00 00 00 01  00
+/// err  "no model"      00 00 00 09  01  6e 6f 20 6d 6f 64 65 6c
+/// ```
+pub const HOSTCALL_ENV: &str = "CORTEX_UVM_HOSTCALL";
+
+/// The vsock port a guest dials to reach the host — see [`HOSTCALL_ENV`].
+///
+/// Any number would do and nothing negotiates it: the vsock address space is this machine's
+/// alone and there is one service in it. It travels to the guest in [`HOSTCALL_ENV`] all the
+/// same, because a caller that read a constant instead would be one that works only while its
+/// build and the server's agree.
+pub const HOSTCALL_VSOCK_PORT: u32 = 1024;
+
+/// Run a model on the host and hand back what it produced. The only op there is.
+///
+/// One and not zero, so that a frame of nothing but zeroes is an op nobody defined rather than
+/// a valid request — which is the kind of mistake a hand-written encoder makes.
+pub const HOSTCALL_OP_NN_INFERENCE: u8 = 1;
+
+/// The answer is what was asked for.
+pub const HOSTCALL_STATUS_OK: u8 = 0;
+
+/// The answer is a UTF-8 sentence saying why there is none.
+pub const HOSTCALL_STATUS_ERROR: u8 = 1;
+
+/// The most one frame may carry, matching the console wire's ceiling.
+pub const HOSTCALL_MAX_FRAME: usize = 64 * 1024 * 1024;
+
 /// Everything a console server tells a boot, as the boot's own command line.
 ///
 /// # Why arguments and not the environment
@@ -396,6 +526,19 @@ pub struct BootArgs {
     /// no tree. Mounted in the guest at [`CONTEXT_PATH`], which is where it is named from
     /// there on — see [`CONTEXT_ENV`].
     pub context: Option<PathBuf>,
+
+    /// Where a process *inside* the guest reaches this host, and `None` for a session that
+    /// may not.
+    ///
+    /// A Unix socket the server has already bound. The boot puts a vsock port in front of it —
+    /// see [`HOSTCALL_ENV`] — so that a guest process dialling that port is
+    /// connected to it, one host socket per connection.
+    ///
+    /// **The opposite direction to [`channel`](Self::channel)**, and a second socket for that
+    /// reason rather than for want of room on the first: the console channel's asker is the
+    /// server, and it is blocked on an `exec`'s answer at exactly the moment the command that
+    /// `exec` started wants to ask something.
+    pub hostcall: Option<PathBuf>,
 
     /// Where the session leaves what it produces, and `None` for a session that named none.
     /// Shared exactly as the context is, and mounted at [`ARTIFACTS_PATH`].
@@ -470,6 +613,9 @@ impl BootArgs {
         if let Some(abin) = &self.abin {
             put("--abin", abin.as_os_str());
         }
+        if let Some(hostcall) = &self.hostcall {
+            put("--hostcall", hostcall.as_os_str());
+        }
         if let Some(vcpus) = self.vcpus {
             put("--vcpus", OsStr::new(&vcpus.to_string()));
         }
@@ -496,6 +642,7 @@ impl BootArgs {
         let mut context = None;
         let mut artifacts = None;
         let mut abin = None;
+        let mut hostcall = None;
         let mut vcpus = None;
         let mut memory_mib = None;
 
@@ -520,6 +667,7 @@ impl BootArgs {
                 "--context" => context = Some(PathBuf::from(value()?)),
                 "--artifacts" => artifacts = Some(PathBuf::from(value()?)),
                 "--abin" => abin = Some(PathBuf::from(value()?)),
+                "--hostcall" => hostcall = Some(PathBuf::from(value()?)),
                 "--vcpus" => vcpus = Some(number(&flag, value()?)?),
                 "--memory-mib" => memory_mib = Some(number(&flag, value()?)?),
                 other => anyhow::bail!("{other} is not an argument a boot takes"),
@@ -548,6 +696,7 @@ impl BootArgs {
             context,
             artifacts,
             abin,
+            hostcall,
             vcpus,
             memory_mib,
         })
@@ -618,6 +767,7 @@ mod tests {
             context: Some("/Users/someone/project".into()),
             artifacts: Some("/Users/someone/out".into()),
             abin: Some("/cache/layers/sha256_2b91c4.erofs".into()),
+            hostcall: Some("/tmp/hostcall.sock".into()),
             vcpus: Some(4),
             memory_mib: Some(8192),
         }
@@ -684,12 +834,19 @@ mod tests {
         let bare = BootArgs {
             context: None,
             artifacts: None,
+            hostcall: None,
             vcpus: None,
             memory_mib: None,
             ..args()
         };
         let spelled = bare.to_args();
-        for flag in ["--context", "--artifacts", "--vcpus", "--memory-mib"] {
+        for flag in [
+            "--context",
+            "--artifacts",
+            "--hostcall",
+            "--vcpus",
+            "--memory-mib",
+        ] {
             assert!(
                 !spelled.iter().any(|arg| arg == flag),
                 "{flag} was sent anyway"

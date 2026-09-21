@@ -45,6 +45,9 @@ tokio = { workspace = true, features = [
     "io-std",
     "io-util",
     "macros",
+    # The host-call listener: a Unix socket a process inside the guest reaches through a vsock
+    # port, accepted here and answered on a blocking task.
+    "net",
     "rt-multi-thread",
 ] }
 

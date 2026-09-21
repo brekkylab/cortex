@@ -156,9 +156,7 @@ pub fn restore(tar: &Path, upper: &Path) -> io::Result<()> {
     for entry in archive.entries()? {
         let mut entry = entry?;
         let path = entry.path()?.into_owned();
-        let named = |e: io::Error| {
-            io::Error::other(format!("restoring {}: {e}", path.display()))
-        };
+        let named = |e: io::Error| io::Error::other(format!("restoring {}: {e}", path.display()));
 
         // Not a file to create: it says the directory holding it hides everything below, which
         // is a property of that directory and not an entry in it.
@@ -199,9 +197,8 @@ pub fn restore(tar: &Path, upper: &Path) -> io::Result<()> {
                     .map_err(|e| named(io::Error::other(e)))?;
                 // SAFETY: `at` is NUL-terminated and outlives the call, and the mode names
                 // exactly one file type.
-                let rc = unsafe {
-                    libc::mknod(at.as_ptr(), kind | mode, libc::makedev(major, minor))
-                };
+                let rc =
+                    unsafe { libc::mknod(at.as_ptr(), kind | mode, libc::makedev(major, minor)) };
                 if rc != 0 {
                     return Err(named(io::Error::last_os_error()));
                 }

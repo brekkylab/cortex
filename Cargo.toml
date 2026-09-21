@@ -6,6 +6,7 @@ members = [
     "cortex-execs/mem",
     "cortex-execs/index",
     "cortex-execs/docread",
+    "cortex-execs/infer",
     "cortex-console-servers/uvm_v2/boot",
     "cortex-console-servers/uvm_v2/common",
     "cortex-console-servers/uvm_v2/host",

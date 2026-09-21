@@ -21,5 +21,6 @@ edition.workspace = true
 # reports it.
 anyhow = { workspace = true }
 # `ImageSpec` and `GuestCommit` cross a boundary as BSON; the codec is the reader's, the
-# derives are here.
+# derives are here. `hostcall` carries no derives at all — its wire is bytes described in
+# prose and written out at both ends, for the reason its module docs give.
 serde = { workspace = true }

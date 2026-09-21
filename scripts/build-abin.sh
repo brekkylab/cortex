@@ -15,8 +15,9 @@
 #       several times the size. `/abin` is mounted rather than copied, so that size is the
 #       host's disk and nothing the guest pays for.
 #
-# What comes out is flat — `mem`, `index` and `docread` at the top level and nothing around
-# them — because that is what the guest mounts: one directory at `/abin`, prepended to `PATH`.
+# What comes out is flat — `mem`, `index`, `docread` and `infer` at the top level and
+# nothing around them — because that is what the guest mounts: one directory at `/abin`,
+# prepended to `PATH`.
 #
 # It goes straight into the cache rather than into `target/`, because that directory *is* how a
 # host has an `/abin`: a session mounts it if it is there and boots without one if it is not,
@@ -78,7 +79,14 @@ root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 # This is the only statement of what `/abin` holds. Anything that publishes a release has to
 # hold the same list, and a program added to one and not the other is an `/abin` that differs
 # between the machine it was developed on and the machine it runs on.
-PROGRAMS=(cortex-exec-mem:mem cortex-exec-index:index cortex-exec-docread:docread)
+PROGRAMS=(
+  cortex-exec-mem:mem
+  cortex-exec-index:index
+  cortex-exec-docread:docread
+  # The one that does its work somewhere else: it hands an inference to the host, because a
+  # guest has no accelerator to run one on. See its own manifest.
+  cortex-exec-infer:infer
+)
 
 # The image the container build runs in. `rust:alpine` is musl's own toolchain with a Rust in
 # it, which is the whole reason it is this and not a Debian image with a cross-compiler bolted

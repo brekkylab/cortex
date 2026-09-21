@@ -78,7 +78,11 @@ async fn main() -> anyhow::Result<()> {
 
     // `test -e` and not `cat`: what is being asked is whether the base's copy is visible
     // again, and a deletion that did not survive shows up as the file being *there*.
-    let gone = run(&mut second, "test -e /etc/hostname && echo there || echo gone").await?;
+    let gone = run(
+        &mut second,
+        "test -e /etc/hostname && echo there || echo gone",
+    )
+    .await?;
     anyhow::ensure!(
         gone.trim() == "gone",
         "the file the first session deleted is {gone:?} in the second"

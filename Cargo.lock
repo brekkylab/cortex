@@ -656,6 +656,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortex-exec-infer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+]
+
+[[package]]
 name = "cortex-exec-mem"
 version = "0.1.0"
 dependencies = [

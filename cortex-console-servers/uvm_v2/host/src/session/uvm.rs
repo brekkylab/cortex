@@ -9,9 +9,11 @@
 //!
 //! **Nothing here holds a hypervisor.** What this module does is make what a machine needs on
 //! disk, spawn `cortex-uvm-v2-boot` over it, and talk to the guest down a socket that boot
-//! turned into a console port. The VMM, the network stack and the entitlement they need are
-//! all in that other binary — see [`halves`](super::halves) for where it and the guest are
-//! found, and [`BootArgs`] for the whole of what this end tells it.
+//! turned into a console port. The socket beside that one is the other direction — see
+//! [`hostcall`](super::hostcall) — and this module's part in it is binding it and telling the
+//! boot where it is. The VMM, the network stack and the entitlement they need are all in that
+//! other binary — see [`halves`](super::halves) for where it and the guest are found, and
+//! [`BootArgs`] for the whole of what this end tells it.
 
 use std::path::{Path, PathBuf};
 
@@ -52,21 +54,6 @@ fn number<T: std::str::FromStr>(key: &str) -> Option<T> {
     std::env::var(key).ok()?.parse().ok()
 }
 
-/// The executables to put at `/abin`, or `None` for a host that has none.
-///
-/// One well-known place under [`home`](crate::home) and no variable naming another: where the
-/// cache is, is already something [`home`](crate::home) answers, so a second way to point
-/// somewhere else would be two answers to one question. What is there is put there by
-/// `scripts/build-abin.sh`, and later by a release this host downloaded.
-///
-/// **A host with none is a session with no `/abin` and not a session that fails.** These are
-/// cortex's own executables, which a session is better off with and can run without — the
-/// guest guards on the directory being there, and an image's own `PATH` is what is left.
-fn abin() -> Option<PathBuf> {
-    let dir = crate::home().join("abin");
-    dir.is_dir().then_some(dir)
-}
-
 /// A host directory the guest can see, and where it sees it.
 #[derive(Clone)]
 pub struct Mount {
@@ -93,10 +80,17 @@ pub struct Uvm {
     dir: PathBuf,
     /// The file in the boot root the guest leaves a layer in — see [`LAYER_TAR`].
     layer: PathBuf,
+    /// The task answering what processes *inside* this machine ask of this host — see
+    /// [`hostcall`](super::hostcall). Aborted when this drops, which is what keeps it from
+    /// outliving the only guest that could reach it.
+    hostcall: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for Uvm {
     fn drop(&mut self) {
+        // Before the machine, because what it answers is a question only the machine can ask:
+        // stopping it first is one fewer task parked on a socket about to be removed.
+        self.hostcall.abort();
         let _ = self.machine.kill();
         let _ = self.machine.wait();
         // This boot's, and only this boot's: the disk beside it is the session's, and a
@@ -141,10 +135,11 @@ impl Uvm {
         std::fs::create_dir_all(&dir)?;
 
         let upper = owner.join("session.ext4");
-        let (root, socket, console) = (
+        let (root, socket, console, hostcall) = (
             dir.join("boot"),
             dir.join("port.sock"),
             dir.join("console.log"),
+            dir.join("hostcall.sock"),
         );
         // In the root and not beside it: the guest reaches that share after the pivot and
         // writes the tar into it, which is one device fewer than a scratch of its own.
@@ -214,13 +209,26 @@ impl Uvm {
         let listener = std::os::unix::net::UnixListener::bind(&socket)
             .map_err(|e| anyhow::anyhow!("binding the console channel: {e}"))?;
 
+        // The other direction, bound here for the same reason: the boot names this path to the
+        // VMM while it is assembling devices, and libkrun connects to it the moment a process
+        // in the guest dials the port in front of it. Answered by a task of its own — see
+        // [`hostcall`](super::hostcall) for why the server's own loop cannot answer it.
+        let calls = std::os::unix::net::UnixListener::bind(&hostcall)
+            .map_err(|e| anyhow::anyhow!("binding the host-call channel: {e}"))?;
+        calls.set_nonblocking(true)?;
+        let calls = super::hostcall::serve(tokio::net::UnixListener::from_std(calls)?);
+
         let mut told = BootArgs {
             boot_root: root,
             channel: socket,
             base,
             base_format: BaseFormat::Vmdk,
             session: upper,
-            abin: abin(),
+            abin: {
+                let a = crate::home().join("abin");
+                a.is_dir().then_some(a)
+            },
+            hostcall: Some(hostcall),
             context: None,
             artifacts: None,
             console: Some(console.clone()),
@@ -308,6 +316,7 @@ impl Uvm {
             next: 0,
             dir,
             layer,
+            hostcall: calls,
         })
     }
 
