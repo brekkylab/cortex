@@ -80,6 +80,17 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3);
 /// longer is one `retrieve` and not another block walk.
 const FRESH: Duration = Duration::from_secs(15);
 
+/// How long a *listing* is served from what is kept, without asking Notion anything.
+///
+/// Longer than [`FRESH`], and deliberately: a listing needs the names and nothing else. A name
+/// that has moved on costs a click that then revalidates; a size or a body that has moved on is
+/// a reader shown the wrong file. So the tree may be a minute behind and the content may not be
+/// behind at all — see `render_cached`, which no listing goes through while this holds.
+const LISTING_TTL: Duration = Duration::from_secs(60);
+
+/// What the top-level listing is kept in. Not an id, so the sweep leaves it alone.
+const ROOTS_FILE: &str = "_roots.json";
+
 /// How many renders are kept on disk, when there is a directory for them.
 const DISK_CAP: usize = 1000;
 
@@ -139,13 +150,22 @@ impl Rendered {
     }
 }
 
+/// One render, and the two things that decide what it may still answer.
+#[derive(Clone)]
+struct Kept {
+    /// When Notion last confirmed this render describes the page. `None` for one read back from
+    /// disk, which nothing in this run has checked — it may be served as a *listing* and must
+    /// not be served as content.
+    checked: Option<Instant>,
+    /// When this render was last put in place, confirmed or not.
+    seen: Instant,
+    rendered: Rendered,
+}
+
 /// The renders being kept, and the order to drop them in.
 #[derive(Default)]
 struct Renders {
-    /// `id -> (last checked against Notion, render)`. The instant is when the render was last
-    /// *confirmed*, not when it was built: a page that has not changed keeps its bytes and
-    /// starts a fresh window.
-    by_id: HashMap<String, (Instant, Rendered)>,
+    by_id: HashMap<String, Kept>,
     /// Ids in the order they were first rendered, so the oldest goes first at the cap. Not
     /// least-recently-used: a reader walks a tree once, so insertion order is what it visited,
     /// and keeping a second index in step with every read would cost more than it saves here.
@@ -153,27 +173,31 @@ struct Renders {
 }
 
 impl Renders {
-    /// The render for `id` and when it was last confirmed, as a copy: every caller would have
-    /// to clone it anyway, and holding the lock past this line is how a re-entrant lock gets
-    /// taken by accident.
-    fn get(&self, id: &str) -> Option<(Instant, Rendered)> {
+    /// What is kept for `id`, as a copy: every caller would have to clone it anyway, and
+    /// holding the lock past this line is how a re-entrant lock gets taken by accident.
+    fn get(&self, id: &str) -> Option<Kept> {
         self.by_id.get(id).cloned()
     }
 
     /// Say that Notion still has what this render describes. A page that is checked and found
-    /// unchanged is as good as one just rendered, so the window starts again.
+    /// unchanged is as good as one just rendered, so both windows start again.
     fn confirm(&mut self, id: &str) {
-        if let Some((checked, _)) = self.by_id.get_mut(id) {
-            *checked = Instant::now();
+        if let Some(kept) = self.by_id.get_mut(id) {
+            let now = Instant::now();
+            kept.checked = Some(now);
+            kept.seen = now;
         }
     }
 
-    fn admit(&mut self, id: String, rendered: Rendered) {
-        if self
-            .by_id
-            .insert(id.clone(), (Instant::now(), rendered))
-            .is_none()
-        {
+    /// Keep `rendered`. `checked` says whether Notion confirmed it in this run — false for one
+    /// read back from disk, which may answer a listing and may not answer for content.
+    fn admit(&mut self, id: String, rendered: Rendered, checked: bool) {
+        let kept = Kept {
+            checked: checked.then(Instant::now),
+            seen: Instant::now(),
+            rendered,
+        };
+        if self.by_id.insert(id.clone(), kept).is_none() {
             self.order.push_back(id);
         }
         while self.order.len() > CACHE_CAP {
@@ -200,6 +224,14 @@ struct Stored {
     bytes: String,
 }
 
+/// Directory names as dirents, which is what every listing here ends in.
+fn dirs_of(names: &[String]) -> Vec<Dirent> {
+    names
+        .iter()
+        .map(|name| Dirent::new(name.clone(), DirentKind::Dir))
+        .collect()
+}
+
 fn epoch_ms(t: SystemTime) -> Option<u64> {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .ok()
@@ -213,10 +245,20 @@ fn at_ms(ms: u64) -> SystemTime {
 /// A Notion workspace's pages, served as a tree.
 ///
 /// Read-only. Each `page.json` is rendered on read; the module doc has the layout.
+/// The workspace's top-level page directories, and when they were last read.
+///
+/// Its own thing rather than a render: it comes from `search`, which has nothing to compare
+/// against — no page to retrieve, no edit stamp — so this one is a TTL and nothing cleverer.
+struct Roots {
+    seen: Instant,
+    names: Arc<Vec<String>>,
+}
+
 pub struct NotionFs {
     client: reqwest::Client,
     api_key: String,
     renders: Mutex<Renders>,
+    roots: Mutex<Option<Roots>>,
     /// Where renders outlive the process, when a caller has said where. See
     /// [`NotionFs::with_cache_dir`].
     cache_dir: Option<PathBuf>,
@@ -239,6 +281,7 @@ impl NotionFs {
             client,
             api_key: cfg.api_key.clone(),
             renders: Mutex::new(Renders::default()),
+            roots: Mutex::new(None),
             cache_dir: None,
             writes: Mutex::new(0),
         })
@@ -306,6 +349,35 @@ impl NotionFs {
         self.sweep(dir);
     }
 
+    /// The top-level directories kept from an earlier run, whatever their age.
+    ///
+    /// Age is not a condition here, and that is the point: after a restart the tree paints
+    /// without a request, and [`LISTING_TTL`] from that moment the next listing asks Notion
+    /// again. A workspace page added since shows up then.
+    fn roots_on_disk(&self) -> Option<Vec<String>> {
+        let path = self.cache_dir.as_ref()?.join(ROOTS_FILE);
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    }
+
+    fn keep_roots_on_disk(&self, names: &[String]) {
+        let Some(dir) = self.cache_dir.as_ref() else {
+            return;
+        };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let path = dir.join(ROOTS_FILE);
+        let tmp = path.with_extension("tmp");
+        if serde_json::to_vec(names)
+            .ok()
+            .and_then(|v| std::fs::write(&tmp, v).ok())
+            .is_some()
+            && std::fs::rename(&tmp, &path).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
     /// Where `id`'s entry lives, for an id that could be one.
     ///
     /// `valid_notion_id` is what keeps this from being a path: an id is a uuid, so there is no
@@ -330,8 +402,12 @@ impl NotionFs {
         let mut found: Vec<(SystemTime, PathBuf)> = entries
             .flatten()
             .filter_map(|e| {
-                let modified = e.metadata().ok()?.modified().ok()?;
-                Some((modified, e.path()))
+                // Pages only: the roots file is not one, and it is not the sweep's to drop.
+                let path = e.path();
+                if !valid_notion_id(path.file_stem()?.to_str()?) {
+                    return None;
+                }
+                Some((e.metadata().ok()?.modified().ok()?, path))
             })
             .collect();
         if found.len() <= DISK_CAP {
@@ -540,29 +616,28 @@ impl NotionFs {
     /// the render it has. Only a page that actually changed pays for the block walk again.
     async fn render_cached(&self, page_id: &str) -> io::Result<Rendered> {
         let cached = self.renders.lock().unwrap().get(page_id);
-        if let Some((checked, rendered)) = &cached
-            && checked.elapsed() < FRESH
+        if let Some(kept) = &cached
+            && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
         {
-            return Ok(rendered.clone());
+            return Ok(kept.rendered.clone());
         }
 
         let page = self.get_page(page_id).await?;
-        if let Some((_, rendered)) = &cached
-            && still_current(rendered, &page)
+        if let Some(kept) = &cached
+            && still_current(&kept.rendered, &page)
         {
             self.renders.lock().unwrap().confirm(page_id);
-            return Ok(rendered.clone());
+            return Ok(kept.rendered.clone());
         }
         // Nothing in memory, but perhaps something from a previous run: the same retrieve
         // answers for it, so a restart costs what a stale entry costs rather than a walk.
-        if cached.is_none()
-            && let Some(rendered) = self.kept_on_disk(page_id)
+        if let Some(rendered) = self.kept_on_disk(page_id)
             && still_current(&rendered, &page)
         {
             self.renders
                 .lock()
                 .unwrap()
-                .admit(page_id.to_string(), rendered.clone());
+                .admit(page_id.to_string(), rendered.clone(), true);
             return Ok(rendered);
         }
 
@@ -580,7 +655,7 @@ impl NotionFs {
         self.renders
             .lock()
             .unwrap()
-            .admit(page_id.to_string(), rendered.clone());
+            .admit(page_id.to_string(), rendered.clone(), true);
         self.keep_on_disk(page_id, &rendered);
         Ok(rendered)
     }
@@ -593,29 +668,28 @@ impl NotionFs {
     /// a database and the read of its `database.json` cost one query between them.
     async fn render_database_cached(&self, db_id: &str) -> io::Result<Rendered> {
         let cached = self.renders.lock().unwrap().get(db_id);
-        if let Some((checked, rendered)) = &cached
-            && checked.elapsed() < FRESH
+        if let Some(kept) = &cached
+            && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
         {
-            return Ok(rendered.clone());
+            return Ok(kept.rendered.clone());
         }
 
         let db = self.get_database(db_id).await?;
         // The same bargain as a page: the retrieve above is the cheap half, the query below is
         // the one that grows with the number of rows.
-        if let Some((_, rendered)) = &cached
-            && still_current(rendered, &db)
+        if let Some(kept) = &cached
+            && still_current(&kept.rendered, &db)
         {
             self.renders.lock().unwrap().confirm(db_id);
-            return Ok(rendered.clone());
+            return Ok(kept.rendered.clone());
         }
-        if cached.is_none()
-            && let Some(rendered) = self.kept_on_disk(db_id)
+        if let Some(rendered) = self.kept_on_disk(db_id)
             && still_current(&rendered, &db)
         {
             self.renders
                 .lock()
                 .unwrap()
-                .admit(db_id.to_string(), rendered.clone());
+                .admit(db_id.to_string(), rendered.clone(), true);
             return Ok(rendered);
         }
         let rows = self.query_database(db_id).await?;
@@ -631,21 +705,19 @@ impl NotionFs {
         self.renders
             .lock()
             .unwrap()
-            .admit(db_id.to_string(), rendered.clone());
+            .admit(db_id.to_string(), rendered.clone(), true);
         self.keep_on_disk(db_id, &rendered);
         Ok(rendered)
     }
 
     /// Contents of a database dir: `database.json` plus a subdir per row.
     async fn database_dir_entries(&self, db_id: &str) -> io::Result<Vec<Dirent>> {
-        let rendered = self.render_database_cached(db_id).await?;
+        let names = match self.kept_child_dirs(db_id) {
+            Some(names) => names,
+            None => self.render_database_cached(db_id).await?.child_dirs,
+        };
         let mut out = vec![Dirent::new("database.json", DirentKind::File)];
-        out.extend(
-            rendered
-                .child_dirs
-                .iter()
-                .map(|name| Dirent::new(name.clone(), DirentKind::Dir)),
-        );
+        out.extend(dirs_of(&names));
         Ok(out)
     }
 
@@ -668,9 +740,28 @@ impl NotionFs {
     }
 
     /// Top-level (workspace) pages as `<title>__<id>` dir entries.
+    ///
+    /// Kept for [`LISTING_TTL`], and read back from disk at any age: a `search` is the one
+    /// request between a reader and the first thing they see, and it is paged, so a workspace
+    /// of any size pays it more than once.
     async fn top_level_page_dirs(&self) -> io::Result<Vec<Dirent>> {
+        if let Some(roots) = self.roots.lock().unwrap().as_ref()
+            && roots.seen.elapsed() < LISTING_TTL
+        {
+            return Ok(dirs_of(&roots.names));
+        }
+        if self.roots.lock().unwrap().is_none()
+            && let Some(names) = self.roots_on_disk()
+        {
+            let names = Arc::new(names);
+            *self.roots.lock().unwrap() = Some(Roots {
+                seen: Instant::now(),
+                names: names.clone(),
+            });
+            return Ok(dirs_of(&names));
+        }
         let pages = self.search_pages().await?;
-        Ok(pages
+        let names: Vec<String> = pages
             .iter()
             .filter(|p| {
                 p.get("parent")
@@ -678,8 +769,35 @@ impl NotionFs {
                     .and_then(|t| t.as_str())
                     == Some("workspace")
             })
-            .map(|p| Dirent::new(page_dirname(p), DirentKind::Dir))
-            .collect())
+            .map(page_dirname)
+            .collect();
+        self.keep_roots_on_disk(&names);
+        let names = Arc::new(names);
+        *self.roots.lock().unwrap() = Some(Roots {
+            seen: Instant::now(),
+            names: names.clone(),
+        });
+        Ok(dirs_of(&names))
+    }
+
+    /// The names a listing of `id` shows, from whatever is kept — and nothing asked for.
+    ///
+    /// A listing needs names. A render read back from disk carries them, and one Notion has not
+    /// confirmed in this run is still a fine answer to "what is in this directory": the click
+    /// that follows goes through `render_cached`, which does confirm. See [`LISTING_TTL`].
+    fn kept_child_dirs(&self, id: &str) -> Option<Arc<Vec<String>>> {
+        if let Some(kept) = self.renders.lock().unwrap().get(id)
+            && kept.seen.elapsed() < LISTING_TTL
+        {
+            return Some(kept.rendered.child_dirs.clone());
+        }
+        let rendered = self.kept_on_disk(id)?;
+        let names = rendered.child_dirs.clone();
+        self.renders
+            .lock()
+            .unwrap()
+            .admit(id.to_string(), rendered, false);
+        Some(names)
     }
 
     /// Contents of a page dir: `page.json` plus a subdir per `child_page` block.
@@ -690,14 +808,12 @@ impl NotionFs {
     /// `stat` of `page.json` would have paid anyway, and the cache means an `ls`
     /// and the read after it share it.
     async fn page_dir_entries(&self, page_id: &str) -> io::Result<Vec<Dirent>> {
-        let rendered = self.render_cached(page_id).await?;
+        let names = match self.kept_child_dirs(page_id) {
+            Some(names) => names,
+            None => self.render_cached(page_id).await?.child_dirs,
+        };
         let mut out = vec![Dirent::new("page.json", DirentKind::File)];
-        out.extend(
-            rendered
-                .child_dirs
-                .iter()
-                .map(|name| Dirent::new(name.clone(), DirentKind::Dir)),
-        );
+        out.extend(dirs_of(&names));
         Ok(out)
     }
 }
@@ -722,12 +838,12 @@ impl FileSystem for NotionFs {
                     // page was rendered a moment ago is already answered — which is most of
                     // them, a reader having just listed the parent.
                     let (Node::Page(id) | Node::Database(id)) = node(last);
-                    if let Some((checked, rendered)) = self.renders.lock().unwrap().get(&id)
-                        && checked.elapsed() < FRESH
+                    if let Some(kept) = self.renders.lock().unwrap().get(&id)
+                        && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
                     {
                         let mut st = Stat::new(DirentKind::Dir, 0);
-                        st.mtime = rendered.mtime;
-                        st.ctime = rendered.ctime;
+                        st.mtime = kept.rendered.mtime;
+                        st.ctime = kept.rendered.ctime;
                         return Ok(st);
                     }
                     // Otherwise confirm the directory exists (and pick up its times) cheaply —
@@ -1303,7 +1419,7 @@ mod tests {
     fn the_cache_drops_the_oldest_render_rather_than_growing() {
         let mut renders = Renders::default();
         for i in 0..CACHE_CAP + 2 {
-            renders.admit(format!("page-{i}"), rendered(None));
+            renders.admit(format!("page-{i}"), rendered(None), true);
         }
         assert_eq!(renders.by_id.len(), CACHE_CAP);
         assert!(
@@ -1316,7 +1432,7 @@ mod tests {
         // Re-rendering a page it already holds replaces it rather than queueing it twice,
         // or the order would drop entries that are still in the map.
         let before = renders.order.len();
-        renders.admit(format!("page-{}", CACHE_CAP + 1), rendered(None));
+        renders.admit(format!("page-{}", CACHE_CAP + 1), rendered(None), true);
         assert_eq!(renders.order.len(), before);
     }
 
@@ -1380,36 +1496,84 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_comes_from_what_is_kept_without_asking_notion() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = store(Some(dir.path()));
+        let mut kept = rendered(Some("2026-09-22T05:00:00.000Z"));
+        kept.child_dirs = Arc::new(vec!["child__38ac4175a910810ab4b6e1bda771cd38".into()]);
+        fs.keep_on_disk(ID, &kept);
+
+        // No client, no server, no token that would work: reaching Notion here would fail, and
+        // the names come back all the same.
+        let names = fs
+            .kept_child_dirs(ID)
+            .expect("the entry answers the listing");
+        assert_eq!(*names, *kept.child_dirs);
+
+        // And what it put in memory is *not* confirmed, so the next `stat` or read still asks.
+        // A listing may be a minute behind; a size may not be wrong at all.
+        let in_memory = fs.renders.lock().unwrap().get(ID).unwrap();
+        assert!(in_memory.checked.is_none());
+    }
+
+    #[test]
+    fn the_top_level_listing_survives_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = store(Some(dir.path()));
+        assert!(fs.roots_on_disk().is_none(), "nothing kept yet");
+
+        let names = vec!["Engineering_Logs__490e8208".to_string()];
+        fs.keep_roots_on_disk(&names);
+        assert_eq!(fs.roots_on_disk().unwrap(), names);
+
+        // Without a directory there is nothing to read back, and nothing was written.
+        assert!(store(None).roots_on_disk().is_none());
+    }
+
+    #[test]
     fn the_directory_stops_growing_at_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let fs = store(Some(dir.path()));
-        // Older than anything the sweep keeps, so which ones go is not a question of ordering
-        // within the same millisecond.
+        // Named as pages are: `valid_notion_id` takes the 32-character form, and the sweep
+        // only ever drops entries that are pages.
         for i in 0..DISK_CAP + 5 {
-            std::fs::write(dir.path().join(format!("old-{i}.json")), b"{}").unwrap();
+            std::fs::write(dir.path().join(format!("{i:032x}.json")), b"{}").unwrap();
         }
+        // Not a page, and not the sweep's to drop: the top-level listing lives here too.
+        std::fs::write(dir.path().join(ROOTS_FILE), b"[]").unwrap();
 
         // A sweep happens every `SWEEP_EVERY` writes, not on each one.
         for _ in 0..SWEEP_EVERY - 1 {
             fs.sweep(dir.path());
         }
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), DISK_CAP + 5);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), DISK_CAP + 6);
         fs.sweep(dir.path());
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), DISK_CAP);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), DISK_CAP + 1);
+        assert!(
+            dir.path().join(ROOTS_FILE).exists(),
+            "the listing is not a page"
+        );
     }
 
     #[test]
     fn confirming_a_render_starts_its_window_again() {
         let mut renders = Renders::default();
-        renders.admit("page".into(), rendered(None));
-        let (first, _) = renders.get("page").unwrap();
+        renders.admit("page".into(), rendered(None), true);
+        let first = renders.get("page").unwrap().checked.unwrap();
 
         renders.confirm("page");
-        let (second, _) = renders.get("page").unwrap();
+        let second = renders.get("page").unwrap().checked.unwrap();
         assert!(
             second >= first,
             "a confirmed render is as good as a fresh one"
         );
+
+        // A render read back from disk is not confirmed: it may answer a listing, and
+        // `render_cached` asks Notion before it answers for content.
+        renders.admit("from-disk".into(), rendered(None), false);
+        let kept = renders.get("from-disk").unwrap();
+        assert!(kept.checked.is_none());
+        assert!(kept.seen.elapsed() < LISTING_TTL);
 
         // Confirming something that is not there is not an insertion: the render is what
         // carries the page's bytes, and there are none to carry.
