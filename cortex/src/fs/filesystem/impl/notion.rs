@@ -38,6 +38,14 @@
 //! between paying one request to look again and paying the whole walk — the walk is only redone
 //! for a page that actually changed.
 //!
+//! Given a directory ([`NotionFs::with_cache_dir`]) the renders outlive the process too, which
+//! is the case that was left: a client restarted is a client that pays the walk for every page
+//! its reader opens again, and a reader opens the same pages. On disk the entry carries the
+//! edit stamp it was built from, so a restart costs the same one `retrieve` a stale entry does.
+//! Nothing is written without a directory to write to, and what is written is the page's own
+//! json — the same content the reader is being shown, under whatever protection the caller
+//! gives that directory.
+//!
 //! Read-only: page/block writes and the domain command channel are not exposed. Every
 //! mutating method keeps [`FileSystem`]'s `ReadOnlyFilesystem` default rather than answering
 //! `Unsupported`, so one read-only source does not disable writes for a whole mount.
@@ -45,7 +53,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     io,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime},
 };
@@ -71,6 +79,13 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3);
 /// Past it the render is revalidated rather than dropped, so the cost of being wrong for
 /// longer is one `retrieve` and not another block walk.
 const FRESH: Duration = Duration::from_secs(15);
+
+/// How many renders are kept on disk, when there is a directory for them.
+const DISK_CAP: usize = 1000;
+
+/// How many writes pass between sweeps of the directory. A sweep is a `read_dir`, and it is
+/// only worth what it costs when there might be something over the cap to drop.
+const SWEEP_EVERY: u32 = 64;
 
 /// How many renders are kept.
 ///
@@ -169,6 +184,32 @@ impl Renders {
     }
 }
 
+/// A render, as it is kept between runs.
+///
+/// Times as epoch milliseconds rather than the strings Notion sent: what is compared is the
+/// `SystemTime` the render was built with, and a format is one more thing to agree about.
+/// The bytes are the rendered json itself, which is valid UTF-8 by construction — it is what
+/// `serde_json` just produced.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Stored {
+    /// `last_edited_time` of the page this was rendered from. Without it an entry could never
+    /// be revalidated, so an entry without it is never written.
+    edited_ms: u64,
+    created_ms: Option<u64>,
+    child_dirs: Vec<String>,
+    bytes: String,
+}
+
+fn epoch_ms(t: SystemTime) -> Option<u64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as u64)
+}
+
+fn at_ms(ms: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(ms)
+}
+
 /// A Notion workspace's pages, served as a tree.
 ///
 /// Read-only. Each `page.json` is rendered on read; the module doc has the layout.
@@ -176,6 +217,11 @@ pub struct NotionFs {
     client: reqwest::Client,
     api_key: String,
     renders: Mutex<Renders>,
+    /// Where renders outlive the process, when a caller has said where. See
+    /// [`NotionFs::with_cache_dir`].
+    cache_dir: Option<PathBuf>,
+    /// Writes since the directory was last swept, so the sweep is not a `read_dir` per page.
+    writes: Mutex<u32>,
 }
 
 impl NotionFs {
@@ -193,7 +239,108 @@ impl NotionFs {
             client,
             api_key: cfg.api_key.clone(),
             renders: Mutex::new(Renders::default()),
+            cache_dir: None,
+            writes: Mutex::new(0),
         })
+    }
+
+    /// Keep renders in `dir`, so they survive this process.
+    ///
+    /// Not part of [`NotionConfig`]: where a cache lives is a fact about the host and not about
+    /// the connection, and a spec that carried a path would carry it to machines that do not
+    /// have it. The directory is created on the first write and holds one file per page, each
+    /// the page's own rendered json — so it deserves whatever protection the pages do.
+    pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = Some(dir.into());
+        self
+    }
+
+    /// The render kept for `id` between runs, if there is one and it parses.
+    ///
+    /// Every failure here is a miss: a cache that cannot be read is a render to redo, never an
+    /// error to hand a reader who asked for a file.
+    fn kept_on_disk(&self, id: &str) -> Option<Rendered> {
+        let path = self.entry_path(id)?;
+        let stored: Stored = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        Some(Rendered {
+            bytes: Arc::new(stored.bytes.into_bytes()),
+            child_dirs: Arc::new(stored.child_dirs),
+            mtime: Some(at_ms(stored.edited_ms)),
+            ctime: stored.created_ms.map(at_ms),
+        })
+    }
+
+    /// Keep `rendered` for the next run. A render with no edit stamp is not written, since
+    /// nothing could ever decide whether it is still current.
+    fn keep_on_disk(&self, id: &str, rendered: &Rendered) {
+        let (Some(path), Some(edited_ms)) =
+            (self.entry_path(id), rendered.mtime.and_then(epoch_ms))
+        else {
+            return;
+        };
+        let Ok(bytes) = String::from_utf8(rendered.bytes.as_ref().clone()) else {
+            return;
+        };
+        let stored = Stored {
+            edited_ms,
+            created_ms: rendered.ctime.and_then(epoch_ms),
+            child_dirs: rendered.child_dirs.as_ref().clone(),
+            bytes,
+        };
+        let Some(dir) = path.parent() else { return };
+        if std::fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        // Through a temporary and renamed into place: a reader that finds a half-written entry
+        // would take a truncated render for the page, and the parse that rejects it is not
+        // guaranteed to — json can be valid and short.
+        let tmp = path.with_extension("tmp");
+        if serde_json::to_vec(&stored)
+            .ok()
+            .and_then(|v| std::fs::write(&tmp, v).ok())
+            .is_some()
+            && std::fs::rename(&tmp, &path).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        self.sweep(dir);
+    }
+
+    /// Where `id`'s entry lives, for an id that could be one.
+    ///
+    /// `valid_notion_id` is what keeps this from being a path: an id is a uuid, so there is no
+    /// separator and no `..` to smuggle through a file name.
+    fn entry_path(&self, id: &str) -> Option<PathBuf> {
+        let dir = self.cache_dir.as_ref()?;
+        valid_notion_id(id).then(|| dir.join(format!("{id}.json")))
+    }
+
+    /// Drop the oldest entries when there are too many, every so many writes.
+    fn sweep(&self, dir: &Path) {
+        {
+            let mut writes = self.writes.lock().unwrap();
+            *writes += 1;
+            if !writes.is_multiple_of(SWEEP_EVERY) {
+                return;
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut found: Vec<(SystemTime, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let modified = e.metadata().ok()?.modified().ok()?;
+                Some((modified, e.path()))
+            })
+            .collect();
+        if found.len() <= DISK_CAP {
+            return;
+        }
+        found.sort_by_key(|(at, _)| *at);
+        for (_, path) in found.iter().take(found.len() - DISK_CAP) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     // ---- Notion API client (async) ------------------------------------------
@@ -406,6 +553,18 @@ impl NotionFs {
             self.renders.lock().unwrap().confirm(page_id);
             return Ok(rendered.clone());
         }
+        // Nothing in memory, but perhaps something from a previous run: the same retrieve
+        // answers for it, so a restart costs what a stale entry costs rather than a walk.
+        if cached.is_none()
+            && let Some(rendered) = self.kept_on_disk(page_id)
+            && still_current(&rendered, &page)
+        {
+            self.renders
+                .lock()
+                .unwrap()
+                .admit(page_id.to_string(), rendered.clone());
+            return Ok(rendered);
+        }
 
         let blocks = self.list_block_tree(page_id.to_string(), 0).await?;
         let mut child_dirs = Vec::new();
@@ -422,6 +581,7 @@ impl NotionFs {
             .lock()
             .unwrap()
             .admit(page_id.to_string(), rendered.clone());
+        self.keep_on_disk(page_id, &rendered);
         Ok(rendered)
     }
 
@@ -448,6 +608,16 @@ impl NotionFs {
             self.renders.lock().unwrap().confirm(db_id);
             return Ok(rendered.clone());
         }
+        if cached.is_none()
+            && let Some(rendered) = self.kept_on_disk(db_id)
+            && still_current(&rendered, &db)
+        {
+            self.renders
+                .lock()
+                .unwrap()
+                .admit(db_id.to_string(), rendered.clone());
+            return Ok(rendered);
+        }
         let rows = self.query_database(db_id).await?;
         let child_dirs: Vec<String> = rows.iter().map(page_dirname).collect();
         let bytes = serde_json::to_vec_pretty(&normalize_database(&db, &rows, &child_dirs))
@@ -462,6 +632,7 @@ impl NotionFs {
             .lock()
             .unwrap()
             .admit(db_id.to_string(), rendered.clone());
+        self.keep_on_disk(db_id, &rendered);
         Ok(rendered)
     }
 
@@ -1147,6 +1318,84 @@ mod tests {
         let before = renders.order.len();
         renders.admit(format!("page-{}", CACHE_CAP + 1), rendered(None));
         assert_eq!(renders.order.len(), before);
+    }
+
+    fn store(dir: Option<&Path>) -> NotionFs {
+        let fs = NotionFs::new(&NotionConfig {
+            api_key: "secret".into(),
+        })
+        .unwrap();
+        match dir {
+            Some(d) => fs.with_cache_dir(d),
+            None => fs,
+        }
+    }
+
+    const ID: &str = "38ac4175-a910-810a-b4b6-e1bda771cd38";
+
+    #[test]
+    fn a_render_kept_on_disk_comes_back_as_what_it_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = store(Some(dir.path()));
+        let mut kept = rendered(Some("2026-09-22T05:00:00.000Z"));
+        kept.bytes = Arc::new(br#"{"title":"a page"}"#.to_vec());
+        kept.child_dirs = Arc::new(vec!["child__38ac4175a910810ab4b6e1bda771cd38".into()]);
+
+        fs.keep_on_disk(ID, &kept);
+        let back = fs.kept_on_disk(ID).expect("an entry was written");
+        assert_eq!(back.bytes, kept.bytes);
+        assert_eq!(back.child_dirs, kept.child_dirs);
+        // The stamp is the whole point of keeping it: it is what the next run revalidates with.
+        assert_eq!(back.mtime, kept.mtime);
+        assert!(still_current(
+            &back,
+            &json!({ "last_edited_time": "2026-09-22T05:00:00.000Z" })
+        ));
+    }
+
+    #[test]
+    fn nothing_is_kept_that_could_never_be_revalidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = store(Some(dir.path()));
+
+        // No edit stamp: an entry whose freshness can never be decided is worse than no entry,
+        // because the next run would serve it and have no way to find out it is wrong.
+        fs.keep_on_disk(ID, &rendered(None));
+        assert!(fs.kept_on_disk(ID).is_none());
+
+        // And an id that is not a Notion id is not a file name. `..` never reaches the path.
+        fs.keep_on_disk(
+            "../../etc/passwd",
+            &rendered(Some("2026-09-22T05:00:00.000Z")),
+        );
+        assert!(fs.kept_on_disk("../../etc/passwd").is_none());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn without_a_directory_there_is_no_disk_to_read_or_write() {
+        let fs = store(None);
+        fs.keep_on_disk(ID, &rendered(Some("2026-09-22T05:00:00.000Z")));
+        assert!(fs.kept_on_disk(ID).is_none());
+    }
+
+    #[test]
+    fn the_directory_stops_growing_at_the_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = store(Some(dir.path()));
+        // Older than anything the sweep keeps, so which ones go is not a question of ordering
+        // within the same millisecond.
+        for i in 0..DISK_CAP + 5 {
+            std::fs::write(dir.path().join(format!("old-{i}.json")), b"{}").unwrap();
+        }
+
+        // A sweep happens every `SWEEP_EVERY` writes, not on each one.
+        for _ in 0..SWEEP_EVERY - 1 {
+            fs.sweep(dir.path());
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), DISK_CAP + 5);
+        fs.sweep(dir.path());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), DISK_CAP);
     }
 
     #[test]
