@@ -91,6 +91,10 @@ impl Stat {
 }
 
 /// One entry in a directory listing.
+///
+/// `Clone` because a listing is data a store may keep: an object store that caches what it
+/// listed hands the same entries out again rather than asking for them twice.
+#[derive(Clone, Debug)]
 pub struct Dirent {
     pub name: String,
 

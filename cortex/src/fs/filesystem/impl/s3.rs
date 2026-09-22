@@ -32,7 +32,7 @@ use std::{
     io,
     path::{Component, Path},
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use object_store::{
@@ -90,6 +90,8 @@ pub struct S3Fs {
     /// Normalised to carry no leading or trailing `/`, so [`Self::key`] can join
     /// with `/` unconditionally.
     prefix: String,
+    /// What the store answered when a directory was last listed.
+    listings: Mutex<Listings>,
     /// What reads have learned about keys, and what they read ahead into.
     ///
     /// Taken through [`lock`], which ignores poisoning: a panic anywhere else must not turn
@@ -128,6 +130,7 @@ impl S3Fs {
         S3Fs {
             prefix: prefix.trim_matches('/').to_string(),
             store,
+            listings: Mutex::default(),
             windows: Mutex::default(),
         }
     }
@@ -305,6 +308,55 @@ impl ReadCache {
             (Some(held), Some(fresh)) => held == fresh,
             _ => self.size == meta.size && self.mtime == SystemTime::from(meta.last_modified),
         }
+    }
+}
+
+/// How long a listing is handed out again without asking the store.
+///
+/// A listing here is one request, sometimes a few — not the walk a page render is — so this
+/// is not about a cold tree. It is about the same directory being asked for twice in a row,
+/// which is what a reader walking a tree does, and what an agent does every time it runs
+/// `ls` in a loop. Nothing in this store writes, so what changes a listing is someone else's
+/// doing; a reader who can see that has [`FileSystem::forget`].
+const LISTING_TTL: Duration = Duration::from_secs(30);
+
+/// How many directories' listings are kept.
+const MAX_CACHED_LISTINGS: usize = 256;
+
+/// The listings kept, and the order to give them up in.
+#[derive(Default)]
+struct Listings {
+    by_prefix: HashMap<String, (Instant, Arc<Vec<Dirent>>)>,
+    /// Prefixes in the order they were first listed. Insertion order for the reason
+    /// [`Windows::order`] gives.
+    order: VecDeque<String>,
+}
+
+impl Listings {
+    /// What was listed for `prefix`, while it is still worth handing out.
+    fn get(&self, prefix: &str) -> Option<Arc<Vec<Dirent>>> {
+        let (at, listed) = self.by_prefix.get(prefix)?;
+        (at.elapsed() < LISTING_TTL).then(|| listed.clone())
+    }
+
+    fn admit(&mut self, prefix: String, listed: Arc<Vec<Dirent>>) {
+        if self
+            .by_prefix
+            .insert(prefix.clone(), (Instant::now(), listed))
+            .is_none()
+        {
+            self.order.push_back(prefix);
+        }
+        while self.order.len() > MAX_CACHED_LISTINGS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_prefix.remove(&oldest);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_prefix.clear();
+        self.order.clear();
     }
 }
 
@@ -557,9 +609,18 @@ impl FileSystem for S3Fs {
     /// * A name can arrive from both sides at once: as a prefix (because keys live under it)
     ///   and as an object (because a key of exactly that name exists). A `readdir` may not
     ///   repeat a name, so one side has to go — see `resolve_collision`.
+    ///
+    /// Answered from the last listing while that is still recent. See [`LISTING_TTL`]: what a
+    /// listing says may be a little behind, and what a *read* says may not be — a stale name
+    /// costs a reader a second look, a stale size or a stale body is a reader handed the wrong
+    /// file. `stat` and `read_at` ask every time, and the sizes a kept listing carries are the
+    /// ones it was given.
     fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
         Box::pin(async move {
             let key = self.key(path)?;
+            if let Some(listed) = lock(&self.listings).get(&key) {
+                return Ok((*listed).clone());
+            }
             let prefix = if key.is_empty() {
                 None
             } else {
@@ -570,10 +631,25 @@ impl FileSystem for S3Fs {
                 .list_with_delimiter(prefix.as_ref())
                 .await
                 .map_err(to_io_error)?;
-            Ok(Self::resolve_collision(
+            let entries = Arc::new(Self::resolve_collision(
                 listed,
                 prefix.as_ref().map(|p| p.as_ref()).unwrap_or(""),
-            ))
+            ));
+            lock(&self.listings).admit(key, entries.clone());
+            Ok((*entries).clone())
+        })
+    }
+
+    /// Drop the listings, and what reads learned about keys.
+    ///
+    /// The read side cannot be stale — a `stat` revalidates it against a fresh `head` — so
+    /// this is mostly about the listings. It goes too because a reader who asks to look
+    /// again has said, as plainly as the protocol allows, that they do not want an answer
+    /// from anything kept here.
+    fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            lock(&self.listings).clear();
+            *lock(&self.windows) = Windows::default();
         })
     }
 
@@ -797,6 +873,68 @@ mod tests {
         let n = fs.read_at(Path::new(key), &mut buf, 0).await.unwrap();
         buf.truncate(n);
         buf
+    }
+
+    /// A listing is kept, and what is kept is what a reader sees until it is not.
+    ///
+    /// Deleting the object *behind* the store is how a test asks whether the answer came from
+    /// the store or from the cache: nothing else can tell the two apart, and counting requests
+    /// would pin how the listing is fetched rather than that it is not fetched twice.
+    #[tokio::test]
+    async fn a_listing_is_answered_from_the_last_one() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"a").await;
+        put(&store, "b.txt", b"b").await;
+        assert_eq!(fs.list(Path::new("/")).await.unwrap().len(), 2);
+
+        store.delete(&os_path("b.txt").unwrap()).await.unwrap();
+        assert_eq!(
+            fs.list(Path::new("/")).await.unwrap().len(),
+            2,
+            "the second listing is the first one, which is the whole point"
+        );
+
+        // What a reader says when they can see that the bucket has moved on.
+        fs.forget().await;
+        assert_eq!(fs.list(Path::new("/")).await.unwrap().len(), 1);
+    }
+
+    /// A read is not a listing: it asks every time, so a file's bytes are never a guess.
+    #[tokio::test]
+    async fn a_read_still_asks_after_a_listing_was_kept() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"one").await;
+        fs.list(Path::new("/")).await.unwrap();
+
+        put(&store, "a.txt", b"two").await;
+        // `stat` heads the object and revalidates the read window with what it finds.
+        assert_eq!(fs.stat(Path::new("a.txt")).await.unwrap().size, 3);
+        assert_eq!(read(&fs, "a.txt", 3).await, b"two");
+    }
+
+    #[test]
+    fn listings_are_given_up_oldest_first() {
+        let mut kept = Listings::default();
+        for i in 0..MAX_CACHED_LISTINGS + 2 {
+            kept.admit(format!("dir-{i}"), Arc::new(vec![]));
+        }
+        assert!(kept.get("dir-0").is_none(), "the first one listed went");
+        assert!(
+            kept.get(&format!("dir-{}", MAX_CACHED_LISTINGS + 1))
+                .is_some()
+        );
+        assert_eq!(kept.by_prefix.len(), MAX_CACHED_LISTINGS);
+
+        // Re-listing a prefix it already holds replaces it rather than queueing it twice.
+        let before = kept.order.len();
+        kept.admit(format!("dir-{}", MAX_CACHED_LISTINGS + 1), Arc::new(vec![]));
+        assert_eq!(kept.order.len(), before);
+
+        kept.clear();
+        assert!(
+            kept.get(&format!("dir-{}", MAX_CACHED_LISTINGS + 1))
+                .is_none()
+        );
     }
 
     /// The case the revalidation exists for: a longer object under a filled entry. The
