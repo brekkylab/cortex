@@ -150,9 +150,13 @@ impl Rendered {
     }
 }
 
-/// One render, and the two things that decide what it may still answer.
+/// One render, and the three things that decide what it may still answer.
 #[derive(Clone)]
 struct Kept {
+    /// Which `forget` this was admitted under. A reader who asks for a refresh is saying
+    /// that what is kept is not what they want, and the cheapest way to mean it is to stop
+    /// answering from anything admitted before they said so.
+    epoch: u64,
     /// When Notion last confirmed this render describes the page. `None` for one read back from
     /// disk, which nothing in this run has checked — it may be served as a *listing* and must
     /// not be served as content.
@@ -173,10 +177,10 @@ struct Renders {
 }
 
 impl Renders {
-    /// What is kept for `id`, as a copy: every caller would have to clone it anyway, and
+    /// What is kept for `id` under `epoch`, as a copy: every caller would have to clone it anyway, and
     /// holding the lock past this line is how a re-entrant lock gets taken by accident.
-    fn get(&self, id: &str) -> Option<Kept> {
-        self.by_id.get(id).cloned()
+    fn get(&self, id: &str, epoch: u64) -> Option<Kept> {
+        self.by_id.get(id).filter(|k| k.epoch == epoch).cloned()
     }
 
     /// Say that Notion still has what this render describes. A page that is checked and found
@@ -189,10 +193,16 @@ impl Renders {
         }
     }
 
+    fn clear(&mut self) {
+        self.by_id.clear();
+        self.order.clear();
+    }
+
     /// Keep `rendered`. `checked` says whether Notion confirmed it in this run — false for one
     /// read back from disk, which may answer a listing and may not answer for content.
-    fn admit(&mut self, id: String, rendered: Rendered, checked: bool) {
+    fn admit(&mut self, id: String, rendered: Rendered, checked: bool, epoch: u64) {
         let kept = Kept {
+            epoch,
             checked: checked.then(Instant::now),
             seen: Instant::now(),
             rendered,
@@ -259,6 +269,9 @@ pub struct NotionFs {
     api_key: String,
     renders: Mutex<Renders>,
     roots: Mutex<Option<Roots>>,
+    /// How many times a reader has asked for a refresh. Nothing kept from before the last
+    /// one answers again — see [`NotionFs::forget`].
+    epoch: std::sync::atomic::AtomicU64,
     /// Where renders outlive the process, when a caller has said where. See
     /// [`NotionFs::with_cache_dir`].
     cache_dir: Option<PathBuf>,
@@ -282,9 +295,34 @@ impl NotionFs {
             api_key: cfg.api_key.clone(),
             renders: Mutex::new(Renders::default()),
             roots: Mutex::new(None),
+            epoch: std::sync::atomic::AtomicU64::new(0),
             cache_dir: None,
             writes: Mutex::new(0),
         })
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Ask the source again for everything.
+    ///
+    /// A reader reaches for this when they can see that Notion has moved on in a way nothing
+    /// here can: a page deleted leaves the parent's listing wrong, and a listing is served
+    /// from a render precisely so that it costs no request. Nothing kept from before this
+    /// call answers again — not the renders in memory, not the ones on disk, and not the
+    /// top-level listing, whose file goes with them. The pages a reader visits afterwards are
+    /// rendered once more, which is what they asked for.
+    ///
+    /// The pages they do *not* visit cost nothing: this drops what is kept, it does not fetch.
+    fn forget_kept(&self) {
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self.roots.lock().unwrap() = None;
+        self.renders.lock().unwrap().clear();
+        if let Some(dir) = self.cache_dir.as_ref() {
+            let _ = std::fs::remove_file(dir.join(ROOTS_FILE));
+        }
     }
 
     /// Keep renders in `dir`, so they survive this process.
@@ -615,7 +653,8 @@ impl NotionFs {
     /// it, one `retrieve` says whether the page has been edited, and an unchanged page keeps
     /// the render it has. Only a page that actually changed pays for the block walk again.
     async fn render_cached(&self, page_id: &str) -> io::Result<Rendered> {
-        let cached = self.renders.lock().unwrap().get(page_id);
+        let epoch = self.epoch();
+        let cached = self.renders.lock().unwrap().get(page_id, epoch);
         if let Some(kept) = &cached
             && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
         {
@@ -631,13 +670,17 @@ impl NotionFs {
         }
         // Nothing in memory, but perhaps something from a previous run: the same retrieve
         // answers for it, so a restart costs what a stale entry costs rather than a walk.
-        if let Some(rendered) = self.kept_on_disk(page_id)
+        // Not after a refresh: a render from a previous run is exactly what the reader said
+        // they did not want, and `last_edited_time` is not a promise that a child page
+        // removed from this one moved it.
+        if epoch == 0
+            && let Some(rendered) = self.kept_on_disk(page_id)
             && still_current(&rendered, &page)
         {
             self.renders
                 .lock()
                 .unwrap()
-                .admit(page_id.to_string(), rendered.clone(), true);
+                .admit(page_id.to_string(), rendered.clone(), true, epoch);
             return Ok(rendered);
         }
 
@@ -655,7 +698,7 @@ impl NotionFs {
         self.renders
             .lock()
             .unwrap()
-            .admit(page_id.to_string(), rendered.clone(), true);
+            .admit(page_id.to_string(), rendered.clone(), true, epoch);
         self.keep_on_disk(page_id, &rendered);
         Ok(rendered)
     }
@@ -667,7 +710,8 @@ impl NotionFs {
     /// beside them, which here are the rows. One query answers both, so an `ls` of
     /// a database and the read of its `database.json` cost one query between them.
     async fn render_database_cached(&self, db_id: &str) -> io::Result<Rendered> {
-        let cached = self.renders.lock().unwrap().get(db_id);
+        let epoch = self.epoch();
+        let cached = self.renders.lock().unwrap().get(db_id, epoch);
         if let Some(kept) = &cached
             && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
         {
@@ -683,13 +727,14 @@ impl NotionFs {
             self.renders.lock().unwrap().confirm(db_id);
             return Ok(kept.rendered.clone());
         }
-        if let Some(rendered) = self.kept_on_disk(db_id)
+        if epoch == 0
+            && let Some(rendered) = self.kept_on_disk(db_id)
             && still_current(&rendered, &db)
         {
             self.renders
                 .lock()
                 .unwrap()
-                .admit(db_id.to_string(), rendered.clone(), true);
+                .admit(db_id.to_string(), rendered.clone(), true, epoch);
             return Ok(rendered);
         }
         let rows = self.query_database(db_id).await?;
@@ -705,7 +750,7 @@ impl NotionFs {
         self.renders
             .lock()
             .unwrap()
-            .admit(db_id.to_string(), rendered.clone(), true);
+            .admit(db_id.to_string(), rendered.clone(), true, epoch);
         self.keep_on_disk(db_id, &rendered);
         Ok(rendered)
     }
@@ -750,7 +795,8 @@ impl NotionFs {
         {
             return Ok(dirs_of(&roots.names));
         }
-        if self.roots.lock().unwrap().is_none()
+        if self.epoch() == 0
+            && self.roots.lock().unwrap().is_none()
             && let Some(names) = self.roots_on_disk()
         {
             let names = Arc::new(names);
@@ -786,17 +832,23 @@ impl NotionFs {
     /// confirmed in this run is still a fine answer to "what is in this directory": the click
     /// that follows goes through `render_cached`, which does confirm. See [`LISTING_TTL`].
     fn kept_child_dirs(&self, id: &str) -> Option<Arc<Vec<String>>> {
-        if let Some(kept) = self.renders.lock().unwrap().get(id)
+        let epoch = self.epoch();
+        if let Some(kept) = self.renders.lock().unwrap().get(id, epoch)
             && kept.seen.elapsed() < LISTING_TTL
         {
             return Some(kept.rendered.child_dirs.clone());
+        }
+        // A render from a previous run answers a listing — but not once a reader has asked
+        // for a refresh, which is the one thing they can say about a page that was deleted.
+        if epoch != 0 {
+            return None;
         }
         let rendered = self.kept_on_disk(id)?;
         let names = rendered.child_dirs.clone();
         self.renders
             .lock()
             .unwrap()
-            .admit(id.to_string(), rendered, false);
+            .admit(id.to_string(), rendered, false, epoch);
         Some(names)
     }
 
@@ -822,6 +874,10 @@ impl NotionFs {
 /// something keeps the trait's `ReadOnlyFilesystem` default, and a caller hears that on the
 /// write rather than on the open — there being no open to hear it on.
 impl FileSystem for NotionFs {
+    fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async move { self.forget_kept() })
+    }
+
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let segs = segments(path);
@@ -838,7 +894,7 @@ impl FileSystem for NotionFs {
                     // page was rendered a moment ago is already answered — which is most of
                     // them, a reader having just listed the parent.
                     let (Node::Page(id) | Node::Database(id)) = node(last);
-                    if let Some(kept) = self.renders.lock().unwrap().get(&id)
+                    if let Some(kept) = self.renders.lock().unwrap().get(&id, self.epoch())
                         && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
                     {
                         let mut st = Stat::new(DirentKind::Dir, 0);
@@ -1419,20 +1475,20 @@ mod tests {
     fn the_cache_drops_the_oldest_render_rather_than_growing() {
         let mut renders = Renders::default();
         for i in 0..CACHE_CAP + 2 {
-            renders.admit(format!("page-{i}"), rendered(None), true);
+            renders.admit(format!("page-{i}"), rendered(None), true, 0);
         }
         assert_eq!(renders.by_id.len(), CACHE_CAP);
         assert!(
-            renders.get("page-0").is_none(),
+            renders.get("page-0", 0).is_none(),
             "the first one visited went"
         );
-        assert!(renders.get("page-1").is_none());
-        assert!(renders.get(&format!("page-{}", CACHE_CAP + 1)).is_some());
+        assert!(renders.get("page-1", 0).is_none());
+        assert!(renders.get(&format!("page-{}", CACHE_CAP + 1), 0).is_some());
 
         // Re-rendering a page it already holds replaces it rather than queueing it twice,
         // or the order would drop entries that are still in the map.
         let before = renders.order.len();
-        renders.admit(format!("page-{}", CACHE_CAP + 1), rendered(None), true);
+        renders.admit(format!("page-{}", CACHE_CAP + 1), rendered(None), true, 0);
         assert_eq!(renders.order.len(), before);
     }
 
@@ -1512,8 +1568,40 @@ mod tests {
 
         // And what it put in memory is *not* confirmed, so the next `stat` or read still asks.
         // A listing may be a minute behind; a size may not be wrong at all.
-        let in_memory = fs.renders.lock().unwrap().get(ID).unwrap();
+        let in_memory = fs.renders.lock().unwrap().get(ID, 0).unwrap();
         assert!(in_memory.checked.is_none());
+    }
+
+    #[test]
+    fn a_refresh_stops_everything_kept_from_answering() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = store(Some(dir.path()));
+        let mut kept = rendered(Some("2026-09-22T05:00:00.000Z"));
+        kept.child_dirs = Arc::new(vec!["deleted__38ac4175a910810ab4b6e1bda771cd38".into()]);
+        fs.keep_on_disk(ID, &kept);
+        fs.keep_roots_on_disk(&["Engineering_Logs__490e8208".to_string()]);
+        assert!(
+            fs.kept_child_dirs(ID).is_some(),
+            "kept, before the reader says otherwise"
+        );
+
+        // What a reader means by Refresh: a page they deleted is still in a listing, and a
+        // listing is served from a render precisely so that it costs no request.
+        fs.forget_kept();
+
+        assert!(
+            fs.kept_child_dirs(ID).is_none(),
+            "the listing has to be asked for again, not answered from the render that has it"
+        );
+        assert!(
+            fs.roots_on_disk().is_none(),
+            "and the top-level listing goes with it"
+        );
+        // The renders themselves are still on disk — dropping them would make the next visit
+        // to every page a whole block walk — but nothing reaches them without asking Notion
+        // first, because the epoch has moved.
+        assert!(fs.kept_on_disk(ID).is_some());
+        assert!(fs.renders.lock().unwrap().get(ID, fs.epoch()).is_none());
     }
 
     #[test]
@@ -1558,11 +1646,11 @@ mod tests {
     #[test]
     fn confirming_a_render_starts_its_window_again() {
         let mut renders = Renders::default();
-        renders.admit("page".into(), rendered(None), true);
-        let first = renders.get("page").unwrap().checked.unwrap();
+        renders.admit("page".into(), rendered(None), true, 0);
+        let first = renders.get("page", 0).unwrap().checked.unwrap();
 
         renders.confirm("page");
-        let second = renders.get("page").unwrap().checked.unwrap();
+        let second = renders.get("page", 0).unwrap().checked.unwrap();
         assert!(
             second >= first,
             "a confirmed render is as good as a fresh one"
@@ -1570,15 +1658,15 @@ mod tests {
 
         // A render read back from disk is not confirmed: it may answer a listing, and
         // `render_cached` asks Notion before it answers for content.
-        renders.admit("from-disk".into(), rendered(None), false);
-        let kept = renders.get("from-disk").unwrap();
+        renders.admit("from-disk".into(), rendered(None), false, 0);
+        let kept = renders.get("from-disk", 0).unwrap();
         assert!(kept.checked.is_none());
         assert!(kept.seen.elapsed() < LISTING_TTL);
 
         // Confirming something that is not there is not an insertion: the render is what
         // carries the page's bytes, and there are none to carry.
         renders.confirm("missing");
-        assert!(renders.get("missing").is_none());
+        assert!(renders.get("missing", 0).is_none());
     }
 
     fn child(btype: &str, title: &str, id: &str) -> Value {

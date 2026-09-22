@@ -409,6 +409,22 @@ pub trait FileSystem: Send + Sync {
         let _ = path;
         Box::pin(async { Ok(()) })
     }
+
+    /// Drop whatever is being kept, so the next read asks the source again.
+    ///
+    /// For a store that keeps nothing this is what it looks like: nothing. It is for the
+    /// ones that do — a remote store that renders or caches, where a reader who can see
+    /// that the source has moved on has no other way to say so. Consistency is not what
+    /// this is for: a cache that could be wrong in a way a `stat` would catch does not need
+    /// asking. It is for what a store cannot check cheaply, and it arrives when a person
+    /// asks for it.
+    ///
+    /// Not a failure to report: a store that cannot drop something has already answered the
+    /// question by keeping it, and a refresh that returns an error the caller cannot act on
+    /// is a worse answer than one that quietly did what it could.
+    fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// A shared backend is itself a backend: every call forwards to the one inside.
@@ -428,6 +444,10 @@ pub trait FileSystem: Send + Sync {
 impl<T: FileSystem + ?Sized> FileSystem for Arc<T> {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         (**self).stat(path)
+    }
+
+    fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
+        (**self).forget()
     }
 
     fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
