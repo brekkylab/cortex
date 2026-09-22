@@ -228,13 +228,30 @@ fn to_io_error(err: object_store::Error) -> io::Error {
 /// per request — a guest asks in 128 KiB pieces at most (32 KiB through FUSE-T).
 const READAHEAD_CHUNK: u64 = 8 << 20;
 
-/// How many keys may hold a read-ahead window at once, which is what bounds this store's
-/// memory: at most this many times [`READAHEAD_CHUNK`], so 64 MiB.
+/// How many keys may hold a window at once.
 ///
 /// A cap is needed *because* the windows are keyed by path rather than by an open. A
 /// per-open window is bounded by however many files a consumer has open at once — which is
 /// to say, not bounded at all, only invisible. This one is a number.
+///
+/// It is not the memory bound, though it was written as one. A window is as large as the
+/// read that filled it: [`READAHEAD_CHUNK`] for a sequential reader asking in guest-sized
+/// pieces, but a caller that reads a whole file in one call — which is what a window
+/// holding a document for a viewer does — gets a window the size of the file. Eight of
+/// those is however large eight files are. [`MAX_CACHED_BYTES`] is the bound.
 const MAX_CACHED_KEYS: usize = 8;
+
+/// How many bytes of object bodies are held across every entry.
+///
+/// The number the count above was assumed to give. Keeping whole bodies is what makes a
+/// file opened twice cost one `head` and no transfer, and it is worth doing — but a reader
+/// that opens six large documents should not be six large documents of memory. Past this,
+/// the oldest entries give up what they hold.
+///
+/// Never the entry just filled, however large it is: that one is what the read in progress
+/// is being served from, and dropping it would send the same bytes over the wire again to
+/// answer the call that just fetched them.
+const MAX_CACHED_BYTES: u64 = 64 << 20;
 
 /// What the store remembers about one key between reads.
 ///
@@ -391,6 +408,47 @@ impl Windows {
         {
             self.by_key.remove(&oldest);
         }
+    }
+
+    /// Put `data` in `key`'s window, and give up what does not fit.
+    ///
+    /// The eviction is here rather than at the call site because this is the only place a
+    /// window grows, and a budget checked anywhere else is a budget that holds until someone
+    /// adds a second writer.
+    fn store_window(&mut self, key: &str, at: u64, data: Vec<u8>) {
+        let Some(cache) = self.by_key.get_mut(key) else {
+            return;
+        };
+        cache.window = Some((at, data));
+        while self.held_bytes() > MAX_CACHED_BYTES {
+            // The oldest entry that is not the one just filled. Nothing is dropped when that
+            // is the only one holding anything — see `MAX_CACHED_BYTES`.
+            let Some(oldest) = self
+                .order
+                .iter()
+                .find(|held| {
+                    held.as_str() != key
+                        && self.by_key.get(*held).is_some_and(|c| c.window.is_some())
+                })
+                .cloned()
+            else {
+                return;
+            };
+            if let Some(cache) = self.by_key.get_mut(&oldest) {
+                // The window goes, the entry stays: what it knows about the object — its
+                // size, its etag — is what lets the next read clamp a range and revalidate,
+                // and that costs nothing to keep.
+                cache.window = None;
+            }
+        }
+    }
+
+    fn held_bytes(&self) -> u64 {
+        self.by_key
+            .values()
+            .filter_map(|c| c.window.as_ref())
+            .map(|(_, data)| data.len() as u64)
+            .sum()
     }
 
     /// Forget `key` entirely, so the next read of it starts from a `head`.
@@ -736,9 +794,7 @@ impl FileSystem for S3Fs {
                 let n = data.len().min(want - filled);
                 buf[filled..filled + n].copy_from_slice(&data[..n]);
                 filled += n;
-                if let Some(cache) = lock(&self.windows).by_key.get_mut(&key) {
-                    cache.window = Some((at, data));
-                }
+                lock(&self.windows).store_window(&key, at, data);
             }
 
             if filled > 0 {
@@ -910,6 +966,70 @@ mod tests {
         // `stat` heads the object and revalidates the read window with what it finds.
         assert_eq!(fs.stat(Path::new("a.txt")).await.unwrap().size, 3);
         assert_eq!(read(&fs, "a.txt", 3).await, b"two");
+    }
+
+    /// A whole body kept for one key, sized `mib`.
+    fn held(mib: usize) -> ReadCache {
+        ReadCache {
+            size: (mib << 20) as u64,
+            etag: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            window: None,
+            last_end: None,
+        }
+    }
+
+    #[test]
+    fn what_is_held_stays_inside_the_budget() {
+        let mut windows = Windows::default();
+        let mib = 1 << 20;
+        // Three bodies, half the budget each: the third pushes the first out.
+        for key in ["a", "b", "c"] {
+            windows.admit(key.to_string(), held(32));
+            windows.store_window(key, 0, vec![0u8; 32 * mib]);
+        }
+        assert!(windows.held_bytes() <= MAX_CACHED_BYTES);
+        assert!(
+            windows.by_key["a"].window.is_none(),
+            "the oldest gave up its body"
+        );
+        assert!(
+            windows.by_key["c"].window.is_some(),
+            "the one just read is kept"
+        );
+        // The entry itself stays: its size and etag are what clamp and revalidate the next
+        // read, and they cost nothing.
+        assert_eq!(windows.by_key["a"].size, (32 * mib) as u64);
+    }
+
+    #[test]
+    fn a_body_larger_than_the_budget_is_still_what_the_read_is_served_from() {
+        let mut windows = Windows::default();
+        windows.admit("small".to_string(), held(1));
+        windows.store_window("small", 0, vec![0u8; 1 << 20]);
+        windows.admit("huge".to_string(), held(96));
+        windows.store_window("huge", 0, vec![0u8; 96 << 20]);
+
+        // Over budget, and kept anyway: dropping it would send the bytes that were just
+        // fetched over the wire again, to answer the call that fetched them.
+        assert!(windows.by_key["huge"].window.is_some());
+        assert!(
+            windows.by_key["small"].window.is_none(),
+            "everything else gave way"
+        );
+    }
+
+    /// The case this is all for: the same file opened twice costs a `head` and no transfer.
+    #[tokio::test]
+    async fn a_file_read_twice_is_fetched_once() {
+        let (store, fs) = store();
+        put(&store, "doc.pdf", b"the whole document").await;
+        assert_eq!(read(&fs, "doc.pdf", 18).await, b"the whole document");
+
+        // Take the object away behind the store: a second read that still answers is one
+        // that never went back for it.
+        store.delete(&os_path("doc.pdf").unwrap()).await.unwrap();
+        assert_eq!(read(&fs, "doc.pdf", 18).await, b"the whole document");
     }
 
     #[test]
