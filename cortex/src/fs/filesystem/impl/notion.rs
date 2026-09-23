@@ -1178,8 +1178,10 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
 ///
 /// The index carries each row's `dir` so a reader that has the index has the path
 /// to the row's body, rather than a name it has to rebuild the same way this module
-/// builds it. `properties` is Notion's own schema, unedited, for the reason a page's
-/// is.
+/// builds it. It carries the row's `icon` for the same reason the row's own page does:
+/// a reader that draws the index as a list has the row's name and nothing else to tell
+/// one row from the next, and reading every row's body to find out costs a request each.
+/// `properties` is Notion's own schema, unedited, for the reason a page's is.
 fn normalize_database(db: &Value, rows: &[Value], dirs: &[String]) -> Value {
     let parent = db.get("parent").cloned().unwrap_or_else(|| json!({}));
     let parent_type = parent.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1203,6 +1205,7 @@ fn normalize_database(db: &Value, rows: &[Value], dirs: &[String]) -> Value {
             json!({
                 "page_id": r.get("id").and_then(|v| v.as_str()).unwrap_or(""),
                 "dir": dir,
+                "icon": emoji_icon(r),
                 "properties": r.get("properties").cloned().unwrap_or_else(|| json!({})),
             })
         })
@@ -1698,6 +1701,21 @@ mod tests {
         let icon = json!({ "type": "emoji", "emoji": "\u{1f4c1}" });
         let rendered = normalize_page(&json!({ "id": "abc", "icon": icon }), &[]);
         assert_eq!(rendered["icon"], json!("\u{1f4c1}"));
+    }
+
+    /// A reader that draws the row index as a list never opens the rows, so an icon
+    /// the index drops is one it will not see.
+    #[test]
+    fn a_rows_icon_reaches_the_index_beside_its_dir() {
+        let rows = [
+            json!({ "id": "r1", "icon": { "type": "emoji", "emoji": "\u{1f41b}" } }),
+            json!({ "id": "r2" }),
+        ];
+        let dirs = ["bug__r1".to_string(), "plain__r2".to_string()];
+        let rendered = normalize_database(&json!({ "id": "db" }), &rows, &dirs);
+
+        assert_eq!(rendered["rows"][0]["icon"], json!("\u{1f41b}"));
+        assert_eq!(rendered["rows"][1].get("icon"), Some(&Value::Null));
     }
 
     /// A page directory and a database directory are told apart by the name alone,
