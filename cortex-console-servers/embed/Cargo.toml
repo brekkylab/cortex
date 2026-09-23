@@ -1,0 +1,27 @@
+[package]
+name = "cortex-console-embed"
+version.workspace = true
+edition.workspace = true
+
+# The console servers, as bytes. A caller of `cortex` names a backend and never a program, so
+# the program has to arrive with `cortex` — inside whatever binary links it — and this is what
+# carries it there.
+#
+# **A crate of its own, and one that does not depend on `cortex`**, because the servers do: a
+# `cortex` that depended on `cortex-local-console` would be a cycle. The servers are built by a
+# cargo of this build script's own, which is outside the graph this crate is in — the same
+# arrangement `cortex-uvm-console` already uses for its guest and its boot half.
+#
+# No dependencies, and no code beyond the constants: decompressing and running what is here is
+# `cortex`'s, which is where a caller meets it.
+
+[features]
+# One per server, and nothing is built for a feature that is off. `cortex`'s own `local` and
+# `uvm` are what turn these on.
+local = []
+uvm = []
+
+[build-dependencies]
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+zstd = { workspace = true }

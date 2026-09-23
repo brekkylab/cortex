@@ -6,6 +6,7 @@ members = [
     "cortex-execs/mem",
     "cortex-execs/index",
     "cortex-execs/docread",
+    "cortex-console-servers/embed",
     "cortex-console-servers/local",
     "cortex-console-servers/uvm/console",
     "cortex-console-servers/uvm/boot",
@@ -30,7 +31,14 @@ async-trait = "0.1"
 # carries a `Bson` in public API: two versions of it in one build would be a type
 # error nobody could read.
 bson = { version = "3", features = ["serde"] }
+# Without its defaults, for every member here. `cortex`'s one default is `local`, which carries
+# `cortex-local-console` inside whatever links it — and the servers are what link it. Taken with
+# its defaults, a server would carry a server, and the cargo `cortex-console-embed` starts to
+# build the servers would be asked to build one inside the other.
 cortex = { path = "cortex", default-features = false }
+# The console servers, carried inside whatever links `cortex` with `local` or `uvm` — so that
+# a caller names a backend and never a program. See its build script for how they get there.
+cortex-console-embed = { path = "cortex-console-servers/embed" }
 # The store format `mem` and `index` share: the tables, what a store says about
 # itself, and how one is opened.
 cortex-exec-storebase = { path = "cortex-execs/storebase" }
@@ -126,6 +134,12 @@ sqlite-vec = "0.1.9"
 # bytes. Without this, serde hands BSON a `Vec<u8>` as an array of integers, which is both
 # several times larger and a different type coming back.
 serde_bytes = "0.11"
+
+# What `cortex-console-embed` carries is zstd, and these are its two ends. Encoding is a
+# build-dependency of that crate and so never reaches a consumer's binary; decoding is
+# `ruzstd`, pure Rust, so a consumer that enables a backend gets no C to build for it.
+ruzstd = "0.8"
+zstd = "0.13"
 
 # Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
 # build-dependencies cannot themselves be optional.

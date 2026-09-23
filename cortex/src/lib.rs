@@ -38,9 +38,10 @@
 //!     let mount = FuseMount::try_new(context, Path::new("/tmp/session"))?;
 //!
 //!     // What the agent can do: a server that runs its commands, against that tree. A
-//!     // session's shape is said once, when the console is built.
+//!     // session's shape is said once, when the console is built. Naming no backend is this
+//!     // host's — a server this crate carries and starts, so there is no program to install;
+//!     // `.backend(Backend::uvm())` would run the same commands in a micro-VM instead.
 //!     let mut console = Console::builder()
-//!         .stdio_client(&["cortex-local-console"])
 //!         .context(mount)
 //!         .build()
 //!         .await?;
@@ -94,6 +95,8 @@
 #![allow(clippy::module_inception)]
 
 pub mod console;
+#[doc(hidden)]
+pub mod exe;
 pub mod fs;
 mod lock;
 pub mod rootfs;

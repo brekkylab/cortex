@@ -14,6 +14,8 @@ anyhow = { workspace = true }
 # `error` is decided by which member is present — and BSON is the self-describing
 # one with a native byte type, which is most of what this channel carries.
 bson = { workspace = true }
+# The console servers `Backend` starts, as bytes — only with `local` or `uvm`.
+cortex-console-embed = { workspace = true, optional = true }
 # `BoxFuture`, which is what every method on `Client` and `Server` hands back — see
 # `console::base` for why they are boxed rather than `async fn`.
 futures-core = { workspace = true }
@@ -27,6 +29,10 @@ object_store = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
+# Decompressing what `cortex-console-embed` carries. Pure Rust, so a backend brings no C to
+# build — measured, 118 KiB in a binary against 243 KiB for the C decoder, which is about 30
+# milliseconds faster once per machine per build.
+ruzstd = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
 # The digest a built image is named by. Small and pure Rust, and already in this
@@ -99,12 +105,37 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 #
 # Editors default to no features too, so a binding shows as inactive code until
 # its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
-default = []
+#
+# **`local` is the one default,** and it is not a binding: it is the console server a session
+# runs on when nobody names another, and it needs nothing a consumer has to install — the
+# toolchain that is building this crate builds it too. A console that exists without the
+# caller having to find a program for it is the point of carrying one, so it is on unless a
+# consumer turns it off with `default-features = false`, which is also how to skip building it.
+#
+# That is exactly what this workspace's own members do — see `cortex` in the workspace
+# manifest — and they have to: a server that took `cortex` with its defaults would carry a
+# server inside itself.
+default = ["local"]
 # Both bindings below also ask for `tokio/rt-multi-thread` and `tokio/net`: a
 # binding is a *synchronous* callback over async stores, so it blocks on one
 # process-wide runtime (`fs::mounts::block_on`), and `Builder::enable_all` is
 # cfg'd on `net` and `time` — built without them the runtime silently has no I/O
 # driver. `time` is already in the base set the console asks for.
+# A console server this crate carries and starts itself: `Backend::local` and `Backend::uvm`.
+# `local` is on by default, and is what a console with no backend named runs on.
+#
+# Enabling one builds that server — always in release, whatever profile this build is — and
+# embeds it compressed, so a caller names a backend and never a program. What that costs:
+#
+# - `local`: about 0.7 MB in whatever binary links this, and a build of `cortex-local-console`.
+# - `uvm`: about 5 MB, and a build of `cortex-uvm-console` — which needs the musl target for
+#   its guest (`rustup target add <arch>-unknown-linux-musl`).
+#
+# Both builds happen once and are cached with the rest of the build, but they are release builds
+# with fat LTO, and a change to this crate's sources is a change to theirs. See
+# `cortex-console-servers/embed/build.rs`, including the variables that shorten them.
+local = ["dep:cortex-console-embed", "cortex-console-embed/local", "dep:ruzstd"]
+uvm = ["dep:cortex-console-embed", "cortex-console-embed/uvm", "dep:ruzstd"]
 # Mount a cortex filesystem on the host through FUSE.
 #
 # Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,

@@ -17,6 +17,9 @@
 //!   stdout).
 //! - [`Console`] — the public end, and what a caller normally reaches for: the channel
 //!   that drives a server, and the session it was opened with.
+//! - `Backend`, under the `local` and `uvm` features — which server a console runs, named
+//!   rather than located: the server is built with this crate and carried inside whatever
+//!   links it, so a caller never has a program to find.
 //!
 //! Everything that waits is a future. A console spends nearly all of its time waiting —
 //! on a pipe, on a command, on a backend bringing a kernel up — so a caller with several
@@ -31,11 +34,15 @@
 //! [`Message`] has the reasoning for the protocol,
 //! [`read`](stdio::read) and [`write`](stdio::write) for the wire.
 
+#[cfg(any(feature = "local", feature = "uvm"))]
+mod backend;
 mod base;
 mod console;
 mod message;
 pub mod stdio;
 
+#[cfg(any(feature = "local", feature = "uvm"))]
+pub use backend::*;
 pub use base::*;
 pub use console::*;
 pub use message::*;

@@ -80,11 +80,12 @@ type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>
 /// is asked over it.
 #[derive(Default)]
 pub struct ConsoleBuilder {
-    /// Not a client but the making of one, because some clients are a process away:
-    /// [`stdio_client`](Self::stdio_client) is handed a program and not a channel, and
-    /// starting a program can fail. Deferring that to [`build`](Self::build) keeps every
-    /// setter infallible and leaves one place where a console either exists or says what
-    /// it lacked.
+    /// Not a client but the making of one, because some clients are a process away: a
+    /// backend names a server and not a channel, and writing a program out and starting it
+    /// can fail. Deferring that to [`build`](Self::build) keeps every setter infallible and
+    /// leaves one place where a console either exists or says what it lacked.
+    ///
+    /// Run on a blocking thread, because making one may write a program to disk.
     client_factory: Option<ClientFactory>,
 
     /// `None` is a console with nothing mounted, and stays `None`: a mount is something a
@@ -137,7 +138,35 @@ impl ConsoleBuilder {
         self
     }
 
+    /// Run the session on a console server this crate carries — see [`Backend`].
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "local")]
+    /// # async fn f() -> anyhow::Result<()> {
+    /// use cortex::console::{Backend, Console};
+    ///
+    /// let mut console = Console::builder().backend(Backend::local()).build().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// The server is written out — the first time on this machine — and started by
+    /// [`build`](Self::build), not here. What this replaces is saying which program to run,
+    /// and knowing where it is, which is neither the caller's to know nor something that
+    /// could stay at the same version as this library if it were.
+    ///
+    /// [`Backend`]: crate::console::Backend
+    #[cfg(any(feature = "local", feature = "uvm"))]
+    pub fn backend(mut self, backend: impl Into<crate::console::Backend>) -> Self {
+        let backend = backend.into();
+        self.client_factory = Some(Box::new(move || backend.start()));
+        self
+    }
+
     /// Drive a server this console starts itself: `cmd`, over its own pipes.
+    ///
+    /// Deprecated in favour of [`backend`](Self::backend), which names the server rather than
+    /// a program a caller has to have installed. A program of the caller's own is still a
+    /// [`StdioClient::new`] and a [`client`](Self::client).
     ///
     /// `cmd` is a program and its arguments — `["cortex-local-console"]`,
     /// `["sh", "-c", "…"]` — and that is the whole of what this shape of caller decides,
@@ -149,6 +178,10 @@ impl ConsoleBuilder {
     /// Starting it is [`build`](Self::build)'s, not this method's — nothing here starts
     /// anything, and a program that cannot be started, like a `cmd` with no program in
     /// it, is one of the ways building a console fails.
+    #[deprecated(
+        note = "name the server with `backend(Backend::local())` or `backend(Backend::uvm())`; \
+                for a program of your own, hand a `StdioClient` to `client`"
+    )]
     pub fn stdio_client(mut self, cmd: &[impl AsRef<str>]) -> Self {
         // Owned before the closure, because the closure outlives this borrow and what it
         // was given has to still be there when `build` runs it.
@@ -241,10 +274,11 @@ impl ConsoleBuilder {
     /// The base the session's commands run in, named as an OCI image.
     ///
     /// ```no_run
-    /// # use cortex::console::Console;
+    /// # #[cfg(feature = "uvm")]
     /// # async fn f() -> anyhow::Result<()> {
+    /// # use cortex::console::{Backend, Console};
     /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .backend(Backend::uvm())
     ///     .image("python:3.13-slim")
     ///     .build()
     ///     .await?;
@@ -272,10 +306,11 @@ impl ConsoleBuilder {
     /// How much of a network the session's commands get.
     ///
     /// ```no_run
-    /// # use cortex::console::{Console, NetworkAccess};
+    /// # #[cfg(feature = "uvm")]
     /// # async fn f() -> anyhow::Result<()> {
+    /// # use cortex::console::{Backend, Console, NetworkAccess};
     /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .backend(Backend::uvm())
     ///     .network(NetworkAccess::public())
     ///     .build()
     ///     .await?;
@@ -300,11 +335,12 @@ impl ConsoleBuilder {
     /// Build a rootfs, and run this session's commands in what it makes.
     ///
     /// ```no_run
-    /// # use cortex::console::Console;
-    /// # use cortex::rootfs::Rootfs;
+    /// # #[cfg(feature = "uvm")]
     /// # async fn f() -> anyhow::Result<()> {
+    /// # use cortex::console::{Backend, Console};
+    /// # use cortex::rootfs::Rootfs;
     /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .backend(Backend::uvm())
     ///     .rootfs(Rootfs::from_image("alpine:3.20").run("apk add --no-cache jq"))
     ///     .build()
     ///     .await?;
@@ -348,12 +384,18 @@ impl ConsoleBuilder {
         self
     }
 
-    /// Fails for the one part that has no default — something to ask — for whatever having
-    /// a channel took (over stdio, a server process that would not start), and for the
-    /// `init` this then sends.
+    /// Fails for whatever having a channel took (over stdio, a server process that would not
+    /// start), and for the `init` this then sends.
     ///
-    /// A runtime has to be under it: a console over [`stdio_client`](Self::stdio_client)
-    /// starts a process, and a process is registered with the runtime that will reap it.
+    /// **A builder that was given no server runs the local one** — [`Backend::local`], with
+    /// nothing changed — which is there unless this crate was built without its `local`
+    /// feature. Without it, a builder given neither a [`backend`](Self::backend) nor a
+    /// [`client`](Self::client) is the one part that has no default, and fails for it.
+    ///
+    /// [`Backend::local`]: crate::console::Backend
+    ///
+    /// A runtime has to be under it: a console over a [`backend`](Self::backend) starts a
+    /// process, and a process is registered with the runtime that will reap it.
     /// Building one from outside a task or `main` is a panic, not an `Err` — the missing
     /// runtime is the caller's own shape and not something the channel could report.
     ///
@@ -427,18 +469,15 @@ async fn build_it(
 /// results.
 ///
 /// ```no_run
+/// # #[cfg(feature = "local")]
+/// # async fn f() -> anyhow::Result<()> {
 /// use cortex::console::Console;
 ///
-/// # #[tokio::main]
-/// # async fn main() -> anyhow::Result<()> {
-/// // Whichever console server this is: the client starts it and owns it from here.
+/// // No backend named, so the local one: the console starts it and owns it from here.
 /// // Building also says what the session is — the tree it works in if there is one — so
 /// // a console that exists is one the server has answered. Nothing is booted by that;
 /// // the command below pays for the boot, unless a `start` gets there first.
-/// let mut console = Console::builder()
-///     .stdio_client(&["cortex-local-console"])
-///     .build()
-///     .await?;
+/// let mut console = Console::builder().build().await?;
 ///
 /// // `None`: this command has no opinion about how long it may take, so the console's
 /// // default stands. `Some(ms)` is how one says otherwise.
@@ -556,9 +595,20 @@ impl Console {
              in — name one"
         );
 
-        let client_factory =
-            client_factory.context("a console needs a client to drive its server")?;
-        let mut client = client_factory()?;
+        // Nothing named is the local server, where there is one: a console that runs commands
+        // on this host is what a caller with no opinion about where they run is asking for.
+        #[cfg(feature = "local")]
+        let client_factory = client_factory.or_else(|| {
+            let local = crate::console::Backend::local();
+            Some(Box::new(move || crate::console::Backend::from(local).start()) as ClientFactory)
+        });
+        let client_factory = client_factory.context(
+            "a console needs a client to drive its server — name a backend, or build cortex with \
+             its `local` feature for one to be there by default",
+        )?;
+        let mut client = tokio::task::spawn_blocking(client_factory)
+            .await
+            .context("starting the console server")??;
 
         // What the server is told about each tree is where this end has it. A mount point
         // with no URL to it is refused here rather than sent, by the rule the client factory
@@ -1069,7 +1119,9 @@ mod tests {
         })
     }
 
-    /// A builder needs exactly one thing, and says which when it does not have it.
+    /// Without the local server to fall back on, a builder needs exactly one thing, and says
+    /// which when it does not have it. With it, see `tests/backend_default.rs`.
+    #[cfg(not(feature = "local"))]
     #[tokio::test]
     async fn a_console_needs_something_to_ask() {
         let Err(failure) = Console::builder().build().await else {
@@ -1081,6 +1133,7 @@ mod tests {
     /// Every way building can fail says which one it was, and all of them are here rather
     /// than spread over the first few methods a caller would have reached for.
     #[tokio::test]
+    #[allow(deprecated)]
     async fn a_stdio_console_starts_its_server_when_it_is_built() {
         let Err(e) = Console::builder()
             .stdio_client(&["cortex-no-such-console"])

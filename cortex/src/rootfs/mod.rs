@@ -16,15 +16,16 @@
 //! the protocol and nothing else.
 //!
 //! ```no_run
-//! use cortex::console::Console;
+//! # #[cfg(feature = "uvm")]
+//! # async fn f() -> anyhow::Result<()> {
+//! use cortex::console::{Backend, Console};
 //! use cortex::rootfs::Rootfs;
 //!
-//! # async fn f() -> anyhow::Result<()> {
 //! // A build reaches the internet unless the session says otherwise — see
 //! // [`ConsoleBuilder::rootfs`](crate::console::ConsoleBuilder::rootfs), which is where a
 //! // recipe meets a server and so the one place a reach is decided.
 //! let mut console = Console::builder()
-//!     .stdio_client(&["cortex-uvm-console"])
+//!     .backend(Backend::uvm())
 //!     .rootfs(
 //!         Rootfs::from_image("python:3.13-slim")
 //!             .run("pip install --no-cache-dir pandas")
