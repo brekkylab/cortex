@@ -1,11 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
-    "cortex",
-    "cortex-execs/storebase",
-    "cortex-execs/mem",
-    "cortex-execs/index",
-    "cortex-execs/docread",
+    "cortex"
 ]
 # `cortex-uvm-guest` is the guest half of `cortex-uvm-console`: its own workspace root, because
 # it is cross-compiled to `*-unknown-linux-musl` and a member would be built for the host by a
