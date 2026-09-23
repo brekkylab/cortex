@@ -13,7 +13,9 @@
 //!   VMM and the network stack behind it out of the process that only answers a session.
 //!
 //! The copy is keyed by the content of the embedded bytes, so a rebuild produces a different
-//! key and therefore a fresh copy, and two servers built from the same source share one.
+//! key and therefore a fresh copy, and two servers built from the same source share one. It is
+//! written by [`cortex::exe::install`], which is also what takes the copies an older build left
+//! behind away — once nothing is about to start them.
 //!
 //! # Why signing here rather than asking the caller to sign
 //!
@@ -22,7 +24,6 @@
 //! property of the process that calls `hv_vm_create`, not of the product. Keeping the
 //! requirement on an artifact this crate carries keeps it out of everyone else's build.
 
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// The boot half, built for this host and embedded by `build.rs`.
@@ -45,38 +46,20 @@ const ENTITLEMENTS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 "#;
 
 /// The program a boot runs, written out and — on macOS — signed, once per build.
-pub fn boot_helper() -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
+///
+/// Hold what comes back until the boot process has started: that is what keeps another
+/// server's cleanup off the file in between.
+pub fn boot_helper() -> anyhow::Result<cortex::exe::Installed> {
     let cache = crate::assets::home()?.join("boot-helper");
-    std::fs::create_dir_all(&cache)?;
-
-    let dest = cache.join(format!("boot-{}", key()));
-    if dest.exists() {
-        return Ok(dest);
-    }
-
-    // Written, made executable and signed at a path nothing else will pick, then renamed
-    // into place. Two boots racing here both do the work and the rename decides which copy
-    // survives — where sharing one temporary path would mean one of them signing a file the
-    // other was still writing.
-    let tmp = cache.join(format!(
-        "boot-{}.{}.{}.tmp",
-        key(),
-        std::process::id(),
-        seq()
-    ));
-    std::fs::write(&tmp, BOOT_BIN)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-
-    #[cfg(target_os = "macos")]
-    if let Err(e) = sign(&cache, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    std::fs::rename(&tmp, &dest)?;
-    Ok(dest)
+    let installed = cortex::exe::install(&cache, "boot", key(), |tmp| {
+        std::fs::write(tmp, BOOT_BIN)?;
+        // Signed before it is renamed into place, so a helper that exists is one that can
+        // create a VM.
+        #[cfg(target_os = "macos")]
+        sign(&cache, tmp).map_err(std::io::Error::other)?;
+        Ok(())
+    })?;
+    Ok(installed)
 }
 
 #[cfg(target_os = "macos")]
@@ -109,11 +92,4 @@ fn key() -> &'static str {
         let hash = format!("{:x}", Sha256::digest(BOOT_BIN));
         format!("{}-{}", &hash[..16], BOOT_BIN.len())
     })
-}
-
-/// Distinguishes two boots of one process, which share a pid and a key.
-fn seq() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    SEQ.fetch_add(1, Ordering::Relaxed)
 }

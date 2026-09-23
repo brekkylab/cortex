@@ -2,7 +2,7 @@
 //!
 //! | | lifetime | cost |
 //! |---|---|---|
-//! | the libkrunfw kernel | installed | found, never built |
+//! | the libkrunfw kernel | cached, shared | downloaded once, pinned by digest |
 //! | the base image | cached, shared | pulled or built once per image |
 //! | the session image (ext4) | one session | formatted per boot, sparse |
 //! | the boot root | one session | a directory with two files in it |
@@ -69,29 +69,133 @@ const SESSION_JOURNAL_BLOCKS: u32 = 4096;
 const ANNOUNCE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Base directory for what is shared between sessions — `CORTEX_UVM_HOME`, else
-/// `$HOME/.cortex/uvm`.
+/// `$CORTEX_HOME/uvm`, else `$HOME/.cortex/uvm`.
+///
+/// `CORTEX_HOME` is the root everything cortex writes lives under, the server a client
+/// writes out included; this server's own share of it is `uvm`.
 pub fn home() -> io::Result<PathBuf> {
     std::env::var_os("CORTEX_UVM_HOME")
         .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CORTEX_HOME").map(|h| PathBuf::from(h).join("uvm")))
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cortex/uvm")))
-        .ok_or_else(|| io::Error::other("neither CORTEX_UVM_HOME nor HOME is set"))
+        .ok_or_else(|| io::Error::other("none of CORTEX_UVM_HOME, CORTEX_HOME or HOME is set"))
 }
 
-/// Find the libkrunfw kernel: `CORTEX_UVM_KERNEL`, else wherever a package manager put it.
+/// Where microsandbox publishes its releases, and so the libkrunfw this server boots.
+const KRUNFW_BASE_URL: &str = "https://github.com/superradcompany/microsandbox/releases/download";
+
+/// Stands in for [`KRUNFW_BASE_URL`] — a mirror, or a server a test runs.
+pub const KRUNFW_BASE_URL_ENV: &str = "CORTEX_UVM_KRUNFW_BASE_URL";
+
+/// The microsandbox release the kernel is taken from.
 ///
-/// Not downloaded. A kernel is loaded into the guest's memory by a `dlopen`ed library that
-/// has to be signed compatibly with the process loading it, so where it came from is a
-/// property of the installation rather than something a console server should decide on
-/// its own — and getting it wrong fails at `VmCreate`, well after the point where a
-/// helpful message is easy to give.
+/// **Moves with the `microsandbox-*` pins in the workspace manifest**, and a test says so:
+/// `msb_krun` is what loads this library, and a libkrunfw from another release is one it was
+/// never built against. Every release republishes it — same size, different digest — so a
+/// release is named by its tag and a file by its hash, and neither is taken on trust.
+pub const KRUNFW_TAG: &str = "v0.6.12";
+
+/// One platform's libkrunfw in [`KRUNFW_TAG`]: the asset, its SHA-256 from the release's
+/// `checksums.sha256`, and the name it is kept under — the versioned one `msb_krun` looks for.
+struct Krunfw {
+    asset: &'static str,
+    sha256: &'static str,
+    file: &'static str,
+}
+
+/// This host's libkrunfw, if the release has one. There is no Intel macOS build.
+fn pinned_krunfw() -> Option<Krunfw> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some(Krunfw {
+            asset: "libkrunfw-darwin-aarch64.dylib",
+            sha256: "13db04fa42d8753a2ebc021bdf42ff4c65342bb5e5373ecde9da4273c9082f97",
+            file: "libkrunfw.5.dylib",
+        }),
+        ("linux", "aarch64") => Some(Krunfw {
+            asset: "libkrunfw-linux-aarch64.so",
+            sha256: "88160091068302e0e0ffc02cb84faf9ca6d1dc6995cdcc6716f1bd92ecc0497f",
+            file: "libkrunfw.so.5",
+        }),
+        ("linux", "x86_64") => Some(Krunfw {
+            asset: "libkrunfw-linux-x86_64.so",
+            sha256: "d395efaa21984cc6934c900519909a12c8148d9688cfc88f9da3b42132ae32c2",
+            file: "libkrunfw.so.5",
+        }),
+        _ => None,
+    }
+}
+
+/// Find the libkrunfw kernel, fetching it if nothing names one.
 ///
-/// Both spellings of the name are checked: the versioned one a release ships, and the
-/// plain one a package manager symlinks.
-pub fn resolve_kernel() -> anyhow::Result<PathBuf> {
+/// In order:
+///
+/// 1. `CORTEX_UVM_KERNEL` — what a caller named.
+/// 2. The pinned release's, under [`home`]`/lib/<tag>/` — downloaded the first time and
+///    checked against its digest every time.
+/// 3. Wherever a package manager put one — **only when the download failed**, so that a host
+///    with no network and a `brew install libkrunfw` still boots. Not first: a libkrunfw
+///    installed for something else is not one this server's `msb_krun` was built against.
+///
+/// A library `dlopen`ed into a VMM is code that runs as the VM, which is why a download is
+/// refused unless it hashes to the pin rather than trusted because of where it came from. On
+/// macOS it needs no signature of ours: the boot process carries
+/// `disable-library-validation`, and a file this process downloads itself is never
+/// quarantined.
+pub async fn resolve_kernel() -> anyhow::Result<PathBuf> {
     if let Some(kernel) = std::env::var_os("CORTEX_UVM_KERNEL") {
         return Ok(PathBuf::from(kernel));
     }
 
+    let fetched = match pinned_krunfw() {
+        Some(pin) => {
+            let base =
+                std::env::var(KRUNFW_BASE_URL_ENV).unwrap_or_else(|_| KRUNFW_BASE_URL.to_string());
+            let url = format!("{base}/{KRUNFW_TAG}/{}", pin.asset);
+            let dest = home()?.join("lib").join(KRUNFW_TAG).join(pin.file);
+            match fetch_pinned(
+                &url,
+                pin.sha256,
+                &dest,
+                &format_args!("libkrunfw {KRUNFW_TAG}"),
+            )
+            .await
+            {
+                Ok(kernel) => return Ok(kernel),
+                Err(e) => Some(e),
+            }
+        }
+        None => None,
+    };
+
+    if let Some(kernel) = installed_kernel() {
+        if let Some(e) = &fetched {
+            eprintln!(
+                "cortex-uvm-console: {e:#} — booting the libkrunfw at {} instead",
+                kernel.display()
+            );
+        }
+        return Ok(kernel);
+    }
+
+    Err(match fetched {
+        Some(e) => e.context(
+            "no libkrunfw: the pinned one could not be fetched and none is installed. Set \
+             CORTEX_UVM_KERNEL to one, or install it (`brew install libkrunfw`)",
+        ),
+        None => anyhow::anyhow!(
+            "no libkrunfw is published for {}-{}, and none is installed. Set \
+             CORTEX_UVM_KERNEL to one",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ),
+    })
+}
+
+/// A libkrunfw a package manager installed, if there is one.
+///
+/// Both spellings of the name are checked: the versioned one a release ships, and the plain one
+/// a package manager symlinks.
+fn installed_kernel() -> Option<PathBuf> {
     let (versioned, plain) = match std::env::consts::OS {
         "macos" => ("libkrunfw.5.dylib", "libkrunfw.dylib"),
         "windows" => ("libkrunfw.dll", "libkrunfw.dll"),
@@ -112,12 +216,7 @@ pub fn resolve_kernel() -> anyhow::Result<PathBuf> {
         candidates.push(PathBuf::from(dir).join(plain));
     }
 
-    candidates.into_iter().find(|p| p.exists()).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no libkrunfw found. Install it (`brew install libkrunfw`, or microsandbox) \
-             or set CORTEX_UVM_KERNEL to the library's path"
-        )
-    })
+    candidates.into_iter().find(|p| p.exists())
 }
 
 /// An OCI reference to use as the base — `python:3.13`, or `python@sha256:…`.
@@ -459,48 +558,57 @@ impl Rootfs {
     /// The tarball on disk, downloading and verifying it if it is not cached.
     pub async fn fetch(&self) -> anyhow::Result<PathBuf> {
         let dest = home()?.join("rootfs").join(format!("{}.tar.gz", self.name));
-        if dest.exists() && digest(&dest).await? == self.sha256 {
-            return Ok(dest);
-        }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // Downloaded to a temp path and renamed, so an interrupted download is never
-        // mistaken for a cached one. `curl` rather than an HTTP client, because this is
-        // the only request this crate makes and a TLS stack is a large thing to link for
-        // one GET.
-        let tmp = dest.with_extension("download");
-        eprintln!("cortex-uvm-console: downloading {}", self.url);
-        let started = std::time::Instant::now();
-        let status = tokio::process::Command::new("curl")
-            .arg("-fsSL")
-            .arg(self.url)
-            .arg("-o")
-            .arg(&tmp)
-            .status()
-            .await
-            .map_err(|e| anyhow::anyhow!("running curl: {e}"))?;
-        anyhow::ensure!(
-            status.success(),
-            "downloading {} failed ({status})",
-            self.url
-        );
-
-        let got = digest(&tmp).await?;
-        if got != self.sha256 {
-            let _ = std::fs::remove_file(&tmp);
-            anyhow::bail!(
-                "{} hashed to {got}, not the pinned {}",
-                self.url,
-                self.sha256
-            );
-        }
-
-        std::fs::rename(&tmp, &dest)?;
-        took(&format_args!("{}", self.name), started);
-        Ok(dest)
+        fetch_pinned(self.url, self.sha256, &dest, &format_args!("{}", self.name)).await
     }
+}
+
+/// `dest`, if it hashes to `sha256` — else `url`, downloaded there and checked first.
+///
+/// Downloaded to a path of its own and renamed, so an interrupted download is never mistaken
+/// for a cached one, and two sessions fetching at once do not write the same file. `curl`
+/// rather than an HTTP client, because a TLS stack is a large thing to link for a handful of
+/// GETs.
+async fn fetch_pinned(
+    url: &str,
+    sha256: &str,
+    dest: &Path,
+    what: &std::fmt::Arguments<'_>,
+) -> anyhow::Result<PathBuf> {
+    if dest.exists() && digest(dest).await? == sha256 {
+        return Ok(dest.to_path_buf());
+    }
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let tmp = unique(
+        dest.parent().map(Path::to_path_buf).unwrap_or_default(),
+        "download",
+    );
+    eprintln!("cortex-uvm-console: downloading {url}");
+    let started = std::time::Instant::now();
+    let status = tokio::process::Command::new("curl")
+        .arg("-fsSL")
+        .arg(url)
+        .arg("-o")
+        .arg(&tmp)
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("running curl: {e}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("downloading {url} failed ({status})");
+    }
+
+    let got = digest(&tmp).await?;
+    if got != sha256 {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("{url} hashed to {got}, not the pinned {sha256}");
+    }
+
+    std::fs::rename(&tmp, dest)?;
+    took(what, started);
+    Ok(dest.to_path_buf())
 }
 
 /// Say that something slow is done, and how slow it was.
@@ -565,4 +673,70 @@ pub async fn ingest(tarball: &Path) -> anyhow::Result<microsandbox_image::tree::
         started,
     );
     Ok(ingested.tree)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The libkrunfw tag and the `microsandbox-*` crates move together — see [`KRUNFW_TAG`].
+    #[test]
+    fn the_kernel_comes_from_the_release_the_microsandbox_crates_do() {
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../../Cargo.lock"))
+                .unwrap();
+        let version = lock
+            .split("[[package]]")
+            .find(|package| package.contains("name = \"microsandbox-network\""))
+            .and_then(|package| {
+                package
+                    .lines()
+                    .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+            })
+            .expect("microsandbox-network in the lockfile");
+        assert_eq!(
+            KRUNFW_TAG,
+            format!("v{version}"),
+            "bump KRUNFW_TAG and its digests with the microsandbox crates"
+        );
+    }
+
+    /// A download is kept only when it hashes to the pin, and a kept one is not fetched again.
+    #[tokio::test]
+    async fn a_pinned_download_is_checked_before_it_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("published");
+        std::fs::write(&source, b"a kernel").unwrap();
+        let url = format!("file://{}", source.display());
+        let right = {
+            use sha2::{Digest as _, Sha256};
+            format!("{:x}", Sha256::digest(b"a kernel"))
+        };
+        let dest = dir.path().join("lib").join("kernel");
+        let what = format_args!("test");
+
+        let e = fetch_pinned(&url, &"0".repeat(64), &dest, &what)
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("not the pinned"), "{e}");
+        assert!(!dest.exists());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("lib")).unwrap().count(),
+            0,
+            "a refused download leaves nothing behind"
+        );
+
+        assert_eq!(
+            fetch_pinned(&url, &right, &dest, &what).await.unwrap(),
+            dest
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"a kernel");
+
+        // Kept: with the source gone, the copy is what answers.
+        std::fs::remove_file(&source).unwrap();
+        assert_eq!(
+            fetch_pinned(&url, &right, &dest, &what).await.unwrap(),
+            dest
+        );
+    }
 }

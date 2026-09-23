@@ -141,7 +141,7 @@ impl Guest {
         host_ports: &[u16],
         committable: bool,
     ) -> anyhow::Result<Guest> {
-        let kernel = assets::resolve_kernel()?;
+        let kernel = assets::resolve_kernel().await?;
         // The layers come back with the disk because the session keeps them: a `commit`
         // stitches onto what its base was made of, and asking again would mean pulling twice.
         let (base, base_layers) = crate::base::image(image).await?;
@@ -203,7 +203,7 @@ impl Guest {
             memory_mib: number(MEMORY_ENV),
         };
 
-        let mut command = Command::new(&helper);
+        let mut command = Command::new(helper.path());
         command
             .args(args.to_args())
             .stdin(Stdio::null())
@@ -213,9 +213,9 @@ impl Guest {
             .stdout(Stdio::from(stderr()?))
             .stderr(Stdio::inherit());
 
-        let vmm = Vmm(command
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("starting the boot helper {}: {e}", helper.display()))?);
+        let vmm = Vmm(command.spawn().map_err(|e| {
+            anyhow::anyhow!("starting the boot helper {}: {e}", helper.path().display())
+        })?);
 
         let stream = tokio::time::timeout(BOOT_TIMEOUT, socket.listener.accept())
             .await

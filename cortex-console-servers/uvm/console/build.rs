@@ -87,7 +87,10 @@ fn main() -> anyhow::Result<()> {
 fn fuse_t_rpath() {
     // Metadata off: this asks *where* FUSE-T is, not to link it. `probe` would otherwise
     // print the `-l fuse-t` that pulls the dylib into a binary that had no reason to carry it.
-    let Ok(fuse_t) = pkg_config::Config::new().cargo_metadata(false).probe("fuse-t") else {
+    let Ok(fuse_t) = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("fuse-t")
+    else {
         return;
     };
     for path in &fuse_t.link_paths {
@@ -182,6 +185,16 @@ fn boot() -> anyhow::Result<()> {
             "vm",
             "--bin",
             "cortex-uvm-boot",
+            // Fat LTO and one codegen unit: half the size of a default release build (10.5 MB
+            // against 5.3 MB, measured), at no cost to the VMM's speed. Given here rather than
+            // in the boot's manifest because a `[profile]` there would be ignored — a profile
+            // belongs to the workspace root, and this package is a member.
+            "--config",
+            "profile.release.lto=\"fat\"",
+            "--config",
+            "profile.release.codegen-units=1",
+            "--config",
+            "profile.release.strip=\"symbols\"",
         ],
         "release/cortex-uvm-boot",
         "building cortex-uvm-boot failed",
@@ -207,7 +220,8 @@ fn build(
     let target_dir = PathBuf::from(std::env::var("OUT_DIR")?).join(target_subdir);
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let status = Command::new(cargo)
+    let mut command = Command::new(cargo);
+    command
         // From the crate's own directory, so its `.cargo/config.toml` — where it has one — is
         // the configuration in effect.
         .current_dir(crate_dir)
@@ -218,7 +232,19 @@ fn build(
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_BUILD_TARGET")
         .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER");
+    // A `CARGO_PROFILE_*` is cargo *configuration*, which outranks a manifest's `[profile]`:
+    // one exported by whoever is building this crate would reach the guest and override the
+    // `opt-level = "z"` its own manifest asks for — measured, 1.3 MB became 2.2 MB.
+    for (var, _) in std::env::vars_os() {
+        if var
+            .to_str()
+            .is_some_and(|name| name.starts_with("CARGO_PROFILE_"))
+        {
+            command.env_remove(&var);
+        }
+    }
+    let status = command
         .status()
         .map_err(|e| anyhow::anyhow!("running cargo in {}: {e}", crate_dir.display()))?;
 
