@@ -10,14 +10,14 @@ use super::Step;
 /// change need make the other's stored values unreadable.
 const FORMAT_VERSION: u32 = 1;
 
-/// Defines how a rootfs is to be composed, and stops there.
+/// Defines how an image is to be composed, and stops there.
 ///
-/// The definition is a base and the [`Step`]s over it. Turning one into an actual image is
-/// each console server's, and they do not agree on how, so nothing here resolves a base,
-/// writes a layer or runs a command.
+/// The definition is a base and the [`Step`]s over it. Building what it describes is each
+/// console server's, and they do not agree on how, so nothing here resolves a base, writes
+/// a layer or runs a command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RootFs {
-    /// Written first and read first, so a recipe from a newer cortex is refused by name
+pub struct Image {
+    /// Written first and read first, so a declaration from a newer cortex is refused by name
     /// rather than by whatever member it happens to disagree about.
     #[serde(rename = "v", deserialize_with = "known_version")]
     version: u32,
@@ -29,7 +29,7 @@ pub struct RootFs {
     pub steps: Vec<Step>,
 }
 
-impl RootFs {
+impl Image {
     /// An empty declaration in this cortex's format: no base, no steps.
     ///
     /// The base starts empty, which is not a base — [`base`](Self::base) states one. Empty
@@ -38,8 +38,8 @@ impl RootFs {
     /// knows which this is.
     ///
     /// ```
-    /// # use cortex::rootfs::{RootFs, Step};
-    /// let declared = RootFs::new()
+    /// # use cortex::image::{Image, Step};
+    /// let declared = Image::new()
     ///     .base("alpine:3.20")
     ///     .step("apk add --no-cache jq")
     ///     .step(Step::env("TZ", "UTC"));
@@ -48,7 +48,7 @@ impl RootFs {
     /// assert_eq!(declared.steps.len(), 2);
     /// ```
     pub fn new() -> Self {
-        RootFs {
+        Image {
             version: FORMAT_VERSION,
             base: String::new(),
             steps: Vec::new(),
@@ -71,8 +71,8 @@ impl RootFs {
     /// does not carry — whoever builds this names the directory it is read from.
     ///
     /// ```
-    /// # use cortex::rootfs::{RootFs, Step};
-    /// let declared = RootFs::from_dockerfile("FROM alpine:3.20\nRUN apk add jq\n")?;
+    /// # use cortex::image::{Image, Step};
+    /// let declared = Image::from_dockerfile("FROM alpine:3.20\nRUN apk add jq\n")?;
     ///
     /// assert_eq!(declared.base, "alpine:3.20");
     /// assert_eq!(declared.steps, [Step::run("apk add jq")]);
@@ -118,7 +118,7 @@ impl RootFs {
             instructions.push(instruction);
         }
 
-        let mut declared = RootFs::new();
+        let mut declared = Image::new();
         for (line, text) in instructions {
             let (instruction, rest) = match text.split_once(char::is_whitespace) {
                 Some((instruction, rest)) => (instruction.to_uppercase(), rest.trim()),
@@ -293,10 +293,10 @@ impl RootFs {
     }
 }
 
-/// The empty declaration, which is what [`new`](RootFs::new) hands back.
-impl Default for RootFs {
+/// The empty declaration, which is what [`new`](Image::new) hands back.
+impl Default for Image {
     fn default() -> Self {
-        RootFs::new()
+        Image::new()
     }
 }
 
@@ -309,7 +309,7 @@ fn known_version<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let found = u32::deserialize(d)?;
     if found != FORMAT_VERSION {
         return Err(serde::de::Error::custom(format!(
-            "this rootfs is written in format {found}, and this cortex reads {FORMAT_VERSION}"
+            "this image is written in format {found}, and this cortex reads {FORMAT_VERSION}"
         )));
     }
     Ok(found)

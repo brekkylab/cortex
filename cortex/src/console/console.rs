@@ -58,7 +58,7 @@ use crate::{
         stdio::StdioClient,
     },
     fs::Mount,
-    rootfs::RootFs,
+    image::Image,
 };
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
@@ -86,12 +86,10 @@ pub struct ConsoleBuilder {
     /// it lacked.
     client_factory: Option<ClientFactory>,
 
-    /// A rootfs to build and then run in, and `None` for a session on an image that
-    /// already exists somewhere.
-    ///
-    /// Mutually exclusive with [`image`](Self::image): both name what the session's commands
-    /// run in, and a caller that said each of them meant one of them.
-    rootfs: Option<RootFs>,
+    /// The image a session's commands run in, and `None` to leave it to the server: a
+    /// backend that runs commands on the host it is already on has nothing to boot, and one
+    /// that boots a machine says so rather than guessing a base on the caller's behalf.
+    image: Option<Image>,
 
     /// What a previous session wrote, for a console that does not start from scratch, and
     /// `None` for one that does. Currently an ext4 blob.
@@ -218,12 +216,12 @@ impl ConsoleBuilder {
     ///
     /// ```no_run
     /// # use cortex::console::Console;
-    /// # use cortex::rootfs::RootFs;
+    /// # use cortex::image::Image;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = Console::builder()
     ///     .stdio_client(&["cortex-uvm-console"])
-    ///     .rootfs(
-    ///         RootFs::new()
+    ///     .image(
+    ///         Image::new()
     ///             .base("alpine:3.20")
     ///             .step("apk add --no-cache jq"),
     ///     )
@@ -231,8 +229,8 @@ impl ConsoleBuilder {
     ///     .await?;
     /// # Ok(()) }
     /// ```
-    pub fn rootfs(mut self, rootfs: impl Into<RootFs>) -> Self {
-        self.rootfs = Some(rootfs.into());
+    pub fn image(mut self, image: impl Into<Image>) -> Self {
+        self.image = Some(image.into());
         self
     }
 
@@ -279,8 +277,8 @@ impl ConsoleBuilder {
     /// Building one from outside a task or `main` is a panic, not an `Err` — the missing
     /// runtime is the caller's own shape and not something the channel could report.
     ///
-    /// Usually one message. The exception is [`rootfs`](Self::rootfs), whose image this may
-    /// have to make before there is a session to be had — see there for what that costs.
+    /// Usually one message. The exception is [`image`](Self::image), which this may have to
+    /// build before there is a session to be had — see there for what that costs.
     pub async fn build(self) -> anyhow::Result<Console> {
         Console::new(self).await
     }
@@ -393,9 +391,9 @@ impl Console {
     pub async fn new(builder: ConsoleBuilder) -> anyhow::Result<Self> {
         let ConsoleBuilder {
             client_factory,
+            image,
             mounts,
             network,
-            rootfs,
             snapshot,
         } = builder;
 
@@ -420,7 +418,7 @@ impl Console {
 
         let session = InitCall {
             mounts: specs,
-            rootfs,
+            image,
             network: network.clone(),
             snapshot,
         };

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// The four the design settled on, and no others. Anything a Dockerfile can say that is not
 /// one of these is warned about or refused by the adapter rather than represented here.
 /// Written under its own name — `{"run": …}`, `{"copy": {…}}` — rather than by position, so
-/// a variant added later cannot change what a stored [`RootFs`](super::RootFs) means.
+/// a variant added later cannot change what a stored [`Image`](super::Image) means.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Step {
@@ -71,7 +71,7 @@ impl Step {
 
 /// A bare string is a `RUN`.
 ///
-/// [`RootFs::step`](super::RootFs::step) takes anything that converts, so this is what
+/// [`Image::step`](super::Image::step) takes anything that converts, so this is what
 /// decides that `.step("apk add jq")` compiles and what it means. `RUN` is the one
 /// instruction whose entire declaration *is* a single string — the other three name two
 /// pieces or a place — so there is nothing else a lone command could have been read as, and

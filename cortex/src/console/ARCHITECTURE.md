@@ -149,7 +149,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{mounts?, rootfs?, snapshot?, network?}` | `{cwd?}` |
+| `init` | `{mounts?, image?, snapshot?, network?}` | `{cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |

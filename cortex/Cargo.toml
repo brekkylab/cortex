@@ -31,7 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
 # The digest a built image is named by. Small and pure Rust, and already in this
 # workspace's lockfile — `cortex-uvm-console` hashes layers with it. Unconditional
-# rather than behind a feature, because `rootfs` is a public API and an API that is
+# rather than behind a feature, because `image` is a public API and an API that is
 # off by default is one callers have to discover twice.
 sha2 = { workspace = true }
 unicode-normalization = { workspace = true, optional = true }
@@ -56,7 +56,7 @@ libc = { workspace = true }
 # name the one it must be.
 serde_json = { workspace = true }
 # A directory standing in for a mounted tree, which is what a `Mount` is from the far side: a
-# path any process can open — and the build contexts the `rootfs` tests hash, which want a
+# path any process can open — and the build contexts the `image` tests hash, which want a
 # real directory for the same reason.
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

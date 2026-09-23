@@ -18,7 +18,7 @@ use std::{path::Path, str::FromStr};
 use bson::{Bson, doc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::rootfs::RootFs;
+use crate::image::Image;
 
 use super::{Method, utils::bytes};
 
@@ -174,9 +174,9 @@ pub struct InitCall {
     ///
     /// It is essential if it runs on VM environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rootfs: Option<RootFs>,
+    pub image: Option<Image>,
 
-    /// Optional snapshot of what an earlier session changed from the base rootfs — what a
+    /// Optional snapshot of what an earlier session changed from the base image — what a
     /// [`snapshot`](SnapshotCall) answered with, handed back.
     ///
     /// Useful when a session does not start from scratch: it starts with those changes already
