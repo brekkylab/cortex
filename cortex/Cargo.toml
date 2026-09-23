@@ -90,9 +90,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 #   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
 #   for f in "" "--features fuse" "--features fuse-t" \
 #            "--features fuse-no-mount" "--features s3" "--features notion" \
-#            "--features gdrive" \
+#            "--features gdrive" "--features onedrive" \
 #            "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,s3,notion,gdrive"; do cargo test -p cortex $f --all-targets; done
+#            "--features fuse,fuse-t,s3,notion,gdrive,onedrive"; do cargo test -p cortex $f --all-targets; done
 #
 # Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
 # unquoted expansion — under zsh pass the flags as separate arguments.
@@ -149,4 +149,17 @@ notion = [
     "dep:serde_json",
     "tokio/net",
     "tokio/rt-multi-thread",
+]
+# A OneDrive account as a read-only tree, over Microsoft Graph. `tokio/sync` because the
+# token cache is held across the `.await` that mints one, which `std::sync::Mutex` cannot
+# be; `unicode-normalization` because macOS looks a name up in a spelling the listing did
+# not necessarily use.
+onedrive = [
+    "dep:reqwest",
+    "dep:chrono",
+    "dep:serde_json",
+    "dep:unicode-normalization",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/sync",
 ]
