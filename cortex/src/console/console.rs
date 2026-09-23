@@ -52,13 +52,13 @@ use crate::{
     console::{
         base::{Client, Failure},
         message::{
-            Call, ExecCall, ExecResp, InitCall, NetworkAccess, Notification, ReadCall, ReadResp,
-            Response, TreeMount, TreeRole, TreeSource, WriteCall, WriteResp,
+            Call, ExecCall, ExecResp, InitCall, MountSpec, NetworkAccess, Notification, ReadCall,
+            ReadResp, Response, WriteCall, WriteResp,
         },
         stdio::StdioClient,
     },
     fs::Mount,
-    rootfs_v2::RootFsV2,
+    rootfs::RootFs,
 };
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
@@ -73,7 +73,7 @@ type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>
 ///
 /// A builder rather than arguments because a console is going to acquire more of them —
 /// limits, a backend of its own choosing — and each should be something a caller can leave
-/// out, as [`context`](Self::context) already is.
+/// out, as [`mount`](Self::mount) already is.
 ///
 /// Nothing here starts anything. The channel is described, not driven, until something
 /// is asked over it.
@@ -91,22 +91,17 @@ pub struct ConsoleBuilder {
     ///
     /// Mutually exclusive with [`image`](Self::image): both name what the session's commands
     /// run in, and a caller that said each of them meant one of them.
-    rootfs: Option<RootFsV2>,
+    rootfs: Option<RootFs>,
 
     /// What a previous session wrote, for a console that does not start from scratch, and
     /// `None` for one that does. Currently an ext4 blob.
     snapshot: Option<Vec<u8>>,
 
-    /// `None` is a console with nothing mounted, and stays `None`: a mount is something a
-    /// caller *has* or has not, and there is no empty one to substitute. Such a session's
-    /// commands see whatever the server's own filesystem holds, and this protocol has
-    /// described none of it.
-    context: Option<Box<dyn Mount>>,
-
-    /// Where the session leaves what it produces, and `None` for a session whose output
-    /// nobody collects. Held on the same terms as [`context`](Self::context) — a tree the
-    /// caller mounted, kept alive for as long as the session is.
-    artifacts: Option<Box<dyn Mount>>,
+    /// Every tree this console gives the session, in the order they will be mounted.
+    ///
+    /// Empty is a console with nothing mounted: such a session's commands see whatever the
+    /// server's own filesystem holds, and this protocol has described none of it.
+    mounts: Vec<Mounted>,
 
     /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
@@ -160,19 +155,19 @@ impl ConsoleBuilder {
         self
     }
 
-    /// Where this console's tree is mounted, which is what the session's context is.
+    /// Give the session a tree, mounted at `at`.
     ///
-    /// One per console and fixed for the session, because it is what every path in the
-    /// session is spelled against: a `read` names a file under it, and so does the command
-    /// that opens the same file by the same name.
+    /// `at` is where the tree appears to the session's commands, and it is this end's to
+    /// choose: [`build`](Self::build) names it in the `init`, so every path the console will
+    /// send is known before the session exists. A [`read`](Console::read) names a file under
+    /// it, so does a [`write`](Console::write), and so does the command that opens the same
+    /// file by the same name. It has to be absolute — a relative one would be relative to a
+    /// working directory nobody named — and a console whose mount point cannot be spelled as
+    /// a URL does not build.
     ///
-    /// Mounting is the caller's, not the console's. Which binding puts a tree in front of a
-    /// kernel is a build's business, and this is the whole of what the server is then told
-    /// about it: [`build`](Self::build) names this mount point as the session's context —
-    /// `file://` and the path — and the server answers where *it* plugged that in. The two
-    /// need not be the same path, and on a server that runs commands in a kernel of its own
-    /// they are not: what comes back is a path in there. Which is why the answer is read
-    /// rather than assumed; see [`TreeMount`](crate::console::TreeMount).
+    /// Mounting *this* end is the caller's, not the console's. Which binding puts a tree in
+    /// front of a kernel is a build's business, and what the server is told about it is the
+    /// URL and the path — see [`Mount::url`].
     ///
     /// Takes the mount by value, so a console holds it and the tree is there for at least as
     /// long as the session is (see [`Mount`]). A caller that needs it elsewhere as well hands
@@ -184,33 +179,38 @@ impl ConsoleBuilder {
     /// the host already has: there is nothing to put up for one, and nothing this end takes
     /// down at the end of the session.
     ///
-    /// **The session reads this tree and does not write in it.** A [`write`](Console::write)
-    /// naming a path inside it is refused, and a server with a kernel of its own mounts it
-    /// read-only so that a command cannot write there either — which is what
-    /// [`artifacts`](Self::artifacts) is for, and how a caller gets a tree back unchanged
-    /// rather than a promise that it was not touched.
+    /// **Called as many times as there are trees, and the order is kept.** A session that is
+    /// given somebody's project and somewhere to leave its result names two, and a tree meant
+    /// to sit inside another is named after it. What each tree is *for* is the caller's own
+    /// and is nowhere in the protocol — what a tree is at a path, and whether a write may
+    /// land in it, is the whole of what both ends agree on.
     ///
-    /// Leaving it out is a console with nothing mounted; see the field this fills.
-    pub fn context(mut self, mount: impl Mount + 'static) -> Self {
-        self.context = Some(Box::new(mount));
+    /// Writable. [`mount_readonly`](Self::mount_readonly) is the other half of that choice.
+    pub fn mount(mut self, mount: impl Mount + 'static, at: impl Into<PathBuf>) -> Self {
+        self.mounts.push(Mounted {
+            mount: Box::new(mount),
+            at: at.into(),
+            readonly: false,
+        });
         self
     }
 
-    /// Where this session leaves what it produces.
+    /// Give the session a tree it may read and not write, at `at`.
     ///
-    /// A second tree, on the same terms as [`context`](Self::context): the caller mounts it, the
-    /// console names it at `init`, and the server answers where it put it — which is what
-    /// [`artifacts_path`](Console::artifacts_path) then spells.
+    /// [`mount`](Self::mount) on every other count. **What it buys is getting the tree back
+    /// unchanged rather than a promise that nothing touched it:** a [`write`](Console::write)
+    /// naming a path under it is refused, and a server with a kernel of its own mounts it
+    /// read-only so that a command cannot write there either.
     ///
-    /// **What it buys is knowing which files are the result.** A session that writes its
-    /// output into the tree it was given leaves the caller to work out what is new, and that
-    /// is a diff against a directory somebody else may also be writing to. A session that
-    /// writes it here leaves the caller a tree whose whole contents are the answer.
-    ///
-    /// Leaving it out is a session whose output nobody collects, which is every session
-    /// written before this existed.
-    pub fn artifacts(mut self, mount: impl Mount + 'static) -> Self {
-        self.artifacts = Some(Box::new(mount));
+    /// Which is what to hand somebody's project over as — and what makes a second, writable
+    /// tree worth naming beside it, since a session that writes its output into the tree it
+    /// was given leaves the caller to work out which files are new.
+    pub fn mount_readonly(mut self, mount: impl Mount + 'static, at: impl Into<PathBuf>) -> Self {
+        self.mounts.push(Mounted {
+            mount: Box::new(mount),
+            at: at.into(),
+            readonly: true,
+        });
         self
     }
 
@@ -218,12 +218,12 @@ impl ConsoleBuilder {
     ///
     /// ```no_run
     /// # use cortex::console::Console;
-    /// # use cortex::rootfs_v2::RootFsV2;
+    /// # use cortex::rootfs::RootFs;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = Console::builder()
     ///     .stdio_client(&["cortex-uvm-console"])
     ///     .rootfs(
-    ///         RootFsV2::new()
+    ///         RootFs::new()
     ///             .base("alpine:3.20")
     ///             .step("apk add --no-cache jq"),
     ///     )
@@ -231,7 +231,7 @@ impl ConsoleBuilder {
     ///     .await?;
     /// # Ok(()) }
     /// ```
-    pub fn rootfs(mut self, rootfs: impl Into<RootFsV2>) -> Self {
+    pub fn rootfs(mut self, rootfs: impl Into<RootFs>) -> Self {
         self.rootfs = Some(rootfs.into());
         self
     }
@@ -323,13 +323,11 @@ impl ConsoleBuilder {
 /// # Ok(())
 /// # }
 /// ```
-/// One of a session's trees: the mount this end holds, and where the server put it.
+/// One of a session's trees: the mount this end holds, and where the session sees it.
 ///
-/// **The two are one value because they are one fact.** A tree this console named is a tree
-/// the server answered a path for — a console whose context went nowhere does not exist, see
-/// [`placed`] — so a mount with no path and a path with no mount are both states this end
-/// would have to decide what to do about, and neither can happen. Holding them apart was
-/// two `Option`s that had to agree, checked by a match; holding them together is the check.
+/// **The two are one value because they are one fact.** A tree this console holds up is a
+/// tree it named a path for, so a mount with no path and a path with no mount are both
+/// states this end would have to decide what to do about, and neither can happen.
 struct Tree {
     /// **Never read, and that is the whole job.** A mount is only promised to be there for
     /// as long as the value is (see [`Mount`]), so holding one here is what keeps the tree
@@ -343,13 +341,12 @@ struct Tree {
     #[allow(dead_code)]
     mount: Box<dyn Mount>,
 
-    /// Where the server put it, as it answered at `init`.
+    /// Where the session sees it, as `init` named it.
     ///
     /// **The paths this protocol speaks are these.** A [`read`](Console::read) names a file
-    /// under one, and so does a [`write`](Console::write). It is the server's answer and not
-    /// the mount point above: a host-local server answers the mount point itself, and one
-    /// with a guest answers where the tree is *in the guest*, which is not a path this host
-    /// has at all.
+    /// under one, and so does a [`write`](Console::write). It is not the mount point above:
+    /// a host-local server may put the tree at the same place, and one with a guest puts it
+    /// where the session can see it, which need not be a path this host has at all.
     ///
     /// Where the session *stands* is not here and is not kept anywhere on this side: the
     /// current directory is the far end's state machine, `init` says where it starts, and
@@ -363,12 +360,9 @@ pub struct Console {
     /// for it to be *replaced* — see [`Console::drop`](Console#impl-Drop-for-Console).
     client: Box<dyn Client>,
 
-    /// The tree this session works in — `None` when this console has nothing mounted.
-    context: Option<Tree>,
-
-    /// Where this session leaves what it produces — `None` when the caller named none.
-    artifacts: Option<Tree>,
-
+    /// Every tree this session was given, in the order they were named — empty when this
+    /// console has nothing mounted.
+    mounts: Vec<Tree>,
 }
 
 impl Console {
@@ -385,11 +379,9 @@ impl Console {
     /// that exists is one the server has heard from and answered — which is the one thing
     /// about a session a caller can act on before asking for work.
     ///
-    /// The answer is not only an acknowledgement: it says where the server put the context,
-    /// and that path is what every later `read` and `write` is spelled in.
-    /// A server that takes a context and says nothing about where it went has left this end
-    /// with no way to name a file, so that is a console that does not exist rather than one
-    /// that guesses.
+    /// Where each tree goes is settled here and not read back: a mount carries the path it
+    /// appears at, so the paths every later `read` and `write` is spelled in are this end's
+    /// own and are known before the `init` goes out.
     ///
     /// Nothing is booted or mounted by it. The first command that needs a session boots
     /// one, unless a [`start`](Self::start) gets there first.
@@ -401,8 +393,7 @@ impl Console {
     pub async fn new(builder: ConsoleBuilder) -> anyhow::Result<Self> {
         let ConsoleBuilder {
             client_factory,
-            context: context_mount,
-            artifacts: artifacts_mount,
+            mounts,
             network,
             rootfs,
             snapshot,
@@ -412,69 +403,49 @@ impl Console {
             client_factory.context("a console needs a client to drive its server")?;
         let mut client = client_factory()?;
 
-        // What the server is told about each tree is where this end has it. A mount point
-        // with no URL to it is refused here rather than sent, by the rule the client factory
-        // above follows: a console either exists or says what it lacked.
-        let context = named(TreeRole::Context, context_mount.as_deref())?;
-        let artifacts = named(TreeRole::Artifacts, artifacts_mount.as_deref())?;
+        // Every tree is turned into what the server is told about it before anything goes
+        // out, by the rule the client factory above follows: a console either exists or says
+        // what it lacked. A mount point with no URL to it and a guest path this protocol
+        // cannot spell are both that, and both are this end's own mistake rather than
+        // something to hear back from a server.
+        let mut specs = Vec::with_capacity(mounts.len());
+        let mut held = Vec::with_capacity(mounts.len());
+        for mounted in mounts {
+            specs.push(named(&mounted)?);
+            held.push(Tree {
+                mount: mounted.mount,
+                path: mounted.at,
+            });
+        }
 
         let session = InitCall {
-            context: context.clone(),
-            artifacts: artifacts.clone(),
+            mounts: specs,
             rootfs,
             network: network.clone(),
             snapshot,
         };
 
-        let answered = client.init(session).await?;
+        client.init(session).await?;
 
         Ok(Console {
             client,
-            context: placed(TreeRole::Context, context_mount, answered.context)?,
-            artifacts: placed(TreeRole::Artifacts, artifacts_mount, answered.artifacts)?,
+            mounts: held,
         })
     }
 
-    /// Where the server put this session's tree, and so what every path this console sends
-    /// is relative to — `None` when nothing is mounted.
+    /// Where each of this session's trees appears, in the order they were named — what
+    /// every path this console sends is relative to.
     ///
     /// A caller builds a [`read`](Self::read) or a [`write`](Self::write) path by joining
-    /// onto this, and reaches the same files on this host by joining onto the mount point it
-    /// handed over instead. The two are not required to be the same directory and on a
-    /// server with a guest they are not — which is why the protocol settles which one it
-    /// speaks in rather than leaving it assumed.
-    pub fn context_path(&self) -> Option<&Path> {
-        self.context.as_ref().map(|tree| tree.path.as_path())
-    }
-
-    /// Where the server put this session's [`artifacts`](ConsoleBuilder::artifacts) tree —
-    /// `None` when the caller named none.
+    /// onto one of these, and reaches the same files on this host by joining onto the mount
+    /// point it handed over instead. The two are not required to be the same directory and
+    /// on a server with a guest they are not — which is why what a path is spelled in is the
+    /// guest path this end named rather than whatever the mount point happened to be.
     ///
-    /// What the session leaves here is what the caller asked for, so this is the path to
-    /// join a [`read`](Self::read) onto to collect it — and the mount this end holds is the
-    /// other way to reach the same files, since a mounted tree is a directory on this host.
-    pub fn artifacts_path(&self) -> Option<&Path> {
-        self.artifacts.as_ref().map(|tree| tree.path.as_path())
-    }
-
-    /// Whether this session has a tree at all, which is whether a path this console sends
-    /// can name one of the caller's files.
-    ///
-    /// The same answer as [`context_path`](Self::context_path) being `Some`, for a caller
-    /// that wants the question and not the path: a [`read`](Self::read) or a
-    /// [`write`](Self::write) has nowhere to join onto without one, so this is what to ask
-    /// before building a path rather than after failing to.
-    pub fn has_context(&self) -> bool {
-        self.context.is_some()
-    }
-
-    /// Whether this session has somewhere to leave what the caller came for.
-    ///
-    /// A session without one still runs commands; what it does not have is a tree whose
-    /// contents outlive it on the caller's terms. Worth asking before running the work that
-    /// would write there — see [`artifacts_path`](Self::artifacts_path) for where it goes.
-    pub fn has_artifacts(&self) -> bool {
-        self.artifacts.is_some()
+    /// Empty is a console with nothing mounted: a `read` or a `write` has nowhere to join
+    /// onto, so this is what to ask before building a path rather than after failing to.
+    pub fn mounts(&self) -> impl ExactSizeIterator<Item = &Path> {
+        self.mounts.iter().map(|tree| tree.path.as_path())
     }
 
     /// Boot the far end now, to hide the cold start.
@@ -520,7 +491,7 @@ impl Console {
     /// The command is an argv — `["echo", "hi"]` — and nothing here consults a shell, so
     /// a caller that wants shell semantics asks for them outright: `["sh", "-c", ".."]`.
     ///
-    /// Where it runs is [where the session stands](Self::context_path), which is the far
+    /// Where it runs is where the session stands, which is the far
     /// end's to keep: this carries no directory, because a second answer to that question
     /// would disagree with the first the moment a command ran `cd`. A caller that wants one
     /// command somewhere else says so in the command — `sh -c 'cd there && ..'`.
@@ -548,7 +519,7 @@ impl Console {
 
     /// Read part of a file where commands run.
     ///
-    /// The path is the server's — under [`context_path`](Self::context_path), which is what a
+    /// The path is the session's — under one of [`mounts`](Self::mounts), which is what a
     /// caller joins onto — so this names the file a command would open by the same name, and
     /// is how a caller sees what an execution wrote to a file rather than to its output.
     ///
@@ -663,58 +634,44 @@ impl Drop for Console {
     }
 }
 
-/// A mount this end holds, as the URL the far end is told to realize — or `None` for a tree
-/// the caller named none of.
-///
-/// `role` is the member it will travel under, and is here only so that a caller who mounted
-/// something unnameable is told *which* of its trees that was — the protocol's own name for
-/// it, so that this end and the server call it the same thing in a failure.
-fn named(role: TreeRole, mount: Option<&dyn Mount>) -> anyhow::Result<Option<TreeSource>> {
-    let Some(mount) = mount else {
-        return Ok(None);
-    };
-    let url = mount.url().with_context(|| {
-        format!(
-            "a mount point that is not an absolute UTF-8 path cannot be named as a {role}: {:?}",
-            mount.mountpoint()
-        )
-    })?;
-    Ok(Some(TreeSource::new(url)))
+/// A tree the caller handed over, as the builder holds it until there is a session to name
+/// it in.
+struct Mounted {
+    mount: Box<dyn Mount>,
+    at: PathBuf,
+    readonly: bool,
 }
 
-/// The tree this end holds and the path the server answered for it, paired — or `None` for a
-/// tree the caller named none of.
+/// A mount this end holds, as the one string the far end is told to realize.
 ///
-/// **A tree the server took and did not place is not a session.** Every path the caller would
-/// send for it afterwards would be a guess, so this is a console that does not exist rather
-/// than one that carries a mount it cannot name a file in. A path that is not absolute is
-/// refused for the same reason one step further on: it would be relative to a working
-/// directory the server never named.
-///
-/// A path answered for a tree that was never asked for is dropped. It describes a session
-/// this end did not name, and there is nothing here it could be a path to.
-fn placed(
-    role: TreeRole,
-    mount: Option<Box<dyn Mount>>,
-    at: Option<TreeMount>,
-) -> anyhow::Result<Option<Tree>> {
-    let Some(mount) = mount else {
-        return Ok(None);
-    };
-    let at = at.with_context(|| {
+/// Both halves can fail and both fail here: a mount point that cannot be spelled as a URL
+/// has no name that travels, and a guest path this protocol cannot read back is one the
+/// server would refuse. Neither is worth a round trip to find out, and neither leaves a
+/// caller anything to do but fix the call.
+fn named(mounted: &Mounted) -> anyhow::Result<MountSpec> {
+    let url = mounted.mount.url().with_context(|| {
         format!(
-            "the console server took the {role} at {} and did not say where it put it",
-            mount.mountpoint().display()
+            "a mount point that is not an absolute UTF-8 path cannot be named: {:?}",
+            mounted.mount.mountpoint()
         )
     })?;
 
-    let path = PathBuf::from(at.path);
-    anyhow::ensure!(
-        path.is_absolute(),
-        "the console server put the {role} somewhere that is not an absolute path: {}",
-        path.display()
-    );
-    Ok(Some(Tree { mount, path }))
+    let at = mounted.at.to_str().with_context(|| {
+        format!(
+            "a tree can only be mounted at a UTF-8 path: {:?}",
+            mounted.at
+        )
+    })?;
+
+    // The refusal already names the spec it was reading, which is both halves of what a
+    // caller would have to be told to fix it.
+    let spec = MountSpec::new(url, at)?;
+
+    Ok(if mounted.readonly {
+        spec.read_only()
+    } else {
+        spec
+    })
 }
 
 #[cfg(test)]
@@ -724,9 +681,7 @@ mod tests {
     use futures_core::future::BoxFuture;
 
     use super::*;
-    use crate::console::message::{
-        Call, Error, InitResp, Method, Notification, Response, TreeMount,
-    };
+    use crate::console::message::{Call, Error, InitResp, Method, Notification, Response};
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.
     ///
@@ -793,20 +748,9 @@ mod tests {
         )
     }
 
-    /// A session taken with nothing mounted, which is what a server answers a context-less
-    /// `init` with.
+    /// A session taken, which is the whole of what a server owes an `init`.
     fn initialized() -> Response {
         Response::Init(InitResp::default())
-    }
-
-    /// A session taken, with the context put at `path`.
-    fn initialized_at(path: &Path) -> Response {
-        Response::Init(InitResp {
-            context: Some(TreeMount {
-                path: path.to_str().expect("a test path is UTF-8").to_string(),
-            }),
-            ..InitResp::default()
-        })
     }
 
     /// An execution that ran and ended.
@@ -929,7 +873,7 @@ mod tests {
     #[tokio::test]
     async fn a_console_the_server_will_not_have_does_not_exist() {
         let (client, log) = recorder(vec![Response::Error(Error::new(
-            Error::UNSUPPORTED_CONTEXT,
+            Error::UNSUPPORTED_MOUNT,
             "s3: this server realizes file:// and nothing else",
         ))]);
         let Err(e) = Console::builder().client(client).build().await else {
@@ -956,19 +900,19 @@ mod tests {
         assert_eq!(log.methods(), [Method::Init, Method::Quit]);
     }
 
-    /// The mount this end holds is what `init` names, and where it went is the server's
-    /// answer — which is the path every later call in the session is spelled in, and not
-    /// the mount point that was sent.
+    /// The mounts this end holds are what `init` names, each as one string carrying where
+    /// the tree is, where the session sees it, and whether a command may write in it.
     ///
-    /// The two need not be the same directory — a server with a guest of its own answers a
-    /// path in there — so they are different here, to make visible which of them a caller
-    /// joins onto: what came back.
+    /// The mount point and the guest path are different here on purpose, to make visible
+    /// which of them the session is spelled in: the one this end chose for the session, not
+    /// the directory the tree happens to sit in on this host.
     #[tokio::test]
-    async fn a_console_names_its_mount_and_reads_back_where_it_went() {
-        let (client, log) = recorder(vec![initialized_at(Path::new("/srv/served"))]);
+    async fn a_console_names_its_mounts_and_where_it_put_them() {
+        let (client, log) = recorder(vec![initialized()]);
         let console = Console::builder()
             .client(client)
-            .context(PathBuf::from("/mnt/here"))
+            .mount_readonly(PathBuf::from("/mnt/project"), "/work")
+            .mount(PathBuf::from("/mnt/collected"), "/work/out")
             .build()
             .await
             .unwrap();
@@ -976,36 +920,56 @@ mod tests {
         let Call::Init(init) = log.call(0) else {
             panic!("{:?} is not an init", log.call(0));
         };
-        assert_eq!(init.context, Some(TreeSource::new("file:///mnt/here")));
-        assert_eq!(console.context_path(), Some(Path::new("/srv/served")));
+        assert_eq!(
+            init.mounts
+                .iter()
+                .map(MountSpec::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "file:///mnt/project:/work:ro",
+                "file:///mnt/collected:/work/out"
+            ]
+        );
+
+        // And what a caller joins a `read` or a `write` onto is the guest path it named, in
+        // the order it named them.
+        assert_eq!(
+            console.mounts().collect::<Vec<_>>(),
+            [Path::new("/work"), Path::new("/work/out")]
+        );
     }
 
-    /// A session with a context needs somewhere to have put it: a path is what every later
-    /// call is spelled in, so a server that answers without one has left this end with
-    /// nothing it could name, and that is not a console.
+    /// A tree the protocol could not name is not a session: every path the caller would send
+    /// for it afterwards would be a guess, so this end says what it lacked rather than
+    /// sending a session it cannot spell.
+    ///
+    /// Both halves are refused before anything goes out, because both are knowable here —
+    /// which is why the recorder below is never asked for an answer.
     #[tokio::test]
-    async fn a_context_the_server_did_not_place_is_not_a_session() {
+    async fn a_mount_this_end_cannot_name_is_not_a_session() {
+        let (client, log) = recorder(vec![initialized()]);
+        let Err(e) = Console::builder()
+            .client(client)
+            .mount(PathBuf::from("relative/here"), "/work")
+            .build()
+            .await
+        else {
+            panic!("a console over a mount point with no URL should not build");
+        };
+        assert!(e.to_string().contains("cannot be named"), "{e}");
+        assert_eq!(log.methods(), [] as [Method; 0]);
+
+        // And a guest path that is not one the session could join onto is the same kind of
+        // nothing — it would be relative to a working directory nobody named.
         let (client, _) = recorder(vec![initialized()]);
         let Err(e) = Console::builder()
             .client(client)
-            .context(PathBuf::from("/mnt/here"))
+            .mount(PathBuf::from("/mnt/here"), "work")
             .build()
             .await
         else {
-            panic!("a console whose context went nowhere should not build");
+            panic!("a console over a relative guest path should not build");
         };
-        assert!(e.to_string().contains("did not say where"), "{e}");
-
-        // And a path that is not one this end could join onto is the same kind of nothing.
-        let (client, _) = recorder(vec![initialized_at(Path::new("relative/served"))]);
-        let Err(e) = Console::builder()
-            .client(client)
-            .context(PathBuf::from("/mnt/here"))
-            .build()
-            .await
-        else {
-            panic!("a console whose context went to a relative path should not build");
-        };
-        assert!(e.to_string().contains("not an absolute path"), "{e}");
+        assert!(e.to_string().contains("guest path is absolute"), "{e}");
     }
 }

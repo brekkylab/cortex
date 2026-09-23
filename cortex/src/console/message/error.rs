@@ -81,20 +81,25 @@ impl Error {
     /// file is whatever it is, and a requester that needs to know asks with a `read`.
     pub const IO_FAILED: i64 = -32007;
 
-    /// `init`: a context URL whose scheme this server has no provider for, named in the
-    /// message.
+    /// `init`: a mount whose scheme this server has no provider for, named in the message.
     ///
     /// `init`'s own, and not deferred to the call that needs a session, because it is
     /// knowable the moment the frame is read: which kinds a server can realize is a fact
-    /// about the *build*, and answering a path for a tree that can never be there would be
-    /// a session in which every later path is a lie.
+    /// about the *build*, and taking a session whose tree can never be there would be one in
+    /// which every later path under it is a lie.
     ///
-    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the context
-    /// is well formed and the server is the wrong build for it — a different binary, or a
+    /// One code for every mount a session names, and the *message* says which entry — because
+    /// a session's trees are a list the client wrote and not a set of members this file
+    /// enumerates, so there is no fixed name to give each of them a code. What a client does
+    /// about it is the same either way: ask for a different URL, or run against a build that
+    /// has the provider.
+    ///
+    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED) because the fix differs: the mount is
+    /// well formed and the server is the wrong build for it — a different binary, or a
     /// different URL.
-    pub const UNSUPPORTED_CONTEXT: i64 = -32008;
+    pub const UNSUPPORTED_MOUNT: i64 = -32008;
 
-    /// `exec`, `read`, `write`: the context could not be put where `init` said it would be —
+    /// `exec`, `read`, `write`: a tree could not be put where `init` said it would be —
     /// no mount binding compiled in, no FUSE provider installed, the mount point busy, the
     /// store itself unreachable.
     ///
@@ -106,7 +111,7 @@ impl Error {
 
     /// `init`: a network reach this server cannot provide, named in the message.
     ///
-    /// `init`'s own, for the reason [`UNSUPPORTED_CONTEXT`](Self::UNSUPPORTED_CONTEXT) is:
+    /// `init`'s own, for the reason [`UNSUPPORTED_MOUNT`](Self::UNSUPPORTED_MOUNT) is:
     /// which reaches a server can answer is a fact about the build and the machine, knowable
     /// the moment the frame is read.
     ///
@@ -141,17 +146,6 @@ impl Error {
     /// here is a file test, where whether a registry has one is a network round trip that
     /// belongs to a boot.
     pub const UNKNOWN_IMAGE: i64 = -32012;
-
-    /// `init`: an [`artifacts`](crate::console::InitCall::artifacts) URL whose scheme this
-    /// server has no provider for, named in the message.
-    ///
-    /// [`UNSUPPORTED_CONTEXT`](Self::UNSUPPORTED_CONTEXT)'s reasoning, applied to the tree a
-    /// session leaves its output in — and a code of its own rather than that one because a
-    /// session names up to two trees, and a client hearing that its session was refused
-    /// has to know *which* of them the build cannot take. The two failures also differ in
-    /// what a client can do about them: a session with no context has nothing to work on,
-    /// where one with nowhere to put its output can often be asked for again without it.
-    pub const UNSUPPORTED_ARTIFACTS: i64 = -32013;
 
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
@@ -190,12 +184,11 @@ mod tests {
             ("NOT_FOUND", Error::NOT_FOUND),
             ("IS_A_DIRECTORY", Error::IS_A_DIRECTORY),
             ("IO_FAILED", Error::IO_FAILED),
-            ("UNSUPPORTED_CONTEXT", Error::UNSUPPORTED_CONTEXT),
+            ("UNSUPPORTED_MOUNT", Error::UNSUPPORTED_MOUNT),
             ("MOUNT_FAILED", Error::MOUNT_FAILED),
             ("UNSUPPORTED_NETWORK", Error::UNSUPPORTED_NETWORK),
             ("UNSUPPORTED_IMAGE", Error::UNSUPPORTED_IMAGE),
             ("UNKNOWN_IMAGE", Error::UNKNOWN_IMAGE),
-            ("UNSUPPORTED_ARTIFACTS", Error::UNSUPPORTED_ARTIFACTS),
             ("INVALID_REQUEST", Error::INVALID_REQUEST),
             ("METHOD_NOT_FOUND", Error::METHOD_NOT_FOUND),
             ("INVALID_PARAMS", Error::INVALID_PARAMS),

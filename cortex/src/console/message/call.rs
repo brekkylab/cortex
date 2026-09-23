@@ -13,12 +13,12 @@
 //!
 //! The three methods that are answered by nothing are `notification`'s, next door.
 
-use std::path::Path;
+use std::{path::Path, str::FromStr};
 
 use bson::{Bson, doc};
-use serde::{Deserialize, Serialize, de};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::rootfs_v2::RootFsV2;
+use crate::rootfs::RootFs;
 
 use super::{Method, utils::bytes};
 
@@ -35,7 +35,7 @@ use super::{Method, utils::bytes};
 /// JSON has no spelling for:
 ///
 /// ```text
-/// {"method":"init","params":{"context":{"url":"file:///srv/project"}}}
+/// {"method":"init","params":{"mounts":["file:///srv/project:/work:ro"]}}
 /// {"method":"exec","params":{"cmd":["sh","-c","ls"],"timeout_ms":1000}}
 /// {"method":"read","params":{"path":"out/log.txt","offset":4096,"len":1024}}
 /// {"method":"write","params":{"path":"in/data","data":<Binary>}}
@@ -55,9 +55,9 @@ pub enum Call {
     /// thing worth answering about it — because the answer is something a client can
     /// act on before it has asked for anything. A channel that answers this has a
     /// server on the far end that read the frame, speaks this protocol, and has taken
-    /// what it was told; a notification could say none of that. The answer also carries
-    /// where each tree went, which is what every later path in the session is spelled
-    /// in — see [`InitResp`](super::InitResp).
+    /// what it was told; a notification could say none of that. The answer also says where
+    /// the session stands to begin with, which is the one thing about it a client could not
+    /// have worked out from what it sent — see [`InitResp`](super::InitResp).
     ///
     /// It carries no booting, and no mounting either. Bringing a backend up costs a kernel
     /// on one and nothing at all on another, and a session's shape is the same either way,
@@ -137,44 +137,44 @@ impl Call {
 /// it, and the base and the reach are the environment a command runs in rather than
 /// anything a command says — so each is said once instead of on every command.
 ///
-/// # Two trees, because they are two lifetimes
+/// # The trees are a list, and each one says where it goes
 ///
-/// [`context`](Self::context) and [`artifacts`](Self::artifacts) are each a [`TreeSource`]
-/// and each answered with a [`TreeMount`](super::TreeMount), and what tells them apart is
-/// the member name rather than anything in the value.
+/// [`mounts`](Self::mounts) is every tree the session gets. Each is a [`MountSpec`]: where
+/// to get the tree, the absolute path it appears at, and whether a command may write in it.
 ///
-/// | member | is | outlives the session |
-/// |---|---|---|
-/// | `context` | what the session is given to work **from**, and reads | yes — it was there before |
-/// | `artifacts` | what the session is to leave behind | yes — that is the point of it |
+/// **What a tree is *for* is the client's and is not on the wire.** A project to read and a
+/// directory to leave output in are two entries that differ in their URL, their path and
+/// their `ro` — which is the whole of what a server has to know to realize either, and the
+/// whole of what this protocol can hold a server to. A member per purpose would be the same
+/// three facts under a name that changes none of them, and would cap a session at the
+/// purposes this file happened to enumerate.
 ///
-/// **Which is why they are two members and not one tree with two directories in it.**
-/// A single tree makes the two the same thing to everyone holding it: the same store
-/// behind them, the same lifetime, the same permissions, and a client that wants to keep
-/// what a session produced has to know which subdirectory that was and trust the session
-/// not to have written outside it. Naming them separately is what lets each be backed by
-/// what it should be — a project directory, a bucket the caller collects from — and it is
-/// the protocol's only way to say which of them a path is in.
+/// So a session that is given somebody's project and leaves its result somewhere the caller
+/// collects from names two trees, a session that composes six stores names six, and the
+/// reason each is there is the client's own. What the protocol settles is the part both ends
+/// have to agree on: which tree is at which path, and which of them a write may land in.
 ///
-/// Room to work in is not a third of them. A session already stands on a filesystem it may
-/// write to and that goes away with it, so a command that unpacks an archive or builds
-/// something has somewhere to put it without the client naming a tree for it — and a tree
-/// named for that purpose would be one more thing to mount, place and answer for, in
-/// exchange for what the session's own root already gives.
+/// Room to work in is not one of them. A session already stands on a filesystem it may write
+/// to and that goes away with it, so a command that unpacks an archive or builds something
+/// has somewhere to put it without the client naming a tree for it — and a tree named for
+/// that purpose would be one more thing to mount, place and answer for, in exchange for what
+/// the session's own root already gives.
 ///
 /// It is a departure from [`ContextFs`](crate::fs::ContextFs)'s composition, which is how a
 /// session gets *many stores* in one tree, and the two answer different questions. Several
-/// stores under one root are one namespace a command walks; these are separate namespaces a
-/// client has separate intentions for.
+/// stores under one root are one namespace a command walks; these are separate namespaces
+/// the client places itself.
 ///
-/// Both are independently optional, and a session with neither is still a session.
+/// An empty list is a session with nothing mounted, which is still a session — a command
+/// then sees whatever the executor's own filesystem holds and nothing this protocol
+/// described.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitCall {
     /// The base a session's commands run in.
     ///
     /// It is essential if it runs on VM environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rootfs: Option<RootFsV2>,
+    pub rootfs: Option<RootFs>,
 
     /// Optional snapshot of what an earlier session changed from the base rootfs — what a
     /// [`snapshot`](SnapshotCall) answered with, handed back.
@@ -193,10 +193,10 @@ pub struct InitCall {
 
     /// How much of a network the session's commands get. `None` leaves it to the server.
     ///
-    /// **Said once, for the same reason the tree is.** What a command can reach is a property
-    /// of the environment it runs in — on some backends a device that has to be attached
-    /// before a kernel comes up — so it cannot be decided per `exec` without meaning a
-    /// different session for every command.
+    /// **Said once, for the same reason the trees are.** What a command can reach is a
+    /// property of the environment it runs in — on some backends a device that has to be
+    /// attached before a kernel comes up — so it cannot be decided per `exec` without meaning
+    /// a different session for every command.
     ///
     /// Answered in [`InitResp::network`](super::InitResp::network) with what is actually in
     /// force, which is the only way a client learns what it got: `None` here is not "no
@@ -205,73 +205,46 @@ pub struct InitCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkAccess>,
 
-    /// The tree this session works **from**, named by URL. `None` is a session with nothing
-    /// mounted, which is still a session — a command then sees whatever the executor's own
-    /// filesystem holds and nothing this protocol described.
+    /// The trees this session works in, each one named and placed by a [`MountSpec`].
     ///
-    /// **What the session is given, as against what it makes.** It was there before the
-    /// session and outlives it, which is why the two trees beside it exist: a session that
-    /// wrote its output and its working files in here would be leaving them in somebody's
-    /// project, and the client would be left to work out which files were new.
+    /// **In order**, and the order is what a client uses to put one tree inside another: a
+    /// server realizes them as they are written, so a mount at `/work/out` that follows one
+    /// at `/work` lands inside it, and the two written the other way round do not. Nothing
+    /// else depends on the order.
     ///
-    /// So this tree is for *reading*, which is what its name says, what the two members
-    /// beside it exist to make possible, and what a server is expected to hold a client to:
-    /// a `write` naming a path in here is refused with
-    /// [`IO_FAILED`](crate::console::Error::IO_FAILED), the code a read-only filesystem
-    /// already answers one with.
-    ///
-    /// How far that reaches is the backend's, because it is a property of what the tree is
-    /// mounted as rather than of this protocol. A backend with a kernel of its own mounts it
-    /// read-only and every write fails, a command's included; a backend running commands on
-    /// the host can only answer for the calls it performs itself, and says so.
-    ///
-    /// Answered by a [`TreeMount`](super::TreeMount) saying where the server put it,
-    /// which is what makes every later path in this protocol a path both ends can spell.
-    /// See [`InitResp`](super::InitResp).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<TreeSource>,
-
-    /// Where this session leaves what it produced, named by URL. `None` is a session that
-    /// produces nothing anybody collects.
-    ///
-    /// **Apart from the context because the client's intention for it is different.** What a
-    /// session was given and what it was asked to make are two sets of files with two
-    /// futures: the first is somebody's project and is read, the second is the result and is
-    /// collected. A session that wrote its output into the tree it was given leaves the
-    /// client to work out which files are new, which is a question the client should not
-    /// have to ask — and on a backend where the context is a store that is expensive or
-    /// unwise to write to, it is a question with no good answer at all.
-    ///
-    /// Answered in [`InitResp::artifacts`](super::InitResp::artifacts) with where it went.
     /// A scheme this build has no provider for is refused at `init` with
-    /// [`UNSUPPORTED_ARTIFACTS`](crate::console::Error::UNSUPPORTED_ARTIFACTS), which is
-    /// [`UNSUPPORTED_CONTEXT`](crate::console::Error::UNSUPPORTED_CONTEXT)'s reasoning applied
-    /// to this member and a code of its own so that a client hears *which* tree the build
-    /// cannot take.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifacts: Option<TreeSource>,
+    /// [`UNSUPPORTED_MOUNT`](crate::console::Error::UNSUPPORTED_MOUNT), naming the entry — and
+    /// refused there rather than deferred to the call that needs a session, because which
+    /// kinds a server can realize is a fact about the *build*: taking a session whose trees
+    /// can never be there would be one in which every later path is a lie.
+    ///
+    /// Two entries at the same path, or one whose path this server cannot use, are a
+    /// malformed request and are [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS) —
+    /// the difference being that a build is what has to change for the first and the request
+    /// is what has to change for these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<MountSpec>,
 }
 
-/// A tree a session is given, named by URL.
+/// A tree a session is given: where to get it, where it appears, and whether it may be
+/// written.
 ///
-/// One type for both of them — the [`context`](InitCall::context) and the
-/// [`artifacts`](InitCall::artifacts) — because naming a tree is one operation and reading
-/// that name is one rule. **What a tree is *for* is the member it arrives under**, and
-/// nothing about that changes how a URL is read, which kinds a build can realize, or what a
-/// server does with the answer.
+/// # The spelling
 ///
-/// A type per member would have been a copy of [`scheme`](Self::scheme) and
-/// [`file_path`](Self::file_path) each, and therefore a chance for two servers to disagree
-/// about what one URL names — which is the failure a shared protocol type exists to
-/// prevent.
+/// ```text
+/// <host url>:<guest path>[:<option>]…
 ///
-/// A *context* is the first of them: what the session is given to work from, as against the
-/// rootfs its commands run on. This is the protocol's way of naming one — not the tree
-/// itself, which is a thing in some process, but where to get it.
+/// file:///srv/project:/work:ro
+/// file:///srv/out:/work/out
+/// ```
 ///
-/// The work is not done in it: a session writes on the root its commands run on and leaves
-/// its result in its [`artifacts`](InitCall::artifacts), and what this tree is for is being
-/// *read*.
+/// **One string, because a mount is one fact.** It is also the spelling a reader already
+/// has — `mount`, `fstab` and every container runtime say a source, a destination and a
+/// list of options in this order — so a person reading a frame, quoting one in a bug report
+/// or writing one into a config file is reading the thing they already know. An object of
+/// three members would be the same three facts spread over a shape that has to be built
+/// before it can be said, and a wire schema that grows a member every time a mount gains an
+/// option.
 ///
 /// # The scheme is the kind
 ///
@@ -280,110 +253,230 @@ pub struct InitCall {
 /// | `file:///srv/project` | a directory on the server's own filesystem |
 /// | `http://…`, `https://…` | a tree reached over HTTP — **on the wire, implemented nowhere** |
 ///
-/// A scheme this build has no provider for is refused at `init`, naming it — with the code
-/// belonging to the member it arrived under, so that a client asking for both trees hears
-/// which one the build cannot take:
-/// [`UNSUPPORTED_CONTEXT`](crate::console::Error::UNSUPPORTED_CONTEXT),
-/// [`UNSUPPORTED_ARTIFACTS`](crate::console::Error::UNSUPPORTED_ARTIFACTS). That is what
-/// `http` and `https` get everywhere today.
-///
-/// **A URL and not a tagged object**, because there is exactly one thing this protocol does
-/// with it: hand it to whatever realizes that kind. A tagged object would put every kind's
+/// A URL and not a tagged object, because there is exactly one thing this protocol does with
+/// it: hand it to whatever realizes that kind. A tagged object would put every kind's
 /// settings in this file and make the wire schema grow with the set of providers, where a
 /// string leaves the schema alone and leaves each kind's spelling to the kind — a peer that
 /// has never heard of a scheme still parses it, and refuses it for the reason it actually
-/// has, which is that its *build* has no provider.
+/// has, which is that its *build* has no provider. That refusal is
+/// [`UNSUPPORTED_MOUNT`](crate::console::Error::UNSUPPORTED_MOUNT), which is what `http` and
+/// `https` get everywhere today.
 ///
-/// # Why this is an object holding one member
+/// # The guest path is the client's to choose
 ///
-/// A kind that has to be *reached* rather than opened needs more than a name for it — an
-/// HTTP tree needs whatever authorizes the request, and a secret does not belong in a URL
-/// that gets logged, quoted in an error and written into a config file. So the URL is a
-/// member rather than the whole of a tree, and what carries a credential is a member
-/// beside it, added when there is a provider that reads one. `file://` needs none, which is
-/// why there is none here yet.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TreeSource {
-    /// `file:///srv/project`, `https://example.com/share`.
-    pub url: String,
+/// [`guest_path`](Self::guest_path) is where the tree appears to the session's commands,
+/// said by the end that is going to spell paths under it. So every path in the session is known before `init`
+/// goes out: a [`read`](ReadCall) names a file under one of these, so does a
+/// [`write`](WriteCall), and so does the command that opens the same file by the same name.
+/// Nothing has to be read back, and there is no moment where a client holds a tree it cannot
+/// yet name a file in.
+///
+/// It is absolute, because a relative one would be relative to a working directory nobody
+/// named and neither end could resolve.
+///
+/// # The options
+///
+/// | option | means |
+/// |---|---|
+/// | `ro` | the session reads this tree and does not write in it |
+/// | `rw` | a command may write in it — the default, and sayable so a client can be explicit |
+///
+/// **Read-only is per tree, because it is a property of the mount and not of the tree's
+/// purpose.** A [`write`](WriteCall) naming a path under an `ro` mount is refused with
+/// [`IO_FAILED`](crate::console::Error::IO_FAILED), the code a read-only filesystem already
+/// answers one with. How far that reaches is the backend's: one with a kernel of its own
+/// mounts the tree read-only and a command's writes fail too, where one running commands on
+/// the host can only answer for the calls it performs itself, and says so. That is what lets
+/// a caller hand over somebody's project and get it back unchanged rather than a promise
+/// that nothing touched it.
+///
+/// # How it is read
+///
+/// From the right: trailing colon-separated segments that are options are options, the first
+/// segment from the right that begins with `/` is the guest path, and everything before it is
+/// the host URL. Which is what makes a URL carrying a colon of its own — a port, say —
+/// unambiguous without quoting, and what the two rules above cost: the guest path is absolute
+/// and carries no colon.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MountSpec {
+    host_url: String,
+    guest_path: String,
+    readonly: bool,
 }
 
-impl TreeSource {
-    pub fn new(url: impl Into<String>) -> Self {
-        TreeSource { url: url.into() }
+impl MountSpec {
+    /// A writable mount of `host_url` at `guest_path`, or why the two do not make one.
+    ///
+    /// Checked here rather than at whoever sends it, so that a value of this type is one
+    /// that can be written and read back as itself — see the type's docs for the two rules
+    /// the spelling needs.
+    pub fn new(
+        host_url: impl Into<String>,
+        guest_path: impl Into<String>,
+    ) -> Result<Self, InvalidMount> {
+        let host_url = host_url.into();
+        let guest_path = guest_path.into();
+
+        let refuse = |why| {
+            Err(InvalidMount {
+                why,
+                spec: format!("{host_url}:{guest_path}"),
+            })
+        };
+
+        match host_url.split_once("://") {
+            None => return refuse("a mount URL needs a scheme"),
+            Some((_, "")) => return refuse("a mount URL needs something after its scheme"),
+            Some(_) => {}
+        }
+        if !guest_path.starts_with('/') {
+            return refuse("a guest path is absolute");
+        }
+        if guest_path.contains(':') {
+            return refuse("a guest path cannot carry a colon");
+        }
+
+        Ok(MountSpec {
+            host_url,
+            guest_path,
+            readonly: false,
+        })
     }
 
-    /// The scheme, which is the kind — `"file"`, `"https"`, or the whole URL when it has
-    /// no `://` in it and so names no kind at all.
+    /// The same mount, read-only — `ro`.
+    pub fn read_only(mut self) -> Self {
+        self.readonly = true;
+        self
+    }
+
+    /// Where to get the tree, on the side that holds it — `file:///srv/project`.
+    pub fn host_url(&self) -> &str {
+        &self.host_url
+    }
+
+    /// Where it appears to the session's commands, which is what every path in the session
+    /// is spelled under.
+    pub fn guest_path(&self) -> &Path {
+        Path::new(&self.guest_path)
+    }
+
+    /// Whether a write in this tree is refused.
+    pub fn is_read_only(&self) -> bool {
+        self.readonly
+    }
+
+    /// The scheme, which is the kind — `"file"`, `"https"`.
     ///
     /// What a server branches on to decide whether it has a provider, and what it names in
-    /// the refusal when it has not — see the type's docs for which code that is.
+    /// the refusal when it has not; see the type's docs for which code that is.
     pub fn scheme(&self) -> &str {
-        self.url.split_once("://").map_or(&self.url, |(s, _)| s)
+        self.host_url
+            .split_once("://")
+            .map_or(&self.host_url, |(s, _)| s)
     }
 
     /// The directory a `file://` URL names, or `None` for any other scheme.
     ///
-    /// The path is what follows the scheme, **as it stands** — see the type's docs on why
-    /// nothing is percent-decoded. Whether it is absolute is the caller's to check and
-    /// refuse, because that refusal is a different one: a relative path is a malformed
-    /// request where an unknown scheme is a build without a provider.
+    /// The path is what follows the scheme, **as it stands**: nothing is percent-decoded,
+    /// because a reader would then have to decode it before it was a path again, which is a
+    /// second thing to get right about one directory.
+    ///
+    /// Whether it is absolute is the caller's to check and refuse, because that refusal is a
+    /// different one: a relative path is a malformed request where an unknown scheme is a
+    /// build without a provider.
     ///
     /// Here rather than in each backend because every server that realizes `file://` has to
     /// read it the same way. Two that disagree would be two servers a client cannot tell
-    /// apart answering the same URL differently, which is the failure a shared protocol
-    /// type exists to prevent.
+    /// apart answering the same URL differently, which is the failure a shared protocol type
+    /// exists to prevent.
     pub fn file_path(&self) -> Option<&Path> {
-        self.url.strip_prefix("file://").map(Path::new)
+        self.host_url.strip_prefix("file://").map(Path::new)
     }
 }
 
-/// Which of a session's trees a [`TreeSource`] arrived as.
-///
-/// The member name and the code that refuses a scheme the build cannot realize, as one
-/// value — because a server that realizes trees does the same work per tree and differs
-/// only in what it calls the tree and what it refuses it with. Passing this is what lets
-/// that be one function.
-///
-/// Here rather than in each server for the reason [`file_path`](TreeSource::file_path) is
-/// here: which code answers which member is a fact about the protocol, and two servers that
-/// spelled it separately could disagree about it — leaving a client to branch on a code that
-/// means one thing on one backend and another on the next.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TreeRole {
-    /// [`InitCall::context`] — what the session is given to work from.
-    Context,
-
-    /// [`InitCall::artifacts`] — what it is to leave behind.
-    Artifacts,
-}
-
-impl TreeRole {
-    /// The member this tree travels under, which is also what an error calls it.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TreeRole::Context => "context",
-            TreeRole::Artifacts => "artifacts",
-        }
-    }
-
-    /// What a scheme this build has no provider for is refused with.
-    ///
-    /// One code per member, so a client that named both trees hears which of them the
-    /// build cannot take — see [`UNSUPPORTED_CONTEXT`](super::Error::UNSUPPORTED_CONTEXT).
-    pub fn unsupported(self) -> i64 {
-        match self {
-            TreeRole::Context => super::Error::UNSUPPORTED_CONTEXT,
-            TreeRole::Artifacts => super::Error::UNSUPPORTED_ARTIFACTS,
-        }
-    }
-}
-
-impl std::fmt::Display for TreeRole {
+impl std::fmt::Display for MountSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        write!(f, "{}:{}", self.host_url, self.guest_path)?;
+        if self.readonly {
+            f.write_str(":ro")?;
+        }
+        Ok(())
     }
 }
+
+impl FromStr for MountSpec {
+    type Err = InvalidMount;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let refuse = |why| {
+            Err(InvalidMount {
+                why,
+                spec: spec.to_string(),
+            })
+        };
+
+        // The URL's own `://` is not a separator, and neither is anything inside it, so the
+        // search starts past it — which is also what makes a missing scheme the first thing
+        // this refuses rather than a URL read as a path.
+        let Some(scheme) = spec.find("://") else {
+            return refuse("a mount URL needs a scheme");
+        };
+        let (head, mut rest) = spec.split_at(scheme + "://".len());
+
+        let mut readonly = false;
+        loop {
+            let Some((before, last)) = rest.rsplit_once(':') else {
+                return refuse("a mount needs a guest path to appear at");
+            };
+            // An absolute guest path is what ends the options, which is the rule that lets
+            // a URL carry colons of its own.
+            if last.starts_with('/') {
+                let mount = MountSpec::new(format!("{head}{before}"), last)?;
+                return Ok(if readonly { mount.read_only() } else { mount });
+            }
+            match last {
+                "ro" => readonly = true,
+                "rw" => readonly = false,
+                // The same refusal covers a guest path that forgot its leading slash,
+                // because from here the two are one thing: a trailing segment that is
+                // neither an option nor a path.
+                _ => return refuse("a mount trails an absolute guest path with `ro` or `rw`"),
+            }
+            rest = before;
+        }
+    }
+}
+
+impl Serialize for MountSpec {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for MountSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spec = String::deserialize(deserializer)?;
+        spec.parse().map_err(de::Error::custom)
+    }
+}
+
+/// Why a string is not a [`MountSpec`].
+///
+/// Carries the string it was reading, because a session names several trees and a peer
+/// hearing only what was wrong with one of them cannot tell which.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidMount {
+    why: &'static str,
+    spec: String,
+}
+
+impl std::fmt::Display for InvalidMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.why, self.spec)
+    }
+}
+
+impl std::error::Error for InvalidMount {}
 
 /// How much of a network a session's commands may reach.
 ///
@@ -426,7 +519,7 @@ impl std::fmt::Display for TreeRole {
 ///
 /// # Why an object and not a string
 ///
-/// The same reason [`TreeSource`] is one. A reach is not always a single word — the ports
+/// The same reason [`MountSpec`] is one. A reach is not always a single word — the ports
 /// below are the first proof of it, and a list of hosts would be the next — and those belong
 /// beside the name rather than encoded into it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,13 +639,12 @@ impl ExecCall {
 /// Part of a file to hand back. The `params` of `read`.
 ///
 /// A path is one in the executor's own filesystem, under the
-/// [`path`](super::TreeMount::path) `init` answered with — so the file this names is the
-/// one a command would open by the same name, and reading it is how a requester sees what
-/// an execution left behind.
+/// [`guest_path`](MountSpec::guest_path) of one of the session's mounts — so the file this names is the one a command would open by
+/// the same name, and reading it is how a requester sees what an execution left behind.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReadCall {
-    /// UTF-8, and the executor's own: a requester builds it by joining onto the path the
-    /// session was answered with, which is the one both ends have a name for.
+    /// UTF-8, and the executor's own: a requester builds it by joining onto the path it
+    /// named the mount at, which is the one both ends have a name for.
     pub path: String,
 
     /// Where in the file to start. `None` is the beginning.
@@ -599,3 +691,103 @@ pub struct WriteCall {
 /// Take what this session has written so far. The `params` of `snapshot`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotCall {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mount is one string both ends read the same way, so what matters about it is that
+    /// what goes out comes back as itself.
+    #[test]
+    fn a_mount_survives_its_spelling() {
+        for spec in [
+            "file:///srv/project:/work",
+            "file:///srv/project:/work:ro",
+            "https://example.com:8080/share:/work/in:ro",
+            "file:///srv/odd:name:/work",
+        ] {
+            let read: MountSpec = spec.parse().expect(spec);
+            assert_eq!(read.to_string(), spec);
+        }
+
+        // `rw` is the default and is sayable, so a client may be explicit — which is the one
+        // spelling that does not come back as itself.
+        let explicit: MountSpec = "file:///srv/project:/work:rw".parse().unwrap();
+        assert_eq!(explicit.to_string(), "file:///srv/project:/work");
+    }
+
+    /// The three parts a server branches on, read out of one string.
+    #[test]
+    fn a_mount_says_where_the_tree_is_and_where_it_goes() {
+        let mount: MountSpec = "file:///srv/project:/work:ro".parse().unwrap();
+
+        assert_eq!(mount.host_url(), "file:///srv/project");
+        assert_eq!(mount.guest_path(), Path::new("/work"));
+        assert!(mount.is_read_only());
+        assert_eq!(mount.scheme(), "file");
+        assert_eq!(mount.file_path(), Some(Path::new("/srv/project")));
+
+        // A scheme with no provider is still read: what refuses it is the build, not this.
+        let remote: MountSpec = "s3://bucket/prefix:/work".parse().unwrap();
+        assert_eq!(remote.scheme(), "s3");
+        assert_eq!(remote.file_path(), None);
+        assert!(!remote.is_read_only());
+    }
+
+    /// What is not a mount, and what each refusal says — a session names several trees, so
+    /// each one names the string it was reading.
+    #[test]
+    fn what_is_not_a_mount_says_which_rule_it_broke() {
+        for (spec, why) in [
+            ("/srv/project:/work", "a mount URL needs a scheme"),
+            (
+                "file://:/work",
+                "a mount URL needs something after its scheme",
+            ),
+            (
+                "file:///srv/project",
+                "a mount needs a guest path to appear at",
+            ),
+            (
+                "file:///srv/project:work",
+                "a mount trails an absolute guest path with `ro` or `rw`",
+            ),
+            (
+                "file:///srv/project:/work:rx",
+                "a mount trails an absolute guest path with `ro` or `rw`",
+            ),
+        ] {
+            let refused = spec.parse::<MountSpec>().expect_err(spec).to_string();
+            assert!(refused.starts_with(why), "{spec}: {refused}");
+            assert!(refused.contains(spec), "{spec}: {refused}");
+        }
+
+        // And the same rules hold for one built rather than read, so that a value of this
+        // type is always one that can be written and read back.
+        assert!(MountSpec::new("file:///srv/project", "work").is_err());
+        assert!(MountSpec::new("file:///srv/project", "/wo:rk").is_err());
+    }
+
+    /// The wire carries the string and nothing around it.
+    #[test]
+    fn a_session_names_its_trees_as_strings() {
+        let init = InitCall {
+            mounts: vec![
+                MountSpec::new("file:///srv/project", "/work")
+                    .unwrap()
+                    .read_only(),
+                MountSpec::new("file:///srv/out", "/work/out").unwrap(),
+            ],
+            ..InitCall::default()
+        };
+
+        let wire = bson::serialize_to_bson(&init).unwrap();
+        assert_eq!(
+            wire,
+            bson::bson!({
+                "mounts": ["file:///srv/project:/work:ro", "file:///srv/out:/work/out"],
+            })
+        );
+        assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
+    }
+}

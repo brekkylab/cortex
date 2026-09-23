@@ -40,7 +40,7 @@ use super::{Error, Method, utils::bytes};
 /// `<Binary>` standing in for a byte payload:
 ///
 /// ```text
-/// {"method":"init","result":{"context":{"mount":"/work"},"cwd":"/work"}}
+/// {"method":"init","result":{"cwd":"/work"}}
 /// {"method":"exec","result":{"code":0,"stdout":<Binary>,"stderr":<Binary>,"truncated":false}}
 /// {"method":"read","result":{"data":<Binary>,"size":4096}}
 /// {"error":{"code":-32000,"message":"timed out after 1000ms"}}
@@ -265,33 +265,15 @@ fn payload<T: DeserializeOwned, E: de::Error>(method: Method, result: Bson) -> R
 /// Answered rather than left to a notification because this is the one thing about a
 /// session a client can hear before it asks for work — that there is a server on the far
 /// end, that it read the frame, that it speaks this protocol, and that it has taken what it
-/// was told. It is also *where*: a session that named a tree has a path to it, and those
-/// paths are what every later `read` and `write` is spelled in.
+/// was told.
 ///
-/// One member per tree the call named, because they are the trees the call named — see
-/// [`InitCall`](super::InitCall) for why that is two members rather than one. A tree the
-/// server took and did not place is the failure each of them exists to prevent: the client
-/// would have nothing to spell a path with.
+/// **It says nothing about where the trees went, because the call already did.** A
+/// [`MountSpec`](super::MountSpec) carries the path its tree appears at, so every path in
+/// the session is settled by the end that is going to spell them and there is nothing here
+/// to read back. What is left is the one fact about a session the client could not have
+/// worked out from what it sent: where it stands.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitResp {
-    /// Where the context [`InitCall::context`](super::InitCall::context) named went, or `None`
-    /// when none was named.
-    ///
-    /// A client that asked for one and is answered without this has been told nothing it
-    /// can use: every path it would send afterwards would be a guess. That is a broken
-    /// session rather than an empty one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<TreeMount>,
-
-    /// Where the [`artifacts`](super::InitCall::artifacts) tree went, or `None` when none
-    /// was named.
-    ///
-    /// Owed for the same reason [`context`](Self::context) is: a client that asked for one and
-    /// is answered without this cannot name a file the session left it, which is what it
-    /// asked for the tree in order to do.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifacts: Option<TreeMount>,
-
     /// Where the session stands to begin with — the working directory the base image
     /// declared, and whatever the server stands a session in when it declared none.
     ///
@@ -299,9 +281,8 @@ pub struct InitResp {
     /// where a process starts is describing the thing it was built to run, and a session
     /// that stood somewhere else would be one where that image's own instructions are
     /// wrong. Standing in a tree the client named instead would make that tree the default
-    /// destination of every relative path a command writes — somebody's project, in the
-    /// [`context`](Self::context)'s case, which is the tree a session reads and does not
-    /// write.
+    /// destination of every relative path a command writes — somebody's project, when that
+    /// is what the tree is, and a mount the client asked to be read-only at that.
     ///
     /// Which is a convention and not a rule this protocol enforces: it is one member saying
     /// one thing, and a server that stands somewhere else says so here and is read.
@@ -322,45 +303,6 @@ pub struct InitResp {
     /// — every path it sends is one it built itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-}
-
-/// Where one of a session's trees is, in the server's filesystem.
-///
-/// [`TreeSource`](super::TreeSource)'s answer, and one type for the same reason that is one:
-/// where a tree went is where a tree went, and which tree it was is the member this arrived
-/// under.
-///
-/// # Why the server says the path instead of both ends agreeing on a namespace
-///
-/// A `read` and a command have to name one file, which needs one name that means one file to
-/// both ends. Two ends realizing the same description separately is one way to get that, and
-/// it costs a tree on each side, a mount on each side, and a rewriting step on every path
-/// that crosses — all to reconstruct something one end already has.
-///
-/// So the server realizes it once and says where. Everything after this is that path: a
-/// `read` names a file under it, an execution's reported directory is a directory under it,
-/// and neither end rewrites anything. What it costs is that the client has to be able to
-/// open what the server opened — the two share a filesystem, which is what the path being
-/// *the server's* means. A backend whose commands run somewhere else, a guest included,
-/// answers a path on this side of that boundary and either translates behind it or arranges
-/// that there is nothing to translate: `cortex-uvm-console` shares the host's directory into
-/// its guest **at the host's own path**, so the two spellings are one string and a `cwd` the
-/// guest reports needs no rewriting to be a name the client can open.
-///
-/// # It is a name before it is a directory
-///
-/// `init` mounts nothing, the way it boots nothing: the mount happens when the session
-/// boots, at the path already answered here. So this is fixed for the session, and a kernel
-/// answers at it only while something is booted. Nothing needs it any sooner — `read`,
-/// `write` and `exec` each boot a session first — which is what makes a path answered
-/// before there is a directory at it useful rather than a promise.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TreeMount {
-    /// Absolute, and in the server's filesystem — `"/mnt/context"`.
-    ///
-    /// A relative one would be relative to a working directory nobody named, and the client
-    /// has no way to guess which.
-    pub path: String,
 }
 
 /// A whole execution in one value: everything it wrote, and how it ended. The `result` of

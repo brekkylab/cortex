@@ -290,7 +290,11 @@ mod tests {
             Message::Request {
                 id: 0,
                 call: Call::Init(InitCall {
-                    context: Some(super::super::TreeSource::new("file:///srv/project")),
+                    mounts: vec![
+                        super::super::MountSpec::new("file:///srv/project", "/work")
+                            .expect("a mount a test wrote")
+                            .read_only(),
+                    ],
                     ..InitCall::default()
                 }),
             },
@@ -509,7 +513,11 @@ mod tests {
             wire(&Message::Request {
                 id: 0,
                 call: Call::Init(InitCall {
-                    context: Some(super::super::TreeSource::new("file:///srv/project")),
+                    mounts: vec![
+                        super::super::MountSpec::new("file:///srv/project", "/work")
+                            .expect("a mount a test wrote")
+                            .read_only(),
+                    ],
                     ..InitCall::default()
                 }),
             }),
@@ -517,7 +525,7 @@ mod tests {
                 "jsonrpc": "2.0",
                 "id": 0i64,
                 "method": "init",
-                "params": {"context": {"url": "file:///srv/project"}},
+                "params": {"mounts": ["file:///srv/project:/work:ro"]},
             },
         );
     }

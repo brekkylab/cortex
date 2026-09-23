@@ -7,8 +7,8 @@ Two things make it more than a remote `exec`:
 
 1. JSON-RPC 2.0's object model — the three shapes, the `id` pairing, the error codes — encoded as BSON rather than as JSON text.
    The semantics are the spec's and read as it; the bytes are not, so a peer needs a BSON codec. See [Codec](#codec) for what that trade bought.
-2. The session declares its **trees** — a context and an artifacts — and the server says where it put each.
-   The client names a tree by URL, the server answers with a path in its own filesystem, and every path in the protocol after that is spelled under one of those — so a file name means the same thing to a command and to a `read`. See [the trees](#the-trees--what-can-be-reached-and-where-it-ends-up).
+2. The session declares its **trees** — a list of mounts, each one a string saying where the tree is, where the session sees it, and whether a command may write in it.
+   The client chooses the path a tree appears at, and every path in the protocol after that is spelled under one of those — so a file name means the same thing to a command and to a `read`. See [the trees](#the-trees--what-can-be-reached-and-where-it-goes).
 
 **Each end of the channel does one job.** The client only asks; the server only answers.
 There is no request a server ever issues, which is what leaves one channel, one end that asks and one end that answers — see [The channel](#the-channel).
@@ -149,7 +149,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{context?, artifacts?}` | `{context?, artifacts?, cwd?}` |
+| `init` | `{mounts?, rootfs?, snapshot?, network?}` | `{cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -187,8 +187,8 @@ A boot that fails is reported to whoever asked for the call that needed it, as `
 ### `init` — this is the session
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"init","params":{"context":{"url":"file:///srv/project"},"artifacts":{"url":"file:///srv/out"}}}
-{"jsonrpc":"2.0","id":0,"method":"init","result":{"context":{"path":"/mnt/context"},"artifacts":{"path":"/mnt/artifacts"},"cwd":"/work"}}
+{"jsonrpc":"2.0","id":0,"method":"init","params":{"mounts":["file:///srv/project:/work:ro","file:///srv/out:/work/out"]}}
+{"jsonrpc":"2.0","id":0,"method":"init","result":{"cwd":"/work"}}
 ```
 
 What a session is: **what can be reached**.
@@ -196,46 +196,54 @@ It outlives any one execution, which is why it is here and not on an `exec` — 
 
 The other thing a session *has* is where it stands, and that is the server's to keep rather than the client's to say — so it is not in the request at all, and the answer is the first reading of it.
 
-It is also the only method whose answer carries anything, and every member is why: a client that has not been told where a tree is cannot name a file in it, and one that has not been told where the session stands cannot say where a command would look.
+It is also the only method whose answer carries anything, and what it carries is the one fact the client could not have worked out from what it sent: a client that has not been told where the session stands cannot say where a command would look.
+Where the trees went is not in it, because the call already said — see below.
 
-#### The trees — what can be reached, and where it ends up
+#### The trees — what can be reached, and where it goes
 
-Up to two of them, each named by URL going out and by a path coming back, and each independently optional.
+A list, in the order they are mounted, each one a string.
 
 ```json
-→ {"context":{"url":"file:///srv/project"},"artifacts":{"url":"file:///srv/out"}}
-← {"context":{"path":"/mnt/context"},"artifacts":{"path":"/mnt/artifacts"}}
+→ {"mounts":["file:///srv/project:/work:ro","file:///srv/out:/work/out"]}
+← {"cwd":"/work"}
 ```
 
-| member | is | writable | outlives the session |
-|---|---|---|---|
-| `context` | what the session is given to work **from**, and reads | **no** | yes — it was there before |
-| `artifacts` | what the session is to leave behind | yes | yes — that is the point of it |
+```text
+<host url>:<guest path>[:<option>]…
+```
 
-A *context* is what the session is given to work from, as against the rootfs its commands run on.
-**The work is not done here**: a session writes on the root its commands run on and leaves its result in its artifacts, so what this tree is for is being read.
-That is what the other two members exist to make possible, and it is enforced rather than merely meant: a `write` naming a path in the context comes back `-32007`, the code a read-only filesystem answers one with.
+| part | is |
+|---|---|
+| host url | where the tree is, on the side that holds it — the kind is the scheme |
+| guest path | where it appears to the session's commands; absolute, and the client's to choose |
+| option | `ro` — the session reads this tree and does not write in it; `rw` is the default and is sayable |
 
-How far it reaches is the backend's, because read-only-ness is a property of what the tree was mounted as and this protocol mounts nothing.
-A backend with a kernel of its own mounts the context `MS_RDONLY` and every write into it fails, a command's included.
+**One string, because a mount is one fact.**
+It is also the spelling a reader already has: `mount`, `fstab` and every container runtime say a source, a destination and a list of options in this order.
+An object of three members would be the same three facts spread over a shape that has to be built before it can be said, and a wire schema that grows a member every time a mount gains an option.
+
+It is read from the right — trailing segments that are options are options, the first segment from the right beginning with `/` is the guest path, and everything before it is the URL.
+Which is what lets a URL carry a colon of its own (`https://example.com:8080/share:/work`) without quoting, and what the two rules above cost: the guest path is absolute and carries no colon.
+
+**What a tree is *for* is the client's and is not on the wire.**
+A project to read and a directory to leave output in are two entries differing in their URL, their guest path and their `ro`, and that is the whole of what a server has to know to realize either.
+A member per purpose would be the same three facts under a name that changes none of them, and would cap a session at the purposes this file happened to enumerate.
+
+So the arrangement worth having is the client's to build, and this one is worth having: a session given somebody's project `ro` and a writable tree beside it leaves the caller a tree whose whole contents are the result, rather than a diff against a directory somebody else may also be writing to — and on a backend where the project is a store expensive or unwise to write to, that is a question with no other good answer.
+
+**`ro` is per tree, because read-only-ness is a property of the mount and not of the tree's purpose.**
+It is enforced rather than merely meant: a `write` naming a path under an `ro` mount comes back `-32007`, the code a read-only filesystem answers one with.
+How far that reaches is the backend's, because this protocol mounts nothing.
+A backend with a kernel of its own mounts the tree `MS_RDONLY` and every write into it fails, a command's included.
 A backend that runs commands on the host has nothing mounted to be read-only, so it answers for the `write` calls it performs itself and leaves a spawned command the reach the host gives it — which is the same thing that makes the host backend's paths a place to stand rather than a confinement.
 
-[`fs`](../fs/ARCHITECTURE.md) spells it the same way (`ContextFs`), so one word means one thing on both sides of the seam.
-
-**Two members and not one tree with two directories in it.**
-A single tree makes the two the same thing to everyone holding them: the same store behind them, the same lifetime, the same permissions — and a client that wants to keep what a session produced has to know which subdirectory that was and trust the session not to have written outside it.
-Naming them separately is what lets each be backed by what it should be — a project directory, a bucket the caller collects from — and it is this protocol's only way to say which of them a path is in.
-
-**Room to work in is not a third of them.**
+**Room to work in is not one of them.**
 A session already stands on a filesystem it may write to and that goes away with it, so a command that unpacks an archive or builds something has somewhere to put it without the client naming a tree for it — and a tree named for that would be one more thing to mount, place and answer for, in exchange for what the session's own root already gives.
 
-That is a different question from the one [`fs`](../fs/ARCHITECTURE.md) answers by composing many stores behind one URL, and both answers stand: several stores under one root are one namespace a command walks, where these are separate namespaces a client has separate intentions for.
-So a session that needs five project directories in view at once still composes them behind one `context` URL.
+That is a different question from the one [`fs`](../fs/ARCHITECTURE.md) answers by composing many stores behind one URL, and both answers stand: several stores under one root are one namespace a command walks, where these are separate namespaces the client places itself.
+So a session that needs five project directories *in one tree* still composes them behind one URL, and one that wants them at five paths writes five entries.
 
-**They are the same kind of value and differ only in the member name.**
-One spelling, one way of reading a URL, one shape coming back — which is what keeps two servers from disagreeing about what one URL names. What a tree is *for* is the client's, and the whole of a server's part in it is to realize it and say where.
-
-Absent is nothing mounted, for each of them independently, and that is not an error — a client with no tree is still a client, and then the member is left off the frame rather than sent empty.
+An empty list is nothing mounted, and that is not an error — a client with no tree is still a client, and then the member is left off the frame rather than sent empty.
 Such a session's commands see whatever the executor's own filesystem holds, and this protocol has described none of it.
 
 **The scheme is the kind.**
@@ -246,51 +254,53 @@ Such a session's commands see whatever the executor's own filesystem holds, and 
 | `http://…`, `https://…` | a tree reached over HTTP — on the wire, implemented nowhere |
 
 A `file://` URL is usually a directory the *client* put there: a cortex tree mounted in front of a kernel on this host, whose path is then the whole of what the server has to be told about it.
-That is why the two paths in this exchange are so often the same one — and why they are exchanged anyway rather than assumed equal.
 
 A URL and not a tagged object, because there is one thing this protocol does with it: hand it to whatever realizes that kind.
 A tagged object would grow the wire schema with every provider anyone adds; a string leaves the schema alone and leaves each kind's spelling to the kind — so a peer that has never heard of a scheme still parses the frame, and refuses it for the reason it actually has.
 
-That reason is [`UNSUPPORTED_CONTEXT`](#errors) — or `UNSUPPORTED_ARTIFACTS`, because a client that named both trees has to hear which one the build cannot take — and unlike the failures below it is **`init`'s own**.
-Which kinds a server can realize is a fact about the build, knowable the moment the frame is read — and answering a path for a tree that can never be there would make every later path in the session a lie.
+That reason is [`UNSUPPORTED_MOUNT`](#errors), and unlike the failures below it is **`init`'s own**.
+Which kinds a server can realize is a fact about the build, knowable the moment the frame is read — and taking a session whose tree can never be there would make every later path under it a lie.
+One code for every entry, with the *message* naming which: a session's trees are a list the client wrote and not a set of members this file enumerates, so there is no fixed name to give each of them a code, and what a client does about it is the same either way.
 
-A URL is a name, so a kind that has to be authorized rather than opened will need a member beside it to carry that; `file://` needs none, which is why there is none yet.
+A URL is a name, so a kind that has to be authorized rather than opened will need somewhere to carry that; `file://` needs none, which is why there is nowhere yet.
 Whatever it becomes will cross in the clear, and what protects it is the transport: over stdio, a pipe to a child on this host.
 
-**The path is the server's, and it is what the rest of the protocol speaks.**
-A `read` names a file under it, and so does a `write`.
+**The guest path is the client's, and it is what the rest of the protocol speaks.**
+A `read` names a file under one, and so does a `write`.
 Nothing is workspace-relative and nothing is rewritten in flight.
 
-That is the trade this member exists to make. Two ends realizing one description separately is the other way to have a name mean one file, and it costs a tree on each side and a translation on every path that crosses — to reconstruct something one end already has.
-So the server realizes it once and says where, and what it costs instead is that a path in this protocol is a name in the *server's* namespace and not always one in the client's.
-A backend whose commands run somewhere else — a guest, a container — answers a path on the far side of that boundary and relays every later path untouched. `cortex-uvm-console` mounts each tree at a constant for its role (`/context`, `/artifacts`) and answers that, so a `pwd` a command prints, a path a `read` carries and what the client was told at `init` are one string, and nothing anywhere rewrites a path.
+That is the trade this part of the string exists to make. The other way to have a name mean one file is for the server to place each tree and answer where it put it, which is a round trip, a member on the response, and a client that holds a tree it cannot yet name a file in.
+Saying it in the call costs the client the choice of a path that has to work on the far side — an absolute path the server can mount at — and buys that every path in the session is settled before `init` goes out.
+A backend whose commands run somewhere else — a guest, a container — mounts each tree at the path it was given and relays every later path untouched, so a `pwd` a command prints, a path a `read` carries and what the client wrote at `init` are one string, and nothing anywhere rewrites a path.
 
-A client that also wants to reach those files *itself* already can, and not through this answer: it mounted the tree, so it has its own name for the same directory — the mount point it sent.
+A client that also wants to reach those files *itself* already can, and not through this protocol: it mounted the tree, so it has its own name for the same directory — the mount point behind the URL it sent.
 The two names never have to meet, because only one of them is ever in a frame.
-This is what [`Console`](console.rs) keeps apart by holding both: the mount it was handed, and the path the server answered.
+This is what [`Console`](console.rs) keeps apart by holding both: the mount it was handed, and the guest path it named.
 
 **One spelling, and it is this one.**
-Every path that comes out of a session afterwards has to be spelled the way this answer is, because the client's only way to relate one to the other is the characters — including what a command's own `pwd` prints, which is a path a client will turn around and send back in a `read`.
-That is not automatic and it is where a backend will get it wrong: `getcwd(2)` answers the *physical* path, so a tree mounted at `/var/x` is seen from inside as `/private/var/x`, and a `cd` that canonicalized would land there too. Both are the same directory and neither is one the client was told about.
-So a server that answers a path holds that spelling and puts what it observes back into it. `cortex-local-console` does this in two places, and both were bugs before they were code.
+Every path that comes out of a session afterwards has to be spelled the way the call wrote it, because the client's only way to relate one to the other is the characters — including what a command's own `pwd` prints, which is a path a client will turn around and send back in a `read`.
+That is not automatic and it is where a backend will get it wrong: `getcwd(2)` answers the *physical* path, so a tree mounted at `/var/x` is seen from inside as `/private/var/x`, and a `cd` that canonicalized would land there too. Both are the same directory and neither is one the client named.
+So a server holds the spelling it was given and puts what it observes back into it. `cortex-local-console` does this in two places, and both were bugs before they were code.
 
 **Nothing is mounted by sending it**, any more than anything is booted by it.
-The path is where the tree *will be*: the mount happens when the session boots, so a client holding this answer holds a name before it holds a directory.
+The guest path is where the tree *will be*: the mount happens when the session boots, so a client holding a path holds a name before it holds a directory.
 Nothing needs it any sooner — a `read`, a `write` and an `exec` each boot a session first.
 A mount that then fails is [`MOUNT_FAILED`](#errors) to whoever asked for the call that needed it, exactly as a boot that fails is `BOOT_FAILED`.
 
 The path is fixed for the session either way, which is what makes it usable as a name: a `stop` takes the mount down and the next call puts it back at the same place.
 
-What the kinds are and how one tree is assembled from several stores is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol carries a URL and a path.
+**In order**, and the order is what puts one tree inside another: a server realizes them as they are written, so a mount at `/work/out` following one at `/work` lands inside it, and the two written the other way round do not.
+Two entries at the same path, or one at a path this server cannot use, are a malformed request — `-32602`, because the request is what has to change rather than the build.
 
-**Nothing is booted by it**, and the response is not a readiness signal — it is the one thing about a session a client can hear before it asks for work: that there is a server on the far end, that it read the frame, that it speaks this protocol, that it has taken what it was told, and where the tree will be.
+What the kinds are and how one tree is assembled from several stores is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol carries a URL, a path and whether it may be written.
+
+**Nothing is booted by it**, and the response is not a readiness signal — it is the one thing about a session a client can hear before it asks for work: that there is a server on the far end, that it read the frame, that it speaks this protocol, and that it has taken what it was told.
 A notification could say none of that, which is the whole reason this one method is answered.
 
 Which is also why the asking side sends it when a console is *constructed* rather than leaving it to a caller to remember: a `Console` that exists is one that got this answer back. See [Session](#session).
-A tree answered without a path is a server that took it and left the client no way to name a file in it, so that is a console that does not exist rather than one that guesses — whichever of the three it was.
 
 A second `init` replaces the first and takes whatever was booted under it with it.
-The context is built into what booting produced — a mounted tree — so a session that changes it has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived. Its answer may name a different path, and that path is the session's from then on.
+The trees are built into what booting produced — a mounted tree apiece — so a session that changes them has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived.
 
 ### `start` — boot now, to hide the cold start
 
@@ -351,7 +361,7 @@ Asking would therefore re-encode base64 at exactly the point the byte type was t
 A session has a current directory, and **the far end is what keeps it**.
 
 ```json
-{"jsonrpc":"2.0","id":0,"method":"init","result":{"artifacts":{"path":"/mnt/artifacts"},"cwd":"/work"}}
+{"jsonrpc":"2.0","id":0,"method":"init","result":{"cwd":"/work"}}
 {"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["cd","work"]}}
 {"jsonrpc":"2.0","id":2,"method":"exec","result":{"code":0,"stdout":…,"stderr":…,"truncated":false}}
 {"jsonrpc":"2.0","id":3,"method":"exec","params":{"cmd":["ls"]}}
@@ -385,7 +395,7 @@ That is the trade, and it is worth taking: a shell has the same one, and an agen
 ### `read` — hand back part of a file
 
 ```json
-{"jsonrpc":"2.0","id":5,"method":"read","params":{"path":"/mnt/artifacts/log.txt","offset":4096,"len":1024}}
+{"jsonrpc":"2.0","id":5,"method":"read","params":{"path":"/work/out/log.txt","offset":4096,"len":1024}}
 {"jsonrpc":"2.0","id":5,"method":"read","result":{"data":{"$binary":{"base64":"aGkK","subType":"00"}},"size":10000}}
 ```
 
@@ -477,11 +487,11 @@ sequenceDiagram
         participant sh
     end
 
-    client->>server: id:0 init {context:{url:"file:///srv/project"}, artifacts:{url:"file:///srv/out"}}
-    server-->>client: id:0 method:init result {context:{path:"/mnt/context"}, artifacts:{path:"/mnt/artifacts"}, cwd:"/work"}
+    client->>server: id:0 init {mounts:["file:///srv/project:/work:ro", "file:///srv/out:/work/out"]}
+    server-->>client: id:0 method:init result {cwd:"/work"}
 
     client->>server: id:1 exec {cmd:["sh","-c","echo hi"]}
-    Note over server: nothing is booted yet, so this boots it:<br/>every tree is mounted at the path init answered with
+    Note over server: nothing is booted yet, so this boots it:<br/>every tree is mounted at the path init named
     server->>sh: spawn
     activate sh
     sh-->>server: writes its output, exits
@@ -525,12 +535,11 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
 | `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
-| `-32008` | `init` | **unsupported context** — a URL whose scheme this server has no provider for, named in the message. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and a path answered for a tree that can never be there would make every later path a lie. Distinct from `BOOT_FAILED` because the fix is different: the context is well formed and the *build* is wrong for it — a different binary, or a different URL. |
+| `-32008` | `init` | **unsupported mount** — a URL whose scheme this server has no provider for, with the message naming which entry. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and taking a session whose tree can never be there would make every later path under it a lie. One code for every entry, because a session's trees are a list the client wrote and not a set of members with fixed names. Distinct from `BOOT_FAILED` because the fix is different: the mount is well formed and the *build* is wrong for it — a different binary, or a different URL. |
 | `-32009` | `exec`, `read`, `write` | **mount failed** — a tree could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
-| `-32013` | `init` | **unsupported artifacts** — as `-32008`, for the tree a session leaves its output in. A code of its own because a session names up to two trees and a refusal has to say which, and because the fix differs: a session with no context has nothing to work on, where one with nowhere to put its output can often be asked for again without it. |
 | `-32600` | any | invalid request. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty argv `cmd`, or a tree URL that is not one. Apart from `UNSUPPORTED_CONTEXT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
+| `-32602` | any | invalid params — an empty argv `cmd`, a mount that is not one, or two mounts asking for the same path. Apart from `UNSUPPORTED_MOUNT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
 | `-32603` | any | internal error |
 
 `-32010` through `-32012` are taken by parts of this protocol the document above does not yet describe, which is why they are not in the table; `-32003`, `-32004` and `-32014` name nothing and stay that way.
@@ -572,8 +581,8 @@ A boot that fails leaves `Idle`, so nothing thinks it is up, and the call that n
 
 What a session carries across all of this is small and worth naming: the tree from `init`, and **where it stands** — which the states above do not show because it is not one. It is seeded by `init`'s answer, moved by an execution that moves it, read back with `pwd`, and untouched by `start` and `stop`.
 
-`init` is not an edge at all. It is legal in either state, it boots and mounts nothing, and what it changes is the shape a future boot will take — its tree — which is why it drops back to `Idle` when it arrives in `Up`.
-The path it answers with is a fact about every state after it: in `Idle` nothing is mounted there, in `Up` something is, and it is the same path throughout.
+`init` is not an edge at all. It is legal in either state, it boots and mounts nothing, and what it changes is the shape a future boot will take — its trees — which is why it drops back to `Idle` when it arrives in `Up`.
+The paths it named are a fact about every state after it: in `Idle` nothing is mounted there, in `Up` something is, and they are the same paths throughout.
 
 > **Barely enforced today, and mostly the answering side's to enforce.**
 > An answering end moves frames and reads no meaning into them, and the shared server layer that held these rules is gone.

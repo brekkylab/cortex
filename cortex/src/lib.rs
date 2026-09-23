@@ -38,15 +38,16 @@
 //!     let mount = FuseMount::try_new(context, Path::new("/tmp/session"))?;
 //!
 //!     // What the agent can do: a server that runs its commands, against that tree. A
-//!     // session's shape is said once, when the console is built.
+//!     // session's shape is said once, when the console is built — including where each
+//!     // tree appears to the commands, which is what their paths are spelled under.
 //!     let mut console = Console::builder()
 //!         .stdio_client(&["cortex-local-console"])
-//!         .context(mount)
+//!         .mount(mount, "/work")
 //!         .build()
 //!         .await?;
 //!
 //!     // A shell the agent wrote, run wherever that server runs things.
-//!     let result = console.exec(["sh", "-c", "wc -w notes/today.md"], None).await?;
+//!     let result = console.exec(["sh", "-c", "wc -w /work/notes/today.md"], None).await?;
 //!     println!("{}", String::from_utf8_lossy(&result.stdout));
 //!     Ok(())
 //! }
@@ -96,8 +97,7 @@
 pub mod console;
 pub mod fs;
 mod lock;
-// pub mod rootfs;
-pub mod rootfs_v2;
+pub mod rootfs;
 
 /// What every method that waits hands back — a [`Client`] or a [`Server`].
 ///

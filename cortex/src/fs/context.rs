@@ -31,13 +31,15 @@ use crate::{
 
 /// A public API for using cortex's filesystem.
 ///
-/// The name is the console protocol's: a session's *context* is the tree it is given to work
-/// from, as against its rootfs — the system's own tree — and this is what one is assembled
-/// out of. Several stores under one root, which is how a session sees five places at once
-/// without the protocol carrying five names for them.
+/// A *context* is a tree a session is given to work in, as against its rootfs — the system's
+/// own tree — and this is what one is assembled out of. Several stores under one root, which
+/// is how a session sees five places at once behind one
+/// [`mount`](crate::console::ConsoleBuilder::mount).
 ///
-/// Nothing here is context-specific, and a caller that has a tree to assemble for a session's
-/// [`artifacts`](crate::console::ConsoleBuilder::artifacts) assembles it with this too.
+/// Which is a different question from the one the console protocol answers by taking a list
+/// of mounts, and both answers stand: this composes many stores into *one* namespace a
+/// command walks, where a session's mounts are separate namespaces the caller places itself.
+/// A tree assembled here is one entry in that list, whatever the caller means it for.
 pub struct ContextFs {
     /// Mount points keyed by their normalized, root-relative path.
     ///
