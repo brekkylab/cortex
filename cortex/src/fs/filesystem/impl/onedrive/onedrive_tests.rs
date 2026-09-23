@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -10,43 +11,31 @@ use super::super::accessor::encode_path;
 use super::super::{OnedriveConfig, OnedriveOrigins};
 use super::*;
 
+// Each test says what it pins. Why the behaviour is what it is lives once, on the code it
+// points to.
+
 // ---------------------------------------------------------------------------
 // Pure, no I/O
 // ---------------------------------------------------------------------------
 
-/// One listing row becomes the entry the mount shows, or nothing at all.
-///
-/// A **package** — a OneNote notebook is the one you meet — is dropped: Microsoft calls it
-/// "a package instead of a folder or file", treated as a folder by some clients and a file
-/// by others, and it has no bytes this API will serve. An item that is neither `file` nor
-/// `folder` goes the same way. A name that cannot be read is worse than an absence.
+/// A listing row becomes the entry the mount shows, or nothing. See [`child_from_item`].
 #[test]
 fn a_row_becomes_the_entry_it_should() {
     let mut notebook = folder_row("Work Notes", "N1");
-    notebook
-        .as_object_mut()
-        .unwrap()
-        .insert("package".into(), json!({"type": "oneNote"}));
+    notebook["package"] = json!({"type": "oneNote"});
     assert!(
         child_from_item(&notebook).is_none(),
-        "a package is dropped even though it also carries a folder facet"
+        "a package, despite its folder facet"
     );
 
     let mut neither = json!({"id": "X1", "name": "mystery", "size": 10});
     assert!(child_from_item(&neither).is_none(), "no file, no folder");
-    neither
-        .as_object_mut()
-        .unwrap()
-        .insert("file".into(), json!({}));
+    neither["file"] = json!({});
     assert!(
         child_from_item(&neither).is_some(),
         "a file facet is enough"
     );
 
-    // A row that cannot be addressed after the listing is dropped, the same judgement one
-    // more time. It is the id every later request uses — the download-URL refresh runs in
-    // the middle of a read — so a `Child` carrying an empty one would not omit the file,
-    // it would break reading it, and only once the URL expired.
     let mut idless = file_row("report.docx", "F1", 1234);
     idless.as_object_mut().unwrap().remove("id");
     assert!(child_from_item(&idless).is_none(), "no id, no entry");
@@ -54,130 +43,85 @@ fn a_row_becomes_the_entry_it_should() {
     let file = child_from_item(&file_row("report.docx", "F1", 1234)).unwrap();
     assert_eq!(
         (file.size, file.etag.as_deref()),
-        (1234, Some("ctag-report.docx")),
-        "the exact size, and the content tag rather than the other one"
+        (1234, Some("ctag-report.docx"))
     );
-    // A folder states a size too — the sum of what it contains, which is not a length
-    // anything reads.
+    let folder = child_from_item(&folder_row("Documents", "D1")).unwrap();
     assert_eq!(
-        child_from_item(&folder_row("Documents", "D1"))
-            .unwrap()
-            .size,
-        0
+        folder.size, 0,
+        "a folder's size is what it holds, not a length"
     );
 }
 
-/// Nothing addresses what it does not name.
-///
-/// A name is one path segment. OneDrive refuses most of what would need removing — `\ / :
-/// * ? " < > |` are not allowed in one — so this guards a gateway that is less strict, `/`
-/// being the one that would silently become a separator. And `..` in a *path* is refused
-/// rather than walked: a name survives the sanitizer with almost anything in it, and the
-/// tree has no `..` of its own for it to mean.
+/// A name is one path segment and a path never walks `..`. See [`sanitize_name`], [`vpath`].
 #[test]
 fn nothing_addresses_what_it_does_not_name() {
-    let evil = child_from_item(&file_row("../../etc/passwd", "E1", 1)).unwrap();
-    assert!(!evil.name.contains('/'));
+    let name = |n: &str| child_from_item(&file_row(n, "E", 1)).unwrap().name;
+    assert!(!name("../../etc/passwd").contains('/'));
     assert_eq!(
-        child_from_item(&file_row("..", "E2", 1)).unwrap().name,
-        "untitled"
+        (name(".."), name("   ")),
+        ("untitled".into(), "untitled".into())
     );
-    assert_eq!(
-        child_from_item(&file_row("   ", "E3", 1)).unwrap().name,
-        "untitled"
-    );
-
     assert_eq!(vpath(Path::new("/a//b/")).unwrap(), "/a/b");
     assert_eq!(vpath(Path::new("/a/./b")).unwrap(), "/a/b");
-    assert!(vpath(Path::new("/a/../b")).is_err(), "`..` is refused");
+    assert!(vpath(Path::new("/a/../b")).is_err());
 }
 
 // ---------------------------------------------------------------------------
 // Mock-backed
 // ---------------------------------------------------------------------------
 
-/// What the mock's `429` asks a client to wait, in seconds. Far past `MAX_RETRY_AFTER`,
-/// which is the case that separates honouring a wait from sleeping through one.
+/// What the mock's `429` asks to wait, in seconds: past `MAX_RETRY_AFTER`, so refused.
 const THROTTLED_FOR: u64 = 900;
-
-/// What the mock's `4290` asks for instead: a wait that fits inside `MAX_RETRY_AFTER` on
-/// its own, so what stops the ladder is the running total rather than any one sleep. Kept
-/// small because the test really does sleep it.
+/// What its `4290` asks instead: within the budget, so actually slept. Small for that reason.
 const THROTTLED_SHORT: u64 = 1;
 
-/// One listing answers resolution and every attribute under it, at any depth.
-///
-/// Three things at once, because they are one behaviour. Graph addresses a folder by path,
-/// so a path of any depth needs only its parent's listing — Drive has no paths at all and
-/// pays one `files.list` per directory to walk to the same place. That listing carries
-/// `size`, the times and the tag, so a `stat` after it spends nothing, which is what makes
-/// the kernel's per-entry `getattr` free: FUSE-T serves over NFS and an NFS client fills an
-/// attribute for every name it lists. And the lookup composes, because macOS hands it the
-/// decomposed spelling of whatever the listing returned.
+/// One listing answers resolution and every attribute under it, at any depth and under
+/// either spelling of a name. See [`OnedriveFs::resolve`].
 #[tokio::test]
 async fn one_listing_answers_the_whole_directory() {
     let composed = "보고서.docx";
-    let mock = start(
+    let (mock, fs) = mount(
         json!({
             "/": [folder_row("Documents", "D1")],
             "/Documents": [folder_row("2026", "D2")],
-            "/Documents/2026": [
-                file_row(composed, "F9", 1234),
-                folder_row("drafts", "D3"),
-            ],
+            "/Documents/2026": [file_row(composed, "F9", 1234), folder_row("drafts", "D3")],
         }),
         HashMap::new(),
     )
     .await;
-    let fs = mounted(&mock.config());
-    let deep = PathBuf::from("/Documents/2026").join(composed);
+    let dir = PathBuf::from("/Documents/2026");
 
-    let st = fs.stat(&deep).await.unwrap();
-    assert_eq!(st.size, 1234, "exact, straight off the listing");
+    let st = fs.stat(&dir.join(composed)).await.unwrap();
     assert_eq!(
-        st.etag.as_deref(),
-        Some(format!("ctag-{composed}").as_str())
+        (st.size, st.etag.as_deref()),
+        (1234, Some("ctag-보고서.docx"))
     );
     assert!(st.mtime.is_some());
-
-    let listings: Vec<String> = mock
-        .targets()
-        .into_iter()
-        .filter(|t| t.contains("/children"))
-        .collect();
     assert_eq!(
-        listings.len(),
+        mock.targets().len(),
         1,
-        "three segments deep and still one listing: {listings:?}"
+        "three deep, one listing: {:?}",
+        mock.targets()
     );
     assert!(
-        listings[0].contains("root:/Documents/2026:/children"),
-        "addressed by path rather than walked to: {listings:?}"
+        mock.asked_for("root:/Documents/2026:/children"),
+        "by path, not walked to"
     );
 
-    // Everything else in that folder is then free — including under the spelling macOS
-    // hands a lookup rather than the one the listing used.
+    // Everything else in that folder is then free, under the spelling macOS hands over too.
     mock.reset();
     let decomposed: String = composed.nfd().collect();
-    assert_ne!(composed.as_bytes(), decomposed.as_bytes(), "two spellings");
+    assert_ne!(composed, decomposed, "two spellings");
+    assert_eq!(fs.stat(&dir.join(&decomposed)).await.unwrap().size, 1234);
+    let listed = fs.list(&dir).await.unwrap();
+    let drafts = listed
+        .iter()
+        .find(|d| d.name == "drafts")
+        .and_then(|d| d.stat())
+        .unwrap();
     assert_eq!(
-        fs.stat(&PathBuf::from("/Documents/2026").join(&decomposed))
-            .await
-            .unwrap()
-            .size,
-        1234,
-        "found under the other spelling"
-    );
-    let listed = fs.list(Path::new("/Documents/2026")).await.unwrap();
-    assert_eq!(listed.len(), 2);
-    assert_eq!(
-        listed
-            .iter()
-            .find(|d| d.name == "drafts")
-            .and_then(|d| d.stat())
-            .map(|s| (s.kind, s.size)),
-        Some((DirentKind::Dir, 0)),
-        "a folder's `size` is what it contains, not a length"
+        (listed.len(), drafts.kind, drafts.size),
+        (2, DirentKind::Dir, 0)
     );
     assert!(
         mock.targets().is_empty(),
@@ -186,449 +130,259 @@ async fn one_listing_answers_the_whole_directory() {
     );
 }
 
-/// A path has two spellings, the service answers to one, and which one varies per segment.
-///
-/// `same_name` covers half of this already: a *name* is matched against a listing under
-/// composition, so a lookup finds what `ls` printed. The other half is the path itself,
-/// which is how this store addresses a folder. Measured against the live service, on one
-/// folder under one name, `root:/문서:/children` is `200` composed and `404` decomposed,
-/// while macOS hands a lookup the decomposed spelling. So `ls` on a directory it had just
-/// listed answered `ENOENT`, and a read under it went the same way through its parent.
-///
-/// Composing the whole path answers that, and only that: it tries two spellings,
-/// all-decomposed and all-composed. A drive touched by two clients has neither, because a
-/// folder made on the web sits composed and one made under it by the macOS sync client sits
-/// decomposed. So the last resort is what the Drive store does by construction, resolving
-/// segment by segment and listing by the id that comes back.
-///
-/// One fixture holds both shapes.
+/// A path resolves under the spelling the kernel hands over, including one whose segments are
+/// stored in different forms. See [`OnedriveFs::list_unspellable`].
 #[tokio::test]
 async fn a_path_resolves_under_the_spelling_the_kernel_hands_over() {
-    // Stored composed, the ordinary case: one fallback reaches it.
+    // Stored composed: one fallback reaches it. Composed over decomposed: only the walk does.
     let simple: String = "문서".nfc().collect();
-    // Stored composed over decomposed, which no single spelling of the path names.
     let parent: String = "상위".nfc().collect();
     let child: String = "하위".nfd().collect();
     assert_ne!(child, "하위".nfc().collect::<String>(), "two spellings");
+    let mut tree = json!({"/": [folder_row(&simple, "D1"), folder_row(&parent, "D2")]});
+    tree[format!("/{simple}")] = json!([file_row("note.txt", "F1", 5)]);
+    tree[format!("/{parent}")] = json!([folder_row(&child, "D3")]);
+    tree[format!("/{parent}/{child}")] = json!([file_row("deep.txt", "F3", 5)]);
+    let (mock, fs) = mount(tree, HashMap::from([("F1".to_string(), b"hello".to_vec())])).await;
+    let names = |d: Vec<Dirent>| d.into_iter().map(|d| d.name).collect::<Vec<_>>();
 
-    let mut tree = json!({
-        "/": [folder_row(&simple, "D1"), folder_row(&parent, "D2")],
-    });
-    let obj = tree.as_object_mut().unwrap();
-    obj.insert(format!("/{simple}"), json!([file_row("note.txt", "F1", 5)]));
-    obj.insert(format!("/{parent}"), json!([folder_row(&child, "D3")]));
-    obj.insert(
-        format!("/{parent}/{child}"),
-        json!([file_row("deep.txt", "F3", 5)]),
-    );
-    let mock = start(tree, HashMap::from([("F1".to_string(), b"hello".to_vec())])).await;
-    let fs = mounted(&mock.config());
-    let by_path = |m: &Mock| {
-        m.targets()
-            .iter()
-            .filter(|t| t.contains(":/children"))
-            .count()
-    };
-
-    // One segment, stored composed, asked decomposed. Two requests: as given, then composed.
+    // One segment asked decomposed: as given, then composed, and it reads through that.
     let asked: String = format!("/{simple}").nfd().collect();
-    let listed = fs.list(Path::new(&asked)).await.expect("found composed");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].name, "note.txt");
+    assert_eq!(
+        names(fs.list(Path::new(&asked)).await.unwrap()),
+        ["note.txt"]
+    );
     assert_eq!(by_path(&mock), 2, "{:?}", mock.targets());
     assert!(
-        fs.list(Path::new("/"))
-            .await
-            .unwrap()
-            .iter()
-            .any(|d| d.name == simple),
-        "and a listing still prints the service's own spelling"
+        names(fs.list(Path::new("/")).await.unwrap()).contains(&simple),
+        "its own spelling"
     );
-    // A file under it reads, through that same listing.
-    let got = fs
-        .read_window(Path::new(&format!("{asked}/note.txt")), Some(0..5))
-        .await
-        .expect("a file under it reads");
-    assert_eq!(got, b"hello");
+    assert_eq!(
+        read(&fs, &format!("{asked}/note.txt"), 0..5).await,
+        b"hello"
+    );
 
-    // Two segments stored in different forms. Neither whole-path spelling names this, so it
-    // resolves through the parent and lists by id.
+    // Two segments in different forms: resolved through the parent, listed by id.
     mock.reset();
     let asked: String = format!("/{parent}/{child}").nfd().collect();
-    let listed = fs
-        .list(Path::new(&asked))
-        .await
-        .expect("mixed still resolves");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].name, "deep.txt");
+    assert_eq!(
+        names(fs.list(Path::new(&asked)).await.unwrap()),
+        ["deep.txt"]
+    );
     assert!(
         mock.asked_for("/me/drive/items/D3/children"),
-        "resolved through the parent and listed by id: {:?}",
+        "{:?}",
         mock.targets()
     );
 }
 
-/// A backend failure is not an absence.
-///
-/// `NotFound` is the one error a traversal is entitled to skip, so everything else must
-/// stay distinguishable from it. Graph states the status in the status line and a
-/// correlation id in the body, and a correlation id is hex: measured on a live token
-/// failure, `Correlation ID: 74bd5c8a-0083-434f-b5b2-9602fa4d4ca3`. Roughly one in a
-/// hundred spells `404` and means nothing by it. Read out of the message rather than off
-/// the status, a folder you may not read becomes a folder that is not there.
+/// A backend failure is not an absence, whatever digits its body carries. See
+/// [`is_not_found`].
 #[tokio::test]
 async fn a_backend_failure_is_not_an_absence() {
-    let mock = start(
-        json!({
-            "/": [
-                folder_row("denied", "D1"),
-                folder_row("gone", "D2"),
-            ],
-            // A 403 whose correlation id happens to contain `404`.
-            "/denied": 403,
-        }),
+    // `/denied` answers 403 with a correlation id that happens to contain `404`.
+    let (_mock, fs) = mount(
+        json!({"/": [folder_row("denied", "D1"), folder_row("gone", "D2")], "/denied": 403}),
         HashMap::new(),
     )
     .await;
-    let fs = mounted(&mock.config());
-    let kind = async |p: &str| match fs.list(Path::new(p)).await {
-        Err(e) => e.kind(),
-        Ok(_) => panic!("{p} is an error"),
-    };
-
-    assert_ne!(
+    let kind = async |p: &str| fs.list(Path::new(p)).await.err().map(|e| e.kind());
+    assert!(!matches!(
         kind("/denied").await,
-        io::ErrorKind::NotFound,
-        "a 403 is not an absence, whatever its correlation id spells"
-    );
-    assert_eq!(
-        kind("/gone").await,
-        io::ErrorKind::NotFound,
-        "and a real 404 still is one"
-    );
+        None | Some(io::ErrorKind::NotFound)
+    ));
+    assert_eq!(kind("/gone").await, Some(io::ErrorKind::NotFound));
 }
 
-/// A throttle is waited out as asked, bounded, and then respected.
-///
-/// Three rules that only make sense together, so one fixture pins all three.
-///
-/// **Taken as asked or not at all.** Microsoft's guidance is to wait exactly what
-/// `Retry-After` says, because usage keeps accruing while a client is throttled, so coming
-/// back early lengthens the window. Shortening the wait while keeping the retry spends the
-/// budget inside the window and extends it on every attempt.
-///
-/// **Bounded by the ladder, not by one sleep.** What blocks the mount is the sum: the FUSE
-/// session loop is single-threaded, so this is the whole mount not answering. A cap on one
-/// sleep would allow `MAX_RETRIES` of them and claim a ceiling five times smaller than the
-/// truth.
-///
-/// **And giving up is a pause, not a green light.** A mount's callers re-ask constantly and
-/// a failed listing is not cached, so a give-up with no cooldown sends *more* requests per
-/// second than the waiting it replaced, against the limit that caused the throttle.
+/// A throttle is waited out as asked, bounded across the whole ladder, and then respected:
+/// nothing is sent until the service said it may be asked again. See `MAX_RETRY_AFTER`.
 #[tokio::test]
 async fn a_throttle_is_waited_out_as_asked_bounded_and_then_respected() {
-    let of_folder = |m: &Mock| {
-        m.targets()
-            .iter()
-            .filter(|t| t.contains(":/children"))
-            .count()
-    };
-
-    // Asked for more than one call may spend waiting: reported at once, nothing slept.
-    let mock = start(
+    // More than a call may spend waiting: reported at once, nothing slept.
+    let (mock, fs) = mount(
         json!({"/": [folder_row("busy", "D1")], "/busy": 429}),
         HashMap::new(),
     )
     .await;
-    let fs = mounted(&mock.config());
     let started = Instant::now();
-    let Err(e) = fs.list(Path::new("/busy")).await else {
-        panic!("a throttle is an error");
-    };
+    let e = fs.list(Path::new("/busy")).await.err().unwrap();
     assert_ne!(e.kind(), io::ErrorKind::NotFound, "not an absence: {e}");
-    assert_eq!(of_folder(&mock), 1, "asked once: {:?}", mock.targets());
+    assert_eq!(by_path(&mock), 1, "asked once: {:?}", mock.targets());
     assert!(
         started.elapsed() < Duration::from_secs(5),
-        "and did not sleep through it, in {:?}",
-        started.elapsed()
+        "not slept through"
     );
 
-    // And then said nothing more. Nineteen further asks, none of which reach the wire:
-    // this is the half that makes giving up honest rather than merely fast.
+    // And then nothing is sent: a give-up that keeps asking is worse than waiting.
     mock.reset();
     for _ in 0..19 {
         assert!(fs.list(Path::new("/busy")).await.is_err());
     }
-    assert_eq!(
-        of_folder(&mock),
-        0,
-        "a give-up that keeps asking is worse than waiting: {:?}",
-        mock.targets()
-    );
+    assert_eq!(by_path(&mock), 0, "{:?}", mock.targets());
 
-    // A wait that fits the budget *is* taken, and the ladder stops when their sum would
-    // leave it. `THROTTLED_SHORT` is well under `MAX_RETRY_AFTER`, so what bounds this is
-    // the running total and not any single sleep.
-    let mock = start(
+    // A wait that fits the budget is actually taken, and the ladder stops inside it.
+    let (_mock, fs) = mount(
         json!({"/": [folder_row("slow", "D1")], "/slow": 4290}),
         HashMap::new(),
     )
     .await;
-    let fs = mounted(&mock.config());
     let started = Instant::now();
     assert!(fs.list(Path::new("/slow")).await.is_err());
     let waited = started.elapsed();
     assert!(
         waited >= Duration::from_secs(THROTTLED_SHORT),
-        "the wait it asked for was actually taken, not skipped: {waited:?}"
+        "slept as asked: {waited:?}"
     );
     assert!(
         waited < Duration::from_secs(30),
-        "and the ladder stopped inside the budget rather than sleeping it per attempt: \
-         {waited:?}"
+        "within the budget: {waited:?}"
     );
 }
 
-/// The span policy, in the cases that distinguish it, and the map it lives in.
-///
-/// The kernel's window is 64 KiB, 32 through FUSE-T, and not ours to choose. One ranged
-/// request per window is
-/// the pathology this exists to avoid: measured against Drive, whose round trip is the same
-/// shape, it put a 641 MB archive at 0.04 MB/s. Two sizes rather than one because a span is
-/// not free either — a reader that takes a file's head and stops would pay a whole
-/// [`READ_SPAN`] for one buffer.
+/// A first read pays [`FIRST_SPAN`], a walk pays [`READ_SPAN`] from where it carried on, and a
+/// short read is the end of the file. See [`OnedriveFs::span`].
 #[tokio::test]
 async fn a_walk_pays_a_span_and_a_head_read_pays_less() {
     const REAL: u64 = 80 * 1024 * 1024;
     const CHUNK: u64 = 64 * 1024;
-    let mock = start(
-        json!({"/": [
-            file_row("big.bin", "P1", REAL),
-            file_row("other.bin", "P2", 4096),
-        ]}),
-        HashMap::from([
-            ("P1".to_string(), vec![b'z'; REAL as usize]),
-            ("P2".to_string(), vec![b'y'; 4096]),
-        ]),
+    let (mock, fs) = mount(
+        json!({"/": [file_row("big.bin", "P1", REAL)]}),
+        HashMap::from([("P1".to_string(), vec![b'z'; REAL as usize])]),
     )
     .await;
-    let fs = mounted(&mock.config());
-    let file = Path::new("/big.bin");
     fs.list(Path::new("/")).await.unwrap();
+    let range = |at: u64, len: u64| Some(format!("bytes={at}-{}", at + len - 1));
 
-    // A first read takes the smaller span, and the windows after it come out of that span
-    // rather than each costing a request — which is the whole point.
+    // Eight windows out of one span, and it is the smaller one.
     mock.reset();
-    for i in 0..8u64 {
-        let got = fs
-            .read_window(file, Some(i * CHUNK..(i + 1) * CHUNK))
-            .await
-            .unwrap();
-        assert_eq!(got.len() as u64, CHUNK);
+    for i in 0..8 {
+        assert_eq!(
+            read(&fs, "/big.bin", i * CHUNK..(i + 1) * CHUNK)
+                .await
+                .len() as u64,
+            CHUNK
+        );
     }
-    assert_eq!(
-        mock.content_ranges(),
-        vec![Some(format!("bytes=0-{}", FIRST_SPAN - 1))],
-        "eight windows, one span, and it is the smaller one"
-    );
+    assert_eq!(mock.content_ranges(), [range(0, FIRST_SPAN)]);
 
-    // Carrying on from the span the reader spent is a walk, and pays the bigger one. Both
-    // shapes of carrying on: a window that begins inside the span and reaches past its end
-    // (which is what a window whose size does not divide the span does), and one that
-    // begins exactly at the end. Each new span begins where its read began rather than on
-    // a fixed boundary, which is what keeps a window from being split across two of them —
-    // and so what makes a short return mean end of file.
+    // Carrying on pays the bigger one from where the read began: from inside the spent span,
+    // then from exactly its end.
     let mut at = FIRST_SPAN - CHUNK / 2;
     for _ in 0..2 {
         mock.reset();
-        let got = fs.read_window(file, Some(at..at + CHUNK)).await.unwrap();
-        assert_eq!(got.len() as u64, CHUNK, "at {at}");
         assert_eq!(
-            mock.content_ranges(),
-            vec![Some(format!("bytes={at}-{}", at + READ_SPAN - 1))],
-            "carrying on from {at} pays READ_SPAN, from where the read began"
+            read(&fs, "/big.bin", at..at + CHUNK).await.len() as u64,
+            CHUNK
         );
+        assert_eq!(mock.content_ranges(), [range(at, READ_SPAN)], "at {at}");
         at += READ_SPAN;
     }
 
-    // Past the end is an ordinary end. A window that starts inside the file and runs off it
-    // comes back short — which is the only thing short is allowed to mean — and one wholly
-    // past it comes back empty. Neither is an error.
-    let tail = fs
-        .read_window(file, Some(REAL - CHUNK / 2..REAL + CHUNK / 2))
-        .await
-        .unwrap();
-    assert_eq!(tail.len() as u64, CHUNK / 2, "short, and short is the end");
+    // Short is the end, and wholly past it is empty. Neither is an error.
+    let tail = read(&fs, "/big.bin", REAL - CHUNK / 2..REAL + CHUNK / 2).await;
+    assert_eq!(tail.len() as u64, CHUNK / 2);
     assert!(
-        fs.read_window(file, Some(REAL + CHUNK..REAL + 2 * CHUNK))
+        read(&fs, "/big.bin", REAL + CHUNK..REAL + 2 * CHUNK)
             .await
-            .unwrap()
-            .is_empty(),
-        "wholly past the end is empty"
+            .is_empty()
     );
 }
 
-/// A span nobody has come back to stops dividing the budget, and then stops being kept.
-///
-/// Presence in the map is the wrong test for both. An entry lives for [`DIR_TTL`], so a
-/// traversal across a folder leaves one behind per file it passed. Counting those as readers
-/// cuts the share of the file actually being walked — nineteen of them took a walk from two
-/// requests to five — and keeping them forever is how a map grows unbounded.
+/// A span nobody came back to stops dividing the budget after [`ACTIVE`] and stops being kept
+/// after [`DIR_TTL`]. See [`OnedriveFs::held`].
 #[tokio::test]
 async fn spans_left_behind_stop_counting_and_stop_being_kept() {
     const SMALL: u64 = 4 * 1024 * 1024;
     const BIG: u64 = 32 * 1024 * 1024;
     const W: u64 = 32 * 1024;
     let mut rows = vec![file_row("big.bin", "BIG", BIG)];
-    let mut blobs: HashMap<String, Vec<u8>> =
-        HashMap::from([("BIG".to_string(), vec![b'z'; BIG as usize])]);
+    let mut blobs = HashMap::from([("BIG".to_string(), vec![b'z'; BIG as usize])]);
     for i in 0..5 {
         rows.push(file_row(&format!("s{i}.bin"), &format!("S{i}"), SMALL));
         blobs.insert(format!("S{i}"), vec![b's'; SMALL as usize]);
     }
-    let mock = start(json!({"/": rows}), blobs).await;
-    let fs = mounted(&mock.config());
+    let (mock, fs) = mount(json!({"/": rows}), blobs).await;
     fs.list(Path::new("/")).await.unwrap();
 
-    // Touched once each and not returned to, the way a traversal leaves them.
+    // Touched once each and abandoned, the way a traversal leaves them.
     for i in 0..5 {
-        fs.read_window(Path::new(&format!("/s{i}.bin")), Some(0..W))
-            .await
-            .unwrap();
+        read(&fs, &format!("/s{i}.bin"), 0..W).await;
     }
     fs.age_spans_for_test(ACTIVE + Duration::from_secs(1)).await;
 
-    // Now walk one file. It is the only reader, so it gets the whole budget as its span and
-    // the walk is two fetches: a first span, then the rest of the file.
+    // The only reader gets the whole budget: a first span, then the rest of the file.
     mock.reset();
-    let big = Path::new("/big.bin");
-    let mut at = 0;
-    while at < BIG {
-        fs.read_window(big, Some(at..(at + W).min(BIG)))
-            .await
-            .unwrap();
-        at += W;
+    for at in (0..BIG).step_by(W as usize) {
+        read(&fs, "/big.bin", at..(at + W).min(BIG)).await;
     }
     assert_eq!(
         mock.content_ranges().len(),
         2,
-        "the abandoned spans are not readers: {:?}",
+        "{:?}",
         mock.content_ranges()
     );
-    assert_eq!(mock.bytes_sent(), BIG, "and nothing was fetched twice");
+    assert_eq!(mock.bytes_sent(), BIG, "nothing fetched twice");
 
-    // Past the TTL they are not even kept. The sweep runs when something is held, since
-    // nothing else ever removes an entry.
+    // Past the TTL they are swept on the way in.
     fs.age_spans_for_test(DIR_TTL + Duration::from_secs(1))
         .await;
-    fs.read_window(Path::new("/s0.bin"), Some(0..W))
-        .await
-        .unwrap();
-    assert!(
-        fs.held_bytes("/big.bin").await.is_none(),
-        "aged out and swept on the way in"
-    );
-    for i in 1..5 {
-        assert!(
-            fs.held_bytes(&format!("/s{i}.bin")).await.is_none(),
-            "s{i} too"
-        );
+    read(&fs, "/s0.bin", 0..W).await;
+    for p in ["/big.bin", "/s1.bin", "/s2.bin", "/s3.bin", "/s4.bin"] {
+        assert!(fs.held_bytes(p).await.is_none(), "{p} swept");
     }
 }
 
-/// Reads of several files interleave, and each one keeps its span.
-///
-/// Not exotic and not threaded. FUSE ops are serialized, so alternating is all it takes, and
-/// the 512 KiB chunk this alternates in is what a local `PassthroughFs` mount produced under
-/// `grep -r`, where the NFS client's read-ahead pulled the next file in before the current
-/// one was done. A network store does not do that on its own, so this pattern is the shape of
-/// the hazard rather than a claim about what one tool costs here — see [`OnedriveFs::held`]
-/// for what two concurrent readers measured live.
-///
-/// The assertion is that nothing is fetched twice. One slot could not make it: each read
-/// found another file's span, so `walking` never became true and every window bought a whole
-/// [`FIRST_SPAN`]. Three files rather than two, and each usefully larger than a span, because
-/// a constant [`READ_SPAN`] clamped by a smaller file never overruns the budget and the
-/// division would go unmeasured.
+/// Files read in turn each keep their span, so nothing is fetched twice. One slot could not;
+/// see [`OnedriveFs::held`]. Each file is larger than a span, so a constant [`READ_SPAN`]
+/// would overrun the budget and the division is measured.
 #[tokio::test]
 async fn interleaved_files_each_keep_a_span() {
     const REAL: u64 = 32 * 1024 * 1024;
-    // The traced window is 32 KiB and the traced chunk 512 KiB. Only the chunk decides what
-    // this exercises, so the window is widened to keep the walk cheap.
+    // 512 KiB chunks per file, as `grep -r` alternated over a local mount. Only the chunk
+    // matters, so the window is widened from 32 KiB to keep the walk cheap.
     const W: u64 = 256 * 1024;
-    const CHUNK: u64 = 2;
-    let ids = ["P1", "P2", "P3"];
-    let mock = start(
-        json!({"/": ids.iter().enumerate()
-            .map(|(i, id)| file_row(&format!("f{i}.bin"), id, REAL))
+    const CHUNK: u64 = 2 * W;
+    let (mock, fs) = mount(
+        json!({"/": (0..3).map(|i| file_row(&format!("f{i}.bin"), &format!("P{i}"), REAL))
             .collect::<Vec<_>>()}),
-        ids.iter()
-            .map(|id| (id.to_string(), vec![b'z'; REAL as usize]))
+        (0..3)
+            .map(|i| (format!("P{i}"), vec![b'z'; REAL as usize]))
             .collect(),
     )
     .await;
-    let fs = mounted(&mock.config());
     fs.list(Path::new("/")).await.unwrap();
     mock.reset();
 
-    let mut at = 0;
-    while at < REAL {
-        for i in 0..ids.len() {
-            let path = format!("/f{i}.bin");
-            for k in 0..CHUNK {
-                let o = at + k * W;
-                if o >= REAL {
-                    break;
-                }
-                let got = fs
-                    .read_window(Path::new(&path), Some(o..(o + W).min(REAL)))
-                    .await
-                    .unwrap();
+    for at in (0..REAL).step_by(CHUNK as usize) {
+        for i in 0..3 {
+            for o in (at..(at + CHUNK).min(REAL)).step_by(W as usize) {
+                let got = read(&fs, &format!("/f{i}.bin"), o..(o + W).min(REAL)).await;
                 assert_eq!(got.len() as u64, (REAL - o).min(W), "f{i} at {o}");
             }
         }
-        at += CHUNK * W;
     }
 
-    // Nothing is fetched twice, up to the overlap a span boundary costs: a span begins where
-    // the reader asks, so a window straddling the end of one makes the next start inside it.
-    // That overlap is under one window per span, and it is what buys never splitting a window
-    // across two spans — which is what makes a short read mean EOF.
-    //
-    // No ceiling on the span count, because one cannot catch this: reverting the share-sizing
-    // half alone fetches *fewer* spans than the fix does, by taking a whole `READ_SPAN` each
-    // time and throwing most of it away. What separates them is the waste.
-    let consumed = REAL * ids.len() as u64;
+    // Nothing fetched twice, up to under a window of overlap per span boundary. No ceiling on
+    // the span count: reverting the share sizing fetches *fewer*, wastefully larger, spans.
     let spans = mock.content_ranges().len() as u64;
-    let waste = mock.bytes_sent().saturating_sub(consumed);
-    assert!(
-        waste < spans * W,
-        "{waste} wasted over {spans} spans is more than a boundary each: {:?}",
-        mock.content_ranges()
-    );
-    for (i, id) in ids.iter().enumerate() {
+    let waste = mock.bytes_sent().saturating_sub(3 * REAL);
+    assert!(waste < spans * W, "{waste} wasted over {spans} spans");
+    for i in 0..3 {
         assert!(
             fs.held_bytes(&format!("/f{i}.bin")).await.is_some(),
-            "f{i} ({id}) still holds a span at the end"
+            "f{i} still held"
         );
     }
 }
 
-/// **The response, not the request, says where the bytes begin.**
-///
-/// Microsoft documents it: *"If the range can't be generated the Range header may be
-/// ignored and an HTTP 200 response would be returned with the full contents of the
-/// file."* Believing the request then serves the front of the file as though it came from
-/// the middle, silently, with the right length and the wrong content.
+/// The response, not the request, says where the bytes begin: a range answered `200` with the
+/// whole file is sliced from zero. See `OnedriveAccessor::download`.
 #[tokio::test]
 async fn a_window_is_read_from_where_the_response_says_it_starts() {
-    const REAL: usize = 1024 * 1024;
-    const AT: u64 = 700_000;
-    let body: Vec<u8> = (0..REAL).map(|i| (i % 251) as u8).collect();
-    let want = &body[AT as usize..AT as usize + 4096];
-
+    const AT: usize = 700_000;
+    let body: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
     let mock = start_full(
-        json!({"/": [file_row("whole.bin", "P1", REAL as u64)]}),
+        json!({"/": [file_row("whole.bin", "P1", body.len() as u64)]}),
         HashMap::from([("P1".to_string(), body.clone())]),
         RangeMode::Ignore,
         false,
@@ -636,37 +390,25 @@ async fn a_window_is_read_from_where_the_response_says_it_starts() {
     .await;
     let fs = mounted(&mock.config());
     fs.list(Path::new("/")).await.unwrap();
-    let got = fs
-        .read_window(Path::new("/whole.bin"), Some(AT..AT + 4096))
-        .await
-        .unwrap();
-    assert_eq!(got, want, "the window is the file's bytes at that offset");
+    let got = read(&fs, "/whole.bin", AT as u64..AT as u64 + 4096).await;
+    assert_eq!(got, body[AT..AT + 4096]);
 }
 
-/// A download URL is short-lived by design, so an expired one costs exactly one refetch.
-///
-/// Exactly one, in both directions. A fresh URL that works makes the read succeed. A fresh
-/// URL that fails too is a fault, and retrying it forever would hide it; it is not an
-/// absence either, since the item answered `get_item_by_id`. And that error must not carry
-/// the URL. A preauthenticated download URL's query string *is* the grant, and reqwest
-/// attaches the URL to a transport error, so a refused connection would put a token that
-/// hands over the file into whatever reads the error. `dead.bin` points at a closed port
-/// for that reason: the transport path, which the hand-built status message does not cover.
+/// An expired download URL costs exactly one refetch. A fresh URL that works is read; one that
+/// fails too is a fault, not an absence, and its error does not carry the URL, whose query
+/// string is the grant. `dead.bin` points at a closed port: the transport path. See
+/// [`OnedriveFs::span`].
 #[tokio::test]
 async fn an_expired_download_url_is_refetched_once_and_then_given_up() {
     const SENTINEL: &str = "SENTINEL-GRANT-DO-NOT-LOG";
     let body = vec![b'k'; 4096];
     let mut dead = file_row("dead.bin", "P2", 4096);
-    dead.as_object_mut().unwrap().insert(
-        DOWNLOAD_URL_KEY.into(),
-        json!(format!("http://127.0.0.1:1/blob?tempauth={SENTINEL}")),
-    );
+    dead[DOWNLOAD_URL_KEY] = json!(format!("http://127.0.0.1:1/blob?tempauth={SENTINEL}"));
+    // Listings hand out expired URLs; an item fetch hands out a fresh one.
     let mock = start_full(
         json!({"/": [file_row("stale.bin", "P1", 4096), dead]}),
         HashMap::from([("P1".to_string(), body.clone())]),
         RangeMode::Honour,
-        // The URL a listing hands out has expired; the one an item fetch hands out has
-        // not. That is the shape of the real failure.
         true,
     )
     .await;
@@ -674,80 +416,49 @@ async fn an_expired_download_url_is_refetched_once_and_then_given_up() {
     fs.list(Path::new("/")).await.unwrap();
 
     mock.reset();
-    let got = fs
-        .read_window(Path::new("/stale.bin"), Some(0..4096))
-        .await
-        .unwrap();
-    assert_eq!(got, body, "the read succeeded on the fresh url");
+    assert_eq!(read(&fs, "/stale.bin", 0..4096).await, body);
     assert!(
         mock.asked_for("/me/drive/items/P1?"),
-        "by asking the service for the item again, by id: {:?}",
+        "refetched by id: {:?}",
         mock.targets()
     );
-    assert_eq!(
-        mock.content_ranges().len(),
-        2,
-        "one failed attempt and one that worked"
-    );
+    assert_eq!(mock.content_ranges().len(), 2, "one failure, one success");
 
-    let Err(e) = fs.read_window(Path::new("/dead.bin"), Some(0..4096)).await else {
-        panic!("a download that never succeeds is an error");
-    };
-    assert_ne!(
-        e.kind(),
-        io::ErrorKind::NotFound,
-        "the item answered, so the bytes failing is a fault: {e}"
-    );
+    let e = fs
+        .read_window(Path::new("/dead.bin"), Some(0..4096))
+        .await
+        .err()
+        .unwrap();
+    assert_ne!(e.kind(), io::ErrorKind::NotFound, "the item answered: {e}");
     assert!(
-        !format!("{e}").contains(SENTINEL),
-        "the grant reached the error text: {e}"
+        !e.to_string().contains(SENTINEL),
+        "the grant reached the error: {e}"
     );
 }
 
-/// What the listing cache does and does not remember.
-///
-/// A failure is not an answer: caching one would turn a single throttled request into five
-/// minutes of an empty directory, which reads as "the folder is gone" rather than "ask
-/// again". Nor is a miss a reason to go looking: a name with one spelling that the service
-/// says is absent is absent. And what has aged out is dropped on the way in, so a traversal
-/// does not leave a listing per folder it ever visited behind it.
+/// The listing cache writes down no failure, looks nowhere else for a name with one spelling,
+/// and sweeps what has aged out on the way in. See [`OnedriveFs::list_dir`].
 #[tokio::test]
 async fn the_listing_cache_forgets_what_it_should() {
-    let mock = start(
-        json!({
-            "/": [folder_row("a", "D1"), folder_row("b", "D2")],
-            "/a": [],
-            "/b": [],
-        }),
+    let (mock, fs) = mount(
+        json!({"/": [folder_row("a", "D1"), folder_row("b", "D2")], "/a": [], "/b": []}),
         HashMap::new(),
     )
     .await;
-    let fs = mounted(&mock.config());
-
-    assert!(
-        fs.list(Path::new("/nowhere")).await.is_err(),
-        "the mock has no such folder"
-    );
-    // One request and nothing else. A name with one spelling cannot be rescued by trying
-    // another or by walking to it, and a macOS mount probes for `.DS_Store` in every
-    // directory it touches, so each such miss must stay the single request it already is.
+    // One request for a miss, and not cached: macOS probes `.DS_Store` in every directory.
+    assert!(fs.list(Path::new("/nowhere")).await.is_err());
     assert_eq!(mock.targets().len(), 1, "{:?}", mock.targets());
-    assert_eq!(
-        fs.listings_retained().await,
-        0,
-        "and a failure was not written down as one"
-    );
+    assert_eq!(fs.listings_retained().await, 0);
 
     fs.list(Path::new("/a")).await.unwrap();
     fs.list(Path::new("/b")).await.unwrap();
     assert!(fs.listings_retained().await >= 2);
-
     fs.age_listings_for_test().await;
     fs.list(Path::new("/a")).await.unwrap();
     assert_eq!(
         fs.listings_retained().await,
         1,
-        "the aged-out ones were swept on the way in"
+        "aged out, swept on the way in"
     );
 }
 
@@ -757,6 +468,26 @@ async fn the_listing_cache_forgets_what_it_should() {
 
 fn mounted(cfg: &OnedriveConfig) -> OnedriveFs {
     OnedriveFs::new(cfg).unwrap()
+}
+
+/// A mock serving `tree` and `blobs`, and a store pointed at it.
+async fn mount(tree: Value, blobs: HashMap<String, Vec<u8>>) -> (Mock, OnedriveFs) {
+    let mock = start(tree, blobs).await;
+    let fs = mounted(&mock.config());
+    (mock, fs)
+}
+
+/// `range` of the file at `path`, which must read.
+async fn read(fs: &OnedriveFs, path: &str, range: Range<u64>) -> Vec<u8> {
+    fs.read_window(Path::new(path), Some(range)).await.unwrap()
+}
+
+/// How many listings were addressed by path (`root:/…:/children`) rather than by id.
+fn by_path(mock: &Mock) -> usize {
+    mock.targets()
+        .iter()
+        .filter(|t| t.contains(":/children"))
+        .count()
 }
 
 /// A file row as Graph returns one, carrying its own download URL the way a `$select`ed

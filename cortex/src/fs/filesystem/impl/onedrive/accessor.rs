@@ -692,44 +692,39 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 mod tests {
     use super::*;
 
-    /// Two hosts in production, each overridable on its own, and the official path follows
-    /// either way — so nothing here depends on how a deployment lays out its paths.
+    /// Each service keeps its official path under any origin and moves only when told. The
+    /// mock moves both together, so only this can see one dragging the other along.
     #[test]
     fn each_service_keeps_its_official_path_under_any_origin() {
-        let e = endpoints(&OnedriveOrigins::default());
+        const TOKEN: &str = "https://login.microsoftonline.com/consumers/oauth2/v2.0/token";
+        let at = |o: OnedriveOrigins| {
+            let e = endpoints(&o);
+            (e.token, e.graph)
+        };
+        let graph = Some("http://127.0.0.1:9/g".to_string());
         assert_eq!(
-            e.token,
-            "https://login.microsoftonline.com/consumers/oauth2/v2.0/token"
+            at(Default::default()),
+            (TOKEN.into(), "https://graph.microsoft.com/v1.0".into())
         );
-        assert_eq!(e.graph, "https://graph.microsoft.com/v1.0");
-
-        let e = endpoints(&OnedriveOrigins {
-            graph: Some("http://127.0.0.1:9/g".into()),
+        let moved = at(OnedriveOrigins {
+            graph,
             ..Default::default()
         });
-        assert_eq!(e.graph, "http://127.0.0.1:9/g/v1.0", "the override moves");
-        assert_eq!(
-            e.token, "https://login.microsoftonline.com/consumers/oauth2/v2.0/token",
-            "and only it moves"
-        );
+        assert_eq!(moved, (TOKEN.into(), "http://127.0.0.1:9/g/v1.0".into()));
     }
 
-    /// A path addresses a path, not one long name — so the separators survive and
-    /// everything else does not.
+    /// A path is encoded segment by segment: separators survive, everything else does not.
     #[test]
     fn a_path_is_encoded_by_segment() {
         assert_eq!(encode_path("/a/b c/d"), "a/b%20c/d");
-        // UTF-8 percent-encoded byte by byte, and the separator left alone.
         assert_eq!(
             encode_path("보고/서.pdf"),
             "%EB%B3%B4%EA%B3%A0/%EC%84%9C.pdf"
         );
-        // The two that would end the path and start something else.
-        assert_eq!(encode_path("a?b"), "a%3Fb");
-        assert_eq!(encode_path("a#b"), "a%23b");
+        assert_eq!([encode_path("a?b"), encode_path("a#b")], ["a%3Fb", "a%23b"]);
     }
 
-    /// A secret must not reach a log through a `Debug` nobody meant to call.
+    /// A config's `Debug` does not print the secrets it holds.
     #[test]
     fn a_config_does_not_print_what_it_holds() {
         let cfg = OnedriveConfig {
@@ -745,27 +740,24 @@ mod tests {
         assert!(shown.contains("origins_overridden: false"));
     }
 
-    /// The whole retry policy, as the arithmetic it is.
-    ///
-    /// The ceiling is a budget for the ladder and not a cap on one sleep, and the two are
-    /// only told apart by a *run* of waits that each fit while their sum does not. Pinned
-    /// here rather than through the ladder because pinning it there means sleeping it:
-    /// five sevens is thirty-five seconds of real time to prove one comparison.
+    /// The retry policy is a budget for the ladder, not a cap on one sleep: a run of waits that
+    /// each fit stops once their sum would not. See [`next_wait`].
     #[test]
     fn a_wait_is_taken_only_while_the_ladder_can_still_afford_it() {
         let s = Duration::from_secs;
+        let all = MAX_RETRY_AFTER;
         assert_eq!(next_wait(Some(s(10)), s(0), 0), Some(s(10)), "as asked");
         assert_eq!(
-            next_wait(Some(MAX_RETRY_AFTER), s(0), 0),
-            Some(MAX_RETRY_AFTER),
-            "the whole budget in one wait is still affordable"
+            next_wait(Some(all), s(0), 0),
+            Some(all),
+            "the whole budget at once"
         );
         assert_eq!(
-            next_wait(Some(MAX_RETRY_AFTER + s(1)), s(0), 0),
+            next_wait(Some(all + s(1)), s(0), 0),
             None,
-            "a single wait past the budget is refused outright"
+            "past it, refused outright"
         );
-        // The case a per-sleep cap gets wrong: each of these fits on its own.
+        // What a per-sleep cap gets wrong: each of these fits on its own.
         assert_eq!(next_wait(Some(s(7)), s(21), 0), Some(s(7)), "28 <= 30");
         assert_eq!(next_wait(Some(s(7)), s(28), 0), None, "35 > 30");
     }
