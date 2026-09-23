@@ -168,6 +168,31 @@ impl Call {
 /// An empty list is a session with nothing mounted, which is still a session — a command
 /// then sees whatever the executor's own filesystem holds and nothing this protocol
 /// described.
+///
+/// # The machine is asked for, and what is asked for is what is given
+///
+/// [`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib) and [`gpu`](Self::gpu) are the
+/// shape of the thing the session runs in, and they are here rather than on an
+/// [`ExecCall`] because a machine is made before the first command and outlives the last
+/// one: a backend with a kernel of its own has fixed all three before that kernel starts.
+///
+/// **A server provides what is named or refuses the session**, which is
+/// [`network`](Self::network)'s rule applied to the rest of the machine, and it is what makes
+/// them worth saying rather than measuring afterwards. A session quietly given two vCPUs
+/// where it asked for eight, or no accelerator where it asked for one, is not a narrower
+/// session — it is a client drawing conclusions from how long its commands took, about a
+/// machine nothing ever told it the shape of. A shape this server cannot make is
+/// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE), said at `init` while
+/// the client can still ask for something else.
+///
+/// **Each is separately optional, and `None` is the common case.** Leaving one out is not a
+/// default this file names: it is the server's own, which is the only end that knows what the
+/// host it runs on has. So a client with an opinion about memory and none about the rest says
+/// one member and the machine is otherwise whatever that server makes.
+///
+/// There is no member for what a *command* gets — a share of the machine, an affinity, a
+/// limit. The machine is the unit of what this protocol hands out, and a session that wants
+/// two sizes of it is two sessions.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitCall {
     /// The base a session's commands run in.
@@ -204,6 +229,51 @@ pub struct InitCall {
     /// has no choice to make.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkAccess>,
+
+    /// How many vCPUs the session's machine gets. `None` leaves the number to the server.
+    ///
+    /// **Said once, for the same reason the reach is.** A vCPU count is settled when a
+    /// machine is made — on a backend with a kernel of its own, before that kernel is
+    /// started — so a number on an `exec` would be a number that could only be honoured by
+    /// making a different session out from under the command that asked for it.
+    ///
+    /// `0` is a machine nothing can run on, and is
+    /// [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS) rather than a way to spell
+    /// leaving it out — which is what `None` already is, and what nearly every client wants:
+    /// the end that knows what the host it runs on can spare is the server, not the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcpus: Option<u8>,
+
+    /// How much memory the session's machine gets, in mebibytes. `None` leaves it to the
+    /// server.
+    ///
+    /// **The unit is in the name because a number this size implies none.** Bytes, MiB and
+    /// GiB are all readings a person writing `2048` could have meant, and the two wrong ones
+    /// are a machine a thousand times the size of the one that was asked for — so the member
+    /// says which, the way [`timeout_ms`](ExecCall::timeout_ms) does.
+    ///
+    /// `0` is [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS), for the reason a
+    /// vCPU count of zero is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mib: Option<u32>,
+
+    /// Whether the session's commands get a GPU. `None` leaves it to the server.
+    ///
+    /// **A boolean and not a device**, because what a protocol can hold a server to here is
+    /// that a command finds an accelerator and not which one it finds: what gets attached is
+    /// the backend's — a virtio-gpu carrying Vulkan on one, whatever the host has on
+    /// another — and a member naming a model or an API would be a promise only that
+    /// backend's build could keep, on a wire schema that grew with every vendor. A session
+    /// that needs a particular device asks the session: the command that would use it is the
+    /// one that can see what is there.
+    ///
+    /// **`false` is not the same as saying nothing.** `None` is the server's choice, which is
+    /// what a client with no opinion sends and what every client sent before this member
+    /// existed; `false` is a session that must not have one, which is worth being able to say
+    /// on a backend that would otherwise give one — a device, a renderer and the boot time
+    /// they cost are not free to a session that will never open it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<bool>,
 
     /// The trees this session works in, each one named and placed by a [`MountSpec`].
     ///
@@ -787,6 +857,28 @@ mod tests {
             bson::bson!({
                 "mounts": ["file:///srv/project:/work:ro", "file:///srv/out:/work/out"],
             })
+        );
+        assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
+    }
+
+    /// The machine's shape is three members and each is absent unless it was asked for, so a
+    /// client with no opinion sends the frame it always sent.
+    #[test]
+    fn a_session_says_only_the_shape_it_asked_for() {
+        let quiet = bson::serialize_to_bson(&InitCall::default()).unwrap();
+        assert_eq!(quiet, bson::bson!({}));
+
+        let init = InitCall {
+            vcpus: Some(4),
+            memory_mib: Some(4096),
+            // Explicitly none, which is a thing to say and not a thing to leave out.
+            gpu: Some(false),
+            ..InitCall::default()
+        };
+        let wire = bson::serialize_to_bson(&init).unwrap();
+        assert_eq!(
+            wire,
+            bson::bson!({ "vcpus": 4, "memory_mib": 4096i64, "gpu": false })
         );
         assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
     }

@@ -133,8 +133,6 @@ impl Error {
     /// filesystem. Said at `init`, while the client can still ask for something else.
     pub const UNSUPPORTED_IMAGE: i64 = -32011;
 
-    /// The four the spec defines that a peer of ours can hit. `-32700` (parse
-    /// error) belongs to whoever reads the frame, not here.
     /// The session named a built image this server does not have.
     ///
     /// Distinct from [`UNSUPPORTED_IMAGE`](Self::UNSUPPORTED_IMAGE), which says the backend
@@ -147,6 +145,27 @@ impl Error {
     /// belongs to a boot.
     pub const UNKNOWN_IMAGE: i64 = -32012;
 
+    /// `init`: a machine of the shape this session asked for is one this server cannot make —
+    /// a GPU it has no device for, more vCPUs or more memory than it will give.
+    ///
+    /// `init`'s own, for the reason [`UNSUPPORTED_NETWORK`](Self::UNSUPPORTED_NETWORK) is:
+    /// what shapes of machine a server can make is a fact about its build and about the host
+    /// it runs on, knowable the moment the frame is read rather than something a boot has to
+    /// be attempted to find out.
+    ///
+    /// Distinct from [`BOOT_FAILED`](Self::BOOT_FAILED), which is a machine this server would
+    /// have made and could not this time. This one does not come true by being asked again:
+    /// what has to change is the number, or the build and the host answering it.
+    ///
+    /// Never used to *narrow* a session. A server that can give fewer vCPUs than were asked
+    /// for, or no accelerator where one was asked for, refuses instead — quietly making a
+    /// smaller machine than the one named is the failure
+    /// [`InitCall::vcpus`](crate::console::InitCall::vcpus) and its two neighbours exist to
+    /// prevent, and it is one a client can only discover from how long its commands took.
+    pub const UNSUPPORTED_MACHINE: i64 = -32013;
+
+    /// The four the spec defines that a peer of ours can hit. `-32700` (parse
+    /// error) belongs to whoever reads the frame, not here.
     pub const INVALID_REQUEST: i64 = -32600;
     pub const METHOD_NOT_FOUND: i64 = -32601;
     pub const INVALID_PARAMS: i64 = -32602;

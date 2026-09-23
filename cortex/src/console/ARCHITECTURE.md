@@ -149,7 +149,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{mounts?, image?, snapshot?, network?}` | `{cwd?}` |
+| `init` | `{image?, snapshot?, network?, vcpus?, memory_mib?, gpu?, mounts?}` | `{cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -293,6 +293,43 @@ The path is fixed for the session either way, which is what makes it usable as a
 Two entries at the same path, or one at a path this server cannot use, are a malformed request — `-32602`, because the request is what has to change rather than the build.
 
 What the kinds are and how one tree is assembled from several stores is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol carries a URL, a path and whether it may be written.
+
+#### The machine — how big it is, and whether it has a GPU
+
+```json
+→ {"vcpus":4,"memory_mib":4096,"gpu":true}
+```
+
+| member | is |
+|---|---|
+| `vcpus` | how many vCPUs the session's machine gets |
+| `memory_mib` | how much memory it gets, in mebibytes |
+| `gpu` | whether its commands get an accelerator |
+
+Here and not on an `exec` for the reason the trees and the reach are: a machine is made before the first command and outlives the last one, so on a backend with a kernel of its own all three are fixed before that kernel starts.
+A number on an `exec` could only be honoured by making a different machine out from under the command that asked for it.
+
+**What is asked for is what is given.**
+A server makes the machine that was named or refuses the session — it does not quietly make a smaller one.
+A session given two vCPUs where it asked for eight, or no accelerator where it asked for one, is not a narrower session: it is a client drawing conclusions from how long its commands took, about a machine nothing ever told it the shape of.
+A shape this server cannot make is [`UNSUPPORTED_MACHINE`](#errors), said at `init` while the client can still ask for something else, and apart from `BOOT_FAILED` because asking again will not make it true.
+
+**Each member is separately optional, and leaving one out is the common case.**
+Absent is not a default this file names — it is the server's own, which is the only end that knows what the host it runs on has to spare.
+So a client with an opinion about memory and none about the rest sends one member, and the machine is otherwise whatever that server makes.
+
+**The unit is in the name**, because a number this size implies none: bytes, MiB and GiB are all readings of `2048` a person could have meant, and two of them are a machine a thousand times the one that was asked for.
+`timeout_ms` is the same member of the same family.
+A `vcpus` or a `memory_mib` of `0` is a machine nothing runs on, and is `-32602` rather than a second spelling of leaving it out.
+
+**`gpu` is a boolean and not a device name.**
+What this protocol can hold a server to is that a command finds an accelerator, not which one: the device is the backend's — a virtio-gpu carrying Vulkan on one, whatever the host has on another — and a member naming a model or an API would be a promise only that backend's build could keep, on a wire schema that grew with every vendor.
+A session that needs a particular device asks the session, since the command that would use it is the end that can see what is there.
+
+`false` is a session that must not have one, which is not the same as saying nothing: a device, a renderer and the boot time they cost are worth declining on a backend that would otherwise attach one.
+
+There is no member for what a *command* gets — a share of the machine, an affinity, a limit.
+The machine is the unit this protocol hands out, and a session that wants two sizes of it is two sessions.
 
 **Nothing is booted by it**, and the response is not a readiness signal — it is the one thing about a session a client can hear before it asks for work: that there is a server on the far end, that it read the frame, that it speaks this protocol, and that it has taken what it was told.
 A notification could say none of that, which is the whole reason this one method is answered.
@@ -537,6 +574,10 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
 | `-32008` | `init` | **unsupported mount** — a URL whose scheme this server has no provider for, with the message naming which entry. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and taking a session whose tree can never be there would make every later path under it a lie. One code for every entry, because a session's trees are a list the client wrote and not a set of members with fixed names. Distinct from `BOOT_FAILED` because the fix is different: the mount is well formed and the *build* is wrong for it — a different binary, or a different URL. |
 | `-32009` | `exec`, `read`, `write` | **mount failed** — a tree could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
+| `-32010` | `init` | **unsupported network** — a reach this server cannot provide, named in the message. Two things arrive as this: a name no backend implements, and a name that is understood and cannot be honoured — a server whose commands run on this host cannot take the network away from them, so it answers only `full`. Never used to narrow a session. |
+| `-32011` | `init` | **unsupported image** — the backend has no base to swap at all, because its commands run on the server's own filesystem. Not a reference that could not be fetched, which is a boot that failed. |
+| `-32012` | `init` | **unknown image** — the session named a built image this server does not have. Apart from `UNSUPPORTED_IMAGE` because a client hearing this one can build the thing. |
+| `-32013` | `init` | **unsupported machine** — a GPU this server has no device for, or more vCPUs or memory than it will give. `init`'s own for the reason `UNSUPPORTED_MOUNT` is: what shapes a server can make is a fact about its build and its host, knowable as the frame is read. Apart from `BOOT_FAILED` because asking again will not make it true, and never used to narrow a session. |
 | `-32600` | any | invalid request. |
 | `-32601` | any | method not found |
 | `-32602` | any | invalid params — an empty argv `cmd`, a mount that is not one, or two mounts asking for the same path. Apart from `UNSUPPORTED_MOUNT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |

@@ -104,6 +104,12 @@ pub struct ConsoleBuilder {
     /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
     network: Option<NetworkAccess>,
+
+    vcpus: Option<u8>,
+
+    memory_mib: Option<u32>,
+
+    gpu: Option<bool>,
 }
 
 impl ConsoleBuilder {
@@ -268,6 +274,50 @@ impl ConsoleBuilder {
         self
     }
 
+    /// How many vCPUs the session's machine gets.
+    ///
+    /// Left out, the server picks — see [`InitCall::vcpus`](crate::console::InitCall::vcpus)
+    /// for why that is the usual case. A count this server cannot give arrives as
+    /// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE) from
+    /// [`build`](Self::build) rather than as a smaller machine.
+    pub fn vcpus(mut self, vcpus: u8) -> Self {
+        self.vcpus = Some(vcpus);
+        self
+    }
+
+    /// How much memory the session's machine gets, in mebibytes.
+    ///
+    /// ```no_run
+    /// # use cortex::console::Console;
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-uvm-console"])
+    ///     .vcpus(4)
+    ///     .memory_mib(4096)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn memory_mib(mut self, memory_mib: u32) -> Self {
+        self.memory_mib = Some(memory_mib);
+        self
+    }
+
+    /// Whether the session's commands get a GPU.
+    ///
+    /// **A server gives one or refuses to open the session**, so a console that exists is one
+    /// whose commands have the accelerator that was asked for — the alternative is a session
+    /// that silently ran on the CPU and took an hour to say so. A backend with none to give
+    /// answers [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE).
+    ///
+    /// `false` is a session that must not have one, and leaving it out is the server's own
+    /// choice — the two are different, and only the second is what a caller with no opinion
+    /// wants.
+    pub fn gpu(mut self, gpu: bool) -> Self {
+        self.gpu = Some(gpu);
+        self
+    }
+
     /// Fails for the one part that has no default — something to ask — for whatever having
     /// a channel took (over stdio, a server process that would not start), and for the
     /// `init` this then sends.
@@ -395,6 +445,9 @@ impl Console {
             mounts,
             network,
             snapshot,
+            vcpus,
+            memory_mib,
+            gpu,
         } = builder;
 
         let client_factory =
@@ -421,6 +474,9 @@ impl Console {
             image,
             network: network.clone(),
             snapshot,
+            vcpus,
+            memory_mib,
+            gpu,
         };
 
         client.init(session).await?;
