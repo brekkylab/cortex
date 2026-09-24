@@ -160,7 +160,7 @@ impl Call {
 /// that purpose would be one more thing to mount, place and answer for, in exchange for what
 /// the session's own root already gives.
 ///
-/// It is a departure from [`ContextFs`](crate::fs::ContextFs)'s composition, which is how a
+/// It is a departure from [`Directory`](crate::fs::Directory)'s composition, which is how a
 /// session gets *many stores* in one tree, and the two answer different questions. Several
 /// stores under one root are one namespace a command walks; these are separate namespaces
 /// the client places itself.

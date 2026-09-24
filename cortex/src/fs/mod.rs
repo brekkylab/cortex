@@ -1,5 +1,5 @@
 //! Two traits and one type. [`FileSystem`] is what a store must provide, [`Mount`] is what the
-//! host has once one of those trees is attached to it, and [`ContextFs`] is the public API — the
+//! host has once one of those trees is attached to it, and [`Directory`] is the public API — the
 //! tree a caller actually assembles and hands to a binding.
 //!
 //! * [`FileSystem`] — the one contract a store implements, and the vocabulary it answers in: a
@@ -12,9 +12,9 @@
 //!   will answer. What implements it is the guard a binding hands back, and the bindings are
 //!   one per concrete filesystem interface, each doing nothing but translating that interface's
 //!   calls onto [`Posix`].
-//! * [`ContextFs`] — several stores grafted under one tree, and itself a [`FileSystem`], so it is
-//!   both a consumer of the trait and something the bindings can drive like any single store.
-//!   A caller that has one store still has a tree; a caller that has five has this.
+//! * [`Directory`] — files held in memory with host directories grafted in beside them, and
+//!   itself a [`FileSystem`], so it is both a consumer of the trait and something the bindings
+//!   can drive like any single store.
 //!
 //! **A [`FileSystem`] describes a tree; a [`Mount`] is one the operating system has.** The
 //! first is a contract some type implements and nothing outside this process can see; the
@@ -42,10 +42,10 @@
 //!
 //! [`Console`]: crate::console::Console
 
-mod context;
+mod directory;
 mod filesystem;
 mod mount;
 
-pub use context::*;
+pub use directory::*;
 pub use filesystem::*;
 pub use mount::*;

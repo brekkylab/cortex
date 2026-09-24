@@ -8,8 +8,9 @@
 //!
 //! * **What it sees is a filesystem.** Whatever it should know about — a project directory,
 //!   an object store, a Notion workspace, a tree assembled in memory — implements
-//!   [`FileSystem`](fs::FileSystem) and is grafted into a [`ContextFs`](fs::ContextFs) at a path
-//!   the caller chooses. A binding mounts that tree on the host, so what reads it is `cat`,
+//!   [`FileSystem`](fs::FileSystem). A [`Directory`](fs::Directory) is the one a caller
+//!   assembles: files handed to it in memory, host directories grafted in at paths the caller
+//!   chooses. A binding mounts that tree on the host, so what reads it is `cat`,
 //!   `grep`, and whatever else the agent thought to run.
 //! * **What it does is run commands.** A [`Console`](console::Console) runs them somewhere —
 //!   this host, a micro-VM — over one channel: an `exec` carrying an argv, and everything the
@@ -24,14 +25,15 @@
 //! use std::path::Path;
 //!
 //! use cortex::console::Console;
-//! use cortex::fs::{ContextFs, FuseMount, InMemFs};
+//! use cortex::fs::{Directory, FuseMount};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
-//!     // What the agent can see. Each store is a `FileSystem`; a `ContextFs` is several of
-//!     // them under one root, and is itself a `FileSystem`, so a binding drives it like
-//!     // any single store.
-//!     let context = ContextFs::new().try_with_mount("notes", InMemFs::new())?;
+//!     // What the agent can see: a file held in memory beside a host directory. A
+//!     // `Directory` is itself a `FileSystem`, so a binding drives it like any single store.
+//!     let context = Directory::new()
+//!         .with_file("notes/today.md", "ship the release".as_bytes())?
+//!         .with_mount("project", "/home/me/project")?;
 //!
 //!     // Where the host can see it. Constructing the guard mounts, dropping it unmounts,
 //!     // and the console below holds it for the length of the session.

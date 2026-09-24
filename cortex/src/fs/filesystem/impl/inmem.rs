@@ -129,6 +129,93 @@ impl InMemFs {
         }
     }
 
+    /// Whether anything is at `path`.
+    pub(crate) fn contains(&self, path: &Path) -> io::Result<bool> {
+        match self.navigate(&components(path)?) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// `mkdir -p`: every missing directory along `path` is made, and one already there is
+    /// left alone.
+    pub(crate) fn mkdir_all(&self, path: &Path) -> io::Result<()> {
+        self.dir_all(&components(path)?).map(drop)
+    }
+
+    /// Put a file at `path` holding everything `content` yields, making the directories on
+    /// the way and replacing a file already there.
+    ///
+    /// The bytes are read in full before the tree is touched, so a reader that fails partway
+    /// leaves the old file — or no file — where it was.
+    pub(crate) fn put_file(&self, path: &Path, content: impl io::Read) -> io::Result<()> {
+        let comps = components(path)?;
+        let (parent, name) = split_last(&comps)?;
+
+        // One byte past the ceiling is enough to know the ceiling was passed.
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(&mut content.take(MAX_FILE_SIZE + 1), &mut bytes)?;
+        if bytes.len() as u64 > MAX_FILE_SIZE {
+            return Err(io::ErrorKind::FileTooLarge.into());
+        }
+
+        let dir = self.dir_all(parent)?;
+        let mut node = lock(&dir);
+        let Node::Dir { children, .. } = &mut *node else {
+            unreachable!("`dir_all` only returns directories");
+        };
+        if let Some(existing) = children.get(name)
+            && matches!(&*lock(existing), Node::Dir { .. })
+        {
+            return Err(io::ErrorKind::IsADirectory.into());
+        }
+        let now = SystemTime::now();
+        children.insert(
+            name.clone(),
+            Arc::new(Mutex::new(Node::File {
+                bytes,
+                mtime: now,
+                created: now,
+            })),
+        );
+        node.touch();
+        Ok(())
+    }
+
+    /// Remove the file at `path`; a directory there is refused.
+    pub(crate) fn remove_file(&self, path: &Path) -> io::Result<()> {
+        self.remove(path, DirentKind::File)
+    }
+
+    /// Walk `comps` from the root, making each missing directory on the way, and return the
+    /// last. A file anywhere along it is `NotADirectory`.
+    fn dir_all(&self, comps: &[String]) -> io::Result<Link> {
+        let mut cur = self.root.clone();
+        for name in comps {
+            let next = {
+                let mut node = lock(&cur);
+                let Node::Dir { children, .. } = &mut *node else {
+                    return Err(io::ErrorKind::NotADirectory.into());
+                };
+                match children.get(name) {
+                    Some(child) => child.clone(),
+                    None => {
+                        let child = Node::new_dir();
+                        children.insert(name.clone(), child.clone());
+                        node.touch();
+                        child
+                    }
+                }
+            };
+            cur = next;
+        }
+        if matches!(&*lock(&cur), Node::File { .. }) {
+            return Err(io::ErrorKind::NotADirectory.into());
+        }
+        Ok(cur)
+    }
+
     /// Walk from the root to the node addressed by `comps`. Every intermediate component must
     /// be a directory.
     fn navigate(&self, comps: &[String]) -> io::Result<Link> {

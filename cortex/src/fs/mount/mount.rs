@@ -7,7 +7,7 @@ use std::{
 ///
 /// # Not a filesystem — a mounted one
 ///
-/// [`FileSystem`] and [`ContextFs`] *describe* a tree: they are contracts and types in this
+/// [`FileSystem`] and [`Directory`] *describe* a tree: they are contracts and types in this
 /// process, saying what is under which name and what its bytes are. Nothing outside the
 /// process can see either of them. This is the other thing entirely — the state of having
 /// been mounted. What implements it is not a store but that state: the guard a binding hands
@@ -15,7 +15,7 @@ use std::{
 /// this process started. What it offers is the one fact only that state has:
 /// [`mountpoint`](Self::mountpoint), a path any process on this host can `open`.
 ///
-/// So the two compose rather than overlap. A `ContextFs` is what a mount serves; a `Mount` is
+/// So the two compose rather than overlap. A `Directory` is what a mount serves; a `Mount` is
 /// what makes it reachable by name — which is how anything that is not this library reads a
 /// cortex tree, a guest included, and why a consumer that needs real paths takes one of these
 /// and not a store.
@@ -65,7 +65,7 @@ use std::{
 /// to whatever runs in the meantime.
 ///
 /// [`FileSystem`]: crate::fs::FileSystem
-/// [`ContextFs`]: crate::fs::ContextFs
+/// [`Directory`]: crate::fs::Directory
 pub trait Mount: Send + Sync {
     /// Where this is mounted — the directory a kernel now answers for.
     fn mountpoint(&self) -> &Path;

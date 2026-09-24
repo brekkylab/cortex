@@ -63,9 +63,8 @@ pub struct S3Config {
     pub secret_access_key: String,
     /// Custom endpoint (MinIO / R2 / localstack); `None` for real AWS.
     pub endpoint: Option<String>,
-    /// Key prefix every path is rooted under. Composes with whatever mount path a
-    /// [`ContextFs`](crate::fs::ContextFs) puts this store at: the mount table strips its own path
-    /// first, then this prefix is prepended.
+    /// Key prefix every path is rooted under. Composes with whatever mount path a mount table
+    /// puts this store at: the table strips its own path first, then this prefix is prepended.
     pub key_prefix: Option<String>,
 }
 

@@ -45,7 +45,7 @@ use cortex::fs::FuseMount as HostMount;
 /// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
 #[cfg(feature = "fuse-t")]
 use cortex::fs::FuseTMount as HostMount;
-use cortex::fs::{ContextFs, FileSystem, InMemFs};
+use cortex::fs::{Directory, FileSystem, InMemFs};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {
@@ -105,53 +105,65 @@ fn the_operating_system_can_read_a_cortex_mount() {
     fs::remove_dir_all(&mnt).ok();
 }
 
-/// Several sources side by side with nothing mounted at the root — the shape a
-/// workspace exists for, and the one that could not be mounted at all before the
-/// directories leading to a mount point were synthesized: the kernel's opening
-/// `getattr` on the root failed, so `mount` never returned a usable filesystem.
+/// Host directories side by side over the tree's in-memory root — the shape a workspace
+/// exists for.
 ///
-/// Also the only place a real kernel drives `Workspace`'s erased handle
-/// (`Handle = Box<dyn FileHandle>`); every other test here mounts a backend whose
-/// handle type is concrete.
+/// Also the only place a real kernel drives the mount table: every other test here mounts
+/// a single store.
 #[test]
 #[ignore = "needs a libfuse provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_multi_source_workspace() {
     let mnt = mountpoint("workspace");
-    let ws = ContextFs::new()
-        .try_with_mount("s3-like", volume())
-        .expect("mount path stays inside the workspace")
-        .try_with_mount("notes", volume())
-        .expect("mount path stays inside the workspace");
+    let (project, notes) = (host_dir(), host_dir());
+    let mut ws = Directory::new();
+    ws.mount("project", project.path()).expect("a fresh path");
+    ws.mount("deep/notes", notes.path()).expect("a fresh path");
+    ws.add_file("readme.md", "in memory\n".as_bytes())
+        .expect("outside every mount");
     let mount = HostMount::try_new(ws, &mnt).expect("mount");
 
-    // The mount points show up as directories even though no backend serves the
-    // directory that holds them.
+    // The mount points show up beside the in-memory file, and the directory leading to a
+    // deeper one is there too.
     let mut top: Vec<_> = fs::read_dir(&mnt)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     top.sort();
-    assert_eq!(top, ["notes", "s3-like"]);
-    assert!(fs::metadata(&mnt).unwrap().is_dir());
-    assert!(fs::metadata(mnt.join("notes")).unwrap().is_dir());
-
-    // ...and the kernel can walk into one and read through it.
+    assert_eq!(top, ["deep", "project", "readme.md"]);
+    assert!(fs::metadata(mnt.join("deep/notes")).unwrap().is_dir());
     assert_eq!(
-        fs::read_to_string(mnt.join("s3-like/greeting.txt")).unwrap(),
+        fs::read_to_string(mnt.join("readme.md")).unwrap(),
+        "in memory\n"
+    );
+
+    // ...and the kernel can walk into one and read through to the host.
+    assert_eq!(
+        fs::read_to_string(mnt.join("project/greeting.txt")).unwrap(),
         "Hello from cortex!\n"
     );
-    assert!(fs::metadata(mnt.join("notes/sub")).unwrap().is_dir());
+    assert!(fs::metadata(mnt.join("deep/notes/sub")).unwrap().is_dir());
 
-    // Each mount is its own namespace: writing under one leaves the other alone.
-    fs::write(mnt.join("notes/fresh.txt"), b"only here").unwrap();
-    assert!(!mnt.join("s3-like/fresh.txt").exists());
+    // A write under a mount lands in its host directory and nowhere else.
+    fs::write(mnt.join("deep/notes/fresh.txt"), b"only here").unwrap();
+    assert!(notes.path().join("fresh.txt").exists());
+    assert!(!mnt.join("project/fresh.txt").exists());
 
-    // The synthesized root is not writable — nothing is mounted there to hold it.
-    assert!(fs::create_dir(mnt.join("nope")).is_err());
+    // What lands beside the mount points is kept in memory and reaches neither of them.
+    fs::create_dir(mnt.join("scratch")).unwrap();
+    assert!(fs::metadata(mnt.join("scratch")).unwrap().is_dir());
+    assert!(!project.path().join("scratch").exists());
 
     // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
+}
+
+/// A host directory with the same one file and one empty directory as [`volume`].
+fn host_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("temp dir is writable");
+    fs::write(dir.path().join("greeting.txt"), "Hello from cortex!\n").unwrap();
+    fs::create_dir(dir.path().join("sub")).unwrap();
+    dir
 }
 
 /// Timestamps as the operating system reports them back.
