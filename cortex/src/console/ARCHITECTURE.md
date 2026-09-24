@@ -153,6 +153,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
+| `snapshot` | `{}` | `{blob}` |
 | `start` | — | *(notification)* |
 | `stop` | — | *(notification)* |
 | `quit` | — | *(notification)* |
@@ -166,7 +167,7 @@ There is no method a server issues — see [The channel](#the-channel).
 ### Booting is not a method
 
 **Anything that needs a booted session boots one.**
-An `exec`, a `read` and a `write` are each served by a server that brings the session up first if it is not up already — so `start` and `stop` are entirely optional, and a client that sends neither runs the same commands to the same results.
+An `exec`, a `read`, a `write` and a `snapshot` are each served by a server that brings the session up first if it is not up already — so `start` and `stop` are entirely optional, and a client that sends neither runs the same commands to the same results.
 
 That leaves the pair as **this protocol's resource management, and nothing else**.
 Neither unlocks anything; both are about what the far end is *holding*, and when it paid to hold it.
@@ -470,6 +471,30 @@ Omitted and `0` are therefore different, and a requester that means to replace a
 A `write` that fails with `IO_FAILED` says nothing about how much of `data` landed.
 The file is whatever it is, and a requester that needs to know asks with a `read`.
 
+### `snapshot` — hand back what this session has written
+
+```json
+{"jsonrpc":"2.0","id":7,"method":"snapshot","params":{}}
+{"jsonrpc":"2.0","id":7,"method":"snapshot","result":{"blob":{"$binary":{"base64":"…","subType":"00"}}}}
+```
+
+The other half of `init`'s `snapshot`: what comes back is exactly what that takes, so a session is carried on by opening a new one with `blob` in hand, and it starts with those changes already in place.
+
+| field | |
+|---|---|
+| `blob` | `Binary`. The session's writes as a layer tar — the files it wrote, with the ones it deleted carried as OCI whiteouts. |
+
+**The bytes are the executor's, not the client's.**
+What is in them is that executor's own encoding of the changes, read back only by an executor of the same kind, and a client's part is to keep them and hand them over.
+A layer and not an image of the filesystem underneath, because a filesystem image brings its own metadata, its journal and all the room it was formatted to, none of which is the session's work — and a layer is what an executor already knows how to put in front of a base.
+
+**Everything since the session began, not since the last `snapshot`.**
+A snapshot is where a session *is*, so two taken in a row give the same thing twice, and the second is not the difference between them.
+
+**One frame, or an error.**
+Unlike `read`, it does not come back in pieces: a snapshot is read back as a filesystem, and the front of one is not a smaller session's work but a broken tree.
+A session that has written more than `MAX_PAYLOAD` holds is refused rather than shortened.
+
 ### `stop` — release what booting took, to stop occupying it
 
 ```json
@@ -568,12 +593,12 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 |---|---|---|
 | `-32000` | `exec` | **timed out** — killed at `timeout_ms`. There is no result: a killed command has no exit code, and whatever it wrote is gone with it. |
 | `-32001` | `exec` | **not executable** — the program was not there, or would not start. |
-| `-32002` | `exec`, `read`, `write` | **boot failed** — the backend could not be brought up. Booting is nobody's own request, so this reaches whoever asked for the call that needed one. |
+| `-32002` | `exec`, `read`, `write`, `snapshot` | **boot failed** — the backend could not be brought up. Booting is nobody's own request, so this reaches whoever asked for the call that needed one. |
 | `-32005` | `read`, `write` | **not found** — nothing at the path. For a `write` that means a directory above it, since the file itself is created if it is missing. |
 | `-32006` | `read`, `write` | **is a directory** — the name is taken, and by something a retry will not turn into a file. |
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
 | `-32008` | `init` | **unsupported mount** — a URL whose scheme this server has no provider for, with the message naming which entry. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and taking a session whose tree can never be there would make every later path under it a lie. One code for every entry, because a session's trees are a list the client wrote and not a set of members with fixed names. Distinct from `BOOT_FAILED` because the fix is different: the mount is well formed and the *build* is wrong for it — a different binary, or a different URL. |
-| `-32009` | `exec`, `read`, `write` | **mount failed** — a tree could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
+| `-32009` | `exec`, `read`, `write`, `snapshot` | **mount failed** — a tree could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
 | `-32010` | `init` | **unsupported network** — a reach this server cannot provide, named in the message. Two things arrive as this: a name no backend implements, and a name that is understood and cannot be honoured — a server whose commands run on this host cannot take the network away from them, so it answers only `full`. Never used to narrow a session. |
 | `-32011` | `init` | **unsupported image** — the backend has no base to swap at all, because its commands run on the server's own filesystem. Not a reference that could not be fetched, which is a boot that failed. |
 | `-32012` | `init` | **unknown image** — the session named a built image this server does not have. Apart from `UNSUPPORTED_IMAGE` because a client hearing this one can build the thing. |
