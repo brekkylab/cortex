@@ -171,10 +171,11 @@ impl Call {
 ///
 /// # The machine is asked for, and what is asked for is what is given
 ///
-/// [`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib) and [`gpu`](Self::gpu) are the
-/// shape of the thing the session runs in, and they are here rather than on an
-/// [`ExecCall`] because a machine is made before the first command and outlives the last
-/// one: a backend with a kernel of its own has fixed all three before that kernel starts.
+/// [`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib), [`gpu`](Self::gpu) and
+/// [`gpu_memory_mib`](Self::gpu_memory_mib) are the shape of the thing the session runs in,
+/// and they are here rather than on an [`ExecCall`] because a machine is made before the
+/// first command and outlives the last one: a backend with a kernel of its own has fixed all
+/// of them before that kernel starts.
 ///
 /// **A server provides what is named or refuses the session**, which is
 /// [`network`](Self::network)'s rule applied to the rest of the machine, and it is what makes
@@ -274,6 +275,27 @@ pub struct InitCall {
     /// they cost are not free to a session that will never open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<bool>,
+
+    /// How much memory the session's GPU may hold, in mebibytes. `None` leaves it to the
+    /// server.
+    ///
+    /// **Beside [`memory_mib`](Self::memory_mib), not a share of it.** What the accelerator
+    /// holds is memory of its own on one backend and the host's on another -- on a GPU that
+    /// shares the host's memory, every buffer a command maps is host memory the machine's RAM
+    /// does not count -- and a session that fills both has taken the two together.
+    ///
+    /// **Given as asked, and what the commands see.** A server attaches an accelerator whose
+    /// memory is this size -- the device the commands enumerate reports it, so a program
+    /// sizes itself to what it has rather than finding out at the allocation that fails --
+    /// or refuses with [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE),
+    /// the way it refuses a GPU it has none of.
+    ///
+    /// A size is a property of an accelerator, so it is only something to say about a session
+    /// that has one: beside a [`gpu`](Self::gpu) of `false`, or of `None` on a server that
+    /// gives none, it is [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS). So is `0`,
+    /// for the reason a vCPU count of zero is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_memory_mib: Option<u32>,
 
     /// The trees this session works in, each one named and placed by a [`MountSpec`].
     ///
@@ -861,7 +883,7 @@ mod tests {
         assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
     }
 
-    /// The machine's shape is three members and each is absent unless it was asked for, so a
+    /// The machine's shape is four members and each is absent unless it was asked for, so a
     /// client with no opinion sends the frame it always sent.
     #[test]
     fn a_session_says_only_the_shape_it_asked_for() {
@@ -879,6 +901,18 @@ mod tests {
         assert_eq!(
             wire,
             bson::bson!({ "vcpus": 4, "memory_mib": 4096i64, "gpu": false })
+        );
+        assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
+
+        let init = InitCall {
+            gpu: Some(true),
+            gpu_memory_mib: Some(8192),
+            ..InitCall::default()
+        };
+        let wire = bson::serialize_to_bson(&init).unwrap();
+        assert_eq!(
+            wire,
+            bson::bson!({ "gpu": true, "gpu_memory_mib": 8192i64 })
         );
         assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
     }

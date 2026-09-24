@@ -149,7 +149,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{image?, snapshot?, network?, vcpus?, memory_mib?, gpu?, mounts?}` | `{cwd?}` |
+| `init` | `{image?, snapshot?, network?, vcpus?, memory_mib?, gpu?, gpu_memory_mib?, mounts?}` | `{cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -298,7 +298,7 @@ What the kinds are and how one tree is assembled from several stores is [`fs/ARC
 #### The machine — how big it is, and whether it has a GPU
 
 ```json
-→ {"vcpus":4,"memory_mib":4096,"gpu":true}
+→ {"vcpus":4,"memory_mib":4096,"gpu":true,"gpu_memory_mib":8192}
 ```
 
 | member | is |
@@ -306,8 +306,9 @@ What the kinds are and how one tree is assembled from several stores is [`fs/ARC
 | `vcpus` | how many vCPUs the session's machine gets |
 | `memory_mib` | how much memory it gets, in mebibytes |
 | `gpu` | whether its commands get an accelerator |
+| `gpu_memory_mib` | how much memory that accelerator may hold, in mebibytes |
 
-Here and not on an `exec` for the reason the trees and the reach are: a machine is made before the first command and outlives the last one, so on a backend with a kernel of its own all three are fixed before that kernel starts.
+Here and not on an `exec` for the reason the trees and the reach are: a machine is made before the first command and outlives the last one, so on a backend with a kernel of its own all of them are fixed before that kernel starts.
 A number on an `exec` could only be honoured by making a different machine out from under the command that asked for it.
 
 **What is asked for is what is given.**
@@ -328,6 +329,13 @@ What this protocol can hold a server to is that a command finds an accelerator, 
 A session that needs a particular device asks the session, since the command that would use it is the end that can see what is there.
 
 `false` is a session that must not have one, which is not the same as saying nothing: a device, a renderer and the boot time they cost are worth declining on a backend that would otherwise attach one.
+
+**`gpu_memory_mib` is beside `memory_mib`, not a share of it.**
+What an accelerator holds is memory of its own on one backend and the host's on another — on a GPU that shares the host's memory, every buffer a command maps is host memory the machine's RAM does not count — so a session that fills both has taken the two together, and a client sizing a session against a host adds them.
+It is given as asked and it is what the commands see: the device they enumerate reports this much, so a program that sizes itself to the device it finds fits in what it was given, rather than finding out at the allocation that fails.
+A size a server cannot give is `UNSUPPORTED_MACHINE`.
+It describes an accelerator, so beside a `gpu` of `false` — or of nothing, on a server that gives none — it is a malformed request, `-32602`; and `0` is too, for the reason a vCPU count of zero is.
+Memory is a property every accelerator has, which is why this member does not break the rule the boolean keeps: it names no model and no API.
 
 There is no member for what a *command* gets — a share of the machine, an affinity, a limit.
 The machine is the unit this protocol hands out, and a session that wants two sizes of it is two sessions.

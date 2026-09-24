@@ -110,6 +110,8 @@ pub struct ConsoleBuilder {
     memory_mib: Option<u32>,
 
     gpu: Option<bool>,
+
+    gpu_memory_mib: Option<u32>,
 }
 
 impl ConsoleBuilder {
@@ -318,6 +320,32 @@ impl ConsoleBuilder {
         self
     }
 
+    /// How much memory the session's GPU may hold, in mebibytes, beside the machine's
+    /// [`memory_mib`](Self::memory_mib).
+    ///
+    /// The commands see an accelerator of this size, so a program that sizes itself to the
+    /// device it finds fits in what it was given. Only for a session with a GPU -- see
+    /// [`InitCall::gpu_memory_mib`](crate::console::InitCall::gpu_memory_mib); a size this
+    /// server cannot give arrives as
+    /// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE) from
+    /// [`build`](Self::build).
+    ///
+    /// ```no_run
+    /// # use cortex::console::Console;
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-krun"])
+    ///     .gpu(true)
+    ///     .gpu_memory_mib(8192)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn gpu_memory_mib(mut self, gpu_memory_mib: u32) -> Self {
+        self.gpu_memory_mib = Some(gpu_memory_mib);
+        self
+    }
+
     /// Fails for the one part that has no default — something to ask — for whatever having
     /// a channel took (over stdio, a server process that would not start), and for the
     /// `init` this then sends.
@@ -448,6 +476,7 @@ impl Console {
             vcpus,
             memory_mib,
             gpu,
+            gpu_memory_mib,
         } = builder;
 
         let client_factory =
@@ -477,6 +506,7 @@ impl Console {
             vcpus,
             memory_mib,
             gpu,
+            gpu_memory_mib,
         };
 
         client.init(session).await?;
