@@ -149,7 +149,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
-| `init` | `{image?, snapshot?, network?, vcpus?, memory_mib?, gpu?, gpu_memory_mib?, mounts?}` | `{cwd?}` |
+| `init` | `{image?, snapshot?, network?, vcpus?, memory_mib?, gpu?, gpu_memory_mib?, disk_gib?, mounts?}` | `{cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -295,10 +295,10 @@ Two entries at the same path, or one at a path this server cannot use, are a mal
 
 What the kinds are and how one tree is assembled from several stores is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol carries a URL, a path and whether it may be written.
 
-#### The machine — how big it is, and whether it has a GPU
+#### The machine — how big it is, whether it has a GPU, and how much it may write
 
 ```json
-→ {"vcpus":4,"memory_mib":4096,"gpu":true,"gpu_memory_mib":8192}
+→ {"vcpus":4,"memory_mib":4096,"gpu":true,"gpu_memory_mib":8192,"disk_gib":32}
 ```
 
 | member | is |
@@ -307,6 +307,7 @@ What the kinds are and how one tree is assembled from several stores is [`fs/ARC
 | `memory_mib` | how much memory it gets, in mebibytes |
 | `gpu` | whether its commands get an accelerator |
 | `gpu_memory_mib` | how much memory that accelerator may hold, in mebibytes |
+| `disk_gib` | how much its commands may write, in gibibytes |
 
 Here and not on an `exec` for the reason the trees and the reach are: a machine is made before the first command and outlives the last one, so on a backend with a kernel of its own all of them are fixed before that kernel starts.
 A number on an `exec` could only be honoured by making a different machine out from under the command that asked for it.
@@ -336,6 +337,12 @@ It is given as asked and it is what the commands see: the device they enumerate 
 A size a server cannot give is `UNSUPPORTED_MACHINE`.
 It describes an accelerator, so beside a `gpu` of `false` — or of nothing, on a server that gives none — it is a malformed request, `-32602`; and `0` is too, for the reason a vCPU count of zero is.
 Memory is a property every accelerator has, which is why this member does not break the rule the boolean keeps: it names no model and no API.
+
+**`disk_gib` is room for writes, not the size of the image.**
+What the base ships is not counted; what is bounded is everything the session adds on top of it — the files its commands create or change, and a `snapshot` handed back at `init` along with them — and a command that writes past it finds a full disk.
+It is a ceiling and not an allocation: a server need not set the space aside up front, so a session that asks for more room than it fills costs the host what it wrote.
+Gibibytes rather than the mebibytes memory is said in, because a mebibyte is too fine a step to mean anything for a disk.
+A size a server cannot give is `UNSUPPORTED_MACHINE`, and `0` is `-32602`, for the reason a vCPU count of zero is.
 
 There is no member for what a *command* gets — a share of the machine, an affinity, a limit.
 The machine is the unit this protocol hands out, and a session that wants two sizes of it is two sessions.

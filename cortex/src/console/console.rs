@@ -112,6 +112,8 @@ pub struct ConsoleBuilder {
     gpu: Option<bool>,
 
     gpu_memory_mib: Option<u32>,
+
+    disk_gib: Option<u32>,
 }
 
 impl ConsoleBuilder {
@@ -346,6 +348,29 @@ impl ConsoleBuilder {
         self
     }
 
+    /// How much the session's commands may write, in gibibytes, on top of what the image
+    /// ships.
+    ///
+    /// A ceiling and not an allocation -- see
+    /// [`InitCall::disk_gib`](crate::console::InitCall::disk_gib); a size this server cannot
+    /// give arrives as [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE)
+    /// from [`build`](Self::build).
+    ///
+    /// ```no_run
+    /// # use cortex::console::Console;
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = Console::builder()
+    ///     .stdio_client(&["cortex-krun"])
+    ///     .disk_gib(32)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn disk_gib(mut self, disk_gib: u32) -> Self {
+        self.disk_gib = Some(disk_gib);
+        self
+    }
+
     /// Fails for the one part that has no default — something to ask — for whatever having
     /// a channel took (over stdio, a server process that would not start), and for the
     /// `init` this then sends.
@@ -477,6 +502,7 @@ impl Console {
             memory_mib,
             gpu,
             gpu_memory_mib,
+            disk_gib,
         } = builder;
 
         let client_factory =
@@ -507,6 +533,7 @@ impl Console {
             memory_mib,
             gpu,
             gpu_memory_mib,
+            disk_gib,
         };
 
         client.init(session).await?;

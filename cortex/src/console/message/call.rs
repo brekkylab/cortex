@@ -171,11 +171,11 @@ impl Call {
 ///
 /// # The machine is asked for, and what is asked for is what is given
 ///
-/// [`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib), [`gpu`](Self::gpu) and
-/// [`gpu_memory_mib`](Self::gpu_memory_mib) are the shape of the thing the session runs in,
-/// and they are here rather than on an [`ExecCall`] because a machine is made before the
-/// first command and outlives the last one: a backend with a kernel of its own has fixed all
-/// of them before that kernel starts.
+/// [`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib), [`gpu`](Self::gpu),
+/// [`gpu_memory_mib`](Self::gpu_memory_mib) and [`disk_gib`](Self::disk_gib) are the shape of
+/// the thing the session runs in, and they are here rather than on an [`ExecCall`] because a
+/// machine is made before the first command and outlives the last one: a backend with a
+/// kernel of its own has fixed all of them before that kernel starts.
 ///
 /// **A server provides what is named or refuses the session**, which is
 /// [`network`](Self::network)'s rule applied to the rest of the machine, and it is what makes
@@ -296,6 +296,26 @@ pub struct InitCall {
     /// for the reason a vCPU count of zero is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_memory_mib: Option<u32>,
+
+    /// How much the session's commands may write, in gibibytes. `None` leaves it to the
+    /// server.
+    ///
+    /// **Room for writes, not the size of the image.** What the base ships is not counted:
+    /// this bounds what the session adds on top of it -- every file its commands create or
+    /// change, and a [`snapshot`](Self::snapshot) handed back at `init` along with them --
+    /// and a command that writes past it finds a full disk.
+    ///
+    /// **A ceiling and not an allocation.** A server need not set this much aside up front,
+    /// so a session that asks for more room than it will fill costs the host what it wrote
+    /// and not what it asked for. A size a server cannot give is
+    /// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE).
+    ///
+    /// The unit is gibibytes rather than the mebibytes memory is said in because a disk is
+    /// sized in them: a mebibyte is too fine a step to mean anything here. `0` is
+    /// [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS), for the reason a vCPU count
+    /// of zero is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_gib: Option<u32>,
 
     /// The trees this session works in, each one named and placed by a [`MountSpec`].
     ///
@@ -883,7 +903,7 @@ mod tests {
         assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
     }
 
-    /// The machine's shape is four members and each is absent unless it was asked for, so a
+    /// The machine's shape is five members and each is absent unless it was asked for, so a
     /// client with no opinion sends the frame it always sent.
     #[test]
     fn a_session_says_only_the_shape_it_asked_for() {
@@ -914,6 +934,14 @@ mod tests {
             wire,
             bson::bson!({ "gpu": true, "gpu_memory_mib": 8192i64 })
         );
+        assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
+
+        let init = InitCall {
+            disk_gib: Some(32),
+            ..InitCall::default()
+        };
+        let wire = bson::serialize_to_bson(&init).unwrap();
+        assert_eq!(wire, bson::bson!({ "disk_gib": 32i64 }));
         assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
     }
 }
