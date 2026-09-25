@@ -385,6 +385,60 @@ fn a_write_protected_volume_is_enforced_by_the_driver() {
     fs::remove_dir_all(&mnt).ok();
 }
 
+
+/// A mount point is handed back the way it was taken, so the same directory can be mounted
+/// again.
+///
+/// The second mount is the assertion. A guard that unmounts and leaves something behind at
+/// the mount point makes a directory a once-per-process thing, which no caller is told and
+/// which `Mount`'s "dropping it unmounts" does not allow for.
+///
+/// **This is where Windows differed and nothing caught it.** `DokanRemoveMountPoint` takes the
+/// volume down and leaves the mount point standing, so what was there afterwards was a
+/// reparse point onto a volume that no longer existed — missing from a listing of its parent,
+/// impossible to open, and refused with `ERROR_ALREADY_EXISTS` by the next `create_dir`. The
+/// teardown tests that would have found it are in `mount_teardown.rs`, which is `unix` only
+/// because its bodies fork and signal; this one needs neither, so it runs everywhere a mount
+/// does.
+///
+/// `read_dir` on the way out rather than `metadata`: what was left behind answered `metadata`
+/// with "not found", the same as a clean unmount, and only a listing of the *parent* told the
+/// two apart.
+#[test]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
+fn a_mount_point_can_be_mounted_again_after_the_guard_is_dropped() {
+    let mnt = mountpoint("reuse");
+
+    let mount = HostMount::try_new(volume(), &mnt).expect("first mount");
+    assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
+    drop(mount);
+
+    // An empty directory, and the same one: it has to be listed by its parent to say so.
+    let named = mnt.file_name().expect("the mount point is named");
+    let parent = mnt.parent().expect("the mount point has a parent");
+    assert!(
+        fs::read_dir(parent)
+            .expect("list the mount point's parent")
+            .any(|e| e.expect("read the entry").file_name() == named),
+        "{} is gone from its parent after the unmount",
+        mnt.display()
+    );
+    assert_eq!(
+        fs::read_dir(&mnt)
+            .expect("the unmounted mount point is a directory again")
+            .count(),
+        0,
+        "{} still has something in it after the unmount",
+        mnt.display()
+    );
+
+    // And the whole of the point: it takes a mount again.
+    let mount = HostMount::try_new(volume(), &mnt).expect("second mount on the same path");
+    assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
+
+    drop(mount);
+    fs::remove_dir_all(&mnt).ok();
+}
 /// `fuser`-only: mount options are part of its call surface, and FUSE-T's are a
 /// different set. The behaviour under test is the kernel's, not ours.
 #[cfg(all(unix, not(target_os = "macos")))]
