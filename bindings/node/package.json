@@ -1,0 +1,32 @@
+{
+  "name": "cortex-node",
+  "version": "0.1.0",
+  "description": "The environment an agent works in: what it can see, and what it can do.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "napi": {
+    "binaryName": "cortex",
+    "targets": [
+      "aarch64-apple-darwin",
+      "x86_64-apple-darwin",
+      "x86_64-unknown-linux-gnu",
+      "aarch64-unknown-linux-gnu",
+      "x86_64-pc-windows-msvc"
+    ]
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --test '__test__/**/*.spec.mjs'"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^3.10.5"
+  },
+  "engines": {
+    "node": ">= 18"
+  }
+}

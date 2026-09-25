@@ -1,0 +1,37 @@
+[package]
+name = "cortex-python"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+# The native half of the `cortex` package, imported as `cortex._cortex` and re-exported by
+# `python/cortex/__init__.py`. The name here is what the `#[pymodule]` is called, and the
+# two have to agree or the import finds a library with no init function in it.
+name = "_cortex"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+# The rpath libfuse-t needs on macOS — see `build.rs`.
+pkg-config = "0.3"
+
+[dependencies]
+# `default-features = false` so that this crate's own features are what decide cortex's:
+# a wheel is built with one set, and it should be the set named here.
+cortex = { path = "../..", default-features = false }
+# `abi3-py310`: one wheel per platform rather than one per interpreter. `extension-module`
+# is not here but in `pyproject.toml`, because it leaves libpython unlinked, which is right
+# for a module the interpreter loads and wrong for `cargo test`.
+pyo3 = { version = "0.29", features = ["abi3-py310"] }
+# Every `Console` method is a future that needs a tokio runtime under it — a stdio client
+# spawns and talks to a process — so Python's awaitables are bridged onto one.
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+anyhow = "1"
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+default = ["mount"]
+mount = ["cortex/mount"]
+s3 = ["cortex/s3"]
+gdrive = ["cortex/gdrive"]
+notion = ["cortex/notion"]

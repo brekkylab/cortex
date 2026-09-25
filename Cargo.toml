@@ -3,6 +3,12 @@ name = "cortex"
 version = "0.1.0"
 edition = "2024"
 
+# The bindings are members so that they build against this crate in the same target
+# directory and lockfile. A `cargo build` or `cargo test` here still builds only `cortex`:
+# the root package is the default member.
+[workspace]
+members = ["bindings/node", "bindings/python"]
+
 [build-dependencies]
 # Compile `contrib/fuse_t/shim.c` for the `mount` feature on macOS. Only used then, but
 # build-dependencies cannot themselves be optional.

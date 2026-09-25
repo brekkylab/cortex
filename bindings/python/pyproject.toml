@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cortex-py"
+version = "0.1.0"
+description = "The environment an agent works in: what it can see, and what it can do."
+readme = "README.md"
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+
+[dependency-groups]
+dev = ["maturin>=1.9,<2", "pytest>=8", "pytest-asyncio>=1"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "cortex._cortex"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

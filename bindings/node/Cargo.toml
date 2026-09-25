@@ -1,0 +1,26 @@
+[package]
+name = "cortex-node"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+napi-build = "2"
+pkg-config = "0.3"
+
+[dependencies]
+anyhow = "1"
+cortex = { path = "../..", default-features = false }
+napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt"] }
+napi-derive = "3"
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+default = ["mount"]
+mount = ["cortex/mount"]
+s3 = ["cortex/s3"]
+gdrive = ["cortex/gdrive"]
+notion = ["cortex/notion"]
