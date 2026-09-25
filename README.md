@@ -2,13 +2,18 @@
 
 ## Requirements
 
+The `mount` feature needs the host's FUSE provider.
+
 ### MacOS
 
-fuse-t
+fuse-t, to build and to run
+```
+brew install --cask fuse-t
+```
 
 ### Windows
 
-dokany
+dokany, to run
 ```
 winget install --id dokan-dev.Dokany
 ```

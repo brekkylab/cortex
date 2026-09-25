@@ -39,7 +39,7 @@ use std::{
 };
 
 // Only taking a claim needs these, and only a build with a binding can take one.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+#[cfg(feature = "mount")]
 use {
     super::table::resolved,
     std::{
@@ -65,7 +65,7 @@ const DIR: &str = "cortex-mounts";
 const BUDGET: usize = 4;
 
 /// Distinguishes two mounts made by one process — a pid alone does not.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+#[cfg(feature = "mount")]
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// Every mount this process has up, resolved as the mount table spells them.
@@ -91,7 +91,7 @@ pub(crate) fn live() -> Vec<PathBuf> {
 ///
 /// Dropping it gives the mount point up in both registers, so an ordinary teardown
 /// leaves nothing for the signal path or for a later run to find.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+#[cfg(feature = "mount")]
 pub(crate) struct Claim {
     mountpoint: PathBuf,
 
@@ -102,7 +102,7 @@ pub(crate) struct Claim {
 }
 
 /// Record `mountpoint` as this process's, in memory and on disk.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+#[cfg(feature = "mount")]
 pub(crate) fn claim(mountpoint: &Path) -> Claim {
     let mountpoint = resolved(mountpoint);
     if let Ok(mut live) = LIVE.lock() {
@@ -124,7 +124,7 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
     Claim { mountpoint, record }
 }
 
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+#[cfg(feature = "mount")]
 impl Drop for Claim {
     fn drop(&mut self) {
         // Dropped unconditionally, unlike the record below: this is the list a signal
@@ -289,7 +289,7 @@ pub fn reclaim_abandoned() -> Vec<PathBuf> {
     left
 }
 
-#[cfg(all(test, any(feature = "fuse", feature = "fuse-t")))]
+#[cfg(all(test, feature = "mount"))]
 mod tests {
     use super::*;
 
@@ -337,9 +337,9 @@ mod tests {
     #[test]
     #[ignore = "mounts a real filesystem"]
     fn a_record_outlives_a_claim_dropped_over_a_live_mount() {
-        #[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
+        #[cfg(not(target_os = "macos"))]
         use crate::fs::FuseMount as HostMount;
-        #[cfg(feature = "fuse-t")]
+        #[cfg(target_os = "macos")]
         use crate::fs::FuseTMount as HostMount;
         use crate::fs::{FileSystem, InMemFs};
 

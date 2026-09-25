@@ -7,9 +7,10 @@
 //! interface speaks inodes and handles, [`FileSystem`](super::FileSystem) directly where it
 //! speaks paths — and exporting a guard that mounts on construction.
 //!
-//! Which bindings a build has is a feature, and the split is why that stays contained: the
-//! guards are re-exported gated, the trait is not, so a consumer can take a tree the host has
-//! mounted without compiling an interface it will never mount through.
+//! Whether a build has a binding is the `mount` feature, and which one is the target's OS; the
+//! split is why that stays contained: the guards are re-exported gated, the trait is not, so a
+//! consumer can take a tree the host has mounted without compiling an interface it will never
+//! mount through.
 //!
 //! # Mounts nobody owns any more
 //!
@@ -44,18 +45,18 @@ mod signal;
 mod table;
 
 // The guards themselves are each gated on the binding that exports them, so a build without
-// that feature has no name for one — which is the point: it cannot mount that way either.
+// that binding has no name for one — which is the point: it cannot mount that way either.
 // Not gated on a binding, like the trait and for the same reason: recovering a mount point
 // and taking this process's mounts down on a signal are about mounts the *host* has, which
 // outlives which binding made one — and the run that has to clean up after a killed process
 // is usually not the run that mounted.
 #[cfg(unix)]
 pub use claim::reclaim_abandoned;
-#[cfg(all(feature = "dokan", windows))]
+#[cfg(all(feature = "mount", windows))]
 pub use r#impl::{DokanMount, MountFlags};
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
 pub use r#impl::{FuseMount, MountOption};
-#[cfg(feature = "fuse-t")]
+#[cfg(all(feature = "mount", target_os = "macos"))]
 pub use r#impl::{FuseTBackend, FuseTMount};
 pub use mount::*;
 #[cfg(unix)]

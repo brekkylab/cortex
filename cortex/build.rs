@@ -1,19 +1,20 @@
-//! Compiles the FUSE-T shim when the `fuse-t` feature is on. See
+//! Compiles the FUSE-T shim when the `mount` feature is on for a macOS target. See
 //! `contrib/fuse_t/shim.h` for why the shim exists.
 
 fn main() {
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.c");
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.h");
 
-    if std::env::var_os("CARGO_FEATURE_FUSE_T").is_none() {
+    // The target's OS, not `cfg!(target_os)`: a build script is compiled for the host.
+    if std::env::var_os("CARGO_FEATURE_MOUNT").is_none()
+        || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+    {
         return;
     }
 
-    // FUSE-T ships `fuse-t.pc`. Not the `fuse.pc` shim in `contrib/pkgconfig`,
-    // which exists only to satisfy `fuser`'s macFUSE probe.
     let fuse_t = pkg_config::Config::new()
         .probe("fuse-t")
-        .expect("the `fuse-t` feature needs FUSE-T installed: brew install --cask fuse-t");
+        .expect("the `mount` feature on macOS needs FUSE-T installed: brew install --cask fuse-t");
 
     // `libfuse-t.dylib`'s install name is `@rpath/libfuse-t.dylib`, so a linking binary needs
     // an `LC_RPATH`. `fuse-t.pc` asks for one in its `Libs:`, but `pkg_config::probe` forwards

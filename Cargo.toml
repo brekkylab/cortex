@@ -74,14 +74,14 @@ olpc-cjson = "0.1"
 # or a build ends up with two `NetBackend` traits and no way to hand one to the other.
 microsandbox-network = "=0.6.12"
 
-# Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl`
-# on `Posix` itself rather than a wrapper holding one — the same shape `fuse-t` takes,
+# Host-side FUSE, off macOS. Its `Filesystem` methods take `&self`, so the binding is an `impl`
+# on `Posix` itself rather than a wrapper holding one — the same shape the FUSE-T one takes,
 # over the same `Mutex`-held inode and open tables.
 fuser = "0.17"
 
 # The Windows binding. `dokan` is the safe wrapper; what it links is Dokany's *user-mode*
 # DLL, dynamically, which is what keeps its LGPL to the library and off a consumer of this
-# crate — see the `dokan` feature in `cortex/Cargo.toml`. The kernel driver beside it is
+# crate — see the `mount` feature in `cortex/Cargo.toml`. The kernel driver beside it is
 # installed on the host and never linked.
 dokan = "0.3"
 # The NT-level `FILE_CREATE`/`FILE_DIRECTORY_FILE` numbering a `create_file` decodes. `dokan`
@@ -145,7 +145,7 @@ sqlite-vec = "0.1.9"
 # several times larger and a different type coming back.
 serde_bytes = "0.11"
 
-# Compiles `contrib/fuse_t/shim.c` for the `fuse-t` feature. Only used then, but
+# Compiles `contrib/fuse_t/shim.c` for the `mount` feature on macOS. Only used then, but
 # build-dependencies cannot themselves be optional.
 cc = "1"
 pkg-config = "0.3"

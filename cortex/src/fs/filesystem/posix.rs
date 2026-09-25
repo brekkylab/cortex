@@ -297,9 +297,9 @@ pub(in crate::fs) struct Attr {
     pub mtime: SystemTime,
     pub atime: SystemTime,
     pub ctime: SystemTime,
-    /// Birth time. Only the host-FUSE binding has a field for it — Linux's `stat64`,
+    /// Birth time. Only the `fuser` binding has a field for it — Linux's `stat64`,
     /// which the guest reads, has no birth time at all.
-    #[cfg_attr(not(feature = "fuse"), allow(dead_code))]
+    #[cfg_attr(not(all(feature = "mount", unix, not(target_os = "macos"))), allow(dead_code))]
     pub crtime: SystemTime,
 }
 
@@ -328,7 +328,7 @@ pub(in crate::fs) fn mode_for(kind: DirentKind) -> u32 {
 /// producing does not fail to build here the way a new enum variant would — it lands on
 /// the `_` arm and reaches userspace as `EIO`, which is a valid number and therefore a
 /// silent wrong answer. A store that answers with a kind not named below has to add it.
-#[cfg(any(feature = "fuse", feature = "fuse-t"))]
+#[cfg(all(feature = "mount", unix))]
 pub(in crate::fs) fn host_errno(err: &io::Error) -> i32 {
     if let Some(errno) = err.raw_os_error() {
         return errno;

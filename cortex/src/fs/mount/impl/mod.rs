@@ -24,31 +24,30 @@
 //!
 //! A binding is also partly a trait impl, so declaring the module is what pulls it in.
 
-// `windows` as well as the feature, and not redundant with it: `dokan` builds only on Windows,
-// so a `--all-features` build of this crate anywhere else has to find no module here rather
-// than a module whose dependency will not compile.
-#[cfg(all(feature = "dokan", windows))]
+// One binding per target, all behind `mount`: which interface a host mounts through is
+// decided by its OS, so a build never has two to choose between.
+#[cfg(all(feature = "mount", windows))]
 mod dokan;
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
 mod fuse;
-#[cfg(feature = "fuse-t")]
+#[cfg(all(feature = "mount", target_os = "macos"))]
 mod fuse_t;
 
 // `self::` because this module and the crate it binds share a name, and a bare `dokan::` in a
 // `use` is the *crate*. Both spellings appear below on purpose.
-#[cfg(all(feature = "dokan", windows))]
+#[cfg(all(feature = "mount", windows))]
 pub use self::dokan::DokanMount;
 // Re-exported for the same reason `MountOption` is below: a caller names its mount flags
 // without taking a direct dependency on `dokan`, which is this binding's implementation detail.
-#[cfg(all(feature = "dokan", windows))]
+#[cfg(all(feature = "mount", windows))]
 pub use ::dokan::MountFlags;
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
 pub use fuse::FuseMount;
 // Re-exported so a caller can name mount options without taking a direct dependency on
 // `fuser`, which is this binding's implementation detail.
-#[cfg(feature = "fuse-t")]
+#[cfg(all(feature = "mount", target_os = "macos"))]
 pub use fuse_t::{FuseTBackend, FuseTMount};
-#[cfg(feature = "fuse")]
+#[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
 pub use fuser::MountOption;
 
 /// Drive an async [`Posix`](crate::fs::Posix) operation to completion from a binding's
@@ -63,7 +62,7 @@ pub use fuser::MountOption;
 /// One runtime serves every mount this module makes, created on first use and **never
 /// dropped** — a `Runtime`'s `Drop` blocks, which would panic on the binding threads that
 /// reach this. Created lazily, so a process that mounts nothing pays for nothing.
-#[cfg(any(feature = "fuse", feature = "fuse-t", all(feature = "dokan", windows)))]
+#[cfg(all(feature = "mount", any(unix, windows)))]
 pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     use std::sync::OnceLock;
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();

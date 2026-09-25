@@ -17,7 +17,6 @@ bson = { workspace = true }
 # `BoxFuture`, which is what every method on `Client` and `Server` hands back — see
 # `console::base` for why they are boxed rather than `async fn`.
 futures-core = { workspace = true }
-fuser = { workspace = true, optional = true }
 # The `errno` values a POSIX filesystem answers in: `Posix` maps an `io::ErrorKind` onto one,
 # and a binding hands that number to the kernel. Unconditional, unlike the bindings' other
 # dependencies: `tokio/process` already activates it on every unix build, so naming it here
@@ -45,11 +44,16 @@ tokio = { workspace = true, features = [
     "time",
 ] }
 
-# The Dokan binding's four, behind the target as well as behind the feature. Optional *and*
-# target-gated is not belt and braces: none of them builds anywhere but Windows, so a
-# `--all-features` build on Linux or macOS has to find the feature turning on nothing at all
-# rather than a dependency that cannot compile. The binding's own module carries the matching
-# `#[cfg(all(feature = "dokan", windows))]`.
+# Each binding's dependencies sit under the target it binds on, and are optional there so that
+# `mount` is what pulls them in: a build turns on one binding, the one its OS has, and a
+# `--all-features` build finds nothing on a target without one rather than a dependency that
+# cannot compile. The binding modules carry the matching `#[cfg(all(feature = "mount", …))]`.
+#
+# The macOS binding has no entry: FUSE-T is reached through `contrib/fuse_t/shim.c`, which
+# `build.rs` compiles.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+fuser = { workspace = true, optional = true }
+
 [target.'cfg(windows)'.dependencies]
 dokan = { workspace = true, optional = true }
 dokan-sys = { workspace = true, optional = true }
@@ -73,10 +77,13 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
-# No *binding* by default. The crate's own layers — `FileSystem`, `Directory`, the
-# inode bookkeeping, the console — need nothing, and each interface binding brings
-# a libfuse provider with it: enabling one by default charges every consumer for
-# it. A consumer that mounts over HTTP has no reason to link libfuse.
+# `mount` by default, because mounting a tree on the host is what a consumer of this crate
+# does. It is also the one default with a cost: on macOS and Windows it brings a FUSE
+# provider with it, which the build or the binary then needs installed (see `mount`
+# below). The crate's own layers — `FileSystem`, `Directory`, the inode bookkeeping, the
+# console — need none of it, so a consumer that mounts over HTTP, or only runs commands,
+# takes this crate with `default-features = false` and links no libfuse. The workspace's
+# own dependency on it is declared that way, so each member names `mount` if it mounts.
 #
 # Count them with
 #
@@ -89,76 +96,59 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # unconditional build-deps `cc`/`pkg-config` are not counted.
 #
 # The numbers themselves are deliberately not written down: they go stale on every
-# dependency bump, and the conclusion does not depend on what they are — `fuse`
-# brings a libfuse provider and `s3` the whole HTTP and TLS stack under
+# dependency bump, and the conclusion does not depend on what they are — `mount`
+# brings a FUSE provider and `s3` the whole HTTP and TLS stack under
 # `object_store`, whatever this month's count is.
 #
 # Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
-# because a binding's tests only exist when its feature is on. No default set fixes
-# that — `fuse` and `fuse-t` are independent, so no single configuration covers
-# every binding. Full coverage is a sweep:
+# because a feature's tests only exist when it is on. Full coverage is a sweep:
 #
-#   export PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig"
-#   for f in "" "--features fuse" "--features fuse-t" \
-#            "--features fuse-no-mount" "--features s3" "--features notion" \
-#            "--features gdrive" \
-#            "--features fuse,fuse-t" \
-#            "--features fuse,fuse-t,s3,notion,gdrive"; do cargo test -p cortex $f --all-targets; done
+#   for f in "--no-default-features" "" "--features s3" "--features notion" \
+#            "--features gdrive" "--features s3,notion,gdrive"; do
+#       cargo test -p cortex $f --all-targets
+#   done
 #
 # Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
 # unquoted expansion — under zsh pass the flags as separate arguments.
 #
-# Editors default to no features too, so a binding shows as inactive code until
-# its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
-default = []
-# Both bindings below also ask for `tokio/rt-multi-thread` and `tokio/net`: a
-# binding is a *synchronous* callback over async stores, so it blocks on one
-# process-wide runtime (`fs::mounts::block_on`), and `Builder::enable_all` is
-# cfg'd on `net` and `time` — built without them the runtime silently has no I/O
-# driver. `time` is already in the base set the console asks for.
-# Mount a cortex filesystem on the host through FUSE.
+# Editors build the default set, so `mount`'s binding is live code and the other
+# features' are not until enabled (rust-analyzer: `"cargo.features": "all"`).
+default = ["mount"]
+# Mount a cortex filesystem on the host, through the one binding this OS has:
 #
-# Needs a libfuse provider at build time. On macOS that is FUSE-T (kext-less,
-# `brew install --cask fuse-t`) or macFUSE; both export the libfuse2 mount ABI
-# fuser links against. FUSE-T ships `fuse-t.pc` rather than the `fuse.pc` that
-# fuser's macOS branch probes for, so point `PKG_CONFIG_PATH` at the shim in
-# `cortex/contrib/pkgconfig`:
+# | Target | Binding | Needs |
+# |---|---|---|
+# | Linux (any unix but macOS) | `fuser`, straight to `/dev/fuse` | nothing installed |
+# | macOS | libfuse-t's own session loop | FUSE-T to build and run (`brew install --cask fuse-t`) |
+# | Windows | Dokany's driver, through `dokan` | Dokany to run |
 #
-#   PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig" cargo build -p cortex --features fuse
+# All three also ask for `tokio/rt-multi-thread` and `tokio/net`: a binding is a
+# *synchronous* callback over async stores, so it blocks on one process-wide runtime
+# (`fs::mount::block_on`), and `Builder::enable_all` is cfg'd on `net` and `time` —
+# built without them the runtime silently has no I/O driver. `time` is already in the
+# base set the console asks for.
 #
-# Linux needs no provider — fuser opens /dev/fuse directly.
-fuse = ["dep:fuser", "tokio/net", "tokio/rt-multi-thread"]
-# Mount on macOS through FUSE-T, which needs no kernel extension.
+# **On macOS, FUSE-T has to be installed to build.** `build.rs` probes `fuse-t.pc` and
+# fails without it, and the binary links `libfuse-t.dylib`, so it will not load on a
+# machine without FUSE-T either.
 #
-# A separate binding rather than a flavour of `fuse`, because the two differ in
-# who drives the session: `fuser` reads the FUSE protocol off the mount fd
-# itself, while FUSE-T hands back a socket to its own helper and expects to drive
-# the filesystem through libfuse-t's loop. Enabling both at once is fine — they
-# are independent call surfaces over the same `Posix`.
-fuse-t = ["tokio/net", "tokio/rt-multi-thread"]
-# Compile and unit-test the FUSE adapter with no libfuse provider installed:
-# skips fuser's pkg-config probe, so the adapter builds but cannot mount.
-fuse-no-mount = ["fuse", "fuser/macos-no-mount"]
-# Mount a cortex filesystem on Windows through Dokany, as a drive letter or on an
-# empty NTFS directory. A no-op off Windows: the dependencies are target-gated, so
-# the feature turns on nothing there and the module is not compiled.
+# **On Windows, Dokany has to be installed to run** — the kernel driver (`dokan2.sys`)
+# comes from Dokany's own installer and is what actually owns the volume. Building
+# needs only a C compiler: `dokan-sys` links the installed user-mode library when the
+# installer's `DokanLibrary2_LibraryPath_x64` is in the environment, and otherwise
+# builds one from its vendored sources. Prefer the former — a self-built DLL can
+# disagree with the installed driver's version, which fails at mount time rather than
+# at build time.
 #
-# **Needs Dokany installed to run** — the kernel driver (`dokan2.sys`) comes from
-# Dokany's own installer and is what actually owns the volume. Building needs
-# only a C compiler: `dokan-sys` links the installed user-mode library when the
-# installer's `DokanLibrary2_LibraryPath_x64` is in the environment, and
-# otherwise builds one from its vendored sources. Prefer the former — a
-# self-built DLL can disagree with the installed driver's version, which fails at
-# mount time rather than at build time.
-#
-# **It constrains a consumer's licence, and it is the only feature here that
-# does.** Dokany's user-mode library is LGPL-3.0 and is linked dynamically, which
-# is what keeps that to the library: a proprietary program may link it, and must
-# leave it replaceable — which `dokan-sys` does for us by linking through an
-# import library rather than statically. Nothing here may be rolled into a static
-# binary without taking on LGPL §4(d0), which means shipping relinkable object
-# code for the program around it.
-dokan = [
+# **On Windows it constrains a consumer's licence, and it is the only feature here
+# that does.** Dokany's user-mode library is LGPL-3.0 and is linked dynamically, which
+# is what keeps that to the library: a proprietary program may link it, and must leave
+# it replaceable — which `dokan-sys` does for us by linking through an import library
+# rather than statically. Nothing here may be rolled into a static binary without
+# taking on LGPL §4(d0), which means shipping relinkable object code for the program
+# around it.
+mount = [
+    "dep:fuser",
     "dep:dokan",
     "dep:dokan-sys",
     "dep:widestring",

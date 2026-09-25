@@ -18,8 +18,9 @@
 //!
 //! ## Quickstart
 //!
-//! Needs the `fuse` feature, which is where `FuseMount` comes from — under `fuse-t` the same
-//! two lines say `FuseTMount`, and nothing else about this changes.
+//! Needs the `mount` feature. This is Linux, where the binding is `FuseMount`; on macOS the
+//! same two lines say `FuseTMount` and on Windows `DokanMount`, and nothing else about this
+//! changes.
 //!
 //! ```ignore
 //! use std::path::Path;

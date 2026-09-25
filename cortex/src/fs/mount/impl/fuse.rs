@@ -1,16 +1,15 @@
 //! Binds a [`Posix`] to `fuser`'s host-side [`Filesystem`]. [`FuseMount`] is the whole of
 //! what it exports.
 //!
-//! Sibling of [`super::fuse_t`]: the same [`Posix`] operations through a different interface,
+//! Sibling of the `fuse_t` binding: the same [`Posix`] operations through a different interface,
 //! so everything here is translation. What differs from that side is who drives the session —
 //! `fuser` speaks the kernel FUSE protocol over the mount fd itself, which is exactly what
 //! FUSE-T's helper will not tolerate — and the attribute type ([`FileAttr`] rather than a
 //! `stat` this crate lays out by hand). The errno numbering is shared: both answer this
 //! host's kernel.
 //!
-//! On Linux `fuser` opens `/dev/fuse` itself, so nothing has to be installed. On macOS this
-//! is **macFUSE**, a kernel extension needing reduced-security boot on Apple Silicon — which
-//! is why [`super::fuse_t`] exists beside it.
+//! The binding for every unix but macOS, which has the `fuse_t` binding instead. On Linux
+//! `fuser` opens `/dev/fuse` itself, so nothing has to be installed.
 //!
 //! What stays on `fuser`'s `ENOSYS` defaults is what the store contract has no notion of:
 //! symlinks, hard links, extended attributes.
@@ -80,8 +79,7 @@ pub struct FuseMount {
 impl FuseMount {
     /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
-    /// `mountpoint` must already exist. On Linux this needs nothing installed; on macOS it
-    /// needs macFUSE.
+    /// `mountpoint` must already exist. On Linux this needs nothing installed.
     ///
     /// Returns as soon as the mount is real, and needs no waiting to say so: the mount syscall
     /// happens before this returns, so the path is a mount point by the time a caller has the

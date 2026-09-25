@@ -5,7 +5,7 @@
 //! decomposition, the attribute policy, the host errno table — already lives in
 //! [`posix`](crate::fs::filesystem::posix), so what is left here is marshalling.
 //!
-//! **Why a binding of its own, beside the `fuser` one?** They differ in who drives the
+//! **Why a binding of its own, rather than `fuser` as on Linux?** They differ in who drives the
 //! session. `fuser` takes the fd from `fuse_mount` and speaks the kernel FUSE protocol over
 //! it itself, which works when that fd is macFUSE's real device. FUSE-T's is a socket to its
 //! own helper, which expects to be driven *by* libfuse-t's loop: hand it to a foreign

@@ -10,14 +10,11 @@
 //! `#[ignore]`, because every body here mounts a real filesystem:
 //!
 //! ```sh
-//! # macOS + FUSE-T
-//! PKG_CONFIG_PATH="$PWD/cortex/contrib/pkgconfig:/usr/local/lib/pkgconfig" \
-//!     cargo test --features fuse-t --test mount_teardown -- --ignored --nocapture
-//!
-//! # Linux, where `fuser` mounts through `mount(2)` itself and needs no libfuse:
-//! # A container is enough, given `--device /dev/fuse` and `--cap-add SYS_ADMIN`.
-//! cargo test --features fuse --test mount_teardown -- --ignored --nocapture
+//! cargo test --test mount_teardown -- --ignored --nocapture
 //! ```
+//!
+//! On Linux `fuser` mounts through `mount(2)` itself and needs no libfuse, so a
+//! container is enough, given `--device /dev/fuse` and `--cap-add SYS_ADMIN`.
 //!
 //! One set of bodies for both host bindings, as in `host_mount.rs` and for the
 //! same reason: what is under test is [`Mount`]'s contract, which both owe, so
@@ -35,7 +32,7 @@
 //! Two mounts alive at once is the whole requirement. Threads are not part of it,
 //! which is why one of these runs on a single thread.
 
-#![cfg(any(feature = "fuse", feature = "fuse-t"))]
+#![cfg(all(feature = "mount", unix))]
 
 use std::{
     fs,
@@ -44,11 +41,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel
-// extension — the same rule `host_mount.rs` picks by.
-#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
+// Whichever host binding this target has, as in `host_mount.rs`.
+#[cfg(not(target_os = "macos"))]
 use cortex::fs::FuseMount as HostMount;
-#[cfg(feature = "fuse-t")]
+#[cfg(target_os = "macos")]
 use cortex::fs::FuseTMount as HostMount;
 use cortex::fs::{FileSystem, InMemFs, Mount};
 

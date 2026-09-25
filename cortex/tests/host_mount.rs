@@ -9,32 +9,21 @@
 //! filesystem.
 //!
 //! ```sh
-//! # macOS, no kernel extension (recommended). The pkg-config shim in
-//! # contrib/ is what lets fuser's macOS branch find FUSE-T.
-//! PKG_CONFIG_PATH="$PWD/contrib/pkgconfig:/usr/local/lib/pkgconfig" \
-//!     cargo test --features fuse-t --test host_mount -- --ignored --nocapture
-//!
-//! # Linux, or macOS with macFUSE:
-//! cargo test --features fuse --test host_mount -- --ignored
-//!
-//! # Windows, with Dokany installed:
-//! cargo test --features dokan --test host_mount -- --ignored
+//! cargo test --test host_mount -- --ignored --nocapture
 //! ```
 //!
-//! # Which binding to use where
+//! # Which binding is under test
 //!
-//! | Platform | Binding | Feature |
-//! |---|---|---|
-//! | Linux | `fuser`, straight to `/dev/fuse` | `fuse` |
-//! | macOS + FUSE-T | libfuse-t's own session loop | `fuse-t` |
-//! | macOS + macFUSE | `fuser` (its macOS path targets macFUSE 4.x) | `fuse` |
-//! | Windows | Dokany's driver, through `dokan` | `dokan` |
+//! Whichever one the target has — `mount` compiles exactly one:
 //!
-//! **`fuser` cannot drive FUSE-T** — see `adapter/fuse_t.rs`, which exists for
-//! exactly that reason.
+//! | Platform | Binding |
+//! |---|---|
+//! | Linux | `FuseMount`: `fuser`, straight to `/dev/fuse` |
+//! | macOS | `FuseTMount`: libfuse-t's own session loop |
+//! | Windows | `DokanMount`: Dokany's driver, through `dokan` |
 //!
-//! **A missing provider is not the same failure on every platform.** The two
-//! FUSE features probe with pkg-config and so fail at *build* time, never by
+//! **A missing provider is not the same failure on every platform.** On macOS
+//! FUSE-T is probed with pkg-config and so fails at *build* time, never by
 //! silently passing. Dokany cannot: its driver is a runtime fact, so a build
 //! without it succeeds and `try_new` answers `can't install driver` instead.
 //! Either way the test fails rather than quietly not running, which is the
@@ -49,25 +38,18 @@
 //! difference invisible from outside, which is the claim worth testing: a cortex
 //! tree behaves the same whichever kernel is asking.
 
-#![cfg(any(feature = "fuse", feature = "fuse-t", all(feature = "dokan", windows)))]
+#![cfg(all(feature = "mount", any(unix, windows)))]
 
 use std::{fs, path::PathBuf};
 
 // One set of test bodies for every host binding: they expose the same call
-// surface, so which is under test is a matter of which feature is on — making
+// surface, so which is under test is a matter of which target this is — making
 // these tests evidence that they behave *alike*, not just that each behaves.
-/// The Windows binding, which is the only one on that platform — the two FUSE
-/// features have no provider there to build against.
-#[cfg(all(
-    feature = "dokan",
-    windows,
-    not(any(feature = "fuse", feature = "fuse-t"))
-))]
+#[cfg(windows)]
 use cortex::fs::DokanMount as HostMount;
-#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
+#[cfg(all(unix, not(target_os = "macos")))]
 use cortex::fs::FuseMount as HostMount;
-/// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
-#[cfg(feature = "fuse-t")]
+#[cfg(target_os = "macos")]
 use cortex::fs::FuseTMount as HostMount;
 use cortex::fs::{Directory, FileSystem, InMemFs};
 
@@ -385,11 +367,7 @@ fn the_operating_system_can_append_to_a_cortex_mount() {
 /// Worth having twice rather than once, because "the kernel refuses the write"
 /// is the *only* assertion in this file that is not about a store answering —
 /// and the two kernels refuse for reasons neither binding controls.
-#[cfg(all(
-    feature = "dokan",
-    windows,
-    not(any(feature = "fuse", feature = "fuse-t"))
-))]
+#[cfg(windows)]
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn a_write_protected_volume_is_enforced_by_the_driver() {
@@ -409,7 +387,7 @@ fn a_write_protected_volume_is_enforced_by_the_driver() {
 
 /// `fuser`-only: mount options are part of its call surface, and FUSE-T's are a
 /// different set. The behaviour under test is the kernel's, not ours.
-#[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn a_read_only_mount_is_enforced_by_the_kernel() {
