@@ -385,7 +385,6 @@ fn a_write_protected_volume_is_enforced_by_the_driver() {
     fs::remove_dir_all(&mnt).ok();
 }
 
-
 /// A mount point is handed back the way it was taken, so the same directory can be mounted
 /// again.
 ///

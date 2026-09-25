@@ -299,7 +299,10 @@ pub(in crate::fs) struct Attr {
     pub ctime: SystemTime,
     /// Birth time. Only the `fuser` binding has a field for it — Linux's `stat64`,
     /// which the guest reads, has no birth time at all.
-    #[cfg_attr(not(all(feature = "mount", unix, not(target_os = "macos"))), allow(dead_code))]
+    #[cfg_attr(
+        not(all(feature = "mount", unix, not(target_os = "macos"))),
+        allow(dead_code)
+    )]
     pub crtime: SystemTime,
 }
 

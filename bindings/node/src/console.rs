@@ -245,9 +245,8 @@ impl JsConsoleBuilder {
 
 /// The console a slot holds, or the error for one that has been closed.
 fn held(slot: &mut Option<Console>) -> Result<&mut Console> {
-    slot.as_mut().ok_or_else(|| {
-        napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed")
-    })
+    slot.as_mut()
+        .ok_or_else(|| napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed"))
 }
 
 /// A console slot: the console, or nothing once it has been closed.
