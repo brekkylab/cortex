@@ -270,7 +270,8 @@ impl Mount for DokanMount {
 }
 
 impl Drop for DokanMount {
-    /// Ask the driver to remove the mount point, then wait for the serving thread to notice.
+    /// Ask the driver to remove the mount point, then wait for the serving thread to notice,
+    /// then put the directory back the way it was found.
     ///
     /// The order is forced: the thread is blocked in Dokan's own wait-for-closed, so it cannot
     /// end until the volume is gone, and joining first would deadlock. `unmount` is what ends
@@ -291,6 +292,43 @@ impl Drop for DokanMount {
             return;
         }
         let _ = serving.join();
+        self.reclaim_mountpoint();
+    }
+}
+
+impl DokanMount {
+    /// Put the mount point back to the empty directory it was before the mount.
+    ///
+    /// **`unmount` takes the volume down and leaves the mount point standing.** What a caller
+    /// handed over was an empty directory; what is there afterwards is a reparse point onto a
+    /// volume that no longer exists — invisible to a listing of its parent, impossible to
+    /// open, and refused with `ERROR_ALREADY_EXISTS` by the next `create_dir_all`. So the
+    /// second mount of the same path fails on a path the first one was supposed to have
+    /// released, which makes a mount a once-per-directory thing rather than a guard.
+    ///
+    /// `symlink_metadata` and not `exists`: the latter follows the reparse point, finds the
+    /// volume gone and answers that nothing is there. `remove_dir` does not follow it either,
+    /// so what it removes is the junction rather than anything it points at.
+    ///
+    /// Failures are ignored rather than reported. This runs from `Drop`, the mount is already
+    /// down, and what is left if it does not work is the state that was there before — which
+    /// the next mount will report on its own.
+    fn reclaim_mountpoint(&self) {
+        use std::os::windows::fs::MetadataExt as _;
+
+        /// `FILE_ATTRIBUTE_REPARSE_POINT`, spelled here rather than taken from `winapi`: it is
+        /// one number and the crate is otherwise only needed for the NTSTATUS surface.
+        const REPARSE_POINT: u32 = 0x0000_0400;
+
+        let Ok(meta) = std::fs::symlink_metadata(&self.mountpoint) else {
+            return;
+        };
+        if meta.file_attributes() & REPARSE_POINT == 0 {
+            return;
+        }
+        if std::fs::remove_dir(&self.mountpoint).is_ok() {
+            let _ = std::fs::create_dir(&self.mountpoint);
+        }
     }
 }
 
