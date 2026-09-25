@@ -5,7 +5,11 @@ edition = "2024"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` as well, for a binding that builds cortex into its own addon — ailoy's does. Two
+# addons cannot hand each other a `Console`: each links its own copy of cortex and of the
+# runtime under it. So such a binding links this crate instead, and napi registers these
+# classes into its addon alongside its own; its `Console` is then the one its agent can take.
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 napi-build = "2"

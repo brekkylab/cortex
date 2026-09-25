@@ -12,13 +12,21 @@
 
 use pyo3::prelude::*;
 
-mod console;
-mod error;
-mod fs;
-mod image;
+pub mod console;
+pub mod error;
+pub mod fs;
+pub mod image;
 
 #[pymodule]
 fn _cortex(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register(m)
+}
+
+/// Add every class, exception and constant this module has to `m`.
+///
+/// The module's own init, and also what a binding that links this crate calls to put cortex
+/// into an extension of its own — see the `rlib` in `Cargo.toml`.
+pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(m)?;
     image::register(m)?;
     fs::register(m)?;

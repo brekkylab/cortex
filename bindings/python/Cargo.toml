@@ -8,8 +8,13 @@ publish = false
 # The native half of the `cortex` package, imported as `cortex._cortex` and re-exported by
 # `python/cortex/__init__.py`. The name here is what the `#[pymodule]` is called, and the
 # two have to agree or the import finds a library with no init function in it.
+#
+# `rlib` as well, for a binding that builds cortex into its own extension — ailoy's does. Two
+# extension modules cannot hand each other a `Console`: each links its own copy of cortex and
+# of the runtime under it. So such a binding links this crate instead and registers its
+# classes through [`register`](src/lib.rs), and its `Console` is the one its agent can take.
 name = "_cortex"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 # The rpath libfuse-t needs on macOS — see `build.rs`.

@@ -15,10 +15,19 @@
 //! # How it ends
 //!
 //! [`Console`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
-//! off one — which is where a Python finalizer runs. So [`Held`] enters the binding's runtime
-//! before letting go, and a console that is garbage-collected ends the same way as one that
-//! is closed. `close()` and `async with` are there for a caller who wants that moment to be
-//! a line in their program rather than whenever the collector gets to it.
+//! off one — which is where a Python finalizer runs. So [`PyConsole`] enters the binding's
+//! runtime before letting go, and a console that is garbage-collected ends the same way as one
+//! that is closed. `close()` and `async with` are there for a caller who wants that moment to
+//! be a line in their program rather than whenever the collector gets to it.
+//!
+//! # Who else holds it
+//!
+//! The slot is an `Arc<Mutex<Option<Console>>>` rather than a type of this module's own,
+//! because that is the shape an agent holds its console in — ailoy's `AgentState::console` —
+//! and a binding that links this crate hands [`PyConsole::slot`] to one. The two then share
+//! one session: calls from either side take turns on the lock, and `close()` ends it for both.
+//! Whichever lets go last ends it, so a holder other than this one owes the same runtime
+//! entry on drop.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -181,27 +190,18 @@ impl PyConsoleBuilder {
     }
 }
 
-/// The console, or nothing once it has been closed — and what makes dropping it say `quit`.
-struct Held(Option<Console>);
-
-impl Held {
-    fn get(&mut self) -> PyResult<&mut Console> {
-        self.0
-            .as_mut()
-            .ok_or_else(|| CortexError::new_err("this console has been closed"))
-    }
+/// The console a slot holds, or the error for one that has been closed.
+fn held(slot: &mut Option<Console>) -> PyResult<&mut Console> {
+    slot.as_mut()
+        .ok_or_else(|| CortexError::new_err("this console has been closed"))
 }
 
-impl Drop for Held {
-    fn drop(&mut self) {
-        let _entered = get_runtime().enter();
-        self.0.take();
-    }
-}
+/// A console slot: the console, or nothing once it has been closed.
+pub type Slot = Arc<Mutex<Option<Console>>>;
 
 #[pyclass(name = "Console", module = "cortex", frozen)]
 pub struct PyConsole {
-    console: Arc<Mutex<Held>>,
+    console: Slot,
 
     /// [`Console::mounts`], read once: the paths are fixed when the session is announced, and
     /// a getter that had to await the lock for them would make them a coroutine.
@@ -218,7 +218,23 @@ impl PyConsole {
                 .mounts()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
-            console: Arc::new(Mutex::new(Held(Some(console)))),
+            console: Arc::new(Mutex::new(Some(console))),
+        }
+    }
+
+    /// The slot this console is held in, for a holder that shares it — see the module docs.
+    pub fn slot(&self) -> Slot {
+        self.console.clone()
+    }
+}
+
+/// What makes dropping the last holder say `quit`: the console is let go of on the runtime.
+/// A holder that is not the last leaves it to whichever is.
+impl Drop for PyConsole {
+    fn drop(&mut self) {
+        if let Some(slot) = Arc::get_mut(&mut self.console) {
+            let _entered = get_runtime().enter();
+            slot.get_mut().take();
         }
     }
 }
@@ -238,26 +254,16 @@ impl PyConsole {
     fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let console = self.console.clone();
         future_into_py(py, async move {
-            console
-                .lock()
-                .await
-                .get()?
-                .start()
-                .await
-                .map_err(error::failure)
+            let mut slot = console.lock().await;
+            held(&mut slot)?.start().await.map_err(error::failure)
         })
     }
 
     fn stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let console = self.console.clone();
         future_into_py(py, async move {
-            console
-                .lock()
-                .await
-                .get()?
-                .stop()
-                .await
-                .map_err(error::failure)
+            let mut slot = console.lock().await;
+            held(&mut slot)?.stop().await.map_err(error::failure)
         })
     }
 
@@ -270,8 +276,8 @@ impl PyConsole {
     ) -> PyResult<Bound<'py, PyAny>> {
         let console = self.console.clone();
         future_into_py(py, async move {
-            let mut held = console.lock().await;
-            let resp = held.get()?.exec(cmd, timeout_ms).await;
+            let mut slot = console.lock().await;
+            let resp = held(&mut slot)?.exec(cmd, timeout_ms).await;
             resp.map(PyExecResult::from).map_err(error::failure)
         })
     }
@@ -286,8 +292,8 @@ impl PyConsole {
     ) -> PyResult<Bound<'py, PyAny>> {
         let console = self.console.clone();
         future_into_py(py, async move {
-            let mut held = console.lock().await;
-            let resp = held.get()?.read(path, offset, len).await;
+            let mut slot = console.lock().await;
+            let resp = held(&mut slot)?.read(path, offset, len).await;
             resp.map(PyReadResult::from).map_err(error::failure)
         })
     }
@@ -304,8 +310,8 @@ impl PyConsole {
         let console = self.console.clone();
         let data = Vec::<u8>::from(data);
         future_into_py(py, async move {
-            let mut held = console.lock().await;
-            let resp = held.get()?.write(path, data, offset).await;
+            let mut slot = console.lock().await;
+            let resp = held(&mut slot)?.write(path, data, offset).await;
             resp.map(|w| w.size).map_err(error::failure)
         })
     }
@@ -313,13 +319,8 @@ impl PyConsole {
     fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let console = self.console.clone();
         future_into_py(py, async move {
-            console
-                .lock()
-                .await
-                .get()?
-                .snapshot()
-                .await
-                .map_err(error::failure)
+            let mut slot = console.lock().await;
+            held(&mut slot)?.snapshot().await.map_err(error::failure)
         })
     }
 
@@ -328,7 +329,7 @@ impl PyConsole {
         let console = self.console.clone();
         future_into_py(py, async move {
             // Dropped here, on the runtime, which is what lets `quit` go out.
-            console.lock().await.0.take();
+            console.lock().await.take();
             Ok(())
         })
     }

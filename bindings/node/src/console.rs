@@ -23,11 +23,20 @@
 //! # How it ends
 //!
 //! [`Console`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
-//! off one — which is where a garbage-collection finalizer runs. So [`Held`] keeps the
+//! off one — which is where a garbage-collection finalizer runs. So [`JsConsole`] keeps the
 //! handle of the runtime the console was built on and enters it before letting go, and a
 //! console that is collected ends the same way as one that is closed. `close()` is there for
 //! a caller who wants that moment to be a line in their program rather than whenever the
 //! collector gets to it.
+//!
+//! # Who else holds it
+//!
+//! The slot is an `Arc<Mutex<Option<Console>>>` rather than a type of this module's own,
+//! because that is the shape an agent holds its console in — ailoy's `AgentState::console` —
+//! and a binding that links this crate hands [`JsConsole::slot`] to one. The two then share
+//! one session: calls from either side take turns on the lock, and `close()` ends it for both.
+//! Whichever lets go last ends it, so a holder other than this one owes the same runtime
+//! entry on drop — [`JsConsole::runtime`] is the handle to enter.
 
 use std::{future::Future, sync::Arc};
 
@@ -46,7 +55,9 @@ use crate::{
 };
 
 /// Run `fut` on napi's runtime, rejecting with the error it answers — `code` and all.
-fn promise<'env, T, F>(env: &'env Env, fut: F) -> napi::Result<PromiseRaw<'env, T>>
+///
+/// Public for a binding that links this crate, whose errors want the same treatment.
+pub fn promise<'env, T, F>(env: &'env Env, fut: F) -> napi::Result<PromiseRaw<'env, T>>
 where
     T: ToNapiValue + Send + 'static,
     F: Future<Output = Result<T>> + Send + 'static,
@@ -57,7 +68,7 @@ where
 }
 
 /// What a synchronous error of ours is on a path that answers in napi's own.
-fn thrown(env: &Env, error: napi::Error<String>) -> napi::Error {
+pub fn thrown(env: &Env, error: napi::Error<String>) -> napi::Error {
     napi::Error::from(JsError::from(error).into_unknown(*env))
 }
 
@@ -232,32 +243,22 @@ impl JsConsoleBuilder {
     }
 }
 
-/// The console, or nothing once it has been closed — and what makes dropping it say `quit`.
-struct Held {
-    console: Option<Console>,
-
-    /// The runtime the console was built on, which is where its `quit` has to go out.
-    runtime: Handle,
+/// The console a slot holds, or the error for one that has been closed.
+fn held(slot: &mut Option<Console>) -> Result<&mut Console> {
+    slot.as_mut().ok_or_else(|| {
+        napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed")
+    })
 }
 
-impl Held {
-    fn get(&mut self) -> Result<&mut Console> {
-        self.console.as_mut().ok_or_else(|| {
-            napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed")
-        })
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        let _entered = self.runtime.enter();
-        self.console.take();
-    }
-}
+/// A console slot: the console, or nothing once it has been closed.
+pub type Slot = Arc<Mutex<Option<Console>>>;
 
 #[napi(js_name = "Console")]
 pub struct JsConsole {
-    console: Arc<Mutex<Held>>,
+    console: Slot,
+
+    /// The runtime the console was built on, which is where its `quit` has to go out.
+    runtime: Handle,
 
     /// [`Console::mounts`], read once: the paths are fixed when the session is announced, and
     /// a getter that had to await the lock for them would make them a promise.
@@ -272,10 +273,29 @@ impl JsConsole {
                 .mounts()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
-            console: Arc::new(Mutex::new(Held {
-                console: Some(console),
-                runtime: Handle::current(),
-            })),
+            console: Arc::new(Mutex::new(Some(console))),
+            runtime: Handle::current(),
+        }
+    }
+
+    /// The slot this console is held in, for a holder that shares it — see the module docs.
+    pub fn slot(&self) -> Slot {
+        self.console.clone()
+    }
+
+    /// The runtime a holder of [`slot`](Self::slot) enters to let go of it.
+    pub fn runtime(&self) -> Handle {
+        self.runtime.clone()
+    }
+}
+
+/// What makes dropping the last holder say `quit`: the console is let go of on the runtime.
+/// A holder that is not the last leaves it to whichever is.
+impl Drop for JsConsole {
+    fn drop(&mut self) {
+        if let Some(slot) = Arc::get_mut(&mut self.console) {
+            let _entered = self.runtime.enter();
+            slot.get_mut().take();
         }
     }
 }
@@ -331,13 +351,8 @@ impl JsConsole {
     pub fn start<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, ()>> {
         let console = self.console.clone();
         promise(env, async move {
-            console
-                .lock()
-                .await
-                .get()?
-                .start()
-                .await
-                .map_err(error::failure)
+            let mut slot = console.lock().await;
+            held(&mut slot)?.start().await.map_err(error::failure)
         })
     }
 
@@ -345,13 +360,8 @@ impl JsConsole {
     pub fn stop<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, ()>> {
         let console = self.console.clone();
         promise(env, async move {
-            console
-                .lock()
-                .await
-                .get()?
-                .stop()
-                .await
-                .map_err(error::failure)
+            let mut slot = console.lock().await;
+            held(&mut slot)?.stop().await.map_err(error::failure)
         })
     }
 
@@ -365,8 +375,8 @@ impl JsConsole {
         let console = self.console.clone();
         promise(env, async move {
             let timeout_ms = unsigned(timeout_ms, "timeoutMs")?;
-            let mut held = console.lock().await;
-            let resp = held.get()?.exec(cmd, timeout_ms).await;
+            let mut slot = console.lock().await;
+            let resp = held(&mut slot)?.exec(cmd, timeout_ms).await;
             resp.map(ExecResult::from).map_err(error::failure)
         })
     }
@@ -382,8 +392,8 @@ impl JsConsole {
         let console = self.console.clone();
         promise(env, async move {
             let (offset, len) = (unsigned(offset, "offset")?, unsigned(len, "len")?);
-            let mut held = console.lock().await;
-            let resp = held.get()?.read(path, offset, len).await;
+            let mut slot = console.lock().await;
+            let resp = held(&mut slot)?.read(path, offset, len).await;
             resp.map(ReadResult::from).map_err(error::failure)
         })
     }
@@ -401,8 +411,8 @@ impl JsConsole {
         let data = bytes(data);
         promise(env, async move {
             let offset = unsigned(offset, "offset")?;
-            let mut held = console.lock().await;
-            let resp = held.get()?.write(path, data, offset).await;
+            let mut slot = console.lock().await;
+            let resp = held(&mut slot)?.write(path, data, offset).await;
             resp.map(|w| w.size as i64).map_err(error::failure)
         })
     }
@@ -411,7 +421,8 @@ impl JsConsole {
     pub fn snapshot<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, Buffer>> {
         let console = self.console.clone();
         promise(env, async move {
-            let blob = console.lock().await.get()?.snapshot().await;
+            let mut slot = console.lock().await;
+            let blob = held(&mut slot)?.snapshot().await;
             blob.map(Buffer::from).map_err(error::failure)
         })
     }
@@ -422,7 +433,7 @@ impl JsConsole {
         let console = self.console.clone();
         promise(env, async move {
             // Dropped here, on the runtime, which is what lets `quit` go out.
-            console.lock().await.console.take();
+            console.lock().await.take();
             Ok(())
         })
     }

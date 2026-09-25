@@ -10,7 +10,12 @@
 //! trees they see, [`image`] for what they run on, and [`error`] for how either half's
 //! failures arrive as JavaScript errors.
 
-mod console;
-mod error;
-mod fs;
-mod image;
+//!
+//! The modules are public for a binding that links this crate into an addon of its own — see
+//! the `rlib` in `Cargo.toml`. Linking it is all that takes: napi registers every class here
+//! into whichever addon it is linked into.
+
+pub mod console;
+pub mod error;
+pub mod fs;
+pub mod image;
