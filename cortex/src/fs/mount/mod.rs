@@ -27,27 +27,39 @@
 //! consumer names *what it owns* — a guard, or the register — never a path to sweep, because
 //! a path says nothing about whose mount is on it.
 //!
-//! Both are ungated, and are what a *consumer* of the trait needs rather than what a binding
-//! needs: clearing a mount a dead run left takes no binding at all. Both are also built out
-//! of what the guards' own teardown uses, so a cortex mount comes down exactly one way
-//! whether its owner is alive or not.
+//! Neither is gated on a *binding*, and both are what a consumer of the trait needs rather
+//! than what a binding needs: clearing a mount a dead run left takes no binding at all. Both
+//! are also built out of what the guards' own teardown uses, so a cortex mount comes down
+//! exactly one way whether its owner is alive or not.
+//!
+//! They are gated on **unix**, which is a different axis and not a choice made here. A mount
+//! point is claimed with a pid and a mode, swept with `kill(pid, 0)`, and taken down by
+//! reading the host's mount table — none of which Windows has a spelling for, and there is
+//! no binding on Windows to leave a mount behind in the first place. So the cleanup half of
+//! this module is compiled where the mounting half can exist; [`Mount`] itself stays
+//! everywhere, because a directory the host already had is a mount on any platform.
 
+#[cfg(unix)]
 mod claim;
 mod r#impl;
 mod mount;
+#[cfg(unix)]
 mod signal;
+#[cfg(unix)]
 mod table;
 
 // The guards themselves are each gated on the binding that exports them, so a build without
 // that feature has no name for one — which is the point: it cannot mount that way either.
-// Ungated, like the trait and for the same reason: recovering a mount point and
-// taking this process's mounts down on a signal are about mounts the *host* has,
-// which outlives which binding made one — and the run that has to clean up after
-// a killed process is usually not the run that mounted.
+// Not gated on a binding, like the trait and for the same reason: recovering a mount point
+// and taking this process's mounts down on a signal are about mounts the *host* has, which
+// outlives which binding made one — and the run that has to clean up after a killed process
+// is usually not the run that mounted. Unix only, per the module docs.
+#[cfg(unix)]
 pub use claim::reclaim_abandoned;
 #[cfg(feature = "fuse")]
 pub use r#impl::{FuseMount, MountOption};
 #[cfg(feature = "fuse-t")]
 pub use r#impl::{FuseTBackend, FuseTMount};
 pub use mount::*;
+#[cfg(unix)]
 pub use signal::unmount_on_signal;
