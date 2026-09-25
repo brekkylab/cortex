@@ -78,6 +78,27 @@ microsandbox-network = "=0.6.12"
 # on `Posix` itself rather than a wrapper holding one — the same shape `fuse-t` takes,
 # over the same `Mutex`-held inode and open tables.
 fuser = "0.17"
+
+# The Windows binding. `dokan` is the safe wrapper; what it links is Dokany's *user-mode*
+# DLL, dynamically, which is what keeps its LGPL to the library and off a consumer of this
+# crate — see the `dokan` feature in `cortex/Cargo.toml`. The kernel driver beside it is
+# installed on the host and never linked.
+dokan = "0.3"
+# The NT-level `FILE_CREATE`/`FILE_DIRECTORY_FILE` numbering a `create_file` decodes. `dokan`
+# re-exports the library's types but not these constants, and it already depends on this
+# crate, so naming it directly adds nothing to the graph — the same argument `libc` makes.
+dokan-sys = "0.3"
+# UTF-16 strings, which every name Dokan hands over is one of.
+#
+# **Pinned to what `dokan` itself takes**, which is the old 0.4 rather than the current 1.x.
+# `U16CStr` is in `dokan`'s public API, so two versions in one build are two unrelated types
+# and every callback fails to match the trait it is implementing — with an error that names
+# the same type twice.
+widestring = "0.4"
+# `NTSTATUS` and the `STATUS_*`/`FILE_ATTRIBUTE_*` numbering a Windows filesystem answers in —
+# what `libc`'s `errno` values are to the FUSE bindings. Only the three modules the binding
+# reads: winapi gates every module behind a feature, and the default set is empty.
+winapi = { version = "0.3", features = ["ntdef", "ntstatus", "winnt"] }
 # A read-only S3 backend. `default-features = false` on purpose: the default set
 # is `["fs"]`, which is object_store's *own* local-filesystem store and drags in
 # walkdir/nix/same-file for a thing we already have in `PassthroughVolume`. The

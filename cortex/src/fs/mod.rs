@@ -11,7 +11,8 @@
 //! * [`Mount`] — the state of having been mounted, which is a path on this host where a kernel
 //!   will answer. What implements it is the guard a binding hands back, and the bindings are
 //!   one per concrete filesystem interface, each doing nothing but translating that interface's
-//!   calls onto [`Posix`].
+//!   calls onto the layer below it — [`Posix`] for an interface that addresses files by number
+//!   and descriptor, [`FileSystem`] itself for one that addresses them by path.
 //! * [`Directory`] — files held in memory with host directories grafted in beside them, and
 //!   itself a [`FileSystem`], so it is both a consumer of the trait and something the bindings
 //!   can drive like any single store.
@@ -20,8 +21,9 @@
 //! first is a contract some type implements and nothing outside this process can see; the
 //! second is a path where a kernel will answer, made by a binding and taken down when the
 //! guard is dropped. A binding exports one such guard: `FuseMount` for the kernel's FUSE,
-//! `FuseTMount` for the transports FUSE-T's helper carries. Constructing one mounts, dropping
-//! it unmounts, and nothing else about the mount is reachable.
+//! `FuseTMount` for the transports FUSE-T's helper carries, `DokanMount` for a Windows volume
+//! through Dokany. Constructing one mounts, dropping it unmounts, and nothing else about the
+//! mount is reachable.
 //!
 //! **A real mount is the only way out.** A guest that needs one of these trees gets it the way
 //! anything else does — mounted on the host, then passed in as a directory — so there is no

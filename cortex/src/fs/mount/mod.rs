@@ -3,8 +3,9 @@
 //! The split is between what a mount *is* and what makes one. [`Mount`] is the first, and is
 //! all a consumer needs: a mounted tree is a path, and every binding's guard reports one the
 //! same way. The bindings are the second, one per concrete filesystem interface, each
-//! translating that interface's calls onto [`Posix`](super::Posix) and exporting a guard that
-//! mounts on construction.
+//! translating that interface's calls onto the layer below — [`Posix`](super::Posix) where the
+//! interface speaks inodes and handles, [`FileSystem`](super::FileSystem) directly where it
+//! speaks paths — and exporting a guard that mounts on construction.
 //!
 //! Which bindings a build has is a feature, and the split is why that stays contained: the
 //! guards are re-exported gated, the trait is not, so a consumer can take a tree the host has
@@ -27,17 +28,11 @@
 //! consumer names *what it owns* — a guard, or the register — never a path to sweep, because
 //! a path says nothing about whose mount is on it.
 //!
-//! Neither is gated on a *binding*, and both are what a consumer of the trait needs rather
+//! Neither is gated on a binding, and both are what a *consumer* of the trait needs rather
 //! than what a binding needs: clearing a mount a dead run left takes no binding at all. Both
 //! are also built out of what the guards' own teardown uses, so a cortex mount comes down
-//! exactly one way whether its owner is alive or not.
-//!
-//! They are gated on **unix**, which is a different axis and not a choice made here. A mount
-//! point is claimed with a pid and a mode, swept with `kill(pid, 0)`, and taken down by
-//! reading the host's mount table — none of which Windows has a spelling for, and there is
-//! no binding on Windows to leave a mount behind in the first place. So the cleanup half of
-//! this module is compiled where the mounting half can exist; [`Mount`] itself stays
-//! everywhere, because a directory the host already had is a mount on any platform.
+//! exactly one way whether its owner is alive or not. Unix only, because a claim is a pid and
+//! a mode and a sweep is `kill(pid, 0)`.
 
 #[cfg(unix)]
 mod claim;
@@ -53,9 +48,11 @@ mod table;
 // Not gated on a binding, like the trait and for the same reason: recovering a mount point
 // and taking this process's mounts down on a signal are about mounts the *host* has, which
 // outlives which binding made one — and the run that has to clean up after a killed process
-// is usually not the run that mounted. Unix only, per the module docs.
+// is usually not the run that mounted.
 #[cfg(unix)]
 pub use claim::reclaim_abandoned;
+#[cfg(all(feature = "dokan", windows))]
+pub use r#impl::{DokanMount, MountFlags};
 #[cfg(feature = "fuse")]
 pub use r#impl::{FuseMount, MountOption};
 #[cfg(feature = "fuse-t")]

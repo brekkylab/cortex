@@ -1,9 +1,9 @@
 //! A real host mount, driven through the operating system.
 //!
 //! Every other test calls the bindings directly, which proves only that the code
-//! answers correctly when *we* ask. This is the one place a kernel asks: real FUSE
-//! opcodes over a real mount, in whatever order and with whatever flags the OS
-//! chooses.
+//! answers correctly when *we* ask. This is the one place a kernel asks: real
+//! filesystem requests over a real mount, in whatever order and with whatever
+//! flags the OS chooses.
 //!
 //! `#[ignore]` because it needs a mount provider and touches the real
 //! filesystem.
@@ -16,6 +16,9 @@
 //!
 //! # Linux, or macOS with macFUSE:
 //! cargo test --features fuse --test host_mount -- --ignored
+//!
+//! # Windows, with Dokany installed:
+//! cargo test --features dokan --test host_mount -- --ignored
 //! ```
 //!
 //! # Which binding to use where
@@ -25,21 +28,42 @@
 //! | Linux | `fuser`, straight to `/dev/fuse` | `fuse` |
 //! | macOS + FUSE-T | libfuse-t's own session loop | `fuse-t` |
 //! | macOS + macFUSE | `fuser` (its macOS path targets macFUSE 4.x) | `fuse` |
+//! | Windows | Dokany's driver, through `dokan` | `dokan` |
 //!
 //! **`fuser` cannot drive FUSE-T** — see `adapter/fuse_t.rs`, which exists for
 //! exactly that reason.
 //!
-//! A missing provider fails at *build* time (both features probe with
-//! pkg-config), never by silently passing: a test that quietly does not run is
-//! worse than one that fails.
+//! **A missing provider is not the same failure on every platform.** The two
+//! FUSE features probe with pkg-config and so fail at *build* time, never by
+//! silently passing. Dokany cannot: its driver is a runtime fact, so a build
+//! without it succeeds and `try_new` answers `can't install driver` instead.
+//! Either way the test fails rather than quietly not running, which is the
+//! property that matters — a test that silently does not run is worse than one
+//! that fails.
+//!
+//! # What it means that these bodies are shared
+//!
+//! The Windows binding reaches `FileSystem` directly where the FUSE ones go
+//! through `Posix`, so it is the one that could drift without anybody noticing.
+//! Running the *same* assertions through it is what makes that structural
+//! difference invisible from outside, which is the claim worth testing: a cortex
+//! tree behaves the same whichever kernel is asking.
 
-#![cfg(any(feature = "fuse", feature = "fuse-t"))]
+#![cfg(any(feature = "fuse", feature = "fuse-t", all(feature = "dokan", windows)))]
 
 use std::{fs, path::PathBuf};
 
-// One set of test bodies for both host bindings: they expose the same call
+// One set of test bodies for every host binding: they expose the same call
 // surface, so which is under test is a matter of which feature is on — making
-// these tests evidence that the two behave *alike*, not just that each behaves.
+// these tests evidence that they behave *alike*, not just that each behaves.
+/// The Windows binding, which is the only one on that platform — the two FUSE
+/// features have no provider there to build against.
+#[cfg(all(
+    feature = "dokan",
+    windows,
+    not(any(feature = "fuse", feature = "fuse-t"))
+))]
+use cortex::fs::DokanMount as HostMount;
 #[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
 use cortex::fs::FuseMount as HostMount;
 /// Whichever host binding this build has. FUSE-T wins a tie, needing no kernel extension.
@@ -75,7 +99,7 @@ fn volume() -> InMemFs {
 }
 
 #[test]
-#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_cortex_mount() {
     let mnt = mountpoint("read");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
@@ -111,7 +135,7 @@ fn the_operating_system_can_read_a_cortex_mount() {
 /// Also the only place a real kernel drives the mount table: every other test here mounts
 /// a single store.
 #[test]
-#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_multi_source_workspace() {
     let mnt = mountpoint("workspace");
     let (project, notes) = (host_dir(), host_dir());
@@ -172,7 +196,7 @@ fn host_dir() -> tempfile::TempDir {
 /// not cosmetic: a guest negotiating `AUTO_INVAL_DATA` decides from `mtime` alone
 /// when to drop cached pages, and `find -newer`, `make` and `rsync` all read it.
 #[test]
-#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_sees_real_timestamps() {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -227,7 +251,7 @@ fn the_operating_system_sees_real_timestamps() {
 /// ("Permission denied", from libfuse-t's default), leaving the edit stranded in
 /// the `.tmp` and the original untouched.
 #[test]
-#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
 fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
     let mnt = mountpoint("rename");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
@@ -276,7 +300,7 @@ fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
 }
 
 #[test]
-#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_can_write_to_a_cortex_mount() {
     let mnt = mountpoint("write");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
@@ -331,7 +355,7 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
 /// starts from an offset the test chose, so none of them would notice if that stopped
 /// being true.
 #[test]
-#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_can_append_to_a_cortex_mount() {
     use std::io::Write;
 
@@ -355,11 +379,39 @@ fn the_operating_system_can_append_to_a_cortex_mount() {
     fs::remove_dir_all(&mnt).ok();
 }
 
+/// The Windows counterpart of the `fuser` test below: same claim, same shape, a
+/// flag from Dokany's own set instead of `fuser`'s.
+///
+/// Worth having twice rather than once, because "the kernel refuses the write"
+/// is the *only* assertion in this file that is not about a store answering —
+/// and the two kernels refuse for reasons neither binding controls.
+#[cfg(all(
+    feature = "dokan",
+    windows,
+    not(any(feature = "fuse", feature = "fuse-t"))
+))]
+#[test]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
+fn a_write_protected_volume_is_enforced_by_the_driver() {
+    let mnt = mountpoint("readonly");
+    let mount = HostMount::try_new_with(volume(), &mnt, cortex::fs::MountFlags::WRITE_PROTECT)
+        .expect("mount");
+
+    // Refused by the *driver*: the request never reaches a store, which is stronger than
+    // each store answering `ReadOnlyFilesystem` by hand.
+    assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
+    assert!(fs::write(mnt.join("nope.txt"), b"x").is_err());
+
+    // Dropping is the unmount — the guard has no other way down, and no way to report one.
+    drop(mount);
+    fs::remove_dir_all(&mnt).ok();
+}
+
 /// `fuser`-only: mount options are part of its call surface, and FUSE-T's are a
 /// different set. The behaviour under test is the kernel's, not ours.
 #[cfg(all(feature = "fuse", not(feature = "fuse-t")))]
 #[test]
-#[ignore = "needs a libfuse provider and mounts a real filesystem"]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
 fn a_read_only_mount_is_enforced_by_the_kernel() {
     let mnt = mountpoint("readonly");
     let mount = HostMount::try_new_with(
