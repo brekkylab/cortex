@@ -90,11 +90,11 @@ cortex
 
 ### Coverage
 
-Use it from Python, Node or Rust, with the same API in each.
-
-Runs on Linux, macOS (Apple silicon) and Windows 11 or later.
-
-The guest is always Linux.
+| | Supported |
+|---|---|
+| **Languages** | 🐍 Python · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nodejs/nodejs-original.svg" height="14" alt=""> Node · 🦀 Rust - same API in each |
+| **Hosts** | 🐧 Linux · 🍎 macOS (Apple silicon) · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/windows11/windows11-original.svg" height="14" alt=""> Windows 11 or later |
+| **Guest** | 🐧 Linux, always |
 
 ### GPU support
 
@@ -181,23 +181,24 @@ The `mount` feature, on by default, mounts a cortex filesystem on the host throu
 
 If you don't mount on the host, build with `default-features = false` and skip all of this.
 
-### macOS
+For macOS
 
 ```sh
 brew install --cask fuse-t
 ```
 
-### Windows
+And for windows
 
 ```powershell
 winget install --id dokan-dev.Dokany
 ```
 
-The build links the installed Dokany library when `DokanLibrary2_LibraryPath_x64` is set, and otherwise builds one from vendored sources. Prefer the installed one: a self-built library can disagree with the installed driver's version, which fails only at mount time.
 
 ## Cache
 
 The only thing cortex keeps is its cache, all under one directory you can delete at any time:
+
+You can safely remove it whenever you no longer need it.
 
 | Host | Cache directory |
 |------|-----------------|
