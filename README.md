@@ -26,6 +26,4 @@ brew install --cask fuse-t
 winget install --id dokan-dev.Dokany
 ```
 
-The build links the installed Dokany library when `DokanLibrary2_LibraryPath_x64` is set,
-and otherwise builds one from vendored sources. Prefer the installed one: a self-built
-library can disagree with the installed driver's version, which fails only at mount time.
+The build links the installed Dokany library when `DokanLibrary2_LibraryPath_x64` is set, and otherwise builds one from vendored sources. Prefer the installed one: a self-built library can disagree with the installed driver's version, which fails only at mount time.
