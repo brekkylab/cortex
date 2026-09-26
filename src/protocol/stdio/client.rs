@@ -11,16 +11,23 @@
 //!
 //! A client over stdio is a client over some program's pipes, so [`new`](StdioClient::new)
 //! takes the program and starts it. What a caller decides is the command — what to run,
-//! with what arguments and environment, where its stderr goes; the two descriptors the
+//! with what arguments and environment; the two descriptors the
 //! protocol runs on are this end's, because a caller who got those wrong would have a
 //! client with nothing to say.
 //!
 //! The pipes and the process are therefore one fact, and this end holds both.
 //! [`quit`](Client::quit) is the ending: the writer is dropped — which is how a
 //! server learns the session is over — and then the process is waited for. Dropping a
-//! client that was never quit kills it instead ([`kill_on_drop`]), so a server does not
-//! outlive the channel to it either way. Which is also the only ending a `drop` can
-//! offer: collecting a process is an `await`, and nothing may await on the way out.
+//! client that was never quit is the same ending without the wait: the writer goes with
+//! it, the server reads the end of its input and takes itself down, and nobody is left to
+//! collect the status. Collecting a process is an `await`, and nothing may await on the
+//! way out. A client whose whole process goes ends the same way, because the operating
+//! system closes the pipe.
+//!
+//! **Not killed**, which is what this end once did on a drop. A server killed has no
+//! chance to release what the session made — a machine, a disk, an image built for it —
+//! and one that reads the end of its input does. The cost is that a server stuck in a call
+//! outlives the client until that call returns.
 //!
 //! Which is why the process is not a [`ConsoleClient`]'s. What a session *is* — the methods, the
 //! tree they are spelled against — is the same wherever a server runs; something to `wait`
@@ -32,14 +39,14 @@
 //! wants.
 //!
 //! [`ConsoleClient`]: crate::console::ConsoleClient
-//! [`kill_on_drop`]: tokio::process::Command::kill_on_drop
 
-use std::{io, process::Stdio};
+use std::{io, process::Stdio, time::Duration};
 
 use futures_core::future::BoxFuture;
 use tokio::{
     io::{AsyncRead, AsyncWrite, BufReader},
     process::{Child, Command},
+    task::JoinHandle,
 };
 
 use crate::protocol::{
@@ -77,6 +84,8 @@ pub struct StdioClient {
     /// whose session is over, so nothing has to be tracked twice.
     server: Option<Child>,
 
+    stderr: Option<JoinHandle<()>>,
+
     /// From zero, by one. Nothing on the other side reads a meaning into the number,
     /// and it only has to be unique among this client's own — see [`RequestId`].
     next_id: RequestId,
@@ -86,10 +95,9 @@ impl StdioClient {
     /// Start `server` and drive the session over its own pipes.
     ///
     /// Everything about the command is the caller's — what to run, its arguments, its
-    /// environment, where its stderr goes — except the three things this end sets: the two
-    /// descriptors the protocol needs, and that the process dies with the client. A caller
-    /// who got the descriptors wrong would have a client with nothing to say, so they are
-    /// not something to get wrong.
+    /// environment — except the descriptors the protocol needs, which this end sets. A
+    /// caller who got those wrong would have a client with nothing to say, so they are not
+    /// something to get wrong.
     ///
     /// The pipes are the protocol's from here on, and so is the process: nothing else may
     /// reach either, because a reader that could would take a byte that was a response's.
@@ -100,18 +108,22 @@ impl StdioClient {
         let mut server = server
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            // The ending a `drop` can give. See the module docs.
-            .kill_on_drop(true)
+            .stderr(Stdio::piped())
             .spawn()?;
 
         // Both are `Some`: they were asked for immediately above.
         let outgoing = server.stdin.take().expect("a piped stdin");
         let incoming = server.stdout.take().expect("a piped stdout");
+        let mut said = server.stderr.take().expect("a piped stderr");
+        let stderr = tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut said, &mut tokio::io::stderr()).await;
+        });
 
         Ok(StdioClient {
             incoming: BufReader::new(Box::new(incoming)),
             outgoing: Box::new(outgoing),
             server: Some(server),
+            stderr: Some(stderr),
             next_id: 0,
         })
     }
@@ -131,6 +143,7 @@ impl StdioClient {
             incoming: BufReader::new(Box::new(incoming)),
             outgoing: Box::new(outgoing),
             server: None,
+            stderr: None,
             next_id: 0,
         }
     }
@@ -246,6 +259,10 @@ impl Client for StdioClient {
                 .wait()
                 .await
                 .map_err(broke("waiting for the console server"))?;
+
+            if let Some(stderr) = self.stderr.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(1), stderr).await;
+            }
 
             if !status.success() {
                 return Err(Failure::broken(format!(

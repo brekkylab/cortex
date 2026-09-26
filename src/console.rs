@@ -155,8 +155,7 @@ impl ConsoleClientBuilder {
     /// `cmd` is a program and its arguments — `["cortex-local-console"]`,
     /// `["sh", "-c", "…"]` — and that is the whole of what this shape of caller decides,
     /// since the two descriptors the protocol runs on are the client's. A caller who
-    /// wants more of the command than that — an environment, a directory, somewhere for
-    /// its stderr to go — builds the [`Command`] itself and hands it to
+    /// wants more of the command than that — an environment, a directory — builds the [`Command`] itself and hands it to
     /// [`StdioClient::new`], then the client to [`client`](Self::client).
     ///
     /// Starting it is [`build`](Self::build)'s, not this method's — nothing here starts
@@ -711,9 +710,8 @@ impl Drop for ConsoleClient {
     /// an `Option` would have put a state that cannot happen into every method that asks.
     ///
     /// Off a runtime, or on one that shuts down before the task is polled, the client is
-    /// dropped without the message. That is still an ending, just an abrupt one: over
-    /// stdio the server process is killed rather than asked, and what it left behind is
-    /// swept by the next run.
+    /// dropped without the message. That is still an ending: over stdio the server's input
+    /// closes with it, and the server takes itself down as if it had heard `quit`.
     fn drop(&mut self) {
         hang_up(&mut self.client);
     }
