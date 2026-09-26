@@ -52,13 +52,13 @@ use futures_core::future::BoxFuture;
 use tokio::process::Command;
 
 use crate::{
+    cache_root,
     fs::Mount,
     image::ImageSource,
     protocol::{
         Call, Client, ExecCall, ExecResp, Failure, InitCall, MountSpec, NetworkAccess,
         Notification, ReadCall, ReadResp, Response, WriteCall, WriteResp, stdio::StdioClient,
     },
-    stdio_server_dir,
 };
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
@@ -120,7 +120,7 @@ pub struct ConsoleClientBuilder {
 impl Default for ConsoleClientBuilder {
     fn default() -> Self {
         ConsoleClientBuilder {
-            client_factory: stdio_factory(&[stdio_server_dir().join("cortex-krun")]),
+            client_factory: stdio_factory(&[cache_root().join("bin").join("cortex-krun")]),
             image: None,
             snapshot: None,
             mounts: Vec::new(),

@@ -112,24 +112,46 @@ pub mod protocol;
 /// [`Server`]: console::Server
 pub use futures_core::future::BoxFuture;
 
-fn stdio_server_dir() -> std::path::PathBuf {
-    if let Some(dir) = std::env::var_os("CORTEX_STDIO_SERVER_PATH") {
-        return dir.into();
+/// Everything cortex keeps on this host, under one root: `$CORTEX_HOME`, or
+/// `cortex` under the user's cache directory.
+///
+/// **One rule for every kind of thing kept here**, because a host has one answer to "where
+/// does this go" and two ways of deriving it are two answers. What hangs off it is split by
+/// what owns it -- images below, which every tool in this repository shares, and one
+/// directory per live server process, which no other process has any business in -- and that
+/// split is a path under the root rather than a root of its own.
+///
+/// The user's cache directory is `XDG_CACHE_HOME` or `~/.cache`, on macOS
+/// `~/Library/Caches`, and on Windows `%LOCALAPPDATA%`, falling back to
+/// `%USERPROFILE%\AppData\Local` when that is unset.
+pub fn cache_root() -> std::path::PathBuf {
+    if let Some(named) = std::env::var_os("CORTEX_HOME") {
+        return std::path::PathBuf::from(named);
     }
-    // Windows keeps per-user caches under `%LOCALAPPDATA%`, not a dot directory in the
-    // profile.
+
     #[cfg(windows)]
-    let cache = std::env::var_os("LOCALAPPDATA")
+    return std::env::var_os("LOCALAPPDATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            std::env::home_dir()
-                .unwrap_or_default()
+            std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap())
                 .join("AppData")
                 .join("Local")
-        });
-    #[cfg(not(windows))]
-    let cache = std::env::home_dir().unwrap_or_default().join(".cache");
-    cache.join("cortex").join("bin")
+        })
+        .join("cortex");
+
+    #[cfg(target_os = "macos")]
+    return std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join("Library")
+        .join("Caches")
+        .join("cortex");
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    return std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache")
+        })
+        .join("cortex");
 }
 
 /// Fetch the console servers if it is not cached.

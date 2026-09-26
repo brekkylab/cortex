@@ -9,11 +9,11 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::process::Command;
 
 use crate::{
+    cache_root,
     console::hang_up,
     protocol::{
         BuildImageCall, BuildImageResp, Client, Failure, RemoveImageCall, stdio::StdioClient,
     },
-    stdio_server_dir,
 };
 
 /// A client for managing the images.
@@ -50,7 +50,7 @@ pub struct ImageClient {
 
 impl ImageClient {
     pub async fn try_new() -> Result<Self, Failure> {
-        Self::try_from_cmd(&[stdio_server_dir().join("cortex-krun")]).await
+        Self::try_from_cmd(&[cache_root().join("bin").join("cortex-krun")]).await
     }
 
     pub async fn try_from_cmd(cmd: &[impl AsRef<OsStr>]) -> Result<Self, Failure> {
