@@ -13,7 +13,7 @@ Two things make it more than a remote `exec`:
 **Each end of the channel does one job.** The client only asks; the server only answers.
 There is no request a server ever issues, which is what leaves one channel, one end that asks and one end that answers — see [The channel](#the-channel).
 
-Source: [`message/`](message/) for the objects, [`stdio/channel.rs`](stdio/channel.rs) for the wire, [`base.rs`](base.rs) for what each end can do, [`stdio/`](stdio/) for the ends themselves, [`console.rs`](console.rs) for the public end.
+Source: [`message/`](message/) for the objects, [`stdio/channel.rs`](stdio/channel.rs) for the wire, [`base.rs`](base.rs) for what each end can do, [`stdio/`](stdio/) for the ends themselves, [`client.rs`](client.rs) for the public end.
 
 ---
 
@@ -149,6 +149,10 @@ Member order is free — `params` may arrive before the `method` that types it.
 
 | method | `params` | `result` |
 |---|---|---|
+| `version` | - | `{version}` |
+| `build_image` | `{recipe, ref?}` | `{ref, digest}` |
+| `remove_image` | `{image}` | `{}` |
+| `list_images` | `{}` | `{images}` |
 | `init` | `{image?, snapshot?, network?, vcpus?, memory_mib?, gpu?, gpu_memory_mib?, disk_gib?, mounts?}` | `{cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
@@ -276,7 +280,7 @@ A backend whose commands run somewhere else — a guest, a container — mounts 
 
 A client that also wants to reach those files *itself* already can, and not through this protocol: it mounted the tree, so it has its own name for the same directory — the mount point behind the URL it sent.
 The two names never have to meet, because only one of them is ever in a frame.
-This is what [`Console`](console.rs) keeps apart by holding both: the mount it was handed, and the guest path it named.
+This is what [`ConsoleClient`](client.rs) keeps apart by holding both: the mount it was handed, and the guest path it named.
 
 **One spelling, and it is this one.**
 Every path that comes out of a session afterwards has to be spelled the way the call wrote it, because the client's only way to relate one to the other is the characters — including what a command's own `pwd` prints, which is a path a client will turn around and send back in a `read`.
@@ -350,7 +354,7 @@ The machine is the unit this protocol hands out, and a session that wants two si
 **Nothing is booted by it**, and the response is not a readiness signal — it is the one thing about a session a client can hear before it asks for work: that there is a server on the far end, that it read the frame, that it speaks this protocol, and that it has taken what it was told.
 A notification could say none of that, which is the whole reason this one method is answered.
 
-Which is also why the asking side sends it when a console is *constructed* rather than leaving it to a caller to remember: a `Console` that exists is one that got this answer back. See [Session](#session).
+Which is also why the asking side sends it when a console is *constructed* rather than leaving it to a caller to remember: a `ConsoleClient` that exists is one that got this answer back. See [Session](#session).
 
 A second `init` replaces the first and takes whatever was booted under it with it.
 The trees are built into what booting produced — a mounted tree apiece — so a session that changes them has a boot that no longer matches it; the next call that needs one builds it again, from what has just arrived.
@@ -525,7 +529,7 @@ So a client that sent a `stop` keeps every path it had built; what changed is on
 [Where the session stands](#where-the-session-stands) survives it too. A current directory is a `PathBuf`, not occupancy — there is nothing to hand back by forgetting it — and a client that ran a `cd`, went idle and came back would otherwise find itself somewhere it never asked to be.
 So a server process outlives the resources it booted, which is what makes handing them back cheap: it costs one cold start later and nothing else.
 
-`Console::stop` is therefore not the end of anything and not owed; dropping the `Console` is what sends `quit`, and a server on its way out releases what a `stop` would have released.
+`ConsoleClient::stop` is therefore not the end of anything and not owed; dropping the `ConsoleClient` is what sends `quit`, and a server on its way out releases what a `stop` would have released.
 What `quit` costs to carry out is the transport's — over stdio it also closes the server's stdin and waits for the process, because that client is what started it.
 
 `stop` does **not** wait for an `exec` that is still running.
@@ -583,14 +587,14 @@ sequenceDiagram
 
 **The client is purely an asking end.**
 No listener, no accept loop, no task per call, and nothing to join at shutdown.
-`Console::exec` waits on the caller's own task and returns one result for the one command it was given.
+`ConsoleClient::exec` waits on the caller's own task and returns one result for the one command it was given.
 
 **Both ends are async, and neither is concurrent with itself.**
 Every method that waits is a future, so a caller can drive many consoles from one runtime — but one console's methods take `&mut self`, because the protocol has one call outstanding at a time.
 Concurrency is *across* sessions, never within one.
 
 **Shutting down is one-sided.**
-Ending the session ends the console channel, and it is a lifetime rather than a decision: dropping a `Console` says `quit`, which is owed exactly once and at exactly one moment.
+Ending the session ends the console channel, and it is a lifetime rather than a decision: dropping a `ConsoleClient` says `quit`, which is owed exactly once and at exactly one moment.
 Nobody hears what it answered, because nothing answers it and there is no caller left to tell.
 
 ---
@@ -667,7 +671,7 @@ The paths it named are a fact about every state after it: in `Idle` nothing is m
 
 > **Barely enforced today, and mostly the answering side's to enforce.**
 > An answering end moves frames and reads no meaning into them, and the shared server layer that held these rules is gone.
-> The asking side keeps no second copy of any of it, with one exception: `init` is sent when a `Console` is constructed, so the one ordering rule that is guaranteed on this side is that it comes first.
+> The asking side keeps no second copy of any of it, with one exception: `init` is sent when a `ConsoleClient` is constructed, so the one ordering rule that is guaranteed on this side is that it comes first.
 > Everything after that is what a caller asked for, in the order it asked.
 >
 > Where enforcement belongs when it comes back: not in each backend, because every backend's version would be the same and would be the same to get wrong.

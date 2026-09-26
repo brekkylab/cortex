@@ -1,7 +1,7 @@
 //! How cortex's failures arrive in Python.
 //!
-//! A console call fails one of two ways, and they are two exceptions because a caller acts
-//! on them differently: [`Failure::Refused`] is the server answering with an error — a
+//! A console or image-client call fails one of two ways, and they are two exceptions because
+//! a caller acts on them differently: [`Failure::Refused`] is the server answering with an error — a
 //! timeout, a missing file — and carries the code it answered with, where
 //! [`Failure::Broken`] is the channel itself gone, after which nothing more will be heard.
 //! Both derive from `CortexError`, which is also what a failure with no finer class —
@@ -10,7 +10,7 @@
 //! The filesystem half answers in [`std::io::Error`], and pyo3 already raises that as the
 //! matching `OSError` subclass, so it is left to do so.
 
-use cortex::console::{Error, Failure};
+use cortex::protocol::{Error, Failure};
 use pyo3::{create_exception, exceptions::PyException, prelude::*, types::PyDict};
 
 create_exception!(cortex, CortexError, PyException);

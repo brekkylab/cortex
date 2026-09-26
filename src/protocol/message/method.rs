@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Method {
+    Version,
+    BuildImage,
+    RemoveImage,
+    ListImages,
     Init,
     Exec,
     Read,
@@ -27,6 +31,10 @@ impl Method {
     /// The name as it appears in a `method` member.
     pub fn as_str(&self) -> &'static str {
         match self {
+            Method::Version => "version",
+            Method::BuildImage => "build_image",
+            Method::RemoveImage => "remove_image",
+            Method::ListImages => "list_images",
             Method::Snapshot => "snapshot",
             Method::Init => "init",
             Method::Exec => "exec",
@@ -49,6 +57,10 @@ impl Method {
 
     pub fn parse(name: &str) -> Option<Method> {
         Some(match name {
+            "version" => Method::Version,
+            "build_image" => Method::BuildImage,
+            "remove_image" => Method::RemoveImage,
+            "list_images" => Method::ListImages,
             "snapshot" => Method::Snapshot,
             "init" => Method::Init,
             "exec" => Method::Exec,

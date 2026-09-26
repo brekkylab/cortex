@@ -1,4 +1,4 @@
-//! How cortex's failures arrive in JavaScript.
+//! How cortex's failures arrive in JavaScript, from a console and an image client alike.
 //!
 //! As an `Error` whose `code` says what kind, the way Node's own errors carry `ENOENT`. A
 //! server that refused answers with a number, and the code is that number's name in cortex
@@ -10,7 +10,7 @@
 //! The filesystem half answers in [`std::io::Error`], and its code is the
 //! [`ErrorKind`](std::io::ErrorKind)'s name.
 
-use cortex::console::{Error, Failure};
+use cortex::protocol::{Error, Failure};
 
 pub type Result<T> = napi::Result<T, String>;
 

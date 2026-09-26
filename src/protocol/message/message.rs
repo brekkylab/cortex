@@ -19,8 +19,9 @@ use serde::{
     ser::SerializeMap,
 };
 
-use super::utils::flatten::FlatMapSerializer;
-use crate::console::{Call, Method, Notification, Response};
+use crate::protocol::message::{
+    Call, Method, Notification, Response, utils::flatten::FlatMapSerializer,
+};
 
 /// The only `jsonrpc` member this protocol accepts.
 pub const VERSION: &str = "2.0";
@@ -251,7 +252,9 @@ mod tests {
 
     use super::{
         super::{
-            Error, ExecCall, ExecResp, InitCall, InitResp, ReadCall, ReadResp, WriteCall, WriteResp,
+            BuildImageCall, BuildImageResp, Error, ExecCall, ExecResp, InitCall, InitResp,
+            ListImagesCall, ListImagesResp, ReadCall, ReadResp, RemoveImageCall, RemoveImageResp,
+            WriteCall, WriteResp,
         },
         *,
     };
@@ -380,6 +383,55 @@ mod tests {
                 Message::Response {
                     id: 8,
                     result: Response::Write(WriteResp { size: 4 }),
+                },
+                // Asked before anything else, and needing no session either.
+                Message::Request {
+                    id: 12,
+                    call: Call::Version(super::super::VersionCall {}),
+                },
+                Message::Response {
+                    id: 12,
+                    result: Response::Version(super::super::VersionResp {
+                        version: "0.1.0".into(),
+                    }),
+                },
+                // The image plane, which needs no session.
+                Message::Request {
+                    id: 9,
+                    call: Call::BuildImage(BuildImageCall {
+                        recipe: crate::image::Recipe::new("alpine:3.20").step("apk add jq"),
+                        reference: Some("myimg:latest".into()),
+                    }),
+                },
+                Message::Response {
+                    id: 9,
+                    result: Response::BuildImage(BuildImageResp {
+                        reference: "myimg:latest".into(),
+                        digest: "sha256:0123abcd".into(),
+                    }),
+                },
+                Message::Request {
+                    id: 10,
+                    call: Call::ListImages(ListImagesCall {}),
+                },
+                Message::Response {
+                    id: 10,
+                    result: Response::ListImages(ListImagesResp {
+                        images: vec![crate::image::ImageEntry {
+                            digest: "sha256:0123abcd".into(),
+                            refs: vec!["myimg:latest".into()],
+                        }],
+                    }),
+                },
+                Message::Request {
+                    id: 11,
+                    call: Call::RemoveImage(RemoveImageCall {
+                        image: crate::image::ImageSource::reference("myimg:latest"),
+                    }),
+                },
+                Message::Response {
+                    id: 11,
+                    result: Response::RemoveImage(RemoveImageResp {}),
                 },
             ])
             .collect()

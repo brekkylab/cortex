@@ -9,8 +9,8 @@
  */
 export declare const __napiBindingTarget: 'native' | 'wasm32-wasi' | 'wasm32-wasip1'
 
-export declare class Console {
-  static builder(): ConsoleBuilder
+export declare class ConsoleClient {
+  static builder(): ConsoleClientBuilder
   get mounts(): Array<string>
   start(): Promise<void>
   stop(): Promise<void>
@@ -22,21 +22,21 @@ export declare class Console {
   /** End the session now. Closing twice is the same as closing once. */
   close(): Promise<void>
 }
-export type JsConsole = Console
+export type JsConsoleClient = ConsoleClient
 
 /**
- * A [`ConsoleBuilder`], filled in place and emptied by `build()`.
+ * A [`ConsoleClientBuilder`], filled in place and emptied by `build()`.
  *
- * In place rather than by value, unlike `Image`: the Rust builder is consumed by each call
+ * In place rather than by value, unlike `Recipe`: the Rust builder is consumed by each call
  * and is not `Clone`, so there is exactly one of it to hand along. Each method returns the
  * same object so calls chain as they do in Rust.
  */
-export declare class ConsoleBuilder {
+export declare class ConsoleClientBuilder {
   constructor()
-  stdioClient(cmd: Array<string>): this
+  cmd(cmd: Array<string>): this
   mount(mount: HostMount | string, at: string): this
   mountReadonly(mount: HostMount | string, at: string): this
-  image(image: Image): this
+  image(image: ImageSource | Recipe): this
   snapshot(snapshot: Buffer): this
   network(network: NetworkAccess): this
   vcpus(vcpus: number): this
@@ -44,10 +44,10 @@ export declare class ConsoleBuilder {
   gpu(gpu: boolean): this
   gpuMemoryMib(gpuMemoryMib: number): this
   diskGib(diskGib: number): this
-  /** Announce the session, and settle with the `Console` the server answered. */
-  build(): Promise<Console>
+  /** Announce the session, and settle with the `ConsoleClient` the server answered. */
+  build(): Promise<ConsoleClient>
 }
-export type JsConsoleBuilder = ConsoleBuilder
+export type JsConsoleClientBuilder = ConsoleClientBuilder
 
 export declare class Directory {
   constructor()
@@ -76,15 +76,30 @@ export declare class HostMount {
 }
 export type JsHostMount = HostMount
 
-export declare class Image {
-  constructor(base?: string | undefined | null, steps?: Array<Step | string>)
-  static fromDockerfile(content: string): Image
-  base(base: string): Image
-  step(step: Step | string): Image
-  steps(steps: Array<Step | string>): Image
+export declare class ImageClient {
+  /**
+   * `cortex-krun` under the stdio server directory, settling with the client once the
+   * server has answered.
+   */
+  static tryNew(): Promise<ImageClient>
+  static tryFromCmd(cmd: Array<string>): Promise<ImageClient>
+  version(): Promise<string>
+  build(recipe: Recipe, reference?: string | undefined | null): Promise<BuildImageResult>
+  list(): Promise<Array<ImageEntry>>
+  remove(image: ImageSource | Recipe): Promise<void>
+  /** End the channel now. Closing twice is the same as closing once. */
+  close(): Promise<void>
+}
+export type JsImageClient = ImageClient
+
+export declare class ImageSource {
+  static reference(reference: string): ImageSource
+  static digest(digest: string): ImageSource
+  static recipe(recipe: Recipe): ImageSource
+  equals(other: ImageSource): boolean
   toString(): string
 }
-export type JsImage = Image
+export type JsImageSource = ImageSource
 
 export declare class NetworkAccess {
   constructor(reach: string)
@@ -98,20 +113,42 @@ export declare class NetworkAccess {
 }
 export type JsNetworkAccess = NetworkAccess
 
+export declare class Recipe {
+  constructor(base: string, steps?: Array<Step | string>)
+  static fromDockerfile(content: string): Recipe
+  get base(): string
+  step(step: Step | string): Recipe
+  steps(steps: Array<Step | string>): Recipe
+  equals(other: Recipe): boolean
+  toString(): string
+}
+export type JsRecipe = Recipe
+
 export declare class Step {
   static run(cmd: string): Step
   static copy(src: string, dst: string): Step
   static env(key: string, value: string): Step
   static workdir(dir: string): Step
+  equals(other: Step): boolean
   toString(): string
 }
 export type JsStep = Step
+
+export interface BuildImageResult {
+  reference: string
+  digest: string
+}
 
 export interface ExecResult {
   code: number
   stdout: Buffer
   stderr: Buffer
   truncated: boolean
+}
+
+export interface ImageEntry {
+  digest: string
+  refs: Array<string>
 }
 
 export interface ReadResult {

@@ -778,17 +778,21 @@ function __napiStampBindingTarget(exportsObject, target) {
 // linked import resolves to `undefined`.
 module.exports.__napiBindingTarget = __napiStampBindingTarget(nativeBinding, __napiLoadedBindingTarget)
 module.exports = nativeBinding
-module.exports.Console = nativeBinding.Console
-module.exports.JsConsole = nativeBinding.JsConsole
-module.exports.ConsoleBuilder = nativeBinding.ConsoleBuilder
-module.exports.JsConsoleBuilder = nativeBinding.JsConsoleBuilder
+module.exports.ConsoleClient = nativeBinding.ConsoleClient
+module.exports.JsConsoleClient = nativeBinding.JsConsoleClient
+module.exports.ConsoleClientBuilder = nativeBinding.ConsoleClientBuilder
+module.exports.JsConsoleClientBuilder = nativeBinding.JsConsoleClientBuilder
 module.exports.Directory = nativeBinding.Directory
 module.exports.JsDirectory = nativeBinding.JsDirectory
 module.exports.HostMount = nativeBinding.HostMount
 module.exports.JsHostMount = nativeBinding.JsHostMount
-module.exports.Image = nativeBinding.Image
-module.exports.JsImage = nativeBinding.JsImage
+module.exports.ImageClient = nativeBinding.ImageClient
+module.exports.JsImageClient = nativeBinding.JsImageClient
+module.exports.ImageSource = nativeBinding.ImageSource
+module.exports.JsImageSource = nativeBinding.JsImageSource
 module.exports.NetworkAccess = nativeBinding.NetworkAccess
 module.exports.JsNetworkAccess = nativeBinding.JsNetworkAccess
+module.exports.Recipe = nativeBinding.Recipe
+module.exports.JsRecipe = nativeBinding.JsRecipe
 module.exports.Step = nativeBinding.Step
 module.exports.JsStep = nativeBinding.JsStep

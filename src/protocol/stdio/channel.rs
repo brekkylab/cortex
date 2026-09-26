@@ -93,7 +93,7 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::console::{MAX_PAYLOAD, Message};
+use crate::protocol::{MAX_PAYLOAD, Message};
 
 /// The length prefix: a big-endian `u32`.
 pub const HEADER: usize = 4;
@@ -191,7 +191,7 @@ fn bad(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::console::{Call, ExecCall, ExecResp, InitCall, InitResp, Notification, Response};
+    use crate::protocol::{Call, ExecCall, ExecResp, InitCall, InitResp, Notification, Response};
 
     fn messages() -> Vec<Message> {
         vec![

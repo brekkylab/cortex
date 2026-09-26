@@ -10,7 +10,7 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const { Console, Directory, HostMount, Image, NetworkAccess } = createRequire(import.meta.url)('../index.js')
+const { ConsoleClient, Directory, HostMount, NetworkAccess, Recipe } = createRequire(import.meta.url)('../index.js')
 
 const project = process.argv[2] ?? process.cwd()
 
@@ -25,9 +25,9 @@ const context = new Directory()
 const mount = new HostMount(context, mkdtempSync(join(tmpdir(), 'cortex-')))
 
 // What the agent can do: a server that runs its commands, against that tree.
-const console_ = await Console.builder()
-  .stdioClient([process.env.CORTEX_CONSOLE ?? 'cortex-krun'])
-  .image(new Image('python:3.12-slim-trixie'))
+const console_ = await ConsoleClient.builder()
+  .cmd([process.env.CORTEX_CONSOLE ?? 'cortex-krun'])
+  .image(new Recipe('python:3.12-slim-trixie'))
   .mount(mount, '/work')
   .network(NetworkAccess.none())
   .build()

@@ -1,4 +1,4 @@
-//! `Console`, its builder, and what its calls answer with.
+//! `ConsoleClient`, its builder, and what its calls answer with.
 //!
 //! Every call that waits is an awaitable, run on the tokio runtime `pyo3-async-runtimes`
 //! keeps: a stdio client spawns its server and reads from it, and both need a reactor under
@@ -14,24 +14,27 @@
 //!
 //! # How it ends
 //!
-//! [`Console`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
-//! off one — which is where a Python finalizer runs. So [`PyConsole`] enters the binding's
+//! [`ConsoleClient`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
+//! off one — which is where a Python finalizer runs. So [`PyConsoleClient`] enters the binding's
 //! runtime before letting go, and a console that is garbage-collected ends the same way as one
 //! that is closed. `close()` and `async with` are there for a caller who wants that moment to
 //! be a line in their program rather than whenever the collector gets to it.
 //!
 //! # Who else holds it
 //!
-//! The slot is an `Arc<Mutex<Option<Console>>>` rather than a type of this module's own,
+//! The slot is an `Arc<Mutex<Option<ConsoleClient>>>` rather than a type of this module's own,
 //! because that is the shape an agent holds its console in — ailoy's `AgentState::console` —
-//! and a binding that links this crate hands [`PyConsole::slot`] to one. The two then share
+//! and a binding that links this crate hands [`PyConsoleClient::slot`] to one. The two then share
 //! one session: calls from either side take turns on the lock, and `close()` ends it for both.
 //! Whichever lets go last ends it, so a holder other than this one owes the same runtime
 //! entry on drop.
 
 use std::{path::PathBuf, sync::Arc};
 
-use cortex::console::{Console, ConsoleBuilder, ExecResp, NetworkAccess, ReadResp};
+use cortex::{
+    console::{ConsoleClient, ConsoleClientBuilder},
+    protocol::{ExecResp, NetworkAccess, ReadResp},
+};
 use pyo3::{exceptions::PyValueError, prelude::*};
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
 use tokio::sync::Mutex;
@@ -39,7 +42,7 @@ use tokio::sync::Mutex;
 use crate::{
     error::{self, CortexError},
     fs::{Content, MountLike},
-    image::PyImage,
+    image::ImageSourceLike,
 };
 
 #[pyclass(name = "NetworkAccess", module = "cortex", frozen, from_py_object)]
@@ -95,21 +98,21 @@ impl PyNetworkAccess {
     }
 }
 
-/// A [`ConsoleBuilder`], filled in place and emptied by `build()`.
+/// A [`ConsoleClientBuilder`], filled in place and emptied by `build()`.
 ///
-/// In place rather than by value, unlike `Image`: the Rust builder is consumed by each call
+/// In place rather than by value, unlike `Recipe`: the Rust builder is consumed by each call
 /// and is not `Clone`, so there is exactly one of it to hand along. Each method returns the
 /// same object so calls chain as they do in Rust.
 ///
 /// The `Mutex` is for `Sync`, which a `pyclass` has to be and the builder's client factory
 /// is not; nothing contends for it.
-#[pyclass(name = "ConsoleBuilder", module = "cortex")]
-pub struct PyConsoleBuilder(std::sync::Mutex<Option<ConsoleBuilder>>);
+#[pyclass(name = "ConsoleClientBuilder", module = "cortex")]
+pub struct PyConsoleClientBuilder(std::sync::Mutex<Option<ConsoleClientBuilder>>);
 
-impl PyConsoleBuilder {
+impl PyConsoleClientBuilder {
     fn update<'py>(
         slf: PyRef<'py, Self>,
-        f: impl FnOnce(ConsoleBuilder) -> PyResult<ConsoleBuilder>,
+        f: impl FnOnce(ConsoleClientBuilder) -> PyResult<ConsoleClientBuilder>,
     ) -> PyResult<PyRef<'py, Self>> {
         {
             let mut held = slf.0.lock().unwrap();
@@ -121,18 +124,18 @@ impl PyConsoleBuilder {
 }
 
 fn built() -> PyErr {
-    PyValueError::new_err("this ConsoleBuilder has already been built")
+    PyValueError::new_err("this ConsoleClientBuilder has already been built")
 }
 
 #[pymethods]
-impl PyConsoleBuilder {
+impl PyConsoleClientBuilder {
     #[new]
     fn new() -> Self {
-        PyConsoleBuilder(std::sync::Mutex::new(Some(ConsoleBuilder::new())))
+        PyConsoleClientBuilder(std::sync::Mutex::new(Some(ConsoleClientBuilder::new())))
     }
 
-    fn stdio_client(slf: PyRef<'_, Self>, cmd: Vec<String>) -> PyResult<PyRef<'_, Self>> {
-        Self::update(slf, |b| Ok(b.stdio_client(&cmd)))
+    fn cmd(slf: PyRef<'_, Self>, cmd: Vec<String>) -> PyResult<PyRef<'_, Self>> {
+        Self::update(slf, |b| Ok(b.cmd(&cmd)))
     }
 
     fn mount(slf: PyRef<'_, Self>, mount: MountLike, at: PathBuf) -> PyResult<PyRef<'_, Self>> {
@@ -147,8 +150,8 @@ impl PyConsoleBuilder {
         Self::update(slf, |b| Ok(b.mount_readonly(mount.into_mount()?, at)))
     }
 
-    fn image(slf: PyRef<'_, Self>, image: PyImage) -> PyResult<PyRef<'_, Self>> {
-        Self::update(slf, |b| Ok(b.image(image.0)))
+    fn image(slf: PyRef<'_, Self>, image: ImageSourceLike) -> PyResult<PyRef<'_, Self>> {
+        Self::update(slf, |b| Ok(b.image(image)))
     }
 
     fn snapshot(slf: PyRef<'_, Self>, snapshot: Vec<u8>) -> PyResult<PyRef<'_, Self>> {
@@ -179,31 +182,31 @@ impl PyConsoleBuilder {
         Self::update(slf, |b| Ok(b.disk_gib(disk_gib)))
     }
 
-    /// Announce the session, and hand back the `Console` the server answered — an
-    /// awaitable, as `ConsoleBuilder::build` is a future.
+    /// Announce the session, and hand back the `ConsoleClient` the server answered — an
+    /// awaitable, as `ConsoleClientBuilder::build` is a future.
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let builder = self.0.lock().unwrap().take().ok_or_else(built)?;
         future_into_py(py, async move {
             let console = builder.build().await.map_err(error::anyhow)?;
-            Ok(PyConsole::new(console))
+            Ok(PyConsoleClient::new(console))
         })
     }
 }
 
 /// The console a slot holds, or the error for one that has been closed.
-fn held(slot: &mut Option<Console>) -> PyResult<&mut Console> {
+fn held(slot: &mut Option<ConsoleClient>) -> PyResult<&mut ConsoleClient> {
     slot.as_mut()
         .ok_or_else(|| CortexError::new_err("this console has been closed"))
 }
 
 /// A console slot: the console, or nothing once it has been closed.
-pub type Slot = Arc<Mutex<Option<Console>>>;
+pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 
-#[pyclass(name = "Console", module = "cortex", frozen)]
-pub struct PyConsole {
+#[pyclass(name = "ConsoleClient", module = "cortex", frozen)]
+pub struct PyConsoleClient {
     console: Slot,
 
-    /// [`Console::mounts`], read once: the paths are fixed when the session is announced, and
+    /// [`ConsoleClient::mounts`], read once: the paths are fixed when the session is announced, and
     /// a getter that had to await the lock for them would make them a coroutine.
     ///
     /// Strings and not `Path`s, because they are the session's paths rather than this
@@ -211,9 +214,9 @@ pub struct PyConsole {
     mounts: Vec<String>,
 }
 
-impl PyConsole {
-    fn new(console: Console) -> Self {
-        PyConsole {
+impl PyConsoleClient {
+    fn new(console: ConsoleClient) -> Self {
+        PyConsoleClient {
             mounts: console
                 .mounts()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -230,7 +233,7 @@ impl PyConsole {
 
 /// What makes dropping the last holder say `quit`: the console is let go of on the runtime.
 /// A holder that is not the last leaves it to whichever is.
-impl Drop for PyConsole {
+impl Drop for PyConsoleClient {
     fn drop(&mut self) {
         if let Some(slot) = Arc::get_mut(&mut self.console) {
             let _entered = get_runtime().enter();
@@ -240,10 +243,10 @@ impl Drop for PyConsole {
 }
 
 #[pymethods]
-impl PyConsole {
+impl PyConsoleClient {
     #[staticmethod]
-    fn builder() -> PyConsoleBuilder {
-        PyConsoleBuilder::new()
+    fn builder() -> PyConsoleClientBuilder {
+        PyConsoleClientBuilder::new()
     }
 
     #[getter]
@@ -411,8 +414,8 @@ impl PyReadResult {
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyNetworkAccess>()?;
-    m.add_class::<PyConsoleBuilder>()?;
-    m.add_class::<PyConsole>()?;
+    m.add_class::<PyConsoleClientBuilder>()?;
+    m.add_class::<PyConsoleClient>()?;
     m.add_class::<PyExecResult>()?;
     m.add_class::<PyReadResult>()?;
     Ok(())

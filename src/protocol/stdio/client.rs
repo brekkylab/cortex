@@ -22,16 +22,16 @@
 //! outlive the channel to it either way. Which is also the only ending a `drop` can
 //! offer: collecting a process is an `await`, and nothing may await on the way out.
 //!
-//! Which is why the process is not a [`Console`]'s. What a session *is* — the methods, the
+//! Which is why the process is not a [`ConsoleClient`]'s. What a session *is* — the methods, the
 //! tree they are spelled against — is the same wherever a server runs; something to `wait`
 //! for exists only because this transport is a pipe to a child. A transport into a
-//! micro-VM guest is a channel with no process behind it, and a `Console` over one should
+//! micro-VM guest is a channel with no process behind it, and a `ConsoleClient` over one should
 //! not carry a field for a thing that does not exist.
 //!
-//! [`Console`] is this plus the session it was built with, and is what a caller normally
+//! [`ConsoleClient`] is this plus the session it was built with, and is what a caller normally
 //! wants.
 //!
-//! [`Console`]: crate::console::Console
+//! [`ConsoleClient`]: crate::console::ConsoleClient
 //! [`kill_on_drop`]: tokio::process::Command::kill_on_drop
 
 use std::{io, process::Stdio};
@@ -42,7 +42,7 @@ use tokio::{
     process::{Child, Command},
 };
 
-use crate::console::{
+use crate::protocol::{
     Call, Client, Failure, Message, Notification, RequestId, Response,
     stdio::{read, write},
 };
@@ -273,7 +273,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::console::{Error, ExecCall, ExecResp, InitCall, InitResp, Method, ReadCall};
+    use crate::protocol::{Error, ExecCall, ExecResp, InitCall, InitResp, Method, ReadCall};
 
     /// Everything the client wrote, readable after it has been dropped or not — a
     /// `Vec` cannot be, once the client owns it.

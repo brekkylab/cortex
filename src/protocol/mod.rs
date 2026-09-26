@@ -1,114 +1,45 @@
-//! What the two ends of a console can *do* on a channel, apart from whatever carries
-//! them.
+//! The two ends of a console, and the wire between them.
 //!
-//! One end asks and the other answers, and the two ends are named for which they are:
-//! a [`Client`] issues calls and takes the answers back, a [`Server`] takes
-//! what arrives and puts an answer out. Both are about moving messages. Neither decides
-//! what a message *means* — where a command runs, what a session allows, when something
-//! has booted: none of that is here, and a transport is the last place it should be.
+//! A *console server* is a process that speaks JSON-RPC over stdio and runs the
+//! commands it is asked to run somewhere — on this host, inside a micro-VM,
+//! wherever. A *console client* is whoever drives one. What differs between
+//! servers is only that "somewhere"; the methods they answer, which end may ask
+//! what, and how a request is paired with its response are decided once, here, so
+//! two servers cannot drift apart on them.
 //!
-//! Each end is only ever the one it is. There is no request a server issues, so nothing
-//! here has to be both — no pending table on the answering side, and no listener on the
-//! asking one.
+//! - `message` — [`Message`] and the methods, errors and payloads both ends agree on.
+//! - `base` — what each end can *do* on a channel: a [`Client`] only asks, a
+//!   [`Server`] only answers. Both move messages and neither reads a meaning into
+//!   one.
+//! - [`stdio`] — the transport there is: framed JSON-RPC over a pipe, and the two
+//!   ends over it ([`StdioClient`](stdio::StdioClient), which starts the server process
+//!   it drives, and [`StdioServer`](stdio::StdioServer), which answers on stdin and
+//!   stdout).
+//! - [`ConsoleClient`] — the public end, and what a caller normally reaches for: the channel
+//!   that drives a server, and the session it was opened with.
 //!
-//! What is here is only what would otherwise be written once per transport: `init`,
-//! `exec`, `read`, `write`, `start`, `stop` and `quit` follow from `call` and `notify`,
-//! so they follow once.
+//! Everything that waits is a future. A console spends nearly all of its time waiting —
+//! on a pipe, on a command, on a backend bringing a kernel up — so a caller with several
+//! of them drives them all from one runtime, and every method that could wait is
+//! something to `await`. What is *not* concurrent is a single session: see [`Client`] for
+//! the borrow that says so.
 //!
-//! [`stdio`](crate::console::stdio) is the transport there is — framed JSON-RPC
-//! over a pipe. A micro-VM's virtio port would be another, and nothing here would
-//! change.
+//! Each end of a channel does one job and only that one. There is no request a server
+//! issues, so nothing on either side needs a pending table, a listener, or a reader that
+//! must not block on work only it can unblock.
 //!
-//! # Every method hands back a boxed future
-//!
-//! Waiting is what these two do — for a pipe to drain, for a server to answer, for a
-//! command that has not finished — so every method is something to `await`, and none of
-//! them is an `async fn`. An `async fn` in a trait returns a type only the implementation
-//! knows, which is a type a `dyn` cannot name: it would make both traits unusable behind
-//! a pointer, and a [`Console`](crate::console::Console) holds a `dyn Client` precisely so
-//! that which transport it drives is not in its type.
-//!
-//! So each method returns a [`BoxFuture`] instead — one allocation per call, against a
-//! round trip over a pipe — and the derived methods are written the same way as the two
-//! they are derived from, rather than being a second shape to read.
-//!
-//! [`Send`], because a session is a thing to hand to a task. Every future here can cross
-//! threads, which is also why both traits require it of the ends themselves.
-//!
-//! # One call at a time, and the borrow that says so
-//!
-//! `&mut self` throughout. Nothing here is `&self` with a lock behind it, and that is the
-//! protocol showing through rather than an omission: there is one call outstanding at a
-//! time, an id is allocated per call, and a second caller interleaving a `read` while a
-//! command runs would be asking a question the server has no way to answer yet.
-//!
-//! An exclusive borrow is how that is said in a signature, and it is checked rather than
-//! documented. A caller wanting concurrency wants a second console.
+//! [`Message`] has the reasoning for the protocol,
+//! [`read`](stdio::read) and [`write`](stdio::write) for the wire.
+
+mod base;
+mod message;
+pub mod stdio;
 
 use std::io;
 
+pub use base::*;
 use futures_core::future::BoxFuture;
-
-use crate::console::{
-    Call, Error, ExecCall, ExecResp, InitCall, InitResp, Message, Method, Notification, ReadCall,
-    ReadResp, RequestId, Response, SnapshotCall, SnapshotResp, WriteCall, WriteResp,
-};
-
-/// Why a call produced no result.
-///
-/// The distinction is the useful part. A refusal came from the server and is about
-/// the call — retry it with more time, or report it. A broken channel is about the
-/// session, and every later call will fail the same way.
-#[derive(Debug)]
-pub enum Failure {
-    /// The server answered `error`. Branch on [`code`](Error::code) —
-    /// [`TIMED_OUT`](Error::TIMED_OUT) is worth another try with more time, the rest
-    /// are not.
-    Refused(Error),
-
-    /// The channel or the server process failed, so there is no answer and will not
-    /// be one.
-    Broken(anyhow::Error),
-}
-
-impl Failure {
-    /// The protocol code, for a refusal. `None` for a broken channel, which is not
-    /// something the server said.
-    pub fn code(&self) -> Option<i64> {
-        match self {
-            Failure::Refused(error) => Some(error.code),
-            Failure::Broken(_) => None,
-        }
-    }
-
-    pub(crate) fn broken(what: impl Into<String>) -> Failure {
-        Failure::Broken(anyhow::Error::msg(what.into()))
-    }
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Failure::Refused(error) => write!(f, "the console server refused: {error}"),
-            Failure::Broken(e) => write!(f, "the console channel broke: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for Failure {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Failure::Refused(error) => Some(error),
-            Failure::Broken(e) => Some(e.as_ref()),
-        }
-    }
-}
-
-impl From<Error> for Failure {
-    fn from(error: Error) -> Failure {
-        Failure::Refused(error)
-    }
-}
+pub use message::*;
 
 /// The asking end of a channel: issue a call, get its answer back.
 ///
@@ -142,6 +73,54 @@ pub trait Client: Send {
 
     /// Send something nothing answers, so there is nothing to wait for.
     fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>>;
+
+    /// Which protocol version the server speaks.
+    fn version(&mut self) -> BoxFuture<'_, Result<VersionResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::Version(VersionCall {})).await? {
+                Response::Version(answer) => Ok(answer),
+                other => Err(mismatched(Method::Version, other)),
+            }
+        })
+    }
+
+    /// Build a recipe, and hear the ref and digest it is stored under.
+    ///
+    /// Needs no session, so it may be called with or without an [`init`](Self::init).
+    fn build_image(
+        &mut self,
+        build: BuildImageCall,
+    ) -> BoxFuture<'_, Result<BuildImageResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::BuildImage(build)).await? {
+                Response::BuildImage(answer) => Ok(answer),
+                other => Err(mismatched(Method::BuildImage, other)),
+            }
+        })
+    }
+
+    /// Forget a built image. Needs no session.
+    fn remove_image(
+        &mut self,
+        remove: RemoveImageCall,
+    ) -> BoxFuture<'_, Result<RemoveImageResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::RemoveImage(remove)).await? {
+                Response::RemoveImage(answer) => Ok(answer),
+                other => Err(mismatched(Method::RemoveImage, other)),
+            }
+        })
+    }
+
+    /// Every image the server has built. Needs no session.
+    fn list_images(&mut self) -> BoxFuture<'_, Result<ListImagesResp, Failure>> {
+        Box::pin(async move {
+            match self.call(Call::ListImages(ListImagesCall {})).await? {
+                Response::ListImages(answer) => Ok(answer),
+                other => Err(mismatched(Method::ListImages, other)),
+            }
+        })
+    }
 
     /// Say what this session is: the tree it works in, and what its commands run in and
     /// may reach.

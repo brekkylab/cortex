@@ -2,8 +2,9 @@
 
 What it sees is a filesystem — a ``Directory`` assembled in memory and grafted onto host
 directories, mounted on the host with ``HostMount``. What it does is run commands — a
-``Console`` built against a console server, which runs them wherever that server runs
-things.
+``ConsoleClient`` built against a console server, which runs them wherever that server runs
+things, on an image named by an ``ImageSource`` or declared by a ``Recipe``. An
+``ImageClient`` builds, lists and removes those images ahead of any session.
 
 The names and their behaviour are cortex's own; see the Rust crate's documentation for the
 long form.
@@ -13,16 +14,20 @@ from enum import IntEnum
 
 from . import _cortex
 from ._cortex import (
-    Console,
+    BuildImageResult,
     ConsoleBroken,
-    ConsoleBuilder,
+    ConsoleClient,
+    ConsoleClientBuilder,
     ConsoleRefused,
     CortexError,
     Directory,
     ExecResult,
-    Image,
+    ImageClient,
+    ImageEntry,
+    ImageSource,
     NetworkAccess,
     ReadResult,
+    Recipe,
     Step,
 )
 
@@ -30,17 +35,21 @@ from ._cortex import (
 ErrorCode = IntEnum("ErrorCode", _cortex.ERROR_CODES)
 
 __all__ = [
-    "Console",
+    "BuildImageResult",
     "ConsoleBroken",
-    "ConsoleBuilder",
+    "ConsoleClient",
+    "ConsoleClientBuilder",
     "ConsoleRefused",
     "CortexError",
     "Directory",
     "ErrorCode",
     "ExecResult",
-    "Image",
+    "ImageClient",
+    "ImageEntry",
+    "ImageSource",
     "NetworkAccess",
     "ReadResult",
+    "Recipe",
     "Step",
 ]
 

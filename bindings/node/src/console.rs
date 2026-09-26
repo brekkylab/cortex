@@ -1,4 +1,4 @@
-//! `Console`, its builder, and what its calls answer with.
+//! `ConsoleClient`, its builder, and what its calls answer with.
 //!
 //! Every call that waits returns a `Promise`, settled on the tokio runtime napi keeps: a
 //! stdio client spawns its server and reads from it, and both need a reactor under them.
@@ -22,8 +22,8 @@
 //!
 //! # How it ends
 //!
-//! [`Console`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
-//! off one — which is where a garbage-collection finalizer runs. So [`JsConsole`] keeps the
+//! [`ConsoleClient`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
+//! off one — which is where a garbage-collection finalizer runs. So [`JsConsoleClient`] keeps the
 //! handle of the runtime the console was built on and enters it before letting go, and a
 //! console that is collected ends the same way as one that is closed. `close()` is there for
 //! a caller who wants that moment to be a line in their program rather than whenever the
@@ -31,16 +31,19 @@
 //!
 //! # Who else holds it
 //!
-//! The slot is an `Arc<Mutex<Option<Console>>>` rather than a type of this module's own,
+//! The slot is an `Arc<Mutex<Option<ConsoleClient>>>` rather than a type of this module's own,
 //! because that is the shape an agent holds its console in — ailoy's `AgentState::console` —
-//! and a binding that links this crate hands [`JsConsole::slot`] to one. The two then share
+//! and a binding that links this crate hands [`JsConsoleClient::slot`] to one. The two then share
 //! one session: calls from either side take turns on the lock, and `close()` ends it for both.
 //! Whichever lets go last ends it, so a holder other than this one owes the same runtime
-//! entry on drop — [`JsConsole::runtime`] is the handle to enter.
+//! entry on drop — [`JsConsoleClient::runtime`] is the handle to enter.
 
 use std::{future::Future, sync::Arc};
 
-use cortex::console::{Console, ConsoleBuilder, ExecResp, NetworkAccess, ReadResp};
+use cortex::{
+    console::{ConsoleClient, ConsoleClientBuilder},
+    protocol::{ExecResp, NetworkAccess, ReadResp},
+};
 use napi::{
     Env, JsError,
     bindgen_prelude::{Buffer, PromiseRaw, This, ToNapiValue},
@@ -51,7 +54,7 @@ use tokio::{runtime::Handle, sync::Mutex};
 use crate::{
     error::{self, Result, unsigned},
     fs::{Content, MountLike, bytes, into_mount},
-    image::JsImage,
+    image::{ImageSourceLike, image_source},
 };
 
 /// Run `fut` on napi's runtime, rejecting with the error it answers — `code` and all.
@@ -119,19 +122,19 @@ impl JsNetworkAccess {
     }
 }
 
-/// A [`ConsoleBuilder`], filled in place and emptied by `build()`.
+/// A [`ConsoleClientBuilder`], filled in place and emptied by `build()`.
 ///
-/// In place rather than by value, unlike `Image`: the Rust builder is consumed by each call
+/// In place rather than by value, unlike `Recipe`: the Rust builder is consumed by each call
 /// and is not `Clone`, so there is exactly one of it to hand along. Each method returns the
 /// same object so calls chain as they do in Rust.
-#[napi(js_name = "ConsoleBuilder")]
-pub struct JsConsoleBuilder(Option<ConsoleBuilder>);
+#[napi(js_name = "ConsoleClientBuilder")]
+pub struct JsConsoleClientBuilder(Option<ConsoleClientBuilder>);
 
-impl JsConsoleBuilder {
+impl JsConsoleClientBuilder {
     fn update<'env>(
         &mut self,
         this: This<'env>,
-        f: impl FnOnce(ConsoleBuilder) -> Result<ConsoleBuilder>,
+        f: impl FnOnce(ConsoleClientBuilder) -> Result<ConsoleClientBuilder>,
     ) -> Result<This<'env>> {
         let builder = self.0.take().ok_or_else(built)?;
         self.0 = Some(f(builder)?);
@@ -140,20 +143,20 @@ impl JsConsoleBuilder {
 }
 
 fn built() -> napi::Error<String> {
-    error::invalid("this ConsoleBuilder has already been built")
+    error::invalid("this ConsoleClientBuilder has already been built")
 }
 
 #[napi]
-impl JsConsoleBuilder {
+impl JsConsoleClientBuilder {
     #[napi(constructor)]
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        JsConsoleBuilder(Some(ConsoleBuilder::new()))
+        JsConsoleClientBuilder(Some(ConsoleClientBuilder::new()))
     }
 
     #[napi]
-    pub fn stdio_client<'env>(&mut self, this: This<'env>, cmd: Vec<String>) -> Result<This<'env>> {
-        self.update(this, |b| Ok(b.stdio_client(&cmd)))
+    pub fn cmd<'env>(&mut self, this: This<'env>, cmd: Vec<String>) -> Result<This<'env>> {
+        self.update(this, |b| Ok(b.cmd(&cmd)))
     }
 
     #[napi]
@@ -180,9 +183,9 @@ impl JsConsoleBuilder {
     pub fn image<'env>(
         &mut self,
         this: This<'env>,
-        #[napi(ts_arg_type = "Image")] image: &JsImage,
+        #[napi(ts_arg_type = "ImageSource | Recipe")] image: ImageSourceLike,
     ) -> Result<This<'env>> {
-        self.update(this, |b| Ok(b.image(image.0.clone())))
+        self.update(this, |b| Ok(b.image(image_source(image))))
     }
 
     #[napi]
@@ -228,9 +231,12 @@ impl JsConsoleBuilder {
         self.update(this, |b| Ok(b.disk_gib(disk_gib)))
     }
 
-    /// Announce the session, and settle with the `Console` the server answered.
-    #[napi(ts_return_type = "Promise<Console>")]
-    pub fn build<'env>(&mut self, env: &'env Env) -> napi::Result<PromiseRaw<'env, JsConsole>> {
+    /// Announce the session, and settle with the `ConsoleClient` the server answered.
+    #[napi(ts_return_type = "Promise<ConsoleClient>")]
+    pub fn build<'env>(
+        &mut self,
+        env: &'env Env,
+    ) -> napi::Result<PromiseRaw<'env, JsConsoleClient>> {
         let builder = self
             .0
             .take()
@@ -238,36 +244,36 @@ impl JsConsoleBuilder {
             .map_err(|e| thrown(env, e))?;
         promise(env, async move {
             let console = builder.build().await.map_err(error::anyhow)?;
-            Ok(JsConsole::new(console))
+            Ok(JsConsoleClient::new(console))
         })
     }
 }
 
 /// The console a slot holds, or the error for one that has been closed.
-fn held(slot: &mut Option<Console>) -> Result<&mut Console> {
+fn held(slot: &mut Option<ConsoleClient>) -> Result<&mut ConsoleClient> {
     slot.as_mut()
         .ok_or_else(|| napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed"))
 }
 
 /// A console slot: the console, or nothing once it has been closed.
-pub type Slot = Arc<Mutex<Option<Console>>>;
+pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 
-#[napi(js_name = "Console")]
-pub struct JsConsole {
+#[napi(js_name = "ConsoleClient")]
+pub struct JsConsoleClient {
     console: Slot,
 
     /// The runtime the console was built on, which is where its `quit` has to go out.
     runtime: Handle,
 
-    /// [`Console::mounts`], read once: the paths are fixed when the session is announced, and
+    /// [`ConsoleClient::mounts`], read once: the paths are fixed when the session is announced, and
     /// a getter that had to await the lock for them would make them a promise.
     mounts: Vec<String>,
 }
 
-impl JsConsole {
+impl JsConsoleClient {
     /// Built inside the future `build()` runs, so the current runtime is the one to keep.
-    fn new(console: Console) -> Self {
-        JsConsole {
+    fn new(console: ConsoleClient) -> Self {
+        JsConsoleClient {
             mounts: console
                 .mounts()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -290,7 +296,7 @@ impl JsConsole {
 
 /// What makes dropping the last holder say `quit`: the console is let go of on the runtime.
 /// A holder that is not the last leaves it to whichever is.
-impl Drop for JsConsole {
+impl Drop for JsConsoleClient {
     fn drop(&mut self) {
         if let Some(slot) = Arc::get_mut(&mut self.console) {
             let _entered = self.runtime.enter();
@@ -335,10 +341,10 @@ impl From<ReadResp> for ReadResult {
 }
 
 #[napi]
-impl JsConsole {
+impl JsConsoleClient {
     #[napi]
-    pub fn builder() -> JsConsoleBuilder {
-        JsConsoleBuilder::new()
+    pub fn builder() -> JsConsoleClientBuilder {
+        JsConsoleClientBuilder::new()
     }
 
     #[napi(getter)]

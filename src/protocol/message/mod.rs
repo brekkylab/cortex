@@ -63,6 +63,10 @@
 //!
 //! | Method | `params` | `result` | Errors |
 //! |---|---|---|---|
+//! | `version` | [`VersionCall`] | [`VersionResp`] | — |
+//! | `build_image` | [`BuildImageCall`] | [`BuildImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
+//! | `remove_image` | [`RemoveImageCall`] | [`RemoveImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
+//! | `list_images` | [`ListImagesCall`] | [`ListImagesResp`] | — |
 //! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_MOUNT`](Error::UNSUPPORTED_MOUNT), [`UNSUPPORTED_NETWORK`](Error::UNSUPPORTED_NETWORK), [`UNSUPPORTED_MACHINE`](Error::UNSUPPORTED_MACHINE) |
 //! | `exec` | [`ExecCall`] | [`ExecResp`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
@@ -230,7 +234,6 @@ mod error;
 mod message;
 mod method;
 mod notification;
-mod response;
 mod utils;
 
 pub use call::*;
@@ -238,4 +241,6 @@ pub use error::*;
 pub use message::*;
 pub use method::*;
 pub use notification::*;
-pub use response::*;
+
+/// The version of this protocol, which `version` answers with.
+pub const PROTOCOL_VERSION: &str = "1";

@@ -5,18 +5,20 @@ import pytest
 
 import cortex
 from cortex import (
-    Console,
+    ConsoleClient,
     CortexError,
     Directory,
     ErrorCode,
-    Image,
+    ImageClient,
+    ImageSource,
+    Recipe,
     NetworkAccess,
     Step,
 )
 
 
 def test_image_is_a_value():
-    base = Image().base("python:3.12-slim")
+    base = Recipe("python:3.12-slim")
     extended = base.step("pip install duckdb").step(Step.env("TZ", "UTC"))
 
     assert "python:3.12-slim" in repr(extended)
@@ -25,8 +27,16 @@ def test_image_is_a_value():
 
 
 def test_image_from_dockerfile():
-    image = Image.from_dockerfile("FROM alpine:3.20\nRUN apk add jq\n")
+    image = Recipe.from_dockerfile("FROM alpine:3.20\nRUN apk add jq\n")
     assert "alpine:3.20" in repr(image)
+
+
+def test_image_source():
+    recipe = Recipe("alpine:3.20").step("apk add jq")
+    assert ImageSource.recipe(recipe) == ImageSource.recipe(Recipe("alpine:3.20", ["apk add jq"]))
+    assert ImageSource.reference("myimg:latest") != ImageSource.digest("myimg:latest")
+    assert repr(ImageSource.digest("sha256:0123")) == 'ImageSource.digest("sha256:0123")'
+    assert recipe.base == "alpine:3.20"
 
 
 def test_network_access():
@@ -63,8 +73,10 @@ def test_host_mount_serves_the_directory(tmp_path):
         del mount
 
 
-async def test_building_without_a_server_fails_and_spends_the_builder():
-    builder = Console.builder()
+async def test_building_without_a_server_fails_and_spends_the_builder(tmp_path, monkeypatch):
+    # The default server is looked up here, where there is none.
+    monkeypatch.setenv("CORTEX_STDIO_SERVER_PATH", str(tmp_path))
+    builder = ConsoleClient.builder()
     with pytest.raises(CortexError):
         await builder.build()
     with pytest.raises(ValueError):
@@ -73,7 +85,12 @@ async def test_building_without_a_server_fails_and_spends_the_builder():
 
 async def test_building_against_a_missing_binary_fails():
     with pytest.raises(CortexError):
-        await Console.builder().stdio_client(["cortex-no-such-console-server"]).build()
+        await ConsoleClient.builder().cmd(["cortex-no-such-console-server"]).build()
+
+
+async def test_image_client_against_a_missing_binary_fails():
+    with pytest.raises(CortexError):
+        await ImageClient.try_from_cmd(["cortex-no-such-console-server"])
 
 
 # Against a real console server, named by `$CORTEX_CONSOLE` (`cortex-krun`, say).
@@ -83,9 +100,9 @@ SERVER = os.environ.get("CORTEX_CONSOLE")
 @pytest.mark.skipif(not SERVER or not shutil.which(SERVER), reason="set $CORTEX_CONSOLE")
 async def test_exec_read_write(tmp_path):
     builder = (
-        Console.builder()
-        .stdio_client([SERVER])
-        .image(Image().base("python:3.12-slim-trixie"))
+        ConsoleClient.builder()
+        .cmd([SERVER])
+        .image(Recipe("python:3.12-slim-trixie"))
         .mount(tmp_path, "/work")
         .network(NetworkAccess.none())
     )
@@ -100,3 +117,18 @@ async def test_exec_read_write(tmp_path):
         read = await console.read("/work/hello.txt")
         assert read.data == b"hi"
         assert read.size == 2
+
+
+@pytest.mark.skipif(not SERVER or not shutil.which(SERVER), reason="set $CORTEX_CONSOLE")
+async def test_build_list_remove():
+    async with await ImageClient.try_from_cmd([SERVER]) as images:
+        assert await images.version()
+
+        built = await images.build(Recipe("alpine:3.20"), "cortex-py-test:latest")
+        assert built.reference == "cortex-py-test:latest"
+        assert any(entry.digest == built.digest for entry in await images.list())
+
+        await images.remove(ImageSource.reference(built.reference))
+        assert all(
+            built.reference not in entry.refs for entry in await images.list()
+        )

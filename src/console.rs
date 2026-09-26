@@ -7,8 +7,8 @@
 //! has no pending table, no listener, and no task waiting on something it also has to
 //! read.
 //!
-//! What that leaves is a [`Console`] whose methods are round trips: one call out, one
-//! answer back, and the answer is to the call that was just made. [`exec`](Console::exec)
+//! What that leaves is a [`ConsoleClient`] whose methods are round trips: one call out, one
+//! answer back, and the answer is to the call that was just made. [`exec`](ConsoleClient::exec)
 //! is the largest of them and is still exactly that.
 //!
 //! # Waiting is the point, and a console does none of it in a thread
@@ -28,9 +28,9 @@
 //! Dropping it, and nothing else. A server exists for as long as a client does, so the
 //! `quit` that lets it exit gracefully is owed exactly once and at exactly one moment —
 //! when the console goes away. That is a lifetime, not a decision, so it is a
-//! [`Drop`](Console#impl-Drop-for-Console) and not a method somebody has to remember.
+//! [`Drop`](ConsoleClient#impl-Drop-for-ConsoleClient) and not a method somebody has to remember.
 //!
-//! [`start`](Console::start) and [`stop`](Console::stop) are neither an ending nor
+//! [`start`](ConsoleClient::start) and [`stop`](ConsoleClient::stop) are neither an ending nor
 //! something to remember. They are **how a caller manages what the far end is holding**,
 //! and that is the whole of what they do: a `stop` hands back the guest, the socket and
 //! the scratch directory a booted session occupies while nothing is running, and a
@@ -42,34 +42,34 @@
 //! Neither is awaited for an answer, because there is nothing a caller would do
 //! differently if one failed.
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context as _;
 use futures_core::future::BoxFuture;
 use tokio::process::Command;
 
 use crate::{
-    console::{
-        base::{Client, Failure},
-        message::{
-            Call, ExecCall, ExecResp, InitCall, MountSpec, NetworkAccess, Notification, ReadCall,
-            ReadResp, Response, WriteCall, WriteResp,
-        },
-        stdio::StdioClient,
-    },
     fs::Mount,
-    image::Image,
+    image::ImageSource,
+    protocol::{
+        Call, Client, ExecCall, ExecResp, Failure, InitCall, MountSpec, NetworkAccess,
+        Notification, ReadCall, ReadResp, Response, WriteCall, WriteResp, stdio::StdioClient,
+    },
+    stdio_server_dir,
 };
 
 /// Whatever it takes to have a channel, deferred until there is a console to hold one.
 ///
-/// [`Send`], because [`build`](ConsoleBuilder::build) awaits the `init` it sends and so
+/// [`Send`], because [`build`](ConsoleClientBuilder::build) awaits the `init` it sends and so
 /// holds this across an await — which is what makes a builder something a task can be
 /// spawned around, like everything else here. It costs nothing: a [`Client`] is already
 /// `Send`, and so is what either setter captures.
-type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>;
+pub(crate) type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>;
 
-/// Assembles a [`Console`] from the parts it needs.
+/// Assembles a [`ConsoleClient`] from the parts it needs.
 ///
 /// A builder rather than arguments because a console is going to acquire more of them —
 /// limits, a backend of its own choosing — and each should be something a caller can leave
@@ -77,19 +77,20 @@ type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>
 ///
 /// Nothing here starts anything. The channel is described, not driven, until something
 /// is asked over it.
-#[derive(Default)]
-pub struct ConsoleBuilder {
+pub struct ConsoleClientBuilder {
     /// Not a client but the making of one, because some clients are a process away:
-    /// [`stdio_client`](Self::stdio_client) is handed a program and not a channel, and
-    /// starting a program can fail. Deferring that to [`build`](Self::build) keeps every
-    /// setter infallible and leaves one place where a console either exists or says what
-    /// it lacked.
-    client_factory: Option<ClientFactory>,
+    /// [`cmd`](Self::cmd) is handed a program and not a channel, and starting a program
+    /// can fail. Deferring that to [`build`](Self::build) keeps every setter infallible and
+    /// leaves one place where a console either exists or says what it lacked.
+    ///
+    /// Starts as `cortex-krun` under the stdio server directory, as an
+    /// [`ImageClient`](crate::image::ImageClient) does.
+    client_factory: ClientFactory,
 
     /// The image a session's commands run in, and `None` to leave it to the server: a
     /// backend that runs commands on the host it is already on has nothing to boot, and one
     /// that boots a machine says so rather than guessing a base on the caller's behalf.
-    image: Option<Image>,
+    image: Option<ImageSource>,
 
     /// What a previous session wrote, for a console that does not start from scratch, and
     /// `None` for one that does. Currently an ext4 blob.
@@ -116,7 +117,24 @@ pub struct ConsoleBuilder {
     disk_gib: Option<u32>,
 }
 
-impl ConsoleBuilder {
+impl Default for ConsoleClientBuilder {
+    fn default() -> Self {
+        ConsoleClientBuilder {
+            client_factory: stdio_factory(&[stdio_server_dir().join("cortex-krun")]),
+            image: None,
+            snapshot: None,
+            mounts: Vec::new(),
+            network: None,
+            vcpus: None,
+            memory_mib: None,
+            gpu: None,
+            gpu_memory_mib: None,
+            disk_gib: None,
+        }
+    }
+}
+
+impl ConsoleClientBuilder {
     pub fn new() -> Self {
         Self::default()
     }
@@ -128,7 +146,7 @@ impl ConsoleBuilder {
     /// a test. Whatever it took to have a channel is the client's, including a process if
     /// that is what it runs over, so there is nothing else here about where a server is.
     pub fn client(mut self, client: impl Client + 'static) -> Self {
-        self.client_factory = Some(Box::new(move || Ok(Box::new(client))));
+        self.client_factory = Box::new(move || Ok(Box::new(client)));
         self
     }
 
@@ -144,22 +162,8 @@ impl ConsoleBuilder {
     /// Starting it is [`build`](Self::build)'s, not this method's — nothing here starts
     /// anything, and a program that cannot be started, like a `cmd` with no program in
     /// it, is one of the ways building a console fails.
-    pub fn stdio_client(mut self, cmd: &[impl AsRef<str>]) -> Self {
-        // Owned before the closure, because the closure outlives this borrow and what it
-        // was given has to still be there when `build` runs it.
-        let cmd: Vec<String> = cmd.iter().map(|s| s.as_ref().to_string()).collect();
-
-        self.client_factory = Some(Box::new(move || {
-            let (program, args) = cmd
-                .split_first()
-                .context("a console server needs a program to run")?;
-
-            let mut server = Command::new(program);
-            server.args(args);
-
-            let client = StdioClient::new(server).context("starting the console server")?;
-            Ok(Box::new(client))
-        }));
+    pub fn cmd(mut self, cmd: &[impl AsRef<OsStr>]) -> Self {
+        self.client_factory = stdio_factory(cmd);
         self
     }
 
@@ -167,8 +171,8 @@ impl ConsoleBuilder {
     ///
     /// `at` is where the tree appears to the session's commands, and it is this end's to
     /// choose: [`build`](Self::build) names it in the `init`, so every path the console will
-    /// send is known before the session exists. A [`read`](Console::read) names a file under
-    /// it, so does a [`write`](Console::write), and so does the command that opens the same
+    /// send is known before the session exists. A [`read`](ConsoleClient::read) names a file under
+    /// it, so does a [`write`](ConsoleClient::write), and so does the command that opens the same
     /// file by the same name. It has to be absolute — a relative one would be relative to a
     /// working directory nobody named — and a console whose mount point cannot be spelled as
     /// a URL does not build.
@@ -206,7 +210,7 @@ impl ConsoleBuilder {
     /// Give the session a tree it may read and not write, at `at`.
     ///
     /// [`mount`](Self::mount) on every other count. **What it buys is getting the tree back
-    /// unchanged rather than a promise that nothing touched it:** a [`write`](Console::write)
+    /// unchanged rather than a promise that nothing touched it:** a [`write`](ConsoleClient::write)
     /// naming a path under it is refused, and a server with a kernel of its own mounts it
     /// read-only so that a command cannot write there either.
     ///
@@ -225,21 +229,19 @@ impl ConsoleBuilder {
     /// The base the session's commands run in.
     ///
     /// ```no_run
-    /// # use cortex::console::Console;
-    /// # use cortex::image::Image;
+    /// # use cortex::console::ConsoleClient;
+    /// # use cortex::image::Recipe;
     /// # async fn f() -> anyhow::Result<()> {
-    /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-uvm-console"])
+    /// let console = ConsoleClient::builder()
     ///     .image(
-    ///         Image::new()
-    ///             .base("alpine:3.20")
+    ///         Recipe::new("alpine:3.20")
     ///             .step("apk add --no-cache jq"),
     ///     )
     ///     .build()
     ///     .await?;
     /// # Ok(()) }
     /// ```
-    pub fn image(mut self, image: impl Into<Image>) -> Self {
+    pub fn image(mut self, image: impl Into<ImageSource>) -> Self {
         self.image = Some(image.into());
         self
     }
@@ -253,10 +255,9 @@ impl ConsoleBuilder {
     /// How much of a network the session's commands get.
     ///
     /// ```no_run
-    /// # use cortex::console::{Console, NetworkAccess};
+    /// # use cortex::{console::ConsoleClient, protocol::NetworkAccess};
     /// # async fn f() -> anyhow::Result<()> {
-    /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-uvm-console"])
+    /// let console = ConsoleClient::builder()
     ///     .network(NetworkAccess::public())
     ///     .build()
     ///     .await?;
@@ -271,7 +272,7 @@ impl ConsoleBuilder {
     /// cannot take the network away from them and so answers only
     /// [`full`](NetworkAccess::full).
     ///
-    /// Leaving it out leaves the choice to the server, and [`Console::network`] is then how to
+    /// Leaving it out leaves the choice to the server, and [`ConsoleClient::network`] is then how to
     /// find out what it chose.
     pub fn network(mut self, network: NetworkAccess) -> Self {
         self.network = Some(network);
@@ -292,10 +293,9 @@ impl ConsoleBuilder {
     /// How much memory the session's machine gets, in mebibytes.
     ///
     /// ```no_run
-    /// # use cortex::console::Console;
+    /// # use cortex::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
-    /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-uvm-console"])
+    /// let console = ConsoleClient::builder()
     ///     .vcpus(4)
     ///     .memory_mib(4096)
     ///     .build()
@@ -333,10 +333,9 @@ impl ConsoleBuilder {
     /// [`build`](Self::build).
     ///
     /// ```no_run
-    /// # use cortex::console::Console;
+    /// # use cortex::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
-    /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-krun"])
+    /// let console = ConsoleClient::builder()
     ///     .gpu(true)
     ///     .gpu_memory_mib(8192)
     ///     .build()
@@ -357,10 +356,9 @@ impl ConsoleBuilder {
     /// from [`build`](Self::build).
     ///
     /// ```no_run
-    /// # use cortex::console::Console;
+    /// # use cortex::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
-    /// let console = Console::builder()
-    ///     .stdio_client(&["cortex-krun"])
+    /// let console = ConsoleClient::builder()
     ///     .disk_gib(32)
     ///     .build()
     ///     .await?;
@@ -371,19 +369,19 @@ impl ConsoleBuilder {
         self
     }
 
-    /// Fails for the one part that has no default — something to ask — for whatever having
-    /// a channel took (over stdio, a server process that would not start), and for the
-    /// `init` this then sends.
+    /// Fails for whatever having a channel took (over stdio, a server process that would not
+    /// start), and for the `init` this then sends.
     ///
-    /// A runtime has to be under it: a console over [`stdio_client`](Self::stdio_client)
-    /// starts a process, and a process is registered with the runtime that will reap it.
+    /// A runtime has to be under it: a console over a program — the default one, or one
+    /// given to [`cmd`](Self::cmd) — starts a process, and a process is registered with the
+    /// runtime that will reap it.
     /// Building one from outside a task or `main` is a panic, not an `Err` — the missing
     /// runtime is the caller's own shape and not something the channel could report.
     ///
     /// Usually one message. The exception is [`image`](Self::image), which this may have to
     /// build before there is a session to be had — see there for what that costs.
-    pub async fn build(self) -> anyhow::Result<Console> {
-        Console::new(self).await
+    pub async fn build(self) -> anyhow::Result<ConsoleClient> {
+        ConsoleClient::new(self).await
     }
 }
 
@@ -400,7 +398,7 @@ impl ConsoleBuilder {
 /// results.
 ///
 /// ```no_run
-/// use cortex::console::Console;
+/// use cortex::console::ConsoleClient;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
@@ -408,8 +406,7 @@ impl ConsoleBuilder {
 /// // Building also says what the session is — the tree it works in if there is one — so
 /// // a console that exists is one the server has answered. Nothing is booted by that;
 /// // the command below pays for the boot, unless a `start` gets there first.
-/// let mut console = Console::builder()
-///     .stdio_client(&["cortex-local-console"])
+/// let mut console = ConsoleClient::builder()
 ///     .build()
 ///     .await?;
 ///
@@ -444,8 +441,8 @@ struct Tree {
 
     /// Where the session sees it, as `init` named it.
     ///
-    /// **The paths this protocol speaks are these.** A [`read`](Console::read) names a file
-    /// under one, and so does a [`write`](Console::write). It is not the mount point above:
+    /// **The paths this protocol speaks are these.** A [`read`](ConsoleClient::read) names a file
+    /// under one, and so does a [`write`](ConsoleClient::write). It is not the mount point above:
     /// a host-local server may put the tree at the same place, and one with a guest puts it
     /// where the session can see it, which need not be a path this host has at all.
     ///
@@ -456,9 +453,9 @@ struct Tree {
     path: PathBuf,
 }
 
-pub struct Console {
+pub struct ConsoleClient {
     /// A console has one, always. What ending needs is not for this to become absent but
-    /// for it to be *replaced* — see [`Console::drop`](Console#impl-Drop-for-Console).
+    /// for it to be *replaced* — see [`ConsoleClient::drop`](ConsoleClient#impl-Drop-for-ConsoleClient).
     client: Box<dyn Client>,
 
     /// Every tree this session was given, in the order they were named — empty when this
@@ -466,9 +463,9 @@ pub struct Console {
     mounts: Vec<Tree>,
 }
 
-impl Console {
-    pub fn builder() -> ConsoleBuilder {
-        ConsoleBuilder::default()
+impl ConsoleClient {
+    pub fn builder() -> ConsoleClientBuilder {
+        ConsoleClientBuilder::default()
     }
 
     /// Take a channel and announce the session on it.
@@ -476,7 +473,7 @@ impl Console {
     /// `init` is here rather than a method a caller remembers, because a session's shape
     /// is not something a console is ever without: the tree, the base and the reach are
     /// what the builder was given, they outlive every execution, and there is no useful
-    /// console in between having a channel and having said what is on it. So a `Console`
+    /// console in between having a channel and having said what is on it. So a `ConsoleClient`
     /// that exists is one the server has heard from and answered — which is the one thing
     /// about a session a caller can act on before asking for work.
     ///
@@ -488,11 +485,11 @@ impl Console {
     /// one, unless a [`start`](Self::start) gets there first.
     ///
     /// A failure here takes the channel with it. The client is dropped rather than told
-    /// `quit`, because there is no `Console` to owe one: over stdio that kills the server
+    /// `quit`, because there is no `ConsoleClient` to owe one: over stdio that kills the server
     /// process instead of asking it to leave, which is the same ending a console dropped
     /// off a runtime gets.
-    pub async fn new(builder: ConsoleBuilder) -> anyhow::Result<Self> {
-        let ConsoleBuilder {
+    pub async fn new(builder: ConsoleClientBuilder) -> anyhow::Result<Self> {
+        let ConsoleClientBuilder {
             client_factory,
             image,
             mounts,
@@ -505,8 +502,6 @@ impl Console {
             disk_gib,
         } = builder;
 
-        let client_factory =
-            client_factory.context("a console needs a client to drive its server")?;
         let mut client = client_factory()?;
 
         // Every tree is turned into what the server is told about it before anything goes
@@ -538,7 +533,7 @@ impl Console {
 
         client.init(session).await?;
 
-        Ok(Console {
+        Ok(ConsoleClient {
             client,
             mounts: held,
         })
@@ -654,7 +649,7 @@ impl Console {
 
     /// Take everything this session has written, as a blob another session can start on.
     ///
-    /// The other half of [`ConsoleBuilder::snapshot`]: what comes back is what that takes, so a
+    /// The other half of [`ConsoleClientBuilder::snapshot`]: what comes back is what that takes, so a
     /// session is carried on by building a new one with these bytes in hand. What is in them
     /// is the server's own encoding of the changes and not a caller's to read — keeping them
     /// and handing them back is the whole of the contract.
@@ -690,13 +685,13 @@ impl Console {
     }
 }
 
-impl Drop for Console {
+impl Drop for ConsoleClient {
     /// Say `quit`, which is what lets the server exit rather than be killed.
     ///
     /// A server exists for as long as the client driving it does, so this is owed exactly
     /// once and this is the moment: nothing else can happen on the channel afterwards.
     /// Only `quit` — a server that hears it releases whatever a
-    /// [`stop`](Console::stop) would have released, on its way out — so an ending is one
+    /// [`stop`](ConsoleClient::stop) would have released, on its way out — so an ending is one
     /// message and not two.
     ///
     /// Nobody hears what it answered. There is no caller left to tell by the time a
@@ -720,28 +715,58 @@ impl Drop for Console {
     /// stdio the server process is killed rather than asked, and what it left behind is
     /// swept by the next run.
     fn drop(&mut self) {
-        /// Answers nothing, because by the time this is reachable there is nothing left
-        /// to answer with.
-        struct Spent;
+        hang_up(&mut self.client);
+    }
+}
 
-        impl Client for Spent {
-            fn call(&mut self, _: Call) -> BoxFuture<'_, Result<Response, Failure>> {
-                Box::pin(async { Err(Failure::broken("the session has ended")) })
-            }
+/// Start `cmd` as a console server, over its own pipes, once the factory is run.
+///
+/// Every builder that takes a program rather than a channel makes its client this way.
+pub(crate) fn stdio_factory(cmd: &[impl AsRef<OsStr>]) -> ClientFactory {
+    // Owned before the closure, because the closure outlives this borrow and what it
+    // was given has to still be there when `build` runs it.
+    let cmd: Vec<OsString> = cmd.iter().map(|s| s.as_ref().to_owned()).collect();
 
-            fn notify(&mut self, _: Notification) -> BoxFuture<'_, Result<(), Failure>> {
-                Box::pin(async { Err(Failure::broken("the session has ended")) })
-            }
+    Box::new(move || {
+        let (program, args) = cmd
+            .split_first()
+            .context("a console server needs a program to run")?;
+
+        let mut server = Command::new(program);
+        server.args(args);
+
+        let client = StdioClient::new(server).context("starting the console server")?;
+        Ok(Box::new(client))
+    })
+}
+
+/// Say `quit` on a task, leaving a client behind that answers nothing.
+///
+/// What a console's `drop` does, for any console that holds a client: see
+/// [`ConsoleClient::drop`](ConsoleClient#impl-Drop-for-ConsoleClient) for why the client is swapped rather
+/// than taken, and what happens off a runtime.
+pub(crate) fn hang_up(client: &mut Box<dyn Client>) {
+    /// Answers nothing, because by the time this is reachable there is nothing left
+    /// to answer with.
+    struct Spent;
+
+    impl Client for Spent {
+        fn call(&mut self, _: Call) -> BoxFuture<'_, Result<Response, Failure>> {
+            Box::pin(async { Err(Failure::broken("the session has ended")) })
         }
 
-        // Zero-sized, so this `Box` is a dangling pointer rather than an allocation.
-        let mut client = std::mem::replace(&mut self.client, Box::new(Spent));
-
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                let _ = client.quit().await;
-            });
+        fn notify(&mut self, _: Notification) -> BoxFuture<'_, Result<(), Failure>> {
+            Box::pin(async { Err(Failure::broken("the session has ended")) })
         }
+    }
+
+    // Zero-sized, so this `Box` is a dangling pointer rather than an allocation.
+    let mut client = std::mem::replace(client, Box::new(Spent));
+
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            let _ = client.quit().await;
+        });
     }
 }
 
@@ -792,7 +817,7 @@ mod tests {
     use futures_core::future::BoxFuture;
 
     use super::*;
-    use crate::console::message::{Call, Error, InitResp, Method, Notification, Response};
+    use crate::protocol::{Call, Error, InitResp, Method, Notification, Response};
 
     /// What a [`Recorder`] was handed, readable while it is still lent out.
     ///
@@ -873,21 +898,12 @@ mod tests {
         })
     }
 
-    /// A builder needs exactly one thing, and says which when it does not have it.
-    #[tokio::test]
-    async fn a_console_needs_something_to_ask() {
-        let Err(failure) = Console::builder().build().await else {
-            panic!("a console with nothing to ask should not build");
-        };
-        assert!(failure.to_string().contains("needs a client"), "{failure}");
-    }
-
     /// Every way building can fail says which one it was, and all of them are here rather
     /// than spread over the first few methods a caller would have reached for.
     #[tokio::test]
     async fn a_stdio_console_starts_its_server_when_it_is_built() {
-        let Err(e) = Console::builder()
-            .stdio_client(&["cortex-no-such-console"])
+        let Err(e) = ConsoleClient::builder()
+            .cmd(&["cortex-no-such-console"])
             .build()
             .await
         else {
@@ -897,11 +913,7 @@ mod tests {
 
         // A command with nothing to run is the same kind of failure and reported the same
         // way: at build, saying what it lacked.
-        let Err(e) = Console::builder()
-            .stdio_client(&[] as &[&str])
-            .build()
-            .await
-        else {
+        let Err(e) = ConsoleClient::builder().cmd(&[] as &[&str]).build().await else {
             panic!("a console over no program at all should not build");
         };
         assert!(e.to_string().contains("needs a program to run"), "{e}");
@@ -911,11 +923,7 @@ mod tests {
         // does not exist. `cat` echoes the request back, so what arrives is a request and
         // not the response that was due — arguments are the caller's, and go to the
         // program as given.
-        let Err(e) = Console::builder()
-            .stdio_client(&["cat", "-u"])
-            .build()
-            .await
-        else {
+        let Err(e) = ConsoleClient::builder().cmd(&["cat", "-u"]).build().await else {
             panic!("a console over a program that cannot answer should not build");
         };
         assert!(e.to_string().contains("cannot answer"), "{e}");
@@ -929,7 +937,11 @@ mod tests {
     #[tokio::test]
     async fn a_session_is_the_servers_to_keep() {
         let (client, log) = recorder(vec![initialized(), ran(b"hi\n")]);
-        let mut console = Console::builder().client(client).build().await.unwrap();
+        let mut console = ConsoleClient::builder()
+            .client(client)
+            .build()
+            .await
+            .unwrap();
 
         // Optional, and unanswered: only the timing of the boot below changes.
         console.start().await.unwrap();
@@ -987,12 +999,12 @@ mod tests {
             Error::UNSUPPORTED_MOUNT,
             "s3: this server realizes file:// and nothing else",
         ))]);
-        let Err(e) = Console::builder().client(client).build().await else {
+        let Err(e) = ConsoleClient::builder().client(client).build().await else {
             panic!("a console whose init was refused should not build");
         };
         assert!(e.to_string().contains("file://"), "{e}");
 
-        // And no `quit`: what would owe one is a `Console`, and there is not one.
+        // And no `quit`: what would owe one is a `ConsoleClient`, and there is not one.
         tokio::task::yield_now().await;
         assert_eq!(log.methods(), [Method::Init]);
     }
@@ -1002,7 +1014,11 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_console_ends_its_session() {
         let (client, log) = recorder(vec![initialized()]);
-        let console = Console::builder().client(client).build().await.unwrap();
+        let console = ConsoleClient::builder()
+            .client(client)
+            .build()
+            .await
+            .unwrap();
 
         drop(console);
 
@@ -1020,7 +1036,7 @@ mod tests {
     #[tokio::test]
     async fn a_console_names_its_mounts_and_where_it_put_them() {
         let (client, log) = recorder(vec![initialized()]);
-        let console = Console::builder()
+        let console = ConsoleClient::builder()
             .client(client)
             .mount_readonly(PathBuf::from("/mnt/project"), "/work")
             .mount(PathBuf::from("/mnt/collected"), "/work/out")
@@ -1059,7 +1075,7 @@ mod tests {
     #[tokio::test]
     async fn a_mount_this_end_cannot_name_is_not_a_session() {
         let (client, log) = recorder(vec![initialized()]);
-        let Err(e) = Console::builder()
+        let Err(e) = ConsoleClient::builder()
             .client(client)
             .mount(PathBuf::from("relative/here"), "/work")
             .build()
@@ -1073,7 +1089,7 @@ mod tests {
         // And a guest path that is not one the session could join onto is the same kind of
         // nothing — it would be relative to a working directory nobody named.
         let (client, _) = recorder(vec![initialized()]);
-        let Err(e) = Console::builder()
+        let Err(e) = ConsoleClient::builder()
             .client(client)
             .mount(PathBuf::from("/mnt/here"), "work")
             .build()

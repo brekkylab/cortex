@@ -34,7 +34,7 @@
 //! path, inside this process, and does not care whether anything outside can see it. A
 //! parameter typed [`Mount`] asks for a tree the host already has — the caller must have
 //! mounted it, and what arrives is a directory that `std::fs`, a spawned program or a guest can
-//! open by name. [`Console`] takes the second: what a session names as its context is what a
+//! open by name. [`ConsoleClient`] takes the second: what a session names as its context is what a
 //! command it runs will open by name, so its signature says "a tree plugged into this host"
 //! rather than "a tree".
 //!
@@ -42,7 +42,7 @@
 //! learn: a store's own `std::fs` calls travel up unchanged, and `FileSystem`'s docs say
 //! which kind answers what.
 //!
-//! [`Console`]: crate::console::Console
+//! [`ConsoleClient`]: crate::console::ConsoleClient
 
 mod directory;
 mod filesystem;

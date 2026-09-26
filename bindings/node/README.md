@@ -1,17 +1,17 @@
 # cortex for Node
 
-Node bindings for cortex, built with [napi-rs](https://napi.rs): the same `Console`,
-`Directory`, `Image` and host mount as the Rust crate, camelCased, with every call that
+Node bindings for cortex, built with [napi-rs](https://napi.rs): the same `ConsoleClient`,
+`ImageClient`, `Recipe`, `Directory` and host mount as the Rust crate, camelCased, with every call that
 waits returning a `Promise`.
 
 ```js
-const { Console, Directory, HostMount, Image, NetworkAccess } = require('cortex-node')
+const { ConsoleClient, Directory, HostMount, NetworkAccess, Recipe } = require('cortex-node')
 
 const mount = new HostMount(new Directory().withFile('SKILL.md', '...'), '/tmp/skill')
 
-const console_ = await Console.builder()
-  .stdioClient(['cortex-krun'])
-  .image(new Image('python:3.12-slim-trixie').step('pip install duckdb'))
+const console_ = await ConsoleClient.builder()
+  .cmd(['cortex-krun'])
+  .image(new Recipe('python:3.12-slim-trixie').step('pip install duckdb'))
   .mountReadonly(mount, '/skills/example')
   .mount('./artifacts', '/artifacts')
   .network(NetworkAccess.none())
@@ -27,13 +27,30 @@ try {
 }
 ```
 
+Without `.cmd(..)` a console runs `cortex-krun` from the stdio server directory
+(`$CORTEX_STDIO_SERVER_PATH`, or `~/.cache/cortex/bin`).
+
+An image can also be built ahead of the session that runs on it, and then named by its ref or
+its digest:
+
+```js
+const { ImageClient, ImageSource, Recipe } = require('cortex-node')
+
+const images = await ImageClient.tryNew()
+const built = await images.build(new Recipe('alpine:3.20').step('apk add jq'), 'myimg:latest')
+for (const image of await images.list()) console.log(image.digest, image.refs)
+await images.close()
+
+const console_ = await ConsoleClient.builder().image(ImageSource.digest(built.digest)).build()
+```
+
 ## Errors
 
 Every error carries a `code`, the way Node's own carry `ENOENT`:
 
 | `code` | When |
 |---|---|
-| `TIMED_OUT`, `NOT_FOUND`, … | the console server refused, with cortex's name for its answer |
+| `TIMED_OUT`, `NOT_FOUND`, … | the console or image server refused, with cortex's name for its answer |
 | `CONSOLE_REFUSED` | the server refused with a number this cortex has no name for |
 | `CONSOLE_BROKEN` | the channel to the server is gone |
 | `CORTEX_ERROR` | anything else from cortex, such as a console that could not be built |

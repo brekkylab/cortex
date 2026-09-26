@@ -31,7 +31,7 @@ use std::{
 use futures_core::future::BoxFuture;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 
-use crate::console::{
+use crate::protocol::{
     Message, RequestId, Response, Server,
     stdio::{read, write},
 };
@@ -119,7 +119,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::console::{Call, Error, ExecCall, InitCall, InitResp, Notification};
+    use crate::protocol::{Call, Error, ExecCall, InitCall, InitResp, Notification};
 
     /// Everything this end wrote, readable after it has been dropped or not — a `Vec`
     /// cannot be, once the server owns it.

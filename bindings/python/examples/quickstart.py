@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 
-from cortex import Console, Directory, HostMount, Image, NetworkAccess
+from cortex import ConsoleClient, Directory, HostMount, NetworkAccess, Recipe
 
 
 async def main(project: str) -> None:
@@ -29,9 +29,9 @@ async def main(project: str) -> None:
 
     # What the agent can do: a server that runs its commands, against that tree.
     console = await (
-        Console.builder()
-        .stdio_client([os.environ.get("CORTEX_CONSOLE", "cortex-krun")])
-        .image(Image().base("python:3.12-slim-trixie"))
+        ConsoleClient.builder()
+        .cmd([os.environ.get("CORTEX_CONSOLE", "cortex-krun")])
+        .image(Recipe("python:3.12-slim-trixie"))
         .mount(mount, "/work")
         .network(NetworkAccess.none())
         .build()

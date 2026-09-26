@@ -6,12 +6,12 @@ import { test } from 'node:test'
 import { createRequire } from 'node:module'
 
 const cortex = createRequire(import.meta.url)('../index.js')
-const { Console, Directory, Image, NetworkAccess, Step } = cortex
+const { ConsoleClient, Directory, ImageClient, ImageSource, NetworkAccess, Recipe, Step } = cortex
 
 const tempDir = () => mkdtempSync(join(tmpdir(), 'cortex-'))
 
-test('an Image is a value', () => {
-  const base = new Image().base('python:3.12-slim')
+test('a Recipe is a value', () => {
+  const base = new Recipe('python:3.12-slim')
   const extended = base.step('pip install duckdb').step(Step.env('TZ', 'UTC'))
 
   assert.match(extended.toString(), /python:3\.12-slim/)
@@ -19,9 +19,17 @@ test('an Image is a value', () => {
   assert.doesNotMatch(base.toString(), /duckdb/)
 })
 
-test('an Image from a Dockerfile', () => {
-  const image = Image.fromDockerfile('FROM alpine:3.20\nRUN apk add jq\n')
+test('a Recipe from a Dockerfile', () => {
+  const image = Recipe.fromDockerfile('FROM alpine:3.20\nRUN apk add jq\n')
   assert.match(image.toString(), /alpine:3\.20/)
+})
+
+test('ImageSource', () => {
+  const recipe = new Recipe('alpine:3.20').step('apk add jq')
+  assert.ok(ImageSource.recipe(recipe).equals(ImageSource.recipe(new Recipe('alpine:3.20', ['apk add jq']))))
+  assert.ok(!ImageSource.reference('myimg:latest').equals(ImageSource.digest('myimg:latest')))
+  assert.equal(ImageSource.digest('sha256:0123').toString(), 'ImageSource.digest("sha256:0123")')
+  assert.equal(recipe.base, 'alpine:3.20')
 })
 
 test('NetworkAccess', () => {
@@ -49,25 +57,31 @@ test('a HostMount serves the Directory', { skip: !cortex.HostMount && 'built wit
 })
 
 test('building without a server fails and spends the builder', async () => {
-  const builder = Console.builder()
+  // The default server is looked up here, where there is none.
+  process.env.CORTEX_STDIO_SERVER_PATH = tempDir()
+  const builder = ConsoleClient.builder()
   await assert.rejects(builder.build(), { code: 'CORTEX_ERROR' })
   assert.throws(() => builder.vcpus(2), { code: 'INVALID_ARG' })
 })
 
 test('building against a missing binary fails', async () => {
   await assert.rejects(
-    Console.builder().stdioClient(['cortex-no-such-console-server']).build(),
+    ConsoleClient.builder().cmd(['cortex-no-such-console-server']).build(),
     { code: 'CORTEX_ERROR' },
   )
+})
+
+test('an image client against a missing binary fails', async () => {
+  await assert.rejects(ImageClient.tryFromCmd(['cortex-no-such-console-server']), { code: 'CONSOLE_BROKEN' })
 })
 
 // Against a real console server, named by `$CORTEX_CONSOLE` (`cortex-krun`, say).
 const SERVER = process.env.CORTEX_CONSOLE
 
 test('exec, read and write', { skip: !SERVER && 'set $CORTEX_CONSOLE' }, async () => {
-  const console_ = await Console.builder()
-    .stdioClient([SERVER])
-    .image(new Image('python:3.12-slim-trixie'))
+  const console_ = await ConsoleClient.builder()
+    .cmd([SERVER])
+    .image(new Recipe('python:3.12-slim-trixie'))
     .mount(tempDir(), '/work')
     .network(NetworkAccess.none())
     .build()
@@ -84,5 +98,21 @@ test('exec, read and write', { skip: !SERVER && 'set $CORTEX_CONSOLE' }, async (
     assert.equal(read.size, 2)
   } finally {
     await console_.close()
+  }
+})
+
+test('build, list and remove', { skip: !SERVER && 'set $CORTEX_CONSOLE' }, async () => {
+  const images = await ImageClient.tryFromCmd([SERVER])
+  try {
+    assert.ok(await images.version())
+
+    const built = await images.build(new Recipe('alpine:3.20'), 'cortex-node-test:latest')
+    assert.equal(built.reference, 'cortex-node-test:latest')
+    assert.ok((await images.list()).some((entry) => entry.digest === built.digest))
+
+    await images.remove(ImageSource.reference(built.reference))
+    assert.ok((await images.list()).every((entry) => !entry.refs.includes(built.reference)))
+  } finally {
+    await images.close()
   }
 })

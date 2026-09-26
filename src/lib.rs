@@ -12,7 +12,7 @@
 //!   assembles: files handed to it in memory, host directories grafted in at paths the caller
 //!   chooses. A binding mounts that tree on the host, so what reads it is `cat`,
 //!   `grep`, and whatever else the agent thought to run.
-//! * **What it does is run commands.** A [`Console`](console::Console) runs them somewhere —
+//! * **What it does is run commands.** A [`ConsoleClient`](console::ConsoleClient) runs them somewhere —
 //!   this host, a micro-VM — over one channel: an `exec` carrying an argv, and everything the
 //!   command wrote coming back.
 //!
@@ -25,7 +25,7 @@
 //! ```ignore
 //! use std::path::Path;
 //!
-//! use cortex::console::Console;
+//! use cortex::console::ConsoleClient;
 //! use cortex::fs::{Directory, FuseMount};
 //!
 //! #[tokio::main]
@@ -43,8 +43,7 @@
 //!     // What the agent can do: a server that runs its commands, against that tree. A
 //!     // session's shape is said once, when the console is built — including where each
 //!     // tree appears to the commands, which is what their paths are spelled under.
-//!     let mut console = Console::builder()
-//!         .stdio_client(&["cortex-local-console"])
+//!     let mut console = ConsoleClient::builder()
 //!         .mount(mount, "/work")
 //!         .build()
 //!         .await?;
@@ -87,20 +86,20 @@
 //!
 //! A module here is a directory whose `mod.rs` holds the module's own documentation and
 //! its re-exports, and whose siblings hold the code — including one named after the
-//! module itself, for the type the module exists for: `console/console.rs` has
-//! [`Console`](console::Console), `message/message.rs` has
+//! module itself, for the type the module exists for: `message/message.rs` has
 //! [`Message`](console::Message).
 //!
 //! That is what `module_inception` fires on, and it is the arrangement rather than an
 //! accident of one file: the reasoning for a module is long here and belongs somewhere
-//! that is not also holding a type, and a reader looking for `Console` should find it in
-//! a file with that name.
+//! that is not also holding a type, and a reader looking for `Message` should find it in a
+//! file with that name.
 #![allow(clippy::module_inception)]
 
 pub mod console;
 pub mod fs;
 pub mod image;
 mod lock;
+pub mod protocol;
 
 /// What every method that waits hands back — a [`Client`] or a [`Server`].
 ///
@@ -112,3 +111,28 @@ mod lock;
 /// [`Client`]: console::Client
 /// [`Server`]: console::Server
 pub use futures_core::future::BoxFuture;
+
+fn stdio_server_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("CORTEX_STDIO_SERVER_PATH") {
+        return dir.into();
+    }
+    // Windows keeps per-user caches under `%LOCALAPPDATA%`, not a dot directory in the
+    // profile.
+    #[cfg(windows)]
+    let cache = std::env::var_os("LOCALAPPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::home_dir()
+                .unwrap_or_default()
+                .join("AppData")
+                .join("Local")
+        });
+    #[cfg(not(windows))]
+    let cache = std::env::home_dir().unwrap_or_default().join(".cache");
+    cache.join("cortex").join("bin")
+}
+
+/// Fetch the console servers if it is not cached.
+pub async fn ensure_cortex() {
+    todo!()
+}

@@ -1,134 +1,8 @@
-//! The methods that are answered, and what each of them asks for.
-//!
-//! [`Call`] is which one a request names; the rest is what each one carries — an
-//! [`InitCall`] and the vocabulary a session is described in, an [`ExecCall`], a
-//! [`ReadCall`], a [`WriteCall`].
-//!
-//! One file for the asking half and one for the answering half, because that is the
-//! division a reader of this protocol has: a client writes calls and reads responses, a
-//! server does the reverse, and neither is ever holding both halves of a method at once.
-//! It is also the division the envelope names — [`Call`] and [`Response`](super::Response)
-//! are the two types a [`Message`](super::Message) is built from — so a file holds exactly
-//! what one of those enums can be, and adding a method is one thing to add on each side.
-//!
-//! The three methods that are answered by nothing are `notification`'s, next door.
-
 use std::{path::Path, str::FromStr};
 
-use bson::{Bson, doc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
-use crate::image::Image;
-
-use super::{Method, utils::bytes};
-
-/// A method and its parameters: what a request carries.
-///
-/// The requests as one type, each variant holding what its method takes.
-///
-/// # On the wire
-///
-/// Part of a JSON-RPC request: the `method` and `params` fields.
-///
-/// What serde writes for it, spelled as BSON's Extended JSON would show it — with
-/// `<Binary>` standing in for a byte payload, which BSON carries as `Binary` and
-/// JSON has no spelling for:
-///
-/// ```text
-/// {"method":"init","params":{"mounts":["file:///srv/project:/work:ro"]}}
-/// {"method":"exec","params":{"cmd":["sh","-c","ls"],"timeout_ms":1000}}
-/// {"method":"read","params":{"path":"out/log.txt","offset":4096,"len":1024}}
-/// {"method":"write","params":{"path":"in/data","data":<Binary>}}
-/// ```
-///
-/// An optional member that was not set is left out rather than sent as null — the
-/// `write` above carries no `offset`, which is what asks for a whole-file write.
-///
-/// `jsonrpc` and `id` are [`Message`](super::Message)'s, and so is putting these two
-/// members beside them.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "method", content = "params", rename_all = "snake_case")]
-pub enum Call {
-    /// This is the session: the trees it works in, and what its commands run in and may reach.
-    ///
-    /// The one exchange that is about the session rather than about work, and the one
-    /// thing worth answering about it — because the answer is something a client can
-    /// act on before it has asked for anything. A channel that answers this has a
-    /// server on the far end that read the frame, speaks this protocol, and has taken
-    /// what it was told; a notification could say none of that. The answer also says where
-    /// the session stands to begin with, which is the one thing about it a client could not
-    /// have worked out from what it sent — see [`InitResp`](super::InitResp).
-    ///
-    /// It carries no booting, and no mounting either. Bringing a backend up costs a kernel
-    /// on one and nothing at all on another, and a session's shape is the same either way,
-    /// so *when* to pay for it is [`Start`](super::Notification::Start)'s and not this
-    /// method's. Each tree is put where this said it would be at the same moment.
-    ///
-    /// A second one replaces the first, and takes whatever was booted under it with it: the
-    /// trees are built into what booting produced, so a session that changes them has a boot
-    /// that no longer matches it.
-    Init(InitCall),
-
-    /// Run this command.
-    Exec(ExecCall),
-
-    /// Hand back part of a file.
-    Read(ReadCall),
-
-    /// Put these bytes in a file.
-    Write(WriteCall),
-
-    /// Take what this session has written so far, as a blob a later session can start from.
-    Snapshot(SnapshotCall),
-}
-
-impl Call {
-    pub fn method(&self) -> Method {
-        match self {
-            Call::Init(_) => Method::Init,
-            Call::Exec(_) => Method::Exec,
-            Call::Read(_) => Method::Read,
-            Call::Write(_) => Method::Write,
-            Call::Snapshot(_) => Method::Snapshot,
-        }
-    }
-
-    /// The call a `method` and its `params` name.
-    ///
-    /// Reached only for a message that carried an `id`, which is what says it is a
-    /// request at all — so a notification's method arriving here is a peer asking to be
-    /// answered about something nothing answers, and is refused as that rather than as
-    /// a name this enum happens not to have.
-    ///
-    /// The two members are put back together into the object the derive above expects,
-    /// because the envelope read them out of a flat one and had to: `params` may arrive
-    /// before the `method` that types it. Nothing is copied — `params` is moved in as
-    /// the value it already was.
-    pub(super) fn from_params<E: de::Error>(method: Method, params: Bson) -> Result<Self, E> {
-        if method.is_notification() {
-            return Err(E::custom(format!(
-                "{method} is a notification and cannot carry an id"
-            )));
-        }
-
-        let mut object = doc! { "method": method.as_str() };
-        // An absent `params` becomes an empty one rather than staying absent: the derive
-        // above is adjacently tagged, so serde wants the member present whatever the
-        // method takes, and a missing one is `missing field \`params\`` and not a method
-        // read as taking none. What an empty object is short of is then the method's own
-        // to refuse — `init` takes it, `exec` wants a `cmd`.
-        object.insert(
-            "params",
-            match params {
-                Bson::Null => Bson::Document(bson::Document::new()),
-                params => params,
-            },
-        );
-
-        bson::deserialize_from_bson(Bson::Document(object))
-            .map_err(|e| E::custom(format!("{method} params: {e}")))
-    }
-}
+use crate::image::ImageSource;
 
 /// What a session is. The `params` of `init`.
 ///
@@ -200,7 +74,7 @@ pub struct InitCall {
     ///
     /// It is essential if it runs on VM environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub image: Option<Image>,
+    pub image: Option<ImageSource>,
 
     /// Optional snapshot of what an earlier session changed from the base image — what a
     /// [`snapshot`](SnapshotCall) answered with, handed back.
@@ -704,105 +578,50 @@ impl NetworkAccess {
     }
 }
 
-/// One execution, and everything it needs. The `params` of `exec`.
+/// What the server made of the session. The `result` of `init`.
 ///
-/// A command and a bound on how long it may take, and nothing else — because nothing else
-/// about an execution is the client's to say. Where it runs is the session's, which the far
-/// end keeps; what it runs with is the executor's; what it reads is whatever a
-/// [`WriteCall`] put where it would look.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecCall {
-    /// Run this. Already split into argv, and nothing here consults a shell, so quoting
-    /// and word rules stay wherever the command was composed; a caller that wants shell
-    /// semantics asks for them outright — `["sh", "-c", "..."]`.
-    ///
-    /// An empty argv is a command nobody can run. It is refused where a command is turned
-    /// into a process rather than everywhere an `exec` is read, because that is the end
-    /// that knows what running one means — see [`split`](Self::split).
-    pub cmd: Vec<String>,
-
-    /// How long this may run before the executor kills it, in milliseconds. `None` is
-    /// no limit: an [`InitCall`] carries no default to fall back on, so a command that
-    /// never ends and was given no timeout is one nobody ends.
-    ///
-    /// Expiry is a kill: no grace period, no second signal, no negotiation. One
-    /// rule is worth more here than a good one — a requester cannot reach into a
-    /// micro-VM guest to check on anything, so anything subtler would be a promise
-    /// only some backends could keep.
-    ///
-    /// The executor enforces it because only the executor knows what running the
-    /// thing means. The requester hears [`TIMED_OUT`](crate::console::Error::TIMED_OUT).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout_ms: Option<u64>,
-}
-
-impl ExecCall {
-    /// The program and its arguments.
-    ///
-    /// The split every executor needs, done once here rather than at each of them — and
-    /// `None` for an empty argv, which is a command that was never usable and is refused
-    /// as [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS) by whoever would have spawned
-    /// it.
-    pub fn split(&self) -> Option<(&String, &[String])> {
-        self.cmd.split_first()
-    }
-}
-
-/// Part of a file to hand back. The `params` of `read`.
+/// Answered rather than left to a notification because this is the one thing about a
+/// session a client can hear before it asks for work — that there is a server on the far
+/// end, that it read the frame, that it speaks this protocol, and that it has taken what it
+/// was told.
 ///
-/// A path is one in the executor's own filesystem, under the
-/// [`guest_path`](MountSpec::guest_path) of one of the session's mounts — so the file this names is the one a command would open by
-/// the same name, and reading it is how a requester sees what an execution left behind.
+/// **It says nothing about where the trees went, because the call already did.** A
+/// [`MountSpec`](super::MountSpec) carries the path its tree appears at, so every path in
+/// the session is settled by the end that is going to spell them and there is nothing here
+/// to read back. What is left is the one fact about a session the client could not have
+/// worked out from what it sent: where it stands.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReadCall {
-    /// UTF-8, and the executor's own: a requester builds it by joining onto the path it
-    /// named the mount at, which is the one both ends have a name for.
-    pub path: String,
-
-    /// Where in the file to start. `None` is the beginning.
+pub struct InitResp {
+    /// Where the session stands to begin with — the working directory the base image
+    /// declared, and whatever the server stands a session in when it declared none.
     ///
-    /// Past the end is not an error: the answer is empty
-    /// [`data`](super::ReadResp::data) and the [`size`](super::ReadResp::size) that says so.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-
-    /// How many bytes to hand back at most, `None` for as many as there are.
+    /// **The image, because the image is what the session runs on.** An image that says
+    /// where a process starts is describing the thing it was built to run, and a session
+    /// that stood somewhere else would be one where that image's own instructions are
+    /// wrong. Standing in a tree the client named instead would make that tree the default
+    /// destination of every relative path a command writes — somebody's project, when that
+    /// is what the tree is, and a mount the client asked to be read-only at that.
     ///
-    /// Either way the answer travels in one message under
-    /// [`MAX_PAYLOAD`](crate::console::MAX_PAYLOAD), so the executor hands back less than this
-    /// asks for when the rest would not fit. Comparing what arrives against
-    /// [`size`](super::ReadResp::size) is how a requester knows, and asking again from
-    /// further along is how it gets the rest.
+    /// Which is a convention and not a rule this protocol enforces: it is one member saying
+    /// one thing, and a server that stands somewhere else says so here and is read.
+    ///
+    /// **A session has a current directory, and the server is what keeps it.** That is why
+    /// an [`ExecCall`](super::ExecCall) asking for a command says nothing about where to run it:
+    /// there is one answer at any moment and the far end holds it.
+    ///
+    /// **To begin with**, and nothing here says otherwise afterwards. A command can move
+    /// the session — `cd` is a shell builtin, so a backend that offers it at all answers it
+    /// itself — and no result reports that it did. A client that wants to know where it
+    /// stands runs `pwd`, the way a person at a terminal does; see [`ExecResp`] for why
+    /// that is the trade rather than a gap.
+    ///
+    /// So what this is worth is the *first* answer: before a client has run anything, this
+    /// is the only way it can say where a relative path would land. Absent is a server that
+    /// will not say, and a client is then no worse off than it was before the field existed
+    /// — every path it sends is one it built itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub len: Option<u64>,
+    pub cwd: Option<String>,
 }
-
-/// Bytes to put in a file. The `params` of `write`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WriteCall {
-    /// Resolved as [`ReadCall::path`] is. Any directory above it has to
-    /// exist already; the file itself does not.
-    pub path: String,
-
-    #[serde(default, with = "bytes", skip_serializing_if = "Vec::is_empty")]
-    pub data: Vec<u8>,
-
-    /// Where in the file to put them.
-    ///
-    /// `None` makes the file be exactly `data`: created if it was not there, cut to
-    /// length if it was. `Some(n)` overwrites from `n` and leaves whatever lies past
-    /// the bytes written, extending the file with zeroes if `n` is beyond its end.
-    ///
-    /// So the whole-file case says nothing about what was there before and the
-    /// positioned case says nothing about the rest of the file, which is why a
-    /// requester that means to replace a file sends `None` rather than `Some(0)`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub offset: Option<u64>,
-}
-
-/// Take what this session has written so far. The `params` of `snapshot`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SnapshotCall {}
 
 #[cfg(test)]
 mod tests {

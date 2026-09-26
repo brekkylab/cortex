@@ -31,7 +31,7 @@ use crate::{
 /// A *context* is a tree a session is given to work in, as against its rootfs — the system's
 /// own tree — and this is what one is assembled out of: files the caller hands over, kept in
 /// memory, and host directories placed beside them, all behind one
-/// [`mount`](crate::console::ConsoleBuilder::mount).
+/// [`mount`](crate::console::ConsoleClientBuilder::mount).
 ///
 /// Which is a different question from the one the console protocol answers by taking a list
 /// of mounts, and both answers stand: this composes many sources into *one* namespace a
