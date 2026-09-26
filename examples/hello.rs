@@ -11,7 +11,7 @@ use cortex::{console::ConsoleClient, image::Recipe};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut console = ConsoleClient::builder()
-        .image(Recipe::new("alpine:3.24").step("apk add --no-cache jq"))
+        .image(Recipe::new("alpine:latest").step("apk add --no-cache jq"))
         .build()
         .await?;
 
