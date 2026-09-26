@@ -1,12 +1,12 @@
 # Cortex
 
-Cortex lets you run tasks in VMs on any OS.
+Cortex lets you run tasks in disposable Linux VMs from your own code.
 
 It's useful for jobs with heavy dependencies that you'd rather not install on your own machine.
 Whatever they install or change is gone when the VM shuts down.
 
-It doesn't need Docker or a heavy daemon.
-Everything runs inside your own code.
+No Docker or heavy daemon required.
+Create, use, and dispose of VMs directly from your code.
 
 ## Quickstart
 
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-It'll shows
+Output:
 ```text
 step 1/1: cd '/' && apk add --no-cache jq
 (1/2) Installing oniguruma (6.9.10-r0)
@@ -92,7 +92,7 @@ cortex
 
 | | Supported |
 |---|---|
-| **Languages** | 🐍 Python · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nodejs/nodejs-original.svg" height="14" alt=""> Node · 🦀 Rust - same API in each |
+| **Languages** | 🐍 Python · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nodejs/nodejs-original.svg" height="14" alt=""> Node · 🦀 Rust |
 | **Hosts** | 🐧 Linux · 🍎 macOS (Apple silicon) · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/windows11/windows11-original.svg" height="14" alt=""> Windows 11 or later |
 | **Guest** | 🐧 Linux, always |
 
@@ -132,10 +132,38 @@ asyncio.run(main())
 
 If the host can't give a GPU, `build()` fails instead of quietly running on the CPU.
 
-### Virtual mounts
+### Filesystem
 
-Build a virtual directory in code and mount it into the VM.
-It can hold files in memory, host directories, or stores like S3, Google Drive and Notion, and commands inside read them as ordinary files.
+Mount a host directory into the VM by passing its path.
+
+```python
+import asyncio
+
+from cortex import ConsoleClient, Recipe
+
+
+async def main() -> None:
+    console = await (
+        ConsoleClient.builder()
+        .image(Recipe("alpine:latest"))
+        .mount(".", "/project")
+        .mount_readonly("/etc", "/host-etc")
+        .build()
+    )
+
+    async with console:
+        result = await console.exec(["sh", "-c", "ls /project && touch /project/hello.txt"])
+
+    print(result.stdout.decode(), end="")
+
+
+asyncio.run(main())
+```
+
+Writes to `/project` land in the host's current directory, while `/host-etc` is read-only: commands in the VM can read it but not write to it.
+
+Going further, you can build a virtual directory in code and mount it into the VM through FUSE.
+It mixes files held only in memory with host directories, all under one mount point.
 
 ```python
 import asyncio
@@ -170,7 +198,54 @@ asyncio.run(main())
 
 `notes/today.md` lives only in memory, and `project` is the host's current directory.
 
-Unfortunately, this feature needs an extra package installed on some hosts.
+Moreover, external stores like S3, Google Drive and Notion, and commands inside the VM can read them as ordinary files.
+
+```rust
+use cortex::{
+    console::ConsoleClient,
+    fs::{S3Config, S3Fs},
+    image::Recipe,
+};
+
+#[cfg(target_os = "linux")]
+use cortex::fs::FuseMount as HostMount;
+#[cfg(target_os = "macos")]
+use cortex::fs::FuseTMount as HostMount;
+#[cfg(windows)]
+use cortex::fs::DokanMount as HostMount;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let bucket = S3Fs::new(&S3Config {
+        bucket: "my-bucket".into(),
+        region: "us-east-1".into(),
+        access_key_id: std::env::var("AWS_ACCESS_KEY_ID")?,
+        secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY")?,
+        endpoint: None,
+        key_prefix: None,
+    })?;
+
+    let mountpoint = std::env::temp_dir().join("cortex-s3");
+    std::fs::create_dir_all(&mountpoint)?;
+    let mount = HostMount::try_new(bucket, &mountpoint)?;
+
+    let mut console = ConsoleClient::builder()
+        .image(Recipe::new("alpine:latest"))
+        .mount_readonly(mount, "/s3")
+        .build()
+        .await?;
+
+    let result = console.exec(["ls", "-R", "/s3"], None).await?;
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+
+    Ok(())
+}
+```
+
+These stores are Rust only for now, each behind its own feature: `s3`, `gdrive` and `notion`.
+S3 is read-only, so it's mounted with `mount_readonly`.
+
+This feature needs an extra package installed on macOS and Windows.
 The `mount` feature, on by default, mounts a cortex filesystem on the host through the host's FUSE provider:
 
 | Host  | Provider | Needed to build | Needed to run |
@@ -193,12 +268,9 @@ And for windows
 winget install --id dokan-dev.Dokany
 ```
 
-
 ## Cache
 
-The only thing cortex keeps is its cache, all under one directory you can delete at any time:
-
-You can safely remove it whenever you no longer need it.
+Cortex keeps all persistent state in a single cache directory that you can safely delete at any time:
 
 | Host | Cache directory |
 |------|-----------------|
