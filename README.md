@@ -61,10 +61,7 @@ use cortex::{console::ConsoleClient, image::Recipe};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut console = ConsoleClient::builder()
-        .image(
-            Recipe::new("alpine:latest")
-                .step("apk add --no-cache jq")
-        )
+        .image(Recipe::new("alpine:latest").step("apk add --no-cache jq"))
         .build()
         .await?;
 
@@ -89,25 +86,91 @@ OK: 9426 KiB in 18 packages
 cortex
 ```
 
-The only thing cortex keeps is its cache, all under one directory you can delete at any time:
-
-| Host | Cache directory |
-|------|-----------------|
-| Linux | `$XDG_CACHE_HOME/cortex`, or `~/.cache/cortex` |
-| macOS | `~/Library/Caches/cortex` |
-| Windows | `%LOCALAPPDATA%\cortex` |
-
-Set `CORTEX_HOME` to put it somewhere else.
-
 ## Features
 
-- **Simple to run**: describe an image as a base and a few steps, or hand over a Dockerfile, and one builder call boots a VM from it. Built images are cached by digest, so the build is paid once.
-- **Virtual mounts**: mount a directory from the host, files held in memory, or an S3, Google Drive or Notion store, and commands inside read it as ordinary files.
-- **GPU support**: ask for a GPU and set its memory. If the backend can't provide one, the session fails to start instead of quietly running on the CPU.
-- **Cross-platform**: runs on Linux, macOS and Windows.
+### Coverage
 
-## Requirements
+Use it from Python, Node or Rust, with the same API in each.
 
+Runs on Linux, macOS (Apple silicon) and Windows 11 or later.
+
+The guest is always Linux.
+
+### GPU support
+
+The VM gets a GPU through Vulkan on every host, so it can run heavy work like deep learning.
+
+Turn it on with the builder's `gpu` option:
+
+```python
+import asyncio
+
+from cortex import ConsoleClient, Recipe
+
+
+async def main() -> None:
+    console = await (
+        ConsoleClient.builder()
+        .image(
+            Recipe("debian:bookworm-slim").step(
+                "apt-get update && apt-get install -y mesa-vulkan-drivers vulkan-tools"
+            )
+        )
+        .gpu(True)
+        .gpu_memory_mib(8192)
+        .build()
+    )
+
+    async with console:
+        result = await console.exec(["vulkaninfo", "--summary"])
+
+    print(result.stdout.decode(), end="")
+
+
+asyncio.run(main())
+```
+
+If the host can't give a GPU, `build()` fails instead of quietly running on the CPU.
+
+### Virtual mounts
+
+Build a virtual directory in code and mount it into the VM.
+It can hold files in memory, host directories, or stores like S3, Google Drive and Notion, and commands inside read them as ordinary files.
+
+```python
+import asyncio
+import tempfile
+
+from cortex import ConsoleClient, Directory, HostMount, Recipe
+
+
+async def main() -> None:
+    directory = (
+        Directory()
+        .with_file("notes/today.md", "ship the release")
+        .with_mount("project", ".")
+    )
+    mount = HostMount(directory, tempfile.mkdtemp())
+
+    console = await (
+        ConsoleClient.builder()
+        .image(Recipe("alpine:latest"))
+        .mount(mount, "/data")
+        .build()
+    )
+
+    async with console:
+        result = await console.exec(["sh", "-c", "cat /data/notes/today.md && ls /data/project"])
+
+    print(result.stdout.decode(), end="")
+
+
+asyncio.run(main())
+```
+
+`notes/today.md` lives only in memory, and `project` is the host's current directory.
+
+Unfortunately, this feature needs an extra package installed on some hosts.
 The `mount` feature, on by default, mounts a cortex filesystem on the host through the host's FUSE provider:
 
 | Host  | Provider | Needed to build | Needed to run |
@@ -131,3 +194,15 @@ winget install --id dokan-dev.Dokany
 ```
 
 The build links the installed Dokany library when `DokanLibrary2_LibraryPath_x64` is set, and otherwise builds one from vendored sources. Prefer the installed one: a self-built library can disagree with the installed driver's version, which fails only at mount time.
+
+## Cache
+
+The only thing cortex keeps is its cache, all under one directory you can delete at any time:
+
+| Host | Cache directory |
+|------|-----------------|
+| Linux | `$XDG_CACHE_HOME/cortex`, or `~/.cache/cortex` |
+| macOS | `~/Library/Caches/cortex` |
+| Windows | `%LOCALAPPDATA%\cortex` |
+
+Set `CORTEX_HOME` to put it somewhere else.
