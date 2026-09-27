@@ -40,6 +40,7 @@ cortex-uvm-boot = { path = "cortex-console-servers/uvm/boot", default-features =
 futures-core = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
+schemars = "0.9"
 # Verifying a downloaded base rootfs against a pinned digest. A tarball that arrives over
 # a link nobody controls decides what every command in every guest runs, so the check is
 # not optional and a `shasum` binary that may or may not be spelled that way is not a

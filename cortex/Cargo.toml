@@ -28,6 +28,7 @@ reqwest = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
 serde = { workspace = true }
+schemars = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 # The digest a built image is named by. Small and pure Rust, and already in this
 # workspace's lockfile — `cortex-uvm-console` hashes layers with it. Unconditional
@@ -100,6 +101,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Editors default to no features too, so a binding shows as inactive code until
 # its feature is enabled (rust-analyzer: `"cargo.features": "all"`).
 default = []
+# `JsonSchema` on the wire types a consumer embeds in its own schema-described config
+# (`SecretAccess`, `SecretLocation`).
+schemars = ["dep:schemars"]
 # Both bindings below also ask for `tokio/rt-multi-thread` and `tokio/net`: a
 # binding is a *synchronous* callback over async stores, so it blocks on one
 # process-wide runtime (`fs::mounts::block_on`), and `Builder::enable_all` is

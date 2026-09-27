@@ -607,6 +607,7 @@ impl NetworkAccess {
 /// One host per secret: a credential for several hosts is declared once each, and a family of
 /// subdomains is a `*.suffix` wildcard [`host`](Self::host), not a list.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SecretAccess {
     /// The environment variable whose value is injected — held by the server, seen by the
     /// commands only as a placeholder.
@@ -624,6 +625,7 @@ pub struct SecretAccess {
 /// Where in a request a [`SecretAccess`] is injected. On the wire it is its own lower-case name
 /// (`query`, `header`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SecretLocation {
     /// A URL query parameter, e.g. `?apiKey=<value>`.
