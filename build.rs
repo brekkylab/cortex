@@ -1,32 +1,31 @@
-//! Compiles the FUSE-T shim when the `mount` feature is on for a macOS target. See
-//! `contrib/fuse_t/shim.h` for why the shim exists.
+//! What the `mount` feature needs from the target's filesystem provider at build time: on
+//! macOS the FUSE-T shim, compiled; on Windows the Dokany DLL, delay-loaded. See
+//! `contrib/fuse_t/shim.h` for why the shim exists, and `src/fs/mount/support.rs` for why
+//! neither provider is a dependency a binary needs in order to start.
 
 fn main() {
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.c");
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.h");
 
-    // The target's OS, not `cfg!(target_os)`: a build script is compiled for the host.
-    if std::env::var_os("CARGO_FEATURE_MOUNT").is_none()
-        || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
-    {
+    if std::env::var_os("CARGO_FEATURE_MOUNT").is_none() {
         return;
     }
-
-    let fuse_t = pkg_config::Config::new()
-        .probe("fuse-t")
-        .expect("the `mount` feature on macOS needs FUSE-T installed: brew install --cask fuse-t");
-
-    // `libfuse-t.dylib`'s install name is `@rpath/libfuse-t.dylib`, so a linking binary needs
-    // an `LC_RPATH`. `fuse-t.pc` asks for one in its `Libs:`, but `pkg_config::probe` forwards
-    // only `-L` and `-l`.
-    //
-    // Without it the binary loads only when `DYLD_FALLBACK_LIBRARY_PATH` is set, which is not
-    // something to rely on: macOS strips every `DYLD_*` when it execs a system binary, so a
-    // command run through `/bin/sh` — how a console runs anything — loses it. Measured with
-    // the variable exported, `sh -c 'echo "[$DYLD_…]"'` prints `[]`.
-    for path in &fuse_t.link_paths {
-        println!("cargo::rustc-link-arg=-Wl,-rpath,{}", path.display());
+    // The target's, not `cfg!(target_os)`: a build script is compiled for the host.
+    match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("macos") => fuse_t_shim(),
+        Ok("windows") => delay_load_dokan(),
+        _ => {}
     }
+}
+
+/// Compile the shim against FUSE-T's headers. **Headers only**: the shim opens libfuse-t
+/// with `dlopen` when a mount first asks for it, so nothing is linked and nothing needs an
+/// rpath -- which is also why a dependent's own link needs nothing from this.
+fn fuse_t_shim() {
+    let fuse_t = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("fuse-t")
+        .expect("the `mount` feature on macOS builds against FUSE-T's headers: brew install --cask fuse-t");
 
     let mut build = cc::Build::new();
     build
@@ -39,5 +38,23 @@ fn main() {
     for path in &fuse_t.include_paths {
         build.include(path);
     }
+    // Where to look when the loader does not find the library by its bare name.
+    if let Some(dir) = fuse_t.link_paths.first() {
+        build.define(
+            "CORTEX_FUSE_T_LIBDIR",
+            format!("\"{}\"", dir.display()).as_str(),
+        );
+    }
     build.compile("cortex_fuse_t_shim");
+}
+
+/// Load `dokan2.dll` at its first call rather than at process start, for this package's
+/// own tests and examples. A dependent's binary has to ask for the same from its own
+/// `build.rs` -- a `rustc-link-arg` reaches only the package that prints it -- as the
+/// bindings' do. `/DELAYLOAD` is MSVC's; a GNU target links the DLL at start as before.
+fn delay_load_dokan() {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo::rustc-link-arg=/DELAYLOAD:dokan2.dll");
+        println!("cargo::rustc-link-lib=delayimp");
+    }
 }

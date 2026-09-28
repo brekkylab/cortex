@@ -151,6 +151,15 @@ export interface ImageEntry {
   refs: Array<string>
 }
 
+/**
+ * Throw, saying what to install, if this host cannot mount.
+ *
+ * `HostMount` checks the same before it mounts, so this is for a caller that wants to know
+ * ahead of asking for one. An addon built with `mount` loads on a host without the
+ * provider: what a missing FUSE-T or Dokany costs is a mount, never the `require`.
+ */
+export declare function mountSupport(): void
+
 export interface ReadResult {
   data: Buffer
   /** A JavaScript number, so exact up to 2^53 bytes. */

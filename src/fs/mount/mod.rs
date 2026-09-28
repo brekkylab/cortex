@@ -41,6 +41,8 @@ mod r#impl;
 mod mount;
 #[cfg(unix)]
 mod signal;
+#[cfg(all(feature = "mount", any(unix, windows)))]
+mod support;
 #[cfg(unix)]
 mod table;
 
@@ -61,3 +63,5 @@ pub use r#impl::{FuseTBackend, FuseTMount};
 pub use mount::*;
 #[cfg(unix)]
 pub use signal::unmount_on_signal;
+#[cfg(all(feature = "mount", any(unix, windows)))]
+pub use support::mount_support;

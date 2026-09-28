@@ -50,6 +50,10 @@ reqwest = { version = "0.13", default-features = false, features = [
     "form",
 ], optional = true }
 uuid = { version = "1", optional = true }
+# The archive `ensure_cortex` unpacks: a gzipped tar, as cortex-krun's `cargo xtask upload`
+# writes one.
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", optional = true }
 chrono = { version = "0.4", optional = true }
 serde = { version = "1", features = ["derive"] }
 # Notion answers in JSON and `page.json` is rendered back to it, so the backend
@@ -104,9 +108,12 @@ dokan-sys = { version = "0.3", optional = true }
 # the same type twice.
 widestring = { version = "0.4", optional = true }
 # `NTSTATUS` and the `STATUS_*`/`FILE_ATTRIBUTE_*` numbering a Windows filesystem answers in —
-# what `libc`'s `errno` values are to the FUSE bindings. Only the three modules the binding
-# reads: winapi gates every module behind a feature, and the default set is empty.
+# what `libc`'s `errno` values are to the FUSE bindings — and `LoadLibraryW`, which is how
+# `mount_support` asks whether Dokany is there before the binding calls into it. Only the
+# modules those read: winapi gates every module behind a feature, and the default set is
+# empty.
 winapi = { version = "0.3", features = [
+    "libloaderapi",
     "ntdef",
     "ntstatus",
     "winnt",
@@ -163,7 +170,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 #
 # Editors build the default set, so `mount`'s binding is live code and the other
 # features' are not until enabled (rust-analyzer: `"cargo.features": "all"`).
-default = ["mount"]
+default = ["mount", "ensure"]
 # Mount a cortex filesystem on the host, through the one binding this OS has:
 #
 # | Target | Binding | Needs |
@@ -178,9 +185,19 @@ default = ["mount"]
 # built without them the runtime silently has no I/O driver. `time` is already in the
 # base set the console asks for.
 #
-# **On macOS, FUSE-T has to be installed to build.** `build.rs` probes `fuse-t.pc` and
-# fails without it, and the binary links `libfuse-t.dylib`, so it will not load on a
-# machine without FUSE-T either.
+# **A binary built with it starts on a host without the provider**, and what the provider
+# missing costs is a mount: `fs::mount_support` says so, with what to install, and every
+# binding's `try_new` asks it first. This matters most to the Python and Node bindings,
+# whose import would otherwise fail for every caller, most of whom never mount.
+#
+# **On macOS, FUSE-T has to be installed to build, not to run.** `build.rs` probes
+# `fuse-t.pc` for the headers and fails without them; the shim links nothing, and opens
+# `libfuse-t.dylib` with `dlopen` when a mount first asks for it.
+#
+# **On Windows, a binary has to delay-load `dokan2.dll` to start without Dokany**, which
+# its own `build.rs` asks for — `/DELAYLOAD` is a `rustc-link-arg`, and one of those reaches
+# only the package that prints it. The bindings' `build.rs` are the two lines to copy.
+# Linked without it, a binary needs the DLL to start, as before.
 #
 # **On Windows, Dokany has to be installed to run** — the kernel driver (`dokan2.sys`)
 # comes from Dokany's own installer and is what actually owns the volume. Building
@@ -206,6 +223,15 @@ mount = [
     "tokio/net",
     "tokio/rt-multi-thread",
 ]
+# `ensure_cortex`: fetch the console server cortex-krun publishes, over HTTPS, into
+# `cache_root()/bin` when a host has none. Brings the HTTP and TLS stack the Notion and
+# Google Drive backends use.
+#
+# On by default, because a consumer that runs commands needs a server to run them in.
+# The server itself is the one that opts out: cortex-krun takes this crate for the
+# protocol, and its guest is a static musl binary whose TLS stack would need a C
+# cross-compiler to build.
+ensure = ["dep:reqwest", "dep:flate2", "dep:tar", "tokio/net"]
 s3 = ["dep:object_store", "tokio/net", "tokio/rt-multi-thread"]
 # Google Drive as a read-only backend: the folder tree as directories, and the
 # Docs-editors types served as their own APIs' JSON rather than as an export.

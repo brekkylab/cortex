@@ -585,6 +585,10 @@ impl FuseTMount {
         mountpoint: &Path,
         backend: *const c_char,
     ) -> io::Result<Self> {
+        // First, before anything below reaches the shim: without FUSE-T every libfuse-t
+        // function it calls is a weak import that resolved to null.
+        crate::fs::mount_support()?;
+
         // What a `SIGKILL`ed run left behind is nobody's but the next run's, and this
         // is the next run. Only mounts whose owning process is gone are touched, so a
         // sibling instance keeps its own.

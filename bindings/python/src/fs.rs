@@ -153,9 +153,22 @@ impl MountLike {
     }
 }
 
+/// Raise `OSError`, saying what to install, if this host cannot mount.
+///
+/// `HostMount` checks the same before it mounts, so this is for a caller that wants to know
+/// ahead of asking for one. An extension built with `mount` imports on a host without the
+/// provider: what a missing FUSE-T or Dokany costs is a mount, never the import.
+#[cfg(feature = "mount")]
+#[pyfunction]
+fn mount_support() -> PyResult<()> {
+    Ok(cortex::fs::mount_support()?)
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDirectory>()?;
     #[cfg(feature = "mount")]
     m.add_class::<PyHostMount>()?;
+    #[cfg(feature = "mount")]
+    m.add_function(wrap_pyfunction!(mount_support, m)?)?;
     Ok(())
 }

@@ -796,3 +796,4 @@ module.exports.Recipe = nativeBinding.Recipe
 module.exports.JsRecipe = nativeBinding.JsRecipe
 module.exports.Step = nativeBinding.Step
 module.exports.JsStep = nativeBinding.JsStep
+module.exports.mountSupport = nativeBinding.mountSupport

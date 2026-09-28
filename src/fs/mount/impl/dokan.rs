@@ -179,6 +179,11 @@ impl DokanMount {
         mountpoint: &Path,
         flags: MountFlags,
     ) -> io::Result<Self> {
+        // First, before the serving thread's `library()` makes the first call into
+        // `dokan2.dll`: delay-loaded, a DLL that is not there fails that call with an SEH
+        // exception, which no `Result` catches.
+        crate::fs::mount_support()?;
+
         let wide = U16CString::from_os_str(mountpoint).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidFilename,

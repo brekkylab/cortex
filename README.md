@@ -248,11 +248,15 @@ S3 is read-only, so it's mounted with `mount_readonly`.
 This feature needs an extra package installed on macOS and Windows.
 The `mount` feature, on by default, mounts a cortex filesystem on the host through the host's FUSE provider:
 
-| Host  | Provider | Needed to build | Needed to run |
+| Host  | Provider | Needed to build | Needed to mount |
 |-------|----------|-----------------|---------------|
 | Linux | `/dev/fuse` in the kernel | — | — |
 | macOS | [FUSE-T](https://www.fuse-t.org) | ✓ | ✓ |
 | Windows | [Dokany](https://github.com/dokan-dev/dokany) | — | ✓ |
+
+A program built with `mount` runs on a host without the provider; only mounting fails, with an error that says what to install.
+`cortex::fs::mount_support()` (`mount_support()` in Python, `mountSupport()` in Node) asks ahead of a mount.
+On Windows that needs the binary linked with `/DELAYLOAD:dokan2.dll` — see the `mount` feature in `Cargo.toml`.
 
 If you don't mount on the host, build with `default-features = false` and skip all of this.
 

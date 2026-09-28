@@ -136,6 +136,17 @@ impl JsHostMount {
     }
 }
 
+/// Throw, saying what to install, if this host cannot mount.
+///
+/// `HostMount` checks the same before it mounts, so this is for a caller that wants to know
+/// ahead of asking for one. An addon built with `mount` loads on a host without the
+/// provider: what a missing FUSE-T or Dokany costs is a mount, never the `require`.
+#[cfg(feature = "mount")]
+#[napi]
+pub fn mount_support() -> Result<()> {
+    cortex::fs::mount_support().map_err(error::io)
+}
+
 /// What a console builder mounts: a `HostMount`, or a host directory by its path.
 #[cfg(feature = "mount")]
 pub type MountLike<'env> = Either<ClassInstance<'env, JsHostMount>, String>;

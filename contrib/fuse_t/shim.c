@@ -17,6 +17,102 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 
+/* libfuse-t, opened at run time rather than linked.
+ *
+ * Nothing here is a link-time reference to it, so a binary with this shim in
+ * it starts whether or not FUSE-T is installed -- and, for a Python or Node
+ * extension, imports: most of their callers never mount. A link would also
+ * need an `LC_RPATH` in every binary that ends up holding this object, which
+ * a `rustc-link-arg` cannot give a dependent, and a weak import resolves to
+ * null when that rpath is missing -- the same answer as not installed.
+ *
+ * Each function the file calls is a pointer here, filled by `dlsym`, and the
+ * macro after it points the call sites at the pointer, so the code below is
+ * written against libfuse's own names. `cortex_fuse_t_available` opens the
+ * library and fills them, once; nothing else may be called before it has
+ * answered nonzero. The list has to be complete: a function called below and
+ * left out is a link error, since the library is not on the link line. */
+#include <dlfcn.h>
+#include <pthread.h>
+
+#define CORTEX_FUSE_T_FNS(X)                                                  \
+    X(fuse_add_direntry)                                                      \
+    X(fuse_chan_fd)                                                           \
+    X(fuse_lowlevel_new)                                                      \
+    X(fuse_mount)                                                             \
+    X(fuse_opt_add_arg)                                                       \
+    X(fuse_opt_free_args)                                                     \
+    X(fuse_reply_attr)                                                        \
+    X(fuse_reply_buf)                                                         \
+    X(fuse_reply_create)                                                      \
+    X(fuse_reply_entry)                                                       \
+    X(fuse_reply_err)                                                         \
+    X(fuse_reply_none)                                                        \
+    X(fuse_reply_open)                                                        \
+    X(fuse_reply_statfs)                                                      \
+    X(fuse_reply_write)                                                       \
+    X(fuse_req_userdata)                                                      \
+    X(fuse_session_add_chan)                                                  \
+    X(fuse_session_destroy)                                                   \
+    X(fuse_session_exit)                                                      \
+    X(fuse_session_loop)                                                      \
+    X(fuse_unmount)
+
+#define CORTEX_FUSE_T_POINTER(name) static __typeof__(name) *cortex_p_##name;
+CORTEX_FUSE_T_FNS(CORTEX_FUSE_T_POINTER)
+
+/* Where FUSE-T's installer puts the library, as `pkg-config` reported it when
+ * this was built; `build.rs` defines it. The bare name is tried first, so a
+ * library the loader would find on its own -- `DYLD_LIBRARY_PATH`, or its
+ * fallback paths -- wins over the one this was built against. */
+#ifndef CORTEX_FUSE_T_LIBDIR
+#define CORTEX_FUSE_T_LIBDIR "/usr/local/lib"
+#endif
+
+static int cortex_fuse_t_loaded;
+static pthread_once_t cortex_fuse_t_once = PTHREAD_ONCE_INIT;
+
+static void cortex_fuse_t_load(void) {
+    void *lib = dlopen("libfuse-t.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (!lib)
+        lib = dlopen(CORTEX_FUSE_T_LIBDIR "/libfuse-t.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (!lib)
+        return;
+    /* Never closed: every mount this process makes calls through these. */
+#define CORTEX_FUSE_T_RESOLVE(name)                                           \
+    if (!(cortex_p_##name = (__typeof__(name) *)dlsym(lib, #name)))           \
+        return;
+    CORTEX_FUSE_T_FNS(CORTEX_FUSE_T_RESOLVE)
+    cortex_fuse_t_loaded = 1;
+}
+
+int cortex_fuse_t_available(void) {
+    pthread_once(&cortex_fuse_t_once, cortex_fuse_t_load);
+    return cortex_fuse_t_loaded;
+}
+
+#define fuse_add_direntry cortex_p_fuse_add_direntry
+#define fuse_chan_fd cortex_p_fuse_chan_fd
+#define fuse_lowlevel_new cortex_p_fuse_lowlevel_new
+#define fuse_mount cortex_p_fuse_mount
+#define fuse_opt_add_arg cortex_p_fuse_opt_add_arg
+#define fuse_opt_free_args cortex_p_fuse_opt_free_args
+#define fuse_reply_attr cortex_p_fuse_reply_attr
+#define fuse_reply_buf cortex_p_fuse_reply_buf
+#define fuse_reply_create cortex_p_fuse_reply_create
+#define fuse_reply_entry cortex_p_fuse_reply_entry
+#define fuse_reply_err cortex_p_fuse_reply_err
+#define fuse_reply_none cortex_p_fuse_reply_none
+#define fuse_reply_open cortex_p_fuse_reply_open
+#define fuse_reply_statfs cortex_p_fuse_reply_statfs
+#define fuse_reply_write cortex_p_fuse_reply_write
+#define fuse_req_userdata cortex_p_fuse_req_userdata
+#define fuse_session_add_chan cortex_p_fuse_session_add_chan
+#define fuse_session_destroy cortex_p_fuse_session_destroy
+#define fuse_session_exit cortex_p_fuse_session_exit
+#define fuse_session_loop cortex_p_fuse_session_loop
+#define fuse_unmount cortex_p_fuse_unmount
+
 /* Mirrors the Rust side's TTL. Spelled here rather than plumbed through the
  * vtable, because libfuse wants it as a double.
  *

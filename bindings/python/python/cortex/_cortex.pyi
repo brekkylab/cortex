@@ -93,6 +93,12 @@ class HostMount:
     @property
     def mountpoint(self) -> str: ...
 
+def mount_support() -> None:
+    """Raise ``OSError``, saying what to install, if this host cannot mount.
+
+    ``HostMount`` checks the same before it mounts; this is for knowing ahead.
+    """
+
 class NetworkAccess:
     def __init__(self, reach: str) -> None: ...
     @staticmethod

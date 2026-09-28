@@ -96,6 +96,8 @@
 #![allow(clippy::module_inception)]
 
 pub mod console;
+#[cfg(feature = "ensure")]
+mod ensure;
 pub mod fs;
 pub mod image;
 mod lock;
@@ -111,6 +113,9 @@ pub mod protocol;
 /// [`Client`]: console::Client
 /// [`Server`]: console::Server
 pub use futures_core::future::BoxFuture;
+
+#[cfg(feature = "ensure")]
+pub use ensure::ensure_cortex;
 
 /// Everything cortex keeps on this host, under one root: `$CORTEX_HOME`, or
 /// `cortex` under the user's cache directory.
@@ -152,9 +157,4 @@ pub fn cache_root() -> std::path::PathBuf {
             std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache")
         })
         .join("cortex");
-}
-
-/// Fetch the console servers if it is not cached.
-pub async fn ensure_cortex() {
-    todo!()
 }

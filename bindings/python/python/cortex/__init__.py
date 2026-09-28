@@ -55,6 +55,6 @@ __all__ = [
 
 # Present only when the extension was built with the `mount` feature, which is the default.
 if hasattr(_cortex, "HostMount"):
-    from ._cortex import HostMount
+    from ._cortex import HostMount, mount_support
 
-    __all__.append("HostMount")
+    __all__ += ["HostMount", "mount_support"]

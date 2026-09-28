@@ -104,6 +104,8 @@ impl FuseMount {
         mountpoint: &Path,
         options: Vec<MountOption>,
     ) -> io::Result<Self> {
+        crate::fs::mount_support()?;
+
         // What a `SIGKILL`ed run left behind is nobody's but the next run's, and this
         // is the next run. Only mounts whose owning process is gone are touched, so a
         // sibling instance keeps its own.

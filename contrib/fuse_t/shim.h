@@ -75,6 +75,12 @@ struct cortex_fuse_t_ops {
     uint32_t name_max;
 };
 
+/* Open libfuse-t, once per process, and answer nonzero if it and every
+ * function the shim calls were found. The shim does not link it, so every
+ * other function here calls through what this resolved: ask this first, and
+ * call nothing else when it answers 0. Thread-safe. */
+int cortex_fuse_t_available(void);
+
 /* Mount and build a session. Returns NULL on failure. The returned pointer owns
  * the channel and session and must be freed with `cortex_fuse_t_destroy`.
  *

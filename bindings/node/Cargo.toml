@@ -13,7 +13,6 @@ crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
 napi-build = "2"
-pkg-config = "0.3"
 
 [dependencies]
 anyhow = "1"
@@ -23,8 +22,9 @@ napi-derive = "3"
 tokio = { version = "1", features = ["sync"] }
 
 [features]
-default = ["mount"]
+default = ["mount", "ensure"]
 mount = ["cortex/mount"]
+ensure = ["cortex/ensure"]
 s3 = ["cortex/s3"]
 gdrive = ["cortex/gdrive"]
 notion = ["cortex/notion"]
