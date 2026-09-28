@@ -17,6 +17,8 @@
 //! into whichever addon it is linked into.
 
 pub mod console;
+#[cfg(feature = "ensure")]
+pub mod ensure;
 pub mod error;
 pub mod fs;
 pub mod image;

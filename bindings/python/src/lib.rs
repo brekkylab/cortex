@@ -14,6 +14,8 @@
 use pyo3::prelude::*;
 
 pub mod console;
+#[cfg(feature = "ensure")]
+pub mod ensure;
 pub mod error;
 pub mod fs;
 pub mod image;
@@ -32,5 +34,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     image::register(m)?;
     fs::register(m)?;
     console::register(m)?;
+    #[cfg(feature = "ensure")]
+    ensure::register(m)?;
     Ok(())
 }

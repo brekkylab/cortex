@@ -163,3 +163,6 @@ class ConsoleClient:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None: ...
+
+async def ensure_cortex() -> str:
+    """Fetch the console server into cortex's cache if it is not there; the directory it is in."""

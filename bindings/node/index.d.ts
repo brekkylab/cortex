@@ -139,6 +139,14 @@ export interface BuildImageResult {
   digest: string
 }
 
+/**
+ * Fetch the console server into cortex's cache if it is not there, and settle with the
+ * directory it is in.
+ *
+ * A server already there is left alone, whether it was fetched or installed by hand.
+ */
+export declare function ensureCortex(): Promise<string>
+
 export interface ExecResult {
   code: number
   stdout: Buffer

@@ -54,6 +54,12 @@ __all__ = [
 ]
 
 # Present only when the extension was built with the `mount` feature, which is the default.
+# Present only when the extension was built with the `ensure` feature, which is the default.
+if hasattr(_cortex, "ensure_cortex"):
+    from ._cortex import ensure_cortex
+
+    __all__.append("ensure_cortex")
+
 if hasattr(_cortex, "HostMount"):
     from ._cortex import HostMount, mount_support
 
