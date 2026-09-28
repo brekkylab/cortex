@@ -26,6 +26,26 @@
 //! A pid can be reused, and then a dead owner looks alive and its mount is left for
 //! a later run to meet again. That is the safe direction to be wrong in: the
 //! mistake is failing to reclaim, never reclaiming something still in use.
+//!
+//! # The watchdog, for the exits nothing in this process sees
+//!
+//! A guard covers every exit that runs a destructor, and [`unmount_on_signal`] the
+//! signals that can be caught once a program asks for it. What neither can cover is
+//! the exit that runs no code of this process's at all: `SIGKILL`, a crash, the OOM
+//! killer -- and, as ordinary as any of those, a runtime that ends without running
+//! its finalizers, as Node does on `process.exit()`. Each of those used to leave a
+//! mount with nothing answering it until a later run reclaimed it.
+//!
+//! So the first claim a process takes starts a watchdog: `/bin/sh`, in a process
+//! group of its own so a terminal's `^C` does not reach it, holding the read end of
+//! a pipe whose write end only this process has. However this process ends, the
+//! kernel closes that end, the watchdog's read returns, and it takes down whatever
+//! this process's records still name -- with the same rungs as
+//! [`unmount_under`], and removing a record only once its mount came down, so what
+//! it could not clear is still [`reclaim_abandoned`]'s to try. An ordinary exit
+//! finds no records left and costs the watchdog nothing but its exit.
+//!
+//! [`unmount_on_signal`]: super::unmount_on_signal
 
 use std::{
     ffi::OsString,
@@ -110,6 +130,7 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
     }
 
     let record = registry().map(|dir| {
+        watch(&dir);
         let name = format!(
             "{}-{}",
             std::process::id(),
@@ -122,6 +143,72 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
         path
     });
     Claim { mountpoint, record }
+}
+
+/// What the watchdog runs -- see the module docs.
+///
+/// `cat` returns when no process holds the pipe's write end any more; the owner's pid
+/// and the registry come in the environment. Signals a person or a supervisor sends
+/// are ignored, since the whole point is to outlive the process they were sent to.
+#[cfg(feature = "mount")]
+const WATCHDOG_SCRIPT: &str = r#"
+trap '' INT TERM HUP QUIT PIPE
+cat >/dev/null
+for record in "$CORTEX_MOUNT_REGISTRY/$CORTEX_MOUNT_OWNER"-*; do
+    [ -f "$record" ] || continue
+    mountpoint=$(cat "$record") || continue
+    if [ -z "$mountpoint" ]; then rm -f "$record"; continue; fi
+    if [ "$(uname)" = Darwin ]; then
+        umount "$mountpoint" 2>/dev/null || diskutil unmount force "$mountpoint" >/dev/null 2>&1
+    else
+        umount "$mountpoint" 2>/dev/null || umount -l "$mountpoint" 2>/dev/null
+    fi && rm -f "$record"
+done
+"#;
+
+/// Start this process's watchdog, once -- see the module docs.
+///
+/// Once per *pid*, not per process image: a forked child inherits the parent's end of the
+/// parent's pipe and would keep that watchdog waiting on the child as well, so a child
+/// that mounts drops the inherited end and starts one of its own.
+///
+/// Best effort. A watchdog that cannot be started costs what it would have saved --
+/// the mount comes down on the next run's reclaim instead -- and is not a reason to
+/// refuse the mount.
+#[cfg(feature = "mount")]
+fn watch(registry: &Path) {
+    use std::{
+        os::unix::process::CommandExt,
+        process::{ChildStdin, Command, Stdio},
+    };
+
+    static WATCHDOG: Mutex<Option<(u32, ChildStdin)>> = Mutex::new(None);
+
+    let pid = std::process::id();
+    let Ok(mut watchdog) = WATCHDOG.lock() else {
+        return;
+    };
+    if watchdog.as_ref().is_some_and(|(owner, _)| *owner == pid) {
+        return;
+    }
+    let spawned = Command::new("/bin/sh")
+        .args(["-c", WATCHDOG_SCRIPT, "cortex-mount-watchdog"])
+        .env("CORTEX_MOUNT_OWNER", pid.to_string())
+        .env("CORTEX_MOUNT_REGISTRY", registry)
+        .current_dir("/")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn();
+    // The `Child` is let go without a wait: the watchdog outlives this process by
+    // design, and until then it is blocked on a read that only this process's end can
+    // end. The pipe's end is `CLOEXEC`, so nothing this process spawns holds it.
+    if let Ok(mut child) = spawned
+        && let Some(stdin) = child.stdin.take()
+    {
+        *watchdog = Some((pid, stdin));
+    }
 }
 
 #[cfg(feature = "mount")]

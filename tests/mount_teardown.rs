@@ -380,6 +380,47 @@ fn a_killed_process_leaves_a_mount_that_the_next_mount_reclaims() {
     let _ = fs::remove_dir_all(&elsewhere);
 }
 
+/// Poll the mount table until `path` is gone from it, or fail saying `why`.
+fn comes_down(path: &std::path::Path, why: &str) {
+    let deadline = Instant::now() + TEARDOWN_DEADLINE;
+    while in_mount_table(path) {
+        assert!(
+            Instant::now() < deadline,
+            "{} was still mounted {TEARDOWN_DEADLINE:?} after {why}",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `SIGKILL` runs no code of the process's, and the mount still comes down -- without
+/// anything mounting again, because the claim's watchdog is outside the process.
+///
+/// Run on its own (`--test-threads=1`) to mean what it says: a mount made by a test
+/// beside it sweeps the register too, and would clear the path the same way.
+#[test]
+#[ignore = "needs a host binding and mounts real filesystems"]
+fn a_killed_process_takes_its_mount_down_with_nobody_mounting_again() {
+    let path = mountpoint("killed-watched");
+    let mut child = child_holding_a_mount(&path, false);
+    child.kill_and_reap(libc::SIGKILL);
+    comes_down(&path, "its process was killed");
+    let _ = fs::remove_dir_all(&path);
+}
+
+/// A process that never asked for [`cortex::fs::unmount_on_signal`] and is ended by a
+/// signal it does not catch -- `SIGTERM`, as a supervisor sends -- takes its mount with
+/// it all the same: nothing in the process runs, and the watchdog does it.
+#[test]
+#[ignore = "needs a host binding and mounts real filesystems"]
+fn a_process_that_did_not_opt_in_unmounts_when_it_is_asked_to_stop() {
+    let path = mountpoint("terminated");
+    let mut child = child_holding_a_mount(&path, false);
+    child.kill_and_reap(libc::SIGTERM);
+    comes_down(&path, "its process was sent SIGTERM");
+    let _ = fs::remove_dir_all(&path);
+}
+
 /// Reclaiming asks whether the *owner* is gone, not whether the path is one it
 /// recognises.
 ///

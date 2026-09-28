@@ -34,14 +34,16 @@
 //!
 //! # `SIGKILL` is not here
 //!
-//! No handler catches it, so a `kill -9` leaves the mount up and no amount of
-//! care in this process can change that. That case is recovered by the *next*
-//! run, and needs nobody to ask: see
-//! [`reclaim_abandoned`](super::reclaim_abandoned), which every `try_new` calls.
+//! No handler catches it, so no amount of care in this process can take a mount
+//! down on a `kill -9`. The claim's watchdog does, from outside the process, as it
+//! does for every exit that runs none of this process's code -- see
+//! [`claim`](super::claim) -- and whatever that could not clear is recovered by the
+//! *next* run: see [`reclaim_abandoned`](super::reclaim_abandoned), which every
+//! `try_new` calls.
 //!
-//! So what this module buys is not *whether* an abandoned mount is cleared but
-//! *when*. Without it the mount point stays blocked until something mounts again;
-//! with it, a program that is asked to stop takes its mounts with it.
+//! So what this module buys is not *whether* a mount comes down when the process
+//! is signalled but *who* takes it down: here, the process itself, before the
+//! signal ends it; without it, the watchdog, a moment after.
 
 use std::{
     io,
