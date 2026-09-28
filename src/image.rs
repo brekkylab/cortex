@@ -111,7 +111,7 @@ impl ImageClient {
 impl Drop for ImageClient {
     /// Say `quit`, as [`ConsoleClient`](crate::console::ConsoleClient) does when it is dropped.
     fn drop(&mut self) {
-        hang_up(&mut self.client);
+        hang_up(&mut self.client, ());
     }
 }
 

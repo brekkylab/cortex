@@ -712,8 +712,18 @@ impl Drop for ConsoleClient {
     /// Off a runtime, or on one that shuts down before the task is polled, the client is
     /// dropped without the message. That is still an ending: over stdio the server's input
     /// closes with it, and the server takes itself down as if it had heard `quit`.
+    ///
+    /// # Why the mounts go with the task
+    ///
+    /// A server is still serving them until it has heard the ending — a guest's virtio-fs
+    /// share holds the files open — and a binding's guard cannot come down under a mount
+    /// that is in use: it unmounts and then waits for its serving thread, which waits for
+    /// every holder to let go. Dropped here, before the `quit`, that wait blocks the thread
+    /// the task is to run on, and on a current-thread runtime there is no other: the server
+    /// never hears `quit`, the guest never lets go, and the drop never returns. So they are
+    /// handed to [`hang_up`] and dropped after the client, when the server has let them go.
     fn drop(&mut self) {
-        hang_up(&mut self.client);
+        hang_up(&mut self.client, std::mem::take(&mut self.mounts));
     }
 }
 
@@ -738,12 +748,17 @@ pub(crate) fn stdio_factory(cmd: &[impl AsRef<OsStr>]) -> ClientFactory {
     })
 }
 
-/// Say `quit` on a task, leaving a client behind that answers nothing.
+/// Say `quit` on a task, leaving a client behind that answers nothing, and let `keep` go
+/// only once the server has been told.
 ///
 /// What a console's `drop` does, for any console that holds a client: see
 /// [`ConsoleClient::drop`](ConsoleClient#impl-Drop-for-ConsoleClient) for why the client is swapped rather
 /// than taken, and what happens off a runtime.
-pub(crate) fn hang_up(client: &mut Box<dyn Client>) {
+///
+/// `keep` is what the server may still be using -- a console's mounts -- and it goes after the
+/// client whichever way this ends: once `quit` is answered, or, off a runtime or on one that
+/// never polls the task, right behind the client that closes the server's input.
+pub(crate) fn hang_up<K: Send + 'static>(client: &mut Box<dyn Client>, keep: K) {
     /// Answers nothing, because by the time this is reachable there is nothing left
     /// to answer with.
     struct Spent;
@@ -759,11 +774,16 @@ pub(crate) fn hang_up(client: &mut Box<dyn Client>) {
     }
 
     // Zero-sized, so this `Box` is a dangling pointer rather than an allocation.
-    let mut client = std::mem::replace(client, Box::new(Spent));
+    let client = std::mem::replace(client, Box::new(Spent));
 
+    // One tuple, because a tuple drops its fields in order and nothing else here promises an
+    // order: dropped whole -- here off a runtime, or as a task that was never polled -- or at
+    // the end of the task, the client goes first and what it was serving after it.
+    let ending = (client, keep);
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
-            let _ = client.quit().await;
+            let mut ending = ending;
+            let _ = ending.0.quit().await;
         });
     }
 }
