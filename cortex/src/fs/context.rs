@@ -327,6 +327,16 @@ fn normalize(path: &Path) -> io::Result<PathBuf> {
 }
 
 impl FileSystem for ContextFs {
+    /// Every mounted store, in turn: a reader asking for a refresh is asking the tree, and
+    /// which of the stores under it was keeping something is not theirs to know.
+    fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for store in self.mounts.values() {
+                store.forget().await;
+            }
+        })
+    }
+
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let key = normalize(path)?;
