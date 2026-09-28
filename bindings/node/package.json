@@ -1,7 +1,13 @@
 {
-  "name": "cortex-node",
+  "name": "@brekkylab/cortex",
   "version": "0.1.0",
   "description": "The environment an agent works in: what it can see, and what it can do.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brekkylab/cortex.git",
+    "directory": "bindings/node"
+  },
+  "homepage": "https://github.com/brekkylab/cortex/tree/main/bindings/node#readme",
   "main": "index.js",
   "types": "index.d.ts",
   "files": [
@@ -12,11 +18,17 @@
     "binaryName": "cortex",
     "targets": [
       "aarch64-apple-darwin",
-      "x86_64-apple-darwin",
       "x86_64-unknown-linux-gnu",
       "aarch64-unknown-linux-gnu",
       "x86_64-pc-windows-msvc"
     ]
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "scripts": {
     "build": "napi build --platform --release",
@@ -25,8 +37,5 @@
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.10.5"
-  },
-  "engines": {
-    "node": ">= 18"
   }
 }

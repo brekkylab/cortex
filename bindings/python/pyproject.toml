@@ -11,7 +11,14 @@ requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
 ]
+
+[project.urls]
+Repository = "https://github.com/brekkylab/cortex"
+Documentation = "https://github.com/brekkylab/cortex/tree/main/bindings/python#readme"
 
 [dependency-groups]
 dev = ["maturin>=1.9,<2", "pytest>=8", "pytest-asyncio>=1"]

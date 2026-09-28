@@ -12,13 +12,19 @@ Create, use, and dispose of VMs directly from your code.
 
 ### Python
 
+```sh
+pip install cortex-py
+```
+
 ```python
 import asyncio
 
-from cortex import ConsoleClient, Recipe
+from cortex import ConsoleClient, Recipe, ensure_cortex
 
 
 async def main() -> None:
+    # Fetches the console server into cortex's cache the first time; a no-op after.
+    await ensure_cortex()
     console = await (
         ConsoleClient.builder()
         .image(Recipe("alpine:latest").step("apk add --no-cache jq"))
@@ -38,9 +44,15 @@ asyncio.run(main())
 
 ### Node
 
-```js
-import { ConsoleClient, Recipe } from 'cortex-node'
+```sh
+npm install @brekkylab/cortex
+```
 
+```js
+import { ConsoleClient, Recipe, ensureCortex } from '@brekkylab/cortex'
+
+// Fetches the console server into cortex's cache the first time; a no-op after.
+await ensureCortex()
 const console_ = await ConsoleClient.builder()
   .image(new Recipe('alpine:latest').step('apk add --no-cache jq'))
   .build()

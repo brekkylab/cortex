@@ -1,0 +1,28 @@
+{
+  "name": "@brekkylab/cortex-win32-x64-msvc",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "cortex.win32-x64-msvc.node",
+  "files": [
+    "cortex.win32-x64-msvc.node"
+  ],
+  "description": "The environment an agent works in: what it can see, and what it can do.",
+  "homepage": "https://github.com/brekkylab/cortex/tree/main/bindings/node#readme",
+  "engines": {
+    "node": ">= 18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brekkylab/cortex.git",
+    "directory": "bindings/node"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "os": [
+    "win32"
+  ]
+}

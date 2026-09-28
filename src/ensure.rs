@@ -20,6 +20,13 @@ use anyhow::Context as _;
 
 use crate::cache_root;
 
+/// The server version this build fetches by default, set at build time. `None` in a build
+/// nobody pinned, which follows `latest`.
+const PINNED: Option<&str> = match option_env!("CORTEX_KRUN_PINNED_VERSION") {
+    Some(version) if !version.is_empty() => Some(version),
+    _ => None,
+};
+
 /// Where releases are fetched from unless `$CORTEX_DIST_URL` says otherwise.
 const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com";
 
@@ -30,8 +37,10 @@ const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east
 /// came from here or from `cargo xtask install` -- this makes a host able to run a session,
 /// and does not keep one up to date.
 ///
-/// The version is `$CORTEX_KRUN_VERSION` if set, else whatever this platform's `latest`
-/// names. `cortex-krun` itself is the last file put in place, so a fetch that fails partway
+/// The version is `$CORTEX_KRUN_VERSION` if set; else the one this build was pinned to, if
+/// it was built with `CORTEX_KRUN_PINNED_VERSION` -- which a published package is, so that
+/// one release of it always fetches the server it was tested with; else whatever this
+/// platform's `latest` names. `cortex-krun` itself is the last file put in place, so a fetch that fails partway
 /// leaves a `bin/` the next call fetches into again rather than one that looks complete.
 pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     let root = cache_root();
@@ -51,6 +60,7 @@ pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     let version = match std::env::var("CORTEX_KRUN_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
+        .or_else(|| PINNED.map(str::to_string))
     {
         Some(version) => version,
         None => {

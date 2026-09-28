@@ -1,0 +1,345 @@
+# Build the Node and Python bindings for every platform they are published for, pack them
+# as they would be published, and install and run them the way a user would.
+#
+# Nothing here publishes. The npm packages go to a registry on the test runner's own
+# localhost, so `npm install @brekkylab/cortex` resolves its optional platform packages by
+# os/cpu/libc exactly as it would from npmjs; the wheels are installed with pip choosing one
+# from a directory, as it would choose from PyPI.
+#
+# # Platforms
+#
+# | package suffix  | runner            | built                         | the test can            |
+# |-----------------|-------------------|-------------------------------|-------------------------|
+# | darwin-arm64    | macos-15          | native                        | mount (FUSE-T), fetch   |
+# | linux-x64-gnu   | ubuntu-24.04      | `--use-napi-cross`, glibc 2.17 | mount, fetch, boot a VM |
+# | linux-arm64-gnu | ubuntu-24.04-arm  | `--use-napi-cross`, glibc 2.17 | mount                   |
+# | win32-x64-msvc  | windows-2025      | native                        | load without Dokany     |
+#
+# macOS runners are virtual M1s without nested virtualization, and the arm64 Linux runners
+# have no /dev/kvm, so only linux-x64 boots a session. linux-aarch64 and Windows have no
+# cortex-krun release yet, so there the test asks that `ensure_cortex` says so.
+#
+# # The server a build fetches
+#
+# Each build is pinned to the cortex-krun release its platform's `latest` names at build
+# time (`CORTEX_KRUN_PINNED_VERSION`, see `src/ensure.rs`), so one version of a package
+# always fetches the server it was tested with.
+name: bindings
+
+on:
+  push:
+    branches: [main, ci/bindings-packages]
+    paths:
+      - .github/workflows/bindings.yml
+      - bindings/**
+      - ci/**
+      - src/**
+      - contrib/**
+      - build.rs
+      - Cargo.toml
+      - Cargo.lock
+  pull_request:
+    paths:
+      - .github/workflows/bindings.yml
+      - bindings/**
+      - ci/**
+      - src/**
+      - contrib/**
+      - build.rs
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+concurrency:
+  group: bindings-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DIST_URL: https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            server: macos-aarch64
+            manylinux: "off"
+          - platform: linux-x64-gnu
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            server: linux-x86_64
+            napi-flags: --use-napi-cross
+            manylinux: "2_17"
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            server: linux-aarch64
+            napi-flags: --use-napi-cross
+            manylinux: "2_17"
+          - platform: win32-x64-msvc
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            server: windows-x86_64
+            manylinux: "off"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+
+      # The shim compiles against FUSE-T's headers; nothing links it.
+      - name: FUSE-T headers
+        if: runner.os == 'macOS'
+        run: |
+          brew install --cask fuse-t
+          command -v pkg-config || brew install pkgconf
+          pkg-config --cflags fuse-t
+
+      - name: Pin the server release
+        shell: bash
+        run: |
+          pinned=$(curl -fsS "$DIST_URL/cortex-krun/${{ matrix.server }}/latest" || true)
+          echo "cortex-krun ${{ matrix.server }}: ${pinned:-none published, builds follow latest}"
+          echo "CORTEX_KRUN_PINNED_VERSION=$pinned" >> "$GITHUB_ENV"
+
+      - name: Node addon
+        working-directory: bindings/node
+        shell: bash
+        run: |
+          npm ci
+          npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.napi-flags }} --output-dir "$GITHUB_WORKSPACE/dist/node"
+          ls -la "$GITHUB_WORKSPACE/dist/node"
+
+      - name: Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out ${{ github.workspace }}/dist/wheels
+          docker-options: -e CORTEX_KRUN_PINNED_VERSION
+
+      - name: The glibc each Linux artifact needs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd dist
+          unzip -oq wheels/*.whl -d wheel
+          for f in node/*.node wheel/cortex/*.so; do
+            need=$(objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+            echo "$f needs $need"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.platform }}
+          path: dist/node/*.node
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+
+  assemble:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: bindings/node/artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist/wheels
+          merge-multiple: true
+
+      # `napi artifacts` refuses to run unless every configured target has its binary,
+      # which is the gate a release wants: no root package names a platform with nothing
+      # behind it.
+      - name: npm packages
+        working-directory: bindings/node
+        run: |
+          npm ci
+          npx napi artifacts --output-dir artifacts
+          node ../../ci/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
+          ls -la "$GITHUB_WORKSPACE/dist/npm"
+          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-cortex-0.1.0.tgz package/package.json
+
+      - name: wheels
+        run: |
+          ls -la dist/wheels
+          pipx run twine check --strict dist/wheels/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.platform }})
+    needs: assemble
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+            mount: "1"
+            server: "1"
+            vm: "0"
+          - platform: linux-x64-gnu
+            runner: ubuntu-24.04
+            mount: "1"
+            server: "1"
+            vm: "1"
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            mount: "1"
+            server: "0"
+            vm: "0"
+          - platform: win32-x64-msvc
+            runner: windows-2025
+            mount: "0"
+            server: "0"
+            vm: "0"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      SMOKE_SERVER: ${{ matrix.server }}
+      SMOKE_VM: ${{ matrix.vm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: ci
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/wheels
+
+      - name: Let this user open /dev/kvm
+        if: matrix.vm == '1'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      # A registry on localhost holding only what `assemble` packed. Published with an
+      # explicit --registry and a config of its own: the packages' publishConfig names
+      # npmjs, and nothing here may reach it.
+      - name: Install from a local registry
+        shell: bash
+        run: |
+          cd ci
+          npx -y verdaccio@6 --config ./verdaccio.yaml --listen 4873 > "$RUNNER_TEMP/verdaccio.log" 2>&1 &
+          for _ in $(seq 60); do curl -sf http://localhost:4873/-/ping >/dev/null && break; sleep 1; done
+          token=$(curl -sf -X PUT -H 'content-type: application/json' \
+            -d '{"name":"ci","password":"ci-local-only"}' \
+            http://localhost:4873/-/user/org.couchdb.user:ci | node -pe 'JSON.parse(require("fs").readFileSync(0)).token')
+          npmrc="$RUNNER_TEMP/npmrc"
+          printf 'registry=http://localhost:4873/\n//localhost:4873/:_authToken=%s\n' "$token" > "$npmrc"
+          for tgz in "$GITHUB_WORKSPACE"/dist/npm/*.tgz; do
+            npm publish "$tgz" --userconfig "$npmrc" --registry http://localhost:4873/
+          done
+          mkdir -p "$RUNNER_TEMP/project" && cd "$RUNNER_TEMP/project"
+          echo '{"name":"project","private":true,"type":"module"}' > package.json
+          npm install @brekkylab/cortex --userconfig "$npmrc" --registry http://localhost:4873/
+          ls node_modules/@brekkylab
+
+      - name: Install the wheel pip picks
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          py="$RUNNER_TEMP/venv/bin/python"; [ -x "$py" ] || py="$RUNNER_TEMP/venv/Scripts/python.exe"
+          "$py" -m pip install --no-index --find-links dist/wheels cortex-py
+          "$py" -m pip show cortex-py | head -3
+          echo "SMOKE_PYTHON=$py" >> "$GITHUB_ENV"
+
+      # On macOS, first without FUSE-T, which a user may not have: the import and every
+      # call but a mount must work, and a mount must say what to install.
+      - name: Smoke, without FUSE-T
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SMOKE_MOUNT: "0"
+        run: |
+          cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/ci/smoke/node.mjs"
+          "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/ci/smoke/python.py"
+
+      - name: FUSE-T
+        if: runner.os == 'macOS'
+        run: brew install --cask fuse-t
+
+      - name: Smoke, Node
+        shell: bash
+        env:
+          SMOKE_MOUNT: ${{ matrix.mount }}
+        run: cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/ci/smoke/node.mjs"
+
+      - name: Smoke, Python
+        shell: bash
+        env:
+          SMOKE_MOUNT: ${{ matrix.mount }}
+        run: '"$SMOKE_PYTHON" "$GITHUB_WORKSPACE/ci/smoke/python.py"'
+
+      - name: verdaccio log
+        if: failure()
+        shell: bash
+        run: cat "$RUNNER_TEMP/verdaccio.log" || true
