@@ -8,16 +8,17 @@
 #
 # # Platforms
 #
-# | package suffix  | runner            | built                         | the test can            |
-# |-----------------|-------------------|-------------------------------|-------------------------|
-# | darwin-arm64    | macos-15          | native                        | mount (FUSE-T), fetch   |
-# | linux-x64-gnu   | ubuntu-24.04      | `--use-napi-cross`, glibc 2.17 | mount, fetch, boot a VM |
-# | linux-arm64-gnu | ubuntu-24.04-arm  | `--use-napi-cross`, glibc 2.17 | mount                   |
-# | win32-x64-msvc  | windows-2025      | native                        | load without Dokany     |
+# | package suffix  | runner            | built                         | the test can                 |
+# |-----------------|-------------------|-------------------------------|------------------------------|
+# | darwin-arm64    | macos-15          | native                        | mount (FUSE-T), fetch, serve |
+# | linux-x64-gnu   | ubuntu-24.04      | `--use-napi-cross`, glibc 2.17 | mount, fetch, serve, boot    |
+# | linux-arm64-gnu | ubuntu-24.04-arm  | `--use-napi-cross`, glibc 2.17 | mount, fetch, serve          |
+# | win32-x64-msvc  | windows-2025      | native                        | load without Dokany, fetch, serve |
 #
-# macOS runners are virtual M1s without nested virtualization, and the arm64 Linux runners
-# have no /dev/kvm, so only linux-x64 boots a session. linux-aarch64 and Windows have no
-# cortex-krun release yet, so there the test asks that `ensure_cortex` says so.
+# "serve" is the fetched server answering, and its boot starting far enough to say what it
+# can make -- everything short of a VM. macOS runners are virtual M1s without nested
+# virtualization, the arm64 Linux runners have no /dev/kvm, and the Windows ones have no
+# Hypervisor Platform, so only linux-x64 boots a session.
 #
 # # The server a build fetches
 #
@@ -238,12 +239,12 @@ jobs:
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             mount: "1"
-            server: "0"
+            server: "1"
             vm: "0"
           - platform: win32-x64-msvc
             runner: windows-2025
             mount: "0"
-            server: "0"
+            server: "1"
             vm: "0"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
