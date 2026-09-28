@@ -32,7 +32,7 @@ use std::{
     io,
     path::{Component, Path},
     sync::{Arc, Mutex},
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use object_store::{
@@ -89,6 +89,8 @@ pub struct S3Fs {
     /// Normalised to carry no leading or trailing `/`, so [`Self::key`] can join
     /// with `/` unconditionally.
     prefix: String,
+    /// What the store answered when a directory was last listed.
+    listings: Mutex<Listings>,
     /// What reads have learned about keys, and what they read ahead into.
     ///
     /// Taken through [`lock`], which ignores poisoning: a panic anywhere else must not turn
@@ -127,6 +129,7 @@ impl S3Fs {
         S3Fs {
             prefix: prefix.trim_matches('/').to_string(),
             store,
+            listings: Mutex::default(),
             windows: Mutex::default(),
         }
     }
@@ -224,13 +227,30 @@ fn to_io_error(err: object_store::Error) -> io::Error {
 /// per request — a guest asks in 128 KiB pieces at most (32 KiB through FUSE-T).
 const READAHEAD_CHUNK: u64 = 8 << 20;
 
-/// How many keys may hold a read-ahead window at once, which is what bounds this store's
-/// memory: at most this many times [`READAHEAD_CHUNK`], so 64 MiB.
+/// How many keys may hold a window at once.
 ///
 /// A cap is needed *because* the windows are keyed by path rather than by an open. A
 /// per-open window is bounded by however many files a consumer has open at once — which is
 /// to say, not bounded at all, only invisible. This one is a number.
+///
+/// It is not the memory bound, though it was written as one. A window is as large as the
+/// read that filled it: [`READAHEAD_CHUNK`] for a sequential reader asking in guest-sized
+/// pieces, but a caller that reads a whole file in one call — which is what a window
+/// holding a document for a viewer does — gets a window the size of the file. Eight of
+/// those is however large eight files are. [`MAX_CACHED_BYTES`] is the bound.
 const MAX_CACHED_KEYS: usize = 8;
+
+/// How many bytes of object bodies are held across every entry.
+///
+/// The number the count above was assumed to give. Keeping whole bodies is what makes a
+/// file opened twice cost one `head` and no transfer, and it is worth doing — but a reader
+/// that opens six large documents should not be six large documents of memory. Past this,
+/// the oldest entries give up what they hold.
+///
+/// Never the entry just filled, however large it is: that one is what the read in progress
+/// is being served from, and dropping it would send the same bytes over the wire again to
+/// answer the call that just fetched them.
+const MAX_CACHED_BYTES: u64 = 64 << 20;
 
 /// What the store remembers about one key between reads.
 ///
@@ -307,6 +327,55 @@ impl ReadCache {
     }
 }
 
+/// How long a listing is handed out again without asking the store.
+///
+/// A listing here is one request, sometimes a few — not the walk a page render is — so this
+/// is not about a cold tree. It is about the same directory being asked for twice in a row,
+/// which is what a reader walking a tree does, and what an agent does every time it runs
+/// `ls` in a loop. Nothing in this store writes, so what changes a listing is someone else's
+/// doing; a reader who can see that has [`FileSystem::forget`].
+const LISTING_TTL: Duration = Duration::from_secs(30);
+
+/// How many directories' listings are kept.
+const MAX_CACHED_LISTINGS: usize = 256;
+
+/// The listings kept, and the order to give them up in.
+#[derive(Default)]
+struct Listings {
+    by_prefix: HashMap<String, (Instant, Arc<Vec<Dirent>>)>,
+    /// Prefixes in the order they were first listed. Insertion order for the reason
+    /// [`Windows::order`] gives.
+    order: VecDeque<String>,
+}
+
+impl Listings {
+    /// What was listed for `prefix`, while it is still worth handing out.
+    fn get(&self, prefix: &str) -> Option<Arc<Vec<Dirent>>> {
+        let (at, listed) = self.by_prefix.get(prefix)?;
+        (at.elapsed() < LISTING_TTL).then(|| listed.clone())
+    }
+
+    fn admit(&mut self, prefix: String, listed: Arc<Vec<Dirent>>) {
+        if self
+            .by_prefix
+            .insert(prefix.clone(), (Instant::now(), listed))
+            .is_none()
+        {
+            self.order.push_back(prefix);
+        }
+        while self.order.len() > MAX_CACHED_LISTINGS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_prefix.remove(&oldest);
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_prefix.clear();
+        self.order.clear();
+    }
+}
+
 /// The windows, and the order to give them up in.
 #[derive(Default)]
 struct Windows {
@@ -338,6 +407,47 @@ impl Windows {
         {
             self.by_key.remove(&oldest);
         }
+    }
+
+    /// Put `data` in `key`'s window, and give up what does not fit.
+    ///
+    /// The eviction is here rather than at the call site because this is the only place a
+    /// window grows, and a budget checked anywhere else is a budget that holds until someone
+    /// adds a second writer.
+    fn store_window(&mut self, key: &str, at: u64, data: Vec<u8>) {
+        let Some(cache) = self.by_key.get_mut(key) else {
+            return;
+        };
+        cache.window = Some((at, data));
+        while self.held_bytes() > MAX_CACHED_BYTES {
+            // The oldest entry that is not the one just filled. Nothing is dropped when that
+            // is the only one holding anything — see `MAX_CACHED_BYTES`.
+            let Some(oldest) = self
+                .order
+                .iter()
+                .find(|held| {
+                    held.as_str() != key
+                        && self.by_key.get(*held).is_some_and(|c| c.window.is_some())
+                })
+                .cloned()
+            else {
+                return;
+            };
+            if let Some(cache) = self.by_key.get_mut(&oldest) {
+                // The window goes, the entry stays: what it knows about the object — its
+                // size, its etag — is what lets the next read clamp a range and revalidate,
+                // and that costs nothing to keep.
+                cache.window = None;
+            }
+        }
+    }
+
+    fn held_bytes(&self) -> u64 {
+        self.by_key
+            .values()
+            .filter_map(|c| c.window.as_ref())
+            .map(|(_, data)| data.len() as u64)
+            .sum()
     }
 
     /// Forget `key` entirely, so the next read of it starts from a `head`.
@@ -556,9 +666,18 @@ impl FileSystem for S3Fs {
     /// * A name can arrive from both sides at once: as a prefix (because keys live under it)
     ///   and as an object (because a key of exactly that name exists). A `readdir` may not
     ///   repeat a name, so one side has to go — see `resolve_collision`.
+    ///
+    /// Answered from the last listing while that is still recent. See [`LISTING_TTL`]: what a
+    /// listing says may be a little behind, and what a *read* says may not be — a stale name
+    /// costs a reader a second look, a stale size or a stale body is a reader handed the wrong
+    /// file. `stat` and `read_at` ask every time, and the sizes a kept listing carries are the
+    /// ones it was given.
     fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
         Box::pin(async move {
             let key = self.key(path)?;
+            if let Some(listed) = lock(&self.listings).get(&key) {
+                return Ok((*listed).clone());
+            }
             let prefix = if key.is_empty() {
                 None
             } else {
@@ -569,10 +688,25 @@ impl FileSystem for S3Fs {
                 .list_with_delimiter(prefix.as_ref())
                 .await
                 .map_err(to_io_error)?;
-            Ok(Self::resolve_collision(
+            let entries = Arc::new(Self::resolve_collision(
                 listed,
                 prefix.as_ref().map(|p| p.as_ref()).unwrap_or(""),
-            ))
+            ));
+            lock(&self.listings).admit(key, entries.clone());
+            Ok((*entries).clone())
+        })
+    }
+
+    /// Drop the listings, and what reads learned about keys.
+    ///
+    /// The read side cannot be stale — a `stat` revalidates it against a fresh `head` — so
+    /// this is mostly about the listings. It goes too because a reader who asks to look
+    /// again has said, as plainly as the protocol allows, that they do not want an answer
+    /// from anything kept here.
+    fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            lock(&self.listings).clear();
+            *lock(&self.windows) = Windows::default();
         })
     }
 
@@ -659,9 +793,7 @@ impl FileSystem for S3Fs {
                 let n = data.len().min(want - filled);
                 buf[filled..filled + n].copy_from_slice(&data[..n]);
                 filled += n;
-                if let Some(cache) = lock(&self.windows).by_key.get_mut(&key) {
-                    cache.window = Some((at, data));
-                }
+                lock(&self.windows).store_window(&key, at, data);
             }
 
             if filled > 0 {
@@ -796,6 +928,132 @@ mod tests {
         let n = fs.read_at(Path::new(key), &mut buf, 0).await.unwrap();
         buf.truncate(n);
         buf
+    }
+
+    /// A listing is kept, and what is kept is what a reader sees until it is not.
+    ///
+    /// Deleting the object *behind* the store is how a test asks whether the answer came from
+    /// the store or from the cache: nothing else can tell the two apart, and counting requests
+    /// would pin how the listing is fetched rather than that it is not fetched twice.
+    #[tokio::test]
+    async fn a_listing_is_answered_from_the_last_one() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"a").await;
+        put(&store, "b.txt", b"b").await;
+        assert_eq!(fs.list(Path::new("/")).await.unwrap().len(), 2);
+
+        store.delete(&os_path("b.txt").unwrap()).await.unwrap();
+        assert_eq!(
+            fs.list(Path::new("/")).await.unwrap().len(),
+            2,
+            "the second listing is the first one, which is the whole point"
+        );
+
+        // What a reader says when they can see that the bucket has moved on.
+        fs.forget().await;
+        assert_eq!(fs.list(Path::new("/")).await.unwrap().len(), 1);
+    }
+
+    /// A read is not a listing: it asks every time, so a file's bytes are never a guess.
+    #[tokio::test]
+    async fn a_read_still_asks_after_a_listing_was_kept() {
+        let (store, fs) = store();
+        put(&store, "a.txt", b"one").await;
+        fs.list(Path::new("/")).await.unwrap();
+
+        put(&store, "a.txt", b"two").await;
+        // `stat` heads the object and revalidates the read window with what it finds.
+        assert_eq!(fs.stat(Path::new("a.txt")).await.unwrap().size, 3);
+        assert_eq!(read(&fs, "a.txt", 3).await, b"two");
+    }
+
+    /// A whole body kept for one key, sized `mib`.
+    fn held(mib: usize) -> ReadCache {
+        ReadCache {
+            size: (mib << 20) as u64,
+            etag: None,
+            mtime: SystemTime::UNIX_EPOCH,
+            window: None,
+            last_end: None,
+        }
+    }
+
+    #[test]
+    fn what_is_held_stays_inside_the_budget() {
+        let mut windows = Windows::default();
+        let mib = 1 << 20;
+        // Three bodies, half the budget each: the third pushes the first out.
+        for key in ["a", "b", "c"] {
+            windows.admit(key.to_string(), held(32));
+            windows.store_window(key, 0, vec![0u8; 32 * mib]);
+        }
+        assert!(windows.held_bytes() <= MAX_CACHED_BYTES);
+        assert!(
+            windows.by_key["a"].window.is_none(),
+            "the oldest gave up its body"
+        );
+        assert!(
+            windows.by_key["c"].window.is_some(),
+            "the one just read is kept"
+        );
+        // The entry itself stays: its size and etag are what clamp and revalidate the next
+        // read, and they cost nothing.
+        assert_eq!(windows.by_key["a"].size, (32 * mib) as u64);
+    }
+
+    #[test]
+    fn a_body_larger_than_the_budget_is_still_what_the_read_is_served_from() {
+        let mut windows = Windows::default();
+        windows.admit("small".to_string(), held(1));
+        windows.store_window("small", 0, vec![0u8; 1 << 20]);
+        windows.admit("huge".to_string(), held(96));
+        windows.store_window("huge", 0, vec![0u8; 96 << 20]);
+
+        // Over budget, and kept anyway: dropping it would send the bytes that were just
+        // fetched over the wire again, to answer the call that fetched them.
+        assert!(windows.by_key["huge"].window.is_some());
+        assert!(
+            windows.by_key["small"].window.is_none(),
+            "everything else gave way"
+        );
+    }
+
+    /// The case this is all for: the same file opened twice costs a `head` and no transfer.
+    #[tokio::test]
+    async fn a_file_read_twice_is_fetched_once() {
+        let (store, fs) = store();
+        put(&store, "doc.pdf", b"the whole document").await;
+        assert_eq!(read(&fs, "doc.pdf", 18).await, b"the whole document");
+
+        // Take the object away behind the store: a second read that still answers is one
+        // that never went back for it.
+        store.delete(&os_path("doc.pdf").unwrap()).await.unwrap();
+        assert_eq!(read(&fs, "doc.pdf", 18).await, b"the whole document");
+    }
+
+    #[test]
+    fn listings_are_given_up_oldest_first() {
+        let mut kept = Listings::default();
+        for i in 0..MAX_CACHED_LISTINGS + 2 {
+            kept.admit(format!("dir-{i}"), Arc::new(vec![]));
+        }
+        assert!(kept.get("dir-0").is_none(), "the first one listed went");
+        assert!(
+            kept.get(&format!("dir-{}", MAX_CACHED_LISTINGS + 1))
+                .is_some()
+        );
+        assert_eq!(kept.by_prefix.len(), MAX_CACHED_LISTINGS);
+
+        // Re-listing a prefix it already holds replaces it rather than queueing it twice.
+        let before = kept.order.len();
+        kept.admit(format!("dir-{}", MAX_CACHED_LISTINGS + 1), Arc::new(vec![]));
+        assert_eq!(kept.order.len(), before);
+
+        kept.clear();
+        assert!(
+            kept.get(&format!("dir-{}", MAX_CACHED_LISTINGS + 1))
+                .is_none()
+        );
     }
 
     /// The case the revalidation exists for: a longer object under a filled entry. The
