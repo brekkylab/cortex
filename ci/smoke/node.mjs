@@ -5,7 +5,7 @@
 //   SMOKE_MOUNT   1 if a FUSE provider is installed here, else 0
 //   SMOKE_SERVER  1 if a cortex-krun release is published for this platform, else 0
 //   SMOKE_VM      1 if this machine can boot one (KVM or HVF), else 0
-import { spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
 import { createRequire } from 'node:module'
 import os from 'node:os'
@@ -76,8 +76,22 @@ try {
 }
 if (server) {
   check(want('SMOKE_SERVER'), 'ensureCortex fetched the server')
-  const exe = process.platform === 'win32' ? 'cortex-krun.exe' : 'cortex-krun'
-  check(fs.existsSync(path.join(server, exe)), `${exe} is in ${server}`)
+  const exe = process.platform === 'win32' ? '.exe' : ''
+  check(fs.existsSync(path.join(server, `cortex-krun${exe}`)), `cortex-krun${exe} is in ${server}`)
+  // The server runs on this machine, and answers -- no VM needed to ask its version.
+  const images = await cortex.ImageClient.tryNew()
+  const version = await images.version()
+  await images.close()
+  check(typeof version === 'string' && version.length > 0, `the server answers (protocol ${version})`)
+  // And the VM process it would spawn starts, and says what it can make here.
+  let caps = null
+  try {
+    caps = execFileSync(path.join(server, `cortex-krun-host${exe}`), ['--capabilities'], { encoding: 'utf8' })
+    console.log(`  cortex-krun-host --capabilities: [${caps.trim().split(/\s+/).filter(Boolean).join(' ')}]`)
+  } catch (e) {
+    console.log(`  cortex-krun-host --capabilities: ${e.message}`)
+  }
+  check(caps !== null, 'cortex-krun-host starts')
 }
 
 if (server && want('SMOKE_VM')) {

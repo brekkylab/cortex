@@ -68,8 +68,17 @@ async def main():
         check(not want("SMOKE_SERVER") and "no cortex-krun release is published" in str(e), "ensure_cortex says no release is published here")
     if server:
         check(want("SMOKE_SERVER"), "ensure_cortex fetched the server")
-        exe = "cortex-krun.exe" if sys.platform == "win32" else "cortex-krun"
-        check(os.path.isfile(os.path.join(server, exe)), f"{exe} is in {server}")
+        exe = ".exe" if sys.platform == "win32" else ""
+        check(os.path.isfile(os.path.join(server, f"cortex-krun{exe}")), f"cortex-krun{exe} is in {server}")
+        # The server runs on this machine, and answers -- no VM needed to ask its version.
+        images = await cortex.ImageClient.try_new()
+        version = await images.version()
+        await images.close()
+        check(bool(version), f"the server answers (protocol {version})")
+        # And the VM process it would spawn starts, and says what it can make here.
+        caps = subprocess.run([os.path.join(server, f"cortex-krun-host{exe}"), "--capabilities"], capture_output=True, text=True)
+        print(f"  cortex-krun-host --capabilities: [{' '.join(caps.stdout.split())}]")
+        check(caps.returncode == 0, "cortex-krun-host starts")
 
     if server and want("SMOKE_VM"):
         host = tempfile.mkdtemp(prefix="cortex-smoke-host-")
