@@ -29,6 +29,8 @@ pub use r#impl::{GdriveConfig, GdriveFs, GdriveOrigins};
 pub use r#impl::{InMemFs, PassthroughFs};
 #[cfg(feature = "notion")]
 pub use r#impl::{NotionConfig, NotionFs};
+#[cfg(feature = "onedrive")]
+pub use r#impl::{OnedriveConfig, OnedriveFs, OnedriveOrigins};
 #[cfg(feature = "s3")]
 pub use r#impl::{S3Config, S3Fs};
 pub use posix::*;

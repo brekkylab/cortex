@@ -40,8 +40,9 @@ object_store = { version = "0.14", default-features = false, features = [
 # The Notion and Google Drive backends: an async HTTP client, plus the two things
 # their payloads are made of — Notion's page ids are UUIDs, and timestamps are
 # RFC 3339. reqwest 0.13 renamed `rustls-tls` → `rustls` and made `query`/`form`
-# optional; Notion's pagination uses `.query()` and Google's token endpoint takes a
-# form body, so both are named.
+# optional; Notion's pagination uses `.query()` and both token endpoints take a form
+# body — Google's and Microsoft's, the latter for the refresh grant — so both are
+# named.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
@@ -152,7 +153,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # because a feature's tests only exist when it is on. Full coverage is a sweep:
 #
 #   for f in "--no-default-features" "" "--features s3" "--features notion" \
-#            "--features gdrive" "--features s3,notion,gdrive"; do
+#            "--features gdrive" "--features onedrive" \
+#            "--features s3,notion,gdrive,onedrive"; do
 #       cargo test $f --all-targets
 #   done
 #
@@ -225,4 +227,17 @@ notion = [
     "dep:serde_json",
     "tokio/net",
     "tokio/rt-multi-thread",
+]
+# A OneDrive account as a read-only tree, over Microsoft Graph. `tokio/sync` because the
+# token cache is held across the `.await` that mints one, which `std::sync::Mutex` cannot
+# be; `unicode-normalization` because macOS looks a name up in a spelling the listing did
+# not necessarily use.
+onedrive = [
+    "dep:reqwest",
+    "dep:chrono",
+    "dep:serde_json",
+    "dep:unicode-normalization",
+    "tokio/net",
+    "tokio/rt-multi-thread",
+    "tokio/sync",
 ]
