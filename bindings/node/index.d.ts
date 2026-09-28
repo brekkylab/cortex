@@ -63,16 +63,32 @@ export declare class Directory {
 export type JsDirectory = Directory
 
 /**
- * A tree mounted on this host, for as long as something holds it.
+ * A tree mounted on this host, until `unmount` or until nothing holds it.
  *
  * Held behind an [`Arc`] so that passing one to a console builder does not take it from
- * the JavaScript object: both hold the mount, and it comes down when the last of them
- * lets go — the builder's copy with the console, the JavaScript one with garbage
- * collection.
+ * the JavaScript object: both hold the mount, and without an `unmount` it comes down when
+ * the last of them lets go — the builder's copy with the console, the JavaScript one with
+ * garbage collection.
+ *
+ * **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and
+ * none at all on a signal or a crash, so a mount left to one is taken down by cortex's
+ * watchdog, from outside the process, once the process is gone. `unmount` is how a
+ * program that wants it down *now* says so.
  */
 export declare class HostMount {
   constructor(fs: Directory, mountpoint: string)
   get mountpoint(): string
+  /**
+   * Take the mount down now, and settle once it is down.
+   *
+   * Whoever else holds it — a console it was handed to — holds a mount point that is no
+   * longer mounted from here on, so this belongs after the console using it is closed.
+   * A second call, or one after the mount already came down, settles at once.
+   *
+   * Off the JavaScript thread: a guard comes down by unmounting and then waiting for the
+   * thread serving it, which waits for every holder of the tree to let go.
+   */
+  unmount(): Promise<void>
 }
 export type JsHostMount = HostMount
 

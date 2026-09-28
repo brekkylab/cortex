@@ -110,15 +110,38 @@ impl JsDirectory {
     }
 }
 
-/// A tree mounted on this host, for as long as something holds it.
+/// A tree mounted on this host, until `unmount` or until nothing holds it.
 ///
 /// Held behind an [`Arc`] so that passing one to a console builder does not take it from
-/// the JavaScript object: both hold the mount, and it comes down when the last of them
-/// lets go — the builder's copy with the console, the JavaScript one with garbage
-/// collection.
+/// the JavaScript object: both hold the mount, and without an `unmount` it comes down when
+/// the last of them lets go — the builder's copy with the console, the JavaScript one with
+/// garbage collection.
+///
+/// **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and
+/// none at all on a signal or a crash, so a mount left to one is taken down by cortex's
+/// watchdog, from outside the process, once the process is gone. `unmount` is how a
+/// program that wants it down *now* says so.
 #[cfg(feature = "mount")]
 #[napi(js_name = "HostMount")]
-pub struct JsHostMount(Arc<Platform>);
+pub struct JsHostMount(Arc<Shared>);
+
+/// The guard behind a `HostMount`, shared with every console it was handed to.
+///
+/// Held in an `Option` so that `unmount` can take it down while a console still holds the
+/// `Arc` — which is what makes it an unmount rather than a release of one reference among
+/// several. The mount point is kept beside it, since a console asks for it after as well.
+#[cfg(feature = "mount")]
+pub struct Shared {
+    guard: std::sync::Mutex<Option<Platform>>,
+    mountpoint: PathBuf,
+}
+
+#[cfg(feature = "mount")]
+impl Mount for Shared {
+    fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+}
 
 #[cfg(feature = "mount")]
 #[napi]
@@ -127,12 +150,45 @@ impl JsHostMount {
     pub fn new(mut fs: ClassInstance<JsDirectory>, mountpoint: String) -> Result<Self> {
         let directory = fs.0.take().ok_or_else(taken)?;
         let mount = Platform::try_new(directory, Path::new(&mountpoint)).map_err(error::io)?;
-        Ok(JsHostMount(Arc::new(mount)))
+        let mountpoint = mount.mountpoint().to_path_buf();
+        Ok(JsHostMount(Arc::new(Shared {
+            guard: std::sync::Mutex::new(Some(mount)),
+            mountpoint,
+        })))
     }
 
     #[napi(getter)]
     pub fn mountpoint(&self) -> String {
         self.0.mountpoint().to_string_lossy().into_owned()
+    }
+
+    /// Take the mount down now, and settle once it is down.
+    ///
+    /// Whoever else holds it — a console it was handed to — holds a mount point that is no
+    /// longer mounted from here on, so this belongs after the console using it is closed.
+    /// A second call, or one after the mount already came down, settles at once.
+    ///
+    /// Off the JavaScript thread: a guard comes down by unmounting and then waiting for the
+    /// thread serving it, which waits for every holder of the tree to let go.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn unmount<'env>(
+        &self,
+        env: &'env napi::Env,
+    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, ()>> {
+        let shared = self.0.clone();
+        crate::console::promise(env, async move {
+            let guard = shared
+                .guard
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(guard) = guard {
+                tokio::task::spawn_blocking(move || drop(guard))
+                    .await
+                    .map_err(|e| error::invalid(format!("unmounting panicked: {e}")))?;
+            }
+            Ok(())
+        })
     }
 }
 
