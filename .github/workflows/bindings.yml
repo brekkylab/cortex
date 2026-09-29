@@ -142,6 +142,26 @@ jobs:
           args: --release --out ${{ github.workspace }}/dist/wheels
           docker-options: -e CORTEX_KRUN_PINNED_VERSION
 
+      # What the addon and the extension need from the loader to be loaded at all. Neither
+      # may need a DLL Windows does not ship: the C runtime is linked in (`.cargo/config.toml`)
+      # and Dokany is delay-loaded, so a host without either still imports the package, and
+      # `mount_support` says what to install.
+      - name: The DLLs each Windows artifact loads
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          readobj="/c/Program Files/LLVM/bin/llvm-readobj.exe"
+          cd dist
+          unzip -oq wheels/*.whl -d wheel
+          for f in node/*.node wheel/cortex/*.pyd; do
+            echo "== $f"
+            "$readobj" --coff-imports "$f" | awk '/^Import \{/{k="load"} /^DelayImport \{/{k="delay"} /Name: .*\.dll/{print "  " k ": " $2}' | sort -u | tee imports.txt
+            if grep -iE "load: (vcruntime|msvcp|dokan)" imports.txt; then
+              echo "::error::$f needs the DLLs above to load"; fail=1
+            fi
+          done
+          exit ${fail:-0}
+
       - name: The glibc each Linux artifact needs
         if: runner.os == 'Linux'
         shell: bash
