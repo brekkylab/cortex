@@ -9,6 +9,7 @@
     "cortex.darwin-arm64.node"
   ],
   "description": "The environment an agent works in: what it can see, and what it can do.",
+  "license": "(MIT OR Apache-2.0)",
   "homepage": "https://github.com/brekkylab/cortex/tree/main/bindings/node#readme",
   "engines": {
     "node": ">= 18"

@@ -2,6 +2,26 @@
 name = "cortex"
 version = "0.1.0"
 edition = "2024"
+description = "Run tasks in disposable Linux VMs from your own code: the environment an agent works in."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/brekkylab/cortex"
+readme = "README.md"
+keywords = ["vm", "sandbox", "agent", "fuse", "microvm"]
+categories = ["virtualization", "filesystem", "development-tools"]
+# What a dependent builds, and nothing it does not: the bindings are packages of their own,
+# and CI's scripts and settings are this repository's. `cortex-krun.version` is the server
+# release a published crate fetches by default -- see `build.rs` -- and is written by the
+# workflow that packs it, so a checkout has none.
+include = [
+    "/src/**",
+    "/build.rs",
+    "/contrib/**",
+    "/examples/**",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/cortex-krun.version",
+]
 
 # The bindings are members so that they build against this crate in the same target
 # directory and lockfile. A `cargo build` or `cargo test` here still builds only `cortex`:

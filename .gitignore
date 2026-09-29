@@ -32,3 +32,6 @@ docs/
 
 # Python bytecode
 __pycache__/
+
+# Written by the workflow that packs the crate -- see `pin_server` in build.rs.
+/cortex-krun.version
