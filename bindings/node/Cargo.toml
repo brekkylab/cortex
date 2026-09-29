@@ -1,0 +1,30 @@
+[package]
+name = "cortex-node"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+# `rlib` as well, for a binding that builds cortex into its own addon — ailoy's does. Two
+# addons cannot hand each other a `Console`: each links its own copy of cortex and of the
+# runtime under it. So such a binding links this crate instead, and napi registers these
+# classes into its addon alongside its own; its `Console` is then the one its agent can take.
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+napi-build = "2"
+
+[dependencies]
+anyhow = "1"
+cortex = { path = "../..", default-features = false }
+napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt"] }
+napi-derive = "3"
+tokio = { version = "1", features = ["sync"] }
+
+[features]
+default = ["mount", "ensure"]
+mount = ["cortex/mount"]
+ensure = ["cortex/ensure"]
+s3 = ["cortex/s3"]
+gdrive = ["cortex/gdrive"]
+notion = ["cortex/notion"]
