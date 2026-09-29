@@ -133,6 +133,9 @@ impl DokanMount {
     /// [`MountFlags::CURRENT_SESSION`] matters because a drive letter belongs to a logon
     /// session: a service's mount is invisible to the desktop unless the mount manager
     /// publishes it.
+    ///
+    /// [`MountFlags::CASE_SENSITIVE`] is added whatever `flags` says: the stores tell names
+    /// apart by case, and a driver that does not mistakes one file for another.
     pub fn try_new_with<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
@@ -363,7 +366,10 @@ fn serve<T: FileSystem>(
         ready: Mutex::new(Some(ready)),
     };
     let options = MountOptions {
-        flags,
+        // Whatever the caller asked for: the stores compare names by their bytes, as
+        // `get_volume_information` already says. Without it the driver matches its searches and
+        // open files without regard to case, so two open files differing only in case were one.
+        flags: flags | MountFlags::CASE_SENSITIVE,
         timeout: OPERATION_TIMEOUT,
         // Matches the free-space reply's block; the library default (`0`) would not.
         allocation_unit_size: BLOCK_SIZE as u32,
