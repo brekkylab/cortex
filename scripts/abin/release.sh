@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Build cortex's own executables for the guest and publish them.
 #
-#   scripts/abin-release.sh
+#   scripts/abin/release.sh
 #       Build every OS below, upload, and move `abin/latest` to this commit.
-#   scripts/abin-release.sh --dry-run
+#   scripts/abin/release.sh --dry-run
 #       Build and stop.
-#   scripts/abin-release.sh --os linux
+#   scripts/abin/release.sh --os linux
 #       Just that OS's architectures.
-#   scripts/abin-release.sh --no-latest-pointer
+#   scripts/abin/release.sh --no-latest-pointer
 #       Upload, but leave `abin/latest` naming whatever it named before.
-#   scripts/abin-release.sh --latest-pointer-only
+#   scripts/abin/release.sh --latest-pointer-only
 #       Move `abin/latest` to this commit and do nothing else.
 #
 # The git sha of HEAD names the release. That is the whole of its identity — nothing
@@ -32,7 +32,7 @@ set -euo pipefail
 
 BUCKET="${ABIN_BUCKET:-cortex-dist-044443350235-us-east-1-an}"
 
-die() { echo "abin-release: $*" >&2; exit 1; }
+die() { echo "abin/release: $*" >&2; exit 1; }
 
 # Every OS this script knows how to build, in the order it builds them. One entry today: the
 # guest is Linux and the guest is the only consumer. A host build — if the local console
@@ -107,7 +107,7 @@ fi
 SHA="$(git rev-parse HEAD)"
 # A warning and not a refusal: a release can be cut and pushed in either order.
 if [ -z "$(git branch -r --contains "$SHA" 2>/dev/null)" ]; then
-  echo "abin-release: warning: $SHA is on no remote branch; nobody else can check it out" >&2
+  echo "abin/release: warning: $SHA is on no remote branch; nobody else can check it out" >&2
 fi
 
 OUT="$(mktemp -d)"
@@ -116,12 +116,12 @@ trap 'rm -rf "$OUT"' EXIT
 move_latest_pointer() {
   printf '%s\n' "$SHA" > "$OUT/latest"
   aws s3 cp --cache-control "no-cache" "$OUT/latest" "s3://$BUCKET/abin/latest"
-  echo "abin-release: the latest-pointer is now $SHA" >&2
+  echo "abin/release: the latest-pointer is now $SHA" >&2
 }
 
 if [ "$LATEST_POINTER_ONLY" = 1 ]; then
   if [ "$DRY_RUN" = 1 ]; then
-    echo "abin-release: would move the latest-pointer to $SHA" >&2
+    echo "abin/release: would move the latest-pointer to $SHA" >&2
     exit 0
   fi
   move_latest_pointer
@@ -139,7 +139,7 @@ for os in "${OSES[@]}"; do
     arch="${pair%%:*}"
     triple="${pair##*:}"
     name="abin-$os-$arch.tar.gz"
-    echo "abin-release: building $triple" >&2
+    echo "abin/release: building $triple" >&2
     cargo zigbuild -p cortex-exec-mem -p cortex-exec-index --release --target "$triple"
     # Flat: `mem` and `index` at the top level, which is exactly what /abin holds.
     tar czf "$OUT/$name" -C "$TARGET_DIR/$triple/release" mem index
@@ -148,7 +148,7 @@ for os in "${OSES[@]}"; do
 done
 
 if [ "$DRY_RUN" = 1 ]; then
-  echo "abin-release: would publish $SHA:" >&2
+  echo "abin/release: would publish $SHA:" >&2
   ls -la "$OUT" >&2
   exit 0
 fi
@@ -167,4 +167,4 @@ if [ "$LATEST_POINTER" = 1 ]; then
   move_latest_pointer
 fi
 
-echo "abin-release: published $SHA (${built[*]})" >&2
+echo "abin/release: published $SHA (${built[*]})" >&2

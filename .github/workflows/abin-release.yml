@@ -2,7 +2,7 @@
 #
 # The release is named by the commit this runs on, so what gets checked out is what gets
 # published: a release event checks out the tagged commit, a dispatch checks out whatever ref
-# was chosen. `scripts/abin-release.sh` is the whole of the work; this file only arranges for
+# was chosen. `scripts/abin/release.sh` is the whole of the work; this file only arranges for
 # it to have a toolchain and credentials, and splits it across a matrix.
 #
 # # Why moving `abin/latest` is a job of its own
@@ -121,7 +121,7 @@ jobs:
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
           fi
-          ./scripts/abin-release.sh "${args[@]}"
+          ./scripts/abin/release.sh "${args[@]}"
 
   latest-pointer:
     needs: build
@@ -143,4 +143,4 @@ jobs:
       # No toolchain: this writes 41 bytes and compiles nothing, which is why the script
       # checks for zig only when it is going to build.
       - name: Move the latest-pointer
-        run: ./scripts/abin-release.sh --latest-pointer-only
+        run: ./scripts/abin/release.sh --latest-pointer-only

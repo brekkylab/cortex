@@ -1,7 +1,7 @@
 // Pack the Node packages as `napi pre-publish` would publish them: every platform
 // package, and the root with each of them as an optional dependency at its version.
 //
-//   node ci/pack-npm.mjs <out-dir> [--allow-missing]   (from bindings/node, after `napi artifacts`)
+//   node ../../scripts/bindings/pack-npm.mjs <out-dir> [--allow-missing]   (from bindings/node, after `napi artifacts`)
 //
 // `--allow-missing` packs only the platform packages that have their binary, and still
 // names every one in the root -- for a local run on one machine. A release packs all.

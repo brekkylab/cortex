@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # Build cortex's own executables for the guest, into a directory `CORTEX_ABIN_DIR` can name.
 #
-#   scripts/build-abin.sh
+#   scripts/abin/build.sh
 #       This host's architecture, release, into the `abin` directory every session here
 #       mounts: `$CORTEX_UVM_HOME/abin`, or `~/.cache/cortex/abin` when that is unset.
-#   scripts/build-abin.sh --zig
+#   scripts/abin/build.sh --zig
 #       The same, built on this host instead of in a container.
-#   scripts/build-abin.sh --arch x86_64
+#   scripts/abin/build.sh --arch x86_64
 #       The other architecture, to find out whether it still compiles.
-#   scripts/build-abin.sh --out /somewhere/else
+#   scripts/abin/build.sh --out /somewhere/else
 #       Somewhere other than the cache, for a build to look at rather than to run.
-#   scripts/build-abin.sh --debug
+#   scripts/abin/build.sh --debug
 #       The debug profile, which compiles in a fraction of the time and produces executables
 #       several times the size. `/abin` is mounted rather than copied, so that size is the
 #       host's disk and nothing the guest pays for.
@@ -67,9 +67,9 @@
 # `cortex-execs/docread/build.rs` is where that is argued and where the ways around it are.
 set -euo pipefail
 
-die() { echo "build-abin: $*" >&2; exit 1; }
+die() { echo "abin/build: $*" >&2; exit 1; }
 
-root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+root=$(cd -- "$(dirname -- "$0")/../.." && pwd)
 
 # What `/abin` holds, as `<package>:<program>`. The two are not the same string — the crate is
 # `cortex-exec-mem` and the name a caller types is `mem` — and both are needed here: one to
@@ -165,7 +165,7 @@ TARGET_DIR="${CARGO_TARGET_DIR:-$root/target}"
 packages=()
 for pair in "${PROGRAMS[@]}"; do packages+=(-p "${pair%%:*}"); done
 
-echo "build-abin: building $TRIPLE ($PROFILE)" >&2
+echo "abin/build: building $TRIPLE ($PROFILE)" >&2
 
 if [ "$ZIG" = 1 ]; then
   built="$TARGET_DIR/$TRIPLE/$PROFILE"
@@ -184,7 +184,7 @@ else
   built="$builder/$PROFILE"
 
   if [ "$ARCH" != "$HOST" ]; then
-    echo "build-abin: warning: $ARCH is emulated on a $HOST host and will be slow (--zig cross-compiles)" >&2
+    echo "abin/build: warning: $ARCH is emulated on a $HOST host and will be slow (--zig cross-compiles)" >&2
   fi
 
   profile_flag=""
@@ -224,7 +224,7 @@ for entry in "$OUT"/*; do
       continue 2
     fi
   done
-  echo "build-abin: warning: $OUT holds $name, which cortex did not build" >&2
+  echo "abin/build: warning: $OUT holds $name, which cortex did not build" >&2
 done
 
 echo

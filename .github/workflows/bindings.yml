@@ -33,7 +33,7 @@ on:
     paths:
       - .github/workflows/bindings.yml
       - bindings/**
-      - ci/**
+      - scripts/bindings/**
       - src/**
       - contrib/**
       - build.rs
@@ -43,7 +43,7 @@ on:
     paths:
       - .github/workflows/bindings.yml
       - bindings/**
-      - ci/**
+      - scripts/bindings/**
       - src/**
       - contrib/**
       - build.rs
@@ -218,7 +218,7 @@ jobs:
         run: |
           npm ci
           npx napi artifacts --output-dir artifacts
-          node ../../ci/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
+          node ../../scripts/bindings/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
           ls -la "$GITHUB_WORKSPACE/dist/npm"
           tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-cortex-0.1.0.tgz package/package.json
 
@@ -274,7 +274,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: ci
+          sparse-checkout: scripts/bindings
 
       - uses: actions/setup-node@v4
         with:
@@ -308,7 +308,7 @@ jobs:
       - name: Install from a local registry
         shell: bash
         run: |
-          cd ci
+          cd scripts/bindings
           npx -y verdaccio@6 --config ./verdaccio.yaml --listen 4873 > "$RUNNER_TEMP/verdaccio.log" 2>&1 &
           for _ in $(seq 60); do curl -sf http://localhost:4873/-/ping >/dev/null && break; sleep 1; done
           token=$(curl -sf -X PUT -H 'content-type: application/json' \
@@ -341,8 +341,8 @@ jobs:
         env:
           SMOKE_MOUNT: "0"
         run: |
-          cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/ci/smoke/node.mjs"
-          "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/ci/smoke/python.py"
+          cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/bindings/smoke/node.mjs"
+          "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/bindings/smoke/python.py"
 
       - name: FUSE-T
         if: runner.os == 'macOS'
@@ -352,13 +352,13 @@ jobs:
         shell: bash
         env:
           SMOKE_MOUNT: ${{ matrix.mount }}
-        run: cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/ci/smoke/node.mjs"
+        run: cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/bindings/smoke/node.mjs"
 
       - name: Smoke, Python
         shell: bash
         env:
           SMOKE_MOUNT: ${{ matrix.mount }}
-        run: '"$SMOKE_PYTHON" "$GITHUB_WORKSPACE/ci/smoke/python.py"'
+        run: '"$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/bindings/smoke/python.py"'
 
       - name: verdaccio log
         if: failure()
