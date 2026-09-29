@@ -23,45 +23,39 @@
 # virtualization, the arm64 Linux runners have no /dev/kvm, and the Windows ones have no
 # Hypervisor Platform, so only linux-x64 boots a session.
 #
-# # The server a build fetches
+# # When it runs, and the server it pins
 #
-# Each build is pinned to the cortex-krun release its platform's `latest` names at build
-# time (`CORTEX_KRUN_PINNED_VERSION`, see `src/ensure.rs`), so one version of a package
-# always fetches the server it was tested with. The crate is compiled by its user rather
-# than here, so it carries the version as a file instead (`cortex-krun.version`, see
-# `build.rs`), and being one package for every platform, it pins the release all four
-# platforms' `latest` agree on -- and is not packed while they disagree.
+# Only for a release: when one is published, or when dispatched with the tag to release.
+# cortex and cortex-krun are released together, under one version tag, and `resolve`
+# refuses a run that would break that:
+#
+# - the ref has to be a version tag, `vX.Y.Z`, and every manifest here -- the crate, the
+#   bindings' crates, npm's packages, the wheel -- has to say that version;
+# - cortex-krun has to have released the same tag already, whole: its dist workflow writes
+#   `cortex-krun/tags/<tag>`, naming the release's sha, only once every platform has its
+#   archive, and `resolve` checks the four archives are there besides.
+#
+# Every package is then built from that tag and pinned to that release
+# (`CORTEX_KRUN_PINNED_VERSION`, see `src/ensure.rs`), so one version of cortex fetches the
+# cortex-krun it was released with, and was tested against here. The crate is compiled by
+# its user rather than here, so it carries the version as a file instead
+# (`cortex-krun.version`, see `build.rs`).
 name: packages
 
 on:
-  push:
-    branches: [main, ci/bindings-packages]
-    paths:
-      - .github/workflows/packages.yml
-      - bindings/**
-      - scripts/packages/**
-      - src/**
-      - contrib/**
-      - build.rs
-      - Cargo.toml
-      - Cargo.lock
-      - LICENSE
-  pull_request:
-    paths:
-      - .github/workflows/packages.yml
-      - bindings/**
-      - scripts/packages/**
-      - src/**
-      - contrib/**
-      - build.rs
-      - Cargo.toml
-      - Cargo.lock
-      - LICENSE
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      ref:
+        description: The version tag to release (vX.Y.Z), the same in brekkylab/cortex-krun
+        required: true
 
+# One run per tag, and never one cut short: a release that stopped halfway is one nobody can
+# tell from a finished one without looking.
 concurrency:
-  group: packages-${{ github.ref }}
-  cancel-in-progress: true
+  group: packages-${{ github.event.release.tag_name || inputs.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -69,10 +63,63 @@ permissions:
 env:
   DIST_URL: https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com
   CARGO_TERM_COLOR: always
+  # The tag this run releases: the release's own, or the one it was dispatched with.
+  REF: ${{ github.event.release.tag_name || inputs.ref }}
 
 jobs:
+  # What this release is, and the cortex-krun release it pins -- or no release at all.
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      krun: ${{ steps.krun.outputs.krun }}
+    steps:
+      # First, and before any checkout: the tag may be one this repository has not made yet
+      # either, and what to do first is the same then -- release cortex-krun.
+      - id: krun
+        name: cortex-krun has released this tag, on every platform
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$REF" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]] \
+            || fail "$REF is not a version tag: a release is tagged vX.Y.Z"
+          krun=$(curl -fsS "$DIST_URL/cortex-krun/tags/$REF") \
+            || fail "cortex-krun has not released $REF: tag it there first, and let its dist workflow finish"
+          krun=$(printf '%s' "$krun" | tr -d '[:space:]')
+          [[ "$krun" =~ ^[0-9a-f]{40}$ ]] || fail "cortex-krun/tags/$REF holds '$krun', not a sha"
+          for p in macos-aarch64 linux-x86_64 linux-aarch64 windows-x86_64; do
+            curl -fsSI -o /dev/null "$DIST_URL/cortex-krun/$p/$krun/cortex-krun-$p.tar.gz" \
+              || fail "cortex-krun's release of $REF ($krun) has no $p archive"
+          done
+          echo "cortex-krun released $REF as $krun"
+          echo "krun=$krun" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - id: resolve
+        name: Every manifest is the tag's version
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$REF" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]
+          version=${BASH_REMATCH[1]}
+          toml() { sed -n 's/^version = "\(.*\)"$/\1/p' "$1" | head -1; }
+          json() { node -p "require('./$1').version"; }
+          wrong=""
+          for f in Cargo.toml bindings/node/Cargo.toml bindings/python/Cargo.toml bindings/python/pyproject.toml; do
+            [ "$(toml "$f")" = "$version" ] || wrong="$wrong $f=$(toml "$f")"
+          done
+          for f in bindings/node/package.json bindings/node/npm/*/package.json; do
+            [ "$(json "$f")" = "$version" ] || wrong="$wrong $f=$(json "$f")"
+          done
+          [ -z "$wrong" ] || fail "$REF is version $version, but these manifests say otherwise:$wrong"
+          echo "releasing cortex $version ($REF), pinned to cortex-krun ${{ steps.krun.outputs.krun }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.platform }})
+    needs: resolve
     strategy:
       fail-fast: false
       matrix:
@@ -80,29 +127,29 @@ jobs:
           - platform: darwin-arm64
             runner: macos-15
             target: aarch64-apple-darwin
-            server: macos-aarch64
             manylinux: "off"
           - platform: linux-x64-gnu
             runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            server: linux-x86_64
             napi-flags: --use-napi-cross
             manylinux: "2_17"
           - platform: linux-arm64-gnu
             runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            server: linux-aarch64
             napi-flags: --use-napi-cross
             manylinux: "2_17"
           - platform: win32-x64-msvc
             runner: windows-2025
             target: x86_64-pc-windows-msvc
-            server: windows-x86_64
             manylinux: "off"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    env:
+      CORTEX_KRUN_PINNED_VERSION: ${{ needs.resolve.outputs.krun }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -125,13 +172,6 @@ jobs:
           brew install --cask fuse-t
           command -v pkg-config || brew install pkgconf
           pkg-config --cflags fuse-t
-
-      - name: Pin the server release
-        shell: bash
-        run: |
-          pinned=$(curl -fsS "$DIST_URL/cortex-krun/${{ matrix.server }}/latest" || true)
-          echo "cortex-krun ${{ matrix.server }}: ${pinned:-none published, builds follow latest}"
-          echo "CORTEX_KRUN_PINNED_VERSION=$pinned" >> "$GITHUB_ENV"
 
       - name: Node addon
         working-directory: bindings/node
@@ -194,11 +234,13 @@ jobs:
           if-no-files-found: error
 
   assemble:
-    needs: build
+    needs: [resolve, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
 
       - uses: actions/setup-node@v4
         with:
@@ -228,7 +270,7 @@ jobs:
           npx napi artifacts --output-dir artifacts
           node ../../scripts/packages/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
           ls -la "$GITHUB_WORKSPACE/dist/npm"
-          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-cortex-0.1.0.tgz package/package.json
+          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-cortex-${{ needs.resolve.outputs.version }}.tgz package/package.json
 
       - name: wheels
         run: |
@@ -249,10 +291,13 @@ jobs:
 
   # The crate, packed once: it is source, and each platform's test builds it for itself.
   crate:
+    needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -261,16 +306,7 @@ jobs:
           key: crate
 
       - name: Pin the server release
-        run: |
-          versions=$(for p in macos-aarch64 linux-x86_64 linux-aarch64 windows-x86_64; do
-            curl -fsS "$DIST_URL/cortex-krun/$p/latest" || echo none
-          done | sort -u)
-          echo "cortex-krun latest: $versions"
-          if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ] || [ "$versions" = none ]; then
-            echo "::error::the platforms' latest name different releases; release cortex-krun with latest first"
-            exit 1
-          fi
-          echo "$versions" > cortex-krun.version
+        run: echo "${{ needs.resolve.outputs.krun }}" > cortex-krun.version
 
       # Verified as cargo verifies it: the packed source, alone, built. `--allow-dirty` for
       # `cortex-krun.version`, written above and in no commit.
@@ -287,7 +323,7 @@ jobs:
 
   test:
     name: test (${{ matrix.platform }})
-    needs: [assemble, crate]
+    needs: [resolve, assemble, crate]
     strategy:
       fail-fast: false
       matrix:
@@ -320,6 +356,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ env.REF }}
           sparse-checkout: scripts/packages
 
       - uses: actions/setup-node@v4
