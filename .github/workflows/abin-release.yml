@@ -37,8 +37,9 @@ env:
 jobs:
   build:
     strategy:
-      # Linux only: the guest is the only consumer of `/abin`. Adding macOS is this, plus a
-      # line in the script's `ALL_OSES`:
+      # Linux only: the guest is the only consumer of `/abin`. Adding macOS is this, plus its
+      # entries in the script's `ALL_OSES` and `targets_for`, a build path there without zig
+      # (the script always runs `cargo zigbuild`), and a case in "Install the Rust targets":
       #
       #   - os: macos
       #     runner: macos-15

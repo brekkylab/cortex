@@ -114,8 +114,9 @@ impl JsDirectory {
 /// with garbage collection).
 ///
 /// **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and none
-/// on a signal or crash; a mount left to one is taken down by cortex's watchdog from outside
-/// the process once it is gone. Call `unmount()` to take it down *now*.
+/// on a signal or crash; a mount left to one is taken down from outside the process once it
+/// is gone (by cortex's watchdog on unix, by Dokany on Windows). Call `unmount()` to take it
+/// down *now*.
 #[cfg(feature = "mount")]
 #[napi(js_name = "HostMount")]
 pub struct JsHostMount(Arc<Shared>);

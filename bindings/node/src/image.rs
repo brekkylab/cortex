@@ -248,7 +248,7 @@ impl Drop for JsImageClient {
 
 #[napi]
 impl JsImageClient {
-    /// Start `cortex-krun` from the stdio server directory; settles once the server answers.
+    /// Start `cortex-krun` from cortex's cache `bin`; settles once the server answers.
     #[napi(ts_return_type = "Promise<ImageClient>")]
     pub fn try_new(env: &Env) -> napi::Result<PromiseRaw<'_, JsImageClient>> {
         promise(env, async move {

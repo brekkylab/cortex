@@ -2,10 +2,10 @@
 //! What a request *means* is decided by whoever answers it.
 //!
 //! ```no_run
-//! use cortex::console::stdio::StdioServer;
-//! use cortex::console::{Message, Response, Server};
+//! use cortex::protocol::stdio::StdioServer;
+//! use cortex::protocol::{Message, Response, Server};
 //!
-//! # fn answer(call: cortex::console::Call) -> Response { unimplemented!() }
+//! # fn answer(call: cortex::protocol::Call) -> Response { unimplemented!() }
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! // Takes stdin and stdout for the protocol; everything else goes to stderr.

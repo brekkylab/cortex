@@ -236,8 +236,7 @@ impl Drop for PyImageClient {
 
 #[pymethods]
 impl PyImageClient {
-    /// Start `cortex-krun` from the stdio server directory; the awaitable resolves to the
-    /// client.
+    /// Start `cortex-krun` from cortex's cache `bin`; the awaitable resolves to the client.
     #[staticmethod]
     fn try_new(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {

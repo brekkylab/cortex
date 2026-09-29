@@ -54,20 +54,19 @@
 //!
 //! * [`fs`] — expose any path-addressed store as a real filesystem. A store implements
 //!   [`FileSystem`](fs::FileSystem) and a binding puts it behind a concrete interface (host
-//!   FUSE, NFS, FSKit, anything addressing files by path). See `fs/ARCHITECTURE.md`.
+//!   FUSE, NFS, FSKit, anything addressing files by path).
 //! * [`console`] — run the commands on this host or in a micro-VM, over one JSON-RPC channel
-//!   where only the client asks. See `console/ARCHITECTURE.md`.
+//!   where only the client asks.
 //!
 //! [`console`] never builds a tree, calls [`FileSystem`](fs::FileSystem) or touches a binding;
-//! it only takes [`Mount`](fs::Mount)s, trees already mounted, which a session names as its
-//! context and its artifacts (what it was given and what it leaves behind), and under which a
-//! `read` and a command spell the same file. [`fs`] does not know a console exists. Both answer
-//! in [`std::io::Error`], classified by kind, so there is no shared error type.
+//! it only takes [`Mount`](fs::Mount)s, trees already mounted, which a session places at paths
+//! its commands see, and under which a `read` and a command spell the same file. [`fs`] does
+//! not know a console exists. Both answer in [`std::io::Error`], classified by kind, so there
+//! is no shared error type.
 //!
-//! **A console server is built on both**; see `cortex-console-servers/`: `local` runs commands
-//! on this host, `uvm/console` in a micro-VM with `uvm/guest` as its far half. Each mounts
-//! through `fs` itself, since a tree is mounted by whoever wants it rather than described on
-//! the wire.
+//! **A console server is built on both**, in its own repository (cortex-krun runs commands in
+//! a micro-VM). A tree reaches it already mounted, named by URL rather than described on the
+//! wire, since a tree is mounted by whoever wants it.
 //!
 //! ## The file layout
 //!
@@ -89,11 +88,11 @@ pub mod protocol;
 
 /// What every waiting method of a [`Client`] or [`Server`] returns.
 ///
-/// Re-exported so implementors can name it without depending on `futures_core`. See
-/// [`console::base`](console) for why futures are boxed rather than `async fn`.
+/// Re-exported so implementors can name it without depending on `futures_core`. Boxed rather
+/// than `async fn` because a trait's `async fn` returns a type a `dyn Client` cannot name.
 ///
-/// [`Client`]: console::Client
-/// [`Server`]: console::Server
+/// [`Client`]: protocol::Client
+/// [`Server`]: protocol::Server
 pub use futures_core::future::BoxFuture;
 
 #[cfg(feature = "ensure")]

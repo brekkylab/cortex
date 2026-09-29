@@ -202,7 +202,7 @@ impl std::fmt::Debug for OnedriveConfig {
     }
 }
 
-/// The HTTP half of the store: tokens, retries, and the three calls a read-only tree
+/// The HTTP half of the store: tokens, retries, and the four calls a read-only tree
 /// makes. Knows nothing of paths as the mount means them, of `Stat`, or of `FileSystem` —
 /// it speaks `serde_json::Value` and `Vec<u8>`.
 pub struct OnedriveAccessor {
@@ -655,7 +655,7 @@ fn backoff_delay(n: u32) -> Duration {
         .unwrap_or(0);
     // The cap applies to the base, then jitter rides on top. Capping the sum instead
     // discards the jitter exactly when two callers are most likely to collide: at
-    // `MAX_RETRIES`, `base` already equals `MAX_BACKOFF`, so `(base + jitter).min(cap)` is
+    // `MAX_RETRIES`, `base` is already capped to `MAX_BACKOFF`, so `(base + jitter).min(cap)` is
     // `cap` for every caller and they wake together — which is what this exists to prevent.
     Duration::from_secs(base)
         .min(MAX_BACKOFF)

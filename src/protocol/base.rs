@@ -1,19 +1,20 @@
 //! What the two ends of a console can *do* on a channel, independent of transport.
 //!
-//! A [`Client`] issues calls and takes answers back; a [`Server`] takes what arrives and
-//! puts an answer out. Neither decides what a message *means* (where a command runs,
-//! what a session allows, when something has booted). The per-method wrappers follow
+//! A [`Client`](crate::protocol::Client) issues calls and takes answers back; a
+//! [`Server`](crate::protocol::Server) takes what arrives and puts an answer out. Neither
+//! decides what a message *means* (where a command runs, what a session allows, when
+//! something has booted). The per-method wrappers follow
 //! from `call` and `notify`, so they are written once here rather than per transport.
 //!
-//! [`stdio`](crate::console::stdio) is the current transport; another (e.g. a micro-VM's
+//! [`stdio`](crate::protocol::stdio) is the current transport; another (e.g. a micro-VM's
 //! virtio port) would change nothing here.
 //!
 //! # Every method hands back a boxed future
 //!
 //! An `async fn` in a trait returns a type a `dyn` cannot name, and a
 //! [`ConsoleClient`](crate::console::ConsoleClient) holds a `dyn Client` so the transport
-//! stays out of its type. A [`BoxFuture`] costs one allocation per call, negligible
-//! against a pipe round trip; derived methods use the same shape.
+//! stays out of its type. A [`BoxFuture`](crate::BoxFuture) costs one allocation per call,
+//! negligible against a pipe round trip; derived methods use the same shape.
 //!
 //! Futures and both ends are [`Send`] so a session can be handed to a task.
 //!

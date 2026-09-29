@@ -147,7 +147,7 @@ pub struct OnedriveFs {
     /// A single tool rarely interleaves on a network store: read-ahead overlaps files only
     /// when it can outrun the reader, and a miss of about a second never lets it (`grep -r`
     /// over six 24 MiB files: 6 path switches in 33 s on the real service, against 679 in
-    /// 0.5 s through a local [`PassthroughFs`](super::PassthroughFs) mount). So a trace
+    /// 0.5 s through a local [`PassthroughFs`](crate::fs::PassthroughFs) mount). So a trace
     /// replayed from a fast store does not describe this one.
     ///
     /// Bounded by *bytes* rather than count, so the ceiling is divided rather than owned by
@@ -205,8 +205,10 @@ impl OnedriveFs {
     /// The service answers to the spelling it stored and 404s every other one. Measured
     /// against it, on one folder under one name:
     ///
-    ///     /me/drive/root:/문서:/children    composed    200
-    ///                                       decomposed  404
+    /// ```text
+    /// /me/drive/root:/문서:/children    composed    200
+    ///                                   decomposed  404
+    /// ```
     ///
     /// and macOS hands a lookup the decomposed spelling of whatever the listing printed.
     /// So after the path as given, two things are tried, cheapest first.

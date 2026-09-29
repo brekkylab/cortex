@@ -5,9 +5,9 @@
 //! inodes and handles, [`FileSystem`](super::FileSystem) for ones that speak paths) and exports
 //! a guard that mounts on construction.
 //!
-//! The `mount` feature decides whether a build has a binding, the target OS which one. Only
-//! the guards are gated, so a consumer can take a host-mounted tree without compiling an
-//! interface it never mounts through.
+//! The `mount` feature decides whether a build has a binding, the target OS which one. The
+//! guards are gated, [`Mount`] is not, so a consumer can take a host-mounted tree without
+//! compiling an interface it never mounts through.
 //!
 //! # Mounts nobody owns any more
 //!

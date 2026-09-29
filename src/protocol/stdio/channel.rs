@@ -33,20 +33,20 @@
 //!
 //! # The two directions are not paired
 //!
-//! [`write`] and [`read`] each take one descriptor. A pipe pair is two independent
+//! [`write`](fn@write) and [`read`] each take one descriptor. A pipe pair is two independent
 //! streams sharing only the framing, and a struct holding both would need a type
 //! parameter per direction and would block borrowing both halves at once (write a
 //! request, then read its answer). Each end keeps whichever halves it has as fields.
 //!
 //! A command's own stdio never appears here; it is captured where the command runs and
-//! returned inside an [`ExecResp`](super::ExecResp), so one descriptor pair suffices.
+//! returned inside an [`ExecResp`](crate::protocol::ExecResp), so one descriptor pair suffices.
 //!
 //! # Neither is cancel-safe
 //!
 //! Dropping either future mid-await leaves the descriptor mid-frame (a header without its
 //! payload, or a payload half consumed), undetectably and unrecoverably. So neither goes
 //! in a [`select!`](tokio::select) branch; wait on other things around a frame, as
-//! [`StdioClient::call`](super::StdioClient::call) does by owning its descriptors for the
+//! [`StdioClient::call`](super::StdioClient#method.call) does by owning its descriptors for the
 //! whole round trip.
 //!
 //! # Why buffering is fine

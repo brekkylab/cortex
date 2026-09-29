@@ -110,8 +110,7 @@ pub trait Client: Send {
     /// Boots and mounts nothing. Returning means a server is there, speaks this protocol,
     /// and accepted the description.
     ///
-    /// The [`InitResp`] carries the path later `read`s and `write`s are spelled in; the
-    /// server decides it, so it may differ from the one asked for.
+    /// The [`InitResp`] carries the session's starting directory, which the server decides.
     fn init(&mut self, init: InitCall) -> BoxFuture<'_, Result<InitResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Init(init)).await? {

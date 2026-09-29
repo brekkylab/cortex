@@ -1,8 +1,8 @@
 //! Binds a [`Posix`] to `fuser`'s host-side [`Filesystem`]; [`FuseMount`] is all it exports.
 //!
 //! The binding for every unix but macOS. `fuser` speaks the kernel FUSE protocol over the
-//! mount fd itself and opens `/dev/fuse`, so nothing has to be installed on Linux. Attributes
-//! are [`FileAttr`], and errnos are this host's.
+//! mount fd itself and opens `/dev/fuse`, so on Linux only a non-root user needs anything
+//! installed (`fusermount3`). Attributes are [`FileAttr`], and errnos are this host's.
 //!
 //! Symlinks, hard links and extended attributes stay on `fuser`'s `ENOSYS` defaults; the store
 //! contract has no notion of them.
@@ -65,7 +65,7 @@ pub struct FuseMount {
 impl FuseMount {
     /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
-    /// `mountpoint` must already exist. On Linux this needs nothing installed.
+    /// `mountpoint` must already exist. On Linux only a non-root user needs anything installed.
     ///
     /// The mount syscall completes before this returns, so the path is already a mount point.
     ///
@@ -393,8 +393,7 @@ impl<T: FileSystem + 'static> Filesystem for Posix<T> {
         reply: ReplyEmpty,
     ) {
         // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are outside the shared contract (libfuse-t's
-        // `rename` takes no flags). EINVAL is Linux's answer for an unimplemented rename flag,
-        // and unlike ENOSYS it does not stop the kernel sending renames for the whole mount.
+        // `rename` takes no flags). EINVAL is Linux's answer for an unimplemented rename flag.
         if !flags.is_empty() {
             reply.error(Errno::from_i32(libc::EINVAL));
             return;

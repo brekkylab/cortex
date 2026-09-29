@@ -1,8 +1,8 @@
 //! Whether this host can mount at all, and what to install when it cannot.
 //!
-//! **A build with `mount` runs on a host without the provider.** On macOS the shim imports
-//! libfuse-t weakly; on Windows `dokan2.dll` loads on a mount's first call into it. A missing
-//! provider costs a mount, not the process, and this finds it before a binding calls in.
+//! **A build with `mount` runs on a host without the provider.** On macOS the shim `dlopen`s
+//! libfuse-t on first use; on Windows `dokan2.dll` loads on a mount's first call into it. A
+//! missing provider costs a mount, not the process, and this finds it before a binding calls in.
 //!
 //! On Windows that needs the binary linked with `/DELAYLOAD:dokan2.dll`, which `rustc-link-arg`
 //! cannot request for a dependent (see the `mount` feature in `Cargo.toml`). Without it the
@@ -38,7 +38,7 @@ fn check() -> io::Result<()> {
     unsafe extern "C" {
         fn cortex_fuse_t_available() -> std::ffi::c_int;
     }
-    // SAFETY: reads whether the shim's weak imports resolved; calls nothing through them.
+    // SAFETY: loads libfuse-t and resolves the shim's pointers; calls nothing through them.
     if unsafe { cortex_fuse_t_available() } == 0 {
         return Err(missing(
             "mounting on macOS needs FUSE-T, which is not installed: \

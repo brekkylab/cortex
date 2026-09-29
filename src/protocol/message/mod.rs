@@ -27,8 +27,8 @@
 //!   pairs a response with its request, and their serde impls.
 //! - `call` — [`Call`] and [`Response`], with one file per method holding its params and
 //!   result types ([`InitCall`]/[`InitResp`], [`ExecCall`]/[`ExecResp`], ...). A method's
-//!   answer is written in its call's vocabulary (an [`ImageSource`] asked for is an
-//!   [`ImageSource`] confirmed), so the two halves stay in step.
+//!   answer is written in its call's vocabulary (the `ref` a `build_image` asks for is the
+//!   `ref` it answers with), so the two halves stay in step.
 //! - `notification` — [`Notification`], the three unanswered methods, and a member-less
 //!   type apiece for what each carries.
 //! - `method` — [`Method`], a method's wire name.
@@ -47,10 +47,11 @@
 //! | `build_image` | [`BuildImageCall`] | [`BuildImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
 //! | `remove_image` | [`RemoveImageCall`] | [`RemoveImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
 //! | `list_images` | [`ListImagesCall`] | [`ListImagesResp`] | — |
-//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_MOUNT`](Error::UNSUPPORTED_MOUNT), [`UNSUPPORTED_NETWORK`](Error::UNSUPPORTED_NETWORK), [`UNSUPPORTED_MACHINE`](Error::UNSUPPORTED_MACHINE) |
-//! | `exec` | [`ExecCall`] | [`ExecResp`] | [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_MOUNT`](Error::UNSUPPORTED_MOUNT), [`UNSUPPORTED_NETWORK`](Error::UNSUPPORTED_NETWORK), [`UNSUPPORTED_IMAGE`](Error::UNSUPPORTED_IMAGE), [`UNKNOWN_IMAGE`](Error::UNKNOWN_IMAGE), [`UNSUPPORTED_MACHINE`](Error::UNSUPPORTED_MACHINE) |
+//! | `exec` | [`ExecCall`] | [`ExecResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `write` | [`WriteCall`] | [`WriteResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `snapshot` | [`SnapshotCall`] | [`SnapshotResp`] | [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
 //! | `start` | — | *(notification — no response)* | — |
 //! | `stop` | — | *(notification — no response)* | — |
 //! | `quit` | — | *(notification — no response)* | — |
@@ -60,10 +61,10 @@
 //!
 //! # Why booting is not a method
 //!
-//! **Anything that needs a booted session boots one** (`exec`, `read`, `write`), so a
-//! client that never sends `start` or `stop` still works, and `stop` followed by `exec`
-//! still runs the `exec`. The pair is **resource management only**: it changes what the
-//! far end holds and when it pays for it, never what a session can do.
+//! **Anything that needs a booted session boots one** (`exec`, `read`, `write`,
+//! `snapshot`), so a client that never sends `start` or `stop` still works, and `stop`
+//! followed by `exec` still runs the `exec`. The pair is **resource management only**: it
+//! changes what the far end holds and when it pays for it, never what a session can do.
 //!
 //! - **`stop` gives occupancy back.** A guest, a mounted tree and a scratch directory are
 //!   memory, descriptors and disk, worth holding only while something runs. An idle
@@ -114,7 +115,7 @@
 //!
 //! Nothing arrives between an `exec` and its answer, and the server never issues a
 //! request, so neither end needs a pending table or a read loop that must not block, and
-//! [`Client`](crate::console::Client) can take `&mut self` (one call outstanding, checked
+//! [`Client`](crate::protocol::Client) can take `&mut self` (one call outstanding, checked
 //! by the borrow).
 //!
 //! The `result` is the [`ExecResp`] itself, unwrapped, so later additions are new

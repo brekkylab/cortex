@@ -9,7 +9,7 @@ publish = false
 # `#[pymodule]` name, or the import finds a library with no init function.
 #
 # `rlib` for a binding that builds cortex into its own extension (e.g. ailoy). Two extension
-# modules cannot pass each other a `Console`, since each links its own cortex and runtime, so
+# modules cannot pass each other a `ConsoleClient`, since each links its own cortex and runtime, so
 # such a binding links this crate and registers its classes through `register` (src/lib.rs).
 name = "_cortex"
 crate-type = ["cdylib", "rlib"]

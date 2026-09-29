@@ -245,7 +245,8 @@ fn gone(pid: libc::pid_t) -> bool {
 /// Only a **dead** owner's mounts are touched, so a live sibling instance keeps its mounts;
 /// sweeping by path could not promise that, so no such call exists.
 ///
-/// Returns what is still mounted afterwards, i.e. what a person must clear by hand.
+/// Returns the mounts it tried and failed to take down, which a person must clear by hand;
+/// ones past the budget are left for the next call and not listed.
 ///
 /// At most four unmounts per call, each with its own deadline. Never panics or fails; with
 /// nothing to reclaim it costs one directory read.

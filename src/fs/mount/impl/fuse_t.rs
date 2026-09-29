@@ -504,7 +504,7 @@ pub struct FuseTMount {
 
     /// This process's ownership of the mount point, read by
     /// [`unmount_on_signal`](crate::fs::unmount_on_signal) and, if this process is killed, a
-    /// later run's [`reclaim_abandoned`](crate::fs::reclaim_abandoned). Dropping it gives the
+    /// later run's [`reclaim_abandoned`]. Dropping it gives the
     /// mount point up.
     _claim: Claim,
 }
@@ -543,7 +543,7 @@ impl FuseTMount {
         mountpoint: &Path,
         backend: *const c_char,
     ) -> io::Result<Self> {
-        // Before anything reaches the shim: without FUSE-T its weak imports are null.
+        // Before anything reaches the shim: without FUSE-T its `dlsym` pointers are null.
         crate::fs::mount_support()?;
 
         // Clears mounts a `SIGKILL`ed run left; live siblings' mounts are untouched.
@@ -688,8 +688,8 @@ impl Drop for FuseTMount {
     /// `fuse_kern_unmount` ends in a blocking `waitpid` on it: an unmount waits on the last
     /// mounted helper, which will not exit until its own mount goes, so `drop(a); drop(b)`
     /// hangs in `wait4`. `_mount_wait_thread` is a single global too. So unmounting is a
-    /// bounded `umount` in a child process, which needs no libfuse-t global; the shim only
-    /// ends the loop, joins its thread and frees the session, all per-session.
+    /// bounded `umount` in a child process, which needs no libfuse-t global; the rest is
+    /// per-session: the shim ends the loop, this joins its thread, the shim frees the session.
     ///
     /// Every step is bounded, so a mount that refuses both attempts leaves this returning
     /// anyway after reporting on stderr, rather than a destructor that never returns.

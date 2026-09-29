@@ -4,7 +4,7 @@ use std::sync::{Mutex, MutexGuard};
 
 /// Lock `mutex`, ignoring poisoning.
 ///
-/// Locks nest (node → child, node → file data), so unwrapping a poisoned child panics while
+/// Locks nest (directory node → child), so unwrapping a poisoned child panics while
 /// the parent is held, poisoning it too, until every operation on the volume panics. Each lock
 /// guards a single insert/remove/resize, so poison means another thread panicked, not that the
 /// data is half-written.

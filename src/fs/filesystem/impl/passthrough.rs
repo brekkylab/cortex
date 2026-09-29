@@ -35,7 +35,7 @@
 //! that crossed a virtio-fs ring or FUSE channel. The real cost is the POSIX guarantee a descriptor carries:
 //! a read after the name is gone answers `ENOENT` where an open file would keep working.
 //! Restoring that belongs to the layer holding descriptors
-//! ([`Posix::unlink_child`](crate::fs::Posix)).
+//! (`Posix::unlink_child`).
 
 use std::{
     ffi::OsString,

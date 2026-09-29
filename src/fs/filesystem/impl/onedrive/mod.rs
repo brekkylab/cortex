@@ -46,8 +46,8 @@
 //! Bytes come from a preauthenticated URL the listing already carried. A walk pays one
 //! round trip per span rather than one per kernel window, which is 64 KiB or 32 through
 //! FUSE-T. Both span sizes are ceilings divided among the files being read at once: a lone
-//! walk takes a whole [`READ_SPAN`], two concurrent walks 32 MiB each, and a read that stops
-//! after the head takes at most [`FIRST_SPAN`].
+//! walk takes a whole `READ_SPAN`, two concurrent walks 32 MiB each, and a read that stops
+//! after the head takes at most `FIRST_SPAN`.
 //!
 //! ## What is duplicated
 //!

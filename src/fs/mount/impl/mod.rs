@@ -5,7 +5,7 @@
 //! is always Linux; the host's is the host's) and the attribute type it fills.
 //!
 //! **How the interface addresses a file decides the layer.** FUSE speaks inode numbers and
-//! file handles, so its bindings go through [`Posix`](crate::fs::Posix). [`dokan`] gets a whole
+//! file handles, so its bindings go through [`Posix`](crate::fs::Posix). `dokan` gets a whole
 //! path per callback (the NT I/O manager resolves names), so it uses
 //! [`FileSystem`](crate::fs::FileSystem) directly.
 //!

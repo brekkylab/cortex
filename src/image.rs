@@ -20,14 +20,14 @@ use crate::{
 ///
 /// ```no_run
 /// use cortex::{
-///     console::stdio::StdioClient,
 ///     image::{ImageClient, Recipe},
+///     protocol::stdio::StdioClient,
 /// };
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
-/// let server = tokio::process::Command::new("cortex-uvm-console");
-/// let mut images = ImageClient::new(StdioClient::new(server)?).await?;
+/// let server = tokio::process::Command::new("cortex-krun");
+/// let mut images = ImageClient::try_from_client(StdioClient::new(server)?).await?;
 ///
 /// let built = images
 ///     .build(Recipe::new("alpine:3.20").step("apk add jq"), Some("myimg:latest"))

@@ -23,7 +23,7 @@
 //!
 //! **A missing provider fails, never silently skips.** On macOS FUSE-T is
 //! probed with pkg-config and fails at build time; Dokany's driver is a runtime
-//! fact, so there `try_new` answers `can't install driver`.
+//! fact, so there `try_new` fails with `mount_support`'s install instructions.
 //!
 //! # Shared bodies
 //!

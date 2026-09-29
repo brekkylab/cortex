@@ -251,8 +251,7 @@ pub struct GdriveConfig {
     pub refresh_token: String,
     /// Where to reach each Google service, when not production Google (an enterprise
     /// mock or a gateway). Deployment-level only — the token endpoint receives the
-    /// app's client secret, so this is NOT part of the mount-create API; the backend
-    /// injects it from its own config.
+    /// app's client secret, so a caller must never fill this from user input.
     #[serde(default, skip_serializing_if = "GdriveOrigins::is_default")]
     pub origins: GdriveOrigins,
 }

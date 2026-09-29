@@ -80,7 +80,7 @@ pub enum Call {
     ///
     /// Answered, unlike a notification, because the answer tells the client a server read
     /// the frame, speaks this protocol and accepted the description, plus where the session
-    /// starts (see [`InitResp`](super::InitResp)), which the client could not work out alone.
+    /// starts (see [`InitResp`]), which the client could not work out alone.
     ///
     /// Boots and mounts nothing: boot cost varies by backend, so *when* to pay it is
     /// [`Start`](super::Notification::Start)'s. Trees are mounted at boot.

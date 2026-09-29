@@ -22,8 +22,9 @@
 //! A descriptor outliving its name is handled by [`unlink_child`](Posix::unlink_child).
 
 // What a build reads depends on which bindings are enabled, in non-aligned subsets (none
-// without a kernel binding; `unix_time` only for C-`stat` bindings; `TTL` only for Rust
-// ones). Per-item gating would track binding internals, so the module opts out wholesale.
+// without a kernel binding; `unix_time` only for C-`stat` bindings; `TTL` only for those
+// passing a timeout from Rust). Per-item gating would track binding internals, so the module
+// opts out wholesale.
 #![allow(dead_code)]
 
 use std::{
@@ -48,7 +49,7 @@ use crate::{
 ///   backend (`O_CREAT|O_EXCL`) or object store (`If-None-Match: *`) the atomic form is the
 ///   only one.
 /// * `truncate` must take effect before anything observes the file, so returned metadata
-///   already shows it empty. [`FileSystem::truncate`](crate::fs::FileSystem::truncate) is the
+///   already shows it empty. [`FileSystem::truncate`] is the
 ///   separate, non-atomic resize.
 ///
 /// [`validate`](Self::validate) rejects neither `read` nor `write`; `O_RDONLY | O_CREAT` is
@@ -142,8 +143,7 @@ impl OpenOptions {
 
     /// Reject the one self-contradictory combination.
     ///
-    /// Called by the flags decoder ([`decode_open_flags`](crate::fs::Posix)); stores never see
-    /// these.
+    /// Called by the flags decoder (`decode_open_flags`); stores never see these.
     pub fn validate(&self) -> io::Result<()> {
         if !self.read && !self.write {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -156,7 +156,7 @@ impl OpenOptions {
 /// names only the fields to change.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SetAttr {
-    /// The only field acted on, via [`FileSystem::truncate`](crate::fs::FileSystem::truncate).
+    /// The only field acted on, via [`FileSystem::truncate`].
     pub size: Option<u64>,
     pub mtime: Option<std::time::SystemTime>,
     pub atime: Option<std::time::SystemTime>,
@@ -170,8 +170,7 @@ const ROOT_INODE: u64 = 1;
 
 /// Answer for an unknown file handle, or one used beyond what its open allowed.
 ///
-/// Raw because `io::ErrorKind` has no name for it; the same on every POSIX system, and `libc`
-/// is only optional.
+/// Raw because `io::ErrorKind` has no name for it; the same on every POSIX system.
 const EBADF: i32 = 9;
 
 /// `EBADF`, as the [`io::Error`] this layer answers with.
@@ -236,7 +235,7 @@ pub(in crate::fs) const TOTAL_BLOCKS: u64 = (1 << 40) / BLOCK_SIZE;
 /// Synthetic inode budget; zero free inodes would fail every `create` up front.
 pub(in crate::fs) const TOTAL_INODES: u64 = 1 << 32;
 
-// The same on every POSIX system, and `libc` is only optional.
+// The same on every POSIX system.
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
@@ -257,7 +256,8 @@ pub(in crate::fs) struct Attr {
     pub mtime: SystemTime,
     pub atime: SystemTime,
     pub ctime: SystemTime,
-    /// Birth time; only `fuser` has a field for it (the guest's Linux `stat64` has none).
+    /// Birth time; only `fuser` and Dokan have a field for it (the guest's Linux `stat64` has
+    /// none).
     #[cfg_attr(
         not(all(feature = "mount", unix, not(target_os = "macos"))),
         allow(dead_code)
@@ -565,8 +565,7 @@ impl<T: FileSystem> Posix<T> {
         let dir = self.path_of(parent)?;
         let path = dir.join(name);
 
-        // Two statements: `open_of` locks `opens` then `inodes`, so holding `inodes` while
-        // taking `opens` could deadlock.
+        // Two statements, so `inodes` is released before `opens` is taken: nothing holds both.
         let numbered = lock(&self.inodes).number_of(&path);
         let held_by = numbered.filter(|&inode| lock(&self.opens).any_on(inode));
 

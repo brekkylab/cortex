@@ -17,8 +17,8 @@ mod r#impl;
 pub(super) mod posix;
 
 pub use filesystem::*;
-// Network stores are each behind a feature (and the crate has no default features): `s3`
-// alone costs 131 crates, an HTTP and TLS stack a local-files build should not compile.
+// Network stores are each behind a non-default feature: `s3` alone adds over 100 crates, an
+// HTTP and TLS stack a local-files build should not compile.
 #[cfg(feature = "gdrive")]
 pub use r#impl::{GdriveConfig, GdriveFs, GdriveOrigins};
 pub use r#impl::{InMemFs, PassthroughFs};

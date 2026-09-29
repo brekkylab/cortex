@@ -119,7 +119,7 @@ impl Dirent {
     /// The metadata the listing came with, if it came with any.
     ///
     /// `None` means "not free from the listing", not "unknown"; ask
-    /// [`FileSystem::stat`](crate::fs::FileSystem::stat) if it is needed.
+    /// [`FileSystem::stat`] if it is needed.
     pub fn stat(&self) -> Option<&Stat> {
         self.stat.as_ref()
     }

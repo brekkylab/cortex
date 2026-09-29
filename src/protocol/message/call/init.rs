@@ -393,7 +393,7 @@ impl NetworkAccess {
     /// The TCP ports on the server's own machine this session may open.
     ///
     /// ```
-    /// # use cortex::console::NetworkAccess;
+    /// # use cortex::protocol::NetworkAccess;
     /// // Resolve names, talk to whatever is on 8080 here, and reach nothing else.
     /// NetworkAccess::host().with_host_ports([8080]);
     /// ```
@@ -433,7 +433,7 @@ impl NetworkAccess {
 
 /// What the server made of the session. The `result` of `init`.
 ///
-/// Mount locations are not echoed: each [`MountSpec`](super::MountSpec) already says where
+/// Mount locations are not echoed: each [`MountSpec`] already says where
 /// its tree appears.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitResp {

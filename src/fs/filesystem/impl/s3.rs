@@ -169,8 +169,9 @@ fn os_path(key: &str) -> io::Result<OsPath> {
 
 /// Translate an object-store error into the kind this crate answers with.
 ///
-/// Every current variant is named, but the wildcard is required: `object_store::Error` is
-/// `#[non_exhaustive]`, so a variant added upstream reaches userspace as `EIO`.
+/// Every variant with its own answer is named, but the wildcard is required:
+/// `object_store::Error` is `#[non_exhaustive]`, so a variant added upstream reaches userspace
+/// as `EIO`.
 ///
 /// Unclassified errors become `Other`, never a raw OS error: `host_errno` forwards
 /// `raw_os_error()`, so a transport errno would reach userspace as itself rather than `EIO`.

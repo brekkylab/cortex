@@ -60,13 +60,11 @@ fn native_kind(mime: &str) -> Option<(NativeApi, &'static str)> {
         .map(|(_, api, suffix)| (*api, *suffix))
 }
 
-/// Per-directory listing TTL, equal to the metadata cache's own listing TTL.
+/// Per-directory listing TTL, and the life of a span held beside it.
 ///
-/// The wrapper above owns freshness (expiry, invalidation, negative caching); this cache
-/// exists because resolving a path to a Drive id walks parent listings. A different
-/// number would cost an extra `files.list` per file whenever a parent listing had expired
-/// here but not there, and between the two TTLs `ls` and reads would answer from
-/// different snapshots.
+/// Nothing above this store caches for it, so this bounds how stale the tree can be.
+/// One number for listings and spans, so `ls` and a read of the same file answer from
+/// the same snapshot.
 const DIR_TTL: Duration = Duration::from_secs(300);
 /// Ceiling on the cell values one spreadsheet's JSON will carry, spent tab by tab
 /// in the workbook's own order until it runs out.
@@ -110,7 +108,7 @@ const UNKNOWN_LENGTH_SIZE: u64 = MAX_DOCUMENT_BYTES;
 /// How long a line the padding past a document's JSON is broken into.
 ///
 /// The padding is whitespace JSON ignores, so this only shapes the tail for line-oriented
-/// tools (measurements in [`FileSystem::read_at`]).
+/// tools (measured in the padding step of this store's `read_at`).
 const PAD_LINE: u64 = 4096;
 
 /// How much a blob read fetches once it is clear the reader is walking the file, so a
@@ -360,7 +358,7 @@ pub struct GdriveFs {
     /// A single tool rarely interleaves on this store: read-ahead overlaps files only when
     /// it can outrun the reader, and a miss of about a second never lets it (`grep -r` over
     /// six 24 MiB files: 6 path switches in 33 s, against 679 in 0.5 s through a local
-    /// [`PassthroughFs`](super::PassthroughFs) mount). So traces replayed from a fast store
+    /// [`PassthroughFs`](crate::fs::PassthroughFs) mount). So traces replayed from a fast store
     /// do not describe this one.
     ///
     /// Bounded by *bytes* rather than count, so the ceiling is divided rather than owned by
@@ -1093,7 +1091,7 @@ fn dirent_for(c: &Child) -> Dirent {
 
 /// Map an accessor error into the one the trait speaks: an upstream HTTP 404 (a file
 /// id that no longer exists) becomes [`NotFound`](io::ErrorKind::NotFound), and
-/// everything else stays whatever it was, described.
+/// everything else becomes `Other` carrying the full error chain as its message.
 ///
 /// The distinction is what a caller acts on. `NotFound` on a path is a name that is
 /// gone, which a traversal skips; anything else is the backend failing, which it must

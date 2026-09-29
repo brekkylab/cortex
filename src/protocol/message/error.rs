@@ -35,7 +35,7 @@ impl Error {
     /// `exec`: the program was not there, or could not be started.
     pub const NOT_EXECUTABLE: i64 = -32001;
 
-    /// `exec`, `read`, `write`: the backend could not be brought up.
+    /// `exec`, `read`, `write`, `snapshot`: the backend could not be brought up.
     ///
     /// Booting happens on demand ([`Start`](super::Notification::Start) only asks early),
     /// so this goes to the call that needed the boot, and says the failure was the
@@ -64,8 +64,8 @@ impl Error {
     /// same: a different URL, or a build that has the provider.
     pub const UNSUPPORTED_MOUNT: i64 = -32008;
 
-    /// `exec`, `read`, `write`: a tree could not be put where `init` said it would be
-    /// (no mount binding compiled in, no FUSE provider, mount point busy, store
+    /// `exec`, `read`, `write`, `snapshot`: a tree could not be put where `init` said it
+    /// would be (no mount binding compiled in, no FUSE provider, mount point busy, store
     /// unreachable).
     ///
     /// Mounting happens at boot, so this reaches the call that needed one. The session is

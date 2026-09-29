@@ -6,7 +6,7 @@ publish = false
 
 [lib]
 # `rlib` for a binding that builds cortex into its own addon (e.g. ailoy). Two addons cannot
-# pass each other a `Console`, since each links its own cortex and runtime, so such a binding
+# pass each other a `ConsoleClient`, since each links its own cortex and runtime, so such a binding
 # links this crate and napi registers these classes into its addon.
 crate-type = ["cdylib", "rlib"]
 
