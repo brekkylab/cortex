@@ -45,7 +45,7 @@ on:
       - build.rs
       - Cargo.toml
       - Cargo.lock
-      - LICENSE-*
+      - LICENSE
   pull_request:
     paths:
       - .github/workflows/packages.yml
@@ -56,7 +56,7 @@ on:
       - build.rs
       - Cargo.toml
       - Cargo.lock
-      - LICENSE-*
+      - LICENSE
   workflow_dispatch:
 
 concurrency:

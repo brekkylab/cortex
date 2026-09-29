@@ -3,7 +3,7 @@ name = "cortex"
 version = "0.1.0"
 edition = "2024"
 description = "Run tasks in disposable Linux VMs from your own code: the environment an agent works in."
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 repository = "https://github.com/brekkylab/cortex"
 readme = "README.md"
 keywords = ["vm", "sandbox", "agent", "fuse", "microvm"]
@@ -18,8 +18,7 @@ include = [
     "/contrib/**",
     "/examples/**",
     "/README.md",
-    "/LICENSE-MIT",
-    "/LICENSE-APACHE",
+    "/LICENSE",
     "/cortex-krun.version",
 ]
 

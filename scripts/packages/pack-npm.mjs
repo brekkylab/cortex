@@ -30,8 +30,8 @@ for (const dir of fs.readdirSync('npm').sort()) {
 }
 const staged = fs.mkdtempSync(path.join(out, 'root-'))
 for (const file of [...root.files, 'README.md']) fs.copyFileSync(file, path.join(staged, file))
-// The licenses are the repository's, two levels up; npm packs a LICENSE* file whatever `files` says.
-for (const file of ['LICENSE-MIT', 'LICENSE-APACHE']) fs.copyFileSync(path.join('..', '..', file), path.join(staged, file))
+// The license is the repository's, two levels up; npm packs a LICENSE file whatever `files` says.
+fs.copyFileSync(path.join('..', '..', 'LICENSE'), path.join(staged, 'LICENSE'))
 fs.writeFileSync(path.join(staged, 'package.json'), JSON.stringify({ ...root, optionalDependencies: optional }, null, 2) + '\n')
 execFileSync('npm', ['pack', '--pack-destination', out], { cwd: staged, stdio: 'inherit', shell: process.platform === 'win32' })
 fs.rmSync(staged, { recursive: true })
