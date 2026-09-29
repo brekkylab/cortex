@@ -36,6 +36,7 @@ use std::{
 
 use super::super::{
     claim::{Claim, claim, reclaim_abandoned},
+    sigchld::Sigchld,
     table::{mounts_under, resolved, unmount_under},
 };
 use crate::fs::{
@@ -599,14 +600,20 @@ impl FuseTMount {
         let fs_ptr = &*fs as *const Posix<T> as *mut c_void;
         let ops = ops_for::<T>();
 
-        let session = unsafe {
-            cortex_fuse_t_mount(
-                c_mountpoint.as_ptr(),
-                FSNAME.as_ptr(),
-                backend,
-                fs_ptr,
-                &ops,
-            )
+        // Scoped to the call and no wider: libfuse-t resets the process's SIGCHLD
+        // handling on its way to forking the mount helper, and what that costs is
+        // paid by whatever else in the program waits on a child. See `sigchld`.
+        let session = {
+            let _sigchld = Sigchld::held();
+            unsafe {
+                cortex_fuse_t_mount(
+                    c_mountpoint.as_ptr(),
+                    FSNAME.as_ptr(),
+                    backend,
+                    fs_ptr,
+                    &ops,
+                )
+            }
         };
         if session.is_null() {
             return Err(io::Error::other(format!(
