@@ -31,13 +31,13 @@
 #
 # - the ref has to be a version tag, `vX.Y.Z`, and every manifest here -- the crate, the
 #   bindings' crates, npm's packages, the wheel -- has to say that version;
-# - cortex-krun has to have released the same tag already, whole: its dist workflow writes
-#   `cortex-krun/tags/<tag>`, naming the release's sha, only once every platform has its
-#   archive, and `resolve` checks the four archives are there besides.
+# - cortex-krun has to have released the same tag already, whole: its dist workflow fills
+#   `cortex-krun/<tag>/` with all four platforms' archives at once, and only once all four
+#   are built, and `resolve` checks the four are there and are of one build.
 #
-# Every package is then built from that tag and pinned to that release
-# (`CORTEX_KRUN_PINNED_VERSION`, see `src/ensure.rs`), so one version of cortex fetches the
-# cortex-krun it was released with, and was tested against here. The crate is compiled by
+# Every package is then built from that tag and pinned to it (`CORTEX_KRUN_PINNED_VERSION`,
+# see `src/ensure.rs`), so one version of cortex fetches `cortex-krun/<tag>/`: the cortex-krun
+# it was released with, and was tested against here. The crate is compiled by
 # its user rather than here, so it carries the version as a file instead
 # (`cortex-krun.version`, see `build.rs`).
 name: packages
@@ -83,16 +83,20 @@ jobs:
           fail() { echo "::error::$*"; exit 1; }
           [[ "$REF" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]] \
             || fail "$REF is not a version tag: a release is tagged vX.Y.Z"
-          krun=$(curl -fsS "$DIST_URL/cortex-krun/tags/$REF") \
-            || fail "cortex-krun has not released $REF: tag it there first, and let its dist workflow finish"
-          krun=$(printf '%s' "$krun" | tr -d '[:space:]')
-          [[ "$krun" =~ ^[0-9a-f]{40}$ ]] || fail "cortex-krun/tags/$REF holds '$krun', not a sha"
+          # cortex-krun's dist names a release for its tag only once all four platforms'
+          # archives are up, and all four at once; each carries the sha it was built from.
+          shas=""
           for p in macos-aarch64 linux-x86_64 linux-aarch64 windows-x86_64; do
-            curl -fsSI -o /dev/null "$DIST_URL/cortex-krun/$p/$krun/cortex-krun-$p.tar.gz" \
-              || fail "cortex-krun's release of $REF ($krun) has no $p archive"
+            head=$(curl -fsSI "$DIST_URL/cortex-krun/$REF/cortex-krun-$p.tar.gz") \
+              || fail "cortex-krun has not released $REF for $p: tag it there first, and let its dist workflow finish"
+            sha=$(printf '%s' "$head" | awk 'tolower($1)=="x-amz-meta-sha:"{print $2}' | tr -d '\r')
+            echo "cortex-krun/$REF/cortex-krun-$p.tar.gz: ${sha:-no sha}"
+            [ -n "$sha" ] || fail "cortex-krun/$REF/cortex-krun-$p.tar.gz says no sha: it was not named by cortex-krun's dist"
+            shas="$shas $sha"
           done
-          echo "cortex-krun released $REF as $krun"
-          echo "krun=$krun" >> "$GITHUB_OUTPUT"
+          [ "$(printf '%s\n' $shas | sort -u | wc -l)" -eq 1 ] \
+            || fail "cortex-krun/$REF holds archives of different builds:$shas"
+          echo "krun=$REF" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
