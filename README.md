@@ -112,20 +112,23 @@ cortex
 
 The VM gets a GPU through Vulkan on every host, so it can run heavy work like deep learning.
 
-Turn it on with the builder's `gpu` option:
+Turn it on with the builder's `gpu` option, and install the guest's half of Vulkan in the image:
 
 ```python
 import asyncio
 
-from cortex import ConsoleClient, Recipe
+from cortex import ConsoleClient, Recipe, ensure_cortex
 
 
 async def main() -> None:
+    await ensure_cortex()
     console = await (
         ConsoleClient.builder()
         .image(
-            Recipe("debian:bookworm-slim").step(
-                "apt-get update && apt-get install -y mesa-vulkan-drivers vulkan-tools"
+            Recipe("alpine:latest").step(
+                # The Vulkan loader, the venus driver that reaches the host's GPU,
+                # and vulkaninfo to look at it.
+                "apk add --no-cache vulkan-loader mesa-vulkan-virtio vulkan-tools"
             )
         )
         .gpu(True)
@@ -142,7 +145,17 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-If the host can't give a GPU, `build()` fails instead of quietly running on the CPU.
+The host's GPU shows up in the guest as `Virtio-GPU Venus (<the host's GPU>)`. What the image needs for that:
+
+| | Alpine | Debian |
+|---|---|---|
+| Vulkan loader (`libvulkan.so.1`) | `vulkan-loader` | `libvulkan1` |
+| venus driver | `mesa-vulkan-virtio` | `mesa-vulkan-drivers`, trixie or later |
+
+- **Install the loader yourself.** Without it, no program in the guest finds a Vulkan device, whatever the host has. Some packages bring it along (Debian's `vulkan-tools` does) and some don't (Alpine's doesn't), so name it rather than count on it.
+- **An image with no venus driver still runs, but on the CPU.** Debian bookworm's Mesa has no venus, and Vulkan there falls back to `llvmpipe`, a software renderer. Check the `deviceName` your program picks.
+
+If the host can't give a GPU, `build()` fails instead of quietly running on the CPU. On the host, that takes a Vulkan loader too: `libvulkan1` (Debian, Ubuntu) or `vulkan-loader` (Fedora) on Linux, and on Windows `vulkan-1.dll`, which comes with the GPU's driver.
 
 ### Filesystem
 
