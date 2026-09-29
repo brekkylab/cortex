@@ -56,8 +56,8 @@ use crate::{
     fs::Mount,
     image::ImageSource,
     protocol::{
-        Call, Client, ExecCall, ExecResp, Failure, InitCall, MountSpec, NetworkAccess,
-        Notification, ReadCall, ReadResp, Response, WriteCall, WriteResp, stdio::StdioClient,
+        Call, Client, ExecCall, ExecResp, Failure, InitCall, MountSpec, Notification, Port,
+        ReadCall, ReadResp, Response, WriteCall, WriteResp, stdio::StdioClient,
     },
 };
 
@@ -102,9 +102,12 @@ pub struct ConsoleClientBuilder {
     /// server's own filesystem holds, and this protocol has described none of it.
     mounts: Vec<Mounted>,
 
-    /// `None` leaves the reach to the server, which is what a caller with no opinion wants —
+    /// `None` leaves the network to the server, which is what a caller with no opinion wants —
     /// and what every caller wanted before this existed.
-    network: Option<NetworkAccess>,
+    network: Option<bool>,
+
+    /// The ports on the server's machine that lead into the session, in the order named.
+    ports: Vec<Port>,
 
     vcpus: Option<u8>,
 
@@ -125,6 +128,7 @@ impl Default for ConsoleClientBuilder {
             snapshot: None,
             mounts: Vec::new(),
             network: None,
+            ports: Vec::new(),
             vcpus: None,
             memory_mib: None,
             gpu: None,
@@ -251,30 +255,47 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// How much of a network the session's commands get.
+    /// Whether the session's commands reach a network at all.
     ///
     /// ```no_run
-    /// # use cortex::{console::ConsoleClient, protocol::NetworkAccess};
+    /// # use cortex::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
+    /// let console = ConsoleClient::builder().network(true).build().await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// **A server gives what is named here or refuses to open the session**, which is what
+    /// makes this worth saying rather than checking afterwards. A network the far end cannot
+    /// take away arrives as [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK)
+    /// from [`build`](Self::build) — a server whose commands run on this host refuses `false`.
+    ///
+    /// On is what the server's machine reaches, less its own loopback — see
+    /// [`InitCall::network`](crate::console::InitCall::network). Leaving it out leaves the
+    /// choice to the server.
+    pub fn network(mut self, network: bool) -> Self {
+        self.network = Some(network);
+        self
+    }
+
+    /// Ports on the server's machine that lead into the session, spelled the way docker's
+    /// `-p` spells them — `"8080:80"`, host first. Replaces what an earlier call said.
+    ///
+    /// ```no_run
+    /// # use cortex::console::ConsoleClient;
+    /// # async fn f() -> anyhow::Result<()> {
+    /// // A VNC server in the session, at 127.0.0.1:5901 here.
     /// let console = ConsoleClient::builder()
-    ///     .network(NetworkAccess::public())
+    ///     .network(true)
+    ///     .ports(["5901:5900".parse()?])
     ///     .build()
     ///     .await?;
     /// # Ok(()) }
     /// ```
     ///
-    /// **A server gives what is named here or refuses to open the session**, which is what
-    /// makes this worth saying rather than checking afterwards: a console that exists is one
-    /// whose commands reach what was asked for and no more. A reach the far end cannot provide
-    /// arrives as [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) from
-    /// [`build`](Self::build) — including from a server whose commands run on this host, which
-    /// cannot take the network away from them and so answers only
-    /// [`full`](NetworkAccess::full).
-    ///
-    /// Leaving it out leaves the choice to the server, and [`ConsoleClient::network`] is then how to
-    /// find out what it chose.
-    pub fn network(mut self, network: NetworkAccess) -> Self {
-        self.network = Some(network);
+    /// Needs a network: a session with [`network`](Self::network) off that names a port is
+    /// refused. See [`Port`] for what a connection to one reaches.
+    pub fn ports(mut self, ports: impl IntoIterator<Item = Port>) -> Self {
+        self.ports = ports.into_iter().collect();
         self
     }
 
@@ -493,6 +514,7 @@ impl ConsoleClient {
             image,
             mounts,
             network,
+            ports,
             snapshot,
             vcpus,
             memory_mib,
@@ -521,7 +543,8 @@ impl ConsoleClient {
         let session = InitCall {
             mounts: specs,
             image,
-            network: network.clone(),
+            network,
+            ports,
             snapshot,
             vcpus,
             memory_mib,

@@ -33,7 +33,7 @@ use serde::{
 
 pub use build_image::{BuildImageCall, BuildImageResp};
 pub use exec::{ExecCall, ExecResp};
-pub use init::{InitCall, InitResp, InvalidMount, MountSpec, NetworkAccess};
+pub use init::{InitCall, InitResp, InvalidMount, InvalidPort, MountSpec, Port};
 pub use list_images::{ListImagesCall, ListImagesResp};
 pub use read::{ReadCall, ReadResp};
 pub use remove_image::{RemoveImageCall, RemoveImageResp};

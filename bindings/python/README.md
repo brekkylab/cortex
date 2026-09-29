@@ -4,7 +4,7 @@ Python bindings for cortex: the same `ConsoleClient`, `ImageClient`, `Recipe`,
 `Directory` and host mount as the Rust crate, with every call that waits as an awaitable.
 
 ```python
-from cortex import ConsoleClient, Directory, HostMount, NetworkAccess, Recipe
+from cortex import ConsoleClient, Directory, HostMount, Recipe
 
 mount = HostMount(Directory().with_file("SKILL.md", "..."), "/tmp/skill")
 
@@ -14,7 +14,7 @@ async with await (
     .image(Recipe("python:3.12-slim-trixie").step("pip install duckdb"))
     .mount_readonly(mount, "/skills/example")
     .mount("./artifacts", "/artifacts")
-    .network(NetworkAccess.none())
+    .network(False)
     .vcpus(2)
     .memory_mib(2048)
     .build()
