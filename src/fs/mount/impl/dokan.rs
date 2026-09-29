@@ -21,7 +21,7 @@ use std::{
         mpsc::{self, SyncSender},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ::dokan::{
@@ -45,9 +45,12 @@ use winapi::{
             STATUS_OBJECT_NAME_NOT_FOUND, STATUS_UNEXPECTED_IO_ERROR, STATUS_UNSUCCESSFUL,
         },
     },
-    um::winnt::{
-        ACCESS_MASK, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_CASE_PRESERVED_NAMES,
-        FILE_CASE_SENSITIVE_SEARCH, FILE_UNICODE_ON_DISK,
+    um::{
+        fileapi::GetVolumeInformationW,
+        winnt::{
+            ACCESS_MASK, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+            FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_UNICODE_ON_DISK,
+        },
     },
 };
 
@@ -75,8 +78,13 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long [`DokanMount::try_new`] waits for the driver to report the mount is live.
 ///
 /// A backstop for a driver that accepts the filesystem but never calls
-/// [`mounted`](FileSystemHandler::mounted); most failures fail `mount()` outright.
+/// [`mounted`](FileSystemHandler::mounted); most failures fail `mount()` outright. It also
+/// bounds the wait after that for the mount point to lead to the volume (see [`answers`]).
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`DokanMount::try_new`] asks whether the mount point leads to the volume yet.
+/// Short, because what is being waited out is measured in tens of milliseconds.
+const ANSWER_POLL: Duration = Duration::from_millis(5);
 
 /// A live Dokan mount: constructing one mounts, dropping it unmounts.
 ///
@@ -107,8 +115,10 @@ impl DokanMount {
     /// `mountpoint` is a drive letter (`Z:\`) or an existing empty directory on an NTFS
     /// volume.
     ///
-    /// Returns once the driver reports the mount live, since `mount()` returns on
-    /// registration, before the volume exists.
+    /// Returns once the path answers as the mounted volume, so it is openable by the time the
+    /// caller has the guard. That takes two waits, as on FUSE-T: `mount()` returns on
+    /// registration, before the volume exists, and the driver reports the volume live before
+    /// the mount point is sure to lead to it (see [`answers`]).
     ///
     /// `'static` because the store is served from that thread for the mount's lifetime.
     pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
@@ -149,12 +159,28 @@ impl DokanMount {
                 .spawn(move || serve(fs, wide, flags, ready))?
         };
 
+        let deadline = Instant::now() + MOUNT_TIMEOUT;
         match mounted.recv_timeout(MOUNT_TIMEOUT) {
-            Ok(Ok(())) => Ok(DokanMount {
-                mountpoint: mountpoint.to_path_buf(),
-                wide,
-                serving: Some(serving),
-            }),
+            Ok(Ok(())) => {
+                let mount = DokanMount {
+                    mountpoint: mountpoint.to_path_buf(),
+                    wide,
+                    serving: Some(serving),
+                };
+                while !answers(&mount.wide) {
+                    if Instant::now() >= deadline {
+                        // The guard exists, so its drop is what takes the volume down.
+                        drop(mount);
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "dokan reported the mount live, and the mount point never came to \
+                             lead to it",
+                        ));
+                    }
+                    std::thread::sleep(ANSWER_POLL);
+                }
+                Ok(mount)
+            }
             // Never mounted, so nothing to take down.
             Ok(Err(err)) => {
                 let _ = serving.join();
@@ -261,6 +287,53 @@ impl DokanMount {
             let _ = std::fs::create_dir(&self.mountpoint);
         }
     }
+}
+
+/// Whether the mount point leads to the mounted volume yet.
+///
+/// [`mounted`](FileSystemHandler::mounted) is the driver saying the volume exists, not that
+/// the mount point has come to lead to it, and with several mounts coming up at once in one
+/// process the two are tens of milliseconds apart: a file opened under the mount point in
+/// between fails with `ERROR_INVALID_FUNCTION` or `ERROR_INVALID_PARAMETER`. Measured here,
+/// four mounts made together had three first reads fail and succeed 20-60 ms later; one on
+/// its own read at once.
+///
+/// Asked of the volume and not of a file under it, because a volume query is answered by
+/// [`get_volume_information`](FileSystemHandler::get_volume_information) and never reaches
+/// the store -- a store across a network is not made to answer a request nobody asked. What
+/// that answers is [`VOLUME_NAME`] and a serial of 0, which no volume of the host answers
+/// both of, and the mount point is a directory on one of those until the mount is through.
+fn answers(mountpoint: &U16CStr) -> bool {
+    const BACKSLASH: u16 = b'\\' as u16;
+
+    // A mounted folder is named as a root, with its trailing separator.
+    let mut root = mountpoint.as_slice().to_vec();
+    if root.last() != Some(&BACKSLASH) {
+        root.push(BACKSLASH);
+    }
+    root.push(0);
+
+    let mut label = [0u16; 64];
+    let mut serial = 0u32;
+    // SAFETY: `root` is nul-terminated, and `label` is as long as the length passed with it.
+    // The outputs not asked for are null, which the call allows.
+    let answered = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            label.as_mut_ptr(),
+            label.len() as u32,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let len = label
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(label.len());
+    answered != 0 && serial == 0 && String::from_utf16_lossy(&label[..len]) == VOLUME_NAME
 }
 
 /// Initialise the Dokan library, once per process.

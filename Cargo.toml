@@ -109,10 +109,12 @@ dokan-sys = { version = "0.3", optional = true }
 # public API, so a second version is an unrelated type and every callback fails to match its
 # trait, with an error naming the same type twice.
 widestring = { version = "0.4", optional = true }
-# `NTSTATUS` and the `STATUS_*`/`FILE_ATTRIBUTE_*` codes a Windows filesystem answers in, and
-# `LoadLibraryW`, which `mount_support` uses to check for Dokany before any call into it.
+# `NTSTATUS` and the `STATUS_*`/`FILE_ATTRIBUTE_*` codes a Windows filesystem answers in,
+# `LoadLibraryW`, which `mount_support` uses to check for Dokany before any call into it, and
+# `GetVolumeInformationW`, which `try_new` uses to wait until the mount point is the volume.
 # winapi gates every module behind a feature (none by default), so only these are named.
 winapi = { version = "0.3", features = [
+    "fileapi",
     "libloaderapi",
     "ntdef",
     "ntstatus",
