@@ -4,7 +4,7 @@
 //! cargo run --example hello
 //! ```
 //!
-//! Needs the console server under `~/.cache/cortex/bin` (or `CORTEX_STDIO_SERVER_PATH`).
+//! Needs `cortex-krun` in `cache_root()/bin` (`$CORTEX_HOME/bin` if set); `ensure_cortex` fetches it.
 
 use cortex::{console::ConsoleClient, image::Recipe};
 

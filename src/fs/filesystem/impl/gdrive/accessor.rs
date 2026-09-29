@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use tokio::sync::Mutex;
 
-/// The OAuth origin, shared by every provider here: one token endpoint serves them all.
+/// Google's OAuth origin; one token endpoint serves every Google API.
 pub(crate) const OAUTH_ORIGIN: &str = "https://oauth2.googleapis.com";
 
 /// Where to reach each Google service. `None` = the real host.
@@ -47,8 +47,8 @@ impl GdriveOrigins {
     }
 
     /// Every service behind one host, laid out the way Google's own paths read:
-    /// `{host}/gmail`, `{host}/oauth2`, `{host}/drive` and so on. A convenience for a
-    /// deployment that fronts all of them, not a substitute for the per-service knobs.
+    /// `{host}/oauth2`, `{host}/drive` and so on. A convenience for a deployment that
+    /// fronts all of them, not a substitute for the per-service knobs.
     pub fn behind(host: &str) -> Self {
         let h = host.trim_end_matches('/');
         let at = |service: &str| Some(format!("{h}/{service}"));
@@ -70,8 +70,8 @@ impl GdriveOrigins {
     }
 }
 
-/// The origin each service lives on, without the version suffix this code appends —
-/// see [`GdriveOrigins`], which overrides these one at a time.
+/// Default service origins, without the version suffix this code appends; each is
+/// overridable through [`GdriveOrigins`].
 const DRIVE_ORIGIN: &str = "https://www.googleapis.com/drive";
 /// The Docs-editors types live behind their own APIs, on their own hosts. Drive can
 /// only *export* them; their structure (paragraph indices, formulas, slide geometry)
@@ -104,25 +104,21 @@ fn endpoints(o: &GdriveOrigins) -> Endpoints {
     }
 }
 
-/// Per-file fields requested from every listing — exactly what the mount needs to
-/// shape an entry. One entry per field, joined at request time: the
-/// separators aren't hand-maintained, so a mask can't grow a stray space or a
-/// missing comma the way a single hand-written literal can.
+/// Per-file fields every listing requests: exactly what the mount needs to shape an
+/// entry. Joined at request time, so the mask can't grow a stray space or lose a comma.
 const FILE_FIELDS: &[&str] = &[
     "id",
     "name",
     "mimeType",
     // Shared-drive scoping: children of a shared drive must be listed with it.
     "driveId",
-    // Drive's own size: populated for binary files *and* Docs-editors files,
-    // absent for folders and shortcuts. (backlot omits it on native
-    // docs — a divergence from Google, so don't rely on either shape.)
+    // Drive's own size: set for blobs *and* Docs-editors files, absent for folders and
+    // shortcuts (backlot also omits it on native docs, so don't rely on either shape).
     //
-    // Never the entry's own length. For a blob it is exact, but a document is served as
-    // its API's JSON and Drive's number describes neither that nor anything else a
-    // reader sees — 4,775 stored against 133,625 of JSON on one measured document. It is
-    // kept because `read_window` refuses on it before a byte moves, and because a blob
-    // Drive lists *without* one has to be told apart from a blob it sized as zero.
+    // Exact for a blob, but never a document's length: a document is served as its API's
+    // JSON, which Drive's number does not describe (4,775 listed against 133,625 of JSON
+    // on one document). Kept so `read_window` can refuse before a byte moves, and so a
+    // blob listed *without* a size is told apart from one sized zero.
     "size",
     "modifiedTime",
     "createdTime",
@@ -133,9 +129,8 @@ const FILE_FIELDS: &[&str] = &[
 /// query/corpora combos) can't spin forever.
 const MAX_PAGES: usize = 50;
 
-/// Retry budget for a rate-limited/5xx request; same reasoning as the gmail
-/// accessor's (these calls sit behind a FUSE/WebDAV op the agent blocks on, so
-/// the worst-case total stays low).
+/// Retry budget for a rate-limited/5xx request, kept low because these calls sit
+/// behind a FUSE/WebDAV op the agent blocks on.
 const MAX_RETRIES: u32 = 5;
 const MAX_BACKOFF: Duration = Duration::from_secs(16);
 const JITTER_MAX_MS: u64 = 1000;
@@ -145,11 +140,10 @@ const JITTER_MAX_MS: u64 = 1000;
 /// A document has no ranges: a read of any part of it produces the whole thing, so its
 /// size sets the memory a single read costs — body, parsed tree, indented output.
 ///
-/// 64 MiB against a measured worst case of 2.5 MB leaves room far past any document in a
-/// real account while keeping one read's footprint bounded. The JSON stays small where an
-/// export does not: a 60 MB document is 2.5 MB of it, and a 401 MB workbook is 242,935
-/// bytes — that workbook could not be served as an export at all, its 382 MiB being far
-/// over this ceiling.
+/// 64 MiB against a measured worst case of 2.5 MB leaves room far past any real document
+/// while bounding one read's footprint. The JSON stays small where an export does not: a
+/// 60 MB document is 2.5 MB of it, and a 401 MB workbook is 242,935 bytes, where its
+/// 382 MiB export would be far over this ceiling.
 pub(super) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Whether a 403 body names a limit that clears by waiting.
@@ -193,11 +187,10 @@ fn first_chars(s: &str, n: usize) -> &str {
 
 /// Read a response body, refusing at `limit` rather than after it.
 ///
-/// The obvious guard — check `Content-Length`, then buffer — never fires here: none of
-/// these endpoints declares a length (measured on Docs, Slides, `spreadsheets.get` and
-/// `values:batchGet`: no `Content-Length`, no `Transfer-Encoding`, just an HTTP/2
-/// stream), so the only check that ran was the one after the whole body had already
-/// been allocated. Reading frame by frame makes the limit mean what it says.
+/// Checking `Content-Length` before buffering cannot work: none of these endpoints
+/// declares a length (measured on Docs, Slides, `spreadsheets.get` and `values:batchGet`:
+/// no `Content-Length`, no `Transfer-Encoding`, just an HTTP/2 stream). Reading frame by
+/// frame refuses before the whole body is allocated.
 async fn body_within(
     mut resp: reqwest::Response,
     limit: u64,
@@ -215,13 +208,11 @@ async fn body_within(
 
 /// A tab name as an A1 range: quoted, with any literal quote doubled.
 ///
-/// A bare name mostly works and then abruptly doesn't. Measured against a real
-/// spreadsheet: `ranges=연간 요약` answered `'연간 요약'!A1:Z968`, while `ranges=A1`
-/// answered `'연간 요약'!A1` — the *first* sheet's cell, not a sheet of that name, and
-/// `B2` and `A:A` the same way. So a tab named like a cell reference returns someone
-/// else's cells, which the caller then attaches to the wrong tab. Quoting is what A1
-/// notation specifies for a name, and the same measurement shows it changes nothing
-/// for the ordinary ones.
+/// A bare name that looks like a cell reference is one. Measured on a real spreadsheet:
+/// `ranges=연간 요약` answered `'연간 요약'!A1:Z968`, while `ranges=A1` answered
+/// `'연간 요약'!A1` — the *first* sheet's cell, not a sheet of that name (`B2` and `A:A`
+/// likewise), so the caller would attach someone else's cells to the tab. Quoting is what
+/// A1 notation specifies for a name, and changes nothing for ordinary ones.
 fn quote_a1(tab: &str) -> String {
     format!("'{}'", tab.replace('\'', "''"))
 }
@@ -229,10 +220,9 @@ fn quote_a1(tab: &str) -> String {
 /// Exponential backoff with jitter for retry `n` (0-based), per Google's API
 /// guidance: `min(2^n s + rand(0..=1000ms), maximum_backoff)`.
 ///
-/// The jitter comes from the clock rather than a random-number crate. What it has to do
-/// is keep two callers that hit the same 429 from waking together, and the nanosecond
-/// they each read it apart is enough for that — a whole dependency for one line here
-/// would not buy anything the retry can tell the difference between.
+/// The jitter comes from the clock rather than a random-number crate: it only has to keep
+/// two callers that hit the same 429 from waking together, and the nanoseconds between
+/// their reads do that.
 fn backoff_delay(n: u32) -> Duration {
     let base = Duration::from_secs(1u64 << n.min(16));
     let nanos = std::time::SystemTime::now()
@@ -267,10 +257,8 @@ pub struct GdriveConfig {
     pub origins: GdriveOrigins,
 }
 
-/// Holds Google OAuth credentials (one refresh token) and a cached access
-/// token. The mount is read-only and never transfers file content, so the token
-/// needs `https://www.googleapis.com/auth/drive.readonly` (metadata-only scopes
-/// would also do for listing, but `drive.readonly` is the documented one).
+/// Holds Google OAuth credentials (one refresh token) and a cached access token. The
+/// mount is read-only, so the token needs `https://www.googleapis.com/auth/drive.readonly`.
 pub struct GdriveAccessor {
     client: reqwest::Client,
     config: GdriveConfig,
@@ -285,9 +273,8 @@ impl GdriveAccessor {
     pub fn new(config: &GdriveConfig) -> anyhow::Result<Self> {
         let urls = endpoints(&config.origins);
         Ok(Self {
-            // Bound every request: a hung upstream call behind a filesystem op
-            // would otherwise wedge the op (and any process touching the mount)
-            // forever. A timeout makes it recoverable.
+            // A hung upstream call would otherwise wedge the filesystem op, and any
+            // process touching the mount, forever.
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10))
@@ -351,12 +338,8 @@ impl GdriveAccessor {
         self.send_retrying(build, MAX_RETRIES).await
     }
 
-    /// As [`Self::send_with_refresh`], with a caller-chosen retry ceiling.
-    ///
-    /// The full ladder is right for a call whose answer the caller needs, and wrong
-    /// for one whose failure it shrugs off: the shared-drive listing is best-effort,
-    /// and walking five backoffs made the first `ls` of a mount block 33 seconds to
-    /// produce a result that was then discarded.
+    /// As [`Self::send_with_refresh`], with a caller-chosen retry ceiling for a call
+    /// whose failure the caller shrugs off.
     async fn send_retrying(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -375,11 +358,9 @@ impl GdriveAccessor {
                 continue;
             }
             // Drive reports a per-user rate limit as 403 with a `reason`, not as 429, so
-            // the status alone classifies it as terminal and the caller gives up on a
-            // condition that clears by waiting. The reason is in the body, and reading
-            // the body consumes the response — which is fine, because a 403 this loop
-            // does not retry is a failure either way, and saying why beats handing back
-            // a response whose only content is the explanation.
+            // the status alone would give up on a condition that clears by waiting.
+            // Reading the reason consumes the response, which is fine: a 403 not retried
+            // fails either way, and its body is the explanation.
             if status == reqwest::StatusCode::FORBIDDEN {
                 let body = resp.text().await.unwrap_or_default();
                 if is_rate_limit(&body) && retries < max_retries {
@@ -439,12 +420,8 @@ impl GdriveAccessor {
                     format!("nextPageToken,files({})", FILE_FIELDS.join(",")),
                 ),
                 ("pageSize", "1000".to_string()),
-                // Ask Drive to order, rather than leaving it unspecified: two
-                // `ls` of one folder should not disagree, and newest-first is
-                // what a person scanning a Drive folder expects. (backlot
-                // ignored `orderBy` until enterprise-mock#28 fixed it, which is
-                // why this was done locally before — and why a mock of our own
-                // cannot be the only thing this is checked against.)
+                // An explicit order so two `ls` of one folder agree; newest-first is
+                // what a person scanning a Drive folder expects.
                 ("orderBy", "modifiedTime desc".to_string()),
             ];
             if let Some(d) = drive_id {
@@ -501,26 +478,20 @@ impl GdriveAccessor {
             .await
     }
 
-    /// Files whose *contents* match `phrase`, via Drive's own index
-    /// (`q=fullText contains`).
-    ///
     /// A blob file's bytes (`files.get?alt=media`), or just one window of them.
     /// A Docs-editors document has no bytes and 403s here; it is served as its own
     /// API's JSON instead (see [`Self::document_json`] and friends).
     ///
-    /// The range is what makes serving originals affordable, and how wide to make it is
-    /// the caller's to decide — see `GdriveFs::span`, which sizes it by whether the reader
-    /// looks to be walking the file. Without `Range` at all, every chunk read would pull
-    /// the whole object, so one `grep` over a folder of 5 MB PDFs would transfer gigabytes
-    /// to look at a few kilobytes.
+    /// The range makes serving originals affordable; the caller sizes it. Without `Range`,
+    /// every chunk read would pull the whole object, so one `grep` over a folder of 5 MB
+    /// PDFs would transfer gigabytes to look at a few kilobytes.
     pub async fn download(
         &self,
         id: &str,
         range: Option<std::ops::Range<u64>>,
     ) -> anyhow::Result<Vec<u8>> {
-        // An empty window is not a request. It used to fall through to the arm that
-        // sends no `Range` at all, so `File::read_bytes(0)` pulled the whole object and
-        // returned none of it — 20 MB to answer with an empty vector.
+        // An empty window is not a request: the no-`Range` arm below would pull the
+        // whole object to answer with nothing.
         if matches!(&range, Some(r) if r.end <= r.start) {
             return Ok(Vec::new());
         }
@@ -578,12 +549,10 @@ impl GdriveAccessor {
 
     /// Cell values for the named tabs (`spreadsheets.values.batchGet`).
     ///
-    /// This, not `includeGridData=true`, is how the grid comes back. That flag
-    /// bills per **allocated** cell at 578-920 bytes each (measured), and a tab
-    /// allocates 1000x26 whether or not one cell is filled — the first real
-    /// workbook tried had 210,125 allocated cells, an estimated 189 MB. `batchGet`
-    /// returns the used range only, and the same workbook's values were 443 B to
-    /// 105 KB per tab.
+    /// Not `includeGridData=true`: that bills per **allocated** cell at 578-920 bytes
+    /// each (measured), and a tab allocates 1000x26 whether or not one cell is filled —
+    /// one real workbook had 210,125 allocated cells, an estimated 189 MB. `batchGet`
+    /// returns the used range only: 443 B to 105 KB per tab for that workbook.
     ///
     /// Values are formatted as the sheet displays them, so what a reader greps is
     /// what a person sees in the cell.
@@ -610,17 +579,13 @@ impl GdriveAccessor {
         Ok(serde_json::from_slice(&raw)?)
     }
 
-    /// GET a JSON API response, pretty-printed so the bytes read as lines rather
-    /// than one long string — the difference between a file a reader can scan and
-    /// one it can only parse.
+    /// GET a JSON API response, pretty-printed so a reader can scan it as lines rather
+    /// than parse one long string.
     ///
-    /// Refuses a response over [`MAX_DOCUMENT_BYTES`]. This is where a document's
-    /// memory is spent — the raw body, the `Value` tree parsed from it (several times
-    /// its size), and the indented copy written back out — and where the only honest
-    /// limit can live: a reader cannot ask for part of a document, so serving one is
-    /// all-or-nothing, and past some size the answer has to be "no" rather than a
-    /// gigabyte of allocations per read. Enforced while the body is read (see
-    /// [`body_within`]) — these endpoints declare no length to check beforehand.
+    /// Refuses a response over [`MAX_DOCUMENT_BYTES`], while the body is read (see
+    /// [`body_within`]). A document is all-or-nothing and its memory is spent here — raw
+    /// body, the `Value` parsed from it (several times its size), the indented copy — so
+    /// past some size the answer has to be "no" rather than a gigabyte of allocations.
     async fn get_pretty(&self, url: &str) -> anyhow::Result<Vec<u8>> {
         let resp = self
             .send_with_refresh(|t| self.client.get(url).bearer_auth(t))
@@ -636,10 +601,9 @@ impl GdriveAccessor {
 
     /// Shared drives visible to the account.
     ///
-    /// Deliberately off the retry ladder. The caller treats a failure as "this account
-    /// has none", so walking five backoffs makes the first `ls` of a mount block for
-    /// half a minute to produce an answer that is then discarded. One attempt, and the
-    /// caller decides what to do with a failure.
+    /// One attempt, off the retry ladder: the caller treats a failure as "this account
+    /// has none", and five backoffs would block the first `ls` of a mount for ~33 s to
+    /// produce an answer that is then discarded.
     pub async fn list_shared_drives(&self) -> anyhow::Result<Vec<Value>> {
         let mut drives = Vec::new();
         let mut page_token: Option<String> = None;
@@ -685,14 +649,8 @@ mod tests {
     use super::*;
 
     /// Five hosts in production, each overridable on its own, and the version suffix
-    /// is the official one either way — so nothing here depends on how a particular
-    /// deployment lays out its paths.
-    ///
-    /// Composed through `endpoints`, which is where every origin is actually read. Two
-    /// tests used to sit under this one, checking `origin` and `behind` a layer down on
-    /// the same inputs; a suffix or a trimmed slash that survives to here survived them
-    /// too. What only they reached is `is_default`, which is not cosmetic — it is what
-    /// keeps a config that overrides nothing from serializing an `origins` block.
+    /// is the official one either way, so nothing depends on a deployment's path layout.
+    /// Checked through `endpoints`, where every origin is read.
     #[test]
     fn each_service_keeps_its_official_path_under_any_origin() {
         let e = endpoints(&GdriveOrigins::default());
@@ -718,8 +676,8 @@ mod tests {
         assert_eq!(e.sheets, "http://localhost:8000/sheets/v4");
         assert_eq!(e.slides, "http://localhost:8000/slides/v1");
 
-        // And an origins that overrides nothing says so, which is what keeps it out of
-        // a serialized config entirely.
+        // An origins that overrides nothing says so, which keeps it out of a serialized
+        // config.
         assert!(!GdriveOrigins::behind("https://mock.example.com/").is_default());
         assert!(
             GdriveOrigins::default().is_default(),
@@ -743,8 +701,7 @@ mod tests {
     }
 
     /// Drive uses 403 for a limit that clears by waiting, which the status alone reads
-    /// as terminal — measured in review: a 403 `rateLimitExceeded` gave up after one
-    /// attempt while a 429 walked the whole ladder.
+    /// as terminal.
     #[test]
     fn a_403_that_clears_by_waiting_is_told_apart_from_one_that_does_not() {
         let body = |reason: &str| {

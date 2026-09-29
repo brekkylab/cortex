@@ -291,14 +291,12 @@ fn shared_drive_names_dodge_the_root_sections() {
 /// comparison answers `ENOENT` for a name `ls` printed a moment earlier, and which files it
 /// does that to depends on what uploaded them.
 ///
-/// Everything downstream of that comparison has to agree with it. Counting collisions by
-/// bytes left a canonically equal pair *both* unnumbered while the lookup matched either
-/// spelling to whichever came first: one file unopenable, and `cat` on it serving the other
-/// one's contents. And the number follows the Drive id rather than arrival order, because
-/// rows arrive `modifiedTime desc` with no defined tiebreak — numbering as they arrive meant
-/// editing either of two `report.pdf` swapped which one was `report (2).pdf` at the next
-/// listing, and the saved path still resolved, still succeeded, and opened the other
-/// document.
+/// Everything downstream of that comparison has to agree with it. Collisions counted by
+/// bytes would leave a canonically equal pair under one name while the lookup matched
+/// either spelling to whichever came first: one file unopenable, and `cat` on it serving
+/// the other one's contents. And a name follows the file, not its position: rows arrive
+/// `modifiedTime desc` with no defined tiebreak, so a name by rank would swap on an edit
+/// and a saved path would silently open the other document.
 #[test]
 fn names_are_compared_and_numbered_by_composition_and_id() {
     let mk = |name: &str, id: &str, serves: Serves| Child {
@@ -369,13 +367,12 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         ]
     );
 
-    // A pair that differs only by composition is a collision, so one of them is numbered.
+    // A pair that differs only by composition is one collision.
     let two = "보고서.pdf".to_string();
     let two_nfd: String = two.nfd().collect();
-    // Ids that also end alike, so the tail check is what has to see these two as one
-    // group. Grouping by bytes would put the two spellings in separate groups, leave both
-    // on the short tag, and produce one name twice — caught only by the numbering net
-    // underneath, which is the rank this scheme exists to remove.
+    // Ids that also end alike, so the tail check has to see these two as one group.
+    // Grouped by bytes, both spellings would keep the short tag and produce one name
+    // twice, caught only by the numbering net underneath.
     let shared_tail = "z".repeat(ID_TAG_LEN);
     let (ia, ib) = (format!("AAA{shared_tail}"), format!("BBB{shared_tail}"));
     assert_eq!(
@@ -411,12 +408,9 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         "nothing reached the numbering"
     );
 
-    // A name is the file's, not the set's. Reordering must not move it — the listing
-    // arrives `modifiedTime desc`, so an edit reorders — and neither must adding or
-    // removing a sibling, which is what numbering by rank could not manage: a new
-    // `report.pdf` sorting between two existing ones took `(2)` from its holder and
-    // pushed it to `(3)`, so a path recorded from one listing opened another file after
-    // the next. Nothing errors on that; it just reads the wrong document.
+    // A name is the file's, not the set's. Neither reordering (the listing arrives
+    // `modifiedTime desc`, so an edit reorders) nor adding or removing a sibling may move
+    // it, or a path recorded from one listing silently opens another file after the next.
     let assign = |ids: &[&str]| {
         let mut c: Vec<Child> = ids
             .iter()
@@ -442,7 +436,7 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
     assert_eq!(three, assign(&["B5", "C", "B"]), "an edit must not rename");
     let name_of =
         |v: &Vec<(String, String)>, id: &str| v.iter().find(|(i, _)| i == id).unwrap().1.clone();
-    // The reported case: a third file whose id sorts between the two.
+    // A third file whose id sorts between the two.
     for id in ["B", "C"] {
         assert_eq!(
             name_of(&two, id),
@@ -507,9 +501,8 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
         "a different collision keeps the short tag rather than the whole id"
     );
 
-    // A Drive name that already looks like a tagged one used to collide with the tag this
-    // code was about to write, and the numbering under everything else caught it. It
-    // cannot collide any more: that name is tagged too, with an id of its own.
+    // A Drive name that already looks like a tagged one is tagged too, with an id of its
+    // own, so it cannot collide with the tag written for another entry.
     let mut planted = vec![
         mk("c.txt", "ccccccccc99999999", Serves::Original),
         mk("c.txt", "ccccccccc88888888", Serves::Original),
@@ -533,12 +526,9 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
     );
 }
 
-/// A shared drive scopes every listing under it, not just its own root.
-///
-/// The mock answered `/drives` with an empty array on every success path, so no runnable
-/// test ever produced a `GKind::SharedDrive` child and nothing covered `driveId` at all —
-/// deleting the propagation left the suite green. Against a real account it makes every
-/// folder inside a shared drive list empty from the second level down.
+/// A shared drive scopes every listing under it, not just its own root. Without the
+/// propagated `driveId`, every folder inside a shared drive lists empty from the second
+/// level down on a real account.
 #[tokio::test]
 async fn a_shared_drive_scopes_the_listings_below_it() {
     let mock = start_full(
@@ -622,8 +612,8 @@ fn omitted_reason(wb: &Value, i: usize) -> Option<String> {
 ///
 /// Every case here is the same failure from a different side: **cells under the wrong
 /// sheet, or missing with nothing said about it.** Values are paired by the sheet a reply
-/// *names* in A1 notation rather than by position, because a sheet the request had to skip
-/// used to consume the next one's values and shift the rest. And every omission carries its
+/// *names* in A1 notation rather than by position, so a sheet the request had to skip
+/// cannot consume the next one's values and shift the rest. And every omission carries its
 /// reason — a titleless sheet, one past the tab cap, one over the byte budget — because the
 /// one thing a reader cannot recover from is an empty grid that looks like an empty sheet.
 #[test]
@@ -651,8 +641,8 @@ fn a_workbooks_values_are_paired_by_name_and_budgeted_tab_by_tab() {
         "and says why"
     );
 
-    // Past the tab cap no request was made, so there are no values — and that used to be
-    // the one silent omission here.
+    // Past the tab cap no request was made, so there are no values, and the omission
+    // says so.
     let titles: Vec<String> = (0..MAX_TABS + 2).map(|i| format!("T{i}")).collect();
     let mut wb = workbook(&titles.iter().map(|t| Some(t.as_str())).collect::<Vec<_>>());
     // Asked for the way the read path asks, so the cap being *in* that call is what makes
@@ -814,9 +804,7 @@ async fn start_with_document(
 /// The whole form, called directly by the two tests that want its last two arguments.
 ///
 /// `drives_status` answers `/drives` with that status instead of a listing; `drives`
-/// replaces the empty listing it answers with otherwise — that route answered empty on
-/// every success path before this argument existed, which left `driveId` propagation with
-/// no runnable test at all.
+/// replaces the empty listing it answers with otherwise.
 async fn start_full(
     listing: Value,
     blobs: HashMap<String, Vec<u8>>,
@@ -988,10 +976,8 @@ async fn start_full(
     }
 }
 
-/// The provider as `build_mounts` assembles it.
-/// The backend itself. agent-k drove a caching wrapper here; this crate has none —
-/// a `FileSystem` holds whatever it means to hold, which is why the render cache
-/// these tests watch lives inside [`GdriveFs`].
+/// The backend itself, with no caching wrapper: the render cache these tests watch
+/// lives inside [`GdriveFs`].
 fn mounted(cfg: &GdriveConfig) -> GdriveFs {
     GdriveFs::new(cfg).unwrap()
 }
@@ -1073,11 +1059,10 @@ async fn a_remembered_length_belongs_to_the_version_it_was_measured_from() {
 /// [`GdriveFs::read_at`] pads whatever it declines to serve out to that length. Once
 /// something has produced the JSON, the same call answers what the document actually is.
 ///
-/// And the number outlives the bytes it was measured from. It used to live inside the
-/// render cache and went away with the JSON, so a listing after that reported the
-/// placeholder again for a file nothing had changed: against a live account, 3.4 MB, then
-/// 64 MiB, then 3.4 MB, on nothing but cache state. Keeping it apart costs a `u64` and a
-/// timestamp.
+/// And the number outlives the bytes it was measured from, so a listing after the JSON is
+/// dropped does not report the placeholder again for an unchanged file (against a live
+/// account that would read 3.4 MB, then 64 MiB, then 3.4 MB, on nothing but cache state).
+/// Keeping it apart costs a `u64` and a timestamp.
 #[tokio::test]
 async fn a_documents_length_is_a_placeholder_until_it_is_read_and_then_keeps() {
     let mock = start_with_document(
@@ -1111,8 +1096,8 @@ async fn a_documents_length_is_a_placeholder_until_it_is_read_and_then_keeps() {
     );
     assert_eq!(fs.stat(&path).await.unwrap().size, real, "read, so known");
 
-    // The bytes go — the slot takes the next file, or the TTL lapses — and the length
-    // stays, without producing the document a second time to recover it.
+    // The bytes go (the byte budget or the TTL) and the length stays, without producing
+    // the document a second time to recover it.
     fs.forget_rendered_for_test().await;
     assert!(fs.held_bytes("D1").await.is_none(), "the JSON is gone");
     mock.reset();
@@ -1129,12 +1114,10 @@ async fn a_documents_length_is_a_placeholder_until_it_is_read_and_then_keeps() {
 
 /// The padding is spaces broken into lines, because a line-oriented tool pays per line.
 ///
-/// It was newlines throughout, on the reasoning that empty lines keep `grep` cheap where
-/// one enormous line would not. Measured on a 64 MiB tail, that is backwards by an order
-/// of magnitude — jq 10.98s against 0.53s, grep 3.95s against 0.15s, sed 6.18s against
-/// 0.03s. What the all-spaces form gives up is the shape of the tail: one 64 MB line,
-/// which a `readline` hands over as one 64 MB string. A newline every `PAD_LINE` bytes
-/// keeps the speed and the shape both.
+/// Measured on a 64 MiB tail, all newlines against all spaces: jq 10.98s against 0.53s,
+/// grep 3.95s against 0.15s, sed 6.18s against 0.03s. All spaces would make the tail one
+/// 64 MB line, which a `readline` hands over as one 64 MB string. A newline every
+/// `PAD_LINE` bytes keeps the speed and the shape both.
 #[tokio::test]
 async fn the_padding_is_lines_of_spaces_and_not_a_run_of_newlines() {
     const PAD: usize = 4096;
@@ -1187,12 +1170,10 @@ async fn the_padding_is_lines_of_spaces_and_not_a_run_of_newlines() {
 /// The span the placeholder claims but the JSON does not fill gets whitespace, so a
 /// document that is read in one go is still a document.
 ///
-/// This is the whole point of padding it here rather than leaving the byte to the
-/// kernel. Measured on a live mount before the change: a 1,574,113-byte deck read back
-/// as 8,388,608 bytes whose last 6,814,495 were `0x00`, and `json.load` raised
-/// `Expecting value` at the seam instead of skipping it. JSON ignores the whitespace
-/// after a value and does not ignore a NUL, so the filler decides whether the read is
-/// usable — and it costs nothing, being the same bytes either way.
+/// Left to the kernel's `0x00` fill instead, a 1,574,113-byte deck read back on a live
+/// mount as 8,388,608 bytes whose last 6,814,495 were `0x00`, and `json.load` raised
+/// `Expecting value` at the seam. JSON ignores the whitespace after a value and does not
+/// ignore a NUL, so the filler decides whether the read is usable, at no extra cost.
 #[tokio::test]
 async fn a_document_is_padded_out_with_whitespace_and_not_with_zeros() {
     const PAD: usize = 4096;
@@ -1311,14 +1292,14 @@ async fn an_oversized_document_stops_being_read() {
 ///
 /// Two failures, both of which read as "the tree is smaller than it is".
 ///
-/// A shared-drive listing is best-effort, so its failure was swallowed: the root came back
-/// with two sections, nothing said why, and that reduced root was cached — so a retry
-/// inside the TTL made no attempt at all. It also sat on the full retry ladder, which put
-/// half a minute of backoff in front of the first `ls` of a mount.
+/// A shared-drive listing is best-effort, so the root survives its failure, but that
+/// reduced root must not be cached: it would hide the drives for the TTL with nothing
+/// saying why, and a retry inside it would make no attempt. Nor may that listing sit on
+/// the full retry ladder, which puts half a minute of backoff before a mount's first `ls`.
 ///
-/// And the cache itself was a high-water mark: one listing per folder ever visited, held
-/// for the life of the mount long after its TTL made it unusable, against a corpus with a
-/// folder that lists 10,000 entries.
+/// And the cache must not be a high-water mark: a listing past its TTL is dropped rather
+/// than held for the life of the mount (the corpus has a folder that lists 10,000
+/// entries).
 #[tokio::test]
 async fn the_listing_cache_keeps_the_fresh_and_refuses_the_failed() {
     let mock = start_full(
@@ -1402,11 +1383,8 @@ async fn the_listing_cache_keeps_the_fresh_and_refuses_the_failed() {
 
 /// A document and a blob's span share one budget, and sharing it is not taking it.
 ///
-/// This test used to assert the opposite: the second document displaced the first, a blob
-/// displaced the document, and going back cost a render. Each of those was the defect
-/// stated as a guarantee — reads of two files interleave without threads or a second
-/// process, and then displacement is every window's cost rather than an occasional one.
-///
+/// Reads of two files interleave without threads or a second process, so if one displaced
+/// another, displacement would be every window's cost rather than an occasional one.
 /// Three files being read at once come to a few megabytes against [`HELD_BUDGET`], so none
 /// has to go, and going back to the first is free rather than another 1.8 s of producing it.
 #[tokio::test]
@@ -1442,7 +1420,7 @@ async fn a_document_and_a_span_share_the_budget() {
         "the one just read"
     );
 
-    // Chunks of the same document come out of the slot rather than a second render.
+    // Chunks of the same document come out of the map rather than a second render.
     mock.reset();
     for at in [0u64, 64 * 1024, 128 * 1024] {
         fs.read_window(&first, Some(at..at + 64 * 1024))
@@ -1475,8 +1453,8 @@ async fn a_document_and_a_span_share_the_budget() {
         "and neither document paid for it"
     );
 
-    // So going back to the first is free. This is the assertion the one slot could not
-    // make, and the one that matters: a lost document costs a render, not a range request.
+    // So going back to the first is free, which matters most: a lost document costs a
+    // render, not a range request.
     mock.reset();
     let again = fs.read_window(&first, None).await.unwrap();
     assert_eq!(again, a);
@@ -1486,12 +1464,10 @@ async fn a_document_and_a_span_share_the_budget() {
     );
 }
 
-/// Each service is reached at its own origin, and only its own.
-///
-/// A single `base_url` could not express this: it stood in for every host, with the
-/// intermediate path (`/drive`, `/sheets`) chosen by the client rather than the
-/// deployment, so a gateway serving one service somewhere else could not be pointed
-/// at. Two listeners here, on paths neither Google nor our own mock uses.
+/// Each service is reached at its own origin, and only its own, with the path chosen by
+/// the deployment rather than the client, so a gateway serving one service somewhere
+/// else can be pointed at. Two listeners here, on paths neither Google nor our own mock
+/// uses.
 #[tokio::test]
 async fn one_service_can_move_without_moving_the_others() {
     let sheet = row(
@@ -1550,19 +1526,17 @@ async fn one_service_can_move_without_moving_the_others() {
 /// What a fetch costs, in every case that changes the answer.
 ///
 /// The kernel asks in 64 KiB windows, 32 through FUSE-T, and that is not ours to choose;
-/// sending each one down
-/// as its own ranged request is what made a 641 MB archive take two and a half hours. But a
-/// span is not free either — 0.90 s for a window against 5.63 s for 64 MiB — and the tools
-/// that read a file's head and stop would pay all of it for one buffer. So the size of a
-/// fetch follows what the last one did: the first read of a file, and any jump away from
-/// where the last span ended, takes the first span; a read carrying on from that end takes
-/// a read span.
+/// one ranged request per window puts a 641 MB archive at two and a half hours. But a span
+/// is not free either — 0.90 s for a window against 5.63 s for 64 MiB — and the tools that
+/// read a file's head and stop would pay all of it for one buffer. So the size of a fetch
+/// follows what the last one did: the first read of a file, and any jump away from where
+/// the last span ended, takes the first span; a read carrying on from that end takes a
+/// read span.
 ///
 /// One fixture answers all of it, including the two degenerate cases. A span that runs off
 /// the end comes back short and is marked `to_eof`, which is what serves the tail of a file
 /// smaller than a span without fetching again. And a zero-length window is not a read at
-/// all — it once fell through to the arm that sends no `Range`, so `read_bytes(0)` pulled
-/// 20 MB to answer with an empty vector.
+/// all: sent without a `Range`, `read_bytes(0)` would pull 20 MB to answer with nothing.
 #[tokio::test]
 async fn what_a_fetch_costs() {
     const REAL: usize = 10 * 1024 * 1024;
@@ -1692,9 +1666,8 @@ async fn what_a_fetch_costs() {
 /// one was done. Against Drive it does not, so this pattern is the shape of the hazard rather
 /// than a claim about what any one tool costs there — see [`GdriveFs::held`].
 ///
-/// The assertion is that nothing is fetched twice. One slot could not make it: each read
-/// found another file's span, so `walking` never became true and every window bought a
-/// whole [`FIRST_SPAN`].
+/// The assertion is that nothing is fetched twice. With one slot, each read would find
+/// another file's span, never count as a walk, and buy a whole [`FIRST_SPAN`] per window.
 #[tokio::test]
 async fn interleaved_files_each_keep_a_span() {
     const REAL: u64 = 32 * 1024 * 1024;
@@ -1756,11 +1729,9 @@ async fn interleaved_files_each_keep_a_span() {
         "{waste} wasted over {spans} spans is more than a boundary each: {:?}",
         mock.media_ranges()
     );
-    // No ceiling on the span count, because one cannot catch this: reverting the
-    // share-sizing half alone fetches *fewer* spans than the fix does (8 against 9) by
-    // taking a whole `READ_SPAN` each time and throwing most of it away. What separates them
-    // is the waste, which is what the bound above measures. Reverting the map as well costs
-    // 192 spans, and the waste catches that too.
+    // No ceiling on the span count, because one cannot catch the defect: sizing every span
+    // as a whole `READ_SPAN` fetches *fewer* spans (8 against 9) while throwing most of
+    // each away. The waste bound above catches that, and a single slot (192 spans) too.
     for (i, id) in ids.iter().enumerate() {
         assert!(
             fs.held_bytes(id).await.is_some(),

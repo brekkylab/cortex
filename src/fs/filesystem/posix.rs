@@ -1,40 +1,29 @@
 //! POSIX bookkeeping over a path-addressed [`FileSystem`] store.
 //!
-//! [`Posix`] maps the store's paths onto stable inode numbers, tracks the kernel's
-//! per-inode reference counts, and keeps the open-file table a file handle is an index
-//! into. It carries no coupling to any one interface of its own — a concrete filesystem
-//! binding drives it.
+//! [`Posix`] maps the store's paths onto stable inode numbers, tracks the kernel's per-inode
+//! reference counts, and keeps the open-file table file handles index. It is tied to no
+//! interface; a concrete binding drives it.
 //!
-//! This layer exists *because* a kernel addresses files by number, and by descriptor.
-//! A path-addressed consumer — an HTTP binding whose verbs all carry paths — reaches
-//! [`FileSystem`] directly and never comes through here.
+//! It exists because a kernel addresses files by number and descriptor. A path-addressed
+//! consumer (e.g. HTTP) uses [`FileSystem`] directly.
 //!
 //! # What it holds that the store does not
 //!
-//! The store answers about names and bytes only (see *No opens, only paths* on
-//! [`FileSystem`]), so everything an open means lives here:
+//! The store answers only about names and bytes, so everything an open means lives here:
 //!
-//! * **The numbers.** inode ↔ path, and the reference counts that say when a number
-//!   may be reclaimed.
-//! * **The descriptors.** A file handle resolves to an inode and the options it was
-//!   opened with — never to a path directly, so an open follows its file through a
-//!   rename the way a descriptor does.
-//! * **The decomposition.** `O_CREAT|O_EXCL` becomes [`create`](FileSystem::create),
-//!   `O_TRUNC` becomes [`truncate`](FileSystem::truncate), and the access mode becomes a check
-//!   made here rather than in every store. [`OpenOptions`] and [`SetAttr`] are what a caller's
-//!   open and a kernel's `setattr` say, and they stop here — a store sees neither.
+//! * **Numbers**: inode ↔ path, and the reference counts that say when a number may be
+//!   reclaimed.
+//! * **Descriptors**: a file handle resolves to an inode and its open options, never to a
+//!   path, so an open follows its file through a rename.
+//! * **Decomposition**: `O_CREAT|O_EXCL` becomes [`create`](FileSystem::create), `O_TRUNC`
+//!   becomes [`truncate`](FileSystem::truncate), and the access mode is checked here rather
+//!   than in every store. [`OpenOptions`] and [`SetAttr`] stop here; a store sees neither.
 //!
-//! What it does *not* hold is a way for a descriptor to outlive its name. See
-//! [`unlink_child`](Posix::unlink_child).
+//! A descriptor outliving its name is handled by [`unlink_child`](Posix::unlink_child).
 
-// Which items a build actually reads depends on which bindings are enabled, and the
-// subsets do not line up: with no kernel binding compiled in nothing here is read at
-// all; `unix_time` serves only the bindings that fill a C `stat`; `TTL` serves only the
-// ones that pass a timeout through Rust.
-//
-// Gating each item by the set of bindings that happens to want it would encode an
-// implementation detail that moves whenever a binding does, so the module opts out
-// wholesale.
+// What a build reads depends on which bindings are enabled, in non-aligned subsets (none
+// without a kernel binding; `unix_time` only for C-`stat` bindings; `TTL` only for Rust
+// ones). Per-item gating would track binding internals, so the module opts out wholesale.
 #![allow(dead_code)]
 
 use std::{
@@ -53,30 +42,24 @@ use crate::{
 
 /// How a file should be opened.
 ///
-/// The options travel *with* the open rather than being a separate `create`,
-/// because two of them are atomicity requirements only the backend can meet:
+/// The options travel *with* the open because two are atomicity requirements:
 ///
-/// * `create_new` is `O_EXCL`. Decomposing it into "stat, then create if absent"
-///   is a race, not a contract — and for a local backend (`O_CREAT|O_EXCL`) or an
-///   object store (`If-None-Match: *`) the atomic form is the only one there is.
-/// * `truncate` must take effect *before* anything can observe the file, so the metadata the
-///   caller gets back already reflects it as empty. [`FileSystem::truncate`](crate::fs::FileSystem::truncate) is the other,
-///   non-atomic resize; a store must not treat one as the other.
+/// * `create_new` is `O_EXCL`; "stat, then create if absent" is a race, and for a local
+///   backend (`O_CREAT|O_EXCL`) or object store (`If-None-Match: *`) the atomic form is the
+///   only one.
+/// * `truncate` must take effect before anything observes the file, so returned metadata
+///   already shows it empty. [`FileSystem::truncate`](crate::fs::FileSystem::truncate) is the
+///   separate, non-atomic resize.
 ///
-/// The only meaningless combination — neither `read` nor `write` — is rejected by
-/// [`validate`](Self::validate). `O_RDONLY | O_CREAT` is ordinary POSIX and stays
-/// legal.
+/// [`validate`](Self::validate) rejects neither `read` nor `write`; `O_RDONLY | O_CREAT` is
+/// ordinary POSIX and stays legal.
 ///
-/// There is deliberately no `append`. A kernel resolves `O_APPEND` itself and sends the
-/// absolute end offset, so a backend that writes only where it is told already appends;
-/// carrying the flag would oblige every store to reproduce "find the end and write there"
-/// as one atomic step, which no consumer has asked for. A caller that wants it seeks to
-/// the end first, as one does with a [`File`](std::fs::File) opened without the flag.
+/// There is deliberately no `append`: a kernel resolves `O_APPEND` itself and sends the
+/// absolute end offset, and the flag would oblige every store to find-the-end-and-write
+/// atomically. A caller wanting it seeks to the end first.
 ///
-/// One is built the way `open(2)` is called: an access mode, then the flags that
-/// modify it. The fields stay public because a backend has to read them, and
-/// `#[non_exhaustive]` is what keeps a caller outside the crate from writing
-/// them.
+/// Built like an `open(2)` call: an access mode, then modifying flags. Fields are public for
+/// backends to read; `#[non_exhaustive]` stops callers outside the crate constructing it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OpenOptions {
@@ -87,9 +70,8 @@ pub struct OpenOptions {
     pub create: bool,
     /// Create the file, failing with [`AlreadyExists`] if it is already there.
     ///
-    /// Meaningless without `create`, as `O_EXCL` is without `O_CREAT`. A backend
-    /// decides *whether* to create from `create`, and reads this only inside that
-    /// branch, to decide whether the creation has to be exclusive.
+    /// Meaningless without `create`, as `O_EXCL` without `O_CREAT`: read only once `create`
+    /// decided to create, to make it exclusive.
     ///
     /// [`AlreadyExists`]: io::ErrorKind::AlreadyExists
     pub create_new: bool,
@@ -118,18 +100,11 @@ impl OpenOptions {
         }
     }
 
-    /// Create a file that must not already exist, opened for reading and
-    /// writing — `O_CREAT | O_EXCL | O_RDWR`, and the shape of
+    /// A file that must not exist yet, opened read-write: `O_CREAT | O_EXCL | O_RDWR`, as
     /// [`File::create_new`](std::fs::File::create_new).
     ///
-    /// Here because "make a new file" is the most common thing a caller wants
-    /// and, without it, the only way to say it is a six-line struct update. The
-    /// combination is also the one that has to be exclusive, so spelling it once
-    /// keeps every caller on the atomic form.
-    ///
-    /// No setter pairs with it, because the name cannot be both. A combination
-    /// wanting `O_EXCL` without both access modes narrows instead:
-    /// `create_new().read(false)`.
+    /// The most common open, spelled once so every caller gets the exclusive form. No setter
+    /// pairs with it; narrow access instead, e.g. `create_new().read(false)`.
     pub fn create_new() -> Self {
         OpenOptions {
             create: true,
@@ -160,16 +135,15 @@ impl OpenOptions {
         }
     }
 
-    /// What a read-only backend refuses on. `create` counts: it writes no bytes
-    /// to the file, but modifies its parent.
+    /// What a read-only backend refuses. `create` counts: it modifies the parent.
     pub fn intends_write(&self) -> bool {
         self.write || self.truncate || self.create || self.create_new
     }
 
     /// Reject the one self-contradictory combination.
     ///
-    /// Called by whatever decodes a flags word — [`decode_open_flags`](crate::fs::Posix), in
-    /// practice — and not by a store, which never sees these at all.
+    /// Called by the flags decoder ([`decode_open_flags`](crate::fs::Posix)); stores never see
+    /// these.
     pub fn validate(&self) -> io::Result<()> {
         if !self.read && !self.write {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -178,12 +152,11 @@ impl OpenOptions {
     }
 }
 
-/// The attribute changes a `setattr` asks for. Optional because the kernel sends
-/// a validity mask: only the named fields are meant to move.
+/// The attribute changes a `setattr` asks for; optional because the kernel's validity mask
+/// names only the fields to change.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SetAttr {
-    /// Resize the file. The only field this crate can actually act on, via
-    /// [`FileSystem::truncate`](crate::fs::FileSystem::truncate).
+    /// The only field acted on, via [`FileSystem::truncate`](crate::fs::FileSystem::truncate).
     pub size: Option<u64>,
     pub mtime: Option<std::time::SystemTime>,
     pub atime: Option<std::time::SystemTime>,
@@ -195,32 +168,26 @@ pub struct SetAttr {
 /// FUSE's fixed inode number for the root directory.
 const ROOT_INODE: u64 = 1;
 
-/// What a descriptor answers when asked to do what its open did not allow, and what an
-/// unknown file handle answers.
+/// Answer for an unknown file handle, or one used beyond what its open allowed.
 ///
-/// Identical on every POSIX system, and `libc` is only an optional dependency. Built
-/// as a raw number because `io::ErrorKind` has no name for it — see
-/// [`host_errno`] for what a translating consumer does with that.
+/// Raw because `io::ErrorKind` has no name for it; the same on every POSIX system, and `libc`
+/// is only optional.
 const EBADF: i32 = 9;
 
 /// `EBADF`, as the [`io::Error`] this layer answers with.
 ///
-/// Not [`NotFound`](io::ErrorKind::NotFound), which is about a *name*: a caller told
-/// "no such file" for a closed descriptor retries the open forever, where "bad
-/// descriptor" makes it fix its own bookkeeping.
+/// Not [`NotFound`](io::ErrorKind::NotFound), which is about a name: a caller told "no such
+/// file" for a closed descriptor retries the open forever.
 fn bad_handle() -> io::Error {
     io::Error::from_raw_os_error(EBADF)
 }
 
 /// A store, in the terms a kernel speaks: inode numbers and file handles.
 ///
-/// The name is the vocabulary, not an interface — nothing here is shaped by the binding
-/// that drives it.
-/// What a binding does with one is translate; see the module doc.
+/// "Posix" names the vocabulary, not an interface; nothing here is shaped by a binding.
 ///
-/// The fields are **private**, and that is the enforcement mechanism for "a binding only
-/// translates": a binding cannot reach the tables, so it cannot re-derive an operation that
-/// belongs here.
+/// Fields are **private** so a binding can only translate: it cannot reach the tables to
+/// re-derive an operation that belongs here.
 pub struct Posix<T: FileSystem> {
     store: T,
 
@@ -246,18 +213,15 @@ impl<T: FileSystem> Posix<T> {
 
 /// The name a file unlinked while open is moved aside to, before its inode number.
 ///
-/// Distinctive on purpose, and the cost is stated plainly: a *real* file whose name starts with
-/// this is hidden from a listing for as long as the prefix does. NFS made the same trade with
-/// `.nfsXXXX`, for the same reason — the name has to live in the same directory, so it has to
-/// live in the caller's namespace.
+/// It must live in the same directory, hence in the caller's namespace (as NFS's `.nfsXXXX`
+/// does), so a *real* file with this prefix is hidden from listings.
 const HELD_PREFIX: &str = ".cortex-unlinked-";
 
-/// How long a kernel may cache a lookup or attribute reply — also the window in which a
-/// write stays invisible, hence short.
+/// How long a kernel may cache a lookup or attribute reply; short because a write stays
+/// invisible that long.
 pub(in crate::fs) const TTL: Duration = Duration::from_secs(1);
 
-/// Reported block size. Shapes only `st_blocks`/`st_blksize` and `statfs`; no store has
-/// a block notion of its own.
+/// Reported block size, for `st_blocks`/`st_blksize` and `statfs` only; stores have none.
 pub(in crate::fs) const BLOCK_SIZE: u64 = 512;
 
 /// Longest single path component reported by `statfs`.
@@ -265,28 +229,24 @@ pub(in crate::fs) const NAME_MAX: u32 = 255;
 
 /// Synthetic `statfs` capacity, in [`BLOCK_SIZE`] blocks (1 TiB).
 ///
-/// No store has a capacity to report, but "unknown" cannot be spelled as zero: zero
-/// total blocks reads as *full*, so `df` shows 100% used and installers refuse to run.
-/// Reported entirely free.
+/// Stores have no capacity, but zero total blocks reads as *full* (`df` shows 100%,
+/// installers refuse to run), so this is reported entirely free.
 pub(in crate::fs) const TOTAL_BLOCKS: u64 = (1 << 40) / BLOCK_SIZE;
 
-/// Synthetic inode budget. Zero free inodes would mean every `create` fails before it
-/// is attempted.
+/// Synthetic inode budget; zero free inodes would fail every `create` up front.
 pub(in crate::fs) const TOTAL_INODES: u64 = 1 << 32;
 
-// Identical on every POSIX system, and `libc` is only an optional dependency.
+// The same on every POSIX system, and `libc` is only optional.
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
 /// The attribute values every binding reports for one entry.
 ///
-/// The foreign attribute structs (`stat64`, `FileAttr`, `struct stat`) cannot be built
-/// here, but the *numbers* can, and deriving them once is what keeps the bindings from
-/// drifting.
+/// The foreign structs (`stat64`, `FileAttr`, `struct stat`) are built per binding, but the
+/// numbers are derived once here so bindings cannot drift.
 ///
-/// `uid`/`gid` are absent on purpose: a guest sees the ids inside the VM, while a host
-/// mount must report the mounting user's or that user cannot traverse their own mount.
-/// Each binding decides those, as it decides its errno numbering.
+/// No `uid`/`gid`: a guest sees ids inside the VM, while a host mount must report the mounting
+/// user's or that user cannot traverse it, so each binding decides.
 pub(in crate::fs) struct Attr {
     pub size: u64,
     pub blocks: u64,
@@ -297,8 +257,7 @@ pub(in crate::fs) struct Attr {
     pub mtime: SystemTime,
     pub atime: SystemTime,
     pub ctime: SystemTime,
-    /// Birth time. Only the `fuser` binding has a field for it — Linux's `stat64`,
-    /// which the guest reads, has no birth time at all.
+    /// Birth time; only `fuser` has a field for it (the guest's Linux `stat64` has none).
     #[cfg_attr(
         not(all(feature = "mount", unix, not(target_os = "macos"))),
         allow(dead_code)
@@ -316,21 +275,17 @@ pub(in crate::fs) fn mode_for(kind: DirentKind) -> u32 {
 
 /// Translate a store error into the *host* kernel's errno numbering.
 ///
-/// `raw_os_error` first, and only then [`kind`](io::Error::kind). A number is here
-/// because this host's own syscall produced it — a passthrough store's `std::fs` call,
-/// or a [`bad_handle`] built above — so it is already in this table's numbering and is
-/// more precise than the kind it was classified into: `EBADF` and `ENOTBLK` have no
-/// `ErrorKind` at all, and would otherwise collapse onto `EIO`.
+/// `raw_os_error` wins over [`kind`](io::Error::kind): a number came from this host's own
+/// syscall (a passthrough `std::fs` call, or [`bad_handle`]), so it is already in host
+/// numbering and more precise; `EBADF` and `ENOTBLK` have no `ErrorKind` and would become
+/// `EIO`.
 ///
-/// A binding whose reader is a *guest* must do the opposite and carry a table of its own:
-/// the numbering that matters is the guest's, whatever this host is, and `ENOTEMPTY` is 66
-/// on macOS against 39 on Linux.
+/// A binding read by a *guest* must use its own table instead (`ENOTEMPTY` is 66 on macOS,
+/// 39 on Linux).
 ///
-/// **No exhaustive match is possible**, so the arms are a standing obligation rather
-/// than a checked one. `io::ErrorKind` is `#[non_exhaustive]`: a kind this crate starts
-/// producing does not fail to build here the way a new enum variant would — it lands on
-/// the `_` arm and reaches userspace as `EIO`, which is a valid number and therefore a
-/// silent wrong answer. A store that answers with a kind not named below has to add it.
+/// **`io::ErrorKind` is `#[non_exhaustive]`**, so a newly produced kind silently lands on `_`
+/// as `EIO` instead of failing the build. A store answering with a kind not named here must
+/// add it.
 #[cfg(all(feature = "mount", unix))]
 pub(in crate::fs) fn host_errno(err: &io::Error) -> i32 {
     if let Some(errno) = err.raw_os_error() {
@@ -356,14 +311,12 @@ pub(in crate::fs) fn host_errno(err: &io::Error) -> i32 {
 
 /// Project a store [`Stat`] onto the attributes every binding reports.
 ///
-/// Store timestamps are `Option` (a store may know only an mtime, or none), so each
-/// missing one falls back to `mtime` then the epoch. Reporting a real `mtime` is
-/// functional, not cosmetic: a guest negotiating `AUTO_INVAL_DATA` watches it to decide
-/// when to drop cached pages, so one stuck at 0 never has its cache invalidated.
+/// Missing timestamps fall back to `mtime`, then the epoch. A real `mtime` matters: a guest
+/// with `AUTO_INVAL_DATA` watches it to drop cached pages, so one stuck at 0 never
+/// invalidates.
 pub(in crate::fs) fn attr_for(stat: &Stat) -> Attr {
-    // A directory's real link count is `2 + subdirs`, and `find`/`du` read `nlink - 2`
-    // as that count and stop descending at zero. `1` is the conventional "unreliable",
-    // which turns that optimisation off.
+    // `find`/`du` read `nlink - 2` as a directory's subdir count and stop descending at
+    // zero; `1` is the conventional "unreliable", disabling that.
     let nlink = 1;
     let mode = mode_for(stat.kind);
     let mtime = stat.mtime.unwrap_or(UNIX_EPOCH);
@@ -389,10 +342,8 @@ pub(in crate::fs) fn unix_time(time: SystemTime) -> (i64, i64) {
     }
 }
 
-/// The numeric values a binding's kernel uses for the three non-portable open flags.
-/// `O_TRUNC` alone is `0o1000` on Linux and `0o2000` on macOS, so each binding supplies
-/// its own — same split as the errno tables. The access mode is portable and decoded
-/// once below.
+/// A binding kernel's values for the three non-portable open flags (`O_TRUNC` is `0o1000` on
+/// Linux, `0o2000` on macOS). The access mode is portable and decoded once.
 pub(in crate::fs) struct OpenFlagBits {
     pub truncate: i32,
     pub create: i32,
@@ -401,12 +352,11 @@ pub(in crate::fs) struct OpenFlagBits {
 
 /// Decode a POSIX open-flags word into [`OpenOptions`].
 ///
-/// The one self-contradictory combination — neither read nor write — is rejected here,
-/// which is the last place it can be: no store sees these options at all.
+/// Rejects neither-read-nor-write here, the last place it can be, since stores never see
+/// these options.
 pub(in crate::fs) fn decode_open_flags(flags: i32, bits: &OpenFlagBits) -> io::Result<OpenOptions> {
-    // `O_ACCMODE` is a two-bit *field*, not a bitmask, and `O_RDONLY` is 0, so
-    // `flags & O_WRONLY != 0` would misread `O_RDWR` as write-only. Match it as a
-    // value. Getting this wrong silently opens files with the wrong access.
+    // `O_ACCMODE` is a two-bit *field* and `O_RDONLY` is 0, so a bitmask test would misread
+    // `O_RDWR` as write-only; match it as a value.
     const O_ACCMODE: i32 = 3;
     const O_RDONLY: i32 = 0;
     const O_WRONLY: i32 = 1;
@@ -429,19 +379,17 @@ pub(in crate::fs) fn decode_open_flags(flags: i32, bits: &OpenFlagBits) -> io::R
 
 /// The filesystem operations themselves, in terms the bindings share.
 ///
-/// Each returns a plain [`io::Result`] over store types, so a binding is left with
-/// nothing but translation: decode the kernel's arguments, call one of these, encode the
-/// reply in whatever shape its interface wants. That keeps the bindings from re-deriving
-/// the same sequences — and makes the sequences testable on their own, which matters
-/// because `fuser`'s reply objects cannot be constructed outside its crate.
+/// Each returns a plain [`io::Result`] over store types, leaving a binding only translation
+/// (decode arguments, call one, encode the reply). The sequences are then shared and testable
+/// on their own, which matters since `fuser`'s reply objects cannot be built outside its crate.
 ///
-/// Every method takes the inode/handle numbers the kernel speaks in and drops each table
-/// lock before touching the (possibly slow) store.
+/// Methods take kernel inode/handle numbers and drop each table lock before touching the
+/// (possibly slow) store.
 impl<T: FileSystem> Posix<T> {
     /// Resolve `name` under `parent`, returning the child's inode and metadata.
     ///
-    /// Takes a kernel reference on the inode, so it must be balanced by
-    /// [`forget`](InodeTable::forget) — that is the `lookup` contract.
+    /// Takes a kernel reference, which [`forget`](InodeTable::forget) must balance (the
+    /// `lookup` contract).
     pub(in crate::fs) async fn lookup_child(
         &self,
         parent: u64,
@@ -461,21 +409,16 @@ impl<T: FileSystem> Posix<T> {
         self.store.stat(&path).await
     }
 
-    /// Record the open `inode` names and return the `fh` the kernel will quote on later
-    /// reads, after applying whatever the options ask of the store.
+    /// Apply what `options` ask of the store, record the open, and return its `fh`.
     ///
-    /// **A plain read open touches the store not at all.** The kernel already has the
-    /// attributes from the `lookup` that got it here, nothing is acquired that would
-    /// have to be released, and so there is nothing to ask for — which is what keeps an
-    /// open cheap over a store that answers across a network.
+    /// **A plain read open does not touch the store**: the kernel has attributes from its
+    /// `lookup` and nothing is acquired, which keeps opens cheap over a network store.
     ///
-    /// No kind check either. A kernel rejects a write-mode open of a directory itself,
-    /// from the attributes it was given, and a *read* open of one is legal POSIX whose
-    /// `read` is the thing that fails — which [`read_handle`](Self::read_handle) gets
-    /// from the store for free.
+    /// No kind check: a kernel rejects write-opening a directory itself, and read-opening one
+    /// is legal POSIX where the `read` fails, which [`read_handle`](Self::read_handle) gets
+    /// from the store.
     ///
-    /// The options are the caller's: a binding decodes them from whatever flags word its
-    /// kernel speaks (see [`decode_open_flags`]).
+    /// Bindings decode `options` from their kernel's flags word (see [`decode_open_flags`]).
     pub(in crate::fs) async fn open_inode(
         &self,
         inode: u64,
@@ -497,35 +440,25 @@ impl<T: FileSystem> Posix<T> {
         let path = self.path_of(parent)?.join(name);
         let stat = match self.realize_open(&path, options).await? {
             Some(stat) => stat,
-            // The name was already there, so this is the one open that pays for its
-            // metadata — see `realize_open`.
+            // The name already existed, so its metadata was not free.
             None => self.store.stat(&path).await?,
         };
-        // `intern`, not `number_for`: a `create` reply carries an entry, which takes a
-        // kernel reference just as `lookup` does. The reference-free path would leave
-        // the count short and the inode evictable too early.
+        // `intern`, not `number_for`: a `create` reply carries an entry, which takes a kernel
+        // reference; without it the inode would be evictable too early.
         let inode = lock(&self.inodes).intern(path);
         let fh = lock(&self.opens).insert(Open { inode, options });
         Ok((inode, stat, fh))
     }
 
-    /// What an open does to the store, in the order POSIX requires, and whatever
-    /// metadata that produced for free.
+    /// Apply an open to the store in POSIX order, returning any metadata that came free.
     ///
-    /// `Some` is the file this call *created*, reported by the store that made it.
-    /// `None` is not "unknown" — it is "not free from this sequence", the same
-    /// distinction [`Dirent::stat`] draws — and a caller that needs a [`Stat`] anyway
-    /// pays for one, which is why an open of an existing name costs a round trip where
-    /// creating a new one does not.
+    /// `Some` is the stat of a file this call *created*; `None` means "not free", not
+    /// "unknown", so opening an existing name costs the caller a `stat`.
     ///
-    /// The two steps are ordered, and both orderings matter:
-    ///
-    /// * Creation first, because `O_EXCL` is decided against what is on the store and
-    ///   nothing else. [`create`](FileSystem::create) is exclusive, so a non-exclusive
-    ///   open reads its `AlreadyExists` as the answer it wanted.
-    /// * Truncation second, and only for a name that was already there: a file this call
-    ///   just made is empty already, and asking a store to resize what it has just
-    ///   reported as empty is a round trip for nothing.
+    /// * Creation first, since `O_EXCL` is decided against the store alone.
+    ///   [`create`](FileSystem::create) is exclusive, so a non-exclusive open accepts its
+    ///   `AlreadyExists`.
+    /// * Truncation second, only for a pre-existing name; a just-created file is already empty.
     async fn realize_open(&self, path: &Path, options: OpenOptions) -> io::Result<Option<Stat>> {
         let created = if options.create {
             match self.store.create(path).await {
@@ -544,8 +477,7 @@ impl<T: FileSystem> Posix<T> {
         Ok(created)
     }
 
-    /// Read the `(offset, size)` window the kernel asked for. A short read is EOF, so
-    /// the returned buffer is only as long as what actually arrived.
+    /// Read the `(offset, size)` window; a short read is EOF, so the buffer is truncated to it.
     pub(in crate::fs) async fn read_handle(
         &self,
         fh: u64,
@@ -564,14 +496,11 @@ impl<T: FileSystem> Posix<T> {
 
     /// Write `data` at `offset` through `fh`, returning the byte count.
     ///
-    /// The loop is here because a store's `write_at` may legally write less than it was
-    /// given: the kernel would resend, but one loop above every store spares each of
-    /// them a whole-buffer variant of its own — and spares the two from disagreeing
-    /// about which one a consumer calls.
+    /// Loops because a store's `write_at` may write short; one loop here spares every store a
+    /// whole-buffer variant.
     ///
-    /// `O_APPEND` never reaches here: a kernel resolves it before the request arrives and
-    /// sends the absolute offset it decided on, which is why [`OpenOptions`] carries no
-    /// flag for it. Permission to write is the access mode alone.
+    /// `O_APPEND` never reaches here (the kernel sends the absolute offset), so write
+    /// permission is the access mode alone.
     pub(in crate::fs) async fn write_handle(
         &self,
         fh: u64,
@@ -589,8 +518,7 @@ impl<T: FileSystem> Posix<T> {
                 .write_at(&path, &data[written..], offset + written as u64)
                 .await?;
             if n == 0 {
-                // A store reporting no progress on a non-empty buffer has no defined
-                // meaning here, and looping on it would not terminate.
+                // No progress on a non-empty buffer would loop forever.
                 return Err(io::ErrorKind::WriteZero.into());
             }
             written += n;
@@ -605,55 +533,40 @@ impl<T: FileSystem> Posix<T> {
         name: &OsStr,
     ) -> io::Result<(u64, Stat)> {
         let path = self.path_of(parent)?.join(name);
-        // One call, not a `mkdir` followed by a `stat`: the store reports what it just
-        // made, which it knows for free and a second request would have to ask for.
         let stat = self.store.mkdir(&path).await?;
-        // Reference-taking, for the same reason as `create_child`.
+        // `intern`: the reply carries an entry, which takes a kernel reference.
         let inode = lock(&self.inodes).intern(path);
         Ok((inode, stat))
     }
 
     /// Remove the file named `name` under `parent`.
     ///
-    /// **A file something has open is moved aside rather than removed**, and removed for real
-    /// once its last handle closes. POSIX keeps an unlinked-but-open file readable, writable and
-    /// `fstat`-able through its descriptor — the basis of every tempfile — and a store addressed
-    /// by path cannot honour that on its own: the descriptor resolves to a path, and the path
-    /// would be gone.
+    /// **A file something has open is moved aside rather than removed**, and removed once its
+    /// last handle closes. POSIX keeps an unlinked-but-open file usable through its descriptor
+    /// (the basis of every tempfile), which a path-addressed store cannot do alone.
     ///
-    /// So the name goes and the file does not. It is renamed to [`HELD_PREFIX`] plus its inode
-    /// number, in the same directory — the same directory because a rename across mounts is
-    /// `EXDEV`, and the inode number because it is unique and never reused, so the hidden name
-    /// cannot collide. The inode table is rekeyed onto it, which is what makes every later read,
-    /// write and `getattr` through the open handle find the file where it went. The original
-    /// name is free immediately, and a file created there next is a different file with a
-    /// different number.
+    /// It is renamed to [`HELD_PREFIX`] plus its inode number: in the same directory because a
+    /// cross-mount rename is `EXDEV`, and by inode number because that is unique and never
+    /// reused. The inode table is rekeyed onto it so the open handle's reads, writes and
+    /// `getattr`s follow. The original name is free at once; a file created there is a
+    /// different file with a different number.
     ///
-    /// This is NFS's silly rename, for NFS's reason — and on one transport it is literally
-    /// NFS's: measured through FUSE-T's `nfs` backend, the macOS client does this itself, so the
-    /// `unlink` never arrives and a `.nfs<hex>` rename does. What is here is what answers on the
-    /// transports whose client does not (FSKit, a kernel FUSE mount), which is why the two end
-    /// up behaving alike.
+    /// This is NFS's silly rename. Through FUSE-T's `nfs` backend the macOS client does it
+    /// itself (a `.nfs<hex>` rename arrives instead of the `unlink`); this covers transports
+    /// whose client does not (FSKit, kernel FUSE), so both behave alike. Inherited caveats:
     ///
-    /// Two things it inherits from NFS:
+    /// * **A held file can be left behind** if the mount goes away with a handle open.
+    /// * **The hidden name is only hidden from listings** ([`dir_entries`](Self::dir_entries));
+    ///   naming it directly still reaches it.
     ///
-    /// * **A held file can be left behind.** If the mount goes away while a handle is still
-    ///   open, the hidden name stays in the store with nothing to clean it up.
-    /// * **The hidden name is only hidden from listings** ([`dir_entries`](Self::dir_entries)
-    ///   drops it). A caller that names it directly can still reach it.
-    ///
-    /// Only files something has open are held: whether the kernel merely *cached* the name is
-    /// not the question, so an ordinary `rm` of an unopened file is one store call as before.
-    /// That is the difference between this and a table of every name the kernel ever looked up.
-    ///
-    /// A store that cannot rename cannot hold anything aside either, so it gets the plain
-    /// removal and the old behaviour with it.
+    /// Only *open* files are held, not names the kernel merely cached, so `rm` of an unopened
+    /// file is one store call. A store that cannot rename gets a plain removal.
     pub(in crate::fs) async fn unlink_child(&self, parent: u64, name: &OsStr) -> io::Result<()> {
         let dir = self.path_of(parent)?;
         let path = dir.join(name);
 
-        // Two statements, not one: `open_of` takes `opens` and then `inodes`, so a lookup
-        // holding `inodes` while it reaches for `opens` is the one ordering that can deadlock.
+        // Two statements: `open_of` locks `opens` then `inodes`, so holding `inodes` while
+        // taking `opens` could deadlock.
         let numbered = lock(&self.inodes).number_of(&path);
         let held_by = numbered.filter(|&inode| lock(&self.opens).any_on(inode));
 
@@ -661,14 +574,13 @@ impl<T: FileSystem> Posix<T> {
             let aside = dir.join(format!("{HELD_PREFIX}{inode}"));
             match self.store.rename(&path, &aside).await {
                 Ok(()) => {
-                    // The number the kernel is holding now means the hidden name, and the
-                    // original resolves to nothing — both from this one rewrite.
+                    // The kernel's number now means the hidden name; the original resolves
+                    // to nothing.
                     lock(&self.inodes).rekey_subtree(&path, &aside);
                     lock(&self.held).insert(inode, aside);
                     return Ok(());
                 }
-                // Not a failure to report: the store simply cannot do this, and the caller
-                // asked for a removal. It gets one, and loses only what it never had.
+                // The store cannot rename; the caller asked for a removal, so do that.
                 Err(err)
                     if matches!(
                         err.kind(),
@@ -679,8 +591,7 @@ impl<T: FileSystem> Posix<T> {
         }
 
         self.store.unlink(&path).await?;
-        // Only after the store agreed: evicting first would strand the mapping if the removal
-        // failed.
+        // After the store agreed, so a failed removal keeps its mapping.
         lock(&self.inodes).evict_path(&path);
         Ok(())
     }
@@ -695,14 +606,11 @@ impl<T: FileSystem> Posix<T> {
 
     /// Move `name` under `from_parent` to `to_name` under `to_parent`.
     ///
-    /// The table is rewritten only after the store agrees, like every other mutation
-    /// here — an eager rekey would strand numbers on paths that never changed. But
-    /// unlike `unlink`/`rmdir` this *rewrites* rather than evicts: the object is still
-    /// there under a new name, and the kernel goes on quoting the inode it was given, so
-    /// dropping the mapping would turn its next `getattr` into `ESTALE`.
+    /// The table is rewritten only after the store agrees; an eager rekey would strand numbers
+    /// on paths that never changed. It is *rekeyed*, not evicted: the kernel keeps quoting the
+    /// inode, so dropping the mapping would make its next `getattr` `ESTALE`.
     ///
-    /// Open handles follow, and get that for free: a handle resolves to an inode, and
-    /// the inode's path is what moves.
+    /// Open handles follow, since they resolve to an inode whose path moves.
     pub(in crate::fs) async fn rename_child(
         &self,
         from_parent: u64,
@@ -719,14 +627,11 @@ impl<T: FileSystem> Posix<T> {
 
     /// Apply a `setattr` and report the resulting metadata.
     ///
-    /// Only `size` is acted on. Mode, ownership, and timestamps are accepted and dropped
-    /// — nothing stores them, and the attribute policy reports fixed permission bits.
-    /// Failing instead would break `cp -p`, `tar -x`, and `touch` for no gain; the
-    /// caller's next `getattr` shows what stuck.
+    /// Only `size` is acted on. Mode, ownership and timestamps are accepted and dropped, since
+    /// nothing stores them and permissions are fixed; failing would break `cp -p`, `tar -x`
+    /// and `touch`. The next `getattr` shows what stuck.
     ///
-    /// No file handle argument, unlike the calls above. A `setattr` may carry one, but a
-    /// resize names a path either way, and the inode the kernel quotes alongside it is
-    /// already that path.
+    /// No file handle: a resize names a path either way, and the quoted inode already is it.
     pub(in crate::fs) async fn setattr_inode(&self, inode: u64, attr: SetAttr) -> io::Result<Stat> {
         if let Some(size) = attr.size {
             let path = self.path_of(inode)?;
@@ -737,8 +642,8 @@ impl<T: FileSystem> Posix<T> {
 
     /// Push `fh`'s writes out without ending it.
     ///
-    /// Serves both FLUSH and FSYNC, which arrive on every `close()` and mid-stream
-    /// respectively, so it must be repeatable and must leave the handle usable.
+    /// Serves FLUSH (every `close()`) and FSYNC (mid-stream), so it must be repeatable and
+    /// leave the handle usable.
     pub(in crate::fs) async fn flush_handle(&self, fh: u64) -> io::Result<()> {
         let (path, _) = self.open_of(fh)?;
         self.store.flush(&path).await
@@ -746,18 +651,15 @@ impl<T: FileSystem> Posix<T> {
 
     /// Drop the open `fh` names.
     ///
-    /// Nothing is finalized, because nothing was held: a store's writes were durable
-    /// when they returned, and the FLUSH that precedes every RELEASE has already asked
-    /// for whatever more it could. What is released is this layer's own entry.
+    /// Nothing is finalized: writes were durable on return, and the FLUSH preceding every
+    /// RELEASE already asked for more. Only this layer's entry (and any held file) goes.
     ///
-    /// A release for a handle we never issued is the kernel tidying up; there is nothing
-    /// to drop and nothing to complain about.
+    /// An unknown handle is the kernel tidying up, and is ignored.
     pub(in crate::fs) async fn release_handle(&self, fh: u64) -> io::Result<()> {
         let Some(open) = lock(&self.opens).remove(fh) else {
             return Ok(());
         };
-        // The *last* handle, which is what POSIX ties the removal to — a `dup`ed descriptor
-        // still open here means the file is still being used.
+        // POSIX ties removal to the *last* handle; a `dup`ed one may still be open.
         if lock(&self.opens).any_on(open.inode) {
             return Ok(());
         }
@@ -765,8 +667,7 @@ impl<T: FileSystem> Posix<T> {
             return Ok(());
         };
         self.store.unlink(&aside).await?;
-        // Only after the store agreed, as everywhere else here: forgetting the hidden name
-        // first would leave a failed removal with nothing left that knows what to remove.
+        // After the store agreed, so a failed removal still knows the hidden name.
         lock(&self.held).remove(&open.inode);
         Ok(())
     }
@@ -775,12 +676,11 @@ impl<T: FileSystem> Posix<T> {
     /// store's children, each already assigned the inode number a later `lookup` will
     /// return.
     ///
-    /// The kernel resumes a partial listing by quoting the last offset it consumed, and
-    /// offsets here are the 1-based position in this vector, so a binding skips what it
-    /// has already sent and emits the rest.
+    /// Offsets are 1-based positions in this vector; the kernel resumes by quoting the last one
+    /// consumed.
     ///
-    /// `..` reuses this directory's inode: resolving the real parent buys nothing for
-    /// traversal, which goes through `lookup`.
+    /// `..` reuses this directory's inode: traversal goes through `lookup`, so the real parent
+    /// buys nothing.
     pub(in crate::fs) async fn dir_entries(&self, inode: u64) -> io::Result<Vec<(u64, Dirent)>> {
         let dir = self.path_of(inode)?;
         let children = self.store.list(&dir).await?;
@@ -792,13 +692,12 @@ impl<T: FileSystem> Posix<T> {
         // One lock for the whole batch, so the numbers stay consistent.
         let mut inodes = lock(&self.inodes);
         for child in children {
-            // Held aside by an `unlink` that had to keep the file: it is not in the tree any
-            // more, so it is not in a listing of it either.
+            // Held aside by `unlink_child`; no longer part of the tree.
             if child.name.starts_with(HELD_PREFIX) {
                 continue;
             }
-            // `number_for`, not `intern`: readdir must not take a kernel reference, only
-            // agree with what a later `lookup` would assign.
+            // `number_for`, not `intern`: readdir takes no kernel reference, but must agree
+            // with a later `lookup`.
             let ino = inodes.number_for(dir.join(&child.name));
             entries.push((ino, child));
         }
@@ -808,9 +707,8 @@ impl<T: FileSystem> Posix<T> {
     /// Stream `inode`'s entries to `emit`, resuming after `offset` and stopping once
     /// `emit` reports the consumer's buffer is full.
     ///
-    /// The cursor protocol is here because every binding must agree on it exactly:
-    /// offsets are 1-based positions in the listing, and the kernel resumes by quoting
-    /// the last one it consumed.
+    /// The cursor protocol lives here so every binding agrees on it: 1-based offsets, resumed
+    /// after the last one the kernel consumed.
     pub(in crate::fs) async fn for_each_dirent<E>(
         &self,
         inode: u64,
@@ -837,9 +735,8 @@ impl<T: FileSystem> Posix<T> {
         lock(&self.inodes).forget(inode, count);
     }
 
-    /// The path behind an inode, or [`NotFound`](io::ErrorKind::NotFound) if we have
-    /// forgotten it (or never issued it). Drops the lock before returning so callers
-    /// never hold it across store work.
+    /// The path behind an inode, or [`NotFound`](io::ErrorKind::NotFound) if forgotten or never
+    /// issued. Drops the lock so callers never hold it across store work.
     fn path_of(&self, inode: u64) -> io::Result<PathBuf> {
         lock(&self.inodes)
             .path_of(inode)
@@ -848,17 +745,16 @@ impl<T: FileSystem> Posix<T> {
 
     /// The path and options behind an `fh`, or [`bad_handle`] if it is closed.
     ///
-    /// Resolved through the *inode*, never from a path recorded at open time. That is
-    /// what makes an open follow its file: a rename rewrites the inode's path, and the
-    /// next read through this handle finds the file where it went.
+    /// Resolved through the *inode*, never a path recorded at open, so an open follows its file
+    /// through a rename.
     fn open_of(&self, fh: u64) -> io::Result<(PathBuf, OpenOptions)> {
         let open = lock(&self.opens).get(fh).ok_or_else(bad_handle)?;
         Ok((self.path_of(open.inode)?, open.options))
     }
 }
 
-/// One live inode: the path it maps to and how many outstanding kernel references
-/// (successful `lookup`s not yet balanced by `forget`) it holds.
+/// One live inode: its path and outstanding kernel references (`lookup`s not yet balanced by
+/// `forget`).
 struct InodeData {
     path: PathBuf,
 
@@ -867,30 +763,26 @@ struct InodeData {
 
 /// The bidirectional inode<->path map plus a monotonic number allocator.
 ///
-/// `next` only ever increases, so a number is never reused even after its entry is
-/// forgotten. That keeps every *live* inode unique within the mount and sidesteps
-/// generation churn — u64 won't wrap in any realistic lifetime.
+/// `next` only increases, so a number is never reused, even after being forgotten; live inodes
+/// stay unique without generation churn, and u64 won't wrap in practice.
 pub(in crate::fs) struct InodeTable {
-    /// inode -> path + reference count. The authority for "what does this inode mean";
-    /// every FUSE call that receives only an inode resolves through it.
+    /// inode -> path + reference count; the authority every inode-only call resolves through.
     fwd: HashMap<u64, InodeData>,
 
-    /// path -> inode, so a repeated `lookup` of the same path reuses its inode instead
-    /// of minting a second one (which would break dedup by `st_ino`).
+    /// path -> inode, so a repeated `lookup` reuses its inode; a second one would break dedup
+    /// by `st_ino`.
     rev: HashMap<PathBuf, u64>,
 
-    /// The next number to hand out.
     next: u64,
 
-    /// Numbers [`number_for`](Self::number_for) minted, oldest first, so the ones
-    /// nothing ever claimed can be recycled.
+    /// Numbers [`number_for`](Self::number_for) minted, oldest first, so unclaimed ones can be
+    /// recycled.
     provisional: VecDeque<u64>,
 }
 
-/// How many advertised-but-unclaimed numbers to keep before recycling the oldest. At
-/// roughly 200 bytes an entry this caps them near 13 MB, which holds a full walk of most
-/// single repositories — inside it, the number `readdir` advertised is still the one a
-/// later `lookup` returns.
+/// Advertised-but-unclaimed numbers kept before recycling the oldest. At ~200 bytes each this
+/// caps them near 13 MB, enough for a full walk of most repositories, within which `readdir`'s
+/// numbers still match a later `lookup`.
 const MAX_PROVISIONAL_INODES: usize = 64 * 1024;
 
 impl InodeTable {
@@ -916,38 +808,34 @@ impl InodeTable {
 
     /// The number `path` already has, without minting one.
     ///
-    /// [`number_for`](Self::number_for) is the other spelling and mints; this one answers "does
-    /// the kernel know this name" and has to be able to say no.
+    /// Answers "does the kernel know this name", so it must be able to say no.
     pub(in crate::fs) fn number_of(&self, path: &Path) -> Option<u64> {
         self.rev.get(path).copied()
     }
 
-    /// The path an inode maps to, or `None` if we've forgotten it (or never issued it).
+    /// The path an inode maps to, or `None` if forgotten or never issued.
     pub(in crate::fs) fn path_of(&self, inode: u64) -> Option<PathBuf> {
         self.fwd.get(&inode).map(|data| data.path.clone())
     }
 
     /// Drop the *name* → inode mapping for `path`, keeping the inode itself.
     ///
-    /// A file later created at the same path is a different file and must get a
-    /// different number, or the kernel's cache conflates the two.
+    /// A file later created at the path must get a different number, or the kernel's cache
+    /// conflates the two.
     ///
-    /// The forward entry stays on purpose: the kernel may still hold references to the removed
-    /// file and will send its `forget` eventually, and a number it is holding must not be handed
-    /// to something else in the meantime. It is reclaimed when that `forget` arrives, as it
-    /// would have been anyway.
+    /// The forward entry stays: the kernel may still hold the number, which must not be reused
+    /// before its `forget` arrives and reclaims it.
     ///
-    /// This is the path for a file nothing had open. One that was open is *moved* rather than
-    /// removed and so keeps both mappings — see [`Posix::unlink_child`].
+    /// For unopened files only; an open one is moved aside instead (see
+    /// [`Posix::unlink_child`]).
     pub(in crate::fs) fn evict_path(&mut self, path: &Path) {
         self.rev.remove(path);
     }
 
     /// [`evict_path`](Self::evict_path) for `prefix` and everything beneath it.
     ///
-    /// `rmdir` succeeding means the *store* sees an empty directory; this table can still
-    /// hold descendants interned by an earlier listing, and leaving them would let a
-    /// rebuilt subtree resolve to the old numbers.
+    /// A successful `rmdir` means the *store* saw an empty directory, but this table may still
+    /// hold descendants from an earlier listing, which a rebuilt subtree would resolve to.
     pub(in crate::fs) fn evict_subtree(&mut self, prefix: &Path) {
         self.rev.retain(|path, _| !path.starts_with(prefix));
     }
@@ -955,37 +843,25 @@ impl InodeTable {
     /// Move the inode↔path mapping for `from`, and everything beneath it, onto `to`,
     /// keeping every number.
     ///
-    /// Not an eviction, and that distinction is the whole point. `unlink` and `rmdir` may
-    /// drop a mapping because the entry is *gone* and the kernel will never quote its
-    /// number again. A rename moves a live object: the kernel updates its own dentry
-    /// cache and goes on using the same inode, so dropping the mapping would turn its
-    /// next `getattr` into `ESTALE`.
+    /// Not an eviction: a renamed object is live, and the kernel keeps using its inode, so
+    /// dropping the mapping would make its next `getattr` `ESTALE`.
     ///
-    /// The destination's own names are dropped first — whatever was there has been
-    /// replaced. `evict_subtree` rather than [`evict_path`](Self::evict_path) for the
-    /// same reason `rmdir` uses it: an earlier listing may have interned descendants the
-    /// store no longer sees.
+    /// The destination's names are dropped first, as replaced, with `evict_subtree` because an
+    /// earlier listing may have interned descendants the store no longer has.
     ///
-    /// One operation rather than two, because two cannot be sequenced safely: evicting
-    /// `to` first *also* wipes the source whenever the paths overlap, leaving `fwd`
-    /// populated and `rev` empty — after which the next `lookup` mints a second number
-    /// for a path the table already knew, which is exactly what `rev` exists to prevent.
+    /// One operation, because evicting `to` separately would also wipe an overlapping source,
+    /// leaving `fwd` populated and `rev` empty so the next `lookup` mints a duplicate number.
     pub(in crate::fs) fn rekey_subtree(&mut self, from: &Path, to: &Path) {
-        // Overlapping moves do nothing. A store refuses them all (`EINVAL` for a
-        // directory into its own descendant, `ENOTEMPTY` for the reverse, a no-op for a
-        // self-rename), so this is a backstop, not the rule — and leaving the table
-        // untouched is the only safe answer when the two subtrees are not disjoint.
-        // `from` being the root is covered for free: every path starts with `/`, so `to`
-        // is always below it.
+        // Overlapping moves do nothing: a backstop, since stores refuse them all (`EINVAL` into
+        // a descendant, `ENOTEMPTY` the reverse, no-op for self-rename), and untouched is the
+        // only safe answer. A root `from` is covered, as every `to` starts with `/`.
         if from == to || to.starts_with(from) || from.starts_with(to) {
             return;
         }
         self.evict_subtree(to);
 
-        // Rebase a path that lives under `from`. `strip_prefix` yields `""` for `from`
-        // itself, and `to.join("")` would append a separator — harmless, since `Path`
-        // equality ignores one, but it makes every later `Debug` and error message read
-        // wrong.
+        // `from` itself strips to `""`, and `to.join("")` would add a trailing separator that
+        // `Path` equality ignores but `Debug` and error messages show.
         let rebase = |path: &Path| -> Option<PathBuf> {
             let rest = path.strip_prefix(from).ok()?;
             Some(if rest.as_os_str().is_empty() {
@@ -995,13 +871,13 @@ impl InodeTable {
             })
         };
 
-        // The path is a *field* here, so rewriting it in place keeps the number.
+        // The path is a field here, so rewrite in place...
         for data in self.fwd.values_mut() {
             if let Some(moved) = rebase(&data.path) {
                 data.path = moved;
             }
         }
-        // ...and the *key* there, so the entries have to be reinserted.
+        // ...but a key here, so reinsert.
         let moved: Vec<(PathBuf, u64)> = self
             .rev
             .iter()
@@ -1019,9 +895,8 @@ impl InodeTable {
                 data.lookup_count += 1;
                 return inode;
             }
-            // The two maps drifted. Mint a new number rather than unwrapping: a panic
-            // here happens under the table's lock, and see `crate::lock` for why one
-            // such panic can take the whole mount with it.
+            // The maps drifted. Mint a new number rather than panic under the table's lock,
+            // which could cascade through nested locks to the whole mount.
             self.rev.remove(&path);
         }
         let inode = self.next;
@@ -1037,20 +912,15 @@ impl InodeTable {
         inode
     }
 
-    /// The inode number `lookup` would assign to `path`, allocating a fresh number if
-    /// it's new — but **without** taking a kernel reference.
+    /// The inode `lookup` would assign to `path`, minting one if new, **without** taking a
+    /// kernel reference, so `readdir`'s `ino`s match later `lookup`s.
     ///
-    /// `readdir` needs this: each listed child's `ino` must match the inode a later
-    /// `lookup` returns, yet readdir (unlike lookup) must not bump the reference count.
-    ///
-    /// Entries start at `lookup_count == 0`, and the kernel never sends `forget` for an
-    /// inode it did not look up, so nothing else would ever reclaim them — one `ls` of a
-    /// large directory would strand an entry per child. Hence the queue: past
+    /// Entries start at `lookup_count == 0` and the kernel never `forget`s what it did not look
+    /// up, so one `ls` of a large directory would strand an entry per child. Hence past
     /// [`MAX_PROVISIONAL_INODES`] the oldest unclaimed number is recycled.
     ///
-    /// A recycled number means a later `lookup` of that path answers with a different
-    /// one than `readdir` advertised. Numbers themselves are still never reused, which is
-    /// what lets each binding report `generation: 0`.
+    /// A recycled entry makes a later `lookup` answer a different number than `readdir`
+    /// advertised, but numbers are never reused, so bindings can report `generation: 0`.
     pub(in crate::fs) fn number_for(&mut self, path: PathBuf) -> u64 {
         if let Some(&inode) = self.rev.get(&path) {
             return inode;
@@ -1065,7 +935,7 @@ impl InodeTable {
             },
         );
         self.rev.insert(path, inode);
-        // One in, at most one out, so the queue never passes the cap.
+        // One in, at most one out, so the queue stays at the cap.
         self.provisional.push_back(inode);
         if self.provisional.len() > MAX_PROVISIONAL_INODES
             && let Some(oldest) = self.provisional.pop_front()
@@ -1075,11 +945,11 @@ impl InodeTable {
         inode
     }
 
-    /// Drop `count` kernel references to `inode`, evicting it once none remain. A no-op
-    /// for inodes we don't know (already forgotten, or never issued).
+    /// Drop `count` kernel references to `inode`, evicting it once none remain; unknown
+    /// inodes are ignored.
     ///
-    /// The root is exempt: the kernel holds it for the life of the mount, and evicting it
-    /// would strand every path that resolves through it.
+    /// The root is exempt: the kernel holds it for the mount's life, and every path resolves
+    /// through it.
     pub(in crate::fs) fn forget(&mut self, inode: u64, count: u64) {
         if inode == ROOT_INODE {
             return;
@@ -1101,9 +971,8 @@ impl InodeTable {
         }
         let path = data.path.clone();
         self.fwd.remove(&inode);
-        // `evict_path` drops the name and keeps the entry, so a second inode may hold
-        // this path by now. Taking its name would leave it live and unreachable, and the
-        // next lookup would mint a third.
+        // After `evict_path` another inode may own this path; removing its name would leave it
+        // unreachable and the next lookup would mint a third.
         if self.rev.get(&path) == Some(&inode) {
             self.rev.remove(&path);
         }
@@ -1112,9 +981,8 @@ impl InodeTable {
 
 /// One open file: which inode it is an open *of*, and what it was opened for.
 ///
-/// The inode rather than the path, so a rename carries the open with it. The options
-/// rather than nothing, because the access mode is enforced here now: a store sees a
-/// read and a write and has no way to know which descriptor asked.
+/// The inode, not the path, so a rename carries the open. The options because the access mode
+/// is enforced here; a store cannot tell which descriptor asked.
 #[derive(Clone, Copy)]
 struct Open {
     inode: u64,
@@ -1124,8 +992,8 @@ struct Open {
 
 /// The open-file table: one entry per file handle (`fh`) the kernel holds.
 ///
-/// Entries are `Copy` and tiny, so a caller takes one out, drops the lock, and then does
-/// the (possibly slow) store I/O without blocking other opens.
+/// Entries are `Copy` and tiny, so a caller copies one out and drops the lock before slow
+/// store I/O.
 pub(in crate::fs) struct OpenTable {
     open: HashMap<u64, Open>,
     next: u64,
@@ -1133,15 +1001,14 @@ pub(in crate::fs) struct OpenTable {
 
 impl OpenTable {
     fn new() -> Self {
-        // Start at 1; 0 is a convenient "no handle" sentinel.
+        // 0 is reserved as a "no handle" sentinel.
         OpenTable {
             open: HashMap::new(),
             next: 1,
         }
     }
 
-    /// Register `open`, returning the `fh` the kernel will quote on later
-    /// read/write/release calls.
+    /// Register `open`, returning the `fh` the kernel quotes on later calls.
     fn insert(&mut self, open: Open) -> u64 {
         let fh = self.next;
         self.next += 1;
@@ -1154,21 +1021,21 @@ impl OpenTable {
         self.open.get(&fh).copied()
     }
 
-    /// Forget `fh`, and say what it was an open of — which is what tells a caller whether a
-    /// file held aside by an `unlink` may now go.
+    /// Forget `fh`, returning what it opened so a caller can tell whether a held-aside file
+    /// may now go.
     fn remove(&mut self, fh: u64) -> Option<Open> {
         self.open.remove(&fh)
     }
 
     /// Whether any open handle names `inode`.
     ///
-    /// A scan, over one entry per open file handle. The alternative is a second index kept in
-    /// step with this one, for a question asked once per `unlink` and once per `release`.
+    /// A linear scan: asked only once per `unlink` and `release`, which does not justify a
+    /// second index to keep in step.
     fn any_on(&self, inode: u64) -> bool {
         self.open.values().any(|open| open.inode == inode)
     }
 
-    /// How many handles are open — the invariant a `release` is supposed to keep.
+    /// How many handles are open, for checking that `release` keeps the table balanced.
     fn len(&self) -> usize {
         self.open.len()
     }
@@ -1178,17 +1045,15 @@ impl OpenTable {
 mod tests {
     use super::*;
 
-    /// A binding's numbering is a binding's business — these three are simply the ones
-    /// the table names, so any host's values serve here.
+    /// Any host's values serve; numbering is a binding's concern.
     const BITS: OpenFlagBits = OpenFlagBits {
         truncate: 0o1000,
         create: 0o100,
         create_new: 0o200,
     };
 
-    /// `O_APPEND` is the flag this contract deliberately does not name, and not naming
-    /// it must not amount to granting write: `O_RDONLY | O_APPEND` is a read-only
-    /// descriptor, and it is [`Posix::write_handle`] that reads the difference.
+    /// `O_RDONLY | O_APPEND` is read-only: leaving `O_APPEND` unmodelled must not grant write,
+    /// which [`Posix::write_handle`] enforces.
     #[test]
     fn an_append_style_open_is_not_permission_to_write() {
         const O_APPEND: i32 = 0o2000;
@@ -1197,8 +1062,7 @@ mod tests {
         assert!(!options.intends_write());
     }
 
-    /// What a read-only backend refuses on. Each flag answers for itself, so a dropped
-    /// term would otherwise go unnoticed — nothing else in the crate calls this.
+    /// Each flag is checked alone, since nothing else in the crate would notice a dropped term.
     #[test]
     fn every_flag_but_read_means_modification() {
         let ro = OpenOptions::read_only();

@@ -1,20 +1,17 @@
 //! Node bindings for cortex, built with napi-rs.
 //!
-//! The shape is cortex's own, spelled in JavaScript: a [`ConsoleClient`](cortex::console::ConsoleClient)
-//! is built by a builder and awaited, a [`Directory`](cortex::fs::Directory) is assembled
-//! and handed to a host mount, a [`Recipe`](cortex::image::Recipe) is a base and its steps,
-//! and an [`ImageClient`](cortex::image::ImageClient) builds one ahead of the session that
-//! runs on it. Names are camelCased and nothing else changes — a caller reading cortex's Rust
-//! documentation should find the same names doing the same things.
+//! The API is cortex's own with camelCased names, so cortex's Rust docs apply: a
+//! [`ConsoleClient`](cortex::console::ConsoleClient) is built by a builder and awaited, a
+//! [`Directory`](cortex::fs::Directory) is assembled and handed to a host mount, a
+//! [`Recipe`](cortex::image::Recipe) is a base plus steps, and an
+//! [`ImageClient`](cortex::image::ImageClient) builds images ahead of the sessions that run on them.
 //!
-//! One module per half, as in the crate: [`console`] for running commands, [`fs`] for the
-//! trees they see, [`image`] for what they run on and the client that builds it, and [`error`] for how either half's
-//! failures arrive as JavaScript errors.
-
+//! Modules mirror the crate: [`console`] runs commands, [`fs`] builds the trees they see,
+//! [`image`] covers what they run on and the client that builds it, and [`error`] maps failures
+//! to JavaScript errors.
 //!
-//! The modules are public for a binding that links this crate into an addon of its own — see
-//! the `rlib` in `Cargo.toml`. Linking it is all that takes: napi registers every class here
-//! into whichever addon it is linked into.
+//! The modules are public for a binding that links this crate into its own addon (the `rlib` in
+//! `Cargo.toml`). Linking is enough: napi registers every class here into whichever addon links it.
 
 pub mod console;
 #[cfg(feature = "ensure")]

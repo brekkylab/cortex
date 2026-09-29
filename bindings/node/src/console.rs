@@ -1,42 +1,36 @@
-//! `ConsoleClient`, its builder, and what its calls answer with.
+//! `ConsoleClient`, its builder, and their results.
 //!
-//! Every call that waits returns a `Promise`, settled on the tokio runtime napi keeps: a
-//! stdio client spawns its server and reads from it, and both need a reactor under them.
+//! Every call that waits returns a `Promise` settled on napi's tokio runtime: a stdio client
+//! spawns its server and reads from it, which needs a reactor.
 //!
 //! # Why not `async fn`
 //!
-//! napi's `async fn` and `spawn_future` reject with a [`Status`](napi::Status), which
-//! becomes the error's `code` — and the codes a caller acts on are cortex's (`TIMED_OUT`,
-//! `CONSOLE_BROKEN`), not napi's. So [`promise`] runs the future to a plain `Result` and
-//! turns an `Err` into the JavaScript error once it is back on the main thread, where one
-//! can be made. It also means the synchronous part of a call happens when the call is made:
-//! `build()` takes the builder then, not whenever the runtime gets to the future.
+//! napi's `async fn` and `spawn_future` reject with a [`Status`](napi::Status) as the error's
+//! `code`, but the codes a caller acts on are cortex's (`TIMED_OUT`, `CONSOLE_BROKEN`). So
+//! [`promise`] runs the future to a plain `Result` and builds the JavaScript error back on the
+//! main thread, where one can be made. The synchronous part of a call runs when it is made:
+//! `build()` takes the builder immediately, not when the runtime polls the future.
 //!
 //! # Where the console lives
 //!
-//! A promise's future has to be `'static`, so it cannot borrow the object it was started
-//! from. The console is therefore behind an `Arc<Mutex<..>>` that each call clones into its
-//! future — which also makes calls take turns, as `&mut self` does in Rust: one channel
-//! carries one call at a time, and a second `exec` started alongside the first waits for it
-//! rather than interleaving with it.
+//! A promise's future must be `'static`, so each call clones an `Arc<Mutex<..>>` into it. The
+//! lock also makes calls take turns, as `&mut self` does in Rust: one channel carries one call,
+//! so a second `exec` waits for the first rather than interleaving with it.
 //!
 //! # How it ends
 //!
-//! [`ConsoleClient`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
-//! off one — which is where a garbage-collection finalizer runs. So [`JsConsoleClient`] keeps the
-//! handle of the runtime the console was built on and enters it before letting go, and a
-//! console that is collected ends the same way as one that is closed. `close()` is there for
-//! a caller who wants that moment to be a line in their program rather than whenever the
-//! collector gets to it.
+//! [`ConsoleClient`]'s `Drop` says `quit` only when dropped on a runtime, and a garbage-collection
+//! finalizer runs off one. So [`JsConsoleClient`] keeps the handle of the runtime it was built on
+//! and enters it before letting go: a collected console ends the same way as a closed one.
+//! `close()` ends it at a chosen line instead of whenever the collector runs.
 //!
 //! # Who else holds it
 //!
-//! The slot is an `Arc<Mutex<Option<ConsoleClient>>>` rather than a type of this module's own,
-//! because that is the shape an agent holds its console in — ailoy's `AgentState::console` —
-//! and a binding that links this crate hands [`JsConsoleClient::slot`] to one. The two then share
-//! one session: calls from either side take turns on the lock, and `close()` ends it for both.
-//! Whichever lets go last ends it, so a holder other than this one owes the same runtime
-//! entry on drop — [`JsConsoleClient::runtime`] is the handle to enter.
+//! The slot is a plain `Arc<Mutex<Option<ConsoleClient>>>` because that is the shape an agent
+//! holds its console in (ailoy's `AgentState::console`), so a binding that links this crate can
+//! hand [`JsConsoleClient::slot`] to one. Both then share one session: calls take turns on the
+//! lock, and `close()` ends it for both. Whichever holder lets go last ends it, so any other
+//! holder must also drop it inside [`JsConsoleClient::runtime`].
 
 use std::{future::Future, sync::Arc};
 
@@ -57,9 +51,9 @@ use crate::{
     image::{ImageSourceLike, image_source},
 };
 
-/// Run `fut` on napi's runtime, rejecting with the error it answers — `code` and all.
+/// Run `fut` on napi's runtime, rejecting with its error's own `code`.
 ///
-/// Public for a binding that links this crate, whose errors want the same treatment.
+/// Public for bindings that link this crate.
 pub fn promise<'env, T, F>(env: &'env Env, fut: F) -> napi::Result<PromiseRaw<'env, T>>
 where
     T: ToNapiValue + Send + 'static,
@@ -70,7 +64,7 @@ where
     })
 }
 
-/// What a synchronous error of ours is on a path that answers in napi's own.
+/// Our error as a thrown JavaScript error, for paths that must return napi's own error type.
 pub fn thrown(env: &Env, error: napi::Error<String>) -> napi::Error {
     napi::Error::from(JsError::from(error).into_unknown(*env))
 }
@@ -124,9 +118,8 @@ impl JsNetworkAccess {
 
 /// A [`ConsoleClientBuilder`], filled in place and emptied by `build()`.
 ///
-/// In place rather than by value, unlike `Recipe`: the Rust builder is consumed by each call
-/// and is not `Clone`, so there is exactly one of it to hand along. Each method returns the
-/// same object so calls chain as they do in Rust.
+/// Mutated in place because the Rust builder is consumed by each call and is not `Clone`.
+/// Every method returns this same object, so calls chain.
 #[napi(js_name = "ConsoleClientBuilder")]
 pub struct JsConsoleClientBuilder(Option<ConsoleClientBuilder>);
 
@@ -231,7 +224,7 @@ impl JsConsoleClientBuilder {
         self.update(this, |b| Ok(b.disk_gib(disk_gib)))
     }
 
-    /// Announce the session, and settle with the `ConsoleClient` the server answered.
+    /// Announce the session to the server and settle with the resulting `ConsoleClient`.
     #[napi(ts_return_type = "Promise<ConsoleClient>")]
     pub fn build<'env>(
         &mut self,
@@ -262,16 +255,16 @@ pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 pub struct JsConsoleClient {
     console: Slot,
 
-    /// The runtime the console was built on, which is where its `quit` has to go out.
+    /// The runtime the console was built on; its `quit` must go out from there.
     runtime: Handle,
 
-    /// [`ConsoleClient::mounts`], read once: the paths are fixed when the session is announced, and
-    /// a getter that had to await the lock for them would make them a promise.
+    /// [`ConsoleClient::mounts`], cached: fixed once the session is announced, and a getter
+    /// that awaited the lock would have to return a promise.
     mounts: Vec<String>,
 }
 
 impl JsConsoleClient {
-    /// Built inside the future `build()` runs, so the current runtime is the one to keep.
+    /// Must run inside `build()`'s future, since it keeps the current runtime.
     fn new(console: ConsoleClient) -> Self {
         JsConsoleClient {
             mounts: console
@@ -283,7 +276,7 @@ impl JsConsoleClient {
         }
     }
 
-    /// The slot this console is held in, for a holder that shares it — see the module docs.
+    /// The slot this console lives in, for sharing it with another holder (see module docs).
     pub fn slot(&self) -> Slot {
         self.console.clone()
     }
@@ -294,8 +287,7 @@ impl JsConsoleClient {
     }
 }
 
-/// What makes dropping the last holder say `quit`: the console is let go of on the runtime.
-/// A holder that is not the last leaves it to whichever is.
+/// Only the last holder drops the console, inside its runtime so `quit` goes out.
 impl Drop for JsConsoleClient {
     fn drop(&mut self) {
         if let Some(slot) = Arc::get_mut(&mut self.console) {
@@ -437,7 +429,7 @@ impl JsConsoleClient {
     pub fn close<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, ()>> {
         let console = self.console.clone();
         promise(env, async move {
-            // Dropped here, on the runtime, which is what lets `quit` go out.
+            // Dropping on the runtime is what lets `quit` go out.
             console.lock().await.take();
             Ok(())
         })

@@ -1,15 +1,14 @@
 //! Python bindings for cortex, imported as `cortex._cortex`.
 //!
-//! The shape is cortex's own, spelled in Python: a [`ConsoleClient`](cortex::console::ConsoleClient)
-//! is built by a builder and awaited, a [`Directory`](cortex::fs::Directory) is assembled and
-//! handed to a host mount, a [`Recipe`](cortex::image::Recipe) is a base and its steps, and an
-//! [`ImageClient`](cortex::image::ImageClient) builds one ahead of the session that runs on it.
-//! Nothing here adds a layer of its own over that — a Python caller reading cortex's Rust
-//! documentation should find the same names doing the same things.
+//! The API is cortex's own with no extra layer, so cortex's Rust docs apply: a
+//! [`ConsoleClient`](cortex::console::ConsoleClient) is built by a builder and awaited, a
+//! [`Directory`](cortex::fs::Directory) is assembled and handed to a host mount, a
+//! [`Recipe`](cortex::image::Recipe) is a base plus steps, and an
+//! [`ImageClient`](cortex::image::ImageClient) builds images ahead of the sessions that run on them.
 //!
-//! One module per half, as in the crate: [`console`] for running commands, [`fs`] for the
-//! trees they see, [`image`] for what they run on and the client that builds it, and [`error`] for how either half's
-//! failures arrive as exceptions.
+//! Modules mirror the crate: [`console`] runs commands, [`fs`] builds the trees they see,
+//! [`image`] covers what they run on and the client that builds it, and [`error`] maps failures
+//! to exceptions.
 
 use pyo3::prelude::*;
 
@@ -27,8 +26,8 @@ fn _cortex(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 /// Add every class, exception and constant this module has to `m`.
 ///
-/// The module's own init, and also what a binding that links this crate calls to put cortex
-/// into an extension of its own — see the `rlib` in `Cargo.toml`.
+/// Called by this module's init, and by a binding that links this crate into its own extension
+/// (the `rlib` in `Cargo.toml`).
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(m)?;
     image::register(m)?;

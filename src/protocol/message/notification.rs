@@ -1,38 +1,19 @@
-//! The methods nothing answers, all three of them.
+//! The methods nothing answers.
 //!
-//! [`Notification`] is which one a message names, and the three types below say what
-//! each carries. One file rather than four, because each of these is a name and a
-//! paragraph and nothing else — there is no `params` type to grow, no `result` to pair
-//! it with. What they have to say is mostly about *each other*: [`Start`] and [`Stop`]
-//! are two ends of the same trade, and [`Quit`] is the one that is not that trade at
-//! all.
+//! [`Start`] and [`Stop`] are **resource management only**: a call that needs a booted
+//! session boots one, so they change what the far end holds, never what a session can do.
+//! [`Quit`] ends the session.
 //!
-//! [`Start`] and [`Stop`] are **the protocol's resource management, and only that**.
-//! Neither changes what a session can do — a call that needs a booted session boots one,
-//! so a client that sends neither runs the same commands to the same results. What they
-//! change is what the far end is *holding*, and when it paid to hold it. Neither is a
-//! question, which is why neither is answered: what a client does next is the same
-//! either way. [`Quit`] is the session ending, which a closed channel says better than
-//! any response could.
-//!
-//! Each is a type with no members rather than no type at all, so that every method has
-//! one place where what it carries is written down, and giving one a parameter later is
-//! a field and not a shape that did not exist.
+//! Each has a member-less type so every method has one place its params are written, and
+//! adding a parameter later is a field rather than a new shape.
 
 use bson::Bson;
 use serde::{Deserialize, Serialize, de, ser::SerializeMap};
 
 use super::Method;
 
-/// A method that is not answered.
-///
-/// A notification is a method with no `id`, and so no response, no error and no result
-/// — which makes it the right shape for exactly one kind of thing: what is true whether
-/// or not the other end acknowledges it. All three here are that, and [`Start`],
-/// [`Stop`] and [`Quit`] below argue each of them.
-///
-/// Which side a method is on is what JSON-RPC's `id` decides, so it is a decision a
-/// method has to make rather than inherit: [`Call`](super::Call) is the other one.
+/// A method with no `id`, so no response, error or result: for what holds whether or
+/// not the other end acknowledges it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Notification {
     /// **client → server.** Boot now, so that no command has to. See [`Start`].
@@ -56,9 +37,7 @@ impl Notification {
 
     /// Writes this notification's `params` into the object being serialized.
     ///
-    /// Nothing carries any today, and the match is what makes that a decision
-    /// rather than an omission: a notification added later cannot compile without
-    /// saying what it sends.
+    /// None carry any; the exhaustive match forces a new notification to say what it sends.
     pub(super) fn serialize_params<M: SerializeMap>(&self, _map: &mut M) -> Result<(), M::Error> {
         match self {
             Notification::Start | Notification::Stop | Notification::Quit => Ok(()),
@@ -67,9 +46,8 @@ impl Notification {
 
     /// The notification a `method` and its `params` name.
     ///
-    /// Reached only for a message that carried no `id`, which is what says nothing
-    /// will answer it — so a request's method arriving here is a peer that has
-    /// asked for something and left no way to be told.
+    /// Reached only for a message without an `id`, so a request's method here is refused:
+    /// the peer asked for something and left no way to answer.
     pub(super) fn from_params<E: de::Error>(method: Method, _params: Bson) -> Result<Self, E> {
         match method {
             Method::Start => Ok(Notification::Start),
@@ -82,54 +60,34 @@ impl Notification {
 
 /// Boot now, so that no command has to. The `params` of `start`, which are none.
 ///
-/// **What it buys is hiding the cold start.** An [`ExecCall`](super::ExecCall), a
-/// [`ReadCall`](super::ReadCall) and a [`WriteCall`](super::WriteCall) each need a booted session and
-/// each boot one if there is none, so nothing here is required and nothing is unlocked
-/// by it. What moves is *who waits*: a backend with a kernel to bring up makes the first
-/// command pay for that in its own latency, and a client that says this as soon as it
-/// has a console pays for it in parallel with whatever it is doing meanwhile — choosing
-/// what to run, waiting on a model, reading a file.
+/// Hides the cold start: [`ExecCall`](super::ExecCall), [`ReadCall`](super::ReadCall)
+/// and [`WriteCall`](super::WriteCall) boot on demand, so this only lets the boot overlap
+/// with the client's other work instead of the first command's latency.
 ///
-/// Which is also why nothing answers it. There is no state a client is entitled to hear
-/// about — a session that failed to boot and one that has not booted yet are the same
-/// session, since the next call that needs one will try again — so a failure goes to
-/// whoever asks for that call, as [`BOOT_FAILED`](super::Error::BOOT_FAILED). That is
-/// the end that was waiting on something and the end that can do something about it.
+/// Unanswered because a failed boot and a not-yet-attempted one are the same session: the
+/// next call that needs a boot retries and gets [`BOOT_FAILED`](super::Error::BOOT_FAILED).
 ///
-/// Sent to a session that is already booted, it does nothing.
+/// No-op on an already-booted session.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Start;
 
 /// Release what booting took. The `params` of `stop`, which are none.
 ///
-/// **What it buys is not occupying anything while nothing is being run.** Much what
-/// stopping a VM is: the guest goes away, the tree is unmounted, and a scratch directory
-/// is cleaned up by whoever made it rather than left for someone to find later. Those are
-/// memory, descriptors and disk on the far end, held for as long as the session is booted
-/// and useful only while something is running — so a client that knows it will be idle for
-/// a while is worth letting say so.
+/// The guest goes away, the tree is unmounted, and the scratch directory is cleaned up
+/// by whoever made it. Worth sending before a long idle stretch, not between commands.
 ///
-/// Optional and reversible, like [`Start`] and for the same reason: the next call that
-/// needs a booted session gets one, under the same [`InitCall`](super::InitCall). Handing
-/// resources back therefore costs a client nothing but the boot it will pay for again —
-/// which is the trade it is making, and the reason this is worth sending when the idle
-/// stretch is long and not when it is two commands apart.
+/// Optional and reversible: the next call that needs a booted session boots again under
+/// the same [`InitCall`](super::InitCall), so the only cost is that boot. A stopped
+/// session is still a session; ending the process is [`Quit`].
 ///
-/// So this is a release and not a close: ending the *process* is [`Quit`], and a session
-/// that is merely stopped is still a session.
-///
-/// Nothing here is about a single execution. To give up on one of those, let its
-/// [`timeout_ms`](super::ExecCall::timeout_ms) expire.
+/// Does not cancel an execution; that is [`timeout_ms`](super::ExecCall::timeout_ms)'s job.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stop;
 
 /// The session is over; exit. The `params` of `quit`, which are none.
 ///
-/// There is nothing a process can say after this that a closed channel does not say
-/// better — which is exactly why it is a notification. Sending it at all is what lets
-/// the other end tell a finished session from a peer that died.
-///
-/// A server on its way out releases whatever a [`Stop`] would have released, so an
-/// ending is one message and not two.
+/// Unanswered, since a closed channel says the rest; sending it lets the other end tell
+/// a finished session from a dead peer. The server also releases what a [`Stop`] would,
+/// so ending takes one message.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quit;

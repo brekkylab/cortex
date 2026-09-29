@@ -1,19 +1,13 @@
 # Publish `/abin` — cortex's own executables, built for the guest.
 #
-# The release is named by the commit this runs on, so what gets checked out is what gets
-# published: a release event checks out the tagged commit, a dispatch checks out whatever ref
-# was chosen. `scripts/abin-release.sh` is the whole of the work; this file only arranges for
-# it to have a toolchain and credentials, and splits it across a matrix.
+# The release is named by the commit checked out: the tagged commit on a release event, the
+# chosen ref on a dispatch. `scripts/abin-release.sh` does the work; this file supplies a
+# toolchain and credentials and splits it across a matrix.
 #
-# # Why moving `abin/latest` is a job of its own
-#
-# `abin/latest` holds the sha of the release a session uses when it has been told nothing —
-# the **latest-pointer**. It must name a release that is *completely* uploaded, so each
-# `build` job uploads only its own OS's tarballs and is told `--no-latest-pointer`, and the
-# `latest-pointer` job runs after all of them and moves it once.
-#
-# A build that fails leaves its siblings' tarballs under a sha nothing refers to, which is
-# inert rather than broken — that is what makes the split safe.
+# `abin/latest` (the **latest-pointer**) holds the sha a session uses when told nothing, and
+# must name a fully uploaded release. So each `build` job uploads only its OS's tarballs with
+# `--no-latest-pointer`, and the `latest-pointer` job moves it once after all of them. A
+# failed build leaves tarballs under a sha nothing refers to, which is inert.
 name: abin release
 
 on:
@@ -26,17 +20,15 @@ on:
         type: boolean
         default: false
 
-# Never two releases at once: the second could move the latest-pointer while the first is
-# still uploading. Queued rather than cancelled, because a run stopped between its tarballs
-# and its latest-pointer leaves a state that is safe but untidy.
+# One release at a time, or a second could move the latest-pointer mid-upload. Queued, not
+# cancelled: a run stopped between tarballs and pointer leaves a safe but untidy state.
 concurrency:
   group: abin-release
   cancel-in-progress: false
 
 permissions:
   contents: read
-  # For the OIDC token `configure-aws-credentials` exchanges for a role. No long-lived key is
-  # stored anywhere for this.
+  # OIDC token `configure-aws-credentials` exchanges for a role; no long-lived key is stored.
   id-token: write
 
 env:
@@ -45,45 +37,37 @@ env:
 jobs:
   build:
     strategy:
-      # One entry today. The guest is Linux and the guest is the only consumer of `/abin`;
-      # a host build would be needed only if the local console server is ever given one.
-      #
-      # Adding macOS is this, plus a line in `ALL_OSES` in the script:
+      # Linux only: the guest is the only consumer of `/abin`. Adding macOS is this, plus a
+      # line in the script's `ALL_OSES`:
       #
       #   - os: macos
       #     runner: macos-15
       #     zig: false      # Apple's clang cross-compiles Mach-O for both arches
       #
-      # The key layout already carries the OS, so nothing published today has to move.
+      # Keys already carry the OS, so nothing published has to move.
       matrix:
         include:
           - os: linux
             runner: ubuntu-latest
-            # Linux/musl needs a C cross-compiler for `rusqlite`'s bundled SQLite, which is
-            # what zig supplies and what the host toolchain cannot.
+            # zig is the C cross-compiler `rusqlite`'s bundled SQLite needs for musl.
             zig: true
-      # Deliberate: one OS failing should not leave the others racing to finish uploads that
-      # the latest-pointer will never refer to.
+      # One OS failing stops the others uploading what the latest-pointer will never name.
       fail-fast: true
 
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
         with:
-          # Pinned to the run's own commit rather than a moving ref, so every job in this
-          # workflow builds and names the same release even if the branch moves underneath.
+          # The run's own commit, so every job builds the same release if the branch moves.
           ref: ${{ github.sha }}
-          # The script warns when the commit is on no remote branch, and a shallow clone has
-          # no remote-tracking branches to look in — it would warn on every run and mean
-          # nothing by it.
+          # The script warns when the commit is on no remote branch; a shallow clone has no
+          # remote-tracking branches, so it would warn on every run.
           fetch-depth: 0
 
       - name: Install zig and cargo-zigbuild
         if: matrix.zig
         env:
-          # Pinned by digest and checked. This workflow holds credentials that can write what
-          # every cortex guest executes, so what it runs is not left to whatever a mirror
-          # serves today.
+          # Pinned by digest: this job holds credentials that write what every guest executes.
           ZIG_VERSION: 0.16.0
           ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
         run: |
@@ -104,8 +88,7 @@ jobs:
             *) echo "no targets known for ${{ matrix.os }}" >&2; exit 1 ;;
           esac
 
-      # Skipped on a dry run, so the workflow can be exercised before the role exists — and
-      # so a build-only run never holds credentials it has no use for.
+      # Skipped on a dry run: works before the role exists, and holds no unneeded credentials.
       - name: Assume the publishing role
         if: ${{ !inputs.dry_run }}
         uses: aws-actions/configure-aws-credentials@v6
@@ -116,7 +99,7 @@ jobs:
       - name: Build and upload
         run: |
           set -euo pipefail
-          # `--no-latest-pointer` always: moving it is the `latest-pointer` job's, once every OS is in.
+          # The `latest-pointer` job moves it, once every OS is in.
           args=(--os "${{ matrix.os }}" --no-latest-pointer)
           if [ "${{ inputs.dry_run }}" = "true" ]; then
             args+=(--dry-run)
@@ -140,7 +123,6 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # No toolchain: this writes 41 bytes and compiles nothing, which is why the script
-      # checks for zig only when it is going to build.
+      # No toolchain needed: this writes one small object and compiles nothing.
       - name: Move the latest-pointer
         run: ./scripts/abin-release.sh --latest-pointer-only

@@ -332,8 +332,8 @@ async fn spans_left_behind_stop_counting_and_stop_being_kept() {
     }
 }
 
-/// Files read in turn each keep their span, so nothing is fetched twice. One slot could not;
-/// see [`OnedriveFs::held`]. Each file is larger than a span, so a constant [`READ_SPAN`]
+/// Files read in turn each keep their span, so nothing is fetched twice. See
+/// [`OnedriveFs::held`]. Each file is larger than a span, so a constant [`READ_SPAN`]
 /// would overrun the budget and the division is measured.
 #[tokio::test]
 async fn interleaved_files_each_keep_a_span() {
@@ -363,7 +363,7 @@ async fn interleaved_files_each_keep_a_span() {
     }
 
     // Nothing fetched twice, up to under a window of overlap per span boundary. No ceiling on
-    // the span count: reverting the share sizing fetches *fewer*, wastefully larger, spans.
+    // the span count: unshared, whole-`READ_SPAN` spans would be *fewer* but wasteful.
     let spans = mock.content_ranges().len() as u64;
     let waste = mock.bytes_sent().saturating_sub(3 * REAL);
     assert!(waste < spans * W, "{waste} wasted over {spans} spans");
@@ -878,8 +878,7 @@ fn find_item_by_id(tree: &Value, encoded: &str) -> Option<Value> {
 ///
 /// That last part is the one place this mock is deliberately as unhelpful as the service:
 /// Graph accepts a `$select` naming the URL by the key it answers under, and then omits it
-/// from every row without saying so. A mock that answered anyway would hide the mistake,
-/// which is exactly what it did until a live read failed.
+/// from every row without saying so. A mock that answered anyway would hide the mistake.
 fn with_host(row: &Value, host: &str, fresh: bool, query: &str) -> Value {
     let mut row = row.clone();
     let Some(u) = row.get(DOWNLOAD_URL_KEY).and_then(|u| u.as_str()) else {

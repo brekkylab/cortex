@@ -9,8 +9,7 @@
 //! It drives **backlot** (the server in `brekkylab/enterprise-mock`), which follows the real
 //! Drive, Docs, Sheets and Slides shapes over a corpus rather than a live account: paging
 //! cursors, `orderBy`, the ACL-filtered view a token sees, the error *statuses* Google
-//! actually returns. When backlot is corrected to match Google — as it was for `orderBy` in
-//! `enterprise-mock#28` — this is what notices.
+//! actually returns. When backlot changes to match Google, this is what notices.
 //!
 //! Skipped, not failed, when the host cannot be reached. A suite with no network stays
 //! green.
@@ -33,11 +32,11 @@
 //! sit under a parent whose id is shaped like a shared drive's root, and backlot answers
 //! `drives.list` with none, so no shared-drive section is built for them: they surface only
 //! through `Shared with me`, which runs past `MAX_FOLDER_FILES` and is truncated before
-//! reaching them. So the blob test below skips against this corpus, and will start running
-//! the day it gains one — the assertions are written and waiting.
+//! reaching them. So the blob test below skips against this corpus, and runs once it gains
+//! one.
 //!
-//! `FIRST_SPAN` is 8 MiB and `READ_SPAN` is 64 MiB in any case, so the policy that made a
-//! 641 MB archive readable could not be exercised at any size this corpus contains.
+//! `FIRST_SPAN` is 8 MiB and `READ_SPAN` is 64 MiB in any case, so the span policy cannot be
+//! exercised at any size this corpus contains.
 //!
 //! **What we asked for.** No server reports the number of requests it received back to its
 //! caller, or the `Range` header on each. Every claim of the form "eight windows, one
@@ -220,8 +219,7 @@ async fn gdrive_endpoint_reads_a_blob_at_the_offset_asked_for() {
 
     let Some((path, size)) = find_file(&fs, 64, |name| !name.ends_with(".json")).await else {
         // Expected against the corpus as it stands — see the note at the top of this file.
-        // Not an assertion, because the day a blob appears this should run rather than
-        // having been deleted for being inconvenient.
+        // Not an assertion, so the test runs the day a blob appears.
         eprintln!(
             "  no blob reachable in {WALK_DIRS} directories; \
              the corpus keeps its two behind a truncated listing"

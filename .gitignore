@@ -26,6 +26,5 @@ rustc-ice-*.txt
 # Generated docs write-ups (not versioned)
 docs/
 
-# Provider keys, for the tests and binaries that ask a model something. A key is a
-# credential and a credential is never a file in a tree anybody clones.
+# Provider keys for tests and binaries that call a model; credentials never go in the tree.
 .env

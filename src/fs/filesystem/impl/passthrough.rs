@@ -1,46 +1,41 @@
-//! A [`FileSystem`] store that passes every operation straight through to the real local
-//! filesystem via `std::fs`.
+//! A [`FileSystem`] store that passes every operation through to the local filesystem via
+//! `std::fs`.
 //!
-//! A [`PassthroughFs`] is anchored at a `root` directory on disk. Request paths are
-//! relative to it: leading `/` and `.` are ignored, `..` is folded, and an OS prefix — or a
-//! `..` with nothing left to fold — is rejected.
+//! A [`PassthroughFs`] is anchored at a `root` directory. Request paths are relative to it:
+//! leading `/` and `.` are ignored, `..` is folded, and an OS prefix, or a `..` with nothing
+//! left to fold, is rejected.
 //!
-//! Folding `..` confines nothing on its own — a symlink inside the root can point out of it.
-//! So one walk resolves what it finds and what it arrives at must be under the root; a path
-//! with no link in it cannot leave, and the same walk finds nothing to resolve. Resolving
-//! *reads* links rather than following them, which keeps the question to where a link points:
-//! one out of the root cannot be traversed, one naming something not created yet is served.
+//! Folding `..` confines nothing on its own, since a symlink inside the root can point out of
+//! it. So a path through a link is resolved and must land under the root. Resolving *reads*
+//! links rather than following them: a link out of the root cannot be traversed, and one
+//! naming something not created yet is served.
 //!
-//! Only an operation that follows a link has to ask. `create`, `mkdir`, `unlink`, `rmdir` and
-//! `rename` act on a name in the directory holding it and never touch what it points at, so
-//! for them that directory is what containment is about — a link out of the root is still
-//! listed, and can still be taken away.
+//! Only operations that follow a link are checked that way. `create`, `mkdir`, `unlink`,
+//! `rmdir` and `rename` act on a name and never touch what it points at, so containment covers
+//! only the directory holding the name; a link out of the root is still listed and removable.
 //!
 //! `..` is folded lexically, and has to be: a mount table routes on a normalized key and hands
-//! a store the folded remainder, and [`Posix`](crate::fs::Posix) never sends one, the kernel
-//! folding it against the parent inode first. Folding some other way here would answer one way
-//! called directly and another through the mount table.
+//! a store the folded remainder, and [`Posix`](crate::fs::Posix) never sends one (the kernel
+//! folds it against the parent inode). Any other fold would answer differently called directly
+//! than through the mount table.
 //!
-//! It does part ways with the kernel behind a directory link — `dirlink/..` returns to the
-//! link's own parent, not the target's — so `RESOLVE_BENEATH` is the *escape* policy here but
-//! not the `..`, that flag resolving in full before judging where it landed.
+//! This departs from the kernel behind a directory link: `dirlink/..` returns to the link's own
+//! parent, not the target's. So `RESOLVE_BENEATH` matches the *escape* policy here but not the
+//! `..` handling, since that flag resolves in full before judging where it landed.
 //!
 //! The check and the operation are separate calls, so a link swapped between them is not
-//! caught. No binding implements `symlink`, so nothing reachable through this crate can do
-//! that; another process on the same tree could.
+//! caught. No binding implements `symlink`, so only another process on the same tree could.
 //!
 //! # A descriptor per call
 //!
-//! Every read and write opens the file, acts, and closes it. There is no open to hang one on:
-//! a store is addressed by path (see *No opens, only paths* on [`FileSystem`]), so the
-//! descriptor cannot outlive the call that made it.
+//! Every read and write opens the file, acts, and closes it: a store is addressed by path (see
+//! *No opens, only paths* on [`FileSystem`]), so no descriptor outlives its call.
 //!
-//! Three syscalls where a held descriptor would need one, and the path walked again each time.
-//! Against a request that crossed a virtio-fs ring or a FUSE channel to get here, that is
-//! noise. What it does cost is the one POSIX guarantee a descriptor carries: a read after the
-//! name is gone answers `ENOENT` where an open file would have kept working. Restoring that
-//! belongs to the layer holding the descriptors, not here — see
-//! [`Posix::unlink_child`](crate::fs::Posix).
+//! That is three syscalls instead of one, and a path walk each time: noise next to a request
+//! that crossed a virtio-fs ring or FUSE channel. The real cost is the POSIX guarantee a descriptor carries:
+//! a read after the name is gone answers `ENOENT` where an open file would keep working.
+//! Restoring that belongs to the layer holding descriptors
+//! ([`Posix::unlink_child`](crate::fs::Posix)).
 
 use std::{
     ffi::OsString,
@@ -54,22 +49,19 @@ use crate::{
     fs::{Dirent, DirentKind, FileSystem, Stat},
 };
 
-/// The links one request may resolve through before the walk calls it a cycle. Reading links
-/// rather than having the kernel follow them moves its ceiling here: `MAXSYMLINKS` is 32 on
-/// macOS and the BSDs, 40 on Linux.
+/// Links one request may resolve through before the walk calls it a cycle. Links are read
+/// rather than followed by the kernel, so its `MAXSYMLINKS` (32 on macOS and the BSDs, 40 on
+/// Linux) does not apply.
 const MAX_LINK_HOPS: u32 = 32;
 
-/// A real on-disk directory, served as-is.
-///
-/// The name is the mapping: every request passes through to `std::fs` under `root`.
+/// A real on-disk directory, served as-is through `std::fs` under `root`.
 pub struct PassthroughFs {
     root: PathBuf,
 
-    /// `root` resolved, which is what containment compares against — on macOS `/tmp` *is*
-    /// `/private/tmp`, so the unresolved spelling would put every ordinary path outside the
-    /// root.
+    /// `root` resolved, for containment checks: on macOS `/tmp` *is* `/private/tmp`, so the
+    /// unresolved spelling would put every ordinary path outside the root.
     ///
-    /// Filled on first use, so [`new`](Self::new) stays offline. Kept once built, so a root
+    /// Filled on first use so [`new`](Self::new) touches no disk; kept once built, so a root
     /// replaced afterwards is measured against where it was.
     canonical_root: OnceLock<PathBuf>,
 }
@@ -99,17 +91,14 @@ impl PassthroughFs {
     /// Where `real` lands once links are resolved, or [`NotFound`](io::ErrorKind::NotFound) if
     /// that is outside the root.
     ///
-    /// Links are *read*, not followed. `canonicalize` answers the same question, but only for a
-    /// path whose every component exists — and a link naming something not created yet points
-    /// somewhere perfectly contained. Reading the link says where without asking whether.
+    /// Links are *read*, not followed: `canonicalize` fails unless every component exists,
+    /// yet a link naming something not created yet can point somewhere contained.
     ///
-    /// `NotFound` rather than `InvalidFilename`, which is for a malformed request: this one is
-    /// well formed, so the error says what a caller holding that name will hear from every
-    /// other operation. `find` and `rsync` skip `ENOENT` and surface `EINVAL`.
+    /// `NotFound` rather than `InvalidFilename` (for malformed requests): the request is well
+    /// formed, and `find` and `rsync` skip `ENOENT` but surface `EINVAL`.
     fn resolve_within_root(&self, real: &Path) -> io::Result<PathBuf> {
         let root = self.canonical_root()?;
-        // Reversed, so `pop` walks left to right and a link's own target can go back on for
-        // the walk to continue through it.
+        // Reversed, so `pop` walks left to right and a link's target can be pushed back on.
         let mut pending: Vec<OsString> = real
             .strip_prefix(&self.root)
             .map_err(|_| io::Error::from(io::ErrorKind::NotFound))?
@@ -124,8 +113,8 @@ impl PassthroughFs {
                 continue;
             }
             if name == ".." {
-                // Against what is already *resolved*, which is where the kernel applies it
-                // too: a `..` after a link climbs from the target's parent, not the link's.
+                // Against what is already *resolved*, as the kernel does: a `..` after a link
+                // climbs from the target's parent, not the link's.
                 resolved.pop();
                 continue;
             }
@@ -135,13 +124,12 @@ impl PassthroughFs {
             };
             hops += 1;
             if hops > MAX_LINK_HOPS {
-                // A cycle names nothing this store can serve, which is what `NotFound` says
-                // for every other unservable name here.
+                // A cycle names nothing servable, which `NotFound` means throughout here.
                 return Err(io::ErrorKind::NotFound.into());
             }
             resolved.pop();
-            // An absolute target replaces what is resolved so far, which `PathBuf::push` does
-            // on its own for a leading `RootDir`.
+            // An absolute target replaces what is resolved so far: `PathBuf::push` does that
+            // for a leading `RootDir`.
             pending.extend(
                 target
                     .components()
@@ -156,8 +144,7 @@ impl PassthroughFs {
     }
 
     /// Fold a request onto `root`: `.` dropped, `..` applied, an OS prefix or a climb past the
-    /// root refused. Containment is not asked about here — the two callers below ask it of
-    /// different things.
+    /// root refused. Containment is left to callers, which check different things.
     fn fold(&self, path: &Path) -> io::Result<Folded> {
         let mut folded = Folded {
             real: self.root.clone(),
@@ -170,17 +157,14 @@ impl PassthroughFs {
                 Component::Normal(name) => {
                     folded.real.push(name);
                     folded.depth += 1;
-                    // Asked here, where it costs no allocation, so a path with no link in it
-                    // never reaches the resolving walk — which builds a stack it would have
-                    // nothing to put on. A `..` that folds a link away leaves this set: a
-                    // wasted resolve, never a missed one.
+                    // Checked here, allocation-free, so a link-free path skips the resolving
+                    // walk. A `..` that folds a link away leaves this set: a wasted resolve,
+                    // never a missed one.
                     folded.through_a_link =
                         folded.through_a_link || fs::read_link(&folded.real).is_ok();
                 }
-                // Folded, not refused: `a/b/../c` names something in the root like any other
-                // request, the same fold a mount table applies a layer up — spelled again, a
-                // store reaching up into that layer inverting the layering. Nothing left to
-                // fold is a climb past the root, which is what the refusal is for.
+                // Folded, not refused: `a/b/../c` names something in the root, the same fold
+                // a mount table applies a layer up. Only a climb past the root is refused.
                 Component::ParentDir => {
                     if folded.depth == 0 {
                         return Err(io::ErrorKind::InvalidFilename.into());
@@ -194,32 +178,28 @@ impl PassthroughFs {
         Ok(folded)
     }
 
-    /// Map a request path to its location under `root`, refusing one that would leave it
-    /// *through* a link. For the operations that follow one: `stat`, `list`, and the data
-    /// plane.
+    /// Map a request path under `root`, refusing one that would leave it *through* a link.
+    /// For operations that follow links: `stat`, `list`, and the data plane.
     ///
-    /// Returns the *unresolved* path, so the OS acts on the name the caller asked for, links
-    /// and all.
+    /// Returns the *unresolved* path, so the OS acts on the name the caller asked for.
     fn real_path(&self, path: &Path) -> io::Result<PathBuf> {
         let folded = self.fold(path)?;
-        // `depth` guards the root itself, which a resolve cannot be asked about: it wants
-        // [`canonical_root`](Self::canonical_root) first, and that would cost a store the
-        // ability to `mkdir` the directory it was anchored at.
+        // Skip the root itself: resolving needs [`canonical_root`](Self::canonical_root),
+        // which would fail before the store could `mkdir` its own root.
         if folded.through_a_link && folded.depth > 0 {
             self.resolve_within_root(&folded.real)?;
         }
         Ok(folded.real)
     }
 
-    /// The same, for the operations that act on a *name* rather than on what it points at:
-    /// `create`, `mkdir`, `unlink`, `rmdir`, `rename`. None of `create_new`, `create_dir`,
-    /// `remove_file`, `remove_dir` or `rename` follows a trailing link, so the directory
-    /// holding the name is all they can reach and all containment has to cover — which is what
-    /// keeps a link out of the root removable.
+    /// Map a request path under `root` for operations on a *name* rather than what it points
+    /// at: `create`, `mkdir`, `unlink`, `rmdir`, `rename`. Their `std::fs` calls never follow a
+    /// trailing link, so containment covers only the parent, which keeps a link out of the
+    /// root removable.
     fn entry_path(&self, path: &Path) -> io::Result<PathBuf> {
         let folded = self.fold(path)?;
-        // `depth > 1`, not `> 0`: one component down the parent *is* the root, contained by
-        // definition and not yet resolvable if it does not exist.
+        // `depth > 1`: one component down, the parent *is* the root, contained by definition
+        // and not resolvable if it does not exist yet.
         if folded.through_a_link && folded.depth > 1 {
             let parent = folded.real.parent().expect("depth > 1 leaves a parent");
             self.resolve_within_root(parent)?;
@@ -227,10 +207,10 @@ impl PassthroughFs {
         Ok(folded.real)
     }
 
-    /// Open the file at `path` for the data plane, in the mode `writable` asks for.
+    /// Open the file at `path` for the data plane.
     ///
-    /// Never creates: [`create`](FileSystem::create) is the one thing that makes a name, so a
-    /// write to a name that went away is an error rather than a resurrection.
+    /// Never creates: only [`create`](FileSystem::create) makes a name, so a write to a name
+    /// that went away errors rather than resurrecting it.
     fn open(&self, path: &Path, writable: bool) -> io::Result<fs::File> {
         let real = self.real_path(path)?;
         fs::OpenOptions::new()
@@ -266,9 +246,8 @@ impl FileSystem for PassthroughFs {
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let real = self.real_path(path)?;
-            // Follows, where `unlink` below does not — POSIX, and it is what makes the
-            // reported size the one a read returns. An `lstat` gives the link string's length,
-            // and a kernel that believes it truncates the read.
+            // Follows links, per POSIX, so the size matches what a read returns: an `lstat`
+            // gives the link string's length, and a kernel believing it truncates the read.
             Ok(Self::stat_of(&fs::metadata(&real)?))
         })
     }
@@ -276,7 +255,7 @@ impl FileSystem for PassthroughFs {
     fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
         Box::pin(async move {
             let real = self.real_path(path)?;
-            // Follows, like `stat`, which has just called such a link a directory.
+            // Follows links, so a link to a directory lists as one.
             if !fs::metadata(&real)?.is_dir() {
                 return Err(io::ErrorKind::NotADirectory.into());
             }
@@ -284,22 +263,16 @@ impl FileSystem for PassthroughFs {
             for entry in fs::read_dir(&real)? {
                 let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
-                // `file_type` comes from the directory entry itself (`d_type`), so the kind is
-                // free. Size and timestamps are not — they would be an `lstat` per entry,
-                // which a plain `ls` never asked for. So this listing leaves `Dirent::stat`
-                // unset and lets the caller decide.
+                // The kind is free from `d_type`; size and timestamps would cost an `lstat`
+                // per entry a plain `ls` never asked for, so `Dirent::stat` stays unset.
                 //
-                // Links are the exception: `d_type` answers DT_LNK and never DT_DIR, so their
-                // kind has to come from the target, and only they pay for it.
+                // Links are the exception: `d_type` says DT_LNK, never DT_DIR, so only they
+                // pay to ask the target.
                 let file_type = entry.file_type()?;
                 let kind = if file_type.is_symlink() {
-                    // Only a target inside the root can be asked what it is; one outside is
-                    // not this store's to describe. `File` is what is left either way —
-                    // `DirentKind` has no `Symlink` — and it is what a link with nothing on
-                    // the end of it gets too.
-                    //
-                    // Reported either way: omitting the name would claim it is not there,
-                    // which `unlink` removing it contradicts.
+                    // Only a target inside the root is described; one outside, or a dangling
+                    // link, is `File` since `DirentKind` has no `Symlink`. Still listed:
+                    // `unlink` can remove it, so omitting it would be wrong.
                     match self.resolve_within_root(&entry.path()) {
                         Ok(target) if fs::metadata(&target).is_ok_and(|meta| meta.is_dir()) => {
                             DirentKind::Dir
@@ -313,8 +286,8 @@ impl FileSystem for PassthroughFs {
                 };
                 out.push(Dirent::new(name, kind));
             }
-            // `read_dir` gives the directory's own order — a hash order on APFS and ext4 —
-            // and a `readdir` resumes by position, so it has to be the same on the next call.
+            // `read_dir` order is a hash order on APFS and ext4, and `readdir` resumes by
+            // position, so the order must be stable across calls.
             out.sort_by(|a, b| a.name.cmp(&b.name));
             Ok(out)
         })
@@ -329,9 +302,8 @@ impl FileSystem for PassthroughFs {
         Box::pin(async move { pread(&self.open(path, false)?, buf, offset) })
     }
 
-    /// `O_CREAT | O_EXCL`, in one call to the OS, so exclusivity is the kernel's own — a
-    /// pre-flight check for the name would be a race, and this is the one operation whose
-    /// whole contract is that there is no window.
+    /// `O_CREAT | O_EXCL` in one OS call, so exclusivity is the kernel's; a pre-flight check
+    /// for the name would race.
     fn create<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let real = self.entry_path(path)?;
@@ -346,8 +318,7 @@ impl FileSystem for PassthroughFs {
     fn mkdir<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let real = self.entry_path(path)?;
-            // `create_dir` is already exclusive — `EEXIST` for a taken name, whatever is under
-            // it — so there is nothing to check first and nothing to re-derive.
+            // `create_dir` is already exclusive: `EEXIST` for any taken name.
             fs::create_dir(&real)?;
             Ok(Self::stat_of(&fs::symlink_metadata(&real)?))
         })
@@ -370,8 +341,7 @@ impl FileSystem for PassthroughFs {
             if !fs::symlink_metadata(&real)?.is_dir() {
                 return Err(io::ErrorKind::NotADirectory.into());
             }
-            // `remove_dir` — never `remove_dir_all`. The emptiness check is the kernel's own
-            // (`ENOTEMPTY`), which arrives here as `DirectoryNotEmpty`.
+            // Never `remove_dir_all`: the kernel's `ENOTEMPTY` arrives as `DirectoryNotEmpty`.
             fs::remove_dir(&real)?;
             Ok(())
         })
@@ -390,19 +360,17 @@ impl FileSystem for PassthroughFs {
         Box::pin(async move { self.open(path, true)?.set_len(size) })
     }
 
-    /// The whole overwrite contract is the kernel's here, and its errors travel up as
-    /// themselves: measured on macOS, `fs::rename` gives `EISDIR` for file-over-directory,
+    /// The overwrite contract and its errors are the kernel's, so nothing here can disagree
+    /// with the platform. On macOS `fs::rename` gives `EISDIR` for file-over-directory,
     /// `ENOTDIR` for the reverse, `ENOTEMPTY` for a non-empty destination, `EINVAL` for a
     /// directory into its own descendant, `ENOENT` for a missing source or destination parent,
-    /// and silently replaces file-over-file. Re-deriving any of that here could only introduce
-    /// disagreement with the platform.
+    /// and silently replaces file-over-file.
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move { fs::rename(self.entry_path(from)?, self.entry_path(to)?) })
     }
 
-    /// A durability barrier the OS has a call for, and the one place this store does more than
-    /// pass a path through: the bytes are already in the page cache when `write_at` returns, so
-    /// what is left is asking the kernel to put them on the device.
+    /// Bytes are already in the page cache when `write_at` returns; this asks the kernel to
+    /// put them on the device.
     fn flush<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move { self.open(path, true)?.sync_all() })
     }
@@ -410,13 +378,9 @@ impl FileSystem for PassthroughFs {
 
 /// Positioned I/O on a [`fs::File`], under one name.
 ///
-/// Both `std::os::unix::fs::FileExt` and `std::os::windows::fs::FileExt` express
-/// offset-addressed reads and writes, but under different names (`read_at`/`write_at` against
-/// `seek_read`/`seek_write`), so neither can be called from portable code.
-///
-/// The descriptor is this call's own either way, so nothing here shares a cursor — which is the
-/// difference that would otherwise matter, `seek_read`/`seek_write` moving one where
-/// `pread`/`pwrite` do not.
+/// Unix names these `read_at`/`write_at` and Windows `seek_read`/`seek_write`. Windows' move
+/// the cursor where `pread`/`pwrite` do not, which is harmless: each descriptor is one call's
+/// own.
 #[cfg(unix)]
 fn pread(file: &fs::File, buf: &mut [u8], offset: u64) -> io::Result<usize> {
     std::os::unix::fs::FileExt::read_at(file, buf, offset)

@@ -1,9 +1,8 @@
 //! A real host mount, driven through the operating system.
 //!
-//! Every other test calls the bindings directly, which proves only that the code
-//! answers correctly when *we* ask. This is the one place a kernel asks: real
-//! filesystem requests over a real mount, in whatever order and with whatever
-//! flags the OS chooses.
+//! Here the kernel asks, not the test: real requests over a real mount, in
+//! whatever order and with whatever flags the OS chooses. Each test ends with
+//! `drop(mount)`, the guard's only way to unmount.
 //!
 //! `#[ignore]` because it needs a mount provider and touches the real
 //! filesystem.
@@ -22,29 +21,21 @@
 //! | macOS | `FuseTMount`: libfuse-t's own session loop |
 //! | Windows | `DokanMount`: Dokany's driver, through `dokan` |
 //!
-//! **A missing provider is not the same failure on every platform.** On macOS
-//! FUSE-T is probed with pkg-config and so fails at *build* time, never by
-//! silently passing. Dokany cannot: its driver is a runtime fact, so a build
-//! without it succeeds and `try_new` answers `can't install driver` instead.
-//! Either way the test fails rather than quietly not running, which is the
-//! property that matters — a test that silently does not run is worse than one
-//! that fails.
+//! **A missing provider fails, never silently skips.** On macOS FUSE-T is
+//! probed with pkg-config and fails at build time; Dokany's driver is a runtime
+//! fact, so there `try_new` answers `can't install driver`.
 //!
-//! # What it means that these bodies are shared
+//! # Shared bodies
 //!
-//! The Windows binding reaches `FileSystem` directly where the FUSE ones go
-//! through `Posix`, so it is the one that could drift without anybody noticing.
-//! Running the *same* assertions through it is what makes that structural
-//! difference invisible from outside, which is the claim worth testing: a cortex
-//! tree behaves the same whichever kernel is asking.
+//! The Windows binding reaches `FileSystem` directly while the FUSE ones go
+//! through `Posix`, so running the same assertions through all of them checks
+//! that a cortex tree behaves the same whichever kernel asks.
 
 #![cfg(all(feature = "mount", any(unix, windows)))]
 
 use std::{fs, path::PathBuf};
 
-// One set of test bodies for every host binding: they expose the same call
-// surface, so which is under test is a matter of which target this is — making
-// these tests evidence that they behave *alike*, not just that each behaves.
+// Every binding exposes the same call surface, so the target picks which is under test.
 #[cfg(windows)]
 use cortex::fs::DokanMount as HostMount;
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -53,7 +44,7 @@ use cortex::fs::FuseMount as HostMount;
 use cortex::fs::FuseTMount as HostMount;
 use cortex::fs::{Directory, FileSystem, InMemFs};
 
-/// A mount point of our own. The guards do not create it — no mount does.
+/// A fresh mount point; no guard creates one.
 fn mountpoint(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!("cortex-mount-{}-{}", std::process::id(), tag));
@@ -64,8 +55,8 @@ fn mountpoint(tag: &str) -> PathBuf {
 
 /// A volume with one file and one empty directory.
 ///
-/// The seeding drives the store's async surface, so it runs on a throwaway runtime here — the crate's own `block_on` is `pub(crate)`, and the
-/// test bodies themselves are synchronous because a real kernel drives the mount.
+/// Seeded on a throwaway runtime, since the crate's `block_on` is `pub(crate)`; the test
+/// bodies are synchronous because a real kernel drives the mount.
 fn volume() -> InMemFs {
     let vol = InMemFs::new();
     let rt = tokio::runtime::Runtime::new().expect("build a runtime for volume setup");
@@ -86,8 +77,7 @@ fn the_operating_system_can_read_a_cortex_mount() {
     let mnt = mountpoint("read");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
-    // `read_dir` is a real `readdir`, so this exercises the cursor protocol as
-    // the kernel drives it rather than as our unit tests drive it.
+    // A real `readdir`, so the kernel drives the cursor protocol.
     let mut names: Vec<_> = fs::read_dir(&mnt)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -106,16 +96,13 @@ fn the_operating_system_can_read_a_cortex_mount() {
     assert_eq!(meta.len(), 19);
     assert!(fs::metadata(mnt.join("sub")).unwrap().is_dir());
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
-/// Host directories side by side over the tree's in-memory root — the shape a workspace
-/// exists for.
+/// Host directories side by side over the tree's in-memory root, the workspace shape.
 ///
-/// Also the only place a real kernel drives the mount table: every other test here mounts
-/// a single store.
+/// The only test where a real kernel drives the tree's mount table; the rest mount one store.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_can_read_a_multi_source_workspace() {
@@ -159,7 +146,6 @@ fn the_operating_system_can_read_a_multi_source_workspace() {
     assert!(fs::metadata(mnt.join("scratch")).unwrap().is_dir());
     assert!(!project.path().join("scratch").exists());
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
@@ -174,9 +160,8 @@ fn host_dir() -> tempfile::TempDir {
 
 /// Timestamps as the operating system reports them back.
 ///
-/// A backend that never advances `mtime` looks frozen at the UNIX epoch, which is
-/// not cosmetic: a guest negotiating `AUTO_INVAL_DATA` decides from `mtime` alone
-/// when to drop cached pages, and `find -newer`, `make` and `rsync` all read it.
+/// A frozen `mtime` is not cosmetic: a guest negotiating `AUTO_INVAL_DATA` decides from
+/// `mtime` alone when to drop cached pages, and `find -newer`, `make` and `rsync` read it.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_sees_real_timestamps() {
@@ -196,8 +181,7 @@ fn the_operating_system_sees_real_timestamps() {
     for name in ["greeting.txt", "sub"] {
         let m = modified(name);
         assert_ne!(m, UNIX_EPOCH, "{name} is stuck at the epoch");
-        // A second of slack: the mount round-trips through the kernel, which
-        // reports whole-second granularity on some paths.
+        // A second of slack: some kernel paths report whole seconds.
         assert!(
             m + Duration::from_secs(1) >= started,
             "{name} predates the volume"
@@ -220,25 +204,22 @@ fn the_operating_system_sees_real_timestamps() {
         "creating an entry modifies its directory"
     );
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
 /// Editing an existing file, which is a rename and not a write.
 ///
-/// Editors do not overwrite in place — they write a temporary beside the target
-/// and rename it over, so the replacement is atomic and a crash cannot leave a
-/// half-written file. Before `rename` was wired this failed with `EACCES`
-/// ("Permission denied", from libfuse-t's default), leaving the edit stranded in
-/// the `.tmp` and the original untouched.
+/// Editors write a temporary beside the target and rename it over, so a crash cannot leave a
+/// half-written file. Without `rename`, libfuse-t's default answers `EACCES` and the edit is
+/// stranded in the `.tmp`.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
     let mnt = mountpoint("rename");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
-    // Write-temp-then-rename, exactly as an editor does.
+    // Write-temp-then-rename, as an editor does.
     fs::write(mnt.join("greeting.txt.tmp"), b"edited by an editor\n").unwrap();
     fs::rename(mnt.join("greeting.txt.tmp"), mnt.join("greeting.txt")).expect("atomic replace");
 
@@ -276,7 +257,6 @@ fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
         "a file must not replace a directory"
     );
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
@@ -287,16 +267,15 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
     let mnt = mountpoint("write");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
-    // `fs::write` is create + write + close, so this covers the whole chain the
-    // kernel actually sends: CREATE, WRITE, FLUSH, RELEASE.
+    // `fs::write` makes the kernel send CREATE, WRITE, FLUSH, RELEASE.
     fs::write(mnt.join("new.txt"), b"written by the kernel").unwrap();
     assert_eq!(
         fs::read_to_string(mnt.join("new.txt")).unwrap(),
         "written by the kernel"
     );
 
-    // Truncating an *existing* file: with `ATOMIC_O_TRUNC` negotiated `O_TRUNC`
-    // rides the open, and dropping the flag leaves the old tail in place.
+    // Truncating an *existing* file: with `ATOMIC_O_TRUNC`, `O_TRUNC` rides the open, and
+    // dropping the flag would leave the old tail.
     fs::write(mnt.join("greeting.txt"), b"replaced").unwrap();
     assert_eq!(
         fs::read_to_string(mnt.join("greeting.txt")).unwrap(),
@@ -326,16 +305,13 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
     fs::remove_file(mnt.join("new.txt")).unwrap();
     assert!(!mnt.join("new.txt").exists());
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
-/// `>>` through a real mount, which the contract has no flag for on purpose: the
-/// kernel resolves `O_APPEND` itself and sends the absolute end offset, so a backend
-/// that only writes where it is told already appends. Every other write in this file
-/// starts from an offset the test chose, so none of them would notice if that stopped
-/// being true.
+/// `>>` through a real mount. The contract has no append flag: the kernel resolves `O_APPEND`
+/// and sends the absolute end offset. The only write here whose offset the test does not
+/// choose.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn the_operating_system_can_append_to_a_cortex_mount() {
@@ -356,17 +332,11 @@ fn the_operating_system_can_append_to_a_cortex_mount() {
         "Hello from cortex!\nand again\n"
     );
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
 
-/// The Windows counterpart of the `fuser` test below: same claim, same shape, a
-/// flag from Dokany's own set instead of `fuser`'s.
-///
-/// Worth having twice rather than once, because "the kernel refuses the write"
-/// is the *only* assertion in this file that is not about a store answering —
-/// and the two kernels refuse for reasons neither binding controls.
+/// A write-protected Dokany volume refuses writes in the driver, before any store answers.
 #[cfg(windows)]
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
@@ -375,12 +345,10 @@ fn a_write_protected_volume_is_enforced_by_the_driver() {
     let mount = HostMount::try_new_with(volume(), &mnt, cortex::fs::MountFlags::WRITE_PROTECT)
         .expect("mount");
 
-    // Refused by the *driver*: the request never reaches a store, which is stronger than
-    // each store answering `ReadOnlyFilesystem` by hand.
+    // Refused by the *driver*; no store sees the request.
     assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
     assert!(fs::write(mnt.join("nope.txt"), b"x").is_err());
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
@@ -388,21 +356,15 @@ fn a_write_protected_volume_is_enforced_by_the_driver() {
 /// A mount point is handed back the way it was taken, so the same directory can be mounted
 /// again.
 ///
-/// The second mount is the assertion. A guard that unmounts and leaves something behind at
-/// the mount point makes a directory a once-per-process thing, which no caller is told and
-/// which `Mount`'s "dropping it unmounts" does not allow for.
+/// The second mount is the assertion: anything left at the mount point would make a directory
+/// mountable once only.
 ///
-/// **This is where Windows differed and nothing caught it.** `DokanRemoveMountPoint` takes the
-/// volume down and leaves the mount point standing, so what was there afterwards was a
-/// reparse point onto a volume that no longer existed — missing from a listing of its parent,
-/// impossible to open, and refused with `ERROR_ALREADY_EXISTS` by the next `create_dir`. The
-/// teardown tests that would have found it are in `mount_teardown.rs`, which is `unix` only
-/// because its bodies fork and signal; this one needs neither, so it runs everywhere a mount
-/// does.
+/// On Windows `DokanRemoveMountPoint` leaves a reparse point onto the gone volume: absent from
+/// its parent's listing, unopenable, and refused with `ERROR_ALREADY_EXISTS` by the next
+/// `create_dir`. Needs no fork or signal, so it runs on every platform that mounts.
 ///
-/// `read_dir` on the way out rather than `metadata`: what was left behind answered `metadata`
-/// with "not found", the same as a clean unmount, and only a listing of the *parent* told the
-/// two apart.
+/// Checked by listing the *parent*, since the leftover answers `metadata` with "not found",
+/// the same as a clean unmount.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn a_mount_point_can_be_mounted_again_after_the_guard_is_dropped() {
@@ -412,7 +374,7 @@ fn a_mount_point_can_be_mounted_again_after_the_guard_is_dropped() {
     assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
     drop(mount);
 
-    // An empty directory, and the same one: it has to be listed by its parent to say so.
+    // Still listed by its parent, and empty.
     let named = mnt.file_name().expect("the mount point is named");
     let parent = mnt.parent().expect("the mount point has a parent");
     assert!(
@@ -431,15 +393,15 @@ fn a_mount_point_can_be_mounted_again_after_the_guard_is_dropped() {
         mnt.display()
     );
 
-    // And the whole of the point: it takes a mount again.
+    // It takes a mount again.
     let mount = HostMount::try_new(volume(), &mnt).expect("second mount on the same path");
     assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
 
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }
-/// `fuser`-only: mount options are part of its call surface, and FUSE-T's are a
-/// different set. The behaviour under test is the kernel's, not ours.
+/// `fuser`-only, since mount options are part of its call surface. The kernel's behaviour is
+/// under test, not ours.
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
@@ -455,12 +417,10 @@ fn a_read_only_mount_is_enforced_by_the_kernel() {
     )
     .expect("mount");
 
-    // The write is refused by the *kernel*: the request never reaches a store, which is
-    // stronger than each store answering `ReadOnlyFilesystem` by hand.
+    // Refused by the *kernel*; no store sees the request.
     assert!(fs::read_to_string(mnt.join("greeting.txt")).is_ok());
     assert!(fs::write(mnt.join("nope.txt"), b"x").is_err());
 
-    // Dropping is the unmount — the guard has no other way down, and no way to report one.
     drop(mount);
     fs::remove_dir_all(&mnt).ok();
 }

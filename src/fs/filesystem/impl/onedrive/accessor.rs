@@ -12,8 +12,8 @@ pub(crate) const GRAPH_ORIGIN: &str = "https://graph.microsoft.com";
 
 /// Where to reach Microsoft's services. `None` = the real host.
 ///
-/// Two hosts rather than Google's five, because Graph is one API: files, metadata and
-/// search all live under `graph.microsoft.com`. Whatever is set here is an *origin* —
+/// Two hosts, because Graph is one API: files, metadata and search all live under
+/// `graph.microsoft.com`. Whatever is set here is an *origin* —
 /// this code appends only the path the official API uses, so the same paths address a
 /// mock and production alike.
 ///
@@ -86,12 +86,12 @@ fn endpoints(o: &OnedriveOrigins) -> Endpoints {
 }
 
 /// Per-item fields asked of every listing — what the mount needs to shape an entry, and
-/// nothing else. One entry per field, joined at request time: the separators are not
-/// hand-maintained, so this cannot grow a stray space or a missing comma.
+/// nothing else. Joined at request time, so the mask cannot grow a stray space or lose a
+/// comma.
 ///
-/// `size` is the one Google could not give. A driveItem states it exactly for every file
-/// including `.docx`, `.xlsx` and `.pptx`, which is why this store has no placeholder, no
-/// padding and no remembered-length map.
+/// A driveItem states `size` exactly for every file, `.docx`, `.xlsx` and `.pptx`
+/// included, which is why this store has no placeholder, no padding and no
+/// remembered-length map.
 const ITEM_FIELDS: &[&str] = &[
     "id",
     "name",
@@ -156,8 +156,7 @@ const JITTER_MAX_MS: u64 = 1000;
 ///
 /// A budget for the ladder rather than a cap on one sleep, because what blocks the mount is
 /// their **sum**: `MAX_RETRIES` waits of 30 s each is 150 s, which is what a per-sleep cap
-/// would permit while claiming a 30 s ceiling. Measured before this was a budget, a header
-/// of 2 s produced 6 requests over 10.0 s.
+/// would permit while claiming a 30 s ceiling.
 ///
 /// It bounds the waiting and not the whole call: each attempt may still spend up to the
 /// `reqwest` request timeout set in [`OnedriveAccessor::new`] on the wire. Requests are
@@ -293,8 +292,8 @@ impl OnedriveAccessor {
     /// mid-flight refresh reach the retry. Every call this makes is an idempotent GET, so
     /// retrying a 5xx is unconditionally safe.
     ///
-    /// Unlike Drive, Graph reports throttling as `429` with `Retry-After` and means it —
-    /// there is no 403-that-is-really-a-rate-limit to classify. A wait it asks for is
+    /// Graph reports throttling as `429` with `Retry-After` and means it, so no other
+    /// status needs classifying as a rate limit. A wait it asks for is
     /// honoured as asked or not taken at all; see [`MAX_RETRY_AFTER`] for why there is no
     /// third option. A backoff this code computed for itself is capped at [`MAX_BACKOFF`],
     /// which is a different thing and safe to shorten.
@@ -346,11 +345,9 @@ impl OnedriveAccessor {
     /// Giving up on a throttle is only half of what Microsoft asks for. Its instruction is
     /// to *pause the client* — "failure to honor Retry-After may result in more throttling
     /// ... even though the calls fail, they still count toward usage limits" — so a
-    /// give-up that leaves the next call free to fire immediately is worse than the waiting
-    /// it replaced. Measured without this gate: twenty listings under a 900 s throttle sent
-    /// twenty requests in 14 ms, where the old clamp-and-retry ladder would have sent 120
-    /// over about 1600 s. Fewer per operation, four orders of magnitude more per second,
-    /// against the very limit that caused the throttle.
+    /// give-up that leaves the next call free to fire immediately is worse than waiting.
+    /// Measured without this gate: twenty listings under a 900 s throttle sent twenty
+    /// requests in 14 ms, against the very limit that caused the throttle.
     ///
     /// A mount is the hostile case for this. Its callers re-ask constantly — Finder, the
     /// NFS client under FUSE-T, a `find` walking a thousand directories — and a failed
@@ -413,9 +410,8 @@ impl OnedriveAccessor {
 
     /// The Graph address of a folder's children.
     ///
-    /// Paths are native here, which is the difference that removes an entire layer. Drive
-    /// has no paths at all, so a four-segment path costs one `files.list` per directory to
-    /// walk; Graph answers `/me/drive/root:/A/B:/children` in one request.
+    /// Paths are native, so `/me/drive/root:/A/B:/children` answers in one request rather
+    /// than one listing per directory walked.
     ///
     /// The root is spelled differently from everything under it — `root/children`, not
     /// `root::/children` — because the colon form needs a path between its colons.
@@ -527,9 +523,8 @@ impl OnedriveAccessor {
             }
             req = req.header("Range", format!("bytes={}-{}", r.start, r.end - 1));
         }
-        // `without_url`, for the same reason the status below is built by hand: reqwest
-        // attaches the request URL to a transport error and `Display` prints its query
-        // string, and *this* URL's query string is the grant. A refused connection or a
+        // `without_url`: reqwest attaches the request URL to a transport error and
+        // `Display` prints its query string, and *this* URL's query string is the grant. A refused connection or a
         // timeout would otherwise put a token that hands over the file into whatever reads
         // the error. The error's kind survives, so `is_timeout` and `is_connect` still work.
         let resp = req.send().await.map_err(reqwest::Error::without_url)?;
@@ -543,8 +538,7 @@ impl OnedriveAccessor {
             // The status and nothing else, deliberately. `error_for_status` names the URL
             // in its message, and *this* URL is preauthenticated: the token that grants
             // the file is in its query string, so an error carrying it into a log hands
-            // the file to whoever reads the log. Graph's URLs have no such property, which
-            // is why [`get_json`](Self::get_json) can keep reqwest's error and this cannot.
+            // the file to whoever reads the log.
             anyhow::bail!("onedrive download {status}");
         }
         let at = if range.is_some() {

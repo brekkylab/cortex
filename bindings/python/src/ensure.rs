@@ -1,18 +1,17 @@
-//! `ensure_cortex`: the console server, fetched when this host has none.
+//! `ensure_cortex`: fetch the console server when this host has none.
 //!
-//! What a console builder and an `ImageClient` start is `cortex-krun` under cortex's cache,
-//! and a host that installed only this package has none there -- so this is the one call
-//! such a host makes before anything else.
+//! Console builders and `ImageClient` start `cortex-krun` from cortex's cache, which a host that
+//! installed only this package lacks, so such a host calls this first.
 
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use crate::error;
 
-/// Fetch the console server into cortex's cache if it is not there, and answer the
-/// directory it is in -- an awaitable, as the Rust `ensure_cortex` is a future.
+/// Fetch the console server into cortex's cache if missing; the awaitable resolves to its
+/// directory.
 ///
-/// A server already there is left alone, whether it was fetched or installed by hand.
+/// An existing server, fetched or installed by hand, is left alone.
 #[pyfunction]
 fn ensure_cortex(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {

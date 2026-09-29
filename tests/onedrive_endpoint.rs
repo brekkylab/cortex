@@ -6,14 +6,13 @@
 //! the API, so it agrees with us by construction and stays green when the API moves. This
 //! file exists for the other half.
 //!
-//! Unlike the Drive store, which drives backlot (`brekkylab/enterprise-mock`), there is no
-//! stand-in that follows Microsoft Graph, so this drives the real service against a real
+//! No stand-in follows Microsoft Graph, so this drives the real service against a real
 //! account. That is a weaker guarantee in one way and a stronger one in another: it needs
 //! credentials and a network, and it is the only thing here that can notice Graph moving.
 //!
-//! It has already earned its place once. `$select` naming the download URL the way the
-//! *response* spells it is accepted, answers `200`, and omits the field from every row, so a
-//! read failed outright with "has no download url" and no mock could have said so.
+//! For example, `$select` naming the download URL the way the *response* spells it is
+//! accepted, answers `200`, and omits the field from every row, so a read fails outright
+//! with "has no download url" — which no mock can show.
 //!
 //! **What we asked for.** No server reports the number of requests it received back to its
 //! caller, or the `Range` header on each. Every claim of the form "eight windows, one
@@ -73,7 +72,7 @@ async fn onedrive_endpoint_tree_and_reads() {
         };
         eprintln!("  {:<44} {:>12} {kind}", e.name, st.size);
         // Every attribute comes off the listing, so this states the real length and never a
-        // placeholder — the thing Drive cannot do — and costs nothing to ask again.
+        // placeholder, and costs nothing to ask again.
         assert_eq!(
             fs.stat(&PathBuf::from("/").join(&e.name))
                 .await

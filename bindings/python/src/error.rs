@@ -1,14 +1,13 @@
-//! How cortex's failures arrive in Python.
+//! How cortex failures reach Python.
 //!
-//! A console or image-client call fails one of two ways, and they are two exceptions because
-//! a caller acts on them differently: [`Failure::Refused`] is the server answering with an error — a
-//! timeout, a missing file — and carries the code it answered with, where
-//! [`Failure::Broken`] is the channel itself gone, after which nothing more will be heard.
-//! Both derive from `CortexError`, which is also what a failure with no finer class —
-//! building a console, say — is raised as.
+//! Console and image-client calls fail two ways, raised as two exceptions because callers act on
+//! them differently: [`Failure::Refused`] (`ConsoleRefused`) is the server answering with an
+//! error, such as a timeout or a missing file, and carries its code; [`Failure::Broken`]
+//! (`ConsoleBroken`) is the channel gone, after which nothing more will be heard. Both derive
+//! from `CortexError`, also raised for failures with no finer class (building a console, say).
 //!
-//! The filesystem half answers in [`std::io::Error`], and pyo3 already raises that as the
-//! matching `OSError` subclass, so it is left to do so.
+//! Filesystem errors are [`std::io::Error`], which pyo3 already raises as the matching `OSError`
+//! subclass.
 
 use cortex::protocol::{Error, Failure};
 use pyo3::{create_exception, exceptions::PyException, prelude::*, types::PyDict};
@@ -21,8 +20,8 @@ pub fn failure(failure: Failure) -> PyErr {
     match failure {
         Failure::Refused(error) => Python::attach(|py| {
             let err = ConsoleRefused::new_err(error.message);
-            // `code` rather than an argument, so `str(err)` stays the server's message and
-            // the number is read by name — against `ErrorCode`, which `register` exports.
+            // An attribute, not an argument, so `str(err)` stays the server's message; callers
+            // compare `code` against `ErrorCode`, built from the `ERROR_CODES` exported below.
             let _ = err.value(py).setattr("code", error.code);
             err
         }),
@@ -30,8 +29,8 @@ pub fn failure(failure: Failure) -> PyErr {
     }
 }
 
-/// What building a console answers in, which may be a [`Failure`] underneath: the server
-/// refusing `init` is as much a refusal as it refusing an `exec`, and is raised as one.
+/// Building a console may fail with a [`Failure`] underneath (the server refusing `init`),
+/// which is raised as any refusal is.
 pub fn anyhow(error: anyhow::Error) -> PyErr {
     match error.downcast::<Failure>() {
         Ok(f) => failure(f),
@@ -45,8 +44,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ConsoleRefused", py.get_type::<ConsoleRefused>())?;
     m.add("ConsoleBroken", py.get_type::<ConsoleBroken>())?;
 
-    // The numbers a `ConsoleRefused` carries, by name. Exported from here rather than
-    // written again in Python so that there is one list of them, and it is cortex's.
+    // `ConsoleRefused` codes by name, exported so the only list is cortex's.
     let codes = PyDict::new(py);
     for (name, code) in [
         ("TIMED_OUT", Error::TIMED_OUT),

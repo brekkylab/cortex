@@ -1,33 +1,28 @@
-//! `ConsoleClient`, its builder, and what its calls answer with.
+//! `ConsoleClient`, its builder, and their results.
 //!
-//! Every call that waits is an awaitable, run on the tokio runtime `pyo3-async-runtimes`
-//! keeps: a stdio client spawns its server and reads from it, and both need a reactor under
-//! them that asyncio does not have.
+//! Every call that waits is an awaitable run on the tokio runtime `pyo3-async-runtimes` keeps: a
+//! stdio client spawns its server and reads from it, which needs a reactor asyncio lacks.
 //!
 //! # Where the console lives
 //!
-//! A Python future has to be `'static`, so it cannot borrow the object it was started from.
-//! The console is therefore behind an `Arc<Mutex<..>>` that each call clones into its
-//! future — which also makes calls take turns, as `&mut self` does in Rust: one channel
-//! carries one call at a time, and a second `exec` awaited alongside the first waits for
-//! it rather than interleaving with it.
+//! A Python future must be `'static`, so each call clones an `Arc<Mutex<..>>` into it. The lock
+//! also makes calls take turns, as `&mut self` does in Rust: one channel carries one call, so a
+//! second `exec` awaited alongside the first waits for it rather than interleaving with it.
 //!
 //! # How it ends
 //!
-//! [`ConsoleClient`]'s `Drop` says `quit` on whatever runtime it is dropped on, and says nothing
-//! off one — which is where a Python finalizer runs. So [`PyConsoleClient`] enters the binding's
-//! runtime before letting go, and a console that is garbage-collected ends the same way as one
-//! that is closed. `close()` and `async with` are there for a caller who wants that moment to
-//! be a line in their program rather than whenever the collector gets to it.
+//! [`ConsoleClient`]'s `Drop` says `quit` only when dropped on a runtime, and a Python finalizer
+//! runs off one. So [`PyConsoleClient`] enters the binding's runtime before letting go: a
+//! garbage-collected console ends the same way as a closed one. `close()` and `async with` end it
+//! at a chosen line instead of whenever the collector runs.
 //!
 //! # Who else holds it
 //!
-//! The slot is an `Arc<Mutex<Option<ConsoleClient>>>` rather than a type of this module's own,
-//! because that is the shape an agent holds its console in — ailoy's `AgentState::console` —
-//! and a binding that links this crate hands [`PyConsoleClient::slot`] to one. The two then share
-//! one session: calls from either side take turns on the lock, and `close()` ends it for both.
-//! Whichever lets go last ends it, so a holder other than this one owes the same runtime
-//! entry on drop.
+//! The slot is a plain `Arc<Mutex<Option<ConsoleClient>>>` because that is the shape an agent
+//! holds its console in (ailoy's `AgentState::console`), so a binding that links this crate can
+//! hand [`PyConsoleClient::slot`] to one. Both then share one session: calls take turns on the
+//! lock, and `close()` ends it for both. Whichever holder lets go last ends it, so any other
+//! holder must also drop it inside the binding's runtime.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -100,12 +95,10 @@ impl PyNetworkAccess {
 
 /// A [`ConsoleClientBuilder`], filled in place and emptied by `build()`.
 ///
-/// In place rather than by value, unlike `Recipe`: the Rust builder is consumed by each call
-/// and is not `Clone`, so there is exactly one of it to hand along. Each method returns the
-/// same object so calls chain as they do in Rust.
-///
-/// The `Mutex` is for `Sync`, which a `pyclass` has to be and the builder's client factory
-/// is not; nothing contends for it.
+/// Mutated in place because the Rust builder is consumed by each call and is not `Clone`.
+/// Every method returns this same object, so calls chain.
+// The `Mutex` only supplies `Sync`, which a `pyclass` needs and the builder's client factory
+// lacks; nothing contends for it.
 #[pyclass(name = "ConsoleClientBuilder", module = "cortex")]
 pub struct PyConsoleClientBuilder(std::sync::Mutex<Option<ConsoleClientBuilder>>);
 
@@ -182,8 +175,8 @@ impl PyConsoleClientBuilder {
         Self::update(slf, |b| Ok(b.disk_gib(disk_gib)))
     }
 
-    /// Announce the session, and hand back the `ConsoleClient` the server answered — an
-    /// awaitable, as `ConsoleClientBuilder::build` is a future.
+    /// Announce the session to the server; the awaitable resolves to the resulting
+    /// `ConsoleClient`.
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let builder = self.0.lock().unwrap().take().ok_or_else(built)?;
         future_into_py(py, async move {
@@ -206,11 +199,10 @@ pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 pub struct PyConsoleClient {
     console: Slot,
 
-    /// [`ConsoleClient::mounts`], read once: the paths are fixed when the session is announced, and
-    /// a getter that had to await the lock for them would make them a coroutine.
+    /// [`ConsoleClient::mounts`], cached: fixed once the session is announced, and a getter
+    /// that awaited the lock would have to be a coroutine.
     ///
-    /// Strings and not `Path`s, because they are the session's paths rather than this
-    /// host's: what a `read` or a `write` is spelled in, which take a `str`.
+    /// `str`, not `Path`: they are session paths, spelled as `read` and `write` take them.
     mounts: Vec<String>,
 }
 
@@ -225,14 +217,13 @@ impl PyConsoleClient {
         }
     }
 
-    /// The slot this console is held in, for a holder that shares it — see the module docs.
+    /// The slot this console lives in, for sharing it with another holder (see module docs).
     pub fn slot(&self) -> Slot {
         self.console.clone()
     }
 }
 
-/// What makes dropping the last holder say `quit`: the console is let go of on the runtime.
-/// A holder that is not the last leaves it to whichever is.
+/// Only the last holder drops the console, inside the runtime so `quit` goes out.
 impl Drop for PyConsoleClient {
     fn drop(&mut self) {
         if let Some(slot) = Arc::get_mut(&mut self.console) {
@@ -331,7 +322,7 @@ impl PyConsoleClient {
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let console = self.console.clone();
         future_into_py(py, async move {
-            // Dropped here, on the runtime, which is what lets `quit` go out.
+            // Dropping on the runtime is what lets `quit` go out.
             console.lock().await.take();
             Ok(())
         })

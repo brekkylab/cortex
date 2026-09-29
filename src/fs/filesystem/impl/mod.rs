@@ -1,9 +1,8 @@
 //! Concrete [`FileSystem`](super::FileSystem) stores.
 //!
-//! The two that need nothing outside `std` are always here. A store that reaches the network is
-//! behind its own feature, for the reason the crate has no default features at all: `s3` costs
-//! 131 crates, and a consumer serving local files should not compile an HTTP and TLS stack to
-//! do it.
+//! The `std`-only stores are always built. Each network store is behind its own feature: `s3`
+//! alone costs 131 crates, and a consumer serving local files should not compile an HTTP and
+//! TLS stack.
 
 #[cfg(feature = "gdrive")]
 mod gdrive;

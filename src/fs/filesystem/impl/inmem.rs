@@ -1,12 +1,10 @@
 //! An in-memory [`FileSystem`] store.
 //!
-//! The whole tree lives behind `Arc<Mutex<..>>` links so that every operation shares one
-//! store through `&self`, and so the store is `Send + Sync` as [`FileSystem`] requires —
-//! enough for tests, scratch space, and prototyping.
+//! The tree lives behind `Arc<Mutex<..>>` links so every operation shares one store through
+//! `&self` and the store is `Send + Sync`, as [`FileSystem`] requires.
 //!
-//! Every path is walked from the root on every call, which is what a store addressed by path
-//! is: there is no open to amortize the walk across, and nothing to hold between calls. For a
-//! tree in RAM the walk is a hash lookup per component.
+//! Every call walks its path from the root: a path-addressed store has no open to amortize the
+//! walk across. In RAM that is one hash lookup per component.
 
 use std::{
     collections::HashMap,
@@ -24,15 +22,13 @@ use crate::{
 
 /// The largest file this store will represent — a safety ceiling, not a capacity plan.
 ///
-/// The tree lives in the host's address space, and a write's size comes from an offset the
+/// The tree lives in the host's address space, and a write's end comes from an offset the
 /// *guest* chooses (virtio-fs bounds the byte count, not the offset). Without a ceiling one
-/// `dd seek=…` makes the host allocate arbitrarily and abort, and nothing catches the unwind
-/// between here and the virtio-fs worker. Raise it if a workload legitimately needs bigger
-/// files in RAM.
+/// `dd seek=…` makes the host allocate arbitrarily and abort, with nothing catching the unwind
+/// before the virtio-fs worker.
 const MAX_FILE_SIZE: u64 = 1 << 30;
 
-/// Bound a requested end-of-file against [`MAX_FILE_SIZE`]. Overflow counts as exceeding it:
-/// both mean a size this store will not represent.
+/// Bound a requested end-of-file against [`MAX_FILE_SIZE`]; overflow counts as exceeding it.
 fn checked_end(offset: u64, len: usize) -> io::Result<usize> {
     match offset.checked_add(len as u64) {
         Some(end) if end <= MAX_FILE_SIZE => Ok(end as usize),
@@ -51,13 +47,13 @@ enum Node {
     },
     /// The bytes and the moment they last changed, under the node's one lock.
     ///
-    /// Keeping them together is what stops an observer seeing new bytes beside an old mtime:
-    /// a guest that negotiated `AUTO_INVAL_DATA` decides from mtime alone when to drop cached
-    /// pages, so that pairing would leave it caching the new bytes forever.
+    /// Together so no observer sees new bytes beside an old mtime: a guest that negotiated
+    /// `AUTO_INVAL_DATA` drops cached pages on mtime alone, and would otherwise keep stale
+    /// pages forever.
     File {
         bytes: Vec<u8>,
         mtime: SystemTime,
-        /// Set once at creation. Nothing here changes a birth time.
+        /// Birth time; never changes.
         created: SystemTime,
     },
 }
@@ -81,10 +77,10 @@ impl Node {
         }))
     }
 
-    /// The metadata this node reports. The caller already holds its lock.
+    /// The caller already holds this node's lock.
     fn stat(&self) -> Stat {
-        // `atime`/`ctime` stay unset: `attr_for` falls back to `mtime` for both, and an
-        // access time would mean a write on every read.
+        // `atime`/`ctime` stay unset (consumers fall back to `mtime`): tracking access time
+        // would put a write on every read.
         match self {
             Node::Dir { mtime, created, .. } => Stat {
                 mtime: Some(*mtime),
@@ -103,10 +99,10 @@ impl Node {
         }
     }
 
-    /// Record that this node just changed: a directory's set of names, or a file's bytes.
+    /// Record that this node changed: a directory's set of names, or a file's bytes.
     ///
-    /// POSIX counts adding or removing a child as modifying the directory itself. Writing a
-    /// child's *contents* does not, which is why a write touches the file and not its parent.
+    /// POSIX counts adding or removing a child as modifying the directory; writing a child's
+    /// contents does not, so a write touches the file and not its parent.
     fn touch(&mut self) {
         match self {
             Node::Dir { mtime, .. } | Node::File { mtime, .. } => *mtime = SystemTime::now(),
@@ -114,15 +110,13 @@ impl Node {
     }
 }
 
-/// A directory tree held entirely in RAM.
-///
-/// For tests, scratch space, and prototyping — nothing here reaches a disk or a network.
+/// A directory tree held entirely in RAM, for tests, scratch space, and prototyping.
 pub struct InMemFs {
     root: Link,
 }
 
 impl InMemFs {
-    /// Create a fresh, empty in-memory store.
+    /// An empty store.
     pub fn new() -> Self {
         InMemFs {
             root: Node::new_dir(),
@@ -147,8 +141,8 @@ impl InMemFs {
     /// Put a file at `path` holding everything `content` yields, making the directories on
     /// the way and replacing a file already there.
     ///
-    /// The bytes are read in full before the tree is touched, so a reader that fails partway
-    /// leaves the old file — or no file — where it was.
+    /// `content` is read in full before the tree is touched, so a reader failing partway
+    /// leaves whatever was there.
     pub(crate) fn put_file(&self, path: &Path, content: impl io::Read) -> io::Result<()> {
         let comps = components(path)?;
         let (parent, name) = split_last(&comps)?;
@@ -188,8 +182,8 @@ impl InMemFs {
         self.remove(path, DirentKind::File)
     }
 
-    /// Walk `comps` from the root, making each missing directory on the way, and return the
-    /// last. A file anywhere along it is `NotADirectory`.
+    /// Walk `comps` from the root, making missing directories, and return the last. A file
+    /// anywhere along it is `NotADirectory`.
     fn dir_all(&self, comps: &[String]) -> io::Result<Link> {
         let mut cur = self.root.clone();
         for name in comps {
@@ -216,8 +210,7 @@ impl InMemFs {
         Ok(cur)
     }
 
-    /// Walk from the root to the node addressed by `comps`. Every intermediate component must
-    /// be a directory.
+    /// Walk from the root to the node addressed by `comps`.
     fn navigate(&self, comps: &[String]) -> io::Result<Link> {
         let mut cur = self.root.clone();
         for name in comps {
@@ -230,9 +223,8 @@ impl InMemFs {
         Ok(cur)
     }
 
-    /// The file at `path`, for the data plane. A directory is refused, which is where a
-    /// caller reading one finds out — a kernel rejects a *write*-mode open of a directory
-    /// itself, and lets a read open through for exactly this answer.
+    /// The file at `path`, for the data plane. A directory is refused here because a kernel
+    /// rejects only a *write*-mode open of one itself; a read open comes through for this answer.
     fn file_at(&self, path: &Path) -> io::Result<Link> {
         let link = self.navigate(&components(path)?)?;
         let is_dir = matches!(&*lock(&link), Node::Dir { .. });
@@ -242,8 +234,7 @@ impl InMemFs {
         Ok(link)
     }
 
-    /// Resolve `path`'s parent directory and final name in one step, which is what every
-    /// mutating operation needs.
+    /// Resolve `path`'s parent directory and final name.
     fn parent_of(&self, path: &Path) -> io::Result<(Link, String)> {
         let comps = components(path)?;
         let (parent, name) = split_last(&comps)?;
@@ -252,8 +243,8 @@ impl InMemFs {
 
     /// Insert a fresh node at `path`, refusing a name that is taken.
     ///
-    /// The check and the insertion happen under the parent's one lock, which is what makes
-    /// this exclusive: no other thread can slip an entry in between the two.
+    /// Check and insert happen under the parent's lock, so no other thread can slip an entry
+    /// in between.
     fn insert(&self, path: &Path, node: Link) -> io::Result<Stat> {
         let (dir, name) = self.parent_of(path)?;
         let mut parent = lock(&dir);
@@ -273,15 +264,14 @@ impl InMemFs {
     /// Detach the entry at `path` from its parent, provided it is of `expect` kind (and, for a
     /// directory, empty).
     ///
-    /// `unlink` and `rmdir` are one operation with two guards: dropping the parent's last
-    /// reference is what deletes the node either way.
+    /// Serves both `unlink` and `rmdir`: dropping the parent's reference deletes the node
+    /// either way.
     fn remove(&self, path: &Path, expect: DirentKind) -> io::Result<()> {
         let comps = components(path)?;
         let (parent, name) = split_last(&comps)?;
         let dir = self.navigate(parent)?;
         let mut node = lock(&dir);
-        // Scoped so the borrow of `children` ends before the removal — and before `touch`,
-        // which needs the node back.
+        // Scoped so the borrow of `children` ends before `touch`.
         {
             let Node::Dir { children, .. } = &mut *node else {
                 return Err(io::ErrorKind::NotADirectory.into());
@@ -325,9 +315,8 @@ impl FileSystem for InMemFs {
             let link = self.navigate(&components(path)?)?;
             let node = lock(&link);
             match &*node {
-                // The child's lock is already taken to learn its kind, and its size and
-                // timestamps are right there behind it, so full metadata is free here — a
-                // consumer that had to re-`stat` every name would pay an N+1.
+                // Full metadata is free: each child's lock is taken for its kind anyway, and
+                // it spares consumers an N+1 of `stat`s.
                 Node::Dir { children, .. } => Ok(children
                     .iter()
                     .map(|(name, child)| Dirent::with_stat(name, lock(child).stat()))
@@ -349,8 +338,7 @@ impl FileSystem for InMemFs {
             let Node::File { bytes, .. } = &*node else {
                 unreachable!("`file_at` refused a directory");
             };
-            // No `touch`: a read is not a modification, and an access time would put a write
-            // on the read path for something `attr_for` already derives.
+            // No `touch`: a read is not a modification.
             let offset = offset as usize;
             if offset >= bytes.len() {
                 return Ok(0);
@@ -384,8 +372,7 @@ impl FileSystem for InMemFs {
         offset: u64,
     ) -> BoxFuture<'a, io::Result<usize>> {
         Box::pin(async move {
-            // Bound before allocating: `offset` is the guest's choice, and `resize` would
-            // honour it literally.
+            // Bound before allocating: `offset` is the guest's choice and `resize` honours it.
             let end = checked_end(offset, buf.len())?;
             let link = self.file_at(path)?;
             let mut node = lock(&link);
@@ -396,8 +383,7 @@ impl FileSystem for InMemFs {
                 bytes.resize(end, 0);
             }
             bytes[end - buf.len()..end].copy_from_slice(buf);
-            // Under the same lock as the bytes, so no observer can pair the new contents with
-            // the old timestamp.
+            // Under the bytes' lock, so no observer pairs new contents with the old mtime.
             node.touch();
             Ok(buf.len())
         })
@@ -405,7 +391,7 @@ impl FileSystem for InMemFs {
 
     fn truncate<'a>(&'a self, path: &'a Path, size: u64) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
-            // Reaches the same `resize`, so it needs the same ceiling.
+            // Bound before `resize`: `size` is the guest's choice.
             let size = checked_end(size, 0)?;
             let link = self.file_at(path)?;
             let mut node = lock(&link);
@@ -425,14 +411,13 @@ impl FileSystem for InMemFs {
         Box::pin(async move {
             let (from_comps, to_comps) = (components(from)?, components(to)?);
 
-            // Onto itself is a no-op, checked before anything is detached — POSIX says a
-            // rename where both names refer to the same file changes nothing, and going
-            // through the move would delete the entry and then re-add it.
+            // POSIX: renaming onto itself changes nothing. Checked before anything is
+            // detached, since the move below would delete and re-add the entry.
             if from_comps == to_comps {
                 return Ok(());
             }
-            // Into its own descendant would detach the subtree from the tree, leaving a cycle
-            // reachable from nothing. `EINVAL`, as `fs::rename` gives.
+            // Into its own descendant would leave an unreachable cycle. `EINVAL`, as
+            // `fs::rename` gives.
             if to_comps.starts_with(&from_comps) {
                 return Err(io::ErrorKind::InvalidInput.into());
             }
@@ -440,9 +425,8 @@ impl FileSystem for InMemFs {
             let (from_dir, from_name) = self.parent_of(from)?;
             let (to_dir, to_name) = self.parent_of(to)?;
 
-            // Detach under the source parent's lock, then attach under the destination's.
-            // Taking both at once would deadlock whenever two renames crossed the same pair
-            // of directories in opposite directions.
+            // One parent lock at a time: holding both would deadlock two renames crossing
+            // the same pair of directories in opposite directions.
             let moving = {
                 let node = lock(&from_dir);
                 let Node::Dir { children, .. } = &*node else {
@@ -452,8 +436,8 @@ impl FileSystem for InMemFs {
             };
             let moving_is_dir = matches!(&*lock(&moving), Node::Dir { .. });
 
-            // The destination decides whether this is legal at all, so it is checked before
-            // the source is detached: a refusal must leave the tree untouched.
+            // Attach before detaching, so a refusal by the destination leaves the tree
+            // untouched.
             {
                 let mut node = lock(&to_dir);
                 let Node::Dir { children, .. } = &mut *node else {
@@ -477,8 +461,8 @@ impl FileSystem for InMemFs {
                 node.touch();
             }
 
-            // Only now does the old name go. If the two parents are the same node this
-            // re-locks it, which is why the destination's guard is already released.
+            // The destination's guard is already released, since both parents may be the
+            // same node.
             let mut node = lock(&from_dir);
             if let Node::Dir { children, .. } = &mut *node {
                 children.remove(&from_name);
@@ -493,9 +477,8 @@ fn not_found() -> io::Error {
     io::ErrorKind::NotFound.into()
 }
 
-/// Normalize a path into its plain-name components, rejecting anything that isn't a
-/// straightforward absolute-or-relative path (`.`/root are ignored, `..`, prefixes, and
-/// non-UTF-8 names are errors).
+/// A path's plain-name components: `.` and root are ignored; `..`, prefixes, and non-UTF-8
+/// names are errors.
 fn components(path: &Path) -> io::Result<Vec<String>> {
     let mut out = Vec::new();
     for comp in path.components() {
@@ -513,8 +496,7 @@ fn components(path: &Path) -> io::Result<Vec<String>> {
     Ok(out)
 }
 
-/// Split `comps` into its parent components and final name; the empty path (the root) has no
-/// name and is rejected.
+/// Split `comps` into parent components and final name; the root has no name and is rejected.
 fn split_last(comps: &[String]) -> io::Result<(&[String], &String)> {
     match comps.split_last() {
         Some((name, parent)) => Ok((parent, name)),

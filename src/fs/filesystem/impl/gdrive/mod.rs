@@ -12,9 +12,8 @@
 //! alone cannot reach everything: a shared item carries no `parents`, so no walk from a
 //! folder ever arrives at one, and a shared drive is a root of its own.
 //!
-//! A refresh token is what this backend takes, and getting one is not its job — the
-//! consent round trip belongs to whatever set the mount up, the same way the Slack lane
-//! takes a token it did not mint.
+//! This backend takes a refresh token and does not mint one: the consent round trip
+//! belongs to whatever set the mount up.
 //!
 //! **The Docs-editors types hold no bytes.** `files.get?alt=media` answers 403 for a Doc, a
 //! Sheet or a Slides deck, because Drive can only export a rendering of one. Each is served
@@ -43,16 +42,15 @@
 //! or move touches anybody else's. The root's sections are not tagged — they are names this
 //! store invents rather than names Drive gave.
 //!
-//! **A listing says which of the two an entry was, by its extension.** An uploaded
-//! `.pptx` keeps its name; a Google Slides deck is served as `<name>.gslide.json`, the
-//! deck as its own API describes it. That is deliberate — the alternative was an Office
-//! export, which reads like a real file and cannot be read at all.
+//! **The extension tells a blob from a document.** An uploaded `.pptx` keeps its name; a
+//! Google Slides deck is served as `<name>.gslide.json`, the deck as its own API describes
+//! it, rather than as an Office export that reads like a real file and cannot be read.
 //!
 //! ## Why not the Office export
 //!
-//! It was tried, and reverted. `files.export` caps at 10 MB and refuses past it, not even
-//! in pieces — a 5 MiB range and a 1 MiB range both drew `403`, after 48 and 41 seconds
-//! spent rendering the export they then refused. The `exportLinks` URL has no such cap,
+//! `files.export` caps at 10 MB and refuses past it, not even in pieces — a 5 MiB range
+//! and a 1 MiB range both drew `403`, after 48 and 41 seconds spent rendering the export
+//! they then refused. The `exportLinks` URL has no such cap,
 //! but it declares no length either: no `Content-Length`, `HEAD` answers `0`, ranges are
 //! ignored. So the only way to learn how long an export is, is to render it — measured
 //! at 1.5-1.8 s for a document, 1.3-2.6 s for a spreadsheet, 8.8-39.6 s for a deck.

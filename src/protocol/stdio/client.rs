@@ -1,42 +1,26 @@
-//! The asking end, over a framed channel: one call out, one response back.
+//! The asking end over a framed channel: one call out, one response back.
 //!
-//! A client only asks. Nothing arrives on this channel but the answers to what it
-//! asked — there is no request a server issues — so this is a send, a read and a match:
-//! no tasks, no locks, no pending table.
+//! Only answers arrive on this channel, so a call is a send, a read and a match: no tasks,
+//! locks or pending table. The methods come from [`Client`]; this adds an id per call and
+//! waiting for the response carrying it.
 //!
-//! The protocol's methods come from [`Client`]. What is here is only what the wire adds:
-//! an id per call, and waiting for the response that brings it back.
+//! # The pipes and their process
 //!
-//! # The pipes, and the process they belong to
+//! [`new`](StdioClient::new) starts the server program; the caller chooses the command,
+//! arguments and environment, and this end sets the protocol's descriptors.
 //!
-//! A client over stdio is a client over some program's pipes, so [`new`](StdioClient::new)
-//! takes the program and starts it. What a caller decides is the command — what to run,
-//! with what arguments and environment; the two descriptors the
-//! protocol runs on are this end's, because a caller who got those wrong would have a
-//! client with nothing to say.
+//! [`quit`](Client::quit) drops the writer (how the server learns the session is over) and
+//! waits for the process. Dropping an unquit client, or the whole process exiting, ends it
+//! the same way minus the wait, since nothing may await on drop.
 //!
-//! The pipes and the process are therefore one fact, and this end holds both.
-//! [`quit`](Client::quit) is the ending: the writer is dropped — which is how a
-//! server learns the session is over — and then the process is waited for. Dropping a
-//! client that was never quit is the same ending without the wait: the writer goes with
-//! it, the server reads the end of its input and takes itself down, and nobody is left to
-//! collect the status. Collecting a process is an `await`, and nothing may await on the
-//! way out. A client whose whole process goes ends the same way, because the operating
-//! system closes the pipe.
+//! **The server is never killed**, so it can release what the session made (a machine, a
+//! disk, a built image) when its input ends. The cost: a server stuck in a call outlives
+//! the client until that call returns.
 //!
-//! **Not killed**, which is what this end once did on a drop. A server killed has no
-//! chance to release what the session made — a machine, a disk, an image built for it —
-//! and one that reads the end of its input does. The cost is that a server stuck in a call
-//! outlives the client until that call returns.
-//!
-//! Which is why the process is not a [`ConsoleClient`]'s. What a session *is* — the methods, the
-//! tree they are spelled against — is the same wherever a server runs; something to `wait`
-//! for exists only because this transport is a pipe to a child. A transport into a
-//! micro-VM guest is a channel with no process behind it, and a `ConsoleClient` over one should
-//! not carry a field for a thing that does not exist.
-//!
-//! [`ConsoleClient`] is this plus the session it was built with, and is what a caller normally
-//! wants.
+//! The process lives here, not on [`ConsoleClient`], because only a pipe-to-child
+//! transport has one; a micro-VM guest channel has no process behind it.
+//! [`ConsoleClient`] is this plus the session it was built with, and is what a caller
+//! normally wants.
 //!
 //! [`ConsoleClient`]: crate::console::ConsoleClient
 
@@ -56,54 +40,35 @@ use crate::protocol::{
 
 /// A [`Client`] over a server process's pipes, and the process itself.
 ///
-/// The two directions are separate fields and not a pair, because that is what they
-/// are: what goes out has nothing to do with what comes back beyond the framing they
-/// share, and holding them apart is what lets [`call`](Client::call) write and then
-/// read without giving up one borrow for the other.
+/// The directions are separate fields so [`call`](Client::call) can borrow both at once.
 ///
-/// Trait objects rather than the child's own descriptor types. Reading frames and writing
-/// them is all this end does with either, so naming the types would buy nothing and cost
-/// two things: a writer that can be let go of when the session ends without the field
-/// becoming an `Option`, and a test that can drive this over a canned stream instead of a
-/// process.
+/// Trait objects rather than the child's descriptor types, so the writer can be swapped
+/// for a sink at `quit` without an `Option`, and tests can drive a canned stream.
 pub struct StdioClient {
-    /// Where responses come from.
-    ///
-    /// Buffered here, once. Nothing hands this to a command — it is the protocol's for
-    /// the life of the session — so reading ahead cannot take a byte that was somebody
-    /// else's.
+    /// Where responses come from. Buffering is safe: the protocol owns this for the
+    /// session's lifetime, so reading ahead takes no one else's bytes.
     incoming: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
 
-    /// Where calls go — the server's stdin, until [`quit`](Client::quit) closes it.
+    /// The server's stdin, until [`quit`](Client::quit) closes it.
     outgoing: Box<dyn AsyncWrite + Send + Unpin>,
 
-    /// The process those pipes belong to.
-    ///
-    /// `None` once it has been collected, which is all this `Option` says and the only
-    /// state either end of the session needs: a client with no process left is a client
-    /// whose session is over, so nothing has to be tracked twice.
+    /// The process those pipes belong to; `None` once collected, which also means the
+    /// session is over.
     server: Option<Child>,
 
     stderr: Option<JoinHandle<()>>,
 
-    /// From zero, by one. Nothing on the other side reads a meaning into the number,
-    /// and it only has to be unique among this client's own — see [`RequestId`].
+    /// Unique only among this client's calls; see [`RequestId`].
     next_id: RequestId,
 }
 
 impl StdioClient {
-    /// Start `server` and drive the session over its own pipes.
+    /// Start `server` and drive the session over its pipes.
     ///
-    /// Everything about the command is the caller's — what to run, its arguments, its
-    /// environment — except the descriptors the protocol needs, which this end sets. A
-    /// caller who got those wrong would have a client with nothing to say, so they are not
-    /// something to get wrong.
+    /// The caller's command settings are kept except stdin, stdout and stderr, which this
+    /// sets. Nothing else may touch the pipes, or it would steal response bytes.
     ///
-    /// The pipes are the protocol's from here on, and so is the process: nothing else may
-    /// reach either, because a reader that could would take a byte that was a response's.
-    ///
-    /// Starting a process registers it with the runtime that will reap it, so this is
-    /// called from a task or from `main` and not from anywhere at all.
+    /// Must be called within a Tokio runtime, which registers the child for reaping.
     pub fn new(mut server: Command) -> io::Result<StdioClient> {
         let mut server = server
             .stdin(Stdio::piped())
@@ -111,7 +76,7 @@ impl StdioClient {
             .stderr(Stdio::piped())
             .spawn()?;
 
-        // Both are `Some`: they were asked for immediately above.
+        // `Some`: piped just above.
         let outgoing = server.stdin.take().expect("a piped stdin");
         let incoming = server.stdout.take().expect("a piped stdout");
         let mut said = server.stderr.take().expect("a piped stderr");
@@ -128,12 +93,8 @@ impl StdioClient {
         })
     }
 
-    /// A client over two descriptors and no process, for the tests below.
-    ///
-    /// Which is where a canned stream of what a server *would* have said comes from — a
-    /// server that has lost track of its own ids is not something a real program does on
-    /// request. Not public: what a caller has is a program to run, and a client that could
-    /// be built without one would have a process to collect on some paths and not others.
+    /// A client over two descriptors and no process, so tests can replay canned server
+    /// output (e.g. a server that lost track of its ids).
     #[cfg(test)]
     fn over(
         incoming: impl AsyncRead + Send + Unpin + 'static,
@@ -162,9 +123,8 @@ impl StdioClient {
 
     /// Put a request out under `id` and read until the response carrying it arrives.
     ///
-    /// Split from [`call`](Client::call) so that the id can be spent before this runs and
-    /// handed back whichever way this goes — a `?` in here would otherwise take the
-    /// number with it.
+    /// Separate from [`call`](Client::call) so the id is spent before any `?` here can
+    /// return early.
     async fn round_trip(&mut self, id: RequestId, call: Call) -> Result<Response, Failure> {
         self.send(&Message::Request { id, call }).await?;
 
@@ -176,11 +136,8 @@ impl StdioClient {
             };
 
             match message {
-                // An [`Error`](crate::console::Response::Error) becomes a
-                // [`Refused`](Failure::Refused) here rather than travelling on as a
-                // `Response`: a caller of this method wanted the answer, and "there is
-                // none" is the one thing every caller handles the same way, alongside a
-                // channel that broke. Which of the two it was is what `Failure` says.
+                // An error response becomes `Refused`, so callers handle "no answer" as a
+                // `Failure` alongside a broken channel.
                 Message::Response {
                     id: answered,
                     result,
@@ -208,17 +165,14 @@ impl StdioClient {
 impl Client for StdioClient {
     /// Send one call and read until the response with its id arrives.
     ///
-    /// Anything else that arrives is a server that has lost track of itself. A
-    /// response to a call nobody made is noted and dropped; a *request* is a server
-    /// trying to be a client, which this end has no answer for.
+    /// A response to an unissued id is logged and dropped; a request from the server
+    /// breaks the channel.
     ///
-    /// The whole round trip is one future over both descriptors, which is what makes the
-    /// pairing sound: nothing else can put a frame on the wire between the request and
-    /// the response that answers it, because nothing else holds the borrow.
+    /// The round trip holds both descriptors in one borrow, so no other frame can come
+    /// between the request and its response.
     fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Response, Failure>> {
         Box::pin(async move {
-            // Spent before the send rather than after the answer, so a call that fails
-            // part way does not leave its id for the next one to reuse.
+            // Spent before sending, so a failed call's id is never reused.
             let id = self.next_id;
             self.next_id += 1;
 
@@ -230,22 +184,16 @@ impl Client for StdioClient {
         Box::pin(async move { self.send(&Message::Notification(notification)).await })
     }
 
-    /// Say the session is over, close the pipe, and wait for the server to go.
+    /// Say the session is over, close the pipe, and wait for the server to exit.
     ///
-    /// In that order, and each step because of the next one. A server ends on `quit`; one
-    /// that somehow missed it still sees its stdin end, and a `wait` that kept the pipe
-    /// open would be a wait that does not return. The writer is swapped for a sink rather
-    /// than removed — anything asked after a session is over goes nowhere, which is what a
-    /// closed pipe would have made of it anyway.
+    /// The pipe must close before `wait`, so a server that missed `quit` still sees EOF
+    /// instead of hanging. The writer becomes a sink, so later sends go nowhere.
     ///
-    /// What comes back is the process's ending and not the notification's: a server that
-    /// exited cleanly did not need to hear `quit` to know, and a send that failed is a
-    /// server that was already gone. A bad exit is a [`Broken`](Failure::Broken) carrying
-    /// the status — nothing can be done about it by then, but a server that died is not the
-    /// ending a caller asked for. With no process to collect, the notification is the whole
-    /// of the ending and its result is what this is.
+    /// Returns the process's outcome, not the notification's (a failed send just means
+    /// the server was already gone): a non-zero exit is [`Broken`](Failure::Broken) with
+    /// the status. With no process, the notification's result is returned.
     ///
-    /// Calling this twice is not an error; the second time there is nothing left to collect.
+    /// Idempotent: a second call has nothing to collect.
     fn quit(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async move {
             let said = self.notify(Notification::Quit).await;
@@ -274,8 +222,7 @@ impl Client for StdioClient {
     }
 }
 
-/// An [`io::Error`] on this channel is about the session and not the call: there is no
-/// answer and there will not be one.
+/// An [`io::Error`] here breaks the session, not just the call.
 fn broke(doing: &'static str) -> impl FnOnce(io::Error) -> Failure {
     move |e| Failure::Broken(anyhow::Error::new(e).context(doing))
 }
@@ -292,11 +239,8 @@ mod tests {
     use super::*;
     use crate::protocol::{Error, ExecCall, ExecResp, InitCall, InitResp, Method, ReadCall};
 
-    /// Everything the client wrote, readable after it has been dropped or not — a
-    /// `Vec` cannot be, once the client owns it.
-    ///
-    /// Never actually pends: a write into memory has nothing to wait for, so every poll
-    /// is a `Ready`.
+    /// Everything the client wrote, readable while the client still owns the writer.
+    /// Never pends.
     #[derive(Clone, Default)]
     struct Sent(Arc<Mutex<Vec<u8>>>);
 
@@ -332,9 +276,7 @@ mod tests {
         }
     }
 
-    /// A client over a canned stream of what a server would have said — which is
-    /// enough for the whole protocol, now that everything this end reads is a
-    /// response.
+    /// A client over a canned stream of server output.
     async fn driving(incoming: &[Message]) -> (StdioClient, Sent) {
         let mut bytes = Vec::new();
         for message in incoming {
@@ -344,7 +286,7 @@ mod tests {
         (StdioClient::over(Cursor::new(bytes), sent.clone()), sent)
     }
 
-    /// An execution that ran and ended, which is what a server answers an `exec` with.
+    /// A successful `exec` response.
     fn ran(id: RequestId, stdout: &[u8]) -> Message {
         Message::Response {
             id,
@@ -356,8 +298,7 @@ mod tests {
         }
     }
 
-    /// A session taken as it was described, with nothing said about a context — which is
-    /// what an `init` that named none is answered with.
+    /// A default `init` response.
     fn initialized(id: RequestId) -> Message {
         Message::Response {
             id,
@@ -365,17 +306,14 @@ mod tests {
         }
     }
 
-    /// The ordinary session, and the ids it allocates: from zero, by one — over the
-    /// calls alone, since the three notifications in here are not answered and so are
-    /// not numbered.
+    /// Ids count from zero over calls only; notifications take none.
     #[tokio::test]
     async fn a_session_is_init_then_execs() {
         let (mut client, sent) = driving(&[initialized(0), ran(1, b"hi\n")]).await;
 
         client.init(InitCall::default()).await.unwrap();
         client.start().await.unwrap();
-        // The `exec` goes out under id 1: `init` took zero, and the two notifications
-        // between them take none.
+        // Id 1: `init` took 0, and `start` takes none.
         let result = client
             .exec(ExecCall {
                 cmd: vec!["sh".into(), "-c".into(), "echo hi".into()],
@@ -398,7 +336,7 @@ mod tests {
         );
     }
 
-    /// The two failures a caller does different things about.
+    /// A refusal carries a code; a closed channel does not.
     #[tokio::test]
     async fn a_refusal_is_an_answer_and_a_closed_channel_is_not() {
         let (mut client, _) = driving(&[Message::Response {
@@ -419,8 +357,7 @@ mod tests {
         );
     }
 
-    /// A response to a call nobody made is dropped; a request is not something this
-    /// end can answer at all.
+    /// A response to an unissued id is dropped; a request from the server is an error.
     #[tokio::test]
     async fn a_client_answers_nothing() {
         let (mut client, _) = driving(&[ran(99, b"who asked"), ran(0, b"mine\n")]).await;
@@ -436,12 +373,8 @@ mod tests {
         assert!(failure.to_string().contains("cannot answer"), "{failure}");
     }
 
-    /// The process is the client's, so how it ended is the client's to report — and
-    /// `quit` is where a caller hears it.
-    ///
-    /// Neither of these programs speaks the protocol, which is the point: what is being
-    /// tested is the ending, and an ending is the one thing this end does not need an
-    /// answer for.
+    /// `quit` reports how the server process exited. These programs do not speak the
+    /// protocol; only the ending is tested.
     #[tokio::test]
     async fn quitting_collects_the_server_and_says_how_it_went() {
         let mut ends_badly = Command::new("sh");
@@ -452,8 +385,7 @@ mod tests {
         assert_eq!(failure.code(), None, "a dead server is not a refusal");
         assert!(failure.to_string().contains("exit status: 3"), "{failure}");
 
-        // Collected once. A second `quit` has nothing left to wait for and says nothing
-        // about a status it already reported.
+        // A second `quit` has nothing to collect and does not re-report the status.
         client.quit().await.unwrap();
 
         let mut ends_well = Command::new("sh");
@@ -461,13 +393,10 @@ mod tests {
         StdioClient::new(ends_well).unwrap().quit().await.unwrap();
     }
 
-    /// An id is spent whether or not its call worked, so a failed call cannot leave its
-    /// number for the next one to reuse — which is visible only on the wire, since a
-    /// caller is handed the answer and not the number.
+    /// A failed call still spends its id (visible only on the wire).
     #[tokio::test]
     async fn a_failed_call_still_spends_its_id() {
-        // Nothing is ever answered, so both calls fail — after their requests have
-        // already gone out, which is the part that matters.
+        // Both fail unanswered, after their requests went out.
         let (mut client, sent) = driving(&[]).await;
         assert!(client.exec(ExecCall::default()).await.is_err());
         assert!(client.read(ReadCall::default()).await.is_err());

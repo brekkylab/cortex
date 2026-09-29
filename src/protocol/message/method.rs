@@ -1,9 +1,5 @@
-//! The name a method goes by on the wire.
-//!
-//! Its own file because all three of [`Call`](super::Call),
-//! [`Notification`](super::Notification) and [`Response`](super::Response) name it, and
-//! none of them owns it: which methods exist is the protocol's, and which side a given
-//! one is on is [`is_notification`](Method::is_notification).
+//! The name a method goes by on the wire, shared by [`Call`](super::Call),
+//! [`Notification`](super::Notification) and [`Response`](super::Response).
 
 use std::fmt;
 
@@ -46,11 +42,10 @@ impl Method {
         }
     }
 
-    /// Whether this method is one nothing answers.
+    /// Whether nothing answers this method.
     ///
-    /// Which side a method is on is what JSON-RPC's `id` decides, and it is a property
-    /// of the method rather than of the message carrying it — so both halves ask here
-    /// rather than each keeping its own list.
+    /// A property of the method, not the message, so both halves ask here instead of
+    /// keeping their own lists.
     pub fn is_notification(&self) -> bool {
         matches!(self, Method::Start | Method::Stop | Method::Quit)
     }

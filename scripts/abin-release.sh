@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build cortex's own executables for the guest and publish them.
+# Build cortex's own guest executables and publish them.
 #
 #   scripts/abin-release.sh
 #       Build every OS below, upload, and move `abin/latest` to this commit.
@@ -12,36 +12,30 @@
 #   scripts/abin-release.sh --latest-pointer-only
 #       Move `abin/latest` to this commit and do nothing else.
 #
-# The git sha of HEAD names the release. That is the whole of its identity — nothing
-# downstream verifies the bytes — which is why a dirty tree is refused below.
+# HEAD's git sha names the release and is its whole identity (nothing downstream verifies the
+# bytes), so a dirty tree is refused.
 #
 # # The latest-pointer, and why moving it is separable
 #
-# `abin/latest` holds one line: the sha of the release a session should use when it has been
-# told nothing. Everything below calls it the **latest-pointer**.
-#
-# It has to name a release that is *completely* uploaded. In one run that is just "write it
-# last". Across a matrix of OSes building in parallel it cannot be: every job would move the
-# latest-pointer itself, and whichever finished last would win regardless of whether the
-# others had. So the builders run with `--no-latest-pointer`, and one job afterwards runs
-# `--latest-pointer-only`.
-#
-# A release the latest-pointer never reaches is inert rather than broken: its tarballs sit
-# under a sha nothing refers to. That is the property that makes the split safe.
+# `abin/latest` holds one line, the **latest-pointer**: the sha of the release a session uses
+# when told nothing. It must name a *completely* uploaded release. One run just writes it last,
+# but in a parallel OS matrix every job would move it and the last to finish would win whether
+# or not the others had. So builders run with `--no-latest-pointer`, and one job afterwards
+# runs `--latest-pointer-only`. That split is safe because a release the pointer never reaches
+# is inert, not broken: its tarballs sit under a sha nothing refers to.
 set -euo pipefail
 
 BUCKET="${ABIN_BUCKET:-cortex-dist-044443350235-us-east-1-an}"
 
 die() { echo "abin-release: $*" >&2; exit 1; }
 
-# Every OS this script knows how to build, in the order it builds them. One entry today: the
-# guest is Linux and the guest is the only consumer. A host build — if the local console
-# server is ever given an `/abin` — is a new line here and a new matrix entry in CI, and
-# nothing else: the key layout already carries the OS.
+# Every OS this script builds, in build order. Only Linux, since the guest is the only
+# consumer. The key layout already carries the OS, so another is a line here plus a CI matrix
+# entry.
 ALL_OSES=(linux)
 
-# `<arch>:<rust target>` per OS. `<arch>` is what goes in the filename and matches
-# `std::env::consts::ARCH`, which is what the client builds its URL from.
+# `<arch>:<rust target>` per OS. `<arch>` goes in the filename and matches
+# `std::env::consts::ARCH`, which the client builds its URL from.
 targets_for() {
   case "$1" in
     linux) echo "aarch64:aarch64-unknown-linux-musl x86_64:x86_64-unknown-linux-musl" ;;
@@ -71,21 +65,18 @@ done
 [ "$LATEST_POINTER_ONLY" = 0 ] || [ "$LATEST_POINTER" = 1 ] \
   || die "--latest-pointer-only and --no-latest-pointer ask for opposite things"
 [ ${#OSES[@]} -gt 0 ] || OSES=("${ALL_OSES[@]}")
-# Validated before anything is built, so a typo is a sentence rather than a surprise after
-# the first architecture has already been compiled and uploaded.
+# Validate before building, so a typo fails before any architecture is compiled and uploaded.
 for os in "${OSES[@]}"; do targets_for "$os" >/dev/null; done
 
-# Credentials come from wherever the aws CLI normally finds them. On a laptop that is a
-# named profile and there is one obvious choice; in CI it is the environment, and naming a
-# profile that does not exist there is an error rather than a default. So this fills in the
-# laptop case and otherwise keeps out of the way — `--profile` is never passed explicitly,
-# because doing so would override the environment it is trying to defer to.
+# Credentials come from the aws CLI's usual sources. Default the profile only when neither a
+# profile nor env keys are set (a laptop); in CI a named profile that does not exist is an
+# error. `--profile` is never passed, since it would override the environment.
 if [ -z "${AWS_PROFILE:-}" ] && [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
   export AWS_PROFILE=brekkylab
 fi
 
-# Prerequisites, said as sentences rather than left to fail as tool errors — and only the
-# ones this invocation will actually reach. Moving the latest-pointer compiles nothing.
+# Check only the prerequisites this invocation reaches, as readable errors rather than tool
+# failures. Moving the latest-pointer compiles nothing.
 [ "$DRY_RUN" = 1 ] || command -v aws >/dev/null || die "the aws CLI is not on PATH"
 if [ "$LATEST_POINTER_ONLY" = 0 ]; then
   command -v zig >/dev/null || die "zig is not on PATH (brew install zig)"
@@ -100,8 +91,8 @@ if [ "$LATEST_POINTER_ONLY" = 0 ]; then
   done
 fi
 
-# The sha is the identity. A tarball built from uncommitted changes and filed under this
-# sha would make the path lie, and nothing downstream would catch it.
+# A tarball built from uncommitted changes and filed under this sha would make the path lie,
+# undetected downstream.
 [ -z "$(git status --porcelain)" ] || die "the working tree is dirty; commit or stash first"
 
 SHA="$(git rev-parse HEAD)"
@@ -128,9 +119,8 @@ if [ "$LATEST_POINTER_ONLY" = 1 ]; then
   exit 0
 fi
 
-# Where cargo actually writes. Hardcoding `target` is wrong wherever CARGO_TARGET_DIR is
-# set, which is most CI and any shared-cache setup — and it would fail at the `tar` below
-# with a missing path rather than anywhere informative.
+# Where cargo actually writes: CARGO_TARGET_DIR is set in most CI and shared-cache setups,
+# where a hardcoded `target` would fail at `tar` with an uninformative missing path.
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 
 built=()
@@ -141,7 +131,7 @@ for os in "${OSES[@]}"; do
     name="abin-$os-$arch.tar.gz"
     echo "abin-release: building $triple" >&2
     cargo zigbuild -p cortex-exec-mem -p cortex-exec-index --release --target "$triple"
-    # Flat: `mem` and `index` at the top level, which is exactly what /abin holds.
+    # Flat: `mem` and `index` at the top level, exactly as /abin holds them.
     tar czf "$OUT/$name" -C "$TARGET_DIR/$triple/release" mem index
     built+=("$name")
   done
@@ -160,9 +150,8 @@ for name in "${built[@]}"; do
     "s3://$BUCKET/abin/$SHA/$name"
 done
 
-# Last, so there is no window in which the latest-pointer names a half-uploaded release.
-# Suppressed by `--no-latest-pointer`, which is how a matrix leaves the move to the one job
-# that knows every other has finished.
+# Last, so the latest-pointer never names a half-uploaded release. `--no-latest-pointer`
+# skips it, leaving the move to the one matrix job that runs after every other finished.
 if [ "$LATEST_POINTER" = 1 ]; then
   move_latest_pointer
 fi
