@@ -1,10 +1,13 @@
-# Build the Node and Python bindings for every platform they are published for, pack them
-# as they would be published, and install and run them the way a user would.
+# Build every package cortex is published as -- the Node and Python bindings for every
+# platform, and the Rust crate -- pack them as they would be published, and install and run
+# them the way a user would.
 #
 # Nothing here publishes. The npm packages go to a registry on the test runner's own
 # localhost, so `npm install @brekkylab/cortex` resolves its optional platform packages by
 # os/cpu/libc exactly as it would from npmjs; the wheels are installed with pip choosing one
-# from a directory, as it would choose from PyPI.
+# from a directory, as it would choose from PyPI; and the crate is published to
+# cargo-http-registry on localhost, for a project of its own to take `cortex` from and build
+# on each platform, as it would from crates.io.
 #
 # # Platforms
 #
@@ -24,35 +27,40 @@
 #
 # Each build is pinned to the cortex-krun release its platform's `latest` names at build
 # time (`CORTEX_KRUN_PINNED_VERSION`, see `src/ensure.rs`), so one version of a package
-# always fetches the server it was tested with.
-name: bindings
+# always fetches the server it was tested with. The crate is compiled by its user rather
+# than here, so it carries the version as a file instead (`cortex-krun.version`, see
+# `build.rs`), and being one package for every platform, it pins the release all four
+# platforms' `latest` agree on -- and is not packed while they disagree.
+name: packages
 
 on:
   push:
     branches: [main, ci/bindings-packages]
     paths:
-      - .github/workflows/bindings.yml
+      - .github/workflows/packages.yml
       - bindings/**
-      - scripts/bindings/**
+      - scripts/packages/**
       - src/**
       - contrib/**
       - build.rs
       - Cargo.toml
       - Cargo.lock
+      - LICENSE-*
   pull_request:
     paths:
-      - .github/workflows/bindings.yml
+      - .github/workflows/packages.yml
       - bindings/**
-      - scripts/bindings/**
+      - scripts/packages/**
       - src/**
       - contrib/**
       - build.rs
       - Cargo.toml
       - Cargo.lock
+      - LICENSE-*
   workflow_dispatch:
 
 concurrency:
-  group: bindings-${{ github.ref }}
+  group: packages-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -218,7 +226,7 @@ jobs:
         run: |
           npm ci
           npx napi artifacts --output-dir artifacts
-          node ../../scripts/bindings/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
+          node ../../scripts/packages/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
           ls -la "$GITHUB_WORKSPACE/dist/npm"
           tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-cortex-0.1.0.tgz package/package.json
 
@@ -239,9 +247,47 @@ jobs:
           path: dist/wheels/*.whl
           if-no-files-found: error
 
+  # The crate, packed once: it is source, and each platform's test builds it for itself.
+  crate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crate
+
+      - name: Pin the server release
+        run: |
+          versions=$(for p in macos-aarch64 linux-x86_64 linux-aarch64 windows-x86_64; do
+            curl -fsS "$DIST_URL/cortex-krun/$p/latest" || echo none
+          done | sort -u)
+          echo "cortex-krun latest: $versions"
+          if [ "$(printf '%s\n' "$versions" | wc -l)" -ne 1 ] || [ "$versions" = none ]; then
+            echo "::error::the platforms' latest name different releases; release cortex-krun with latest first"
+            exit 1
+          fi
+          echo "$versions" > cortex-krun.version
+
+      # Verified as cargo verifies it: the packed source, alone, built. `--allow-dirty` for
+      # `cortex-krun.version`, written above and in no commit.
+      - name: Pack
+        run: |
+          cargo package --allow-dirty
+          cargo package --list --allow-dirty
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate
+          path: target/package/*.crate
+          if-no-files-found: error
+
   test:
     name: test (${{ matrix.platform }})
-    needs: assemble
+    needs: [assemble, crate]
     strategy:
       fail-fast: false
       matrix:
@@ -267,14 +313,14 @@ jobs:
             server: "1"
             vm: "0"
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       SMOKE_SERVER: ${{ matrix.server }}
       SMOKE_VM: ${{ matrix.vm }}
     steps:
       - uses: actions/checkout@v4
         with:
-          sparse-checkout: scripts/bindings
+          sparse-checkout: scripts/packages
 
       - uses: actions/setup-node@v4
         with:
@@ -294,6 +340,11 @@ jobs:
           name: wheels
           path: dist/wheels
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: crate
+          path: dist/crate
+
       - name: Let this user open /dev/kvm
         if: matrix.vm == '1'
         run: |
@@ -308,7 +359,7 @@ jobs:
       - name: Install from a local registry
         shell: bash
         run: |
-          cd scripts/bindings
+          cd scripts/packages
           npx -y verdaccio@6 --config ./verdaccio.yaml --listen 4873 > "$RUNNER_TEMP/verdaccio.log" 2>&1 &
           for _ in $(seq 60); do curl -sf http://localhost:4873/-/ping >/dev/null && break; sleep 1; done
           token=$(curl -sf -X PUT -H 'content-type: application/json' \
@@ -341,8 +392,8 @@ jobs:
         env:
           SMOKE_MOUNT: "0"
         run: |
-          cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/bindings/smoke/node.mjs"
-          "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/bindings/smoke/python.py"
+          cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
+          "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"
 
       - name: FUSE-T
         if: runner.os == 'macOS'
@@ -352,15 +403,55 @@ jobs:
         shell: bash
         env:
           SMOKE_MOUNT: ${{ matrix.mount }}
-        run: cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/bindings/smoke/node.mjs"
+        run: cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
 
       - name: Smoke, Python
         shell: bash
         env:
           SMOKE_MOUNT: ${{ matrix.mount }}
-        run: '"$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/bindings/smoke/python.py"'
+        run: '"$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"'
 
-      - name: verdaccio log
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A registry on localhost holding only the packed crate, published from that archive
+      # as it is, and a project of its own that takes `cortex` from it -- built here, with
+      # this platform's toolchain, as a user's would be. A CARGO_HOME of its own, so that no
+      # crates.io token is within reach, and a CORTEX_HOME of its own, so that
+      # `ensure_cortex` fetches the release the crate pins rather than finding the one the
+      # other smokes left. After FUSE-T: on macOS the crate builds against its headers.
+      - name: Smoke, Rust
+        shell: bash
+        env:
+          SMOKE_MOUNT: ${{ matrix.mount }}
+        run: |
+          cargo install --locked --quiet cargo-http-registry
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home" CORTEX_HOME="$RUNNER_TEMP/cortex-home-rust"
+          mkdir -p "$CARGO_HOME" "$RUNNER_TEMP/crate"
+          printf '[registries.local]\nindex = "http://127.0.0.1:35503/git"\n\n[net]\ngit-fetch-with-cli = true\n' > "$CARGO_HOME/config.toml"
+          cargo-http-registry --addr 127.0.0.1:35503 "$RUNNER_TEMP/registry" > "$RUNNER_TEMP/registry.log" 2>&1 &
+          for _ in $(seq 60); do [ -f "$RUNNER_TEMP/registry/config.json" ] && break; sleep 1; done
+
+          # From stdin: GNU tar takes the `D:` of a Windows path for a remote host.
+          (cd "$RUNNER_TEMP/crate" && tar -xzf - < "$(ls "$GITHUB_WORKSPACE"/dist/crate/*.crate)")
+          package=$(ls -d "$RUNNER_TEMP"/crate/*/)
+          (cd "$package" && cargo publish --registry local --no-verify --token local)
+
+          cp -R "$GITHUB_WORKSPACE/scripts/packages/smoke/rust" "$RUNNER_TEMP/smoke-rust"
+          cd "$RUNNER_TEMP/smoke-rust"
+          cargo build --quiet
+          grep -q 'registry+http://127.0.0.1:35503' Cargo.lock \
+            || { echo "::error::cortex did not come from the local registry"; exit 1; }
+          echo "PASS cortex came from the local registry"
+          pin=$(cat "$package/cortex-krun.version")
+          exe=target/debug/cortex-smoke; [ -f "$exe" ] || exe=$exe.exe
+          grep -aq "$pin" "$exe" \
+            || { echo "::error::the build does not carry the pinned cortex-krun $pin"; exit 1; }
+          echo "PASS the build fetches cortex-krun $pin by default"
+          "$exe"
+
+      - name: registry logs
         if: failure()
         shell: bash
-        run: cat "$RUNNER_TEMP/verdaccio.log" || true
+        run: |
+          cat "$RUNNER_TEMP/verdaccio.log" || true
+          cat "$RUNNER_TEMP/registry.log" || true

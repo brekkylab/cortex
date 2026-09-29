@@ -1,7 +1,7 @@
 // Pack the Node packages as `napi pre-publish` would publish them: every platform
 // package, and the root with each of them as an optional dependency at its version.
 //
-//   node ../../scripts/bindings/pack-npm.mjs <out-dir> [--allow-missing]   (from bindings/node, after `napi artifacts`)
+//   node ../../scripts/packages/pack-npm.mjs <out-dir> [--allow-missing]   (from bindings/node, after `napi artifacts`)
 //
 // `--allow-missing` packs only the platform packages that have their binary, and still
 // names every one in the root -- for a local run on one machine. A release packs all.
@@ -30,6 +30,8 @@ for (const dir of fs.readdirSync('npm').sort()) {
 }
 const staged = fs.mkdtempSync(path.join(out, 'root-'))
 for (const file of [...root.files, 'README.md']) fs.copyFileSync(file, path.join(staged, file))
+// The licenses are the repository's, two levels up; npm packs a LICENSE* file whatever `files` says.
+for (const file of ['LICENSE-MIT', 'LICENSE-APACHE']) fs.copyFileSync(path.join('..', '..', file), path.join(staged, file))
 fs.writeFileSync(path.join(staged, 'package.json'), JSON.stringify({ ...root, optionalDependencies: optional }, null, 2) + '\n')
 execFileSync('npm', ['pack', '--pack-destination', out], { cwd: staged, stdio: 'inherit', shell: process.platform === 'win32' })
 fs.rmSync(staged, { recursive: true })
