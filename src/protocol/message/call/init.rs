@@ -506,8 +506,8 @@ impl std::error::Error for InvalidMount {}
 /// that arrives while nothing is booted waits for the next boot rather than being refused.
 ///
 /// A connection reaches whatever in the session listens on `console`, whichever address it
-/// listens on — its own loopback included — and is refused, as a machine on a network would
-/// refuse it, when nothing does.
+/// listens on — its own loopback included — and is closed, as soon as it is accepted, when
+/// nothing does.
 ///
 /// # Both numbers, always
 ///
