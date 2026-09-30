@@ -10,16 +10,13 @@ pub(crate) const OAUTH_ORIGIN: &str = "https://oauth2.googleapis.com";
 
 /// Where to reach each Google service. `None` = the real host.
 ///
-/// Drive, Docs, Sheets and Slides are four APIs on four hosts, and a deployment that is
-/// not production Google may put any of them anywhere — so no single origin stands in for
-/// all of them and each is overridable on its own. Whatever is set here is an *origin*:
-/// this code appends only the suffix the official API uses, so the same paths address a
-/// mock and production alike.
+/// Drive, Docs, Sheets and Slides are four APIs on four hosts, so each is overridable on
+/// its own. Each value is an *origin*: only the official API's suffix is appended, so the
+/// same paths address a mock and production alike.
 ///
 /// **Deployment-level only: the token endpoint receives the app's client secret, so none
-/// of this may be user-suppliable.** It derives `Deserialize` for a config file read by
-/// whoever runs the mount, not for a field filled in from a request — pointing `oauth`
-/// somewhere is pointing the client secret there.
+/// of this may be user-suppliable.** `Deserialize` is for an operator's config file, not
+/// a request.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GdriveOrigins {
     /// Serves the OAuth token endpoint (`{oauth}/token`).
@@ -80,11 +77,8 @@ const DOCS_ORIGIN: &str = "https://docs.googleapis.com";
 const SHEETS_ORIGIN: &str = "https://sheets.googleapis.com";
 const SLIDES_ORIGIN: &str = "https://slides.googleapis.com";
 
-/// Every host this accessor talks to, resolved once from a config.
-///
-/// Each is an origin from [`GdriveOrigins`] plus the version suffix the official API uses,
-/// so nothing here encodes any one deployment's path layout: point `GdriveOrigins::drive` at
-/// a gateway and `/v3` still follows, exactly as it does against Google.
+/// Every host this accessor talks to: each [`GdriveOrigins`] origin plus its official
+/// version suffix, resolved once.
 #[derive(Clone)]
 struct Endpoints {
     drive: String,
@@ -112,13 +106,9 @@ const FILE_FIELDS: &[&str] = &[
     "mimeType",
     // Shared-drive scoping: children of a shared drive must be listed with it.
     "driveId",
-    // Drive's own size: set for blobs *and* Docs-editors files, absent for folders and
-    // shortcuts (backlot also omits it on native docs, so don't rely on either shape).
-    //
-    // Exact for a blob, but never a document's length: a document is served as its API's
-    // JSON, which Drive's number does not describe. Kept so a blob's listing states its
-    // exact length, and so a blob listed *without* a size is told apart from one sized
-    // zero.
+    // Exact for a blob, never a document's served (JSON) length; absent for folders and
+    // shortcuts, and not reliably present on native docs. Lets a blob's listing state its
+    // length, and tells a sizeless blob apart from an empty one.
     "size",
     "modifiedTime",
     "createdTime",
@@ -135,13 +125,8 @@ const MAX_RETRIES: u32 = 5;
 const MAX_BACKOFF: Duration = Duration::from_secs(16);
 const JITTER_MAX_MS: u64 = 1000;
 
-/// Ceiling on one document's JSON.
-///
-/// A document has no ranges: a read of any part of it produces the whole thing, so its
-/// size sets the memory a single read costs — body, parsed tree, indented output.
-///
-/// Set far past any real document's JSON while bounding one read's footprint; the JSON
-/// stays small even where a file's export is huge.
+/// Ceiling on one document's JSON. A document has no ranges, so any read builds all of it
+/// (body, parsed tree, indented output); set far past any real document while bounding that.
 pub(super) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Whether a 403 body names a limit that clears by waiting.
@@ -204,10 +189,9 @@ async fn body_within(
 
 /// A tab name as an A1 range: quoted, with any literal quote doubled.
 ///
-/// A bare name that looks like a cell reference is one: `ranges=A1` answers the *first*
-/// sheet's cell, not a sheet of that name, so the caller would attach someone else's cells
-/// to the tab. Quoting is what A1 notation specifies for a name, and changes nothing for
-/// ordinary ones.
+/// Unquoted, a name that looks like a cell reference is one (`ranges=A1` is the first
+/// sheet's A1), which would attach another sheet's cells to the tab; quoting is harmless
+/// for ordinary names.
 fn quote_a1(tab: &str) -> String {
     format!("'{}'", tab.replace('\'', "''"))
 }
@@ -246,9 +230,8 @@ pub struct GdriveConfig {
     pub client_id: String,
     pub client_secret: String,
     pub refresh_token: String,
-    /// Where to reach each Google service, when not production Google (an enterprise
-    /// mock or a gateway). Deployment-level only — the token endpoint receives the
-    /// app's client secret, so a caller must never fill this from user input.
+    /// Service hosts when not production Google (a mock or a gateway); deployment-level
+    /// only, see [`GdriveOrigins`].
     #[serde(default, skip_serializing_if = "GdriveOrigins::is_default")]
     pub origins: GdriveOrigins,
 }
@@ -260,8 +243,7 @@ pub struct GdriveAccessor {
     config: GdriveConfig,
     /// Every API host, resolved once from [`GdriveConfig::origins`].
     urls: Endpoints,
-    /// Cached OAuth access token + its expiry. Refreshed proactively before
-    /// expiry and on a 401 (see [`Self::send_with_refresh`]).
+    /// Cached OAuth access token and its expiry.
     access_token: Mutex<Option<(String, Instant)>>,
 }
 
@@ -284,8 +266,7 @@ impl GdriveAccessor {
 
     async fn token(&self) -> anyhow::Result<String> {
         let mut guard = self.access_token.lock().await;
-        // Reuse a cached token until it's within 60s of expiry (proactive refresh
-        // avoids the "everything 401s after ~1h" failure).
+        // Refresh 60s early so calls don't start 401ing at the ~1h expiry.
         if let Some((t, exp)) = guard.as_ref()
             && *exp > Instant::now() + Duration::from_secs(60)
         {
@@ -321,13 +302,7 @@ impl GdriveAccessor {
         Ok(token)
     }
 
-    /// Send a request built from the current access token, retrying transient
-    /// failures. A 401 (expired/revoked despite proactive refresh) drops the
-    /// token, refreshes, and retries once; a 429/5xx retries a bounded number
-    /// of times honoring `Retry-After`, and a rate-limit 403 with backoff. Every call
-    /// this accessor makes is an idempotent GET, so the 5xx retry is always safe. A 403
-    /// not retried fails here with its body; other non-retryable statuses are returned
-    /// to the caller, which classifies them via `error_for_status`.
+    /// [`Self::send_retrying`] with the default [`MAX_RETRIES`].
     async fn send_with_refresh(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -335,8 +310,13 @@ impl GdriveAccessor {
         self.send_retrying(build, MAX_RETRIES).await
     }
 
-    /// As [`Self::send_with_refresh`], with a caller-chosen retry ceiling for a call
-    /// whose failure the caller shrugs off.
+    /// Send a request built from the current access token, retrying transient failures up
+    /// to `max_retries` (lower for a call whose failure the caller shrugs off).
+    ///
+    /// A 401 drops the token, refreshes and retries once; a 429/5xx retries honoring
+    /// `Retry-After`, a rate-limit 403 with backoff; safe since every call is an
+    /// idempotent GET. An unretried 403 fails here with its body; other statuses are
+    /// returned for `error_for_status`.
     async fn send_retrying(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -354,10 +334,8 @@ impl GdriveAccessor {
                 refreshed = true;
                 continue;
             }
-            // Drive reports a per-user rate limit as 403 with a `reason`, not as 429, so
-            // the status alone would give up on a condition that clears by waiting.
-            // Reading the reason consumes the response, which is fine: a 403 not retried
-            // fails either way, and its body is the explanation.
+            // Reading the reason consumes the response; fine, since an unretried 403
+            // fails anyway with its body as the explanation.
             if status == reqwest::StatusCode::FORBIDDEN {
                 let body = resp.text().await.unwrap_or_default();
                 if is_rate_limit(&body) && retries < max_retries {
@@ -479,8 +457,7 @@ impl GdriveAccessor {
     /// A Docs-editors document has no bytes and 403s here; it is served as its own
     /// API's JSON instead (see [`Self::document_json`] and friends).
     ///
-    /// The range makes serving originals affordable; the caller sizes it. Without `Range`,
-    /// every chunk read would pull the whole object.
+    /// The caller sizes the range; without one, every chunk read would pull the whole object.
     pub async fn download(
         &self,
         id: &str,
@@ -571,13 +548,9 @@ impl GdriveAccessor {
         Ok(serde_json::from_slice(&raw)?)
     }
 
-    /// GET a JSON API response, pretty-printed so a reader can scan it as lines rather
-    /// than parse one long string.
-    ///
-    /// Refuses a response over [`MAX_DOCUMENT_BYTES`], while the body is read (see
-    /// [`body_within`]). A document is all-or-nothing and its memory is spent here — raw
-    /// body, the `Value` parsed from it (several times its size), the indented copy — so
-    /// past some size the answer has to be "no" rather than a gigabyte of allocations.
+    /// GET a JSON response, pretty-printed so a reader scans lines. Refuses one over
+    /// [`MAX_DOCUMENT_BYTES`] while the body is read; the parsed `Value` costs several
+    /// times the body.
     async fn get_pretty(&self, url: &str) -> anyhow::Result<Vec<u8>> {
         let resp = self
             .send_with_refresh(|t| self.client.get(url).bearer_auth(t))
@@ -640,9 +613,7 @@ impl GdriveAccessor {
 mod tests {
     use super::*;
 
-    /// Each production host is overridable on its own, and the version suffix
-    /// is the official one either way, so nothing depends on a deployment's path layout.
-    /// Checked through `endpoints`, where every origin is read.
+    /// Each host is overridable on its own and keeps its official version suffix.
     #[test]
     fn each_service_keeps_its_official_path_under_any_origin() {
         let e = endpoints(&GdriveOrigins::default());

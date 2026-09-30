@@ -14,15 +14,12 @@ use crate::{
 
 /// A tree assembled from in-memory files and host directories, served as one namespace.
 ///
-/// An [`InMemFs`] root under a longest-prefix mount table: each [`PassthroughFs`] is registered
-/// at a root-relative path and serves every request under it, re-based onto its own root.
-/// Everything no mount claims is the in-memory tree's. Itself a [`FileSystem`], so bindings
-/// drive it like any single store.
+/// An [`InMemFs`] root under a longest-prefix mount table: each [`PassthroughFs`] serves every
+/// request under its root-relative mount point, re-based onto its own root; everything else is
+/// the in-memory tree's. Itself a [`FileSystem`], so bindings drive it like any single store.
 ///
-/// This is how a session's *context* (the tree it works in, as opposed to its rootfs) is
-/// built, behind one [`mount`](crate::console::ConsoleClientBuilder::mount). It composes many
-/// sources into one namespace, whereas a session's mounts are separate namespaces the caller
-/// places; a `Directory` is one entry among them.
+/// Builds a session's *context* (as opposed to its rootfs): many sources in one namespace,
+/// where a session's mounts are separate namespaces.
 ///
 /// The two kinds of content do not nest: files go to the in-memory tree only, so a path under a
 /// mount is refused rather than written to the host, and mounts are disjoint, so a host
@@ -34,10 +31,6 @@ pub struct Directory {
 
     /// Mount points keyed by their normalized, root-relative path. Never the empty path: the
     /// root is [`root`](Self::root)'s.
-    ///
-    /// `PathBuf`'s component-wise `Ord` makes the longest prefix of a request also the greatest
-    /// such key, so longest-prefix lookup is a reverse range scan ([`Directory::mount_for`]),
-    /// and keys sharing a prefix are contiguous ([`Directory::descendant_mounts`]).
     mounts: BTreeMap<PathBuf, PassthroughFs>,
 }
 
@@ -91,9 +84,8 @@ impl Directory {
     /// and with [`AlreadyExists`](io::ErrorKind::AlreadyExists) where the in-memory tree has an
     /// entry. `host_dir` is not checked; a missing one fails at first use.
     ///
-    /// The mount is this tree's table, not the operating system's: invisible outside the
-    /// process until a binding yields a [`Mount`](crate::fs::Mount), so a `Directory` with ten
-    /// mounts may be mounted nowhere.
+    /// Registers in this tree's table only; the OS sees nothing until a binding yields a
+    /// [`Mount`](crate::fs::Mount).
     pub fn mount(
         &mut self,
         path: impl AsRef<Path>,

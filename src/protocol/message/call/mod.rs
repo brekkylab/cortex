@@ -86,10 +86,10 @@ pub enum Call {
     /// starts (see [`InitResp`]), which the client could not work out alone.
     ///
     /// Boots and mounts nothing: boot cost varies by backend, so *when* to pay it is
-    /// [`Start`](super::Notification::Start)'s. Trees are mounted at boot.
+    /// [`Start`](super::Notification::Start)'s.
     ///
-    /// A second `init` replaces the first and tears down whatever was booted under it,
-    /// since the trees are built into the boot.
+    /// Trees are mounted at boot, so a second `init` replaces the first and tears down
+    /// whatever was booted under it.
     Init(InitCall),
 
     /// Run this command.
@@ -126,8 +126,7 @@ impl Call {
     /// such rather than as an unknown name.
     ///
     /// Reassembles the adjacently tagged object the derive expects, since the envelope
-    /// had to read the members flat (`params` may precede `method`). `params` is moved,
-    /// not copied.
+    /// had to read the members flat (`params` may precede `method`).
     pub(super) fn from_params<E: de::Error>(method: Method, params: Bson) -> Result<Self, E> {
         if method.is_notification() {
             return Err(E::custom(format!(
@@ -223,9 +222,8 @@ impl Response {
     /// The response a set of members names.
     ///
     /// The envelope reads members flat (a `result` may precede the `method` that types
-    /// it); reassembling them keeps the `Deserialize` impl below the one place a response's
-    /// shape, including which member combinations are valid, is decided. Members are
-    /// moved, not copied.
+    /// it); reassembling them leaves the `Deserialize` impl below as the one place a
+    /// response's valid shape is decided.
     pub(super) fn from_members<E: de::Error>(
         method: Option<Method>,
         result: Option<Bson>,
@@ -250,16 +248,11 @@ impl Response {
 // `result` vs `error`. Adjacent tagging has nowhere for the error; untagged would report a
 // mistyped result as "no variant matched". This is also where `result` xor `error` is
 // enforced.
-//
-// Both halves work in members, not a nested object: serialization writes into the map
-// the envelope opened (see `utils::flatten`), and deserialization reads the members the
-// envelope handed back.
 
 impl Serialize for Response {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let mut map = s.serialize_map(None)?;
 
-        // Only beside `result`: an error needs no method to be typed.
         if let Some(method) = self.method() {
             map.serialize_entry("method", method.as_str())?;
         }

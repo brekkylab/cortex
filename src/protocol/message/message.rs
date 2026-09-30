@@ -52,8 +52,7 @@ pub enum Message {
 
     /// `{"jsonrpc":"2.0","id":N,"method":..,"result":..}` or `{..,"error":..}`
     ///
-    /// `result` xor `error`, both carried by one [`Response`]; the echoed `method`
-    /// types the `result`.
+    /// Both shapes are one [`Response`].
     Response { id: RequestId, result: Response },
 }
 

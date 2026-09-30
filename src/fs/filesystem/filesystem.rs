@@ -65,12 +65,9 @@ pub struct Dirent {
 
     pub kind: DirentKind,
 
-    /// Full metadata, only when the listing produced it for free.
-    ///
-    /// An object store or document API returns sizes and timestamps in the listing response,
-    /// saving an N+1 round trip (FUSE `readdirplus`, WebDAV `PROPFIND Depth: 1`). A local
-    /// directory read yields only names and `d_type`, so `Some` there would cost an `lstat` per
-    /// entry a plain `ls` never asked for.
+    /// Full metadata, only when the listing produced it for free: object stores and document APIs
+    /// return it in the listing (sparing an N+1 of `stat`s), while a local directory would pay an
+    /// `lstat` per entry.
     ///
     /// Private so it cannot contradict `kind`: [`with_stat`](Self::with_stat), the only setter,
     /// takes `kind` *from* the stat.
@@ -114,9 +111,7 @@ impl Dirent {
 /// (`stat`/`list`/`create`/`mkdir`/`unlink`/`rmdir`/`rename`) and the bytes
 /// (`read_at`/`write_at`/`truncate`/`flush`). Nothing stands between a caller and either:
 ///
-/// * The trait stays object-safe, so `dyn FileSystem` is all the erasure needed. An associated
-///   handle type would need an object-safe twin, a bridging blanket impl, and a third impl to
-///   make the erased handle usable before a mount table could hold mixed backends.
+/// * The trait stays object-safe, so a mount table holds mixed backends as `dyn FileSystem`.
 /// * It matches the wire: the console's `read`/`write` carry path, offset and length, so a
 ///   remote backend forwards calls instead of keeping bookkeeping on each end.
 /// * Most backends have no per-open state; their bytes are reachable by path, and an open
@@ -131,9 +126,8 @@ impl Dirent {
 /// descriptors. So a backend author (document API, object store, database) never reasons about
 /// an identity POSIX invented.
 ///
-/// That identity is kept where descriptors already are. A kernel binding owns file-handle
-/// numbers and the kernel's reference counts, so it amortizes the expensive part of an open and
-/// keeps a descriptor alive past its name's unlink (as NFS does), without any backend knowing.
+/// That identity lives in the layer that has descriptors, which keeps one alive past its name's
+/// unlink (as NFS does) without any backend knowing.
 ///
 /// A backend must not keep that state itself: a path names a file, not an open of it, and POSIX
 /// lets a name be unlinked and recreated while an earlier open is still written. Path-keyed
@@ -154,9 +148,8 @@ impl Dirent {
 /// has the bytes, since no signal says a caller is done. A backend that must batch does so on
 /// its own terms (size threshold, timer).
 ///
-/// [`flush`](Self::flush) makes what is written to a name durable *now*. It gives a guest's
-/// `fsync` somewhere to land instead of a silent `Ok`, and defaults to `Ok` for stores whose
-/// writes already were durable.
+/// [`flush`](Self::flush) makes what is written to a name durable *now*, giving a guest's
+/// `fsync` somewhere to land instead of a silent `Ok`.
 ///
 /// # Errors
 ///
@@ -176,10 +169,9 @@ impl Dirent {
 /// * [`PermissionDenied`] (`EACCES`) is skipped by `find`/`rsync`/`tar`, which abort on `EIO`;
 ///   collapsing the two loses a whole traversal to one unreadable file.
 ///
-/// A consumer translating these for a kernel classifies by `kind`. Forwarding
-/// [`raw_os_error`](io::Error::raw_os_error) is correct and more precise for a host mount,
-/// which shares this process's numbering, but not for a **guest** (`ENOTEMPTY` is 66 on macOS,
-/// 39 on Linux), so a binding read by a Linux guest must use its own table and forward nothing.
+/// A consumer translating these for a kernel classifies by `kind`; forwarding
+/// [`raw_os_error`](io::Error::raw_os_error) suits only a host mount, which shares this
+/// process's numbering, never a guest.
 ///
 /// [`Unsupported`]: io::ErrorKind::Unsupported
 /// [`CrossesDevices`]: io::ErrorKind::CrossesDevices
@@ -191,18 +183,17 @@ impl Dirent {
 /// (WebDAV/HTTP frontend) `.await`s directly; a sync binding (fuse/fuse-t) `block_on`s at its
 /// callback boundary.
 ///
-/// A backend calling blocking `std::fs` or locking a map is async in signature only and stalls
-/// the executor worker for the syscall. An async-native frontend over one should wrap calls in
-/// `tokio::task::block_in_place` (multi-thread runtime only), free when the call is quick,
-/// rather than `spawn_blocking`.
+/// A backend on blocking `std::fs` or a lock stalls the executor worker; an async frontend over
+/// one wraps calls in `tokio::task::block_in_place` (multi-thread runtime only; free when the
+/// call is quick) rather than `spawn_blocking`.
 ///
 /// # Boxed futures
 ///
 /// Every method returns a [`BoxFuture`]: the trait is held as `dyn` (a mount table keeps
 /// backends of different types behind one pointer), and an `async fn` in a trait returns a type
 /// a `dyn` cannot name. That is one allocation per call, against a syscall or round trip.
-/// Written out rather than via `#[async_trait]`, the lifetimes are visible where the borrows
-/// are, and a forwarding impl returns the inner future instead of boxing it again.
+/// Written out rather than via `#[async_trait]`, so the lifetimes are visible where the borrows
+/// are.
 ///
 /// Each method binds its borrows and future to one lifetime, so `path` and `buf` may be
 /// shorter-lived than the backend, as they usually are: the buffer belongs to the request.
@@ -258,9 +249,6 @@ pub trait FileSystem: Send + Sync {
     /// A filesystem never deletes recursively: callers decompose `rm -rf` into `list`, `unlink`
     /// per file and a final `rmdir`, so a subtree removal here would only be reached by mistake.
     ///
-    /// This removes only the name; whether an existing reader may continue is not the store's
-    /// question (see *No opens, only paths*).
-    ///
     /// [`IsADirectory`]: io::ErrorKind::IsADirectory
     /// [`rmdir`]: Self::rmdir
     fn unlink<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
@@ -283,8 +271,7 @@ pub trait FileSystem: Send + Sync {
     /// Write `buf` at `offset`, zero-extending the file if needed; returns the bytes
     /// written.
     ///
-    /// A short write is legal; the consumer drains the buffer, in one loop above the trait
-    /// rather than a whole-buffer default a backend could override inconsistently.
+    /// A short write is legal; the consumer drains the buffer.
     ///
     /// Never creates the file, so writing to a name that went away is an error, not a
     /// resurrection. Only [`create`](Self::create) makes a name.
@@ -339,9 +326,8 @@ pub trait FileSystem: Send + Sync {
 
     /// Drop whatever is being kept, so the next read asks the source again.
     ///
-    /// For stores that render or cache remotely, so a reader who knows the source moved on can
-    /// say so. Not for consistency a `stat` would catch; for what a store cannot check cheaply,
-    /// triggered when a person asks.
+    /// For stores that render or cache remotely: what a `stat` cannot cheaply catch, dropped
+    /// when a person asks.
     ///
     /// Infallible: a store that cannot drop something has answered by keeping it, and an error
     /// the caller cannot act on is worse than a best effort.

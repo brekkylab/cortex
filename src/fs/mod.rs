@@ -14,11 +14,8 @@
 //! real mount is the only way out: a guest gets a tree by having it mounted on the host and
 //! passed in as a directory, so there is no second, VM-shaped path through [`Posix`].
 //!
-//! Which one a parameter is typed as is a statement: [`FileSystem`] asks only for a tree the
-//! callee addresses by path in-process; [`Mount`] asks for one the caller already mounted,
-//! which `std::fs`, a spawned program or a guest can open by name. So
-//! [`ConsoleClientBuilder::mount`] takes a [`Mount`]: a session's commands open its context by
-//! name.
+//! So [`ConsoleClientBuilder::mount`] takes a [`Mount`], not a [`FileSystem`]: a session's
+//! commands open its context by name, as `std::fs`, a spawned program or a guest can.
 //!
 //! [`ConsoleClientBuilder::mount`]: crate::console::ConsoleClientBuilder::mount
 

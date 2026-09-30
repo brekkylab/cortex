@@ -45,8 +45,6 @@ use crate::{
 /// # Ok(())
 /// # }
 /// ```
-///
-/// Dropping it says `quit` and ends the channel.
 pub struct ImageClient {
     client: Box<dyn Client>,
 }
@@ -118,13 +116,7 @@ impl Drop for ImageClient {
     }
 }
 
-/// Specifies an image.
-///
-/// An image can be specified in three ways.
-///
-/// - [`Recipe`](Self::Recipe) gives a base image and the steps over it
-/// - [`Ref`](Self::Ref) names an image by its reference, as `name:tag`
-/// - [`Digest`](Self::Digest) names an image by its digest, as `algorithm:hex`
+/// Specifies an image to run on, without building it.
 ///
 /// ## Example
 ///
@@ -144,10 +136,6 @@ impl Drop for ImageClient {
 /// {"type": "ref", "ref": "myimg:latest"}
 /// {"type": "digest", "digest": "sha256:0123abcd"}
 /// ```
-///
-/// ## Notes
-///
-/// This only specifies an image and does not build one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImageSource {
@@ -213,10 +201,8 @@ pub struct ImageEntry {
 /// may change its digest independently, without making either's stored values unreadable.
 const FORMAT_VERSION: u32 = 1;
 
-/// Defines how an image is to be composed, and stops there.
-///
-/// A base and the [`Step`]s over it. Console servers build it, each differently, so nothing
-/// here resolves a base, writes a layer or runs a command.
+/// A base and the [`Step`]s over it: a declaration only, which each console server builds its
+/// own way.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recipe {
     /// Serialized first, so a declaration from a newer cortex is refused by version rather than
@@ -237,11 +223,9 @@ pub struct Recipe {
 impl Recipe {
     /// A declaration over `base`, with no steps yet.
     ///
-    /// `base` is spelled as a registry does. A digest is better than a tag: a store naming this
-    /// build by what it declares sees the string, not what it resolved to, so a moved tag keeps
-    /// serving the image built before it moved.
-    ///
-    /// Required; an image built from nothing uses `scratch`, as in a Dockerfile.
+    /// `base` is spelled as a registry does; an image built from nothing uses `scratch`, as in
+    /// a Dockerfile. Prefer a digest to a tag: a store names this build by the declared string,
+    /// not what it resolved to, so a moved tag keeps serving the image built before it moved.
     ///
     /// ```
     /// # use cortex::image::{Recipe, Step};
@@ -430,8 +414,6 @@ impl Recipe {
                     );
                     steps.push(Step::Workdir(rest.to_string()));
                 }
-                // Anything else has no form here, and skipping it would yield a build other
-                // than the one the Dockerfile describes.
                 other => anyhow::bail!(
                     "Dockerfile:{line}: {other} is not one of FROM, RUN, COPY, ENV and \
                      WORKDIR, which is all a declaration has"
@@ -489,7 +471,6 @@ fn some_base<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 /// accumulated environment and `ENV` becomes nothing), so a build is named by the digest of
 /// what it *declares*: identical declarations get the same image.
 ///
-/// Only these four; other Dockerfile instructions are refused rather than represented.
 /// Serialized by name (`{"run": …}`, `{"copy": {…}}`), not position, so a new variant cannot
 /// change what a stored [`Recipe`] means.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,8 +481,8 @@ pub enum Step {
 
     /// A path in the build context, copied into the image.
     ///
-    /// `src` is relative to the context directory. `dst` is an absolute image path, a `String`
-    /// because this host must not normalise a path in another filesystem.
+    /// `dst` is an absolute image path, a `String` because this host must not normalise a path
+    /// in another filesystem.
     Copy { src: PathBuf, dst: String },
 
     /// A variable for every later [`Run`](Self::Run) and the built image's config.

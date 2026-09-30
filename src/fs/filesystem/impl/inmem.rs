@@ -40,11 +40,8 @@ enum Node {
         mtime: SystemTime,
         created: SystemTime,
     },
-    /// The bytes and the moment they last changed, under the node's one lock.
-    ///
-    /// Together so no observer sees new bytes beside an old mtime: a guest that negotiated
-    /// `AUTO_INVAL_DATA` drops cached pages on mtime alone, and would otherwise keep stale
-    /// pages forever.
+    /// Bytes and mtime share the node's lock, so no observer sees new bytes beside an old mtime:
+    /// a guest with `AUTO_INVAL_DATA` drops cached pages on mtime alone and would keep stale ones.
     File {
         bytes: Vec<u8>,
         mtime: SystemTime,

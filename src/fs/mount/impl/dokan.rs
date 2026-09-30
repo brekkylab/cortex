@@ -105,7 +105,7 @@ impl DokanMount {
     /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
     /// `mountpoint` is a drive letter (`Z:\`) or an existing empty directory on an NTFS
-    /// volume. Needs Dokany installed.
+    /// volume.
     ///
     /// Returns once the driver reports the mount live, since `mount()` returns on
     /// registration, before the volume exists.
@@ -178,10 +178,8 @@ impl DokanMount {
         }
     }
 
-    /// Serve until the mount goes away.
-    ///
-    /// Waits for something else to end the mount (`dokanctl /u`, an eject from Explorer, or the
-    /// driver). **It does not unmount**; to end the mount, drop the guard.
+    /// Serve until something else ends the mount (`dokanctl /u`, an eject from Explorer, or
+    /// the driver). **It does not unmount**; to end the mount, drop the guard.
     ///
     /// `Err` if the serving thread panicked.
     pub fn join(mut self) -> io::Result<()> {
@@ -536,8 +534,6 @@ impl<'c, 'h: 'c, T: FileSystem + 'h> FileSystemHandler<'c, 'h> for Handler<T> {
         })
     }
 
-    /// Stream the directory's children.
-    ///
     /// No `.` or `..`: by NT convention a filesystem driver does not synthesise them.
     fn find_files(
         &'h self,
@@ -750,9 +746,7 @@ impl<'c, 'h: 'c, T: FileSystem + 'h> FileSystemHandler<'c, 'h> for Handler<T> {
     }
 }
 
-/// Drive a store call to completion from Dokan's synchronous callback thread.
-///
-/// Local alias for [`block_on`](super::block_on), to keep the callbacks short.
+/// Shorthand for [`block_on`](super::block_on), to keep the callbacks short.
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     super::block_on(fut)
 }
@@ -790,8 +784,7 @@ fn store_path(name: &U16CStr) -> Result<PathBuf, NTSTATUS> {
     Ok(path)
 }
 
-/// Translate a store error into the numbering *this* consumer expects, which on Windows is
-/// `NTSTATUS`.
+/// A store error as the `NTSTATUS` a Windows caller expects.
 ///
 /// Its own table, not shared with errno: NTSTATUS and errno values only correspond as ideas.
 ///
@@ -839,11 +832,9 @@ fn file_attributes(kind: DirentKind) -> u32 {
 
 /// A stable identity for a path, which is what `nFileIndex` is read as.
 ///
-/// Hashed from the path, so there is no inode table to keep, evict or reference-count. The
-/// cost, hard links getting distinct indices, is moot: nothing under [`FileSystem`] has hard links.
-///
-/// Collisions are harmless: the index is advisory, used to ask whether two paths are the same
-/// file.
+/// Hashed from the path, so there is no inode table to keep, evict or reference-count; hard
+/// links would get distinct indices, but nothing under [`FileSystem`] has any. Collisions are
+/// harmless: the index is advisory, used to ask whether two paths are the same file.
 fn file_index(path: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);
@@ -900,8 +891,6 @@ mod tests {
 
     #[test]
     fn a_kind_reports_one_attribute_and_not_a_pair() {
-        // `FILE_ATTRIBUTE_NORMAL` means "nothing else is set", so it must never appear
-        // alongside the directory bit.
         assert_eq!(file_attributes(DirentKind::Dir), FILE_ATTRIBUTE_DIRECTORY);
         assert_eq!(file_attributes(DirentKind::File), FILE_ATTRIBUTE_NORMAL);
     }

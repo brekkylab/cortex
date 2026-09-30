@@ -70,9 +70,7 @@ impl std::fmt::Debug for NotionConfig {
 /// A rendered `page.json`: its bytes, the page's timestamps, and the child
 /// directories that go beside it.
 ///
-/// Directories and bytes come from the same tree, so they cannot disagree: a `child_page`
-/// block renders as a marker because its directory carries the content, so that directory
-/// must exist for exactly the blocks marked.
+/// Both come from one block tree, so every `child_page` marker in the bytes has its directory.
 #[derive(Clone)]
 struct Rendered {
     bytes: Arc<Vec<u8>>,
@@ -257,12 +255,11 @@ impl NotionFs {
         self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Ask the source again for everything.
+    /// Stop everything kept, in memory or on disk, from answering again; nothing is fetched
+    /// here, pages re-render as they are visited.
     ///
-    /// For changes nothing here can see, such as a deleted page leaving its parent's listing
-    /// (served from a render) wrong. Nothing kept before this answers again: not renders in
-    /// memory or on disk, nor the top-level listing, whose file is removed. This fetches
-    /// nothing; pages are re-rendered as they are visited.
+    /// For changes nothing here can see, such as a deleted page still in its parent's kept
+    /// listing.
     fn forget_kept(&self) {
         self.epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -280,9 +277,8 @@ impl NotionFs {
     /// directory is created on first write and holds each page's rendered json, so it
     /// deserves whatever protection the pages do.
     ///
-    /// A restarted client's reader reopens the same pages, and each entry carries the edit
-    /// stamp it was built from, so a restart costs one `retrieve` per page rather than a walk.
-    /// Without a directory nothing is written.
+    /// Each entry carries its edit stamp, so after a restart a page costs one `retrieve`, not a
+    /// walk.
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self
@@ -611,9 +607,7 @@ impl NotionFs {
             self.renders.lock().unwrap().confirm(page_id);
             return Ok(kept.rendered.clone());
         }
-        // A previous run's render is validated by the same retrieve, so a restart costs no
-        // walk. Not after a refresh: the reader rejected kept renders, and removing a child
-        // page need not move `last_edited_time`.
+        // Not after a refresh: removing a child page need not move `last_edited_time`.
         if epoch == 0
             && let Some(rendered) = self.kept_on_disk(page_id)
             && still_current(&rendered, &page)
@@ -722,10 +716,7 @@ impl NotionFs {
         }
     }
 
-    /// Top-level (workspace) pages as `<title>__<id>` dir entries.
-    ///
-    /// Kept for [`LISTING_TTL`], and read back from disk at any age: the paged `search` stands
-    /// between a reader and the first thing they see.
+    /// Top-level (workspace) pages as `<title>__<id>` dir entries, kept for [`LISTING_TTL`].
     async fn top_level_page_dirs(&self) -> io::Result<Vec<Dirent>> {
         if let Some(roots) = self.roots.lock().unwrap().as_ref()
             && roots.seen.elapsed() < LISTING_TTL
@@ -787,11 +778,8 @@ impl NotionFs {
         Some(names)
     }
 
-    /// Contents of a page dir: `page.json` plus a subdir per `child_page` block.
-    ///
-    /// From the render, not one level of blocks: a child page sits wherever the layout puts
-    /// it (a two-column page's immediate children are columns). An `ls` and the read after it
-    /// share the cached render.
+    /// Contents of a page dir: `page.json` plus a subdir per `child_page` block at any depth,
+    /// taken from the render so an `ls` and the read after it share one.
     async fn page_dir_entries(&self, page_id: &str) -> io::Result<Vec<Dirent>> {
         let names = match self.kept_child_dirs(page_id) {
             Some(names) => names,
@@ -804,9 +792,7 @@ impl NotionFs {
 }
 
 /// Every mutating method keeps the trait's `ReadOnlyFilesystem` default, so a writer hears
-/// it on the write; there is no open to hear it on. Not `Unsupported` (`ENOSYS`), which `cp`,
-/// `rsync` and editors read as a broken filesystem. Page/block writes and the domain command
-/// channel are not exposed.
+/// it on the write; there is no open to hear it on. Page/block writes are not exposed.
 impl FileSystem for NotionFs {
     fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move { self.forget_kept() })
@@ -979,11 +965,8 @@ fn page_id(dir_name: &str) -> String {
         .to_string()
 }
 
-/// Every `child_page` and `child_database` block in a tree, at whatever depth, as
-/// a directory name.
-///
-/// At any depth, since a two-column page's immediate children are columns. Neither kind has
-/// `children`, as the walk never descends into them.
+/// Every `child_page` and `child_database` block in a tree as a directory name, at any depth,
+/// since a two-column page's immediate children are columns.
 fn collect_child_dirs(blocks: &[Value], out: &mut Vec<String>) {
     for b in blocks {
         let btype = b.get("type").and_then(|t| t.as_str()).unwrap_or("");

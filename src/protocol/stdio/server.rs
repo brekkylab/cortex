@@ -41,8 +41,7 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 /// # }
 /// ```
 pub struct StdioServer {
-    /// Where requests come from. Buffering is safe: the protocol owns this for the
-    /// session's lifetime, so reading ahead takes no one else's bytes.
+    /// Where requests come from.
     incoming: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
 
     /// Where responses go.

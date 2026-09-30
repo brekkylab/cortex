@@ -11,11 +11,8 @@ use serde::{Deserialize, Serialize};
 
 /// Why a request could not be answered with a result.
 ///
-/// `data` is optional extra context; nothing in this protocol requires it.
-///
-/// `data` is boxed because a [`Bson`] is several times the size of the rest, which would
-/// bloat every `Result<_, Failure>`. The box allocates only when `data` is
-/// present and is invisible on the wire.
+/// `data` is optional extra context, boxed because a [`Bson`] is several times the size
+/// of the rest and would bloat every `Result<_, Failure>`; the box is invisible on the wire.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Error {
     pub code: i64,
@@ -24,6 +21,8 @@ pub struct Error {
     pub data: Option<Box<Bson>>,
 }
 
+/// The `init` codes depend only on the frame and the server (its build, host and stored
+/// images), so they are raised before any boot.
 impl Error {
     /// `exec`: the execution outlived its [`timeout_ms`](super::ExecCall::timeout_ms) and
     /// was killed.
@@ -59,9 +58,8 @@ impl Error {
     /// `init`: a mount whose scheme this server has no provider for; the message names
     /// the entry.
     ///
-    /// Raised at `init` rather than at boot because supported schemes are a fact about the
-    /// build, knowable from the frame alone. One code for all mounts, since the fix is the
-    /// same: a different URL, or a build that has the provider.
+    /// One code for all mounts, since the fix is the same: a different URL, or a build that
+    /// has the provider.
     pub const UNSUPPORTED_MOUNT: i64 = -32008;
 
     /// `exec`, `read`, `write`, `snapshot`: a tree could not be put where `init` said it
@@ -74,18 +72,13 @@ impl Error {
 
     /// `init`: a network reach this server cannot provide, named in the message.
     ///
-    /// Raised at `init` because supported reaches are a fact about the build and machine.
     /// Covers both an unknown name and an understood one that cannot be honoured (a host
     /// backend cannot take the network away, so it refuses all but `full`); the fix is the
     /// same: ask for something else, or use another backend.
-    ///
-    /// A server never grants a different reach than the one named; it refuses instead.
     pub const UNSUPPORTED_NETWORK: i64 = -32010;
 
     /// `init`: this backend cannot swap the base image at all (its commands run on the
     /// server's own filesystem).
-    ///
-    /// An unfetchable reference is a failed boot instead.
     pub const UNSUPPORTED_IMAGE: i64 = -32011;
 
     /// `init`: the session named a built image this server does not have; the client can
@@ -98,11 +91,7 @@ impl Error {
     /// `init`: this server cannot make the machine shape asked for (a GPU it has no device
     /// for, more vCPUs or memory than it will give).
     ///
-    /// Raised at `init` because it depends only on the build and host, and a retry will not
-    /// help: the request, or the server, has to change.
-    ///
-    /// A server never makes a smaller machine than asked; it refuses, since a client could
-    /// otherwise only notice from how slow its commands are.
+    /// A retry will not help: the request, or the server, has to change.
     pub const UNSUPPORTED_MACHINE: i64 = -32013;
 
     /// The spec codes a peer can hit here. `-32700` (parse error) belongs to the frame

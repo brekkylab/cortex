@@ -72,9 +72,6 @@ pub struct S3Fs {
     /// What the store answered when a directory was last listed.
     listings: Mutex<Listings>,
     /// What reads have learned about keys, and what they read ahead into.
-    ///
-    /// Taken through [`lock`], which ignores poisoning: a binding serving its device from one
-    /// worker thread would otherwise lose the whole mount to one panic.
     windows: Mutex<Windows>,
 }
 
@@ -111,15 +108,12 @@ impl S3Fs {
 
     /// Confirm the bucket answers, for a caller that wants to fail at mount time.
     ///
-    /// One listing. A misconfigured bucket, region, endpoint or key otherwise shows up only
-    /// when the mount is read, as `EIO` on every `stat`: a failed listing carries no status
-    /// code, so there is nothing finer to say later either.
+    /// One listing. Otherwise a misconfigured bucket, region, endpoint or key surfaces only as
+    /// `EIO` on every `stat` once the mount is read.
     ///
     /// Separate from [`Self::new`] so building stays offline: a caller choosing among
     /// credentials, or probing what a principal may read, can construct a volume with no
     /// request, and "cannot build a client" stays distinct from "cannot read the bucket".
-    ///
-    /// Credentials that expire mid-session are not covered; nothing at mount time can be.
     pub async fn check_reachable(&self) -> io::Result<()> {
         self.list(Path::new("")).await?;
         Ok(())
@@ -160,13 +154,9 @@ fn os_path(key: &str) -> io::Result<OsPath> {
 
 /// Translate an object-store error into the kind this crate answers with.
 ///
-/// Every variant with its own answer is named, but the wildcard is required:
-/// `object_store::Error` is `#[non_exhaustive]`, so a variant added upstream reaches userspace
-/// as `EIO`.
-///
-/// Unclassified errors become `Other`, never a raw OS error: `host_errno` forwards
-/// `raw_os_error()`, so a transport errno would reach userspace as itself rather than `EIO`.
-/// Wrapping also keeps the upstream error as the `source`.
+/// The wildcard is required (`object_store::Error` is `#[non_exhaustive]`): an unnamed variant
+/// becomes `Other` and reaches userspace as `EIO`, never as a raw transport errno. The upstream
+/// error stays as the `source`.
 fn to_io_error(err: object_store::Error) -> io::Error {
     use object_store::Error;
     let kind = match &err {
@@ -192,20 +182,14 @@ fn to_io_error(err: object_store::Error) -> io::Error {
 /// trip; a guest asks in 128 KiB pieces at most (32 KiB through FUSE-T).
 const READAHEAD_CHUNK: u64 = 8 << 20;
 
-/// How many keys may hold a window at once.
+/// How many keys may hold a window at once; entries are keyed by path, so no open bounds them.
 ///
-/// Windows are keyed by path, not by an open, so no open's lifetime bounds them; this does.
-///
-/// Not a memory bound: a window is as large as the read that filled it, and a caller reading
-/// a whole file in one call gets a window the size of the file. [`MAX_CACHED_BYTES`] is the
-/// memory bound.
+/// Not a memory bound, since a window is as large as the read that filled it:
+/// [`MAX_CACHED_BYTES`] is.
 const MAX_CACHED_KEYS: usize = 8;
 
-/// How many bytes of object bodies are held across every entry.
-///
-/// Whole bodies make a file opened twice cost one `head` and no transfer, but six large
-/// documents should not be six large documents of memory. Past this, the oldest entries give
-/// up their windows.
+/// How many bytes of object bodies are held across every entry; past this the oldest entries
+/// give up their windows.
 ///
 /// Never the entry just filled, however large: the read in progress is served from it, and
 /// dropping it would refetch the bytes just fetched.
@@ -213,24 +197,16 @@ const MAX_CACHED_BYTES: u64 = 64 << 20;
 
 /// What the store remembers about one key between reads.
 ///
-/// Keyed by path, so no open ends its life (see [`FileSystem`]). Staleness is bounded by
-/// [`MAX_CACHED_KEYS`] on how many are kept and [`S3Fs::revalidate`] on whether a kept one
-/// still describes the object.
+/// Staleness is bounded by [`MAX_CACHED_KEYS`] on how many are kept and [`S3Fs::revalidate`]
+/// on whether a kept one still describes the object.
 struct ReadCache {
-    /// Size as of the `head` that filled this entry.
+    /// Size as of the `head` that filled this entry, which reads clamp to without a round trip.
     ///
-    /// Lets a read past the end answer without a round trip, and ranges be clamped rather
-    /// than rejected: an out-of-range GET returns the generic error, indistinguishable from a
-    /// transport failure.
-    ///
-    /// Because it clamps, staleness matters: a grown object read against a smaller remembered
-    /// size answers `Ok(0)` at the old end, which means EOF. Hence [`Self::describes`].
+    /// So staleness matters: a grown object read against it answers `Ok(0)` (EOF) at the old
+    /// end. Hence [`Self::describes`].
     size: u64,
 
     /// The object's identity when this entry was filled, for [`Self::describes`].
-    ///
-    /// `etag` is a content fingerprint and settles it alone; `mtime` serves stores that
-    /// report no tag, where size and timestamp are all there is to compare.
     etag: Option<String>,
 
     mtime: SystemTime,
@@ -332,9 +308,8 @@ impl Listings {
 struct Windows {
     by_key: HashMap<String, ReadCache>,
 
-    /// Keys in first-cached order, oldest evicted first. Insertion rather than true LRU: a
-    /// wrong eviction costs one round trip, and a use-ordered queue would be touched on every
-    /// read under the mutex every read already contends for.
+    /// Keys in first-cached order, oldest evicted first. Not LRU: a wrong eviction costs one
+    /// round trip, a use-ordered queue a write under the read mutex on every hit.
     ///
     /// Holds exactly `by_key`'s keys, so its length is the cap; a stale key would waste a slot
     /// and later evict a live entry.
@@ -440,14 +415,7 @@ fn children_from(listed: object_store::Result<object_store::ListResult>) -> io::
 }
 
 impl S3Fs {
-    /// What a path is, in as few requests as the answer allows.
-    ///
-    /// Three answers from up to two requests:
-    ///
-    /// * an object with a body: a file, from `head` alone;
-    /// * a key that also names a prefix with children: a directory, whether or not an empty
-    ///   object of that exact name exists;
-    /// * neither: absent.
+    /// What a path is, in as few requests as the answer allows (at most two).
     ///
     /// A successful `head` is not always the end: an object store console writes a 0-byte
     /// object to stand for a folder, and trusting `head` would make it an empty file the guest
@@ -517,8 +485,7 @@ impl S3Fs {
     ///
     /// Always preferring the directory would make `stat` disagree with the listing unless it
     /// checked for children on *every* successful `head`, a second round trip per ordinary
-    /// file. `stat` reaches the same verdict from the same fact: only an empty body sends it
-    /// to the children check.
+    /// file. `stat` reaches the same verdict from the same fact.
     ///
     /// Sorted, because the kernel resumes a `readdir` by position.
     fn resolve_collision(listed: object_store::ListResult, marker: &str) -> Vec<Dirent> {
@@ -579,12 +546,7 @@ impl FileSystem for S3Fs {
     /// this level's objects with metadata, so [`Dirent::with_stat`] answers a `readdirplus`
     /// without a `stat` per name.
     ///
-    /// A flat key space posing as a tree needs two fixes:
-    ///
-    /// * The listed prefix can come back as its own object (a folder marker). That is *this*
-    ///   directory, so it is dropped.
-    /// * A name can arrive both as a prefix and as an object. A `readdir` may not repeat a
-    ///   name, so one side goes.
+    /// Folder markers and prefix/object name collisions are settled by `resolve_collision`.
     ///
     /// Answered from the last listing within `LISTING_TTL`. A listing may lag but a read may
     /// not: a stale name costs a second look, a stale size or body hands over the wrong file.

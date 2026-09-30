@@ -18,8 +18,7 @@ pub fn failure(failure: Failure) -> PyErr {
     match failure {
         Failure::Refused(error) => Python::attach(|py| {
             let err = ConsoleRefused::new_err(error.message);
-            // An attribute, not an argument, so `str(err)` stays the server's message; callers
-            // compare `code` against `ErrorCode`, built from the `ERROR_CODES` exported below.
+            // An attribute, not an argument, so `str(err)` stays the server's message.
             let _ = err.value(py).setattr("code", error.code);
             err
         }),

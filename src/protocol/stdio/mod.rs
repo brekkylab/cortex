@@ -16,7 +16,9 @@
 //! [`write`](fn@write) and [`read`](fn@read) each take one descriptor. A pipe pair is two
 //! independent streams sharing only the framing, and a struct holding both would need a
 //! type parameter per direction and would block borrowing both halves at once (write a
-//! request, then read its answer). Each end keeps whichever halves it has as fields.
+//! request, then read its answer). Each end keeps whichever halves it has as fields, and
+//! may buffer its incoming one: the protocol owns it for the session, so reading ahead
+//! takes no one else's bytes.
 //!
 //! A command's own stdio never appears here; it is captured where the command runs and
 //! returned inside an [`ExecResp`](crate::protocol::ExecResp), so one descriptor pair suffices.

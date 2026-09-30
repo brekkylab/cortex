@@ -11,10 +11,8 @@ use crate::protocol::message::utils::bytes;
 pub struct ExecCall {
     /// The argv. No shell is involved; for shell semantics send `["sh", "-c", "..."]`.
     ///
-    /// UTF-8, since an argv is a list of `String`s by the time anything runs it.
-    ///
-    /// An empty argv is refused where the process is spawned, not when the call is read;
-    /// see [`split`](Self::split).
+    /// UTF-8, since an argv is a list of `String`s by the time anything runs it. An empty
+    /// one is refused at spawn; see [`split`](Self::split).
     pub cmd: Vec<String>,
 
     /// Milliseconds before the executor kills it. `None` is no limit, and there is no
@@ -41,16 +39,13 @@ impl ExecCall {
 /// a code instead (see [`Error`](crate::protocol::Error)), since an exit code (e.g.
 /// 126/127) could be forged by `exit()`.
 ///
-/// Sent unwrapped, so later additions are new members, which older peers ignore; a tagged
-/// alternative would be a shape they fail on.
+/// Sent unwrapped, so later additions are new members, which older peers ignore.
 ///
-/// All at once when the command is over, never streamed: the caller is an agent that
-/// cannot act on partial output before its next inference, so streaming would buy
-/// unobserved latency for a second shape per ending and a second code path per consumer.
-/// JSON-RPC also gives a request one response.
+/// Whole, never streamed: the caller is an agent that cannot act on partial output before
+/// its next inference, so streaming would buy only a second shape and code path.
 ///
-/// The session's current directory (see [`InitResp::cwd`](super::InitResp::cwd)) is not reported, even if the
-/// command moved it: a result describes the command, not the machine. Run `pwd` to ask.
+/// The session's current directory is not reported, even if the command moved it: a
+/// result describes the command, not the machine. Run `pwd` to ask.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecResp {
     /// For a command killed by a signal, `128 + signal` by convention.
@@ -64,12 +59,9 @@ pub struct ExecResp {
     #[serde(with = "bytes")]
     pub stderr: Vec<u8>,
 
-    /// The command wrote more than the executor would hold, and the output here is its
-    /// beginning.
-    ///
-    /// A result must fit one message under [`MAX_PAYLOAD`](crate::protocol::MAX_PAYLOAD).
-    /// That suits an agent, which could not read more either; flagged so it does not draw
-    /// conclusions from output it thinks is complete.
+    /// The output outgrew one message under [`MAX_PAYLOAD`](crate::protocol::MAX_PAYLOAD)
+    /// and what is here is its beginning; flagged so an agent does not reason from output
+    /// it takes as complete.
     #[serde(default)]
     pub truncated: bool,
 }

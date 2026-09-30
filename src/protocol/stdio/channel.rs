@@ -6,15 +6,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::{MAX_PAYLOAD, Message};
 
-/// The length prefix: a big-endian `u32`, as wire lengths conventionally are.
+/// The length prefix: a big-endian `u32`.
 ///
-/// Redundant: a BSON document already starts with its own length (little-endian `int32`,
-/// including those four bytes), so a reader could use that and drop the one bespoke layer
-/// no off-the-shelf peer can guess. Kept because dropping it is a wire change, which
-/// means: read `HEADER` bytes as a little-endian `u32`, check it against [`MAX_PAYLOAD`],
-/// read that many *minus* the four already in hand, and refuse anything under five (an
-/// empty document, `\x05\x00\x00\x00\x00`) instead of zero. What [`read`](fn@read) tells apart
-/// stays the same.
+/// Redundant with the little-endian length a BSON document starts with, but dropping it
+/// is a wire change.
 pub const HEADER: usize = 4;
 
 /// Write one frame and flush it.

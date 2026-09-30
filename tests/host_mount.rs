@@ -338,18 +338,11 @@ fn a_write_protected_volume_is_enforced_by_the_driver() {
     fs::remove_dir_all(&mnt).ok();
 }
 
-/// A mount point is handed back the way it was taken, so the same directory can be mounted
-/// again.
+/// A mount point is handed back the way it was taken, so the same directory mounts again; the
+/// second mount is the assertion.
 ///
-/// The second mount is the assertion: anything left at the mount point would make a directory
-/// mountable once only.
-///
-/// On Windows `DokanRemoveMountPoint` leaves a reparse point onto the gone volume: absent from
-/// its parent's listing, unopenable, and refused with `ERROR_ALREADY_EXISTS` by the next
-/// `create_dir`. Needs no fork or signal, so it runs on every platform that mounts.
-///
-/// Checked by listing the *parent*, since the leftover answers `metadata` with "not found",
-/// the same as a clean unmount.
+/// Checked by listing the *parent*: a leftover (on Windows, a reparse point onto the gone
+/// volume) answers `metadata` with "not found", the same as a clean unmount.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn a_mount_point_can_be_mounted_again_after_the_guard_is_dropped() {

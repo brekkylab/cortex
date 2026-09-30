@@ -119,8 +119,7 @@ pub trait Client: Send {
     /// Make one call and wait for its response.
     ///
     /// The transport allocates the id and pairs the response with it; the id is a wire
-    /// detail, so it is not returned. The [`Response`] is typed
-    /// by the `method` the frame echoed, so no table of outstanding asks is needed.
+    /// detail, so it is not returned.
     ///
     /// An [`Error`](crate::protocol::Response::Error) arrives as
     /// [`Refused`](Failure::Refused), so a caller handles "no answer" in one shape.
@@ -181,13 +180,10 @@ pub trait Client: Send {
         })
     }
 
-    /// Describe this session: the trees it works in, and what its commands run in and may
-    /// reach.
+    /// Describe this session: its trees, and what its commands run in and may reach.
     ///
-    /// Boots and mounts nothing. Returning means a server is there, speaks this protocol,
-    /// and accepted the description.
-    ///
-    /// The [`InitResp`] carries the session's starting directory, which the server decides.
+    /// Returning means a server is there, speaks this protocol and accepted the
+    /// description; the [`InitResp`] carries the starting directory, which the server decides.
     fn init(&mut self, init: InitCall) -> BoxFuture<'_, Result<InitResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Init(init)).await? {
@@ -234,13 +230,10 @@ pub trait Client: Send {
         })
     }
 
-    /// Take everything this session has written, as a blob a new session can start on.
+    /// Take everything this session has written, as the layer tar [`InitCall::snapshot`]
+    /// takes; a caller just keeps the bytes and hands them over.
     ///
-    /// The result is exactly what [`InitCall::snapshot`] takes: a layer tar of the session's
-    /// writes. A caller just keeps the bytes and hands them over.
-    ///
-    /// Always one message: a truncated snapshot is a broken tree, not a smaller session,
-    /// so a session that has written more than a message holds is refused.
+    /// Refused, not truncated, when it outgrows one message.
     fn snapshot(&mut self) -> BoxFuture<'_, Result<SnapshotResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Snapshot(SnapshotCall {})).await? {
@@ -250,11 +243,8 @@ pub trait Client: Send {
         })
     }
 
-    /// Boot now, to hide the cold start.
-    ///
-    /// Optional: [`exec`](Self::exec), [`read`](Self::read), [`write`](Self::write) and
-    /// [`snapshot`](Self::snapshot) boot on demand, so this only moves the boot wait off the
-    /// first call that needs one.
+    /// Boot now, to hide the cold start; optional, since any call that needs a boot boots
+    /// on demand.
     ///
     /// `Ok` means the notification went out, not that the boot succeeded; a failed boot
     /// surfaces as [`BOOT_FAILED`](Error::BOOT_FAILED) on the next call that needs one.

@@ -12,19 +12,15 @@ pub(crate) const GRAPH_ORIGIN: &str = "https://graph.microsoft.com";
 
 /// Where to reach Microsoft's services. `None` = the real host.
 ///
-/// Two hosts, because Graph is one API: files, metadata and search all live under
-/// `graph.microsoft.com`. Whatever is set here is an *origin* —
-/// this code appends only the path the official API uses, so the same paths address a
-/// mock and production alike.
+/// Two hosts suffice because Graph is one API (files, metadata, search). Each value is an
+/// *origin*; the official API path is appended, so the same paths address a mock and
+/// production alike.
 ///
 /// **Deployment-level only: the token endpoint receives the app's client secret, so none
-/// of this may be user-suppliable.** It derives `Deserialize` for a config file read by
-/// whoever runs the mount, not for a field filled in from a request — pointing `login`
-/// somewhere is pointing the client secret there.
+/// of this may be user-suppliable.** `Deserialize` is for the operator's config file.
 ///
-/// The *content* host is deliberately absent. A download URL arrives from Graph itself
-/// (`@microsoft.graph.downloadUrl`) and is followed as given; overriding it would mean
-/// rewriting a URL the service minted, which a mock does not need — it returns its own.
+/// No *content* host: a download URL is minted by Graph (`@microsoft.graph.downloadUrl`)
+/// and followed as given; a mock returns its own.
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OnedriveOrigins {
     /// Serves the token endpoint (`{login}/consumers/oauth2/v2.0/token`).
@@ -62,10 +58,6 @@ impl OnedriveOrigins {
 }
 
 /// Every host this accessor talks to, resolved once from a config.
-///
-/// Each is an origin from [`OnedriveOrigins`] plus the path the official API uses, so
-/// nothing here encodes any one deployment's layout: point `OnedriveOrigins::graph` at a
-/// gateway and `/v1.0` still follows, exactly as it does against Microsoft.
 #[derive(Clone)]
 struct Endpoints {
     token: String,
@@ -85,29 +77,22 @@ fn endpoints(o: &OnedriveOrigins) -> Endpoints {
     }
 }
 
-/// Per-item fields asked of every listing — what the mount needs to shape an entry, and
-/// nothing else. Joined at request time, so the mask cannot grow a stray space or lose a
-/// comma.
-///
-/// A driveItem states `size` exactly for every file, `.docx`, `.xlsx` and `.pptx`
-/// included, which is why this store has no placeholder, no padding and no
-/// remembered-length map.
+/// Per-item fields asked of every listing: what the mount needs to shape an entry, nothing
+/// else.
 const ITEM_FIELDS: &[&str] = &[
     "id",
     "name",
     "size",
     "lastModifiedDateTime",
     "createdDateTime",
-    // Which of the two an item is. A file has `file`, a folder has `folder`; an item with
-    // neither — see `package` below — is neither.
+    // A file has `file`, a folder has `folder`.
     "file",
     "folder",
-    // OneNote notebooks and the like: "a package instead of a folder or file", treated as
-    // a folder by some clients and a file by others. Requested so the listing can drop it
-    // rather than guess.
+    // OneNote notebooks and the like; requested so the listing can drop them rather than
+    // guess.
     "package",
-    // `cTag` changes when content changes, `eTag` when anything does. `Stat` has a field
-    // for one of them and a revalidating reader wants the content one.
+    // `cTag` changes when content changes, `eTag` when anything does; a revalidating reader
+    // wants the content one.
     "cTag",
     "eTag",
 ];
@@ -119,8 +104,7 @@ const ITEM_FIELDS: &[&str] = &[
 /// under [`DOWNLOAD_URL_KEY`].
 ///
 /// Asked for beside the fields above so a read needs no second round trip to find the
-/// bytes. [`OnedriveAccessor::get_item_by_id`] selects the same way, so a wrong spelling
-/// here also breaks the refetch meant to rescue a missing URL.
+/// bytes.
 const DOWNLOAD_URL_SELECT: &str = "content.downloadUrl";
 
 /// The instance annotation a download URL actually arrives under. See
@@ -141,30 +125,16 @@ const JITTER_MAX_MS: u64 = 1000;
 
 /// How long one call may spend *waiting* across the whole retry ladder.
 ///
-/// A different kind of number from [`MAX_BACKOFF`], and not interchangeable with it.
-/// Microsoft's guidance is to wait exactly what `Retry-After` says, because usage keeps
-/// accruing while a client is throttled: coming back early makes the throttle last longer.
-/// So there is no "retry sooner" option, only waiting as told or giving up — and shortening
-/// the wait while keeping the retry is the one combination worse than either, since it
-/// spends the retry budget inside the window and extends it on every attempt.
+/// Microsoft says to wait exactly what `Retry-After` asks: usage accrues while throttled,
+/// so returning early prolongs the throttle. A wait is taken as asked or not at all;
+/// shortening it while still retrying spends the retry budget inside the window.
 ///
-/// Waiting cannot be unbounded either. A FUSE op is a synchronous callback and the session
-/// loop is single-threaded, so a sleep here is not one blocked process but the whole mount
-/// not answering anybody.
-///
-/// A budget for the ladder rather than a cap on one sleep, because what blocks the mount is
-/// their **sum**, which a per-sleep cap would let reach `MAX_RETRIES` times its ceiling.
-///
-/// It bounds the waiting and not the whole call: each attempt may still spend up to the
-/// `reqwest` request timeout set in [`OnedriveAccessor::new`] on the wire. Requests are
-/// progress; sleeping is not.
+/// Still bounded: a FUSE op is a synchronous callback on a single-threaded session loop,
+/// so a sleep here stalls the whole mount. A budget on the **sum** of sleeps, since the sum
+/// is what blocks. Time on the wire is bounded separately by the `reqwest` timeout.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 /// Ceiling on a response body read into memory.
-///
-/// Bounded while reading rather than after: a JSON listing costs several times its bytes
-/// once parsed into a tree, so a body that arrives unbounded is already too late to
-/// refuse.
 pub(super) const MAX_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
 /// What a mount needs to reach one OneDrive account.
@@ -207,7 +177,7 @@ pub struct OnedriveAccessor {
     config: OnedriveConfig,
     urls: Endpoints,
     access_token: Mutex<Option<(String, Instant)>>,
-    /// Until when the service said to stop asking. See
+    /// Until when the service asked us to stop sending. See
     /// [`refuse_while_throttled`](Self::refuse_while_throttled).
     throttled_until: Mutex<Option<Instant>>,
 }
@@ -289,11 +259,8 @@ impl OnedriveAccessor {
     /// mid-flight refresh reach the retry. Every call this makes is an idempotent GET, so
     /// retrying a 5xx is unconditionally safe.
     ///
-    /// Graph reports throttling as `429` with `Retry-After` and means it, so no other
-    /// status needs classifying as a rate limit. A wait it asks for is
-    /// honoured as asked or not taken at all; see [`MAX_RETRY_AFTER`] for why there is no
-    /// third option. A backoff this code computed for itself has its base capped at
-    /// [`MAX_BACKOFF`], which is a different thing and safe to shorten.
+    /// Graph signals throttling only as `429` with `Retry-After`, so no other status is
+    /// treated as a rate limit.
     async fn send_retrying(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -339,14 +306,10 @@ impl OnedriveAccessor {
 
     /// Refuse to send at all while the service has told us to wait.
     ///
-    /// Giving up on a throttle is only half of what Microsoft asks for. Its instruction is
-    /// to *pause the client* — "failure to honor Retry-After may result in more throttling
-    /// ... even though the calls fail, they still count toward usage limits" — so a
-    /// give-up that leaves the next call free to fire immediately is worse than waiting.
-    ///
-    /// A mount is the hostile case for this. Its callers re-ask constantly — Finder, the
-    /// NFS client under FUSE-T, a `find` walking a tree — and a failed
-    /// listing is deliberately not cached, so every re-ask would be a fresh request.
+    /// Microsoft asks to *pause the client*: throttled calls "still count toward usage
+    /// limits", so a give-up that lets the next call fire at once is worse than waiting. A
+    /// mount re-asks constantly (Finder, NFS under FUSE-T, `find`) and failed listings are
+    /// not cached, so every re-ask would be a fresh request.
     async fn refuse_while_throttled(&self) -> anyhow::Result<()> {
         let until = *self.throttled_until.lock().await;
         if let Some(until) = until
@@ -387,10 +350,8 @@ impl OnedriveAccessor {
             .send_with_refresh(|t| self.client.get(url).bearer_auth(t))
             .await?;
         if let Err(failed) = resp.error_for_status_ref() {
-            // `unwrap_or_default` and not `?`: the status is what a caller classifies on,
-            // so it has to survive a body that will not read. Propagating the body's error
-            // instead would drop the status, and a 404 whose body was cut off would stop
-            // being an absence.
+            // Not `?`: a body that will not read must not replace the status, so a
+            // truncated 404 is still an absence.
             let body = body_within(resp, MAX_BODY_BYTES, "error")
                 .await
                 .unwrap_or_default();
@@ -429,11 +390,8 @@ impl OnedriveAccessor {
         self.pages_from(self.children_url(path), limit).await
     }
 
-    /// The same listing addressed by the folder's id rather than by its path.
-    ///
-    /// The slow half of resolution, for the paths the fast half cannot spell. A path is
-    /// one string and the service answers to one normalization of it; an id is the
-    /// service's own. See [`OnedriveFs::list_dir`](super::OnedriveFs::list_dir).
+    /// The same listing addressed by folder id, for a path whose spelling the service does
+    /// not match.
     pub async fn list_children_of_id(&self, id: &str, limit: usize) -> anyhow::Result<Vec<Value>> {
         let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_SELECT);
         let url = format!(
@@ -470,12 +428,9 @@ impl OnedriveAccessor {
     /// One item by id, for the case a listing cannot answer: a download URL the listing did
     /// not carry, or a fresh one after the cached one has expired.
     ///
-    /// By id rather than by path, and that is load-bearing rather than tidy. A path has
-    /// two Unicode spellings and the service answers only to the one it stored, while an
-    /// id is opaque ASCII the service itself minted. This refresh
-    /// happens mid-read, where a `404` would surface as a file that vanished halfway
-    /// through, so it is the last place that should depend on a spelling. It also survives
-    /// a rename between the listing and the read, which a path does not.
+    /// By id, not by path: a path has two Unicode spellings and the service answers only to
+    /// the one it stored, while an id is opaque and survives a rename. This runs mid-read,
+    /// where a `404` would look like a file vanishing halfway through.
     pub async fn get_item_by_id(&self, id: &str) -> anyhow::Result<Value> {
         let select = format!("{},{}", ITEM_FIELDS.join(","), DOWNLOAD_URL_SELECT);
         let url = format!(
@@ -486,30 +441,22 @@ impl OnedriveAccessor {
         self.get_json(&url).await
     }
 
-    /// A window of a file's bytes, from a URL Graph minted, with where they start.
+    /// A window of a file's bytes from a Graph-minted URL, as `(at, bytes)`: `at` is where
+    /// they actually start, **not** necessarily the offset asked for.
     ///
-    /// Returns `(at, bytes)` — the offset the bytes actually begin at, which is **not**
-    /// necessarily the offset asked for. Microsoft documents that a ranged GET may ignore
-    /// the header: *"If the range can't be generated the Range header may be ignored and
-    /// an HTTP 200 response would be returned with the full contents of the file."* So a
-    /// `200` is a whole file starting at zero, and the caller slices from there. Assuming
-    /// the requested offset instead would serve bytes from the front of the file as though
-    /// they came from the middle, with nothing to notice it by.
+    /// Graph may ignore `Range` and answer `200` with the whole file (*"If the range can't
+    /// be generated the Range header may be ignored"*), so a `200` starts at zero and the
+    /// caller slices; assuming the asked offset would serve the file's front as its middle.
+    /// A `206`'s start is taken from `Content-Range`, not from the request.
     ///
-    /// A `206` states its own start in `Content-Range`, and that is what is returned
-    /// rather than what was requested — the two agree in practice, and trusting the
-    /// response over the intent is what makes them provably agree here.
-    ///
-    /// The URL is not this store's to keep: Microsoft calls it short-lived and warns it
-    /// "can't be cached". An expired one answers 4xx, which the caller turns into one
-    /// refetch. Nothing here retries, because retrying an expired URL cannot help.
+    /// The URL is short-lived ("can't be cached"); an expired one answers 4xx, which the
+    /// caller turns into one refetch, so nothing here retries.
     pub async fn download(
         &self,
         url: &str,
         range: Option<std::ops::Range<u64>>,
     ) -> anyhow::Result<(u64, Vec<u8>)> {
-        // The download URL is preauthenticated and takes no bearer token. Sending one
-        // anyway is what breaks a CORS preflight in a browser and is simply noise here.
+        // Preauthenticated: takes no bearer token.
         let mut req = self.client.get(url);
         if let Some(r) = &range {
             if r.end <= r.start {
@@ -517,10 +464,8 @@ impl OnedriveAccessor {
             }
             req = req.header("Range", format!("bytes={}-{}", r.start, r.end - 1));
         }
-        // `without_url`: reqwest attaches the request URL to a transport error and
-        // `Display` prints its query string, and *this* URL's query string is the grant. A refused connection or a
-        // timeout would otherwise put a token that hands over the file into whatever reads
-        // the error. The error's kind survives, so `is_timeout` and `is_connect` still work.
+        // `without_url`: this URL's query string is the grant, and a transport error's
+        // `Display` would print it. The error kind (`is_timeout`, `is_connect`) survives.
         let resp = req.send().await.map_err(reqwest::Error::without_url)?;
         let status = resp.status();
         // Past the end of the file. A walk that runs off the end asks for this, and it is
@@ -529,10 +474,8 @@ impl OnedriveAccessor {
             return Ok((range.map(|r| r.start).unwrap_or(0), Vec::new()));
         }
         if !status.is_success() {
-            // The status and nothing else, deliberately. `error_for_status` names the URL
-            // in its message, and *this* URL is preauthenticated: the token that grants
-            // the file is in its query string, so an error carrying it into a log hands
-            // the file to whoever reads the log.
+            // Status only: `error_for_status` would put the URL, and so the grant, in the
+            // message.
             anyhow::bail!("onedrive download {status}");
         }
         let at = if range.is_some() {
@@ -541,8 +484,7 @@ impl OnedriveAccessor {
                     anyhow::anyhow!("onedrive download: 206 without a usable Content-Range")
                 })?
             } else {
-                // A range was asked for and the whole file came back. Documented, and
-                // correct to serve — from zero, which is where it starts.
+                // Range ignored: the whole file, starting at zero.
                 0
             }
         } else {
@@ -593,12 +535,10 @@ fn content_range_start(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .ok()
 }
 
-/// Percent-encode a path for the `root:/{path}:` form.
+/// Percent-encode a path for the `root:/{path}:` form, segment by segment so `/` survives.
 ///
-/// Segment by segment, so the separators survive: encoding the whole string would turn
-/// `/` into `%2F` and address one long name instead of a path. `?` and `#` are what make
-/// this load-bearing rather than tidy — either one raw would end the path and start a
-/// query, and OneDrive allows neither in a name but a gateway is not obliged to agree.
+/// `?` and `#` must be escaped: raw, either ends the path and starts a query. OneDrive
+/// forbids both in names, but a gateway need not.
 pub(super) fn encode_path(path: &str) -> String {
     path.trim_matches('/')
         .split('/')
@@ -620,14 +560,8 @@ fn encode_segment(seg: &str) -> String {
     out
 }
 
-/// The wait to take before retrying, or `None` when this call has no more waiting to give.
-///
-/// Kept apart from [`OnedriveAccessor::send_retrying`] because it is the whole of the
-/// policy and it is arithmetic: the ladder around it only sleeps and counts.
-///
-/// `slept` is what the call has already spent, which is what makes [`MAX_RETRY_AFTER`] a
-/// budget for the ladder rather than a cap on one sleep: the two diverge on a run of short
-/// waits whose sum passes it.
+/// The wait before retrying, or `None` once `slept` plus the asked wait would pass
+/// [`MAX_RETRY_AFTER`]. An unasked wait backs off.
 fn next_wait(asked: Option<Duration>, slept: Duration, retries: u32) -> Option<Duration> {
     match asked {
         Some(d) if slept + d > MAX_RETRY_AFTER => None,
@@ -646,10 +580,8 @@ fn backoff_delay(n: u32) -> Duration {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| u64::from(d.subsec_nanos()) % (JITTER_MAX_MS + 1))
         .unwrap_or(0);
-    // The cap applies to the base, then jitter rides on top. Capping the sum instead
-    // discards the jitter exactly when two callers are most likely to collide: at
-    // `MAX_RETRIES`, `base` is already capped to `MAX_BACKOFF`, so `(base + jitter).min(cap)` is
-    // `cap` for every caller and they wake together — which is what this exists to prevent.
+    // Cap the base, not the sum: at the cap, `(base + jitter).min(cap)` is `cap` for every
+    // caller and they wake together.
     Duration::from_secs(base)
         .min(MAX_BACKOFF)
         .saturating_add(Duration::from_millis(jitter))
@@ -660,10 +592,8 @@ fn backoff_delay(n: u32) -> Duration {
 /// Delta-seconds only. The HTTP-date form is legal and Graph does not send it, and a date
 /// parsed against a skewed clock is worse than a backoff.
 ///
-/// A zero is `None` rather than a zero wait. "Avoid immediate retries, because all requests
-/// accrue against your usage limits" is the one thing the guidance names outright, and a
-/// header of `0` from a gateway would otherwise produce exactly that: a full ladder of
-/// requests with no delay between them at all.
+/// A zero is `None`: the guidance says to avoid immediate retries, and a gateway's `0`
+/// would fire the whole ladder with no delay.
 fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let secs: u64 = headers
         .get(reqwest::header::RETRY_AFTER)?

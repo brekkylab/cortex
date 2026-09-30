@@ -34,11 +34,10 @@ use super::table::{mounts_under, unmount_under};
 /// Records directory, under the temporary directory.
 const DIR: &str = "cortex-mounts";
 
-/// How many abandoned mounts one call will try to unmount.
+/// How many abandoned mounts one call will try to unmount; only mounts still present are charged.
 ///
 /// Each costs a bounded wait on the thread trying to mount, so an unbounded sweep would turn
-/// a host's accumulated leftovers into startup latency. The rest is the next run's. Only
-/// mounts still present are charged.
+/// a host's accumulated leftovers into startup latency.
 const BUDGET: usize = 4;
 
 /// Distinguishes two mounts made by one process — a pid alone does not.
@@ -58,8 +57,6 @@ pub(crate) fn live() -> Vec<PathBuf> {
 }
 
 /// A guard's ownership of one mount point, held for as long as the mount is.
-///
-/// Gated on `mount`, since without a binding nothing can mount.
 #[cfg(feature = "mount")]
 pub(crate) struct Claim {
     mountpoint: PathBuf,
@@ -172,7 +169,6 @@ impl Drop for Claim {
             live.swap_remove(at);
         }
         // Kept while the mount is still up (a failed teardown), so a later run reclaims it.
-        // Asked of the mount table, which knows what is actually there.
         if let Some(record) = &self.record
             && mounts_under(&self.mountpoint).is_empty()
         {
@@ -236,11 +232,10 @@ fn gone(pid: libc::pid_t) -> bool {
 /// safe: a live sibling instance keeps its mounts. A path says nothing about whose mount is on
 /// it, so no sweep-by-path call exists.
 ///
-/// Returns the mounts it tried and failed to take down, which a person must clear by hand;
-/// ones past the budget are left for the next call and not listed.
-///
-/// A bounded number of unmounts per call (`BUDGET`), each with its own deadline. Never panics
-/// or fails; with nothing to reclaim it costs one directory read.
+/// Returns the mounts it tried and failed to take down, which a person must clear by hand.
+/// At most `BUDGET` unmounts per call, each with its own deadline; the rest wait for the next
+/// call and are not listed. Never panics or fails; with nothing to reclaim it costs one
+/// directory read.
 pub fn reclaim_abandoned() -> Vec<PathBuf> {
     let mut left = Vec::new();
     let Some(dir) = registry() else {

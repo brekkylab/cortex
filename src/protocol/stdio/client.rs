@@ -25,19 +25,14 @@ use crate::protocol::{
 /// the client until that call returns.
 ///
 /// The process lives here, not on [`ConsoleClient`], because only a pipe-to-child
-/// transport has one; a micro-VM guest channel has no process behind it.
-/// [`ConsoleClient`] is this plus the session it was built with, and is what a caller
-/// normally wants.
-///
-/// The directions are separate fields so [`call`](Client::call) can borrow both at once.
+/// transport has one; [`ConsoleClient`] adds the session and is what a caller normally wants.
 ///
 /// Trait objects rather than the child's descriptor types, so the writer can be swapped
 /// for a sink at `quit` without an `Option`, and tests can drive a canned stream.
 ///
 /// [`ConsoleClient`]: crate::console::ConsoleClient
 pub struct StdioClient {
-    /// Where responses come from. Buffering is safe: the protocol owns this for the
-    /// session's lifetime, so reading ahead takes no one else's bytes.
+    /// Where responses come from.
     incoming: BufReader<Box<dyn AsyncRead + Send + Unpin>>,
 
     /// The server's stdin, until [`quit`](Client::quit) closes it.
@@ -127,8 +122,6 @@ impl StdioClient {
             };
 
             match message {
-                // An error response becomes `Refused`, so callers handle "no answer" as a
-                // `Failure` alongside a broken channel.
                 Message::Response {
                     id: answered,
                     result,

@@ -19,28 +19,20 @@ use crate::{
 
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 
-/// The mount root mirrors Drive's sidebar as virtual sections, under Drive's own English
-/// labels. `My Drive` is the literal folder id `root` and a shared drive has a drive id of
-/// its own, but `Shared with me` has no id: Drive holds no folder for it, and what it
-/// gathers carries no `parents`, so the folder tree alone never surfaces any of it.
+/// Root sections, under Drive's own English sidebar labels. `My Drive` is the literal
+/// folder id `root`.
 const MY_DRIVE_ID: &str = "root";
 const MY_DRIVE_NAME: &str = "My Drive";
 const SHARED_WITH_ME_NAME: &str = "Shared with me";
 
-/// How each Docs-editors type is served: the API that answers for it, and the
-/// suffix its entry carries.
+/// How each Docs-editors type is served: the API that answers for it, and the suffix its
+/// entry carries (the Drive name has no extension).
 ///
-/// These types hold no bytes of their own — Drive can only export a rendering of
-/// them — so the document's own API is the only form that carries everything:
-/// formulas, slide geometry, and the character indices an edit has to address.
-/// The suffix says which document it is, since the Drive name has no extension.
-///
-/// Not the Office export, which has no usable length: `files.export` refuses anything
-/// over its size cap, and `exportLinks` declares no length and ignores ranges, so the
-/// length exists only after a render that takes seconds. An OOXML reader seeks to the end
-/// from the length `stat` gave, Drive's listed size is too far off to stand in, and
-/// rendering at `stat` would render a whole folder for one `ls -l`. The JSON is read front
-/// to back, needs no render, and is much smaller than the export.
+/// Not the Office export, which has no usable length: `files.export` refuses anything over
+/// its size cap, and `exportLinks` declares no length and ignores ranges, so a length needs
+/// a seconds-long render. An OOXML reader seeks to the end from `stat`'s length, Drive's
+/// listed size is too far off, and rendering at `stat` would render a whole folder per
+/// `ls -l`. The JSON is read front to back, needs no render, and is much smaller.
 const NATIVE_KINDS: &[(&str, NativeApi, &str)] = &[
     (
         "application/vnd.google-apps.document",
@@ -83,62 +75,39 @@ const GRID_BYTES_BUDGET: u64 = 8 * 1024 * 1024;
 /// query string, so an unbounded count would eventually build an unsendable URL.
 const MAX_TABS: usize = 64;
 
-/// Size reported for a document whose length nobody has learned yet.
+/// Size reported for a document whose length nobody has learned yet: a placeholder that
+/// `ls -l` and `find -size` see until a read learns the exact length.
 ///
-/// A placeholder, not a measurement: `ls -l` and `find -size` see it until something reads
-/// the file, which from then on reports its exact length.
+/// Not 0: a client bounds a read by the length it was told, so an "empty" file yields
+/// nothing and search tools skip it. An over-estimate is padded by [`FileSystem::read_at`].
+/// An *under*-estimate has no recovery: the reader stops where it was told with every
+/// window full, and the JSON ends mid-token. So it equals [`MAX_DOCUMENT_BYTES`], the
+/// accessor's cap on the *raw* body; Google already returns pretty JSON of about the
+/// re-serialized length, so served bytes cannot exceed it, and a larger document fails
+/// loudly instead.
 ///
-/// It cannot be 0: a client bounds a read by the length it was told, so a file reported
-/// empty hands back nothing however many bytes are behind it, and a search tool skips it.
-///
-/// An over-estimate means the client asks for and takes back the whole claimed span, so
-/// [`FileSystem::read_at`] fills the part past the JSON; zero fill there would make every
-/// JSON parser throw at the seam.
-///
-/// An *under*-estimate has no recovery: the reader stops where it was told, every window
-/// full, so nothing reports a short read and the JSON ends mid-token. Equal to
-/// [`MAX_DOCUMENT_BYTES`] so that cannot happen: `get_pretty` bounds the *raw* body at that
-/// number and Google already returns pretty JSON of about the re-serialized length, so
-/// served bytes cannot exceed it, and a larger document fails loudly in `body_within`
-/// instead.
-///
-/// An exact length up front costs one render per document, and `stat` runs once per name,
-/// because FUSE-T serves over NFS and an NFS client fills an attribute for every entry it
-/// lists.
+/// An exact length up front would cost a render per listed document: FUSE-T serves over
+/// NFS, whose client fills an attribute for every entry it lists.
 const UNKNOWN_LENGTH_SIZE: u64 = MAX_DOCUMENT_BYTES;
 
-/// How long a line the padding past a document's JSON is broken into.
-///
-/// The padding is whitespace JSON ignores, so this only shapes the tail for line-oriented
-/// tools (see the padding step of this store's `read_at`).
+/// Line length of the whitespace padding past a document's JSON.
 const PAD_LINE: u64 = 4096;
 
-/// How much a blob read fetches once it is clear the reader is walking the file, so a
-/// walk pays a round trip per span of this size rather than one per window.
+/// How much a blob read fetches once the reader is clearly walking the file, so a walk
+/// pays a request, and its quota, per span rather than per kernel window (64 KiB, halved
+/// to 32 KiB by FUSE-T's NFS backend).
 ///
-/// The kernel's window is 64 KiB and not ours to choose, and FUSE-T's NFS backend halves
-/// it to 32 KiB; one ranged request per window makes a large file cost a request, and its
-/// quota, per window.
-///
-/// A ranged request costs a round trip of about the same length whatever its size, then
-/// bytes, so bigger spans pay off until the transfer itself dominates — around this size,
-/// past which only the request count falls.
-///
-/// The *first* fetch takes [`FIRST_SPAN`] instead, so a reader that stops after a buffer
-/// never pays for a span it will not use. And a walk gets this only as a lone reader: its
-/// span is its share of [`HELD_BUDGET`], divided among the files being read at once.
+/// A ranged request costs about one round trip plus its bytes, so bigger spans pay off
+/// until the transfer dominates, around this size. This is a lone walker's span; see
+/// [`GdriveFs::span`] for the first fetch and for concurrent readers.
 const READ_SPAN: u64 = 64 * 1024 * 1024;
 
 /// What the first fetch of a file takes, before anything says the reader is walking it.
 ///
-/// It cannot be the window the kernel asked for, however little that reader wants. The
-/// mount is served over NFS, whose client fires around a megabyte of read-ahead the
-/// moment a file is touched, and every window of it continues the one before — which is
-/// a walk by any test this layer can apply, so a head-read would fetch [`READ_SPAN`] for
-/// read-ahead nobody reads.
-///
-/// This swallows that read-ahead whole, so a head-read is one fetch and stops there. A
-/// reader that really is walking spends this span and gets [`READ_SPAN`] for the next one.
+/// Not the kernel's window: the NFS client fires about a megabyte of contiguous read-ahead
+/// the moment a file is touched, which passes any walk test this layer has, so a head-read
+/// would fetch a whole [`READ_SPAN`]. This swallows that read-ahead in one fetch; a real
+/// walk spends it and gets [`READ_SPAN`] next.
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
 /// Ceiling on the bytes held across every file at once: one [`READ_SPAN`], so concurrent
@@ -182,21 +151,16 @@ const MAX_FOLDER_FILES: usize = 10_000;
 /// [`disambiguate`]).
 const ID_TAG_LEN: usize = 8;
 
-/// The longest name this store will hand out, measured the way the mount measures it.
+/// The longest name this store hands out, counted decomposed as the mount emits it.
 ///
-/// [`NAME_MAX`] is what `statfs` reports, and nothing below enforces it. The reason to
-/// keep to it anyway is what happens on the way *out*: `cp`, `tar` and `rsync` write to
-/// filesystems that do enforce it, and a name over it fails there rather than here.
-///
-/// Counted decomposed, because that is the form the mount emits and it is not the form
-/// Drive stores. Decomposed Korean takes two to three times the bytes, so a name that fits
-/// comfortably as Drive holds it can be too long once served.
+/// Nothing below enforces [`NAME_MAX`] (what `statfs` reports), but `cp`, `tar` and `rsync`
+/// write to filesystems that do. Drive stores names composed, and decomposed Korean takes
+/// two to three times the bytes, so a name that fits in Drive can overflow once served.
 const NAME_BUDGET: usize = NAME_MAX as usize;
 
 /// Whether Drive holds real bytes for this row. The Docs-editors types (and Forms,
 /// Maps, Drawings) do not — `alt=media` answers *"Only files with binary content can be
-/// downloaded. Use Export with Docs Editors files."* The first three have APIs of their
-/// own and are served from those; the rest have nothing to serve and are not listed.
+/// downloaded. Use Export with Docs Editors files."*
 fn has_original_bytes(mime: &str) -> bool {
     !mime.starts_with("application/vnd.google-apps.")
 }
@@ -240,12 +204,8 @@ impl GKind {
     }
 }
 
-/// What listing a directory takes, which is not the same question as what it is called.
-///
-/// Two of the root's three kinds of section resolve to an id Drive knows, and the third
-/// resolves to none: `Shared with me` is a view rather than a folder. An `Option<String>`
-/// would say the same thing and let a caller reach past it into a query that needs an id
-/// — this cannot be read without deciding which of the two it is.
+/// What listing a directory takes. Not an `Option<String>` id: `Shared with me` has none,
+/// and this forces a caller to pick the case before building a query that needs an id.
 enum Listing {
     /// A real Drive folder. `drive_id` scopes it to a shared drive when it lives in one.
     Folder {
@@ -271,11 +231,8 @@ struct Child {
     created: Option<std::time::SystemTime>,
     /// What this entry hands back when read.
     serves: Serves,
-    /// Byte length as the listing reported it, for a file Drive holds bytes for.
-    ///
-    /// Exact, so a reader can seek inside it. `None` for a directory and for a document,
-    /// whose Drive size is what Drive *stores* and describes neither the JSON served nor
-    /// anything else a reader sees; the length an entry reports comes from `entry_size`.
+    /// Drive's exact byte length for a blob, so a reader can seek inside it; `None` for a
+    /// directory or document. The length an entry reports comes from `entry_size`.
     size: Option<u64>,
 }
 
@@ -354,25 +311,13 @@ pub struct GdriveFs {
     /// parent listings, so one cached listing answers readdir, stat and the lookup
     /// a read starts with; fetching the bytes themselves still costs a request.
     dir_cache: Mutex<HashMap<String, CachedListing>>,
-    /// Drive id → the span last read from that file, bounded in bytes by [`HELD_BUDGET`].
+    /// Drive id → the span last read from that file (a document: its whole JSON at offset
+    /// 0), bounded by *bytes* in [`HELD_BUDGET`] so concurrent readers divide the ceiling
+    /// rather than whoever fetched last owning it; see [`Self::span`].
     ///
-    /// A document lands here too, as a whole-file span at offset 0. Its API has no ranges,
-    /// so a read of any window produces all of it, and the next window finds it here or
-    /// renders the whole document again.
-    ///
-    /// A map rather than one slot, because reads of two files interleave with neither
-    /// threads nor a second process: FUSE ops are serialized, so alternating is enough.
-    /// With one slot each read finds the other file there, no read ever counts as a walk,
-    /// and every window pays a whole [`FIRST_SPAN`] and a request's quota. A lost document
-    /// is worse than a lost span, costing a re-render rather than a re-fetch.
-    ///
-    /// A single tool rarely interleaves on this store: read-ahead overlaps files only when
-    /// it can outrun the reader, and a miss of about a second never lets it. So traces
-    /// replayed from a fast local store do not describe this one.
-    ///
-    /// Bounded by *bytes* rather than count, so the ceiling is divided rather than owned by
-    /// whoever fetched last, and each span is sized to that division so nothing has to be
-    /// evicted to fit. See [`READ_SPAN`] and [`ACTIVE`].
+    /// A map rather than one slot: FUSE ops are serialized, so two files read alternately
+    /// would evict each other, no read would count as a walk, and every window would pay a
+    /// whole [`FIRST_SPAN`] and a request's quota.
     held: Mutex<HashMap<String, HeldSpan>>,
 }
 
@@ -396,12 +341,10 @@ impl GdriveFs {
     /// read comes back short of what it asked for — which [`FileSystem::read_at`] would
     /// report to the kernel as the end of the file.
     ///
-    /// How much a miss fetches depends on what the last one did and on how many other files
-    /// are being read. A read that carries on from where the held span ended is a reader
-    /// walking the file, and gets its share of [`HELD_BUDGET`] — a whole [`READ_SPAN`] when
-    /// it is the only reader, half that at two. Anything else — a different file, a jump to
-    /// somewhere new — gets that share capped at [`FIRST_SPAN`], so a reader that stops
-    /// after a buffer pays for a first span it mostly throws away rather than a walk's worth.
+    /// A miss that continues where the held span ended is a walk and gets its share of
+    /// [`HELD_BUDGET`] (a whole [`READ_SPAN`] for a lone reader). Anything else, such as
+    /// another file or a jump, gets that share capped at [`FIRST_SPAN`], so a reader that
+    /// stops after a buffer does not pay for a walk.
     ///
     /// A span is never smaller than the window asked for, so an oversized read is
     /// answered whole rather than truncated.
@@ -423,10 +366,8 @@ impl GdriveFs {
                         && (start.saturating_add(want) <= h.at.saturating_add(h.bytes.len() as u64)
                             || h.to_eof)
                     {
-                        // Served, so the file keeps counting toward *everyone else's*
-                        // share: a neighbour must not decide it is alone and take enough
-                        // to evict this span. Hits are microseconds apart, so ACTIVE only
-                        // lapses between them for a reader that pauses seconds mid-file.
+                        // Keeps this file counted in others' shares, so a neighbour
+                        // cannot decide it is alone and take enough to evict this span.
                         h.used = Instant::now();
                         return Ok((h.at, h.bytes.clone()));
                     }
@@ -566,8 +507,7 @@ impl GdriveFs {
         };
         let mut children = vec![
             section(MY_DRIVE_NAME, MY_DRIVE_ID, GKind::Folder, None),
-            // No id: nothing reads one for this kind, and `Listing` is what makes that
-            // hold rather than a convention.
+            // No id: `Listing::SharedWithMe` never reads one.
             section(SHARED_WITH_ME_NAME, "", GKind::SharedWithMe, None),
         ];
         let listed = self.accessor.list_shared_drives().await;
@@ -673,14 +613,9 @@ impl GdriveFs {
             children
         };
 
-        // Drive lets one folder hold two files of a name and a directory cannot, so every
-        // entry takes a tag off its own id: readdir shows distinct names, resolve finds each
-        // one, and no entry's name depends on what else the folder holds.
-        //
-        // Not at the root. Its sections are this store's own names or shared drives',
-        // `unique_name` already keeps them apart, and `Shared with me`
-        // answers to no id at all — tagging it would leave a trailing `_` standing in for
-        // an id that does not exist.
+        // A Drive folder can hold two files of a name, so every entry is tagged. Not at the
+        // root: its sections are this store's names or shared drives', `unique_name` keeps
+        // them apart, and `Shared with me` has no id to tag.
         if folder != "/" {
             disambiguate(&mut children);
         }
@@ -753,20 +688,13 @@ impl GdriveFs {
         pretty(&v)
     }
 
-    /// The length `stat` reports for a document, kept so it does not fall back to the
-    /// placeholder.
+    /// The length `stat` reports for a document, so it need not fall back to the placeholder.
     ///
-    /// Held apart from the bytes: the JSON is large and expires on [`DIR_TTL`] under a
-    /// byte budget, while the length is tiny with no reason to expire, so an unchanged
-    /// document read minutes ago does not flip back to the placeholder in `ls -l`.
-    ///
-    /// Stamped with `modifiedTime` rather than aged by a clock: an unchanged document keeps
-    /// its length indefinitely, and a changed one loses it the moment a listing says so,
-    /// where a TTL would discard lengths still right and serve ones already wrong.
-    ///
-    /// Keyed by id with the stamp in the value, so an edit replaces the row instead of
-    /// leaving an unreadable row per version. Losing an entry costs a listing's accuracy,
-    /// never correctness, so the bound is a flat cap and a clear.
+    /// Kept apart from the bytes, which expire on [`DIR_TTL`] under a byte budget, so a
+    /// document read minutes ago keeps its length in `ls -l`. Stamped with `modifiedTime`
+    /// rather than aged: an unchanged document keeps its length indefinitely and a changed
+    /// one loses it as soon as a listing shows the new stamp. Keyed by id so an edit
+    /// replaces the row instead of adding one per version.
     async fn remembered_len(&self, child: &Child) -> Option<u64> {
         // The bytes first, while they are still held: `stat` and a read of the same
         // document answer from the same place or they disagree about where it ends.
@@ -882,12 +810,9 @@ impl GdriveFs {
             .is_ok_and(|c| matches!(c.serves, Serves::Native(..)))
     }
 
-    /// One file's bytes, or one window of them.
-    ///
-    /// Kept apart from [`FileSystem::read_at`] because the two count in different
-    /// units: a window is what Drive charges for, and a buffer is what the kernel
-    /// hands over. The branching that decides *which* API answers belongs with the
-    /// window; filling a buffer from the answer is the other side's whole job.
+    /// One file's bytes, or one window of them. Kept apart from [`FileSystem::read_at`]:
+    /// this picks the API and counts in the windows Drive charges for; `read_at` only fills
+    /// the kernel's buffer.
     async fn read_window(
         &self,
         path: &Path,
@@ -917,11 +842,9 @@ impl GdriveFs {
                         .await
                         .map_err(not_found_or_backend);
                 };
-                // `read_at` never builds a backwards range, but its `offset + buf.len()`
-                // saturates, so an offset at the top of the range gives an empty window.
-                // Saturating here lands any degenerate range in the zero check below,
-                // where plain `-` would wrap in release and ask Drive for the rest of the
-                // file to answer with nothing.
+                // `read_at`'s `offset + buf.len()` saturates, so a window can be empty or
+                // degenerate; plain `-` would wrap in release and ask Drive for the rest of
+                // the file to answer with nothing.
                 let want = r.end.saturating_sub(r.start);
                 // An empty window is not a read: `span` would widen it and fetch a whole
                 // span to answer with nothing.
@@ -955,12 +878,8 @@ impl FileSystem for GdriveFs {
             }
             let child = self.resolve(&path).await?;
             let size = match (&child.serves, child.size) {
-                // A document reports its served JSON length once something has produced
-                // it, remembered past the bytes against `modifiedTime`; no request either
-                // way. Before that, the placeholder: `HEAD` answers `400`, so the length
-                // needs the whole body, and `stat` runs once per listed name (FUSE-T
-                // serves over NFS), so an exact length would cost a render per document
-                // per listing.
+                // Served length once something produced it, else the placeholder; no
+                // request either way.
                 (Serves::Native(..), _) => self.remembered_len(&child).await,
                 _ => None,
             };
@@ -996,34 +915,24 @@ impl FileSystem for GdriveFs {
             let bytes = self
                 .read_window(path, Some(offset..offset.saturating_add(want)))
                 .await?;
-            // Short is EOF and nothing else, because a span never splits a window: `span`
-            // fetches from where the read begins and at least as far as it asks, so what
-            // comes back either covers the window or ran out of file.
-            //
-            // A short answer does not reach a caller as one: through a mount the client
-            // fills the rest out to the length `stat` claimed with `0x00`, and `cp` copies
-            // that padding. So a document fills its own tail below, with a byte JSON can
-            // absorb.
+            // Short is EOF and nothing else: `span` fetches from where the read begins and
+            // at least as far as it asks, so a window is either covered or ran out of file.
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
             // A full window is the common case and needs nothing more.
             if n == buf.len() {
                 return Ok(n);
             }
-            // Short. For a blob that is the true end, because Drive sizes blobs exactly.
-            // For a document it is the read running past the JSON into the span
-            // [`UNKNOWN_LENGTH_SIZE`] claimed, which something fills either way: whitespace
-            // here keeps the document parseable, where the kernel's `0x00` makes every
-            // parser throw at the seam.
+            // Short: for a blob the true end (Drive sizes blobs exactly). For a document,
+            // the read ran past the JSON into the span [`UNKNOWN_LENGTH_SIZE`] claimed,
+            // which the client would fill with `0x00` (and `cp` copy), making every parser
+            // throw at the seam; whitespace keeps the JSON parseable.
             //
-            // Spaces, broken by a newline every [`PAD_LINE`] bytes. Not all newlines: a
-            // line-oriented tool pays per line, so a tail of newlines makes it slow where
-            // spaces do not. The periodic newline keeps the tail from being one huge line,
-            // which a `readline` would hand over as one huge string; it costs nothing
-            // noticeable and leaves `wc -l` a number a reader can look at.
+            // Spaces with a newline every [`PAD_LINE`] bytes: all newlines make line-oriented
+            // tools slow, and one huge line makes `readline` return one huge string.
             //
-            // Asked only when the window came back short, so a walk does not pay a second
-            // `resolve` per window.
+            // Checked only on a short window, so a walk does not pay a second `resolve` per
+            // window.
             let end = offset.saturating_add(n as u64);
             if end >= UNKNOWN_LENGTH_SIZE || !self.serves_json(path).await {
                 return Ok(n);
@@ -1063,14 +972,9 @@ fn kind_of(c: &Child) -> DirentKind {
     }
 }
 
-/// The listing row for one child.
-///
-/// With a [`Stat`] attached, because a Drive listing answers with names, types and
-/// timestamps in one response: filling it costs nothing here and saves the caller a
-/// `stat` per entry.
-///
-/// A `Stat` carries no provenance for its length, so an unread document's placeholder
-/// reads as a size like any other.
+/// The listing row for one child, with a [`Stat`] attached: the Drive listing already has
+/// names, types and timestamps, so this saves the caller a `stat` per entry. An unread
+/// document's placeholder size looks like any other size here.
 fn dirent_for(c: &Child) -> Dirent {
     Dirent::with_stat(
         c.vfs_name.clone(),
@@ -1083,13 +987,9 @@ fn dirent_for(c: &Child) -> Dirent {
     )
 }
 
-/// Map an accessor error into the one the trait speaks: an upstream HTTP 404 (a file
-/// id that no longer exists) becomes [`NotFound`](io::ErrorKind::NotFound), and
-/// everything else becomes `Other` carrying the full error chain as its message.
-///
-/// The distinction is what a caller acts on. `NotFound` on a path is a name that is
-/// gone, which a traversal skips; anything else is the backend failing, which it must
-/// not read as an absence.
+/// Map an accessor error to the trait's: HTTP 404 → [`NotFound`](io::ErrorKind::NotFound),
+/// else `Other` with the full chain. A traversal skips a `NotFound` name as gone, but must
+/// not read a backend failure as an absence.
 fn not_found_or_backend(e: anyhow::Error) -> io::Error {
     let is_404 = e
         .downcast_ref::<reqwest::Error>()
@@ -1102,9 +1002,8 @@ fn not_found_or_backend(e: anyhow::Error) -> io::Error {
     }
 }
 
-/// Map one `files.list` row into the entry it becomes, or `None` when the mount
-/// has nothing to serve for it (Forms, Maps and Drawings answer no API this mount reads,
-/// and it serves no export — a name that cannot be read is worse than an absence).
+/// Map one `files.list` row into its entry, or `None` for a type this mount cannot serve
+/// (Forms, Maps and Drawings answer no API it reads, and it serves no export).
 fn child_from_file(f: &Value) -> Option<Child> {
     let name = sanitize_name(f.get("name")?.as_str()?);
     let id = f.get("id")?.as_str()?.to_string();
@@ -1125,18 +1024,14 @@ fn child_from_file(f: &Value) -> Option<Child> {
         });
     }
     let (vfs_name, serves, size) = if has_original_bytes(mime) {
-        // Drive reports the length up front, so this entry is honest about its
-        // size and a reader can seek inside it.
         let size = f
             .get("size")
             .and_then(|s| s.as_str())
             .and_then(|s| s.parse::<u64>().ok());
         (name, Serves::Original, size)
     } else {
-        // A native document: served as its own API's JSON. Drive's `size` is dropped
-        // here rather than carried: it describes what Drive stores, which is neither the
-        // JSON's length nor within an order of magnitude of it, so keeping it would only
-        // give `entry_size` a wrong number to prefer over the placeholder.
+        // Drive's `size` is dropped: it describes what Drive stores, not within an order of
+        // magnitude of the JSON, and `entry_size` would prefer it over the placeholder.
         let (api, suffix) = native_kind(mime)?;
         (format!("{name}{suffix}"), Serves::Native(api), None)
     };
@@ -1152,18 +1047,14 @@ fn child_from_file(f: &Value) -> Option<Child> {
     })
 }
 
-/// Attach each tab's values to the tab they belong to.
+/// Attach each tab's values to its tab, paired by the title `valueRanges[].range` names
+/// rather than by position: the request was built from a filtered, truncated view of
+/// `sheets` (untitled tabs skipped, cut at [`MAX_TABS`]), so walking both in step would
+/// shift cells onto the wrong tabs.
 ///
-/// Paired by sheet title, not by position. `valueRanges` comes back in request order,
-/// but the request is built from a *filtered and truncated* view of `sheets` — a sheet
-/// with no title cannot be addressed and a workbook past [`MAX_TABS`] is cut off — so
-/// walking the two in step hands one tab another's cells and shifts every tab after
-/// it. `valueRanges[].range` names its own sheet, which removes the guesswork.
-///
-/// A tab that ends up with no values says why: it was never requested, nothing came
-/// back for it, or its cells did not fit the budget. The budget is spent tab by tab
-/// and an oversized one does not consume the remainder, so a small tab after it still
-/// fits.
+/// A tab left without values says why: never requested, nothing returned, or over budget.
+/// The budget is spent tab by tab, and an oversized tab does not consume it, so a smaller
+/// tab after it still fits.
 fn fold_values(workbook: &mut Value, batch: &Value, requested: &[String]) {
     let mut by_title: HashMap<String, Value> = HashMap::new();
     for vr in batch
@@ -1351,15 +1242,11 @@ fn shorten_for_tag(name: &str, serves: Serves, tag: &str) -> String {
 
 /// Give every child a `vfs_name` that names the file and nothing else about the folder.
 ///
-/// **Every entry carries a tag off its own Drive id** ([`id_tag`]) — `report_a1b2c3d4.pdf`
-/// — whether or not anything else in the folder shares its name, so no arrival, departure,
-/// rename or move renames anybody else, and a path an agent carries from listing to
-/// reading keeps resolving. For the same reason the tag comes from the file, never from its
-/// rank: numbering (` (2)`, ` (3)`) makes a name a function of the sibling set, and even
-/// ordered by id a file's *position* among the ids changes.
-///
-/// The tag goes in front of the extension, because appending it (`sheet.gsheet.json_1Bxi`)
-/// takes the entry out of every glob a reader would use, such as `**/*.gsheet.json`.
+/// **Every entry carries a tag off its own Drive id** ([`id_tag`]), as in
+/// `report_a1b2c3d4.pdf`, shared name or not, so no arrival, departure, rename or move
+/// renames anybody else and a carried path keeps resolving. Not numbering (` (2)`): that
+/// makes a name a function of the sibling set, and even a file's rank among sorted ids
+/// shifts.
 ///
 /// **Grouped by composition, not by bytes**, because [`same_name`] resolves by composition
 /// and Drive stores whichever spelling the uploader sent, both within one folder. Two
@@ -1534,12 +1421,8 @@ fn split_last(path: &str) -> (String, String) {
     }
 }
 
-/// The requested window of `data`, clamped to what exists.
-///
-/// Both ends are clamped, because a reader may seek past the end and a window may
-/// straddle it. Neither is reordered: the only non-test way in is the private `read_window` from
-/// [`FileSystem::read_at`], which builds `offset..offset + buf.len()`, so
-/// `r.end >= r.start` holds by construction.
+/// The requested window of `data`, both ends clamped, since a window may pass or straddle
+/// the end. Expects a forward range and does not reorder one.
 fn slice(data: &[u8], range: Option<std::ops::Range<u64>>) -> Vec<u8> {
     match range {
         Some(r) => {

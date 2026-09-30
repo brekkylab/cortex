@@ -683,9 +683,8 @@ async fn start_full(
                         // What an expired preauthenticated URL answers.
                         reply(401, br#"{"error":"expired"}"#.to_vec())
                     } else {
-                        // A blob the fixture does not carry is a 404, not an empty file.
-                        // Serving empty bytes would make a download failure unreachable
-                        // from a test, which is the shape the read path classifies on.
+                        // A missing blob is a 404, not empty bytes, so a test can reach a
+                        // download failure.
                         match blobs.get(id) {
                             Some(blob) => serve_content(blob.clone(), range.as_deref(), range_mode),
                             None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
@@ -784,8 +783,7 @@ fn serve_content(blob: Vec<u8>, range: Option<&str>, mode: RangeMode) -> (Vec<u8
         (out, bytes.len())
     };
     let asked = range.and_then(parse_range);
-    // No range asked, or one this origin ignores — the whole file, which Microsoft
-    // documents as a legitimate answer to a range it cannot generate.
+    // No range asked, or one this origin ignores: the whole file.
     let Some((from, to)) = asked.filter(|_| mode != RangeMode::Ignore) else {
         return body(200, &blob, None);
     };
@@ -853,10 +851,8 @@ fn folder_path_of_id(tree: &Value, encoded: &str) -> Option<String> {
 
 /// The row whose id encodes to `encoded`.
 ///
-/// Encoding the fixtures forwards rather than decoding the request: the accessor's own
-/// encoder is the definition of what an id becomes on the wire, so a mock that compares
-/// against it cannot disagree with the thing under test about what was asked for. A
-/// second, hand-written decoder here could.
+/// Encodes fixture ids with the accessor's own encoder instead of decoding the request, so
+/// the mock cannot disagree with the code under test about the wire form.
 fn find_item_by_id(tree: &Value, encoded: &str) -> Option<Value> {
     tree.as_object()?
         .values()

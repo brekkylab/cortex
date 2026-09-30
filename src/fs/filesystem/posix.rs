@@ -29,11 +29,7 @@ use crate::{
 ///   backend (`O_CREAT|O_EXCL`) or object store (`If-None-Match: *`) the atomic form is the
 ///   only one.
 /// * `truncate` must take effect before anything observes the file, so returned metadata
-///   already shows it empty. [`FileSystem::truncate`] is the
-///   separate, non-atomic resize.
-///
-/// [`validate`](Self::validate) rejects neither `read` nor `write`; `O_RDONLY | O_CREAT` is
-/// ordinary POSIX and stays legal.
+///   already shows it empty; [`FileSystem::truncate`] is the separate, non-atomic resize.
 ///
 /// There is deliberately no `append`: a kernel resolves `O_APPEND` itself and sends the
 /// absolute end offset, and the flag would oblige every store to find-the-end-and-write
@@ -49,10 +45,7 @@ pub struct OpenOptions {
     pub truncate: bool,
     /// Create the file if it is absent. The parent directory is never created.
     pub create: bool,
-    /// Create the file, failing with [`AlreadyExists`] if it is already there.
-    ///
-    /// Meaningless without `create`, as `O_EXCL` without `O_CREAT`: read only once `create`
-    /// decided to create, to make it exclusive.
+    /// Fail with [`AlreadyExists`] if the file is there; honoured only with `create`, as `O_EXCL`.
     ///
     /// [`AlreadyExists`]: io::ErrorKind::AlreadyExists
     pub create_new: bool,
@@ -164,8 +157,7 @@ fn bad_handle() -> io::Error {
 
 /// A store, in the terms a kernel speaks: inode numbers and file handles.
 ///
-/// "Posix" names the vocabulary, not an interface; nothing here is shaped by a binding, which
-/// only drives it. A path-addressed consumer (e.g. HTTP) uses the [`FileSystem`] directly.
+/// A path-addressed consumer (e.g. HTTP) uses the [`FileSystem`] directly.
 ///
 /// The store answers only about names and bytes, so everything an open means lives here, where
 /// no store names it:
@@ -598,11 +590,8 @@ impl<T: FileSystem> Posix<T> {
 
     /// Move `name` under `from_parent` to `to_name` under `to_parent`.
     ///
-    /// The table is rewritten only after the store agrees; an eager rekey would strand numbers
-    /// on paths that never changed. It is *rekeyed*, not evicted: the kernel keeps quoting the
-    /// inode, so dropping the mapping would make its next `getattr` `ESTALE`.
-    ///
-    /// Open handles follow, since they resolve to an inode whose path moves.
+    /// The table is rekeyed only after the store agrees; an eager rekey would strand numbers on
+    /// paths that never changed.
     pub(in crate::fs) async fn rename_child(
         &self,
         from_parent: u64,
@@ -667,9 +656,6 @@ impl<T: FileSystem> Posix<T> {
     /// The entries a `readdir` of `inode` should stream, in order: `.`, `..`, then the
     /// store's children, each already assigned the inode number a later `lookup` will
     /// return.
-    ///
-    /// Offsets are 1-based positions in this vector; the kernel resumes by quoting the last one
-    /// consumed.
     ///
     /// `..` reuses this directory's inode: traversal goes through `lookup`, so the real parent
     /// buys nothing.
@@ -736,9 +722,6 @@ impl<T: FileSystem> Posix<T> {
     }
 
     /// The path and options behind an `fh`, or [`bad_handle`] if it is closed.
-    ///
-    /// Resolved through the *inode*, never a path recorded at open, so an open follows its file
-    /// through a rename.
     fn open_of(&self, fh: u64) -> io::Result<(PathBuf, OpenOptions)> {
         let open = lock(&self.opens).get(fh).ok_or_else(bad_handle)?;
         Ok((self.path_of(open.inode)?, open.options))

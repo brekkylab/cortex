@@ -1,16 +1,9 @@
-//! A Graph API that this repository does not write, driven through [`OnedriveFs::new`].
+//! Live check against real Microsoft Graph, driven through [`OnedriveFs::new`].
 //!
-//! Every other onedrive test is pure or answers from a loopback mock in `onedrive_tests.rs`, which
-//! answers *what did we ask for*. A mock encodes our understanding of the API, so it agrees
-//! with us by construction and stays green when the API moves; this suite asks **whether
-//! what we ask for is what Graph answers.**
-//!
-//! No stand-in follows Microsoft Graph, so this drives the real service against a real
-//! account: it needs credentials and a network, and it is the only thing here that can
-//! notice Graph moving.
-//!
-//! Not covered: what we asked for (request counts, each `Range` header), which no server
-//! reports back and which stays with the loopback mock, which counts.
+//! The loopback mock in `onedrive_tests.rs` encodes our understanding of the API, so it
+//! agrees with us by construction and stays green when the API moves; this suite checks
+//! **whether what we ask for is what Graph answers.** It needs credentials and a network.
+//! Request counts and `Range` headers stay with the mock, since no server reports them back.
 //!
 //!     set -a; . ./.env; set +a
 //!     cargo test -p cortex --features onedrive onedrive_endpoint -- --ignored --nocapture
@@ -26,10 +19,6 @@ use cortex::fs::{DirentKind, FileSystem, OnedriveConfig, OnedriveFs};
 const WALK_ENTRIES: usize = 10;
 
 /// The credentials, or `None` when this host has none.
-///
-/// `client_secret` is optional because a personal-account app registration is normally a
-/// public client, which has none. Absent here means absent from the token form too, which
-/// is a shape of the registration rather than a failure.
 fn config() -> Option<OnedriveConfig> {
     Some(OnedriveConfig {
         client_id: std::env::var("ONEDRIVE_CLIENT_ID").ok()?,
@@ -45,8 +34,7 @@ fn config() -> Option<OnedriveConfig> {
 /// download URL the way the *response* spells it is accepted and omits the field from every
 /// row, so a read fails outright with "has no download url".
 ///
-/// Skipped, not failed, when the credentials are absent: this needs an account, and a suite
-/// that has none should stay green.
+/// Skipped, not failed, without credentials.
 #[tokio::test]
 #[ignore = "requires ONEDRIVE_* env + network"]
 async fn onedrive_endpoint_tree_and_reads() {

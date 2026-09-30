@@ -72,10 +72,8 @@ fn fetch_roster() -> Option<Vec<Principal>> {
     )
 }
 
-/// Pull one string field out of a JSON fragment, or the first string when `field` is
-/// empty (the value the fragment was split on).
-///
-/// A scan rather than a JSON parse: the fields wanted are flat and unambiguous.
+/// Pull one string field out of a flat JSON fragment by scanning, or the first string when
+/// `field` is empty (the value the fragment was split on).
 fn json_string(body: &str, field: &str) -> Option<String> {
     let after_field = if field.is_empty() {
         body

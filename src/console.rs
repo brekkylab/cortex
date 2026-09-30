@@ -29,6 +29,12 @@ pub(crate) type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Clien
 /// Assembles a [`ConsoleClient`] from the parts it needs.
 ///
 /// Every part is optional. Nothing starts until [`build`](Self::build).
+///
+/// The machine's shape ([`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib),
+/// [`gpu`](Self::gpu), [`gpu_memory_mib`](Self::gpu_memory_mib), [`disk_gib`](Self::disk_gib))
+/// is given exactly or refused: one the server cannot give fails [`build`](Self::build) with
+/// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE), never a smaller
+/// machine or the CPU. Left out, the server picks.
 pub struct ConsoleClientBuilder {
     /// A factory, not a client, because starting a program can fail; deferring that to
     /// [`build`](Self::build) keeps every setter infallible.
@@ -116,8 +122,7 @@ impl ConsoleClientBuilder {
     /// [`Mount`]); pass an `Arc<..>` to share it. A plain [`PathBuf`] is a [`Mount`] for an
     /// existing host directory, with nothing to put up or take down.
     ///
-    /// **Call once per tree; order is kept**, so a tree nested inside another is named
-    /// after it.
+    /// **Order is kept**: mount a nested tree after the tree containing it.
     ///
     /// Writable; see [`mount_readonly`](Self::mount_readonly).
     pub fn mount(mut self, mount: impl Mount + 'static, at: impl Into<PathBuf>) -> Self {
@@ -133,8 +138,6 @@ impl ConsoleClientBuilder {
     ///
     /// Otherwise as [`mount`](Self::mount). A [`write`](ConsoleClient::write) under it is
     /// refused, and a VM backend mounts it read-only so commands cannot write there either.
-    ///
-    /// Suits a project to hand over unchanged, with a separate writable tree for output.
     pub fn mount_readonly(mut self, mount: impl Mount + 'static, at: impl Into<PathBuf>) -> Self {
         self.mounts.push(Mounted {
             mount: Box::new(mount),
@@ -193,10 +196,6 @@ impl ConsoleClientBuilder {
     }
 
     /// How many vCPUs the session's machine gets.
-    ///
-    /// Left out, the server picks. A count it cannot give fails [`build`](Self::build) with
-    /// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE), never a smaller
-    /// machine.
     pub fn vcpus(mut self, vcpus: u8) -> Self {
         self.vcpus = Some(vcpus);
         self
@@ -219,13 +218,7 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// Whether the session's commands get a GPU.
-    ///
-    /// **The server gives one or refuses** with
-    /// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE), rather than
-    /// silently running on the CPU.
-    ///
-    /// `false` forbids a GPU; leaving it out lets the server choose.
+    /// Whether the session's commands get a GPU; `false` forbids one.
     pub fn gpu(mut self, gpu: bool) -> Self {
         self.gpu = Some(gpu);
         self
@@ -235,9 +228,7 @@ impl ConsoleClientBuilder {
     /// [`memory_mib`](Self::memory_mib).
     ///
     /// Commands see a device of this size. Only valid with a GPU (see
-    /// [`InitCall::gpu_memory_mib`](crate::console::InitCall::gpu_memory_mib)); a size the
-    /// server cannot give fails [`build`](Self::build) with
-    /// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE).
+    /// [`InitCall::gpu_memory_mib`](crate::console::InitCall::gpu_memory_mib)).
     ///
     /// ```no_run
     /// # use cortex::console::ConsoleClient;
@@ -257,9 +248,7 @@ impl ConsoleClientBuilder {
     /// How much the session's commands may write, in GiB, on top of what the image ships.
     ///
     /// A ceiling, not an allocation (see
-    /// [`InitCall::disk_gib`](crate::console::InitCall::disk_gib)); a size the server cannot
-    /// give fails [`build`](Self::build) with
-    /// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE).
+    /// [`InitCall::disk_gib`](crate::console::InitCall::disk_gib)).
     ///
     /// ```no_run
     /// # use cortex::console::ConsoleClient;
@@ -275,8 +264,7 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// Opens the channel (starting the server process over stdio) and sends `init`; fails
-    /// if either fails.
+    /// Opens the channel (starting the server process over stdio) and sends `init`.
     ///
     /// Panics outside a Tokio runtime when it starts a process (the default, or
     /// [`cmd`](Self::cmd)), since the runtime reaps the child.
@@ -293,11 +281,7 @@ struct Tree {
     #[allow(dead_code)]
     mount: Box<dyn Mount>,
 
-    /// Where the session sees it, as `init` named it; what [`read`](ConsoleClient::read) and
-    /// [`write`](ConsoleClient::write) paths are spelled under. Not necessarily the host mount
-    /// point: a guest may see the tree at a path this host does not have.
-    ///
-    /// The current directory is not tracked here; the server keeps it, and `pwd` asks.
+    /// Where the session sees it, as `init` named it; not necessarily the host mount point.
     path: PathBuf,
 }
 
@@ -317,18 +301,13 @@ struct Tree {
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
-/// // Starts the server and sends `init`; nothing is booted until the first command
-/// // (or a `start`).
+/// // Starts the server and sends `init`; nothing boots yet.
 /// let mut console = ConsoleClient::builder()
 ///     .build()
 ///     .await?;
 ///
-/// // `None`: no time limit. `Some(ms)` sets one.
 /// let result = console.exec(["sh", "-c", "echo hi"], None).await?;
 /// assert_eq!(result.stdout, b"hi\n");
-///
-/// // Dropping the console sends `quit`; the server releases what it booted and exits,
-/// // so no `stop` is owed.
 /// # Ok(())
 /// # }
 /// ```
@@ -490,7 +469,7 @@ impl ConsoleClient {
     /// The path is under one of [`mounts`](Self::mounts), as for [`read`](Self::read).
     ///
     /// `None` makes the file exactly `data` (created or truncated); `Some(0)` writes the
-    /// same bytes but keeps whatever lay past them. To replace a file, send `None`.
+    /// same bytes but keeps whatever lay past them.
     pub async fn write(
         &mut self,
         path: impl AsRef<str>,
@@ -514,21 +493,10 @@ impl Drop for ConsoleClient {
     /// Owed exactly once, when the console goes away, so it is a `Drop` rather than a
     /// method to remember.
     ///
-    /// # Why the client is swapped rather than taken
-    ///
-    /// `quit` must be awaited on a task, which needs to own the client, and a field cannot
-    /// be moved out of a type with a destructor. Swapping in a client that answers nothing
-    /// keeps the field a plain `Box` instead of an `Option` every method must check.
-    ///
-    /// Off a runtime, or if the task is never polled, the client is dropped without the
-    /// message; over stdio the server still sees its input close and exits.
-    ///
-    /// # Why the mounts go with the task
-    ///
-    /// The server serves them until it hears the ending (a guest's virtio-fs share holds
-    /// files open), and a binding's guard unmounts then waits for every holder. Dropped here,
-    /// before `quit`, that wait would block the thread the task runs on; on a current-thread
-    /// runtime it deadlocks. So `hang_up` drops them after the client.
+    /// The mounts go after the client: the server serves them until it hears the ending (a
+    /// guest's virtio-fs share holds files open), and a binding's guard unmounts then waits
+    /// for every holder, which dropped here would block the task's thread, deadlocking a
+    /// current-thread runtime.
     fn drop(&mut self) {
         hang_up(&mut self.client, std::mem::take(&mut self.mounts));
     }
@@ -555,12 +523,11 @@ pub(crate) fn stdio_factory(cmd: &[impl AsRef<OsStr>]) -> ClientFactory {
 /// Say `quit` on a task, leaving a client behind that answers nothing, and drop `keep`
 /// only after the client.
 ///
-/// Swapping (not taking) lets a type with a destructor hand its client to a task. Off a
-/// runtime, nothing is spawned and the client is dropped, closing the server's input.
+/// Swapping (not taking) lets a type with a destructor hand its client to a task, and keeps
+/// the field a plain `Box` rather than an `Option` every method must check. Off a runtime,
+/// or if the task never runs, the client is dropped without `quit`, closing the server's input.
 ///
-/// `keep` is what the server may still be using (a console's mounts). It is dropped after
-/// the client either way: once `quit` is answered, or, if the task never runs, right
-/// behind the client.
+/// `keep` is what the server may still be using (a console's mounts).
 pub(crate) fn hang_up<K: Send + 'static>(client: &mut Box<dyn Client>, keep: K) {
     /// Stands in once the session has ended.
     struct Spent;
@@ -597,9 +564,6 @@ struct Mounted {
 }
 
 /// A mount this end holds, as the spec string the server is told to realize.
-///
-/// Fails locally, without a round trip, if the mount point has no URL or the guest path
-/// is not a valid spec path.
 fn named(mounted: &Mounted) -> anyhow::Result<MountSpec> {
     let url = mounted.mount.url().with_context(|| {
         format!(

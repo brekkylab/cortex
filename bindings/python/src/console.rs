@@ -69,10 +69,8 @@ impl PyNetworkAccess {
     }
 }
 
-/// A [`ConsoleClientBuilder`], filled in place and emptied by `build()`.
-///
-/// Mutated in place because the Rust builder is consumed by each call and is not `Clone`.
-/// Every method returns this same object, so calls chain.
+/// A [`ConsoleClientBuilder`], mutated in place (the Rust one is consumed per call and is not
+/// `Clone`) and emptied by `build()`; every method returns this same object, so calls chain.
 // The `Mutex` only supplies `Sync`, which a `pyclass` needs and the builder's client factory
 // lacks; nothing contends for it.
 #[pyclass(name = "ConsoleClientBuilder", module = "cortex")]
@@ -168,10 +166,8 @@ fn held(slot: &mut Option<ConsoleClient>) -> PyResult<&mut ConsoleClient> {
         .ok_or_else(|| CortexError::new_err("this console has been closed"))
 }
 
-/// A console slot: the console, or nothing once it has been closed.
-///
-/// Plain because that is how an agent holds its console (ailoy's `AgentState::console`), so
-/// [`PyConsoleClient::slot`] can be handed to one.
+/// A console slot: the console, or `None` once closed. A plain type, so an agent can hold
+/// [`PyConsoleClient::slot`] as its console.
 pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 
 #[pyclass(name = "ConsoleClient", module = "cortex", frozen)]

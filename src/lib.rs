@@ -89,9 +89,8 @@ pub use ensure::ensure_cortex;
 /// Everything cortex keeps on this host, under one root: `$CORTEX_HOME`, or
 /// `cortex` under the user's cache directory.
 ///
-/// **One root for everything kept here**, so a host has a single answer to "where does this
-/// go". Contents are split by owner as paths under it, not separate roots; this crate keeps
-/// only `bin/`, where the console server lives.
+/// One root, so a host has a single answer to "where does this go": contents are split by
+/// owner as paths under it. This crate keeps only `bin/`, where the console server lives.
 ///
 /// The user's cache directory is `XDG_CACHE_HOME` or `~/.cache`, on macOS
 /// `~/Library/Caches`, and on Windows `%LOCALAPPDATA%`, falling back to

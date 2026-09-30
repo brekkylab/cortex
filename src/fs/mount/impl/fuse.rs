@@ -42,8 +42,7 @@ const FSNAME: &str = "cortex";
 /// The binding for every unix but macOS. `fuser` speaks the kernel FUSE protocol over the
 /// mount fd itself and opens `/dev/fuse`.
 ///
-/// Not generic in the store: `fuser`'s session owns the filesystem, so there is no raw
-/// pointer whose target something else must keep alive.
+/// Not generic in the store: `fuser`'s session owns the filesystem.
 pub struct FuseMount {
     /// `Option` because both of `fuser`'s exits consume the session and `Drop` has only
     /// `&mut self`. `None` once [`join`](Self::join) or `Drop` took it.
@@ -51,10 +50,9 @@ pub struct FuseMount {
 
     mountpoint: PathBuf,
 
-    /// This process's ownership of the mount point, read by
-    /// [`unmount_on_signal`](crate::fs::unmount_on_signal) and, if this process is killed, a
-    /// later run's [`reclaim_abandoned`](crate::fs::reclaim_abandoned). Dropping it gives the
-    /// mount point up.
+    /// Names the mount point to [`unmount_on_signal`](crate::fs::unmount_on_signal) and, if
+    /// this process is killed, to a later run's
+    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned).
     _claim: Claim,
 }
 
@@ -96,9 +94,7 @@ impl FuseMount {
         })
     }
 
-    /// Serve until the mount goes away.
-    ///
-    /// Waits for something else to end the mount (`umount`, `fusermount -u`, or the kernel
+    /// Serve until something else ends the mount (`umount`, `fusermount -u`, or the kernel
     /// dropping the connection). **It does not unmount**; to end the mount, drop the guard.
     ///
     /// `Err` if the serving thread failed or panicked.
@@ -257,8 +253,7 @@ impl<T: FileSystem + 'static> Filesystem for Posix<T> {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        // The cursor protocol is the shared operation's; this closure only encodes. `add`
-        // returning true is the `stop` flag.
+        // `add` returning true (buffer full) is the `stop` flag.
         let streamed =
             super::block_on(
                 self.for_each_dirent(ino.0, offset, |child_inode, child, cursor| {
@@ -392,8 +387,8 @@ impl<T: FileSystem + 'static> Filesystem for Posix<T> {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are outside the shared contract (libfuse-t's
-        // `rename` takes no flags). EINVAL is Linux's answer for an unimplemented rename flag.
+        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are outside the shared contract; EINVAL is
+        // Linux's answer for an unimplemented rename flag.
         if !flags.is_empty() {
             reply.error(Errno::from_i32(libc::EINVAL));
             return;
@@ -423,8 +418,7 @@ impl<T: FileSystem + 'static> Filesystem for Posix<T> {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // `fuser` has decoded the validity mask into these `Option`s. Any file handle is
-        // ignored: the inode already names the path to resize.
+        // Any file handle is ignored: the inode already names the path to resize.
         let want = SetAttr {
             size,
             mode,

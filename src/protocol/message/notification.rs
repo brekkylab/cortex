@@ -59,10 +59,9 @@ impl Notification {
 
 /// Boot now, so that no command has to. The `params` of `start`, which are none.
 ///
-/// Hides the cold start: [`ExecCall`](super::ExecCall), [`ReadCall`](super::ReadCall),
-/// [`WriteCall`](super::WriteCall) and [`SnapshotCall`](super::SnapshotCall) boot on
-/// demand, so this only lets the boot overlap with the client's other work instead of the
-/// first command's latency.
+/// Hides the cold start: every call that needs a booted session boots on demand, so this
+/// only lets the boot overlap with the client's other work instead of the first command's
+/// latency.
 ///
 /// Unanswered because a failed boot and a not-yet-attempted one are the same session: the
 /// next call that needs a boot retries and gets [`BOOT_FAILED`](super::Error::BOOT_FAILED).

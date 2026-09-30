@@ -151,8 +151,7 @@ fn watch(read: libc::c_int) -> ! {
             unsafe { libc::sigaction(*signal, &disposition.0, std::ptr::null_mut()) };
         }
     }
-    // SAFETY: no arguments to get wrong, and the disposition is now the
-    // program's own.
+    // SAFETY: the disposition is now the program's own.
     unsafe { libc::raise(signal) };
 
     // Reached only if the restored disposition does not end the process (ignored, or a

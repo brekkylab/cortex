@@ -492,20 +492,16 @@ pub struct FuseTMount {
     /// `dyn Send + Sync`, not `dyn Any`, so it does not advertise a downcast.
     _fs: Option<Box<dyn Send + Sync>>,
 
-    /// This process's ownership of the mount point, read by
-    /// [`unmount_on_signal`](crate::fs::unmount_on_signal) and, if this process is killed, a
-    /// later run's [`reclaim_abandoned`]. Dropping it gives the
-    /// mount point up.
+    /// Names the mount point to [`unmount_on_signal`](crate::fs::unmount_on_signal) and, if
+    /// this process is killed, to a later run's [`reclaim_abandoned`].
     _claim: Claim,
 }
 
 impl FuseTMount {
-    /// Mount `fs` at `mountpoint`, serve it from a background thread, and return once the
-    /// mount is real.
+    /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
     /// `mountpoint` must already exist and be empty. Requires FUSE-T
-    /// (`brew install --cask fuse-t`) — no kernel extension, no reboot (macFUSE is a kext
-    /// needing reduced-security boot on Apple Silicon).
+    /// (`brew install --cask fuse-t`).
     ///
     /// **Blocks until the mount is real.** `fuse_mount` returns early, but the kernel
     /// attaches it only after the serving thread answers the helper's opening
@@ -513,7 +509,6 @@ impl FuseTMount {
     /// block on a half-built mount.
     ///
     /// The transport comes from `fuse-t.ini`; [`try_new_with`](Self::try_new_with) names one.
-    ///
     /// `'static` because the store is served from that thread for the mount's lifetime.
     pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
         Self::mount(fs, mountpoint, std::ptr::null())
@@ -595,9 +590,7 @@ impl FuseTMount {
         Ok(mount)
     }
 
-    /// Serve until the mount goes away.
-    ///
-    /// Waits for something else to end the mount (`umount`, `diskutil unmount`, or the helper
+    /// Serve until something else ends the mount (`umount`, `diskutil unmount`, or the helper
     /// dying). **It does not unmount**; to end the mount, drop the guard.
     ///
     /// `Err` if the serving loop ended badly or its thread panicked. (A panic in an
@@ -674,16 +667,13 @@ impl Drop for FuseTMount {
     ///
     /// # Why not `fuse_unmount`
     ///
-    /// It breaks with two mounts in one process. libfuse-t keeps the helper's pid in one global
-    /// (`_cpid`, set by `fuse_mount_core` after `fork`, overwritten by every mount), and
-    /// `fuse_kern_unmount` ends in a blocking `waitpid` on it: an unmount waits on the last
-    /// mounted helper, which will not exit until its own mount goes, so `drop(a); drop(b)`
-    /// hangs in `wait4`. `_mount_wait_thread` is a single global too. So unmounting is a
-    /// bounded `umount` in a child process, which needs no libfuse-t global; the rest is
-    /// per-session: the shim ends the loop, this joins its thread, the shim frees the session.
+    /// It breaks with two mounts in one process: libfuse-t keeps the helper's pid in one global
+    /// (`_cpid`, overwritten by every mount) and `fuse_kern_unmount` blocks in `waitpid` on it,
+    /// so `drop(a)` waits on `b`'s helper, which will not exit until its own mount goes. So
+    /// unmounting is a bounded `umount` in a child process; the rest is per-session: the shim
+    /// ends the loop, this joins its thread, the shim frees the session.
     ///
-    /// Every step is bounded, so a mount that refuses both attempts leaves this returning
-    /// anyway after reporting on stderr, rather than a destructor that never returns.
+    /// Every step is bounded; a mount refusing both attempts is reported on stderr.
     ///
     /// Never panics: a panic mid-unwind aborts, hiding a failing test's real assertion.
     fn drop(&mut self) {

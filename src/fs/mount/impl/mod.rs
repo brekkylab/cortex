@@ -8,9 +8,6 @@
 //! `Drop` takes it down, plus its mount options; vtables, callbacks and session handles stay
 //! private.
 
-// One binding per target, all behind `mount`: which interface a host mounts through is
-// decided by its OS, so a build never has two to choose between.
-// A binding is partly a trait impl, so declaring its module pulls it in.
 #[cfg(all(feature = "mount", windows))]
 mod dokan;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]

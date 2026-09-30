@@ -27,16 +27,14 @@ const MAX_LINK_HOPS: u32 = 32;
 ///
 /// Folding `..` confines nothing on its own, since a symlink inside the root can point out of
 /// it. So for operations that follow a link (`stat`, `list`, the data plane), a path through
-/// one is resolved and must land under the root. Links are *read* rather than followed: a link
-/// out of the root cannot be traversed, and one naming something not created yet is served.
+/// one is resolved and must land under the root, even a link to something not created yet.
 ///
 /// `create`, `mkdir`, `unlink`, `rmdir` and `rename` act on a name and never touch what it
 /// points at, so only the directory holding the name is checked; a link out of the root is
 /// still listed and removable.
 ///
 /// Lexical `..` departs from the kernel behind a directory link: `dirlink/..` returns to the
-/// link's own parent, not the target's. So `RESOLVE_BENEATH` matches the *escape* policy here
-/// but not the `..` handling, since that flag resolves in full before judging where it landed.
+/// link's own parent, not the target's.
 ///
 /// The check and the operation are separate calls, so a link swapped between them is not
 /// caught. No binding implements `symlink`, so only another process on the same tree could.
@@ -134,8 +132,8 @@ impl PassthroughFs {
         Ok(resolved)
     }
 
-    /// Fold a request onto `root`: `.` dropped, `..` applied, an OS prefix or a climb past the
-    /// root refused. Containment is left to callers, which check different things.
+    /// Fold a request onto `root` lexically; containment is left to callers, which check
+    /// different things.
     ///
     /// Lexical because a mount table routes on a normalized key and hands a store the folded
     /// remainder, and [`Posix`](crate::fs::Posix) never sends `..` (the kernel folds it against
@@ -158,8 +156,7 @@ impl PassthroughFs {
                     folded.through_a_link =
                         folded.through_a_link || fs::read_link(&folded.real).is_ok();
                 }
-                // Folded, not refused: `a/b/../c` names something in the root, the same fold
-                // a mount table applies a layer up. Only a climb past the root is refused.
+                // `a/b/../c` names something in the root; only a climb past it is refused.
                 Component::ParentDir => {
                     if folded.depth == 0 {
                         return Err(io::ErrorKind::InvalidFilename.into());
@@ -187,10 +184,8 @@ impl PassthroughFs {
         Ok(folded.real)
     }
 
-    /// Map a request path under `root` for operations on a *name* rather than what it points
-    /// at: `create`, `mkdir`, `unlink`, `rmdir`, `rename`. Their `std::fs` calls never follow a
-    /// trailing link, so containment covers only the parent, which keeps a link out of the
-    /// root removable.
+    /// Map a request path under `root` for operations on a *name*; their `std::fs` calls never
+    /// follow a trailing link, so only the parent is checked.
     fn entry_path(&self, path: &Path) -> io::Result<PathBuf> {
         let folded = self.fold(path)?;
         // `depth > 1`: one component down, the parent *is* the root, contained by definition
@@ -268,9 +263,8 @@ impl FileSystem for PassthroughFs {
                 // pay to ask the target.
                 let file_type = entry.file_type()?;
                 let kind = if file_type.is_symlink() {
-                    // Only a target inside the root is described; one outside, or a dangling
-                    // link, is `File` since `DirentKind` has no `Symlink`. Still listed:
-                    // `unlink` can remove it, so omitting it would be wrong.
+                    // A target outside the root, or a dangling link, lists as `File`
+                    // (`DirentKind` has no `Symlink`); still listed so `unlink` can reach it.
                     match self.resolve_within_root(&entry.path()) {
                         Ok(target) if fs::metadata(&target).is_ok_and(|meta| meta.is_dir()) => {
                             DirentKind::Dir
@@ -358,11 +352,8 @@ impl FileSystem for PassthroughFs {
         Box::pin(async move { self.open(path, true)?.set_len(size) })
     }
 
-    /// The overwrite contract and its errors are the kernel's, so nothing here can disagree
-    /// with the platform. On macOS `fs::rename` gives `EISDIR` for file-over-directory,
-    /// `ENOTDIR` for the reverse, `ENOTEMPTY` for a non-empty destination, `EINVAL` for a
-    /// directory into its own descendant, `ENOENT` for a missing source or destination parent,
-    /// and silently replaces file-over-file.
+    /// The overwrite contract and its errors are the kernel's `rename(2)`, so nothing here can
+    /// disagree with the platform.
     fn rename<'a>(&'a self, from: &'a Path, to: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move { fs::rename(self.entry_path(from)?, self.entry_path(to)?) })
     }

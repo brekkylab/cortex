@@ -14,30 +14,18 @@ use crate::{
     fs::filesystem::{Dirent, DirentKind, FileSystem, Stat},
 };
 
-/// Per-directory listing TTL.
+/// Per-directory listing TTL, shared by the spans held under it.
 ///
-/// One number for the listing and for the span held under it, deliberately. Two would mean
-/// a window in which `ls` answers from one snapshot while a read of the same file answers
-/// from another — and everything a `stat` reports (size, mtime, etag) comes off the parent
-/// listing, so the two are describing the same snapshot or they are lying about one.
-///
-/// This is what bounds how stale the tree can be. A network filesystem always has such a
-/// number: macOS's own NFS client caches attributes (`acregmin`/`acregmax`) and serves them
-/// while the server moves on. This one is longer because a listing here costs a round trip
-/// rather than a LAN hop.
+/// One number for both: `stat` (size, mtime, etag) comes off the parent listing, so a read
+/// must not answer from a different snapshot than `ls`. It bounds how stale the tree can
+/// be; minutes, since a listing costs a round trip.
 const DIR_TTL: Duration = Duration::from_secs(300);
 
-/// How much a read fetches once it is clear the reader is walking the file *and* nothing
-/// else is being walked, so a lone walk pays a round trip per span of this size rather
-/// than one per window.
+/// Span a read fetches once the reader is walking the file *and* walks alone.
 ///
-/// The kernel's window is 64 KiB (32 KiB through FUSE-T) and not ours to choose; one ranged
-/// request per window leaves a large read crawling at round-trip speed.
-///
-/// It is a ceiling rather than the size every walk gets: [`HELD_BUDGET`] is divided among
-/// whatever is being walked, and this is what a lone reader's share comes to. Shrinking it
-/// instead of dividing it would multiply every large read's round trips, each a sizable
-/// fraction of a second to the download host.
+/// The kernel window is 64 KiB (32 KiB via FUSE-T); one ranged request per window leaves a
+/// large read crawling at round-trip speed. A ceiling, not the size every walk gets:
+/// concurrent walks divide [`HELD_BUDGET`].
 const READ_SPAN: u64 = 64 * 1024 * 1024;
 
 /// How much a *first* read fetches, before anything says the reader is walking.
@@ -98,27 +86,19 @@ struct HeldSpan {
 /// One resolved entry, as the mount means it.
 #[derive(Clone)]
 struct Child {
-    /// The item's own id, which is how anything asked of the service *after* the listing
-    /// addresses it. Opaque ASCII the service minted, so unlike a path it has one
-    /// spelling and it survives a rename. See
-    /// [`get_item_by_id`](OnedriveAccessor::get_item_by_id).
+    /// Service-minted id, used for every request after the listing.
     id: String,
     /// Listing name: the item's own name, sanitized into a single path segment.
     name: String,
     is_dir: bool,
-    /// Exact, for every file: nothing has to be produced to learn it, so nothing has to
-    /// stand in for it.
     size: u64,
     mtime: Option<SystemTime>,
     created: Option<SystemTime>,
     /// `cTag` where there is one, else `eTag`. The content tag is the one a revalidating
     /// reader wants; a folder has no `cTag` at all.
     etag: Option<String>,
-    /// A preauthenticated URL for the bytes, as the listing returned it.
-    ///
-    /// Held only as long as the listing that carried it. Microsoft calls it short-lived
-    /// and says outright that it "can't be cached"; an expired one answers 4xx, which
-    /// [`OnedriveFs::span`] turns into exactly one refetch.
+    /// Preauthenticated URL from the listing, held only as long as it; an expired one is
+    /// refetched once in [`OnedriveFs::span`].
     download_url: Option<String>,
 }
 
@@ -149,10 +129,6 @@ pub struct OnedriveFs {
     /// With one slot each read finds the other file's span there, no read ever counts as a
     /// walk, and every window pays a whole [`FIRST_SPAN`].
     ///
-    /// A single tool rarely interleaves on a network store: read-ahead overlaps files only
-    /// when it can outrun the reader, and a miss of about a second never lets it. So a trace
-    /// replayed from a fast local store does not describe this one.
-    ///
     /// Bounded by *bytes* rather than count, so the ceiling is divided rather than owned by
     /// whoever fetched last, and each span is sized to that division so nothing has to be
     /// evicted for a new span to fit. See [`READ_SPAN`] and [`ACTIVE`].
@@ -174,8 +150,8 @@ impl OnedriveFs {
     /// request into a whole `DIR_TTL` of an empty directory, which reads as "the folder is
     /// gone" rather than "ask again".
     ///
-    /// This is the one call left that addresses the service by a path, and a path has two
-    /// Unicode spellings. See the fallback below.
+    /// Addresses by path, which has two Unicode spellings; a 404 falls back to
+    /// [`list_unspellable`](Self::list_unspellable).
     async fn list_dir(&self, folder: &str) -> io::Result<Arc<Vec<Child>>> {
         {
             let cache = self.dir_cache.lock().await;
@@ -205,27 +181,22 @@ impl OnedriveFs {
 
     /// The folder a path names when the path, as spelled, names nothing.
     ///
-    /// The service answers to the spelling it stored and 404s every other one, and macOS
-    /// hands a lookup the decomposed spelling of whatever the listing printed.
-    /// So after the path as given, two things are tried, cheapest first.
+    /// The service 404s every spelling but the one it stored, and macOS hands a lookup the
+    /// decomposed form of what the listing printed. Tried after the path as given, cheapest
+    /// first:
     ///
-    /// **Composed.** One request, and it answers the ordinary case: a macOS reader asking
-    /// for a folder the service stored composed. The path as given goes first because the
-    /// two spellings can name two different sibling folders, and only that order returns
-    /// the one the caller's bytes meant.
+    /// **Composed.** One request, covering the usual case. The path as given goes first
+    /// because the two spellings can name two different sibling folders.
     ///
-    /// **Then segment by segment.** A whole-path spelling is all-composed or
-    /// all-decomposed, and a tree touched by two clients can be neither: a folder made on
-    /// the web under a child made by the macOS sync client is composed then decomposed.
-    /// Such a path would `stat` (since [`resolve`](Self::resolve) normalizes per segment)
-    /// while `list` says ENOENT. So the last resort resolves the folder through its
-    /// parent's listing, where `same_name` settles each segment on its own, and lists by
-    /// the id that comes back. Only a path that was going to fail pays for that, and the
-    /// parents are usually already cached because the kernel looked each one up on the way
-    /// down.
+    /// **Then segment by segment.** A tree touched by two clients can mix forms per segment
+    /// (web-made folder, macOS-synced child), which would `stat` (since
+    /// [`resolve`](Self::resolve) normalizes per segment) but `list` as ENOENT. So resolve
+    /// through the parent's listing, where `same_name` settles each segment, and list by
+    /// the id. Only a failing path pays, and parents are usually cached from the kernel's
+    /// lookups on the way down.
     ///
-    /// The recursion terminates at the root, which is addressed as `/me/drive/root` and
-    /// has no spelling to get wrong.
+    /// Recursion ends at the root, addressed as `/me/drive/root` with no spelling to get
+    /// wrong.
     async fn list_unspellable(
         &self,
         folder: &str,
@@ -413,9 +384,6 @@ impl OnedriveFs {
     /// Costs one request and does not disturb the listing: the rest of that snapshot is
     /// still good, and re-listing the folder to refresh one URL would throw away every
     /// other entry's.
-    ///
-    /// By the item's id and not by its path, because this runs in the middle of a read.
-    /// See [`get_item_by_id`](OnedriveAccessor::get_item_by_id).
     async fn fresh_download_url(&self, child: &Child) -> io::Result<String> {
         let item = self
             .accessor
@@ -468,10 +436,8 @@ impl OnedriveFs {
             return Ok(Vec::new());
         }
         let (at, bytes) = self.span(&child, path, r.start, want).await?;
-        // `at <= r.start` on both of `span`'s return paths: the hit branch carries it as
-        // a conjunct, and a fetch returns where the response said the bytes begin, which
-        // is `r.start` for a `206` and `0` for a whole file. So neither subtraction here
-        // goes backwards.
+        // `at <= r.start` on both `span` paths (a hit checks it; a fetch starts at `r.start`
+        // or 0), so neither subtraction goes backwards.
         let from = r.start.saturating_sub(at);
         Ok(slice(&bytes, Some(from..r.end.saturating_sub(at))))
     }
@@ -558,9 +524,6 @@ impl FileSystem for OnedriveFs {
             // Short is EOF and nothing else, which holds because a span never splits a
             // window: `span` fetches from where the read begins and at least as far as it
             // asks, so what comes back either covers the window or ran out of file.
-            //
-            // Nothing is padded: a driveItem states its length, so a read that comes up
-            // short has genuinely reached the end.
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
             Ok(n)
@@ -593,17 +556,10 @@ fn stat_of(c: &Child) -> Stat {
 
 /// One listing row into an entry, or `None` for a row this tree does not show.
 ///
-/// A **package** — a OneNote notebook is the one you meet — is dropped. Microsoft
-/// describes it as "a package instead of a folder or file", treated as a folder by some
-/// clients and a file by others; it has no bytes to read and no children this API will
-/// list. A name that cannot be read is worse than an absence, so it is not shown.
-///
-/// An item that is neither `file` nor `folder` is dropped for the same reason.
-///
-/// So is a row with no `id`, which is the same judgement one more time: an item that
-/// cannot be addressed after the listing is one whose read would fail the moment its
-/// download URL expired. Graph states an id on every driveItem and this code `$select`s
-/// it, so the case is a malformed row rather than a shape of the API.
+/// Dropped, since a name that cannot be read is worse than an absence: a **package** (e.g.
+/// a OneNote notebook, "a package instead of a folder or file", with no bytes to read and
+/// no listable children), any item that is neither `file` nor `folder`, and a row with no
+/// `id` (malformed; its read would fail once the download URL expired).
 fn child_from_item(v: &Value) -> Option<Child> {
     if v.get("package").is_some() {
         return None;
@@ -648,12 +604,8 @@ fn time_field(v: &Value, key: &str) -> Option<SystemTime> {
     (secs >= 0).then(|| std::time::UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
-/// An `anyhow` error from the accessor into an `io` one, keeping "not found" apart from
-/// everything else — a reader distinguishes them and a mount has to as well.
-///
-/// The distinction is what a caller acts on, and it only goes one way safely. `NotFound`
-/// on a path is a name that is gone, which a traversal skips; anything else is the backend
-/// failing, which it must not read as an absence. See [`is_not_found`].
+/// An accessor error into an `io` one, `NotFound` only for a real absence: a traversal
+/// skips a missing name, so a backend failure must never read as one. See [`is_not_found`].
 fn not_found_or_backend(e: anyhow::Error) -> io::Error {
     if is_not_found(&e) {
         io::Error::from(io::ErrorKind::NotFound)

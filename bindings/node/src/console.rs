@@ -23,9 +23,7 @@ use crate::{
 ///
 /// Not napi's `async fn` or `spawn_future`, which reject with a [`Status`](napi::Status) as the
 /// `code`: this runs `fut` to a plain `Result` and builds the JavaScript error back on the main
-/// thread, where one can be made. Work before the call is synchronous, so `build()` empties its
-/// builder at once rather than when the runtime polls the future. Public for bindings that link
-/// this crate.
+/// thread, where one can be made.
 pub fn promise<'env, T, F>(env: &'env Env, fut: F) -> napi::Result<PromiseRaw<'env, T>>
 where
     T: ToNapiValue + Send + 'static,
@@ -88,10 +86,8 @@ impl JsNetworkAccess {
     }
 }
 
-/// A [`ConsoleClientBuilder`], filled in place and emptied by `build()`.
-///
-/// Mutated in place because the Rust builder is consumed by each call and is not `Clone`.
-/// Every method returns this same object, so calls chain.
+/// A [`ConsoleClientBuilder`], mutated in place (the Rust one is consumed per call and is not
+/// `Clone`) and emptied by `build()`; every method returns this same object, so calls chain.
 #[napi(js_name = "ConsoleClientBuilder")]
 pub struct JsConsoleClientBuilder(Option<ConsoleClientBuilder>);
 
@@ -220,10 +216,8 @@ fn held(slot: &mut Option<ConsoleClient>) -> Result<&mut ConsoleClient> {
         .ok_or_else(|| napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed"))
 }
 
-/// A console slot: the console, or nothing once it has been closed.
-///
-/// Plain because that is how an agent holds its console (ailoy's `AgentState::console`), so
-/// [`JsConsoleClient::slot`] can be handed to one.
+/// A console slot: the console, or `None` once closed. A plain type, so an agent can hold
+/// [`JsConsoleClient::slot`] as its console.
 pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 
 #[napi(js_name = "ConsoleClient")]

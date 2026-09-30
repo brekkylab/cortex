@@ -16,11 +16,9 @@ use crate::image::ImageSource;
 /// to get it, the absolute path it appears at, and whether commands may write in it.
 ///
 /// **A tree's purpose is the client's and is not on the wire.** A project to read and an
-/// output directory differ only in URL, path and `ro`, which is all a server needs and all
-/// the protocol can hold it to; per-purpose members would cap sessions at the purposes
-/// enumerated here. The protocol settles only which tree is at which path and which accept
-/// writes. These are separate namespaces the client places itself, not stores composed
-/// under one root.
+/// output directory differ only in URL, path and `ro`; per-purpose members would cap
+/// sessions at the purposes enumerated here. Trees are separate namespaces the client
+/// places itself, not stores composed under one root.
 ///
 /// No tree is needed for scratch space: a session already stands on a writable filesystem
 /// that goes away with it. An empty list is a valid session that sees only the executor's
@@ -33,9 +31,9 @@ use crate::image::ImageSource;
 /// machine, which is made before the first command and outlives the last.
 ///
 /// **A server provides exactly what is named or refuses** with
-/// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE) at `init`, as with
-/// [`network`](Self::network). A silently smaller machine would leave the client inferring
-/// its shape from how long commands take.
+/// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE) at `init`: a
+/// silently smaller machine would leave the client inferring its shape from how long
+/// commands take.
 ///
 /// Each is separately optional; `None` (the common case) is the server's own default,
 /// since only it knows what its host has. `0` for any numeric member is
@@ -68,8 +66,6 @@ pub struct InitCall {
     pub vcpus: Option<u8>,
 
     /// Memory for the session's machine, in MiB. `None` leaves it to the server.
-    ///
-    /// The unit is in the name because `2048` alone could mean bytes, MiB or GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
 
@@ -109,13 +105,9 @@ pub struct InitCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_gib: Option<u32>,
 
-    /// The trees this session works in, each one named and placed by a [`MountSpec`].
-    ///
     /// **Ordered** to nest trees: mounts are realized in order, so `/work/out` after `/work`
     /// lands inside it, and not the other way round. Nothing else depends on order.
     ///
-    /// A scheme with no provider in this build is refused at `init` with
-    /// [`UNSUPPORTED_MOUNT`](crate::protocol::Error::UNSUPPORTED_MOUNT), naming the entry.
     /// Duplicate paths, or a path this server cannot use, are
     /// [`INVALID_PARAMS`](crate::protocol::Error::INVALID_PARAMS).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -147,8 +139,7 @@ pub struct InitCall {
 /// A URL, not a tagged object: the protocol only hands it to whatever realizes that kind,
 /// so the schema does not grow with providers. A peer that has never heard of a scheme
 /// still parses it and refuses it with
-/// [`UNSUPPORTED_MOUNT`](crate::protocol::Error::UNSUPPORTED_MOUNT), which is what `http`
-/// and `https` get everywhere today.
+/// [`UNSUPPORTED_MOUNT`](crate::protocol::Error::UNSUPPORTED_MOUNT).
 ///
 /// # The guest path is the client's to choose
 ///
@@ -361,8 +352,7 @@ impl std::error::Error for InvalidMount {}
 ///
 /// [`host_ports`](Self::host_ports) is a separate axis because **widening outside reach
 /// must not widen access to the server's own machine**: `public` does not grant local
-/// listeners, and a granted port does not grant the internet. `host` alone only resolves
-/// names; with ports it reaches services the operator placed there.
+/// listeners, and a granted port does not grant the internet.
 ///
 /// # Why an object
 ///
@@ -398,13 +388,9 @@ impl NetworkAccess {
     /// NetworkAccess::host().with_host_ports([8080]);
     /// ```
     ///
-    /// # Reaching one from inside
-    ///
-    /// `host.microsandbox.internal` resolves, inside the session, to the server's machine;
-    /// fetching it on 8080 reaches whatever listens on 8080 there.
-    ///
-    /// A name because the backend assigns the address per session. Resolving grants nothing;
-    /// an ungranted port is refused whether reached by name or address.
+    /// Inside the session a name (e.g. `host.microsandbox.internal`) resolves to the
+    /// server's machine, since the backend assigns the address per session. Resolving grants
+    /// nothing; an ungranted port is refused whether reached by name or address.
     pub fn with_host_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
         self.host_ports = ports.into_iter().collect();
         self
@@ -444,9 +430,7 @@ pub struct InitResp {
     /// starting in a client tree would make it (maybe a read-only project) the default
     /// target of every relative path. A server that differs just reports it here.
     ///
-    /// The server keeps the current directory, which is why an
-    /// [`ExecCall`](super::ExecCall) says nothing about where to run. A command may move it
-    /// (a backend offering `cd` handles it itself) and nothing reports that; run `pwd`.
+    /// The server keeps the current directory, so an [`ExecCall`](super::ExecCall) names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }

@@ -20,9 +20,8 @@ const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east
 ///
 /// # Release layout
 ///
-/// cortex-krun's `cargo xtask upload` publishes one archive per platform holding what its
-/// `cargo xtask install` puts in `bin/`: `cortex-krun`, the VM process, the guest, the guest
-/// kernel, and `abin/`. Under the bucket's public HTTPS endpoint:
+/// One archive per platform, holding what `bin/` needs, under the bucket's public HTTPS
+/// endpoint:
 ///
 /// ```text
 /// cortex-krun/<os>-<arch>/latest                                    one line: a version
@@ -30,7 +29,7 @@ const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east
 /// ```
 ///
 /// `<os>`/`<arch>` are as [`std::env::consts`] spells them. A version is a cortex-krun git sha;
-/// `latest` is per platform because each platform is built and uploaded by its own machine.
+/// `latest` is per platform, since each platform is uploaded separately.
 pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     let root = cache_root();
     let bin = root.join("bin");
