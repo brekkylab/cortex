@@ -588,11 +588,7 @@ impl FromStr for Port {
         let (host, console) = spec
             .split_once(':')
             .ok_or_else(|| invalid("not <host>:<console>"))?;
-        let port = Port::new(number(host)?, number(console)?);
-        if port.host == 0 || port.console == 0 {
-            return Err(invalid("port 0 is no port"));
-        }
-        Ok(port)
+        Port::new(number(host)?, number(console)?).map_err(|_| invalid("port 0 is no port"))
     }
 }
 
@@ -676,14 +672,14 @@ mod tests {
     /// A port is docker's string on the wire, host first, with both numbers said.
     #[test]
     fn a_port_is_spelled_the_way_docker_spells_it() {
-        assert_eq!("8080:80".parse(), Ok(Port::new(8080, 80)));
+        assert_eq!("8080:80".parse(), Port::new(8080, 80));
         assert_eq!(
-            serde_json::to_value(Port::new(5901, 5900)).unwrap(),
+            serde_json::to_value(Port::new(5901, 5900).unwrap()).unwrap(),
             serde_json::json!("5901:5900")
         );
         assert_eq!(
             serde_json::from_value::<Port>(serde_json::json!("8080:80")).unwrap(),
-            Port::new(8080, 80)
+            Port::new(8080, 80).unwrap()
         );
 
         for bad in [
