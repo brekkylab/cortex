@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_directory_with_nothing_mounted_under_it_reports_nothing() {
-        let dir = std::env::temp_dir().join(format!("cortex-table-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("virtx-table-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert!(mounts_under(&resolved(&dir)).is_empty());
 
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn resolving_a_temp_path_changes_it() {
-        let raw = std::env::temp_dir().join("cortex-resolve-probe");
+        let raw = std::env::temp_dir().join("virtx-resolve-probe");
         assert!(
             resolved(&raw).starts_with("/private"),
             "macOS `$TMPDIR` resolves under /private; got {}",

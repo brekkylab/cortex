@@ -70,7 +70,7 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .expect("build cortex binding runtime")
+            .expect("build virtx binding runtime")
     })
     .block_on(fut)
 }

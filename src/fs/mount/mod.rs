@@ -31,7 +31,7 @@
 //!
 //! Neither is gated on a binding, and both are what a *consumer* of the trait needs rather
 //! than what a binding needs: clearing a mount a dead run left takes no binding at all. Both
-//! are also built out of what the guards' own teardown uses, so a cortex mount comes down
+//! are also built out of what the guards' own teardown uses, so a virtx mount comes down
 //! exactly one way whether its owner is alive or not. Unix only, because a claim is a pid and
 //! a mode and a sweep is `kill(pid, 0)`.
 

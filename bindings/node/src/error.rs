@@ -1,16 +1,16 @@
-//! How cortex's failures arrive in JavaScript, from a console and an image client alike.
+//! How virtx's failures arrive in JavaScript, from a console and an image client alike.
 //!
 //! As an `Error` whose `code` says what kind, the way Node's own errors carry `ENOENT`. A
-//! server that refused answers with a number, and the code is that number's name in cortex
+//! server that refused answers with a number, and the code is that number's name in virtx
 //! — `TIMED_OUT`, `NOT_FOUND` — so a caller compares against a string it can read; a number
-//! this cortex has no name for is `CONSOLE_REFUSED`, with the number in the message. A
+//! this virtx has no name for is `CONSOLE_REFUSED`, with the number in the message. A
 //! channel that broke is `CONSOLE_BROKEN`, after which nothing more will be heard. Anything
-//! else — building a console, say — is `CORTEX_ERROR`.
+//! else — building a console, say — is `VIRTX_ERROR`.
 //!
 //! The filesystem half answers in [`std::io::Error`], and its code is the
 //! [`ErrorKind`](std::io::ErrorKind)'s name.
 
-use cortex::protocol::{Error, Failure};
+use virtx::protocol::{Error, Failure};
 
 pub type Result<T> = napi::Result<T, String>;
 
@@ -34,7 +34,7 @@ pub fn failure(failure: Failure) -> napi::Error<String> {
 pub fn anyhow(error: anyhow::Error) -> napi::Error<String> {
     match error.downcast::<Failure>() {
         Ok(f) => failure(f),
-        Err(error) => napi::Error::new("CORTEX_ERROR".to_string(), format!("{error:#}")),
+        Err(error) => napi::Error::new("VIRTX_ERROR".to_string(), format!("{error:#}")),
     }
 }
 
@@ -68,7 +68,7 @@ fn name(code: i64) -> Option<&'static str> {
     })
 }
 
-/// A JavaScript number where cortex takes a `u64`: an offset, a length, a timeout.
+/// A JavaScript number where virtx takes a `u64`: an offset, a length, a timeout.
 ///
 /// `i64` on the way in because that is what napi converts a number to; a negative one is a
 /// caller's mistake and is said so here rather than wrapped into a very large length.

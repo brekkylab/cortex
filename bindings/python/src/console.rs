@@ -31,7 +31,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use cortex::{
+use virtx::{
     console::{ConsoleClient, ConsoleClientBuilder},
     protocol::{ExecResp, Port, ReadResp},
 };
@@ -40,7 +40,7 @@ use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
 use tokio::sync::Mutex;
 
 use crate::{
-    error::{self, CortexError},
+    error::{self, VirtxError},
     fs::{Content, MountLike},
     image::ImageSourceLike,
 };
@@ -53,7 +53,7 @@ use crate::{
 ///
 /// The `Mutex` is for `Sync`, which a `pyclass` has to be and the builder's client factory
 /// is not; nothing contends for it.
-#[pyclass(name = "ConsoleClientBuilder", module = "cortex")]
+#[pyclass(name = "ConsoleClientBuilder", module = "virtx")]
 pub struct PyConsoleClientBuilder(std::sync::Mutex<Option<ConsoleClientBuilder>>);
 
 impl PyConsoleClientBuilder {
@@ -156,13 +156,13 @@ impl PyConsoleClientBuilder {
 /// The console a slot holds, or the error for one that has been closed.
 fn held(slot: &mut Option<ConsoleClient>) -> PyResult<&mut ConsoleClient> {
     slot.as_mut()
-        .ok_or_else(|| CortexError::new_err("this console has been closed"))
+        .ok_or_else(|| VirtxError::new_err("this console has been closed"))
 }
 
 /// A console slot: the console, or nothing once it has been closed.
 pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 
-#[pyclass(name = "ConsoleClient", module = "cortex", frozen)]
+#[pyclass(name = "ConsoleClient", module = "virtx", frozen)]
 pub struct PyConsoleClient {
     console: Slot,
 
@@ -314,7 +314,7 @@ impl PyConsoleClient {
     }
 }
 
-#[pyclass(name = "ExecResult", module = "cortex", frozen, get_all)]
+#[pyclass(name = "ExecResult", module = "virtx", frozen, get_all)]
 pub struct PyExecResult {
     code: i32,
     stdout: Vec<u8>,
@@ -346,7 +346,7 @@ impl PyExecResult {
     }
 }
 
-#[pyclass(name = "ReadResult", module = "cortex", frozen, get_all)]
+#[pyclass(name = "ReadResult", module = "virtx", frozen, get_all)]
 pub struct PyReadResult {
     data: Vec<u8>,
     size: u64,

@@ -1,10 +1,10 @@
 [package]
-name = "cortex"
+name = "virtx"
 version = "0.1.0"
 edition = "2024"
 
 # The bindings are members so that they build against this crate in the same target
-# directory and lockfile. A `cargo build` or `cargo test` here still builds only `cortex`:
+# directory and lockfile. A `cargo build` or `cargo test` here still builds only `virtx`:
 # the root package is the default member.
 [workspace]
 members = ["bindings/node", "bindings/python"]
@@ -50,7 +50,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "form",
 ], optional = true }
 uuid = { version = "1", optional = true }
-# The archive `ensure_cortex` unpacks: a gzipped tar, as cortex-krun's `cargo xtask upload`
+# The archive `ensure_virtx` unpacks: a gzipped tar, as virtx-uvm's `cargo xtask upload`
 # writes one.
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
@@ -145,7 +145,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 #
 # Count them with
 #
-#   cargo tree --features <f> -e normal --prefix none | grep -v '^cortex' \
+#   cargo tree --features <f> -e normal --prefix none | grep -v '^virtx' \
 #       | sed 's/ (\*)$//' | sort -u | grep -c .
 #
 # Normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
@@ -171,7 +171,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Editors build the default set, so `mount`'s binding is live code and the other
 # features' are not until enabled (rust-analyzer: `"cargo.features": "all"`).
 default = ["mount", "ensure"]
-# Mount a cortex filesystem on the host, through the one binding this OS has:
+# Mount a virtx filesystem on the host, through the one binding this OS has:
 #
 # | Target | Binding | Needs |
 # |---|---|---|
@@ -223,12 +223,12 @@ mount = [
     "tokio/net",
     "tokio/rt-multi-thread",
 ]
-# `ensure_cortex`: fetch the console server cortex-krun publishes, over HTTPS, into
+# `ensure_virtx`: fetch the console server virtx-uvm publishes, over HTTPS, into
 # `cache_root()/bin` when a host has none. Brings the HTTP and TLS stack the Notion and
 # Google Drive backends use.
 #
 # On by default, because a consumer that runs commands needs a server to run them in.
-# The server itself is the one that opts out: cortex-krun takes this crate for the
+# The server itself is the one that opts out: virtx-uvm takes this crate for the
 # protocol, and its guest is a static musl binary whose TLS stack would need a C
 # cross-compiler to build.
 ensure = ["dep:reqwest", "dep:flate2", "dep:tar", "tokio/net"]

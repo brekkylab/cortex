@@ -6,7 +6,7 @@
 //! # Why not `async fn`
 //!
 //! napi's `async fn` and `spawn_future` reject with a [`Status`](napi::Status), which
-//! becomes the error's `code` — and the codes a caller acts on are cortex's (`TIMED_OUT`,
+//! becomes the error's `code` — and the codes a caller acts on are virtx's (`TIMED_OUT`,
 //! `CONSOLE_BROKEN`), not napi's. So [`promise`] runs the future to a plain `Result` and
 //! turns an `Err` into the JavaScript error once it is back on the main thread, where one
 //! can be made. It also means the synchronous part of a call happens when the call is made:
@@ -40,7 +40,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use cortex::{
+use virtx::{
     console::{ConsoleClient, ConsoleClientBuilder},
     protocol::{ExecResp, Port, ReadResp},
 };
@@ -212,7 +212,7 @@ impl JsConsoleClientBuilder {
 /// The console a slot holds, or the error for one that has been closed.
 fn held(slot: &mut Option<ConsoleClient>) -> Result<&mut ConsoleClient> {
     slot.as_mut()
-        .ok_or_else(|| napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed"))
+        .ok_or_else(|| napi::Error::new("VIRTX_ERROR".to_string(), "this console has been closed"))
 }
 
 /// A console slot: the console, or nothing once it has been closed.

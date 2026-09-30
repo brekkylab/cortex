@@ -258,58 +258,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cortex"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bson",
- "cc",
- "chrono",
- "dokan",
- "dokan-sys",
- "flate2",
- "fuser",
- "futures-core",
- "libc",
- "object_store",
- "pkg-config",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "tokio",
- "unicode-normalization",
- "uuid",
- "widestring",
- "winapi",
-]
-
-[[package]]
-name = "cortex-node"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cortex",
- "napi",
- "napi-build",
- "napi-derive",
- "tokio",
-]
-
-[[package]]
-name = "cortex-python"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cortex",
- "pyo3",
- "pyo3-async-runtimes",
- "tokio",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2428,6 +2376,58 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "virtx"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bson",
+ "cc",
+ "chrono",
+ "dokan",
+ "dokan-sys",
+ "flate2",
+ "fuser",
+ "futures-core",
+ "libc",
+ "object_store",
+ "pkg-config",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "tokio",
+ "unicode-normalization",
+ "uuid",
+ "widestring",
+ "winapi",
+]
+
+[[package]]
+name = "virtx-node"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "tokio",
+ "virtx",
+]
+
+[[package]]
+name = "virtx-python"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "tokio",
+ "virtx",
+]
 
 [[package]]
 name = "walkdir"

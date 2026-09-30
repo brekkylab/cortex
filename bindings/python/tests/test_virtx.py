@@ -3,10 +3,10 @@ import shutil
 
 import pytest
 
-import cortex
-from cortex import (
+import virtx
+from virtx import (
     ConsoleClient,
-    CortexError,
+    VirtxError,
     Directory,
     ErrorCode,
     ImageClient,
@@ -48,7 +48,7 @@ def test_a_port_is_spelled_the_way_docker_spells_it():
         builder.ports(["http"])
 
 
-def test_error_codes_are_cortex_s():
+def test_error_codes_are_virtx_s():
     assert ErrorCode.TIMED_OUT == -32000
     assert ErrorCode.INTERNAL_ERROR == -32603
 
@@ -59,13 +59,13 @@ def test_directory_refuses_a_file_under_a_mount(tmp_path):
         directory.add_file("project/notes.md", "under a mount")
 
 
-@pytest.mark.skipif(not hasattr(cortex, "HostMount"), reason="built without `mount`")
+@pytest.mark.skipif(not hasattr(virtx, "HostMount"), reason="built without `mount`")
 def test_host_mount_serves_the_directory(tmp_path):
     mountpoint = tmp_path / "mnt"
     mountpoint.mkdir()
     directory = Directory().with_file("notes/today.md", b"ship the release")
 
-    mount = cortex.HostMount(directory, mountpoint)
+    mount = virtx.HostMount(directory, mountpoint)
     try:
         assert (mountpoint / "notes" / "today.md").read_bytes() == b"ship the release"
         # The mount owns the tree now.
@@ -77,29 +77,29 @@ def test_host_mount_serves_the_directory(tmp_path):
 
 async def test_building_without_a_server_fails_and_spends_the_builder(tmp_path, monkeypatch):
     # The default server is looked up here, where there is none.
-    monkeypatch.setenv("CORTEX_STDIO_SERVER_PATH", str(tmp_path))
+    monkeypatch.setenv("VIRTX_STDIO_SERVER_PATH", str(tmp_path))
     builder = ConsoleClient.builder()
-    with pytest.raises(CortexError):
+    with pytest.raises(VirtxError):
         await builder.build()
     with pytest.raises(ValueError):
         builder.vcpus(2)
 
 
 async def test_building_against_a_missing_binary_fails():
-    with pytest.raises(CortexError):
-        await ConsoleClient.builder().cmd(["cortex-no-such-console-server"]).build()
+    with pytest.raises(VirtxError):
+        await ConsoleClient.builder().cmd(["virtx-no-such-console-server"]).build()
 
 
 async def test_image_client_against_a_missing_binary_fails():
-    with pytest.raises(CortexError):
-        await ImageClient.try_from_cmd(["cortex-no-such-console-server"])
+    with pytest.raises(VirtxError):
+        await ImageClient.try_from_cmd(["virtx-no-such-console-server"])
 
 
-# Against a real console server, named by `$CORTEX_CONSOLE` (`cortex-krun`, say).
-SERVER = os.environ.get("CORTEX_CONSOLE")
+# Against a real console server, named by `$VIRTX_CONSOLE` (`virtx-uvm`, say).
+SERVER = os.environ.get("VIRTX_CONSOLE")
 
 
-@pytest.mark.skipif(not SERVER or not shutil.which(SERVER), reason="set $CORTEX_CONSOLE")
+@pytest.mark.skipif(not SERVER or not shutil.which(SERVER), reason="set $VIRTX_CONSOLE")
 async def test_exec_read_write(tmp_path):
     builder = (
         ConsoleClient.builder()
@@ -121,13 +121,13 @@ async def test_exec_read_write(tmp_path):
         assert read.size == 2
 
 
-@pytest.mark.skipif(not SERVER or not shutil.which(SERVER), reason="set $CORTEX_CONSOLE")
+@pytest.mark.skipif(not SERVER or not shutil.which(SERVER), reason="set $VIRTX_CONSOLE")
 async def test_build_list_remove():
     async with await ImageClient.try_from_cmd([SERVER]) as images:
         assert await images.version()
 
-        built = await images.build(Recipe("alpine:3.20"), "cortex-py-test:latest")
-        assert built.reference == "cortex-py-test:latest"
+        built = await images.build(Recipe("alpine:3.20"), "virtx-py-test:latest")
+        assert built.reference == "virtx-py-test:latest"
         assert any(entry.digest == built.digest for entry in await images.list())
 
         await images.remove(ImageSource.reference(built.reference))

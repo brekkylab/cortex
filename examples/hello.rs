@@ -4,9 +4,9 @@
 //! cargo run --example hello
 //! ```
 //!
-//! Needs the console server under `~/.cache/cortex/bin` (or `CORTEX_STDIO_SERVER_PATH`).
+//! Needs the console server under `~/.cache/virtx/bin` (or `VIRTX_STDIO_SERVER_PATH`).
 
-use cortex::{console::ConsoleClient, image::Recipe};
+use virtx::{console::ConsoleClient, image::Recipe};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
 
     let result = console
         .exec(
-            ["sh", "-c", r#"echo '{"hello": "cortex"}' | jq -r .hello"#],
+            ["sh", "-c", r#"echo '{"hello": "virtx"}' | jq -r .hello"#],
             None,
         )
         .await?;

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Build cortex's own executables for the guest, into a directory `CORTEX_ABIN_DIR` can name.
+# Build virtx's own executables for the guest, into a directory `VIRTX_ABIN_DIR` can name.
 #
 #   scripts/build-abin.sh
 #       This host's architecture, release, into the `abin` directory every session here
-#       mounts: `$CORTEX_UVM_HOME/abin`, or `~/.cache/cortex/abin` when that is unset.
+#       mounts: `$VIRTX_UVM_HOME/abin`, or `~/.cache/virtx/abin` when that is unset.
 #   scripts/build-abin.sh --zig
 #       The same, built on this host instead of in a container.
 #   scripts/build-abin.sh --arch x86_64
@@ -64,7 +64,7 @@
 # Its `pdfium` feature is off, which is also what the release is built with: linking a PDF
 # engine in statically needs a `libpdfium.a` for this target, and building one for musl needs a
 # musl sysroot and a C++ toolchain aimed at it. So a PDF is a file `docread` names and refuses.
-# `cortex-execs/docread/build.rs` is where that is argued and where the ways around it are.
+# `virtx-execs/docread/build.rs` is where that is argued and where the ways around it are.
 set -euo pipefail
 
 die() { echo "build-abin: $*" >&2; exit 1; }
@@ -72,13 +72,13 @@ die() { echo "build-abin: $*" >&2; exit 1; }
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
 
 # What `/abin` holds, as `<package>:<program>`. The two are not the same string — the crate is
-# `cortex-exec-mem` and the name a caller types is `mem` — and both are needed here: one to
+# `virtx-exec-mem` and the name a caller types is `mem` — and both are needed here: one to
 # build and one to install.
 #
 # This is the only statement of what `/abin` holds. Anything that publishes a release has to
 # hold the same list, and a program added to one and not the other is an `/abin` that differs
 # between the machine it was developed on and the machine it runs on.
-PROGRAMS=(cortex-exec-mem:mem cortex-exec-index:index cortex-exec-docread:docread)
+PROGRAMS=(virtx-exec-mem:mem virtx-exec-index:index virtx-exec-docread:docread)
 
 # The image the container build runs in. `rust:alpine` is musl's own toolchain with a Rust in
 # it, which is the whole reason it is this and not a Debian image with a cross-compiler bolted
@@ -91,7 +91,7 @@ triple_for() {
   case "$1" in
     aarch64) echo aarch64-unknown-linux-musl ;;
     x86_64) echo x86_64-unknown-linux-musl ;;
-    *) die "'$1' is not an architecture cortex builds for (aarch64, x86_64)" ;;
+    *) die "'$1' is not an architecture virtx builds for (aarch64, x86_64)" ;;
   esac
 }
 
@@ -99,7 +99,7 @@ platform_for() {
   case "$1" in
     aarch64) echo linux/arm64 ;;
     x86_64) echo linux/amd64 ;;
-    *) die "'$1' is not an architecture cortex builds for (aarch64, x86_64)" ;;
+    *) die "'$1' is not an architecture virtx builds for (aarch64, x86_64)" ;;
   esac
 }
 
@@ -108,7 +108,7 @@ host_arch() {
     arm64 | aarch64) echo aarch64 ;;
     x86_64) echo x86_64 ;;
     # A guest runs the host's architecture, so there is nothing to fall back to.
-    *) die "cortex builds no executables for a $(uname -m) host" ;;
+    *) die "virtx builds no executables for a $(uname -m) host" ;;
   esac
 }
 
@@ -138,9 +138,9 @@ done
 
 HOST="$(host_arch)"
 [ -n "$ARCH" ] || ARCH="$HOST"
-# The same place the host resolves, spelled the same way: `CORTEX_UVM_HOME`, else
-# `~/.cache/cortex`. A second rule here would be a directory this fills and nothing mounts.
-[ -n "$OUT" ] || OUT="${CORTEX_UVM_HOME:-$HOME/.cache/cortex}/abin"
+# The same place the host resolves, spelled the same way: `VIRTX_UVM_HOME`, else
+# `~/.cache/virtx`. A second rule here would be a directory this fills and nothing mounts.
+[ -n "$OUT" ] || OUT="${VIRTX_UVM_HOME:-$HOME/.cache/virtx}/abin"
 TRIPLE="$(triple_for "$ARCH")"
 
 # Prerequisites, said as sentences rather than left to fail as tool errors — and said before
@@ -195,7 +195,7 @@ else
   docker run --rm \
     --platform "$(platform_for "$ARCH")" \
     --volume "$root:/src" \
-    --volume "cortex-abin-cargo-$ARCH:/cargo" \
+    --volume "virtx-abin-cargo-$ARCH:/cargo" \
     --env CARGO_HOME=/cargo \
     --env CARGO_TARGET_DIR="/src/target/abin-builder-$ARCH" \
     --workdir /src \
@@ -224,7 +224,7 @@ for entry in "$OUT"/*; do
       continue 2
     fi
   done
-  echo "build-abin: warning: $OUT holds $name, which cortex did not build" >&2
+  echo "build-abin: warning: $OUT holds $name, which virtx did not build" >&2
 done
 
 echo

@@ -7,12 +7,12 @@ _Content = bytes | str
 
 ERROR_CODES: dict[str, int]
 
-class CortexError(Exception): ...
+class VirtxError(Exception): ...
 
-class ConsoleRefused(CortexError):
+class ConsoleRefused(VirtxError):
     code: int
 
-class ConsoleBroken(CortexError): ...
+class ConsoleBroken(VirtxError): ...
 
 class Step:
     @staticmethod
@@ -151,5 +151,5 @@ class ConsoleClient:
         tb: TracebackType | None,
     ) -> None: ...
 
-async def ensure_cortex() -> str:
-    """Fetch the console server into cortex's cache if it is not there; the directory it is in."""
+async def ensure_virtx() -> str:
+    """Fetch the console server into virtx's cache if it is not there; the directory it is in."""

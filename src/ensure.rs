@@ -1,17 +1,17 @@
 //! Fetching the console server when this host has none.
 //!
-//! cortex-krun's `cargo xtask upload` publishes one archive per platform, holding what its
-//! `cargo xtask install` would put in [`cache_root`]`/bin`: `cortex-krun`, the VM process
+//! virtx-uvm's `cargo xtask upload` publishes one archive per platform, holding what its
+//! `cargo xtask install` would put in [`cache_root`]`/bin`: `virtx-uvm`, the VM process
 //! beside it, the guest, the guest kernel, and `abin/`. The layout it writes, under the
 //! bucket's public HTTPS endpoint, is
 //!
 //! ```text
-//! cortex-krun/<os>-<arch>/latest                                    one line: a version
-//! cortex-krun/<os>-<arch>/<version>/cortex-krun-<os>-<arch>.tar.gz
+//! virtx-uvm/<os>-<arch>/latest                                    one line: a version
+//! virtx-uvm/<os>-<arch>/<version>/virtx-uvm-<os>-<arch>.tar.gz
 //! ```
 //!
 //! with `<os>` and `<arch>` spelled as [`std::env::consts`] spells them. A version is a git
-//! sha of cortex-krun, and `latest` is per platform because each is built on a machine of
+//! sha of virtx-uvm, and `latest` is per platform because each is built on a machine of
 //! its own and uploaded when that machine is done.
 
 use std::path::{Path, PathBuf};
@@ -20,35 +20,35 @@ use anyhow::Context as _;
 
 use crate::cache_root;
 
-/// Where releases are fetched from unless `$CORTEX_DIST_URL` says otherwise.
+/// Where releases are fetched from unless `$VIRTX_DIST_URL` says otherwise.
 const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com";
 
 /// Fetch the console server into [`cache_root`]`/bin` if it is not there, and answer that
 /// directory.
 ///
-/// **Present is enough.** A `bin/` that already has `cortex-krun` is left alone, whether it
+/// **Present is enough.** A `bin/` that already has `virtx-uvm` is left alone, whether it
 /// came from here or from `cargo xtask install` -- this makes a host able to run a session,
 /// and does not keep one up to date.
 ///
-/// The version is `$CORTEX_KRUN_VERSION` if set, else whatever this platform's `latest`
-/// names. `cortex-krun` itself is the last file put in place, so a fetch that fails partway
+/// The version is `$VIRTX_UVM_VERSION` if set, else whatever this platform's `latest`
+/// names. `virtx-uvm` itself is the last file put in place, so a fetch that fails partway
 /// leaves a `bin/` the next call fetches into again rather than one that looks complete.
-pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
+pub async fn ensure_virtx() -> anyhow::Result<PathBuf> {
     let root = cache_root();
     let bin = root.join("bin");
-    let server = format!("cortex-krun{}", std::env::consts::EXE_SUFFIX);
+    let server = format!("virtx-uvm{}", std::env::consts::EXE_SUFFIX);
     if bin.join(&server).is_file() {
         return Ok(bin);
     }
 
     let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-    let base = std::env::var("CORTEX_DIST_URL")
+    let base = std::env::var("VIRTX_DIST_URL")
         .ok()
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| DIST_URL.to_string());
-    let base = format!("{}/cortex-krun/{platform}", base.trim_end_matches('/'));
+    let base = format!("{}/virtx-uvm/{platform}", base.trim_end_matches('/'));
 
-    let version = match std::env::var("CORTEX_KRUN_VERSION")
+    let version = match std::env::var("VIRTX_UVM_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
     {
@@ -56,7 +56,7 @@ pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
         None => {
             let latest = fetch(&format!("{base}/latest"))
                 .await
-                .with_context(|| format!("no cortex-krun release is published for {platform}"))?;
+                .with_context(|| format!("no virtx-uvm release is published for {platform}"))?;
             String::from_utf8(latest)
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -65,11 +65,11 @@ pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
         }
     };
 
-    let url = format!("{base}/{version}/cortex-krun-{platform}.tar.gz");
+    let url = format!("{base}/{version}/virtx-uvm-{platform}.tar.gz");
     let archive = fetch(&url).await?;
     tokio::task::spawn_blocking(move || unpack(&archive, &root, &server))
         .await
-        .context("unpacking cortex-krun panicked")??;
+        .context("unpacking virtx-uvm panicked")??;
     Ok(bin)
 }
 
@@ -99,10 +99,10 @@ fn unpack(archive: &[u8], root: &Path, server: &str) -> anyhow::Result<()> {
     let moved = (|| {
         tar::Archive::new(flate2::read::GzDecoder::new(archive))
             .unpack(&part)
-            .context("unpacking the cortex-krun archive")?;
+            .context("unpacking the virtx-uvm archive")?;
         anyhow::ensure!(
             part.join(server).is_file(),
-            "the cortex-krun archive has no {server}"
+            "the virtx-uvm archive has no {server}"
         );
 
         let bin = root.join("bin");

@@ -41,11 +41,11 @@ fn fuse_t_shim() {
     // Where to look when the loader does not find the library by its bare name.
     if let Some(dir) = fuse_t.link_paths.first() {
         build.define(
-            "CORTEX_FUSE_T_LIBDIR",
+            "VIRTX_FUSE_T_LIBDIR",
             format!("\"{}\"", dir.display()).as_str(),
         );
     }
-    build.compile("cortex_fuse_t_shim");
+    build.compile("virtx_fuse_t_shim");
 }
 
 /// Load `dokan2.dll` at its first call rather than at process start, for this package's

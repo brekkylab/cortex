@@ -52,7 +52,7 @@ const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
 /// What the mount reports as its source — the name `df` and Finder show.
 ///
 /// Fixed, because nothing has wanted another one.
-const FSNAME: &str = "cortex";
+const FSNAME: &str = "virtx";
 
 /// A live mount on the kernel's own FUSE: constructing one mounts, dropping it unmounts.
 ///
@@ -178,7 +178,7 @@ impl Drop for FuseMount {
         // Not silent: a mount that would not come down is left behind for someone to clear by
         // hand, so saying so — and saying what `fuser` made of it — is the least this can do.
         eprintln!(
-            "cortex: unmounting {} failed: {refused}",
+            "virtx: unmounting {} failed: {refused}",
             self.mountpoint.display()
         );
     }

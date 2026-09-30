@@ -1,10 +1,10 @@
-//! Node bindings for cortex, built with napi-rs.
+//! Node bindings for virtx, built with napi-rs.
 //!
-//! The shape is cortex's own, spelled in JavaScript: a [`ConsoleClient`](cortex::console::ConsoleClient)
-//! is built by a builder and awaited, a [`Directory`](cortex::fs::Directory) is assembled
-//! and handed to a host mount, a [`Recipe`](cortex::image::Recipe) is a base and its steps,
-//! and an [`ImageClient`](cortex::image::ImageClient) builds one ahead of the session that
-//! runs on it. Names are camelCased and nothing else changes — a caller reading cortex's Rust
+//! The shape is virtx's own, spelled in JavaScript: a [`ConsoleClient`](virtx::console::ConsoleClient)
+//! is built by a builder and awaited, a [`Directory`](virtx::fs::Directory) is assembled
+//! and handed to a host mount, a [`Recipe`](virtx::image::Recipe) is a base and its steps,
+//! and an [`ImageClient`](virtx::image::ImageClient) builds one ahead of the session that
+//! runs on it. Names are camelCased and nothing else changes — a caller reading virtx's Rust
 //! documentation should find the same names doing the same things.
 //!
 //! One module per half, as in the crate: [`console`] for running commands, [`fs`] for the

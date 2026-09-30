@@ -5,7 +5,7 @@
 //! handle on one. Mounting it *takes* it: a `HostMount` owns the tree it serves, and the
 //! `Directory` it was built from is empty afterwards and refuses further use.
 //!
-//! `HostMount` is one name for three types. cortex names each binding's guard after the
+//! `HostMount` is one name for three types. virtx names each binding's guard after the
 //! binding — `FuseMount`, `FuseTMount`, `DokanMount` — and only the one this platform has is
 //! compiled, so a JavaScript caller who wants "mount this on the host" should not have to
 //! know which it is.
@@ -14,7 +14,7 @@ use std::{io, path::PathBuf};
 #[cfg(feature = "mount")]
 use std::{path::Path, sync::Arc};
 
-use cortex::fs::{Directory, Mount};
+use virtx::fs::{Directory, Mount};
 #[cfg(feature = "mount")]
 use napi::bindgen_prelude::ClassInstance;
 use napi::bindgen_prelude::{Buffer, Either, This};
@@ -23,11 +23,11 @@ use napi_derive::napi;
 use crate::error::{self, Result};
 
 #[cfg(all(feature = "mount", windows))]
-use cortex::fs::DokanMount as Platform;
+use virtx::fs::DokanMount as Platform;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
-use cortex::fs::FuseMount as Platform;
+use virtx::fs::FuseMount as Platform;
 #[cfg(all(feature = "mount", target_os = "macos"))]
-use cortex::fs::FuseTMount as Platform;
+use virtx::fs::FuseTMount as Platform;
 
 /// File content as a caller may spell it: a `Buffer` as it is, a string as its UTF-8.
 pub type Content = Either<Buffer, String>;
@@ -118,7 +118,7 @@ impl JsDirectory {
 /// garbage collection.
 ///
 /// **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and
-/// none at all on a signal or a crash, so a mount left to one is taken down by cortex's
+/// none at all on a signal or a crash, so a mount left to one is taken down by virtx's
 /// watchdog, from outside the process, once the process is gone. `unmount` is how a
 /// program that wants it down *now* says so.
 #[cfg(feature = "mount")]
@@ -200,7 +200,7 @@ impl JsHostMount {
 #[cfg(feature = "mount")]
 #[napi]
 pub fn mount_support() -> Result<()> {
-    cortex::fs::mount_support().map_err(error::io)
+    virtx::fs::mount_support().map_err(error::io)
 }
 
 /// What a console builder mounts: a `HostMount`, or a host directory by its path.

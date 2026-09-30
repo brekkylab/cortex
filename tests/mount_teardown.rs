@@ -43,10 +43,10 @@ use std::{
 
 // Whichever host binding this target has, as in `host_mount.rs`.
 #[cfg(not(target_os = "macos"))]
-use cortex::fs::FuseMount as HostMount;
+use virtx::fs::FuseMount as HostMount;
 #[cfg(target_os = "macos")]
-use cortex::fs::FuseTMount as HostMount;
-use cortex::fs::{FileSystem, InMemFs, Mount};
+use virtx::fs::FuseTMount as HostMount;
+use virtx::fs::{FileSystem, InMemFs, Mount};
 
 /// How long a teardown gets before the test calls it a hang.
 ///
@@ -57,7 +57,7 @@ const TEARDOWN_DEADLINE: Duration = Duration::from_secs(20);
 
 fn mountpoint(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push(format!("cortex-mount-{}-{}", std::process::id(), tag));
+    dir.push(format!("virtx-mount-{}-{}", std::process::id(), tag));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("temp dir is writable");
     dir
@@ -69,7 +69,7 @@ fn volume() -> InMemFs {
     rt.block_on(async {
         let greeting = std::path::Path::new("greeting.txt");
         vol.create(greeting).await.expect("fresh store");
-        vol.write_at(greeting, b"Hello from cortex!\n", 0)
+        vol.write_at(greeting, b"Hello from virtx!\n", 0)
             .await
             .expect("write the greeting");
     });
@@ -81,7 +81,7 @@ fn volume() -> InMemFs {
 fn assert_serves(mount: &impl Mount) {
     assert_eq!(
         fs::read_to_string(mount.mountpoint().join("greeting.txt")).unwrap(),
-        "Hello from cortex!\n"
+        "Hello from virtx!\n"
     );
 }
 
@@ -254,10 +254,10 @@ fn a_mount_dropped_under_load_does_not_abort() {
 const CHILD_MOUNT_DEADLINE: Duration = Duration::from_secs(20);
 
 /// The env var naming where the child fixture should mount.
-const CHILD_MOUNTPOINT: &str = "CORTEX_CHILD_MOUNTPOINT";
+const CHILD_MOUNTPOINT: &str = "VIRTX_CHILD_MOUNTPOINT";
 
-/// Set when the child should call [`cortex::fs::unmount_on_signal`] first.
-const CHILD_CATCHES_SIGNALS: &str = "CORTEX_CHILD_CATCHES_SIGNALS";
+/// Set when the child should call [`virtx::fs::unmount_on_signal`] first.
+const CHILD_CATCHES_SIGNALS: &str = "VIRTX_CHILD_CATCHES_SIGNALS";
 
 /// Mount where [`CHILD_MOUNTPOINT`] says, then wait to be killed.
 ///
@@ -272,7 +272,7 @@ fn child_mounts_and_waits_to_be_killed() {
         return;
     };
     if std::env::var_os(CHILD_CATCHES_SIGNALS).is_some() {
-        cortex::fs::unmount_on_signal().expect("install the signal teardown");
+        virtx::fs::unmount_on_signal().expect("install the signal teardown");
     }
     let _mount = HostMount::try_new(volume(), std::path::Path::new(&path)).expect("mount");
 
@@ -408,7 +408,7 @@ fn a_killed_process_takes_its_mount_down_with_nobody_mounting_again() {
     let _ = fs::remove_dir_all(&path);
 }
 
-/// A process that never asked for [`cortex::fs::unmount_on_signal`] and is ended by a
+/// A process that never asked for [`virtx::fs::unmount_on_signal`] and is ended by a
 /// signal it does not catch -- `SIGTERM`, as a supervisor sends -- takes its mount with
 /// it all the same: nothing in the process runs, and the watchdog does it.
 #[test]
@@ -434,7 +434,7 @@ fn reclaiming_leaves_a_running_process_its_own_mounts() {
     let mount = HostMount::try_new(volume(), &path).expect("mount");
     assert_serves(&mount);
 
-    cortex::fs::reclaim_abandoned();
+    virtx::fs::reclaim_abandoned();
 
     // This process is running, so its mount is not abandoned, whatever the register
     // says about the path.

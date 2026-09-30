@@ -1,4 +1,4 @@
-/* Translation between libfuse-t's lowlevel callbacks and cortex's flat vtable.
+/* Translation between libfuse-t's lowlevel callbacks and virtx's flat vtable.
  *
  * Handing the session loop back to libfuse-t is the whole reason this exists —
  * see `src/mountable/adapter/fuse_t.rs`. No logic beyond marshalling; every
@@ -28,14 +28,14 @@
  *
  * Each function the file calls is a pointer here, filled by `dlsym`, and the
  * macro after it points the call sites at the pointer, so the code below is
- * written against libfuse's own names. `cortex_fuse_t_available` opens the
+ * written against libfuse's own names. `virtx_fuse_t_available` opens the
  * library and fills them, once; nothing else may be called before it has
  * answered nonzero. The list has to be complete: a function called below and
  * left out is a link error, since the library is not on the link line. */
 #include <dlfcn.h>
 #include <pthread.h>
 
-#define CORTEX_FUSE_T_FNS(X)                                                  \
+#define VIRTX_FUSE_T_FNS(X)                                                  \
     X(fuse_add_direntry)                                                      \
     X(fuse_chan_fd)                                                           \
     X(fuse_lowlevel_new)                                                      \
@@ -58,60 +58,60 @@
     X(fuse_session_loop)                                                      \
     X(fuse_unmount)
 
-#define CORTEX_FUSE_T_POINTER(name) static __typeof__(name) *cortex_p_##name;
-CORTEX_FUSE_T_FNS(CORTEX_FUSE_T_POINTER)
+#define VIRTX_FUSE_T_POINTER(name) static __typeof__(name) *virtx_p_##name;
+VIRTX_FUSE_T_FNS(VIRTX_FUSE_T_POINTER)
 
 /* Where FUSE-T's installer puts the library, as `pkg-config` reported it when
  * this was built; `build.rs` defines it. The bare name is tried first, so a
  * library the loader would find on its own -- `DYLD_LIBRARY_PATH`, or its
  * fallback paths -- wins over the one this was built against. */
-#ifndef CORTEX_FUSE_T_LIBDIR
-#define CORTEX_FUSE_T_LIBDIR "/usr/local/lib"
+#ifndef VIRTX_FUSE_T_LIBDIR
+#define VIRTX_FUSE_T_LIBDIR "/usr/local/lib"
 #endif
 
-static int cortex_fuse_t_loaded;
-static pthread_once_t cortex_fuse_t_once = PTHREAD_ONCE_INIT;
+static int virtx_fuse_t_loaded;
+static pthread_once_t virtx_fuse_t_once = PTHREAD_ONCE_INIT;
 
-static void cortex_fuse_t_load(void) {
+static void virtx_fuse_t_load(void) {
     void *lib = dlopen("libfuse-t.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!lib)
-        lib = dlopen(CORTEX_FUSE_T_LIBDIR "/libfuse-t.dylib", RTLD_NOW | RTLD_LOCAL);
+        lib = dlopen(VIRTX_FUSE_T_LIBDIR "/libfuse-t.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!lib)
         return;
     /* Never closed: every mount this process makes calls through these. */
-#define CORTEX_FUSE_T_RESOLVE(name)                                           \
-    if (!(cortex_p_##name = (__typeof__(name) *)dlsym(lib, #name)))           \
+#define VIRTX_FUSE_T_RESOLVE(name)                                           \
+    if (!(virtx_p_##name = (__typeof__(name) *)dlsym(lib, #name)))           \
         return;
-    CORTEX_FUSE_T_FNS(CORTEX_FUSE_T_RESOLVE)
-    cortex_fuse_t_loaded = 1;
+    VIRTX_FUSE_T_FNS(VIRTX_FUSE_T_RESOLVE)
+    virtx_fuse_t_loaded = 1;
 }
 
-int cortex_fuse_t_available(void) {
-    pthread_once(&cortex_fuse_t_once, cortex_fuse_t_load);
-    return cortex_fuse_t_loaded;
+int virtx_fuse_t_available(void) {
+    pthread_once(&virtx_fuse_t_once, virtx_fuse_t_load);
+    return virtx_fuse_t_loaded;
 }
 
-#define fuse_add_direntry cortex_p_fuse_add_direntry
-#define fuse_chan_fd cortex_p_fuse_chan_fd
-#define fuse_lowlevel_new cortex_p_fuse_lowlevel_new
-#define fuse_mount cortex_p_fuse_mount
-#define fuse_opt_add_arg cortex_p_fuse_opt_add_arg
-#define fuse_opt_free_args cortex_p_fuse_opt_free_args
-#define fuse_reply_attr cortex_p_fuse_reply_attr
-#define fuse_reply_buf cortex_p_fuse_reply_buf
-#define fuse_reply_create cortex_p_fuse_reply_create
-#define fuse_reply_entry cortex_p_fuse_reply_entry
-#define fuse_reply_err cortex_p_fuse_reply_err
-#define fuse_reply_none cortex_p_fuse_reply_none
-#define fuse_reply_open cortex_p_fuse_reply_open
-#define fuse_reply_statfs cortex_p_fuse_reply_statfs
-#define fuse_reply_write cortex_p_fuse_reply_write
-#define fuse_req_userdata cortex_p_fuse_req_userdata
-#define fuse_session_add_chan cortex_p_fuse_session_add_chan
-#define fuse_session_destroy cortex_p_fuse_session_destroy
-#define fuse_session_exit cortex_p_fuse_session_exit
-#define fuse_session_loop cortex_p_fuse_session_loop
-#define fuse_unmount cortex_p_fuse_unmount
+#define fuse_add_direntry virtx_p_fuse_add_direntry
+#define fuse_chan_fd virtx_p_fuse_chan_fd
+#define fuse_lowlevel_new virtx_p_fuse_lowlevel_new
+#define fuse_mount virtx_p_fuse_mount
+#define fuse_opt_add_arg virtx_p_fuse_opt_add_arg
+#define fuse_opt_free_args virtx_p_fuse_opt_free_args
+#define fuse_reply_attr virtx_p_fuse_reply_attr
+#define fuse_reply_buf virtx_p_fuse_reply_buf
+#define fuse_reply_create virtx_p_fuse_reply_create
+#define fuse_reply_entry virtx_p_fuse_reply_entry
+#define fuse_reply_err virtx_p_fuse_reply_err
+#define fuse_reply_none virtx_p_fuse_reply_none
+#define fuse_reply_open virtx_p_fuse_reply_open
+#define fuse_reply_statfs virtx_p_fuse_reply_statfs
+#define fuse_reply_write virtx_p_fuse_reply_write
+#define fuse_req_userdata virtx_p_fuse_req_userdata
+#define fuse_session_add_chan virtx_p_fuse_session_add_chan
+#define fuse_session_destroy virtx_p_fuse_session_destroy
+#define fuse_session_exit virtx_p_fuse_session_exit
+#define fuse_session_loop virtx_p_fuse_session_loop
+#define fuse_unmount virtx_p_fuse_unmount
 
 /* Mirrors the Rust side's TTL. Spelled here rather than plumbed through the
  * vtable, because libfuse wants it as a double.
@@ -119,8 +119,8 @@ int cortex_fuse_t_available(void) {
  * Two copies of one number, with nothing checking they agree: changing
  * `posix::TTL` and not this leaves the FUSE-T mount caching for a different
  * window than the other bindings, silently. Plumb it through
- * `cortex_fuse_t_ops` if it ever needs to be configurable. */
-#define CORTEX_TTL 1.0
+ * `virtx_fuse_t_ops` if it ever needs to be configurable. */
+#define VIRTX_TTL 1.0
 
 struct session {
     struct fuse_chan *ch;
@@ -128,16 +128,16 @@ struct session {
     char *mountpoint;
     void *fs;
     /* The serving loop has been told to stop. Makes stopping idempotent, which
-     * is what lets `cortex_fuse_t_destroy` call it unconditionally. */
+     * is what lets `virtx_fuse_t_destroy` call it unconditionally. */
     int stopped;
-    struct cortex_fuse_t_ops ops;
+    struct virtx_fuse_t_ops ops;
 };
 
 static struct session *ctx(fuse_req_t req) {
     return (struct session *)fuse_req_userdata(req);
 }
 
-static void widen(const struct cortex_stat *in, struct stat *out) {
+static void widen(const struct virtx_stat *in, struct stat *out) {
     memset(out, 0, sizeof *out);
     out->st_ino = in->ino;
     out->st_size = (off_t)in->size;
@@ -168,7 +168,7 @@ static int replied_error(fuse_req_t req, int err) {
 static void ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
     struct session *s = ctx(req);
     uint64_t ino = 0;
-    struct cortex_stat cs;
+    struct virtx_stat cs;
     if (replied_error(req, s->ops.lookup(s->fs, parent, name, &ino, &cs))) return;
 
     struct fuse_entry_param e;
@@ -176,8 +176,8 @@ static void ll_lookup(fuse_req_t req, fuse_ino_t parent, const char *name) {
     e.ino = (fuse_ino_t)ino;
     /* Inode numbers are never reused, so no generation is needed. */
     e.generation = 0;
-    e.attr_timeout = CORTEX_TTL;
-    e.entry_timeout = CORTEX_TTL;
+    e.attr_timeout = VIRTX_TTL;
+    e.entry_timeout = VIRTX_TTL;
     widen(&cs, &e.attr);
     fuse_reply_entry(req, &e);
 }
@@ -191,11 +191,11 @@ static void ll_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup) {
 static void ll_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
     (void)fi;
     struct session *s = ctx(req);
-    struct cortex_stat cs;
+    struct virtx_stat cs;
     if (replied_error(req, s->ops.getattr(s->fs, ino, &cs))) return;
     struct stat st;
     widen(&cs, &st);
-    fuse_reply_attr(req, &st, CORTEX_TTL);
+    fuse_reply_attr(req, &st, VIRTX_TTL);
 }
 
 static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set,
@@ -204,12 +204,12 @@ static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
     int has_size = (to_set & FUSE_SET_ATTR_SIZE) != 0;
     uint64_t size = has_size ? (uint64_t)attr->st_size : 0;
     /* Mode, ownership, and timestamps are dropped; see `setattr_inode`. */
-    struct cortex_stat cs;
+    struct virtx_stat cs;
     int err = s->ops.setattr(s->fs, ino, fi ? fi->fh : 0, fi ? 1 : 0, size, has_size, &cs);
     if (replied_error(req, err)) return;
     struct stat st;
     widen(&cs, &st);
-    fuse_reply_attr(req, &st, CORTEX_TTL);
+    fuse_reply_attr(req, &st, VIRTX_TTL);
 }
 
 static void ll_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi) {
@@ -225,7 +225,7 @@ static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     (void)mode;
     struct session *s = ctx(req);
     uint64_t ino = 0, fh = 0;
-    struct cortex_stat cs;
+    struct virtx_stat cs;
     int err = s->ops.create(s->fs, parent, name, fi->flags, &ino, &fh, &cs);
     if (replied_error(req, err)) return;
     fi->fh = fh;
@@ -234,8 +234,8 @@ static void ll_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_
     memset(&e, 0, sizeof e);
     e.ino = (fuse_ino_t)ino;
     e.generation = 0;
-    e.attr_timeout = CORTEX_TTL;
-    e.entry_timeout = CORTEX_TTL;
+    e.attr_timeout = VIRTX_TTL;
+    e.entry_timeout = VIRTX_TTL;
     widen(&cs, &e.attr);
     fuse_reply_create(req, &e, fi);
 }
@@ -289,15 +289,15 @@ static void ll_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t
     (void)mode;
     struct session *s = ctx(req);
     uint64_t ino = 0;
-    struct cortex_stat cs;
+    struct virtx_stat cs;
     if (replied_error(req, s->ops.mkdir(s->fs, parent, name, &ino, &cs))) return;
 
     struct fuse_entry_param e;
     memset(&e, 0, sizeof e);
     e.ino = (fuse_ino_t)ino;
     e.generation = 0;
-    e.attr_timeout = CORTEX_TTL;
-    e.entry_timeout = CORTEX_TTL;
+    e.attr_timeout = VIRTX_TTL;
+    e.entry_timeout = VIRTX_TTL;
     widen(&cs, &e.attr);
     fuse_reply_entry(req, &e);
 }
@@ -375,7 +375,7 @@ static void ll_statfs(fuse_req_t req, fuse_ino_t ino) {
     fuse_reply_statfs(req, &v);
 }
 
-/* Only what cortex implements. libfuse answers the rest with ENOSYS, matching
+/* Only what virtx implements. libfuse answers the rest with ENOSYS, matching
  * the other bindings: symlinks, hard links, xattrs, locks. */
 static const struct fuse_lowlevel_ops LL_OPS = {
     .lookup = ll_lookup,
@@ -397,9 +397,9 @@ static const struct fuse_lowlevel_ops LL_OPS = {
     .create = ll_create,
 };
 
-void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname,
+void *virtx_fuse_t_mount(const char *mountpoint, const char *fsname,
                           const char *backend, void *fs,
-                          const struct cortex_fuse_t_ops *ops) {
+                          const struct virtx_fuse_t_ops *ops) {
     struct session *s = calloc(1, sizeof *s);
     if (!s) return NULL;
     s->fs = fs;
@@ -408,7 +408,7 @@ void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname,
     if (!s->mountpoint) goto fail;
 
     struct fuse_args args = FUSE_ARGS_INIT(0, NULL);
-    if (fuse_opt_add_arg(&args, "cortex") != 0) goto fail_args;
+    if (fuse_opt_add_arg(&args, "virtx") != 0) goto fail_args;
     if (fuse_opt_add_arg(&args, "-o") != 0) goto fail_args;
     {
         /* One `-o`, because libfuse takes a comma-separated list and a second
@@ -446,12 +446,12 @@ fail:
     return NULL;
 }
 
-int cortex_fuse_t_loop(void *session) {
+int virtx_fuse_t_loop(void *session) {
     struct session *s = session;
     return fuse_session_loop(s->se);
 }
 
-void cortex_fuse_t_stop(void *session) {
+void virtx_fuse_t_stop(void *session) {
     struct session *s = session;
     if (!s || s->stopped) return;
     s->stopped = 1;
@@ -479,10 +479,10 @@ void cortex_fuse_t_stop(void *session) {
     if (fd >= 0) shutdown(fd, SHUT_RDWR);
 }
 
-void cortex_fuse_t_destroy(void *session) {
+void virtx_fuse_t_destroy(void *session) {
     struct session *s = session;
     if (!s) return;
-    cortex_fuse_t_stop(s);
+    virtx_fuse_t_stop(s);
     /* Takes the channel with it, and with it the one close of its descriptor. */
     if (s->se) fuse_session_destroy(s->se);
     free(s->mountpoint);

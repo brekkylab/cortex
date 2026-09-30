@@ -1,4 +1,4 @@
-//! # Cortex
+//! # Virtx
 //!
 //! The environment an agent works in: what it can see, and what it can do.
 //!
@@ -25,8 +25,8 @@
 //! ```ignore
 //! use std::path::Path;
 //!
-//! use cortex::console::ConsoleClient;
-//! use cortex::fs::{Directory, FuseMount};
+//! use virtx::console::ConsoleClient;
+//! use virtx::fs::{Directory, FuseMount};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -77,7 +77,7 @@
 //! [`std::io::Error`], classified by kind, so neither has a vocabulary the other has to learn.
 //!
 //! **A console server is built on top of both**, and the crates under
-//! `cortex-console-servers/` are what that looks like: `local` runs commands on this host,
+//! `virtx-console-servers/` are what that looks like: `local` runs commands on this host,
 //! `uvm/console` runs them in a micro-VM with `uvm/guest` as its far half. Each finds its own
 //! way through `fs`, because a tree is mounted by whoever wants one rather than described on
 //! the wire and realized at the far end.
@@ -115,10 +115,10 @@ pub mod protocol;
 pub use futures_core::future::BoxFuture;
 
 #[cfg(feature = "ensure")]
-pub use ensure::ensure_cortex;
+pub use ensure::ensure_virtx;
 
-/// Everything cortex keeps on this host, under one root: `$CORTEX_HOME`, or
-/// `cortex` under the user's cache directory.
+/// Everything virtx keeps on this host, under one root: `$VIRTX_HOME`, or
+/// `virtx` under the user's cache directory.
 ///
 /// **One rule for every kind of thing kept here**, because a host has one answer to "where
 /// does this go" and two ways of deriving it are two answers. What hangs off it is split by
@@ -130,7 +130,7 @@ pub use ensure::ensure_cortex;
 /// `~/Library/Caches`, and on Windows `%LOCALAPPDATA%`, falling back to
 /// `%USERPROFILE%\AppData\Local` when that is unset.
 pub fn cache_root() -> std::path::PathBuf {
-    if let Some(named) = std::env::var_os("CORTEX_HOME") {
+    if let Some(named) = std::env::var_os("VIRTX_HOME") {
         return std::path::PathBuf::from(named);
     }
 
@@ -142,13 +142,13 @@ pub fn cache_root() -> std::path::PathBuf {
                 .join("AppData")
                 .join("Local")
         })
-        .join("cortex");
+        .join("virtx");
 
     #[cfg(target_os = "macos")]
     return std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
         .join("Library")
         .join("Caches")
-        .join("cortex");
+        .join("virtx");
 
     #[cfg(not(any(windows, target_os = "macos")))]
     return std::env::var_os("XDG_CACHE_HOME")
@@ -156,5 +156,5 @@ pub fn cache_root() -> std::path::PathBuf {
         .unwrap_or_else(|| {
             std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache")
         })
-        .join("cortex");
+        .join("virtx");
 }

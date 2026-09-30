@@ -40,10 +40,10 @@ fn missing(what: &str) -> io::Error {
 #[cfg(target_os = "macos")]
 fn check() -> io::Result<()> {
     unsafe extern "C" {
-        fn cortex_fuse_t_available() -> std::ffi::c_int;
+        fn virtx_fuse_t_available() -> std::ffi::c_int;
     }
     // SAFETY: reads whether the shim's weak imports resolved; calls nothing through them.
-    if unsafe { cortex_fuse_t_available() } == 0 {
+    if unsafe { virtx_fuse_t_available() } == 0 {
         return Err(missing(
             "mounting on macOS needs FUSE-T, which is not installed: \
              brew install --cask fuse-t, or the installer from https://www.fuse-t.org",

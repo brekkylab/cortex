@@ -1,6 +1,6 @@
-# Cortex
+# virtX
 
-Cortex lets you run tasks in disposable Linux VMs from your own code.
+virtX lets you run tasks in disposable Linux VMs from your own code.
 
 It's useful for jobs with heavy dependencies that you'd rather not install on your own machine.
 Whatever they install or change is gone when the VM shuts down.
@@ -15,7 +15,7 @@ Create, use, and dispose of VMs directly from your code.
 ```python
 import asyncio
 
-from cortex import ConsoleClient, Recipe
+from virtx import ConsoleClient, Recipe
 
 
 async def main() -> None:
@@ -27,7 +27,7 @@ async def main() -> None:
 
     async with console:
         result = await console.exec(
-            ["sh", "-c", """echo '{"hello": "cortex"}' | jq -r .hello"""]
+            ["sh", "-c", """echo '{"hello": "virtx"}' | jq -r .hello"""]
         )
 
     print("\n" + result.stdout.decode(), end="")
@@ -39,14 +39,14 @@ asyncio.run(main())
 ### Node
 
 ```js
-import { ConsoleClient, Recipe } from 'cortex-node'
+import { ConsoleClient, Recipe } from 'virtx-node'
 
 const console_ = await ConsoleClient.builder()
   .image(new Recipe('alpine:latest').step('apk add --no-cache jq'))
   .build()
 
 try {
-  const result = await console_.exec(['sh', '-c', `echo '{"hello": "cortex"}' | jq -r .hello`])
+  const result = await console_.exec(['sh', '-c', `echo '{"hello": "virtx"}' | jq -r .hello`])
   process.stdout.write('\n' + result.stdout)
 } finally {
   await console_.close()
@@ -56,7 +56,7 @@ try {
 ### Rust
 
 ```rust
-use cortex::{console::ConsoleClient, image::Recipe};
+use virtx::{console::ConsoleClient, image::Recipe};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     let result = console
-        .exec(["sh", "-c", r#"echo '{"hello": "cortex"}' | jq -r .hello"#], None)
+        .exec(["sh", "-c", r#"echo '{"hello": "virtx"}' | jq -r .hello"#], None)
         .await?;
 
     print!("\n{}", String::from_utf8_lossy(&result.stdout));
@@ -83,7 +83,7 @@ step 1/1: cd '/' && apk add --no-cache jq
 Executing busybox-1.37.0-r31.trigger
 OK: 9426 KiB in 18 packages
 
-cortex
+virtx
 ```
 
 ## Features
@@ -105,7 +105,7 @@ Turn it on with the builder's `gpu` option:
 ```python
 import asyncio
 
-from cortex import ConsoleClient, Recipe
+from virtx import ConsoleClient, Recipe
 
 
 async def main() -> None:
@@ -139,7 +139,7 @@ Mount a host directory into the VM by passing its path.
 ```python
 import asyncio
 
-from cortex import ConsoleClient, Recipe
+from virtx import ConsoleClient, Recipe
 
 
 async def main() -> None:
@@ -169,7 +169,7 @@ It mixes files held only in memory with host directories, all under one mount po
 import asyncio
 import tempfile
 
-from cortex import ConsoleClient, Directory, HostMount, Recipe
+from virtx import ConsoleClient, Directory, HostMount, Recipe
 
 
 async def main() -> None:
@@ -201,18 +201,18 @@ asyncio.run(main())
 Moreover, external stores like S3, Google Drive and Notion, and commands inside the VM can read them as ordinary files.
 
 ```rust
-use cortex::{
+use virtx::{
     console::ConsoleClient,
     fs::{S3Config, S3Fs},
     image::Recipe,
 };
 
 #[cfg(target_os = "linux")]
-use cortex::fs::FuseMount as HostMount;
+use virtx::fs::FuseMount as HostMount;
 #[cfg(target_os = "macos")]
-use cortex::fs::FuseTMount as HostMount;
+use virtx::fs::FuseTMount as HostMount;
 #[cfg(windows)]
-use cortex::fs::DokanMount as HostMount;
+use virtx::fs::DokanMount as HostMount;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -225,7 +225,7 @@ async fn main() -> anyhow::Result<()> {
         key_prefix: None,
     })?;
 
-    let mountpoint = std::env::temp_dir().join("cortex-s3");
+    let mountpoint = std::env::temp_dir().join("virtx-s3");
     std::fs::create_dir_all(&mountpoint)?;
     let mount = HostMount::try_new(bucket, &mountpoint)?;
 
@@ -246,7 +246,7 @@ These stores are Rust only for now, each behind its own feature: `s3`, `gdrive` 
 S3 is read-only, so it's mounted with `mount_readonly`.
 
 This feature needs an extra package installed on macOS and Windows.
-The `mount` feature, on by default, mounts a cortex filesystem on the host through the host's FUSE provider:
+The `mount` feature, on by default, mounts a virtx filesystem on the host through the host's FUSE provider:
 
 | Host  | Provider | Needed to build | Needed to mount |
 |-------|----------|-----------------|---------------|
@@ -255,7 +255,7 @@ The `mount` feature, on by default, mounts a cortex filesystem on the host throu
 | Windows | [Dokany](https://github.com/dokan-dev/dokany) | — | ✓ |
 
 A program built with `mount` runs on a host without the provider; only mounting fails, with an error that says what to install.
-`cortex::fs::mount_support()` (`mount_support()` in Python, `mountSupport()` in Node) asks ahead of a mount.
+`virtx::fs::mount_support()` (`mount_support()` in Python, `mountSupport()` in Node) asks ahead of a mount.
 On Windows that needs the binary linked with `/DELAYLOAD:dokan2.dll` — see the `mount` feature in `Cargo.toml`.
 
 If you don't mount on the host, build with `default-features = false` and skip all of this.
@@ -274,12 +274,12 @@ winget install --id dokan-dev.Dokany
 
 ## Cache
 
-Cortex keeps all persistent state in a single cache directory that you can safely delete at any time:
+virtX keeps all persistent state in a single cache directory that you can safely delete at any time:
 
 | Host | Cache directory |
 |------|-----------------|
-| Linux | `$XDG_CACHE_HOME/cortex`, or `~/.cache/cortex` |
-| macOS | `~/Library/Caches/cortex` |
-| Windows | `%LOCALAPPDATA%\cortex` |
+| Linux | `$XDG_CACHE_HOME/virtx`, or `~/.cache/virtx` |
+| macOS | `~/Library/Caches/virtx` |
+| Windows | `%LOCALAPPDATA%\virtx` |
 
-Set `CORTEX_HOME` to put it somewhere else.
+Set `VIRTX_HOME` to put it somewhere else.

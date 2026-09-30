@@ -3,7 +3,7 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "cortex-py"
+name = "virtx-py"
 version = "0.1.0"
 description = "The environment an agent works in: what it can see, and what it can do."
 readme = "README.md"
@@ -18,7 +18,7 @@ dev = ["maturin>=1.9,<2", "pytest>=8", "pytest-asyncio>=1"]
 
 [tool.maturin]
 python-source = "python"
-module-name = "cortex._cortex"
+module-name = "virtx._virtx"
 features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]

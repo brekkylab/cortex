@@ -113,7 +113,7 @@ fn install() -> io::Result<()> {
     }
 
     std::thread::Builder::new()
-        .name("cortex-unmount-on-signal".into())
+        .name("virtx-unmount-on-signal".into())
         .spawn(move || watch(read))?;
 
     // Published before the first handler is installed, so a signal that arrives
@@ -203,7 +203,7 @@ fn watch(read: libc::c_int) -> ! {
             // to clear by hand, and this is the last moment anything in this
             // process can say so.
             eprintln!(
-                "cortex: {} did not come down on signal {signal} — unmount it by hand",
+                "virtx: {} did not come down on signal {signal} — unmount it by hand",
                 mountpoint.display()
             );
         }

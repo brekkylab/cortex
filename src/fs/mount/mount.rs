@@ -17,7 +17,7 @@ use std::{
 ///
 /// So the two compose rather than overlap. A `Directory` is what a mount serves; a `Mount` is
 /// what makes it reachable by name — which is how anything that is not this library reads a
-/// cortex tree, a guest included, and why a consumer that needs real paths takes one of these
+/// virtx tree, a guest included, and why a consumer that needs real paths takes one of these
 /// and not a store.
 ///
 /// # The tree is there for as long as the value is

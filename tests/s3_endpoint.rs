@@ -23,7 +23,7 @@
 
 use std::{path::Path, process::Command};
 
-use cortex::fs::{DirentKind, FileSystem, S3Config, S3Fs};
+use virtx::fs::{DirentKind, FileSystem, S3Config, S3Fs};
 
 /// The mock this drives — a stand-in for the read APIs of a dozen enterprise
 /// services, S3 among them, over a corpus rather than a live account.
@@ -274,7 +274,7 @@ async fn a_missing_key_on_a_real_endpoint_is_not_found() {
     let Some((vol, _)) = volume().await else {
         return;
     };
-    let missing = Path::new("cortex-e2e-no-such-key-8f2a1c");
+    let missing = Path::new("virtx-e2e-no-such-key-8f2a1c");
     let err = vol
         .stat(missing)
         .await

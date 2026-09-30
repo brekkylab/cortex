@@ -10,8 +10,8 @@
 //!
 //! # Why a register at all, rather than reading the mount table
 //!
-//! The mount table cannot say which mounts are cortex's. A FUSE-T mount is spelled
-//! `nfs` there, and the mount point is a path the *caller* chose — cortex takes an
+//! The mount table cannot say which mounts are virtx's. A FUSE-T mount is spelled
+//! `nfs` there, and the mount point is a path the *caller* chose — virtx takes an
 //! arbitrary `&Path` and has no naming convention to recognise later. So what is
 //! swept has to be what was written down.
 //!
@@ -72,7 +72,7 @@ use {
 use super::table::{mounts_under, unmount_under};
 
 /// Where the records live, under the temporary directory.
-const DIR: &str = "cortex-mounts";
+const DIR: &str = "virtx-mounts";
 
 /// How many abandoned mount points one call will spend an unmount on.
 ///
@@ -154,7 +154,7 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
 const WATCHDOG_SCRIPT: &str = r#"
 trap '' INT TERM HUP QUIT PIPE
 cat >/dev/null
-for record in "$CORTEX_MOUNT_REGISTRY/$CORTEX_MOUNT_OWNER"-*; do
+for record in "$VIRTX_MOUNT_REGISTRY/$VIRTX_MOUNT_OWNER"-*; do
     [ -f "$record" ] || continue
     mountpoint=$(cat "$record") || continue
     if [ -z "$mountpoint" ]; then rm -f "$record"; continue; fi
@@ -192,9 +192,9 @@ fn watch(registry: &Path) {
         return;
     }
     let spawned = Command::new("/bin/sh")
-        .args(["-c", WATCHDOG_SCRIPT, "cortex-mount-watchdog"])
-        .env("CORTEX_MOUNT_OWNER", pid.to_string())
-        .env("CORTEX_MOUNT_REGISTRY", registry)
+        .args(["-c", WATCHDOG_SCRIPT, "virtx-mount-watchdog"])
+        .env("VIRTX_MOUNT_OWNER", pid.to_string())
+        .env("VIRTX_MOUNT_REGISTRY", registry)
         .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -286,7 +286,7 @@ fn gone(pid: libc::pid_t) -> bool {
     answer == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Take down every mount this host has that belonged to a cortex process which is
+/// Take down every mount this host has that belonged to a virtx process which is
 /// no longer running, and report what that met.
 ///
 /// This is the `SIGKILL` half of the contract. Nothing a dying process does can
@@ -384,7 +384,7 @@ mod tests {
     /// a mount that is up has to be on it and one that is gone has to be off it.
     #[test]
     fn a_claim_lasts_exactly_as_long_as_it_is_held() {
-        let path = std::env::temp_dir().join("cortex-claim-probe");
+        let path = std::env::temp_dir().join("virtx-claim-probe");
         let resolved = resolved(&path);
 
         // This path and no other. The register is process-wide and these tests run
@@ -406,7 +406,7 @@ mod tests {
     /// property that keeps a second instance from unmounting the first's tree.
     #[test]
     fn a_live_process_keeps_its_own_records() {
-        let path = std::env::temp_dir().join("cortex-claim-live-probe");
+        let path = std::env::temp_dir().join("virtx-claim-live-probe");
         let held = claim(&path);
         let record = held.record.clone().expect("a record was written");
 
@@ -431,7 +431,7 @@ mod tests {
         use crate::fs::{FileSystem, InMemFs};
 
         let path =
-            std::env::temp_dir().join(format!("cortex-claim-live-mount-{}", std::process::id()));
+            std::env::temp_dir().join(format!("virtx-claim-live-mount-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("temp dir is writable");
 
@@ -465,8 +465,8 @@ mod tests {
         };
         // Above the largest pid any of these systems hands out, so it names nothing
         // running and cannot come to name something later.
-        let record = dir.join(format!("{}-cortex-test", libc::pid_t::MAX));
-        let mountpoint = std::env::temp_dir().join("cortex-claim-dead-probe");
+        let record = dir.join(format!("{}-virtx-test", libc::pid_t::MAX));
+        let mountpoint = std::env::temp_dir().join("virtx-claim-dead-probe");
         fs::create_dir_all(&mountpoint).unwrap();
         fs::write(&record, mountpoint.as_os_str().as_bytes()).unwrap();
 

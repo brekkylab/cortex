@@ -1,10 +1,10 @@
-//! Python bindings for cortex, imported as `cortex._cortex`.
+//! Python bindings for virtx, imported as `virtx._virtx`.
 //!
-//! The shape is cortex's own, spelled in Python: a [`ConsoleClient`](cortex::console::ConsoleClient)
-//! is built by a builder and awaited, a [`Directory`](cortex::fs::Directory) is assembled and
-//! handed to a host mount, a [`Recipe`](cortex::image::Recipe) is a base and its steps, and an
-//! [`ImageClient`](cortex::image::ImageClient) builds one ahead of the session that runs on it.
-//! Nothing here adds a layer of its own over that — a Python caller reading cortex's Rust
+//! The shape is virtx's own, spelled in Python: a [`ConsoleClient`](virtx::console::ConsoleClient)
+//! is built by a builder and awaited, a [`Directory`](virtx::fs::Directory) is assembled and
+//! handed to a host mount, a [`Recipe`](virtx::image::Recipe) is a base and its steps, and an
+//! [`ImageClient`](virtx::image::ImageClient) builds one ahead of the session that runs on it.
+//! Nothing here adds a layer of its own over that — a Python caller reading virtx's Rust
 //! documentation should find the same names doing the same things.
 //!
 //! One module per half, as in the crate: [`console`] for running commands, [`fs`] for the
@@ -21,13 +21,13 @@ pub mod fs;
 pub mod image;
 
 #[pymodule]
-fn _cortex(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _virtx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register(m)
 }
 
 /// Add every class, exception and constant this module has to `m`.
 ///
-/// The module's own init, and also what a binding that links this crate calls to put cortex
+/// The module's own init, and also what a binding that links this crate calls to put virtx
 /// into an extension of its own — see the `rlib` in `Cargo.toml`.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(m)?;

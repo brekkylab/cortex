@@ -2,13 +2,13 @@
 
     uv run python examples/hello.py
 
-Needs the console server under `~/.cache/cortex/bin` (or `CORTEX_STDIO_SERVER_PATH`).
+Needs the console server under `~/.cache/virtx/bin` (or `VIRTX_STDIO_SERVER_PATH`).
 """
 
 import asyncio
 import sys
 
-from cortex import ConsoleClient, Recipe
+from virtx import ConsoleClient, Recipe
 
 
 async def main() -> None:
@@ -21,7 +21,7 @@ async def main() -> None:
     # Leaving the block says `quit`, and the server tears the session down.
     async with console:
         result = await console.exec(
-            ["sh", "-c", """echo '{"hello": "cortex"}' | jq -r .hello"""]
+            ["sh", "-c", """echo '{"hello": "virtx"}' | jq -r .hello"""]
         )
 
     print(result.stdout.decode(errors="replace"), end="")

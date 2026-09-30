@@ -250,7 +250,7 @@ impl<T: FileSystem> Posix<T> {
 /// this is hidden from a listing for as long as the prefix does. NFS made the same trade with
 /// `.nfsXXXX`, for the same reason — the name has to live in the same directory, so it has to
 /// live in the caller's namespace.
-const HELD_PREFIX: &str = ".cortex-unlinked-";
+const HELD_PREFIX: &str = ".virtx-unlinked-";
 
 /// How long a kernel may cache a lookup or attribute reply — also the window in which a
 /// write stays invisible, hence short.

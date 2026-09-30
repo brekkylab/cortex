@@ -53,12 +53,12 @@ const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
     create_new: libc::O_EXCL,
 };
 
-/// Mirror of `struct cortex_stat` in `contrib/fuse_t/shim.h`. All fixed-width with an
+/// Mirror of `struct virtx_stat` in `contrib/fuse_t/shim.h`. All fixed-width with an
 /// explicit pad, so keeping the two in step is a matter of reading rather than of trusting
 /// alignment rules.
 #[repr(C)]
 #[derive(Default)]
-struct CortexStat {
+struct VirtxStat {
     ino: u64,
     size: u64,
     blocks: u64,
@@ -74,12 +74,12 @@ struct CortexStat {
     ctime_nsec: i64,
 }
 
-fn to_cortex_stat(inode: u64, stat: &Stat) -> CortexStat {
+fn to_virtx_stat(inode: u64, stat: &Stat) -> VirtxStat {
     let attr = attr_for(stat);
     let (mtime, mtime_nsec) = unix_time(attr.mtime);
     let (atime, atime_nsec) = unix_time(attr.atime);
     let (ctime, ctime_nsec) = unix_time(attr.ctime);
-    CortexStat {
+    VirtxStat {
         ino: inode,
         size: attr.size,
         blocks: attr.blocks,
@@ -100,14 +100,14 @@ fn to_cortex_stat(inode: u64, stat: &Stat) -> CortexStat {
 /// Implemented on the C side, which owns `fuse_add_direntry`'s accounting.
 type DirentSink = unsafe extern "C" fn(*mut c_void, u64, *const c_char, u32, u64) -> c_int;
 
-/// Mirror of `struct cortex_fuse_t_ops`. Field order is the contract.
+/// Mirror of `struct virtx_fuse_t_ops`. Field order is the contract.
 #[repr(C)]
 struct Ops {
     lookup:
-        unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut CortexStat) -> c_int,
-    getattr: unsafe extern "C" fn(*mut c_void, u64, *mut CortexStat) -> c_int,
+        unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut VirtxStat) -> c_int,
+    getattr: unsafe extern "C" fn(*mut c_void, u64, *mut VirtxStat) -> c_int,
     setattr:
-        unsafe extern "C" fn(*mut c_void, u64, u64, c_int, u64, c_int, *mut CortexStat) -> c_int,
+        unsafe extern "C" fn(*mut c_void, u64, u64, c_int, u64, c_int, *mut VirtxStat) -> c_int,
     open: unsafe extern "C" fn(*mut c_void, u64, c_int, *mut u64) -> c_int,
     create: unsafe extern "C" fn(
         *mut c_void,
@@ -116,14 +116,14 @@ struct Ops {
         c_int,
         *mut u64,
         *mut u64,
-        *mut CortexStat,
+        *mut VirtxStat,
     ) -> c_int,
     read: unsafe extern "C" fn(*mut c_void, u64, u64, u64, *mut c_char) -> c_long,
     write: unsafe extern "C" fn(*mut c_void, u64, u64, u64, *const c_char) -> c_long,
     flush: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
     release: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
     mkdir:
-        unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut CortexStat) -> c_int,
+        unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut VirtxStat) -> c_int,
     unlink: unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> c_int,
     rmdir: unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> c_int,
     rename: unsafe extern "C" fn(*mut c_void, u64, *const c_char, u64, *const c_char) -> c_int,
@@ -136,22 +136,22 @@ struct Ops {
 }
 
 unsafe extern "C" {
-    fn cortex_fuse_t_mount(
+    fn virtx_fuse_t_mount(
         mountpoint: *const c_char,
         fsname: *const c_char,
         backend: *const c_char,
         fs: *mut c_void,
         ops: *const Ops,
     ) -> *mut c_void;
-    fn cortex_fuse_t_loop(session: *mut c_void) -> c_int;
-    fn cortex_fuse_t_stop(session: *mut c_void);
-    fn cortex_fuse_t_destroy(session: *mut c_void);
+    fn virtx_fuse_t_loop(session: *mut c_void) -> c_int;
+    fn virtx_fuse_t_stop(session: *mut c_void);
+    fn virtx_fuse_t_destroy(session: *mut c_void);
 }
 
 /// Recover the filesystem from the opaque pointer the shim carries for us.
 ///
 /// # Safety
-/// `fs` must be the pointer given to `cortex_fuse_t_mount`, and the `Posix<T>` behind it must
+/// `fs` must be the pointer given to `virtx_fuse_t_mount`, and the `Posix<T>` behind it must
 /// outlive the session — [`FuseTMount`] boxes it and keeps it until after the loop returns.
 unsafe fn recover<'a, T: FileSystem>(fs: *mut c_void) -> &'a Posix<T> {
     unsafe { &*(fs as *const Posix<T>) }
@@ -173,14 +173,14 @@ unsafe extern "C" fn lookup<T: FileSystem>(
     parent: u64,
     name: *const c_char,
     out_inode: *mut u64,
-    out: *mut CortexStat,
+    out: *mut VirtxStat,
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
     code(
         super::block_on(fs.lookup_child(parent, name)).map(|(inode, stat)| unsafe {
             *out_inode = inode;
-            *out = to_cortex_stat(inode, &stat);
+            *out = to_virtx_stat(inode, &stat);
         }),
     )
 }
@@ -188,11 +188,11 @@ unsafe extern "C" fn lookup<T: FileSystem>(
 unsafe extern "C" fn getattr<T: FileSystem>(
     fs: *mut c_void,
     inode: u64,
-    out: *mut CortexStat,
+    out: *mut VirtxStat,
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     code(super::block_on(fs.stat_inode(inode)).map(|stat| unsafe {
-        *out = to_cortex_stat(inode, &stat);
+        *out = to_virtx_stat(inode, &stat);
     }))
 }
 
@@ -206,7 +206,7 @@ unsafe extern "C" fn setattr<T: FileSystem>(
     _has_fh: c_int,
     size: u64,
     has_size: c_int,
-    out: *mut CortexStat,
+    out: *mut VirtxStat,
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     let want = SetAttr {
@@ -216,7 +216,7 @@ unsafe extern "C" fn setattr<T: FileSystem>(
     };
     code(
         super::block_on(fs.setattr_inode(inode, want)).map(|stat| unsafe {
-            *out = to_cortex_stat(inode, &stat);
+            *out = to_virtx_stat(inode, &stat);
         }),
     )
 }
@@ -246,7 +246,7 @@ unsafe extern "C" fn create<T: FileSystem>(
     flags: c_int,
     out_inode: *mut u64,
     out_fh: *mut u64,
-    out: *mut CortexStat,
+    out: *mut VirtxStat,
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
@@ -260,7 +260,7 @@ unsafe extern "C" fn create<T: FileSystem>(
         super::block_on(fs.create_child(parent, name, options)).map(|(inode, stat, fh)| unsafe {
             *out_inode = inode;
             *out_fh = fh;
-            *out = to_cortex_stat(inode, &stat);
+            *out = to_virtx_stat(inode, &stat);
         }),
     )
 }
@@ -314,14 +314,14 @@ unsafe extern "C" fn mkdir<T: FileSystem>(
     parent: u64,
     name: *const c_char,
     out_inode: *mut u64,
-    out: *mut CortexStat,
+    out: *mut VirtxStat,
 ) -> c_int {
     let fs = unsafe { recover::<T>(fs) };
     let name = OsStr::from_bytes(unsafe { CStr::from_ptr(name) }.to_bytes());
     code(
         super::block_on(fs.mkdir_child(parent, name)).map(|(inode, stat)| unsafe {
             *out_inode = inode;
-            *out = to_cortex_stat(inode, &stat);
+            *out = to_virtx_stat(inode, &stat);
         }),
     )
 }
@@ -428,7 +428,7 @@ fn ops_for<T: FileSystem>() -> Ops {
 ///
 /// Fixed, because nothing has wanted another one, and a `CStr` literal so there is neither
 /// an allocation nor an invalid-name case to answer for.
-const FSNAME: &CStr = c"cortex";
+const FSNAME: &CStr = c"virtx";
 
 /// How long to wait for FUSE-T to finish mounting. Generous: the helper has to start,
 /// negotiate, and get the kernel to complete a mount.
@@ -604,7 +604,7 @@ impl FuseTMount {
         let ops = ops_for::<T>();
 
         let session = unsafe {
-            cortex_fuse_t_mount(
+            virtx_fuse_t_mount(
                 c_mountpoint.as_ptr(),
                 FSNAME.as_ptr(),
                 backend,
@@ -622,13 +622,13 @@ impl FuseTMount {
 
         let sendable = SessionPtr(session);
         let thread = std::thread::Builder::new()
-            .name("cortex-fuse-t".into())
-            .spawn(move || unsafe { cortex_fuse_t_loop(sendable.get()) })
+            .name("virtx-fuse-t".into())
+            .spawn(move || unsafe { virtx_fuse_t_loop(sendable.get()) })
             .inspect_err(|_| {
                 // The one failure no guard can clean up after, because it is what keeps the
                 // guard from existing: nothing is serving, so tear the mount back down here
                 // rather than leave it wedged.
-                unsafe { cortex_fuse_t_destroy(session) };
+                unsafe { virtx_fuse_t_destroy(session) };
             })?;
 
         // From here on the guard exists, so every way out of this function unmounts by
@@ -762,7 +762,7 @@ impl Drop for FuseTMount {
     /// its own mount goes. With two mounts up, `drop(a); drop(b)` therefore never reaches the
     /// second line: both teardowns sit in `wait4` while the mounts stay in the table.
     /// `_mount_wait_thread`, joined a few instructions later, is a single global in the same
-    /// way. The whole path is written for one mount per process, and cortex mounts one per
+    /// way. The whole path is written for one mount per process, and virtx mounts one per
     /// session.
     ///
     /// So the mount comes down the way a mount whose owner is *gone* has to come down anyway
@@ -795,7 +795,7 @@ impl Drop for FuseTMount {
         // Then stop serving, whether or not that worked. It is what releases anything still
         // reading through the mount, and a caller that has dropped the guard has already
         // said the mount is over.
-        unsafe { cortex_fuse_t_stop(session) };
+        unsafe { virtx_fuse_t_stop(session) };
 
         // Joined before the session is freed, because the loop reads it — and joined with a
         // deadline, because a thread that did not notice the shutdown must not become a hang
@@ -827,13 +827,13 @@ impl Drop for FuseTMount {
         // someone to clear by hand, so saying so is the least this can do.
         for survivor in left {
             eprintln!(
-                "cortex: {} would not unmount — take it down by hand",
+                "virtx: {} would not unmount — take it down by hand",
                 survivor.display()
             );
         }
         if !collected {
             eprintln!(
-                "cortex: the thread serving {} did not stop within {LOOP_EXIT_TIMEOUT:?}; \
+                "virtx: the thread serving {} did not stop within {LOOP_EXIT_TIMEOUT:?}; \
                  leaving its session and filesystem allocated",
                 self.mountpoint.display()
             );
@@ -842,7 +842,7 @@ impl Drop for FuseTMount {
             std::mem::forget(self._fs.take());
             return;
         }
-        unsafe { cortex_fuse_t_destroy(session) };
+        unsafe { virtx_fuse_t_destroy(session) };
     }
 }
 

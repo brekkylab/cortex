@@ -1,21 +1,21 @@
-//! How cortex's failures arrive in Python.
+//! How virtx's failures arrive in Python.
 //!
 //! A console or image-client call fails one of two ways, and they are two exceptions because
 //! a caller acts on them differently: [`Failure::Refused`] is the server answering with an error — a
 //! timeout, a missing file — and carries the code it answered with, where
 //! [`Failure::Broken`] is the channel itself gone, after which nothing more will be heard.
-//! Both derive from `CortexError`, which is also what a failure with no finer class —
+//! Both derive from `VirtxError`, which is also what a failure with no finer class —
 //! building a console, say — is raised as.
 //!
 //! The filesystem half answers in [`std::io::Error`], and pyo3 already raises that as the
 //! matching `OSError` subclass, so it is left to do so.
 
-use cortex::protocol::{Error, Failure};
+use virtx::protocol::{Error, Failure};
 use pyo3::{create_exception, exceptions::PyException, prelude::*, types::PyDict};
 
-create_exception!(cortex, CortexError, PyException);
-create_exception!(cortex, ConsoleRefused, CortexError);
-create_exception!(cortex, ConsoleBroken, CortexError);
+create_exception!(virtx, VirtxError, PyException);
+create_exception!(virtx, ConsoleRefused, VirtxError);
+create_exception!(virtx, ConsoleBroken, VirtxError);
 
 pub fn failure(failure: Failure) -> PyErr {
     match failure {
@@ -35,18 +35,18 @@ pub fn failure(failure: Failure) -> PyErr {
 pub fn anyhow(error: anyhow::Error) -> PyErr {
     match error.downcast::<Failure>() {
         Ok(f) => failure(f),
-        Err(error) => CortexError::new_err(format!("{error:#}")),
+        Err(error) => VirtxError::new_err(format!("{error:#}")),
     }
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
-    m.add("CortexError", py.get_type::<CortexError>())?;
+    m.add("VirtxError", py.get_type::<VirtxError>())?;
     m.add("ConsoleRefused", py.get_type::<ConsoleRefused>())?;
     m.add("ConsoleBroken", py.get_type::<ConsoleBroken>())?;
 
     // The numbers a `ConsoleRefused` carries, by name. Exported from here rather than
-    // written again in Python so that there is one list of them, and it is cortex's.
+    // written again in Python so that there is one list of them, and it is virtx's.
     let codes = PyDict::new(py);
     for (name, code) in [
         ("TIMED_OUT", Error::TIMED_OUT),

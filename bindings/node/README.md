@@ -1,16 +1,16 @@
-# cortex for Node
+# virtx for Node
 
-Node bindings for cortex, built with [napi-rs](https://napi.rs): the same `ConsoleClient`,
+Node bindings for virtx, built with [napi-rs](https://napi.rs): the same `ConsoleClient`,
 `ImageClient`, `Recipe`, `Directory` and host mount as the Rust crate, camelCased, with every call that
 waits returning a `Promise`.
 
 ```js
-const { ConsoleClient, Directory, HostMount, Recipe } = require('cortex-node')
+const { ConsoleClient, Directory, HostMount, Recipe } = require('virtx-node')
 
 const mount = new HostMount(new Directory().withFile('SKILL.md', '...'), '/tmp/skill')
 
 const console_ = await ConsoleClient.builder()
-  .cmd(['cortex-krun'])
+  .cmd(['virtx-uvm'])
   .image(new Recipe('python:3.12-slim-trixie').step('pip install duckdb'))
   .mountReadonly(mount, '/skills/example')
   .mount('./artifacts', '/artifacts')
@@ -27,14 +27,14 @@ try {
 }
 ```
 
-Without `.cmd(..)` a console runs `cortex-krun` from the stdio server directory
-(`$CORTEX_STDIO_SERVER_PATH`, or `~/.cache/cortex/bin`).
+Without `.cmd(..)` a console runs `virtx-uvm` from the stdio server directory
+(`$VIRTX_STDIO_SERVER_PATH`, or `~/.cache/virtx/bin`).
 
 An image can also be built ahead of the session that runs on it, and then named by its ref or
 its digest:
 
 ```js
-const { ImageClient, ImageSource, Recipe } = require('cortex-node')
+const { ImageClient, ImageSource, Recipe } = require('virtx-node')
 
 const images = await ImageClient.tryNew()
 const built = await images.build(new Recipe('alpine:3.20').step('apk add jq'), 'myimg:latest')
@@ -50,10 +50,10 @@ Every error carries a `code`, the way Node's own carry `ENOENT`:
 
 | `code` | When |
 |---|---|
-| `TIMED_OUT`, `NOT_FOUND`, … | the console or image server refused, with cortex's name for its answer |
-| `CONSOLE_REFUSED` | the server refused with a number this cortex has no name for |
+| `TIMED_OUT`, `NOT_FOUND`, … | the console or image server refused, with virtx's name for its answer |
+| `CONSOLE_REFUSED` | the server refused with a number this virtx has no name for |
 | `CONSOLE_BROKEN` | the channel to the server is gone |
-| `CORTEX_ERROR` | anything else from cortex, such as a console that could not be built |
+| `VIRTX_ERROR` | anything else from virtx, such as a console that could not be built |
 | `INVALID_ARG` | a spent builder, a mounted `Directory`, a negative offset |
 | `NotFound`, `InvalidInput`, … | a filesystem error, by its `io::ErrorKind` |
 
@@ -65,7 +65,7 @@ does — see the top-level README.
 ```sh
 cd bindings/node
 npm install
-npm run build        # or build:debug; writes index.js, index.d.ts and cortex.<platform>.node
+npm run build        # or build:debug; writes index.js, index.d.ts and virtx.<platform>.node
 npm test
 ```
 
@@ -73,4 +73,4 @@ npm test
 through: `npm run build -- --features s3,notion`.
 
 The console test at the end of `__test__/index.spec.mjs` needs a console server, named by
-`$CORTEX_CONSOLE`; without one it is skipped.
+`$VIRTX_CONSOLE`; without one it is skipped.

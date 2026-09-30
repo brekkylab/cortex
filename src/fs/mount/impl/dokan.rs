@@ -97,7 +97,7 @@ use crate::fs::{
 };
 
 /// What the volume calls itself — the label Explorer shows beside the drive letter.
-const VOLUME_NAME: &str = "cortex";
+const VOLUME_NAME: &str = "virtx";
 
 /// What the volume reports as its *format*.
 ///
@@ -197,7 +197,7 @@ impl DokanMount {
         let serving = {
             let wide = wide.clone();
             std::thread::Builder::new()
-                .name("cortex-dokan".into())
+                .name("virtx-dokan".into())
                 .spawn(move || serve(fs, wide, flags, ready))?
         };
 
@@ -217,7 +217,7 @@ impl DokanMount {
             // panic, not that we can do much with it.
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = serving.join();
-                Err(io::Error::other("cortex dokan serving thread ended"))
+                Err(io::Error::other("virtx dokan serving thread ended"))
             }
             // Accepted and then silent. The filesystem may yet be registered, so take it down
             // by name rather than leaving a volume nobody holds a guard for.
@@ -246,7 +246,7 @@ impl DokanMount {
         match self.serving.take() {
             Some(serving) => serving
                 .join()
-                .map_err(|_| io::Error::other("cortex dokan serving thread panicked")),
+                .map_err(|_| io::Error::other("virtx dokan serving thread panicked")),
             None => Ok(()),
         }
     }
@@ -291,7 +291,7 @@ impl Drop for DokanMount {
         };
         if !::dokan::unmount(&self.wide) {
             eprintln!(
-                "cortex: unmounting {} failed; the volume is left for dokanctl to clear",
+                "virtx: unmounting {} failed; the volume is left for dokanctl to clear",
                 self.mountpoint.display()
             );
             return;
@@ -537,7 +537,7 @@ impl<'c, 'h: 'c, T: FileSystem + 'h> FileSystemHandler<'c, 'h> for Handler<T> {
             block_on(self.store.unlink(&path))
         };
         if let Err(err) = removed {
-            eprintln!("cortex: removing {} failed: {err}", path.display());
+            eprintln!("virtx: removing {} failed: {err}", path.display());
         }
     }
 
@@ -836,7 +836,7 @@ impl<'c, 'h: 'c, T: FileSystem + 'h> FileSystemHandler<'c, 'h> for Handler<T> {
             serial_number: 0,
             max_component_length: NAME_MAX,
             // **Case-sensitive, which Windows software does not expect.** The stores compare
-            // names by their bytes, so `README` and `readme` are two files on a cortex tree
+            // names by their bytes, so `README` and `readme` are two files on a virtx tree
             // whatever the platform convention is — and reporting otherwise would make the
             // shell hide one of them. A caller that needs the usual behaviour needs a store
             // that folds case; it is not something this binding can add.

@@ -5,7 +5,7 @@
 //! handle on one. Mounting it *takes* it: a `HostMount` owns the tree it serves, and the
 //! `Directory` it was built from is empty afterwards and refuses further use.
 //!
-//! `HostMount` is one name for three types. cortex names each binding's guard after the
+//! `HostMount` is one name for three types. virtx names each binding's guard after the
 //! binding — `FuseMount`, `FuseTMount`, `DokanMount` — and only the one this platform has is
 //! compiled, so a Python caller who wants "mount this on the host" should not have to know
 //! which it is.
@@ -14,15 +14,15 @@
 use std::sync::Arc;
 use std::{io, path::PathBuf};
 
-use cortex::fs::{Directory, Mount};
+use virtx::fs::{Directory, Mount};
 use pyo3::{exceptions::PyValueError, prelude::*};
 
 #[cfg(all(feature = "mount", windows))]
-use cortex::fs::DokanMount as Platform;
+use virtx::fs::DokanMount as Platform;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
-use cortex::fs::FuseMount as Platform;
+use virtx::fs::FuseMount as Platform;
 #[cfg(all(feature = "mount", target_os = "macos"))]
-use cortex::fs::FuseTMount as Platform;
+use virtx::fs::FuseTMount as Platform;
 
 /// File content as a caller may spell it: bytes as they are, a string as its UTF-8.
 #[derive(FromPyObject)]
@@ -40,7 +40,7 @@ impl From<Content> for Vec<u8> {
     }
 }
 
-#[pyclass(name = "Directory", module = "cortex")]
+#[pyclass(name = "Directory", module = "virtx")]
 pub struct PyDirectory(Option<Directory>);
 
 impl PyDirectory {
@@ -109,7 +109,7 @@ impl PyDirectory {
 /// the Python object: both hold the mount, and it comes down when the last of them lets go
 /// — the builder's copy with the console, the Python one with garbage collection.
 #[cfg(feature = "mount")]
-#[pyclass(name = "HostMount", module = "cortex", frozen)]
+#[pyclass(name = "HostMount", module = "virtx", frozen)]
 pub struct PyHostMount(pub Arc<Platform>);
 
 #[cfg(feature = "mount")]
@@ -161,7 +161,7 @@ impl MountLike {
 #[cfg(feature = "mount")]
 #[pyfunction]
 fn mount_support() -> PyResult<()> {
-    Ok(cortex::fs::mount_support()?)
+    Ok(virtx::fs::mount_support()?)
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

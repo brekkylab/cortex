@@ -19,14 +19,14 @@ use crate::{
 /// A client for managing the images.
 ///
 /// ```no_run
-/// use cortex::{
+/// use virtx::{
 ///     console::stdio::StdioClient,
 ///     image::{ImageClient, Recipe},
 /// };
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
-/// let server = tokio::process::Command::new("cortex-uvm-console");
+/// let server = tokio::process::Command::new("virtx-uvm-console");
 /// let mut images = ImageClient::new(StdioClient::new(server)?).await?;
 ///
 /// let built = images
@@ -38,7 +38,7 @@ use crate::{
 ///     println!("{} {:?}", image.digest, image.refs);
 /// }
 ///
-/// images.remove(cortex::image::ImageSource::reference("myimg:latest")).await?;
+/// images.remove(virtx::image::ImageSource::reference("myimg:latest")).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -50,7 +50,7 @@ pub struct ImageClient {
 
 impl ImageClient {
     pub async fn try_new() -> Result<Self, Failure> {
-        Self::try_from_cmd(&[cache_root().join("bin").join("cortex-krun")]).await
+        Self::try_from_cmd(&[cache_root().join("bin").join("virtx-uvm")]).await
     }
 
     pub async fn try_from_cmd(cmd: &[impl AsRef<OsStr>]) -> Result<Self, Failure> {
@@ -126,7 +126,7 @@ impl Drop for ImageClient {
 /// ## Example
 ///
 /// ```
-/// # use cortex::image::{ImageSource, Recipe};
+/// # use virtx::image::{ImageSource, Recipe};
 /// let recipe: ImageSource = Recipe::new("alpine:3.20").step("apk add jq").into();
 /// let reference = ImageSource::reference("myimg:latest");
 /// let digest = ImageSource::digest("sha256:0123abcd");
@@ -220,7 +220,7 @@ const FORMAT_VERSION: u32 = 1;
 /// a layer or runs a command.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recipe {
-    /// Written first and read first, so a declaration from a newer cortex is refused by name
+    /// Written first and read first, so a declaration from a newer virtx is refused by name
     /// rather than by whatever member it happens to disagree about.
     #[serde(rename = "v", deserialize_with = "known_version")]
     version: u32,
@@ -247,7 +247,7 @@ impl Recipe {
     /// so with `scratch`, the way a Dockerfile does.
     ///
     /// ```
-    /// # use cortex::image::{Recipe, Step};
+    /// # use virtx::image::{Recipe, Step};
     /// let declared = Recipe::new("alpine:3.20")
     ///     .step("apk add --no-cache jq")
     ///     .step(Step::env("TZ", "UTC"));
@@ -279,7 +279,7 @@ impl Recipe {
     /// does not carry — whoever builds this names the directory it is read from.
     ///
     /// ```
-    /// # use cortex::image::{Recipe, Step};
+    /// # use virtx::image::{Recipe, Step};
     /// let declared = Recipe::from_dockerfile("FROM alpine:3.20\nRUN apk add jq\n")?;
     ///
     /// assert_eq!(declared.base, "alpine:3.20");
@@ -486,7 +486,7 @@ impl Recipe {
     }
 }
 
-/// Refuse a version this cortex does not speak.
+/// Refuse a version this virtx does not speak.
 ///
 /// A missing member is refused too, and by serde rather than here: a document with no
 /// version is not a declaration of ours, and guessing that it means version 1 would be
@@ -495,7 +495,7 @@ fn known_version<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
     let found = u32::deserialize(d)?;
     if found != FORMAT_VERSION {
         return Err(serde::de::Error::custom(format!(
-            "this image is written in format {found}, and this cortex reads {FORMAT_VERSION}"
+            "this image is written in format {found}, and this virtx reads {FORMAT_VERSION}"
         )));
     }
     Ok(found)

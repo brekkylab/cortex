@@ -1,4 +1,4 @@
-# Publish `/abin` — cortex's own executables, built for the guest.
+# Publish `/abin` — virtx's own executables, built for the guest.
 #
 # The release is named by the commit this runs on, so what gets checked out is what gets
 # published: a release event checks out the tagged commit, a dispatch checks out whatever ref
@@ -82,7 +82,7 @@ jobs:
         if: matrix.zig
         env:
           # Pinned by digest and checked. This workflow holds credentials that can write what
-          # every cortex guest executes, so what it runs is not left to whatever a mirror
+          # every virtx guest executes, so what it runs is not left to whatever a mirror
           # serves today.
           ZIG_VERSION: 0.16.0
           ZIG_SHA256: 70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00

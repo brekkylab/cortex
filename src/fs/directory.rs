@@ -26,7 +26,7 @@ use crate::{
     fs::{Dirent, DirentKind, FileSystem, InMemFs, PassthroughFs, Stat},
 };
 
-/// A public API for using cortex's filesystem.
+/// A public API for using virtx's filesystem.
 ///
 /// A *context* is a tree a session is given to work in, as against its rootfs — the system's
 /// own tree — and this is what one is assembled out of: files the caller hands over, kept in

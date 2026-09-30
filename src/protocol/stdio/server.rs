@@ -5,10 +5,10 @@
 //! [`Server`] moves frames, and whoever answers them does so somewhere else.
 //!
 //! ```no_run
-//! use cortex::console::stdio::StdioServer;
-//! use cortex::console::{Message, Response, Server};
+//! use virtx::console::stdio::StdioServer;
+//! use virtx::console::{Message, Response, Server};
 //!
-//! # fn answer(call: cortex::console::Call) -> Response { unimplemented!() }
+//! # fn answer(call: virtx::console::Call) -> Response { unimplemented!() }
 //! # #[tokio::main]
 //! # async fn main() -> anyhow::Result<()> {
 //! // Takes stdin and stdout for the protocol; everything else goes to stderr.

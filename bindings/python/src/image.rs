@@ -12,7 +12,7 @@
 
 use std::{path::PathBuf, sync::Arc};
 
-use cortex::{
+use virtx::{
     image::{ImageClient, ImageEntry, ImageSource, Recipe, Step},
     protocol::BuildImageResp,
 };
@@ -20,9 +20,9 @@ use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
 use tokio::sync::Mutex;
 
-use crate::error::{self, CortexError};
+use crate::error::{self, VirtxError};
 
-#[pyclass(name = "Step", module = "cortex", frozen, eq, from_py_object)]
+#[pyclass(name = "Step", module = "virtx", frozen, eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyStep(pub Step);
 
@@ -74,7 +74,7 @@ impl From<StepLike> for Step {
     }
 }
 
-#[pyclass(name = "Recipe", module = "cortex", frozen, eq, from_py_object)]
+#[pyclass(name = "Recipe", module = "virtx", frozen, eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyRecipe(pub Recipe);
 
@@ -112,7 +112,7 @@ impl PyRecipe {
     }
 }
 
-#[pyclass(name = "ImageSource", module = "cortex", frozen, eq, from_py_object)]
+#[pyclass(name = "ImageSource", module = "virtx", frozen, eq, from_py_object)]
 #[derive(Clone, PartialEq)]
 pub struct PyImageSource(pub ImageSource);
 
@@ -165,7 +165,7 @@ impl From<ImageSourceLike> for ImageSource {
     }
 }
 
-#[pyclass(name = "BuildImageResult", module = "cortex", frozen, get_all)]
+#[pyclass(name = "BuildImageResult", module = "virtx", frozen, get_all)]
 pub struct PyBuildImageResult {
     reference: String,
     digest: String,
@@ -190,7 +190,7 @@ impl PyBuildImageResult {
     }
 }
 
-#[pyclass(name = "ImageEntry", module = "cortex", frozen, get_all)]
+#[pyclass(name = "ImageEntry", module = "virtx", frozen, get_all)]
 pub struct PyImageEntry {
     digest: String,
     refs: Vec<String>,
@@ -215,10 +215,10 @@ impl PyImageEntry {
 /// The client a slot holds, or the error for one that has been closed.
 fn held(slot: &mut Option<ImageClient>) -> PyResult<&mut ImageClient> {
     slot.as_mut()
-        .ok_or_else(|| CortexError::new_err("this image client has been closed"))
+        .ok_or_else(|| VirtxError::new_err("this image client has been closed"))
 }
 
-#[pyclass(name = "ImageClient", module = "cortex", frozen)]
+#[pyclass(name = "ImageClient", module = "virtx", frozen)]
 pub struct PyImageClient(Arc<Mutex<Option<ImageClient>>>);
 
 impl PyImageClient {
@@ -242,7 +242,7 @@ impl Drop for PyImageClient {
 
 #[pymethods]
 impl PyImageClient {
-    /// `cortex-krun` under the stdio server directory — an awaitable, as
+    /// `virtx-uvm` under the stdio server directory — an awaitable, as
     /// `ImageClient::try_new` is a future.
     #[staticmethod]
     fn try_new(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {

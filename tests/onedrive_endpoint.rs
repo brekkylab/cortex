@@ -21,13 +21,13 @@
 //! `onedrive_tests.rs`, which counts.
 //!
 //!     set -a; . ./.env; set +a
-//!     cargo test -p cortex --features onedrive onedrive_endpoint -- --ignored --nocapture
+//!     cargo test -p virtx --features onedrive onedrive_endpoint -- --ignored --nocapture
 
 #![cfg(feature = "onedrive")]
 
 use std::path::{Path, PathBuf};
 
-use cortex::fs::{DirentKind, FileSystem, OnedriveConfig, OnedriveFs};
+use virtx::fs::{DirentKind, FileSystem, OnedriveConfig, OnedriveFs};
 
 /// Bounds on the walk, so the same test runs against a five-file account and a large one
 /// without becoming the slowest thing in the suite.

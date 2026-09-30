@@ -35,7 +35,7 @@
 //! The Windows binding reaches `FileSystem` directly where the FUSE ones go
 //! through `Posix`, so it is the one that could drift without anybody noticing.
 //! Running the *same* assertions through it is what makes that structural
-//! difference invisible from outside, which is the claim worth testing: a cortex
+//! difference invisible from outside, which is the claim worth testing: a virtx
 //! tree behaves the same whichever kernel is asking.
 
 #![cfg(all(feature = "mount", any(unix, windows)))]
@@ -46,17 +46,17 @@ use std::{fs, path::PathBuf};
 // surface, so which is under test is a matter of which target this is — making
 // these tests evidence that they behave *alike*, not just that each behaves.
 #[cfg(windows)]
-use cortex::fs::DokanMount as HostMount;
+use virtx::fs::DokanMount as HostMount;
 #[cfg(all(unix, not(target_os = "macos")))]
-use cortex::fs::FuseMount as HostMount;
+use virtx::fs::FuseMount as HostMount;
 #[cfg(target_os = "macos")]
-use cortex::fs::FuseTMount as HostMount;
-use cortex::fs::{Directory, FileSystem, InMemFs};
+use virtx::fs::FuseTMount as HostMount;
+use virtx::fs::{Directory, FileSystem, InMemFs};
 
 /// A mount point of our own. The guards do not create it — no mount does.
 fn mountpoint(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
-    dir.push(format!("cortex-mount-{}-{}", std::process::id(), tag));
+    dir.push(format!("virtx-mount-{}-{}", std::process::id(), tag));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("temp dir is writable");
     dir
@@ -72,7 +72,7 @@ fn volume() -> InMemFs {
     rt.block_on(async {
         let greeting = std::path::Path::new("greeting.txt");
         vol.create(greeting).await.expect("fresh store");
-        vol.write_at(greeting, b"Hello from cortex!\n", 0)
+        vol.write_at(greeting, b"Hello from virtx!\n", 0)
             .await
             .expect("write the greeting");
         vol.mkdir(std::path::Path::new("sub")).await.unwrap();
@@ -82,7 +82,7 @@ fn volume() -> InMemFs {
 
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
-fn the_operating_system_can_read_a_cortex_mount() {
+fn the_operating_system_can_read_a_virtx_mount() {
     let mnt = mountpoint("read");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
@@ -97,7 +97,7 @@ fn the_operating_system_can_read_a_cortex_mount() {
 
     assert_eq!(
         fs::read_to_string(mnt.join("greeting.txt")).unwrap(),
-        "Hello from cortex!\n"
+        "Hello from virtx!\n"
     );
 
     // Attribute projection, as the OS reports it back.
@@ -145,7 +145,7 @@ fn the_operating_system_can_read_a_multi_source_workspace() {
     // ...and the kernel can walk into one and read through to the host.
     assert_eq!(
         fs::read_to_string(mnt.join("project/greeting.txt")).unwrap(),
-        "Hello from cortex!\n"
+        "Hello from virtx!\n"
     );
     assert!(fs::metadata(mnt.join("deep/notes/sub")).unwrap().is_dir());
 
@@ -167,7 +167,7 @@ fn the_operating_system_can_read_a_multi_source_workspace() {
 /// A host directory with the same one file and one empty directory as [`volume`].
 fn host_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("temp dir is writable");
-    fs::write(dir.path().join("greeting.txt"), "Hello from cortex!\n").unwrap();
+    fs::write(dir.path().join("greeting.txt"), "Hello from virtx!\n").unwrap();
     fs::create_dir(dir.path().join("sub")).unwrap();
     dir
 }
@@ -234,7 +234,7 @@ fn the_operating_system_sees_real_timestamps() {
 /// the `.tmp` and the original untouched.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
-fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
+fn an_editor_can_save_over_a_file_on_a_virtx_mount() {
     let mnt = mountpoint("rename");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
@@ -283,7 +283,7 @@ fn an_editor_can_save_over_a_file_on_a_cortex_mount() {
 
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
-fn the_operating_system_can_write_to_a_cortex_mount() {
+fn the_operating_system_can_write_to_a_virtx_mount() {
     let mnt = mountpoint("write");
     let mount = HostMount::try_new(volume(), &mnt).expect("mount");
 
@@ -338,7 +338,7 @@ fn the_operating_system_can_write_to_a_cortex_mount() {
 /// being true.
 #[test]
 #[ignore = "needs a mount provider and mounts a real filesystem"]
-fn the_operating_system_can_append_to_a_cortex_mount() {
+fn the_operating_system_can_append_to_a_virtx_mount() {
     use std::io::Write;
 
     let mnt = mountpoint("append");
@@ -353,7 +353,7 @@ fn the_operating_system_can_append_to_a_cortex_mount() {
 
     assert_eq!(
         fs::read_to_string(mnt.join("greeting.txt")).unwrap(),
-        "Hello from cortex!\nand again\n"
+        "Hello from virtx!\nand again\n"
     );
 
     // Dropping is the unmount — the guard has no other way down, and no way to report one.
@@ -372,7 +372,7 @@ fn the_operating_system_can_append_to_a_cortex_mount() {
 #[ignore = "needs a mount provider and mounts a real filesystem"]
 fn a_write_protected_volume_is_enforced_by_the_driver() {
     let mnt = mountpoint("readonly");
-    let mount = HostMount::try_new_with(volume(), &mnt, cortex::fs::MountFlags::WRITE_PROTECT)
+    let mount = HostMount::try_new_with(volume(), &mnt, virtx::fs::MountFlags::WRITE_PROTECT)
         .expect("mount");
 
     // Refused by the *driver*: the request never reaches a store, which is stronger than
@@ -449,8 +449,8 @@ fn a_read_only_mount_is_enforced_by_the_kernel() {
         volume(),
         &mnt,
         vec![
-            cortex::fs::MountOption::FSName("cortex".into()),
-            cortex::fs::MountOption::RO,
+            virtx::fs::MountOption::FSName("virtx".into()),
+            virtx::fs::MountOption::RO,
         ],
     )
     .expect("mount");

@@ -83,7 +83,7 @@ pub struct ConsoleClientBuilder {
     /// can fail. Deferring that to [`build`](Self::build) keeps every setter infallible and
     /// leaves one place where a console either exists or says what it lacked.
     ///
-    /// Starts as `cortex-krun` under the stdio server directory, as an
+    /// Starts as `virtx-uvm` under the stdio server directory, as an
     /// [`ImageClient`](crate::image::ImageClient) does.
     client_factory: ClientFactory,
 
@@ -122,7 +122,7 @@ pub struct ConsoleClientBuilder {
 impl Default for ConsoleClientBuilder {
     fn default() -> Self {
         ConsoleClientBuilder {
-            client_factory: stdio_factory(&[cache_root().join("bin").join("cortex-krun")]),
+            client_factory: stdio_factory(&[cache_root().join("bin").join("virtx-uvm")]),
             image: None,
             snapshot: None,
             mounts: Vec::new(),
@@ -155,7 +155,7 @@ impl ConsoleClientBuilder {
 
     /// Drive a server this console starts itself: `cmd`, over its own pipes.
     ///
-    /// `cmd` is a program and its arguments — `["cortex-local-console"]`,
+    /// `cmd` is a program and its arguments — `["virtx-local-console"]`,
     /// `["sh", "-c", "…"]` — and that is the whole of what this shape of caller decides,
     /// since the two descriptors the protocol runs on are the client's. A caller who
     /// wants more of the command than that — an environment, a directory — builds the [`Command`] itself and hands it to
@@ -231,8 +231,8 @@ impl ConsoleClientBuilder {
     /// The base the session's commands run in.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
-    /// # use cortex::image::Recipe;
+    /// # use virtx::console::ConsoleClient;
+    /// # use virtx::image::Recipe;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .image(
@@ -257,7 +257,7 @@ impl ConsoleClientBuilder {
     /// Whether the session's commands reach a network at all.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder().network(true).build().await?;
     /// # Ok(()) }
@@ -280,7 +280,7 @@ impl ConsoleClientBuilder {
     /// `-p` spells them — `"8080:80"`, host first. Replaces what an earlier call said.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// // A VNC server in the session, at 127.0.0.1:5901 here.
     /// let console = ConsoleClient::builder()
@@ -312,7 +312,7 @@ impl ConsoleClientBuilder {
     /// How much memory the session's machine gets, in mebibytes.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .vcpus(4)
@@ -352,7 +352,7 @@ impl ConsoleClientBuilder {
     /// [`build`](Self::build).
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .gpu(true)
@@ -375,7 +375,7 @@ impl ConsoleClientBuilder {
     /// from [`build`](Self::build).
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .disk_gib(32)
@@ -417,7 +417,7 @@ impl ConsoleClientBuilder {
 /// results.
 ///
 /// ```no_run
-/// use cortex::console::ConsoleClient;
+/// use virtx::console::ConsoleClient;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
@@ -943,7 +943,7 @@ mod tests {
     #[tokio::test]
     async fn a_stdio_console_starts_its_server_when_it_is_built() {
         let Err(e) = ConsoleClient::builder()
-            .cmd(&["cortex-no-such-console"])
+            .cmd(&["virtx-no-such-console"])
             .build()
             .await
         else {

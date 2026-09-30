@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build cortex's own executables for the guest and publish them.
+# Build virtx's own executables for the guest and publish them.
 #
 #   scripts/abin-release.sh
 #       Build every OS below, upload, and move `abin/latest` to this commit.
@@ -140,7 +140,7 @@ for os in "${OSES[@]}"; do
     triple="${pair##*:}"
     name="abin-$os-$arch.tar.gz"
     echo "abin-release: building $triple" >&2
-    cargo zigbuild -p cortex-exec-mem -p cortex-exec-index --release --target "$triple"
+    cargo zigbuild -p virtx-exec-mem -p virtx-exec-index --release --target "$triple"
     # Flat: `mem` and `index` at the top level, which is exactly what /abin holds.
     tar czf "$OUT/$name" -C "$TARGET_DIR/$triple/release" mem index
     built+=("$name")
