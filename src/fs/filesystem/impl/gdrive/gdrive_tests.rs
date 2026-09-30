@@ -31,7 +31,7 @@ fn file_row(name: &str, id: &str, mime: &str) -> Value {
     })
 }
 
-/// A name too long to serve is cut here, and cutting forces a tag.
+/// A name too long to serve is cut here, keeping the tag every entry carries.
 ///
 /// The mount hands names to macOS decomposed, where Korean takes two to three times the
 /// bytes it does composed — so a name Drive holds well inside `NAME_MAX` can arrive over
@@ -69,8 +69,8 @@ fn a_name_too_long_to_serve_is_cut_and_tagged() {
         ))
         .unwrap(),
         child_from_file(&file_row("짧은.pdf", "cccccccccc33", "application/pdf")).unwrap(),
-        // A long name with no prefix-sharing sibling. After the cut its group holds one,
-        // so the collision rule has nothing to say about it — only the cut itself does.
+        // A long name with no prefix-sharing sibling: cut, and tagged like every other
+        // entry.
         child_from_file(&file_row(
             &format!("{}.pdf", "다".repeat(60)),
             "dddddddddd44",
@@ -331,7 +331,7 @@ fn names_are_compared_and_numbered_by_composition_and_id() {
 
     // The tag goes *before* the extension, or the entry leaves every glob a reader
     // would use, such as `**/*.gsheet.json`. A folder is not renamed around a dot. A name
-    // only one child holds is not touched at all.
+    // only one child holds is tagged too.
     let mut children = vec![
         mk("report.gsheet.json", "s1", Serves::Native(NativeApi::Sheet)),
         mk("report.gsheet.json", "s2", Serves::Native(NativeApi::Sheet)),
@@ -783,7 +783,7 @@ fn parse_range(h: &str) -> Option<(u64, Option<u64>)> {
     Some((s.parse().ok()?, e.parse().ok()))
 }
 
-/// Serve a token, one folder listing, and one blob with `Range` support.
+/// Serve a token, one folder listing, and the given blobs with `Range` support.
 async fn start(listing: Value, blobs: HashMap<String, Vec<u8>>) -> Mock {
     start_full(listing, blobs, None, None, None).await
 }
@@ -1458,8 +1458,8 @@ async fn a_document_and_a_span_share_the_budget() {
 
 /// Each service is reached at its own origin, and only its own, with the path chosen by
 /// the deployment rather than the client, so a gateway serving one service somewhere
-/// else can be pointed at. Two listeners here, on paths neither Google nor our own mock
-/// uses.
+/// else can be pointed at. Two listeners here: Drive and the token on one, Sheets on the
+/// other.
 #[tokio::test]
 async fn one_service_can_move_without_moving_the_others() {
     let sheet = row(
@@ -1468,7 +1468,7 @@ async fn one_service_can_move_without_moving_the_others() {
         "application/vnd.google-apps.spreadsheet",
         None,
     );
-    // Gateway A: Drive and the token endpoint, Drive on a path of its own choosing.
+    // Gateway A: Drive and the token endpoint.
     let a = start(json!([sheet]), HashMap::new()).await;
     // Gateway B: Sheets only, on a different port.
     let b = start(json!([]), HashMap::new()).await;

@@ -100,7 +100,7 @@ int cortex_fuse_t_loop(void *session);
  * operating system instead. */
 void cortex_fuse_t_stop(void *session);
 
-/* Release the session and channel. Must follow a `cortex_fuse_t_loop` return. */
+/* Release the session and channel. Must not run while `cortex_fuse_t_loop` does. */
 void cortex_fuse_t_destroy(void *session);
 
 #endif

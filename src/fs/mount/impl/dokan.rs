@@ -178,7 +178,7 @@ impl DokanMount {
         }
     }
 
-    /// Serve until the mount goes away, then take it down.
+    /// Serve until the mount goes away.
     ///
     /// Waits for something else to end the mount (`dokanctl /u`, an eject from Explorer, or the
     /// driver). **It does not unmount**; to end the mount, drop the guard.
@@ -250,8 +250,7 @@ impl DokanMount {
     fn reclaim_mountpoint(&self) {
         use std::os::windows::fs::MetadataExt as _;
 
-        /// `FILE_ATTRIBUTE_REPARSE_POINT`, inlined; `winapi` is otherwise only needed for
-        /// NTSTATUS.
+        /// `FILE_ATTRIBUTE_REPARSE_POINT`, inlined.
         const REPARSE_POINT: u32 = 0x0000_0400;
 
         let Ok(meta) = std::fs::symlink_metadata(&self.mountpoint) else {
@@ -768,8 +767,8 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 ///
 /// * `.` and `..`, which the object manager resolves before an IRP is built, so one arriving
 ///   cannot mean what it says.
-/// * `:`, the alternate data stream separator. [`MountFlags::ALT_STREAM`] is not requested,
-///   and Windows forbids colons in names anyway.
+/// * `:`, the alternate data stream separator. [`MountFlags::ALT_STREAM`] is not requested by
+///   `try_new`, and Windows forbids colons in names anyway.
 fn store_path(name: &U16CStr) -> Result<PathBuf, NTSTATUS> {
     const SEPARATOR: u16 = b'\\' as u16;
     const COLON: u16 = b':' as u16;
@@ -841,7 +840,7 @@ fn file_attributes(kind: DirentKind) -> u32 {
 /// A stable identity for a path, which is what `nFileIndex` is read as.
 ///
 /// Hashed from the path, so there is no inode table to keep, evict or reference-count. The
-/// cost, hard links sharing an index, is moot: nothing under [`FileSystem`] has hard links.
+/// cost, hard links getting distinct indices, is moot: nothing under [`FileSystem`] has hard links.
 ///
 /// Collisions are harmless: the index is advisory, used to ask whether two paths are the same
 /// file.
@@ -851,8 +850,8 @@ fn file_index(path: &Path) -> u64 {
     hasher.finish()
 }
 
-/// Only name translation and the status table: callbacks answer through objects only Dokan
-/// constructs, so the rest needs a real mount against a real driver.
+/// Only the pure helpers (name translation, attributes, index, status table): callbacks answer
+/// through objects only Dokan constructs, so the rest needs a real mount against a real driver.
 #[cfg(test)]
 mod tests {
     use super::*;

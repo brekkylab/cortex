@@ -333,8 +333,8 @@ async fn spans_left_behind_stop_counting_and_stop_being_kept() {
 }
 
 /// Files read in turn each keep their span, so nothing is fetched twice. See
-/// [`OnedriveFs::held`]. Each file is larger than a span, so a constant [`READ_SPAN`]
-/// would overrun the budget and only the division passes.
+/// [`OnedriveFs::held`]. Each file is larger than its share of the budget, so a constant
+/// [`READ_SPAN`] would overrun the budget and only the division passes.
 #[tokio::test]
 async fn interleaved_files_each_keep_a_span() {
     const REAL: u64 = 32 * 1024 * 1024;

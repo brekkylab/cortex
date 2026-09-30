@@ -1,6 +1,6 @@
 //! A Graph API that this repository does not write, driven through [`OnedriveFs::new`].
 //!
-//! Every other onedrive test answers from a loopback mock in `onedrive_tests.rs`, which
+//! Every other onedrive test is pure or answers from a loopback mock in `onedrive_tests.rs`, which
 //! answers *what did we ask for*. A mock encodes our understanding of the API, so it agrees
 //! with us by construction and stays green when the API moves; this suite asks **whether
 //! what we ask for is what Graph answers.**
@@ -41,9 +41,9 @@ fn config() -> Option<OnedriveConfig> {
 
 /// Walk a real account, then read a real file by windows.
 ///
-/// Catches what no mock can show: `$select` naming the download URL the way the *response*
-/// spells it is accepted and omits the field from every row, so a read fails outright with
-/// "has no download url".
+/// Catches against the real service what the mock only encodes: `$select` naming the
+/// download URL the way the *response* spells it is accepted and omits the field from every
+/// row, so a read fails outright with "has no download url".
 ///
 /// Skipped, not failed, when the credentials are absent: this needs an account, and a suite
 /// that has none should stay green.
@@ -105,8 +105,8 @@ async fn onedrive_endpoint_tree_and_reads() {
 
 /// `len` bytes at `offset`, however many reads that takes.
 ///
-/// `read_at` may answer short of the buffer, and a short answer is end of file — so this
-/// asks again from where the last one stopped until it is satisfied or the file ends.
+/// `read_at` may answer short of the buffer, so this asks again from where the last one
+/// stopped until it is satisfied or a read returns zero.
 async fn read_at(fs: &OnedriveFs, path: &Path, offset: u64, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut got = 0usize;

@@ -1,6 +1,7 @@
 //! Which mount points this process owns: in memory for the signal path, on disk for later
 //! runs, since a `SIGKILL`ed mount can only be cleared by another run. Taking a claim records
-//! the mount point in both places; dropping it removes both.
+//! the mount point in both places; dropping it removes both, the disk one only once the mount
+//! is down.
 //!
 //! A register rather than the mount table, which cannot say which mounts are cortex's: a
 //! FUSE-T mount is spelled `nfs` there, and the mount point is an arbitrary caller-chosen path.
@@ -226,7 +227,7 @@ fn gone(pid: libc::pid_t) -> bool {
 ///
 /// Covers `SIGKILL`, where no handler runs and only the next run can help; the dead
 /// process's watchdog usually took its mounts down already, and this gets what it could not.
-/// Every binding's `try_new` calls it.
+/// Every unix binding's `try_new` calls it.
 ///
 /// **Call it directly before touching a mount point ahead of mounting:** `stat` blocks on a
 /// leftover mount nothing answers, so a `create_dir_all` under it would hang before `try_new`.

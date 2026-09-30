@@ -308,7 +308,8 @@ struct Tree {
 /// everything goes away with the console. [`start`](Self::start) and [`stop`](Self::stop)
 /// are optional resource management.
 ///
-/// Every method is one round trip, [`exec`](Self::exec) included. One console is not
+/// Every method that reaches the server is one message, [`exec`](Self::exec) included; only
+/// [`start`](Self::start) and [`stop`](Self::stop) go unanswered. One console is not
 /// concurrent: its methods take `&mut self` (see [`Client`]).
 ///
 /// ```no_run
@@ -476,8 +477,8 @@ impl ConsoleClient {
 
     /// Take everything this session has written, as a blob another session can start on.
     ///
-    /// Pass the bytes to [`ConsoleClientBuilder::snapshot`] to carry the session on. They
-    /// are the server's own encoding and opaque to the caller.
+    /// Pass the bytes to [`ConsoleClientBuilder::snapshot`] to carry the session on: a
+    /// layer tar of the session's writes, kept as bytes by the caller.
     ///
     /// Cumulative since the session began, not since the last snapshot.
     pub async fn snapshot(&mut self) -> Result<Vec<u8>, Failure> {

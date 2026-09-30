@@ -116,9 +116,9 @@ const FILE_FIELDS: &[&str] = &[
     // shortcuts (backlot also omits it on native docs, so don't rely on either shape).
     //
     // Exact for a blob, but never a document's length: a document is served as its API's
-    // JSON, which Drive's number does not describe. Kept so `read_window` can refuse
-    // before a byte moves, and so a blob listed *without* a size is told apart from one
-    // sized zero.
+    // JSON, which Drive's number does not describe. Kept so a blob's listing states its
+    // exact length, and so a blob listed *without* a size is told apart from one sized
+    // zero.
     "size",
     "modifiedTime",
     "createdTime",
@@ -324,9 +324,10 @@ impl GdriveAccessor {
     /// Send a request built from the current access token, retrying transient
     /// failures. A 401 (expired/revoked despite proactive refresh) drops the
     /// token, refreshes, and retries once; a 429/5xx retries a bounded number
-    /// of times honoring `Retry-After`. Every call this accessor makes is an
-    /// idempotent GET, so the 5xx retry is always safe. Non-retryable statuses
-    /// are returned to the caller, which classifies them via `error_for_status`.
+    /// of times honoring `Retry-After`, and a rate-limit 403 with backoff. Every call
+    /// this accessor makes is an idempotent GET, so the 5xx retry is always safe. A 403
+    /// not retried fails here with its body; other non-retryable statuses are returned
+    /// to the caller, which classifies them via `error_for_status`.
     async fn send_with_refresh(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -739,7 +740,7 @@ mod tests {
                 d2 >= Duration::from_secs(4) && d2 <= Duration::from_millis(5000),
                 "{d2:?}"
             );
-            // large n → capped at MAX_BACKOFF; 2^4=16s + jitter > cap
+            // large n → capped at MAX_BACKOFF; 2^4=16s + jitter >= cap
             assert_eq!(backoff_delay(4), MAX_BACKOFF);
             assert_eq!(backoff_delay(10), MAX_BACKOFF);
         }

@@ -123,7 +123,8 @@ impl OpenOptions {
 
     /// Reject the one self-contradictory combination.
     ///
-    /// Called by the flags decoder (`decode_open_flags`); stores never see these.
+    /// Not called in this crate: `decode_open_flags` rejects an invalid access mode itself.
+    /// Stores never see these.
     pub fn validate(&self) -> io::Result<()> {
         if !self.read && !self.write {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -233,8 +234,8 @@ const S_IFREG: u32 = 0o100000;
 
 /// The attribute values every binding reports for one entry.
 ///
-/// The foreign structs (`stat64`, `FileAttr`, `struct stat`) are built per binding, but the
-/// numbers are derived once here so bindings cannot drift.
+/// The foreign structs (`FileAttr`, `struct cortex_stat`, `FileInfo`) are built per binding, but
+/// the numbers are derived once here so bindings cannot drift.
 ///
 /// No `uid`/`gid`: a guest sees ids inside the VM, while a host mount must report the mounting
 /// user's or that user cannot traverse it, so each binding decides.
@@ -248,7 +249,7 @@ pub(in crate::fs) struct Attr {
     pub mtime: SystemTime,
     pub atime: SystemTime,
     pub ctime: SystemTime,
-    /// Birth time; only `fuser` and Dokan have a field for it (the guest's Linux `stat64` has
+    /// Birth time; only `fuser` and Dokan have a field for it (FUSE-T's `struct cortex_stat` has
     /// none).
     #[cfg_attr(
         not(all(feature = "mount", unix, not(target_os = "macos"))),
@@ -817,8 +818,8 @@ impl InodeTable {
     /// The forward entry stays: the kernel may still hold the number, which must not be reused
     /// before its `forget` arrives and reclaims it.
     ///
-    /// For unopened files only; an open one is moved aside instead (see
-    /// [`Posix::unlink_child`]).
+    /// For unopened files, and open ones a store cannot rename; any other open one is moved
+    /// aside instead (see [`Posix::unlink_child`]).
     pub(in crate::fs) fn evict_path(&mut self, path: &Path) {
         self.rev.remove(path);
     }
@@ -886,8 +887,7 @@ impl InodeTable {
                 data.lookup_count += 1;
                 return inode;
             }
-            // The maps drifted. Mint a new number rather than panic under the table's lock,
-            // which could cascade through nested locks to the whole mount.
+            // The maps drifted. Mint a new number rather than panic under the table's lock.
             self.rev.remove(&path);
         }
         let inode = self.next;
@@ -1053,7 +1053,8 @@ mod tests {
         assert!(!options.intends_write());
     }
 
-    /// Each flag is checked alone, since nothing else in the crate would notice a dropped term.
+    /// Each flag but `create_new` (whose constructor also sets `create`) is checked alone, since
+    /// nothing else in the crate would notice a dropped term.
     #[test]
     fn every_flag_but_read_means_modification() {
         let ro = OpenOptions::read_only();

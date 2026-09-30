@@ -19,7 +19,7 @@ anyhow = "1"
 # method that may arrive after them, and `result` xor `error` is decided by which is
 # present), and BSON is one with a native byte type, which most payloads are.
 bson = { version = "3", features = ["serde"] }
-# `BoxFuture`, which every `Client` and `Server` method returns; `protocol::base` says why
+# `BoxFuture`, which every `Client` and `Server` method returns; `protocol` says why
 # they are boxed rather than `async fn`.
 futures-core = "0.3"
 # The `errno` values `Posix` maps an `io::ErrorKind` onto for the kernel. Unconditional:
@@ -105,7 +105,7 @@ winapi = { version = "0.3", features = [
 libc = "0.2"
 # A concrete format to round-trip a `Recipe` through; the type itself is format-agnostic.
 serde_json = "1"
-# Real directories: stand-ins for a mounted tree, and the build contexts `image` tests hash.
+# Real directories: stand-ins for a mounted tree.
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 

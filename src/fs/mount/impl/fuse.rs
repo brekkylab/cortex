@@ -96,7 +96,7 @@ impl FuseMount {
         })
     }
 
-    /// Serve until the mount goes away, then take it down.
+    /// Serve until the mount goes away.
     ///
     /// Waits for something else to end the mount (`umount`, `fusermount -u`, or the kernel
     /// dropping the connection). **It does not unmount**; to end the mount, drop the guard.
@@ -180,8 +180,8 @@ fn to_file_type(kind: DirentKind) -> FileType {
     }
 }
 
-/// Symlinks, hard links and extended attributes stay on `fuser`'s `ENOSYS` defaults; the store
-/// contract has no notion of them.
+/// Symlinks and hard links stay on `fuser`'s `EPERM` defaults, extended attributes on its
+/// `ENOSYS` ones; the store contract has no notion of them.
 ///
 /// The `'static` bound is `fuser`'s: a mounted session outlives the mount call, so the
 /// filesystem may not borrow.

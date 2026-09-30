@@ -23,7 +23,7 @@
 //!
 //! ```text
 //! {"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","ls"]}}
-//! {"jsonrpc":"2.0","id":2,"result":{"code":0,"stdout":<Binary>,"stderr":<Binary>,"truncated":false}}
+//! {"jsonrpc":"2.0","id":2,"method":"exec","result":{"code":0,"stdout":<Binary>,"stderr":<Binary>,"truncated":false}}
 //! {"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"timed out after 1000ms"}}
 //! {"jsonrpc":"2.0","method":"quit"}
 //! ```
@@ -71,7 +71,7 @@
 //! that can look ahead, which postcard and bincode cannot.
 //!
 //! **A byte type.** Exec output and file contents are most of the traffic and are program
-//! bytes, not text. JSON would need base64 (1.37×, plus decoding); BSON's `Binary`
+//! bytes, not text. JSON would need base64 (1.33×, plus decoding); BSON's `Binary`
 //! carries them as themselves.
 //!
 //! ### What that costs
@@ -108,7 +108,7 @@ pub use message::*;
 
 /// The asking end of a channel: issue a call, get its answer back.
 ///
-/// A transport implements only [`call`](Self::call) and [`notify`](Self::notify); the
+/// A transport need implement only [`call`](Self::call) and [`notify`](Self::notify); the
 /// per-method wrappers are derived here, which is also the one place a
 /// [`Response`] becomes what its method returns.
 ///
@@ -181,7 +181,7 @@ pub trait Client: Send {
         })
     }
 
-    /// Describe this session: the tree it works in, and what its commands run in and may
+    /// Describe this session: the trees it works in, and what its commands run in and may
     /// reach.
     ///
     /// Boots and mounts nothing. Returning means a server is there, speaks this protocol,
@@ -201,7 +201,7 @@ pub trait Client: Send {
     ///
     /// A command that failed is still `Ok`, with a non-zero [`code`](ExecResp::code).
     /// [`Refused`](Failure::Refused) means no result at all: it timed out, or there was
-    /// nothing to run.
+    /// nothing to run, or the session could not be brought up.
     fn exec(&mut self, exec: ExecCall) -> BoxFuture<'_, Result<ExecResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Exec(exec)).await? {
@@ -236,9 +236,8 @@ pub trait Client: Send {
 
     /// Take everything this session has written, as a blob a new session can start on.
     ///
-    /// The result is exactly what [`InitCall::snapshot`] takes. Its contents are the
-    /// executor's own encoding, readable only by an executor of the same kind; a caller
-    /// just keeps the bytes and hands them over.
+    /// The result is exactly what [`InitCall::snapshot`] takes: a layer tar of the session's
+    /// writes. A caller just keeps the bytes and hands them over.
     ///
     /// Always one message: a truncated snapshot is a broken tree, not a smaller session,
     /// so a session that has written more than a message holds is refused.
@@ -253,8 +252,9 @@ pub trait Client: Send {
 
     /// Boot now, to hide the cold start.
     ///
-    /// Optional: [`exec`](Self::exec), [`read`](Self::read) and [`write`](Self::write)
-    /// boot on demand, so this only moves the boot wait off the first command.
+    /// Optional: [`exec`](Self::exec), [`read`](Self::read), [`write`](Self::write) and
+    /// [`snapshot`](Self::snapshot) boot on demand, so this only moves the boot wait off the
+    /// first call that needs one.
     ///
     /// `Ok` means the notification went out, not that the boot succeeded; a failed boot
     /// surfaces as [`BOOT_FAILED`](Error::BOOT_FAILED) on the next call that needs one.

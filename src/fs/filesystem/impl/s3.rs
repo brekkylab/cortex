@@ -182,7 +182,7 @@ fn to_io_error(err: object_store::Error) -> io::Error {
         Error::NotSupported { .. } => io::ErrorKind::Unsupported,
         Error::NotImplemented { .. } => io::ErrorKind::Unsupported,
         // `Precondition`/`NotModified` need conditional requests, which this store does not
-        // send. Their right answer, `ESTALE`, has no `io::ErrorKind`.
+        // send.
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, err)
@@ -445,8 +445,8 @@ impl S3Fs {
     /// Three answers from up to two requests:
     ///
     /// * an object with a body: a file, from `head` alone;
-    /// * a key that also names a prefix with children: a directory, whether or not an object
-    ///   of that exact name exists;
+    /// * a key that also names a prefix with children: a directory, whether or not an empty
+    ///   object of that exact name exists;
     /// * neither: absent.
     ///
     /// A successful `head` is not always the end: an object store console writes a 0-byte
@@ -588,7 +588,7 @@ impl FileSystem for S3Fs {
     ///
     /// Answered from the last listing within `LISTING_TTL`. A listing may lag but a read may
     /// not: a stale name costs a second look, a stale size or body hands over the wrong file.
-    /// So `stat` and `read_at` ask every time.
+    /// So `stat` asks every time, and its `head` revalidates what `read_at` keeps.
     fn list<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Vec<Dirent>>> {
         Box::pin(async move {
             let key = self.key(path)?;
@@ -838,7 +838,8 @@ mod tests {
         assert_eq!(fs.list(Path::new("/")).await.unwrap().len(), 1);
     }
 
-    /// A read is not a listing: it asks every time, so a file's bytes are never a guess.
+    /// A read is not a listing: the `stat` before it asks every time, so a file's bytes are
+    /// never a guess.
     #[tokio::test]
     async fn a_read_still_asks_after_a_listing_was_kept() {
         let (store, fs) = store();
@@ -851,7 +852,7 @@ mod tests {
         assert_eq!(read(&fs, "a.txt", 3).await, b"two");
     }
 
-    /// A whole body kept for one key, sized `mib`.
+    /// An entry for one key sized `mib`, with no body held yet.
     fn held(mib: usize) -> ReadCache {
         ReadCache {
             size: (mib << 20) as u64,

@@ -55,7 +55,7 @@ fn install() -> io::Result<()> {
     }
     let [read, write] = fds;
     for fd in [read, write] {
-        // A child holding the write end would keep the watcher's read alive past our exit.
+        // `CLOEXEC` so programs this process runs do not inherit the pipe.
         //
         // SAFETY: `fd` was just returned by `pipe`.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
@@ -155,7 +155,8 @@ fn watch(read: libc::c_int) -> ! {
     // program's own.
     unsafe { libc::raise(signal) };
 
-    // Reached only if the restored disposition ignores the signal; the process carries on.
+    // Reached only if the restored disposition does not end the process (ignored, or a
+    // handler that returns); the process carries on.
     loop {
         std::thread::park();
     }

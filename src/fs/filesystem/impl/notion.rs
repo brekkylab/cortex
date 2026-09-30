@@ -33,7 +33,7 @@ const FRESH: Duration = Duration::from_secs(15);
 /// How long a *listing* is served from what is kept, without asking Notion anything.
 ///
 /// Longer than [`FRESH`]: a stale name costs a click that then revalidates, but a stale size
-/// or body shows the wrong file. So the tree may lag a minute; content may not lag at all.
+/// or body shows the wrong file. So the tree may lag a minute, content only [`FRESH`].
 const LISTING_TTL: Duration = Duration::from_secs(60);
 
 /// The top-level listing's file. Not an id, so the sweep leaves it alone.
@@ -67,7 +67,7 @@ impl std::fmt::Debug for NotionConfig {
     }
 }
 
-/// A rendered `page.json`: its bytes, the page's timestamps, and the sub-page
+/// A rendered `page.json`: its bytes, the page's timestamps, and the child
 /// directories that go beside it.
 ///
 /// Directories and bytes come from the same tree, so they cannot disagree: a `child_page`
@@ -76,7 +76,8 @@ impl std::fmt::Debug for NotionConfig {
 #[derive(Clone)]
 struct Rendered {
     bytes: Arc<Vec<u8>>,
-    /// `<sanitized-title>__<id>` per `child_page` block, at whatever depth it sat.
+    /// A directory name per `child_page`/`child_database` block, at whatever depth it sat; per
+    /// row, for a database.
     child_dirs: Arc<Vec<String>>,
     mtime: Option<SystemTime>,
     ctime: Option<SystemTime>,
@@ -803,9 +804,9 @@ impl NotionFs {
 }
 
 /// Every mutating method keeps the trait's `ReadOnlyFilesystem` default, so a writer hears
-/// it on the write; there is no open to hear it on. Not `Unsupported`, so one read-only source
-/// does not disable writes for a whole mount. Page/block writes and the domain command channel
-/// are not exposed.
+/// it on the write; there is no open to hear it on. Not `Unsupported` (`ENOSYS`), which `cp`,
+/// `rsync` and editors read as a broken filesystem. Page/block writes and the domain command
+/// channel are not exposed.
 impl FileSystem for NotionFs {
     fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move { self.forget_kept() })
@@ -823,8 +824,8 @@ impl FileSystem for NotionFs {
                         // Render so the guest kernel sees the real size (no direct_io).
                         return Ok(self.render_for_file(rest).await?.stat());
                     }
-                    // A fresh render carries this directory's times, and one usually exists
-                    // since the reader just listed the parent.
+                    // A fresh render carries this directory's times; one exists once this
+                    // directory was listed or its file read.
                     let (Node::Page(id) | Node::Database(id)) = node(last);
                     if let Some(kept) = self.renders.lock().unwrap().get(&id, self.epoch())
                         && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
@@ -1066,7 +1067,7 @@ fn page_time(v: &Value, key: &str) -> Option<SystemTime> {
 }
 
 /// Page metadata + markdown body + raw blocks. `child_page`/`child_database`
-/// blocks are excluded (they surface as subdirectories).
+/// blocks carry no content here (it surfaces in their subdirectories).
 fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
     let parent = page.get("parent").cloned().unwrap_or_else(|| json!({}));
     let parent_type = parent.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1351,7 +1352,7 @@ fn blocks_to_markdown(blocks: &[Value]) -> String {
 mod tests {
     use super::*;
 
-    /// A render carrying `edited` as the page's last edit, the only field the cache reads.
+    /// A render carrying `edited` as the page's last edit, the only field revalidation reads.
     fn rendered(edited: Option<&str>) -> Rendered {
         Rendered {
             bytes: Arc::new(b"{}".to_vec()),
@@ -1504,8 +1505,8 @@ mod tests {
             fs.roots_on_disk().is_none(),
             "and the top-level listing goes with it"
         );
-        // Renders stay on disk (dropping them would cost every page a block walk), but the
-        // moved epoch keeps them from answering without Notion.
+        // Renders stay on disk (dropping them would cost the next run a block walk per page),
+        // but the moved epoch keeps them from answering in this one.
         assert!(fs.kept_on_disk(ID).is_some());
         assert!(fs.renders.lock().unwrap().get(ID, fs.epoch()).is_none());
     }

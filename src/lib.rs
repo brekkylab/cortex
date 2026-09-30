@@ -56,15 +56,15 @@
 //!
 //! [`fs`] and [`console`] meet only at [`Mount`](fs::Mount): a console takes trees already
 //! mounted and never builds one or touches a binding, and [`fs`] does not know a console
-//! exists. Both answer in [`std::io::Error`], classified by kind, so there is no shared error
-//! type.
+//! exists. There is no shared error type: [`fs`] answers in [`std::io::Error`], classified by
+//! kind, and [`console`] in [`Failure`](protocol::Failure), or [`anyhow::Error`] while building.
 //!
 //! ## The file layout
 //!
-//! A module is a directory whose `mod.rs` holds its documentation and re-exports, and whose
-//! siblings hold the code, including one named after the module for its main type
-//! (`message/message.rs` has [`Message`](protocol::Message)); hence `module_inception` is
-//! allowed.
+//! A module with submodules is a directory whose `mod.rs` holds its documentation and
+//! re-exports, and whose siblings hold the code, including one named after the module for its
+//! main type (`message/message.rs` has [`Message`](protocol::Message)); hence
+//! `module_inception` is allowed.
 #![allow(clippy::module_inception)]
 
 pub mod console;
@@ -90,8 +90,8 @@ pub use ensure::ensure_cortex;
 /// `cortex` under the user's cache directory.
 ///
 /// **One root for everything kept here**, so a host has a single answer to "where does this
-/// go". Contents are split by owner as paths under it, not separate roots: images, shared by
-/// every tool in this repository, and one directory per live server process, private to it.
+/// go". Contents are split by owner as paths under it, not separate roots; this crate keeps
+/// only `bin/`, where the console server lives.
 ///
 /// The user's cache directory is `XDG_CACHE_HOME` or `~/.cache`, on macOS
 /// `~/Library/Caches`, and on Windows `%LOCALAPPDATA%`, falling back to

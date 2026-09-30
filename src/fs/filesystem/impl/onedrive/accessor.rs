@@ -207,7 +207,7 @@ pub struct OnedriveAccessor {
     config: OnedriveConfig,
     urls: Endpoints,
     access_token: Mutex<Option<(String, Instant)>>,
-    /// When the service last said to stop asking, and until when. See
+    /// Until when the service said to stop asking. See
     /// [`refuse_while_throttled`](Self::refuse_while_throttled).
     throttled_until: Mutex<Option<Instant>>,
 }
@@ -292,8 +292,8 @@ impl OnedriveAccessor {
     /// Graph reports throttling as `429` with `Retry-After` and means it, so no other
     /// status needs classifying as a rate limit. A wait it asks for is
     /// honoured as asked or not taken at all; see [`MAX_RETRY_AFTER`] for why there is no
-    /// third option. A backoff this code computed for itself is capped at [`MAX_BACKOFF`],
-    /// which is a different thing and safe to shorten.
+    /// third option. A backoff this code computed for itself has its base capped at
+    /// [`MAX_BACKOFF`], which is a different thing and safe to shorten.
     async fn send_retrying(
         &self,
         build: impl Fn(&str) -> reqwest::RequestBuilder,
@@ -376,7 +376,7 @@ impl OnedriveAccessor {
     ///
     /// A failure keeps reqwest's own error underneath, so the *status* survives as a
     /// status and a caller can ask what it was rather than search the message for digits.
-    /// Graph's error body goes on top as context, because that is where the AADSTS code
+    /// Graph's error body goes on top as context, because that is where the error code
     /// and the correlation id are, and neither is recoverable from a status.
     ///
     /// Safe to let reqwest's message name the URL here: a Graph URL carries a path and a
@@ -467,8 +467,8 @@ impl OnedriveAccessor {
         Ok(out)
     }
 
-    /// One item by id, for the case a listing cannot answer: a fresh download URL after
-    /// the cached one has expired.
+    /// One item by id, for the case a listing cannot answer: a download URL the listing did
+    /// not carry, or a fresh one after the cached one has expired.
     ///
     /// By id rather than by path, and that is load-bearing rather than tidy. A path has
     /// two Unicode spellings and the service answers only to the one it stored, while an
@@ -636,7 +636,7 @@ fn next_wait(asked: Option<Duration>, slept: Duration, retries: u32) -> Option<D
     }
 }
 
-/// `2^n` seconds plus jitter, capped.
+/// `2^n` seconds, capped, plus jitter.
 ///
 /// The jitter comes from the clock rather than a random-number crate: it only has to keep
 /// two callers off the same wake-up, which a nanosecond count does.

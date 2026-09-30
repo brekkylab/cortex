@@ -407,7 +407,8 @@ impl OnedriveFs {
         held.insert(path.to_string(), span);
     }
 
-    /// A download URL straight from the service, for when the listing's has expired.
+    /// A download URL straight from the service, for when the listing's is missing or has
+    /// expired.
     ///
     /// Costs one request and does not disturb the listing: the rest of that snapshot is
     /// still good, and re-listing the folder to refresh one URL would throw away every

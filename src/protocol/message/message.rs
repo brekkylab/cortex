@@ -275,7 +275,7 @@ mod tests {
         ]
     }
 
-    /// Everything a session above does not happen to contain.
+    /// Other messages the session above does not happen to contain.
     fn all() -> Vec<Message> {
         session()
             .into_iter()

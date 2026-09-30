@@ -4,8 +4,9 @@
 //! encode the reply. It decides only the errno numbering its consumer expects (a guest kernel
 //! is always Linux; the host's is the host's) and the attribute type it fills.
 //!
-//! Each binding exports only a guard whose `try_new` mounts, `join` waits for the mount to
-//! end, and `Drop` takes it down; vtables, callbacks and session handles stay private.
+//! Each binding exports a guard whose `try_new` mounts, `join` waits for the mount to end, and
+//! `Drop` takes it down, plus its mount options; vtables, callbacks and session handles stay
+//! private.
 
 // One binding per target, all behind `mount`: which interface a host mounts through is
 // decided by its OS, so a build never has two to choose between.

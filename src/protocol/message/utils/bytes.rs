@@ -1,4 +1,4 @@
-//! Raw bytes as BSON `Binary` (subtype `Generic`), at 1.0× rather than base64's 1.37×.
+//! Raw bytes as BSON `Binary` (subtype `Generic`), at 1.0× rather than base64's 1.33×.
 //!
 //! # Why this does not ask the codec
 //!

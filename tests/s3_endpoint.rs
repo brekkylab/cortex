@@ -75,8 +75,7 @@ fn fetch_roster() -> Option<Vec<Principal>> {
 /// Pull one string field out of a JSON fragment, or the first string when `field` is
 /// empty (the value the fragment was split on).
 ///
-/// A scan rather than a JSON crate, which every test build would pay for; the fields
-/// wanted are flat and unambiguous.
+/// A scan rather than a JSON parse: the fields wanted are flat and unambiguous.
 fn json_string(body: &str, field: &str) -> Option<String> {
     let after_field = if field.is_empty() {
         body
@@ -209,7 +208,7 @@ async fn a_real_endpoint_answers_the_whole_read_surface() {
     assert!(stat.mtime.is_some(), "LastModified should reach Stat");
     assert!(stat.etag.is_some(), "ETag should reach Stat");
 
-    // A whole read, then a ranged read from the middle to exercise `Range`/206.
+    // A whole read, itself a ranged `GET` (`Range`/206), then a read from the middle.
     let mut whole = vec![0u8; size as usize];
     let read = vol
         .read_at(&path, &mut whole, 0)
@@ -219,7 +218,7 @@ async fn a_real_endpoint_answers_the_whole_read_surface() {
 
     let at = size / 2;
     let mut middle = vec![0u8; (size - at) as usize];
-    // May be served from the window the first read filled; the bytes must agree either way.
+    // Served from the window the first read filled; the bytes must still agree.
     let read = vol
         .read_at(&path, &mut middle, at)
         .await

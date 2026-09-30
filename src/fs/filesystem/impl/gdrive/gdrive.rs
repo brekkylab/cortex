@@ -178,7 +178,7 @@ const MAX_REMEMBERED_LENGTHS: usize = 50_000;
 /// accessor logs it) — a folder that large is pathological to `ls` anyway.
 const MAX_FOLDER_FILES: usize = 10_000;
 
-/// How many characters of a Drive id every served name carries (see [`id_tag`] and
+/// How many characters of a Drive id a short tag carries (see [`id_tag`] and
 /// [`disambiguate`]).
 const ID_TAG_LEN: usize = 8;
 
@@ -242,7 +242,7 @@ impl GKind {
 
 /// What listing a directory takes, which is not the same question as what it is called.
 ///
-/// Two of the root's three sections resolve to an id Drive knows, and the third
+/// Two of the root's three kinds of section resolve to an id Drive knows, and the third
 /// resolves to none: `Shared with me` is a view rather than a folder. An `Option<String>`
 /// would say the same thing and let a caller reach past it into a query that needs an id
 /// — this cannot be read without deciding which of the two it is.
@@ -260,8 +260,8 @@ enum Listing {
 #[derive(Clone)]
 struct Child {
     /// Listing name: the sanitized Drive name with a tag off this entry's own id (see
-    /// [`disambiguate`]) — plus a `.json` suffix when the entry serves a document's API
-    /// JSON. Untagged at the root, whose sections this store names itself.
+    /// [`disambiguate`]) — plus a `.gdoc.json`-style suffix when the entry serves a
+    /// document's API JSON. Untagged at the root, whose sections this store names itself.
     vfs_name: String,
     id: String,
     /// Set when the entry lives in a shared drive (listing scope).
@@ -271,12 +271,11 @@ struct Child {
     created: Option<std::time::SystemTime>,
     /// What this entry hands back when read.
     serves: Serves,
-    /// Byte length as the listing reported it, which means two different things.
+    /// Byte length as the listing reported it, for a file Drive holds bytes for.
     ///
-    /// For a file Drive holds bytes for it is exact, and a reader can seek inside it. For
-    /// a document it is the size of what Drive *stores*, which describes neither the JSON
-    /// served nor anything else a reader sees. It is kept for the ceiling check and nothing
-    /// else; the length an entry reports comes from `entry_size`.
+    /// Exact, so a reader can seek inside it. `None` for a directory and for a document,
+    /// whose Drive size is what Drive *stores* and describes neither the JSON served nor
+    /// anything else a reader sees; the length an entry reports comes from `entry_size`.
     size: Option<u64>,
 }
 
@@ -678,8 +677,8 @@ impl GdriveFs {
         // entry takes a tag off its own id: readdir shows distinct names, resolve finds each
         // one, and no entry's name depends on what else the folder holds.
         //
-        // Not at the root. Those three sections are names this store invents rather than
-        // names Drive gave, `unique_name` already keeps them apart, and `Shared with me`
+        // Not at the root. Its sections are this store's own names or shared drives',
+        // `unique_name` already keeps them apart, and `Shared with me`
         // answers to no id at all — tagging it would leave a trailing `_` standing in for
         // an id that does not exist.
         if folder != "/" {
@@ -723,9 +722,9 @@ impl GdriveFs {
     ///
     /// Two calls, because Sheets has no single one that answers both cheaply.
     /// `spreadsheets.get` gives the workbook's shape and, with it, the tab titles that
-    /// name the ranges; `values:batchGet` then returns the used range of every tab at once.
-    /// `includeGridData=true` is no route: it bills per *allocated* cell. See
-    /// [`GdriveAccessor::sheet_values_batch`].
+    /// name the ranges; `values:batchGet` then returns the used range of up to [`MAX_TABS`]
+    /// tabs at once. `includeGridData=true` is no route: it costs bytes per *allocated*
+    /// cell. See [`GdriveAccessor::sheet_values_batch`].
     ///
     /// A tab whose values exceed the budget is left out with a `valuesOmitted` note
     /// on it, so a reader sees a stated omission rather than an empty sheet.
@@ -1104,8 +1103,8 @@ fn not_found_or_backend(e: anyhow::Error) -> io::Error {
 }
 
 /// Map one `files.list` row into the entry it becomes, or `None` when the mount
-/// has nothing to serve for it (Forms, Maps and Drawings answer no API and export
-/// to nothing — a name that cannot be read is worse than an absence).
+/// has nothing to serve for it (Forms, Maps and Drawings answer no API this mount reads,
+/// and it serves no export — a name that cannot be read is worse than an absence).
 fn child_from_file(f: &Value) -> Option<Child> {
     let name = sanitize_name(f.get("name")?.as_str()?);
     let id = f.get("id")?.as_str()?.to_string();
@@ -1460,7 +1459,7 @@ fn split_extension(name: &str, serves: Serves) -> (&str, &str) {
     }
 }
 
-/// Disambiguate a shared-drive name that collides with a root section.
+/// Disambiguate a shared-drive name that collides with a root section or an earlier drive.
 ///
 /// `existing` holds composed names and is asked in composed form: a byte-compared set
 /// would leave a canonically equal pair both unnumbered, and [`same_name`] would then
@@ -1538,7 +1537,7 @@ fn split_last(path: &str) -> (String, String) {
 /// The requested window of `data`, clamped to what exists.
 ///
 /// Both ends are clamped, because a reader may seek past the end and a window may
-/// straddle it. Neither is reordered: the only way in is the private `read_window` from
+/// straddle it. Neither is reordered: the only non-test way in is the private `read_window` from
 /// [`FileSystem::read_at`], which builds `offset..offset + buf.len()`, so
 /// `r.end >= r.start` holds by construction.
 fn slice(data: &[u8], range: Option<std::ops::Range<u64>>) -> Vec<u8> {

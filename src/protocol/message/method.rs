@@ -44,8 +44,7 @@ impl Method {
 
     /// Whether nothing answers this method.
     ///
-    /// A property of the method, not the message, so both halves ask here instead of
-    /// keeping their own lists.
+    /// A property of the method, not the message.
     pub fn is_notification(&self) -> bool {
         matches!(self, Method::Start | Method::Stop | Method::Quit)
     }

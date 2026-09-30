@@ -226,8 +226,7 @@ pub struct Recipe {
 
     /// The base, as the caller spelled it.
     ///
-    /// Never empty; a document with an empty base is refused on read, as there is no build
-    /// without one.
+    /// A document with an empty base is refused on read, as there is no build without one.
     #[serde(deserialize_with = "some_base")]
     pub base: String,
 

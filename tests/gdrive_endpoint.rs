@@ -200,7 +200,7 @@ async fn gdrive_endpoint_reads_a_blob_at_the_offset_asked_for() {
     let fs = GdriveFs::new(&cfg).unwrap();
 
     let Some((path, size)) = find_file(&fs, 64, |name| !name.ends_with(".json")).await else {
-        // Expected against the corpus as it stands — see the note at the top of this file.
+        // Expected against the corpus as it stands — see this test's doc.
         // Not an assertion, so the test runs the day a blob appears.
         eprintln!(
             "  no blob reachable in {WALK_DIRS} directories; \
@@ -321,7 +321,7 @@ async fn read_to_end(fs: &GdriveFs, path: &Path) -> Vec<u8> {
     out
 }
 
-/// The first file in the corpus over `min` bytes whose name `want` accepts, breadth-first
+/// The first file in the corpus of at least `min` bytes whose name `want` accepts, breadth-first
 /// and bounded. Discovered rather than named, so the corpus can change underneath.
 async fn find_file(fs: &GdriveFs, min: u64, want: impl Fn(&str) -> bool) -> Option<(PathBuf, u64)> {
     // The account's own drive first. A listing can run to many pages, so the order the

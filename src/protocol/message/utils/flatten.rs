@@ -180,8 +180,7 @@ impl<M: SerializeMap> SerializeStruct for FlatMap<'_, M> {
         self.0.serialize_entry(key, value)
     }
 
-    /// A skipped field is omitted, so a variant carrying nothing gets no `params` rather
-    /// than a null one.
+    /// A skipped field is omitted, not written as a null member.
     fn skip_field(&mut self, _key: &'static str) -> Result<(), M::Error> {
         Ok(())
     }

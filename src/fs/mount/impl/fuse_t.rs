@@ -457,8 +457,8 @@ impl FuseTBackend {
 /// The session pointer, sent to the serving thread.
 ///
 /// # Safety
-/// Touched only by the serving thread and by [`FuseTMount`]'s `Drop`, which runs after that
-/// thread is joined, never from two threads at once.
+/// Touched only by the serving thread and by [`FuseTMount`]'s `Drop`, which frees it only
+/// after that thread is joined.
 struct SessionPtr(*mut c_void);
 unsafe impl Send for SessionPtr {}
 
@@ -507,7 +507,7 @@ impl FuseTMount {
     /// (`brew install --cask fuse-t`) — no kernel extension, no reboot (macFUSE is a kext
     /// needing reduced-security boot on Apple Silicon).
     ///
-    /// **Blocks until the mount is real.** `fuse_mount` returns a session early, but the kernel
+    /// **Blocks until the mount is real.** `fuse_mount` returns early, but the kernel
     /// attaches it only after the serving thread answers the helper's opening
     /// INIT/STATFS/GETATTR; touching the path before then would see the bare directory or
     /// block on a half-built mount.
@@ -595,7 +595,7 @@ impl FuseTMount {
         Ok(mount)
     }
 
-    /// Serve until the mount goes away, then take it down.
+    /// Serve until the mount goes away.
     ///
     /// Waits for something else to end the mount (`umount`, `diskutil unmount`, or the helper
     /// dying). **It does not unmount**; to end the mount, drop the guard.

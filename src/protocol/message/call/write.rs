@@ -24,6 +24,7 @@ pub struct WriteCall {
 /// How big the file is now. The `result` of `write`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteResp {
-    /// Where a positioned write carries on from; for a whole-file write, confirms the length.
+    /// The whole file's size, where an appending write carries on from; for a whole-file
+    /// write, confirms the length.
     pub size: u64,
 }
