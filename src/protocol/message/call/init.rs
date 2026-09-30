@@ -525,9 +525,16 @@ pub struct Port {
 }
 
 impl Port {
-    /// `console` in the session, reached at `host` on the server's machine.
-    pub fn new(host: u16, console: u16) -> Self {
-        Port { host, console }
+    /// `console` in the session, reached at `host` on the server's machine. Port 0 on either
+    /// side is no port, and is refused here as it is on the wire.
+    pub fn new(host: u16, console: u16) -> Result<Self, InvalidPort> {
+        if host == 0 || console == 0 {
+            return Err(InvalidPort {
+                why: "port 0 is no port",
+                spec: format!("{host}:{console}"),
+            });
+        }
+        Ok(Port { host, console })
     }
 }
 
