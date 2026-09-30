@@ -316,7 +316,7 @@ There is nothing between the two, because a level between them is a firewall eve
 - **Loopback, and TCP.** A port is a service on the server's own machine, never one on its interfaces, so there is no address in front of it and no `/udp` after it.
 - **The host port is the client's to choose**, so there is nothing for the result to answer: the port a client connects to is the one it wrote. One that is taken on the server's machine is refused with `-32602`, while the client can still pick another.
 - **A port is the session's, not a boot's.** It is held from `init` to `quit`, across every `stop` and the boot after it. A connection that arrives while nothing is booted waits for the next boot.
-- **A connection reaches whatever in the session listens on that port**, whichever address it listens on, and is refused when nothing does.
+- **A connection reaches whatever in the session listens on that port**, whichever address it listens on, and is closed when nothing does.
 
 A port on a session with `network: false`, and a port of `0` on either side, are refused with `-32602`.
 
