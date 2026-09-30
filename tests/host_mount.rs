@@ -22,11 +22,10 @@
 //! | macOS | `FuseTMount`: libfuse-t's own session loop |
 //! | Windows | `DokanMount`: Dokany's driver, through `dokan` |
 //!
-//! **A missing provider is not the same failure on every platform.** On macOS
-//! FUSE-T is probed with pkg-config and so fails at *build* time, never by
-//! silently passing. Dokany cannot: its driver is a runtime fact, so a build
-//! without it succeeds and `try_new` answers `can't install driver` instead.
-//! Either way the test fails rather than quietly not running, which is the
+//! **A missing provider fails the test, on every platform.** The build does not
+//! need one -- on macOS the shim opens libfuse-t at run time, and on Windows the
+//! DLL is delay-loaded -- so `try_new` is what finds it missing, and answers with
+//! what to install. The test fails rather than quietly not running, which is the
 //! property that matters — a test that silently does not run is worse than one
 //! that fails.
 //!

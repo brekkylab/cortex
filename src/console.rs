@@ -336,6 +336,30 @@ impl ConsoleClientBuilder {
     /// `false` is a session that must not have one, and leaving it out is the server's own
     /// choice — the two are different, and only the second is what a caller with no opinion
     /// wants.
+    ///
+    /// **The image has to bring the guest's half of Vulkan**: a loader (`libvulkan.so.1`) and
+    /// the venus driver that reaches the host's GPU. The server attaches the device; it cannot
+    /// install a program's libraries. Without the loader nothing in the guest finds a device,
+    /// and without venus Vulkan falls back to a software renderer on the CPU.
+    ///
+    /// | | Alpine | Debian |
+    /// |---|---|---|
+    /// | loader | `vulkan-loader` | `libvulkan1` |
+    /// | venus driver | `mesa-vulkan-virtio` | `mesa-vulkan-drivers`, trixie or later |
+    ///
+    /// ```no_run
+    /// # use cortex::{console::ConsoleClient, image::Recipe};
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = ConsoleClient::builder()
+    ///     .image(
+    ///         Recipe::new("alpine:latest")
+    ///             .step("apk add --no-cache vulkan-loader mesa-vulkan-virtio vulkan-tools"),
+    ///     )
+    ///     .gpu(true)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
     pub fn gpu(mut self, gpu: bool) -> Self {
         self.gpu = Some(gpu);
         self
@@ -352,9 +376,13 @@ impl ConsoleClientBuilder {
     /// [`build`](Self::build).
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use cortex::{console::ConsoleClient, image::Recipe};
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
+    ///     // A loader and the venus driver -- see `gpu`.
+    ///     .image(
+    ///         Recipe::new("alpine:latest").step("apk add --no-cache vulkan-loader mesa-vulkan-virtio"),
+    ///     )
     ///     .gpu(true)
     ///     .gpu_memory_mib(8192)
     ///     .build()

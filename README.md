@@ -12,13 +12,19 @@ Create, use, and dispose of VMs directly from your code.
 
 ### Python
 
+```sh
+pip install cortex-py
+```
+
 ```python
 import asyncio
 
-from cortex import ConsoleClient, Recipe
+from cortex import ConsoleClient, Recipe, ensure_cortex
 
 
 async def main() -> None:
+    # Fetches the console server into cortex's cache the first time; a no-op after.
+    await ensure_cortex()
     console = await (
         ConsoleClient.builder()
         .image(Recipe("alpine:latest").step("apk add --no-cache jq"))
@@ -38,9 +44,15 @@ asyncio.run(main())
 
 ### Node
 
-```js
-import { ConsoleClient, Recipe } from 'cortex-node'
+```sh
+npm install @brekkylab/cortex
+```
 
+```js
+import { ConsoleClient, Recipe, ensureCortex } from '@brekkylab/cortex'
+
+// Fetches the console server into cortex's cache the first time; a no-op after.
+await ensureCortex()
 const console_ = await ConsoleClient.builder()
   .image(new Recipe('alpine:latest').step('apk add --no-cache jq'))
   .build()
@@ -100,20 +112,23 @@ cortex
 
 The VM gets a GPU through Vulkan on every host, so it can run heavy work like deep learning.
 
-Turn it on with the builder's `gpu` option:
+Turn it on with the builder's `gpu` option, and install the guest's half of Vulkan in the image:
 
 ```python
 import asyncio
 
-from cortex import ConsoleClient, Recipe
+from cortex import ConsoleClient, Recipe, ensure_cortex
 
 
 async def main() -> None:
+    await ensure_cortex()
     console = await (
         ConsoleClient.builder()
         .image(
-            Recipe("debian:bookworm-slim").step(
-                "apt-get update && apt-get install -y mesa-vulkan-drivers vulkan-tools"
+            Recipe("alpine:latest").step(
+                # The Vulkan loader, the venus driver that reaches the host's GPU,
+                # and vulkaninfo to look at it.
+                "apk add --no-cache vulkan-loader mesa-vulkan-virtio vulkan-tools"
             )
         )
         .gpu(True)
@@ -130,7 +145,17 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-If the host can't give a GPU, `build()` fails instead of quietly running on the CPU.
+The host's GPU shows up in the guest as `Virtio-GPU Venus (<the host's GPU>)`. What the image needs for that:
+
+| | Alpine | Debian |
+|---|---|---|
+| Vulkan loader (`libvulkan.so.1`) | `vulkan-loader` | `libvulkan1` |
+| venus driver | `mesa-vulkan-virtio` | `mesa-vulkan-drivers`, trixie or later |
+
+- **Install the loader yourself.** Without it, no program in the guest finds a Vulkan device, whatever the host has. Some packages bring it along (Debian's `vulkan-tools` does) and some don't (Alpine's doesn't), so name it rather than count on it.
+- **An image with no venus driver still runs, but on the CPU.** Debian bookworm's Mesa has no venus, and Vulkan there falls back to `llvmpipe`, a software renderer. Check the `deviceName` your program picks.
+
+If the host can't give a GPU, `build()` fails instead of quietly running on the CPU. On the host, that takes a Vulkan loader too: `libvulkan1` (Debian, Ubuntu) or `vulkan-loader` (Fedora) on Linux, and on Windows `vulkan-1.dll`, which comes with the GPU's driver.
 
 ### Filesystem
 
@@ -251,12 +276,25 @@ The `mount` feature, on by default, mounts a cortex filesystem on the host throu
 | Host  | Provider | Needed to build | Needed to mount |
 |-------|----------|-----------------|---------------|
 | Linux | `/dev/fuse` in the kernel | — | — |
-| macOS | [FUSE-T](https://www.fuse-t.org) | ✓ | ✓ |
+| macOS | [FUSE-T](https://www.fuse-t.org) | — | ✓ |
 | Windows | [Dokany](https://github.com/dokan-dev/dokany) | — | ✓ |
 
 A program built with `mount` runs on a host without the provider; only mounting fails, with an error that says what to install.
 `cortex::fs::mount_support()` (`mount_support()` in Python, `mountSupport()` in Node) asks ahead of a mount.
-On Windows that needs the binary linked with `/DELAYLOAD:dokan2.dll` — see the `mount` feature in `Cargo.toml`.
+
+On Windows, a Rust program gets that only if it delay-loads `dokan2.dll`, which it has to ask for in its own `build.rs`. cortex's cannot do it on the program's behalf, since a link argument reaches only the package that prints it. The Node and Python packages already do it. Without it, a program that mounts needs Dokany installed just to start.
+
+```rust
+// build.rs of a program that depends on cortex
+fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo::rustc-link-arg=/DELAYLOAD:dokan2.dll");
+        println!("cargo::rustc-link-lib=delayimp");
+    }
+}
+```
 
 If you don't mount on the host, build with `default-features = false` and skip all of this.
 
@@ -265,6 +303,8 @@ For macOS
 ```sh
 brew install --cask fuse-t
 ```
+
+cortex mounts through FUSE-T 1.x, and is checked against 1.2.7. A FUSE-T of another major version is refused before a mount, with the release to install instead, rather than risk a crash on a layout that changed; `CORTEX_FUSE_T_UNCHECKED=1` mounts with it anyway.
 
 And for windows
 

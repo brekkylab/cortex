@@ -3,8 +3,9 @@
  * Everything fragile stays on the C side: `fuse_lowlevel_ops` (~50 function
  * pointers, `__APPLE__`-conditional members), `fuse_file_info` (bitfields), and
  * `fuse_entry_param` (embeds a host `struct stat`). A wrong layout in Rust is
- * silent memory corruption, not a compile error, so the C compiler — which has
- * the real headers — owns them and Rust sees only the flat types below.
+ * silent memory corruption, not a compile error, so the C compiler owns them --
+ * declared in `fuse_t.h`, and checked against FUSE-T's own headers by
+ * `check-abi.sh` -- and Rust sees only the flat types below.
  *
  * Rust supplies `cortex_fuse_t_ops`, a vtable of its own design. Operations
  * return 0 or a negative errno, as libfuse itself does.
@@ -75,11 +76,27 @@ struct cortex_fuse_t_ops {
     uint32_t name_max;
 };
 
-/* Open libfuse-t, once per process, and answer nonzero if it and every
- * function the shim calls were found. The shim does not link it, so every
- * other function here calls through what this resolved: ask this first, and
- * call nothing else when it answers 0. Thread-safe. */
-int cortex_fuse_t_available(void);
+/* What `cortex_fuse_t_status` answers. */
+#define CORTEX_FUSE_T_MISSING 0 /* no libfuse-t, or one without a function the shim calls */
+#define CORTEX_FUSE_T_OK 1
+#define CORTEX_FUSE_T_OTHER_API 2 /* a libfuse API other than 2.x: `cortex_fuse_t_api` */
+#define CORTEX_FUSE_T_OTHER_MAJOR 3 /* a FUSE-T release of another major version: `cortex_fuse_t_release` */
+
+/* Open libfuse-t, once per process, check it is one the shim's declarations are right
+ * for, and resolve every function the shim calls. The shim does not link it, so every
+ * other function here calls through what this resolved: ask this first, and call nothing
+ * else unless it answers CORTEX_FUSE_T_OK. Thread-safe. */
+int cortex_fuse_t_status(void);
+
+/* The loaded libfuse-t's `fuse_version()`, or 0 when none was loaded. */
+int cortex_fuse_t_api(void);
+
+/* The FUSE-T release the loaded libfuse-t is, as its installer names the file
+ * (`libfuse-t-<release>.dylib`), or "" when that name does not say. */
+const char *cortex_fuse_t_release(void);
+
+/* The FUSE-T release `fuse_t.h` was last checked against. */
+const char *cortex_fuse_t_checked(void);
 
 /* Mount and build a session. Returns NULL on failure. The returned pointer owns
  * the channel and session and must be freed with `cortex_fuse_t_destroy`.

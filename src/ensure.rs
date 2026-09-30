@@ -6,19 +6,26 @@
 //! bucket's public HTTPS endpoint, is
 //!
 //! ```text
-//! cortex-krun/<os>-<arch>/latest                                    one line: a version
-//! cortex-krun/<os>-<arch>/<version>/cortex-krun-<os>-<arch>.tar.gz
+//! cortex-krun/<ref>/cortex-krun-<os>-<arch>.tar.gz
 //! ```
 //!
-//! with `<os>` and `<arch>` spelled as [`std::env::consts`] spells them. A version is a git
-//! sha of cortex-krun, and `latest` is per platform because each is built on a machine of
-//! its own and uploaded when that machine is done.
+//! with `<os>` and `<arch>` spelled as [`std::env::consts`] spells them, and `<ref>` any name
+//! a release goes by: the git sha of cortex-krun it was built from, a version tag, or
+//! `latest`. Each is a directory of every platform's archive, so fetching is one URL whichever
+//! name it is given.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
 use crate::cache_root;
+
+/// The server release this build fetches by default, set at build time -- a sha or a tag.
+/// `None` in a build nobody pinned, which follows `latest`.
+const PINNED: Option<&str> = match option_env!("CORTEX_KRUN_PINNED_VERSION") {
+    Some(version) if !version.is_empty() => Some(version),
+    _ => None,
+};
 
 /// Where releases are fetched from unless `$CORTEX_DIST_URL` says otherwise.
 const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com";
@@ -30,9 +37,11 @@ const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east
 /// came from here or from `cargo xtask install` -- this makes a host able to run a session,
 /// and does not keep one up to date.
 ///
-/// The version is `$CORTEX_KRUN_VERSION` if set, else whatever this platform's `latest`
-/// names. `cortex-krun` itself is the last file put in place, so a fetch that fails partway
-/// leaves a `bin/` the next call fetches into again rather than one that looks complete.
+/// The release is `$CORTEX_KRUN_VERSION` if set; else the one this build was pinned to, if it
+/// was built with `CORTEX_KRUN_PINNED_VERSION` -- which a published package is, so that one
+/// release of it always fetches the server it was tested with; else `latest`. `cortex-krun`
+/// itself is the last file put in place, so a fetch that fails partway leaves a `bin/` the
+/// next call fetches into again rather than one that looks complete.
 pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     let root = cache_root();
     let bin = root.join("bin");
@@ -46,27 +55,19 @@ pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
         .ok()
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| DIST_URL.to_string());
-    let base = format!("{}/cortex-krun/{platform}", base.trim_end_matches('/'));
-
-    let version = match std::env::var("CORTEX_KRUN_VERSION")
+    let release = std::env::var("CORTEX_KRUN_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
-    {
-        Some(version) => version,
-        None => {
-            let latest = fetch(&format!("{base}/latest"))
-                .await
-                .with_context(|| format!("no cortex-krun release is published for {platform}"))?;
-            String::from_utf8(latest)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .with_context(|| format!("{base}/latest does not name a version"))?
-        }
-    };
+        .or_else(|| PINNED.map(str::to_string))
+        .unwrap_or_else(|| "latest".to_string());
 
-    let url = format!("{base}/{version}/cortex-krun-{platform}.tar.gz");
-    let archive = fetch(&url).await?;
+    let url = format!(
+        "{}/cortex-krun/{release}/cortex-krun-{platform}.tar.gz",
+        base.trim_end_matches('/')
+    );
+    let archive = fetch(&url).await.with_context(|| {
+        format!("no cortex-krun release is published for {platform} as `{release}`")
+    })?;
     tokio::task::spawn_blocking(move || unpack(&archive, &root, &server))
         .await
         .context("unpacking cortex-krun panicked")??;
