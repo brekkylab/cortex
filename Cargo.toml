@@ -215,7 +215,7 @@ default = ["mount", "ensure"]
 #
 # **On Windows, a binary has to delay-load `dokan2.dll` to start without Dokany**, which
 # its own `build.rs` asks for — `/DELAYLOAD` is a `rustc-link-arg`, and one of those reaches
-# only the package that prints it. The bindings' `build.rs` are the two lines to copy.
+# only the package that prints it. The README's `mount` section has the two lines to copy.
 # Linked without it, a binary needs the DLL to start, as before.
 #
 # **On Windows, Dokany has to be installed to run** — the kernel driver (`dokan2.sys`)

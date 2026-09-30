@@ -4,8 +4,15 @@
 //!   SMOKE_MOUNT   1 if a FUSE provider is installed here, else 0
 //!   SMOKE_VM      1 if this machine can boot one (KVM or HVF), else 0
 use cortex::console::ConsoleClient;
-use cortex::fs::mount_support;
+use cortex::fs::{Directory, mount_support};
 use cortex::image::{ImageClient, Recipe};
+
+#[cfg(windows)]
+use cortex::fs::DokanMount as HostMount;
+#[cfg(target_os = "linux")]
+use cortex::fs::FuseMount as HostMount;
+#[cfg(target_os = "macos")]
+use cortex::fs::FuseTMount as HostMount;
 
 fn want(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
@@ -29,6 +36,28 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     check(fuse == want("SMOKE_MOUNT"), &format!("mount_support says {}", if fuse { "yes" } else { "no" }));
+
+    // A mount, whether or not this host can make one: it links the provider's code into this
+    // binary, which is what a delay-load is for. Reaching here at all is the binary starting
+    // without the provider -- on Windows, the `/DELAYLOAD` in `build.rs` -- and without one, a
+    // mount has to be an error rather than a crash.
+    let point = std::env::temp_dir().join(format!("cortex-smoke-rust-mount-{}", std::process::id()));
+    std::fs::create_dir_all(&point)?;
+    let tree = Directory::new().with_file("a.txt", "hi".as_bytes())?;
+    match HostMount::try_new(tree, &point) {
+        Ok(mount) => {
+            check(fuse, "a HostMount is made only where mount_support says yes");
+            let read = std::fs::read_to_string(point.join("a.txt")).unwrap_or_default();
+            check(read == "hi", "HostMount serves its tree");
+            drop(mount);
+            check(!point.join("a.txt").exists(), "dropping the HostMount takes it down");
+        }
+        Err(e) => {
+            println!("  HostMount: {e}");
+            check(!fuse, "a HostMount without a provider is an error, not a crash");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&point);
 
     // The release this crate was packed with, unless the environment says otherwise -- see
     // `build.rs`.

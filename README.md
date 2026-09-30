@@ -281,7 +281,20 @@ The `mount` feature, on by default, mounts a cortex filesystem on the host throu
 
 A program built with `mount` runs on a host without the provider; only mounting fails, with an error that says what to install.
 `cortex::fs::mount_support()` (`mount_support()` in Python, `mountSupport()` in Node) asks ahead of a mount.
-On Windows that needs the binary linked with `/DELAYLOAD:dokan2.dll` — see the `mount` feature in `Cargo.toml`.
+
+On Windows, a Rust program gets that only if it delay-loads `dokan2.dll`, which it has to ask for in its own `build.rs`. cortex's cannot do it on the program's behalf, since a link argument reaches only the package that prints it. The Node and Python packages already do it. Without it, a program that mounts needs Dokany installed just to start.
+
+```rust
+// build.rs of a program that depends on cortex
+fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!("cargo::rustc-link-arg=/DELAYLOAD:dokan2.dll");
+        println!("cargo::rustc-link-lib=delayimp");
+    }
+}
+```
 
 If you don't mount on the host, build with `default-features = false` and skip all of this.
 
