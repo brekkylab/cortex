@@ -306,7 +306,7 @@ What the kinds are and how one tree is assembled from several stores is [`fs/ARC
 "ports": ["8080:80", "5901:5900"]
 ```
 
-`network` is whether a session's commands reach a network at all.
+`network` is whether a session's commands reach a network at all, and is on when left out: on is the one value every server can give.
 On is what a process on the server's machine reaches, less that machine's own loopback: the services listening there are the operator's, not the session's.
 Off is no network at all.
 There is nothing between the two, because a level between them is a firewall every backend would have to reimplement, and the server's machine is already the place that knows how to keep a process off part of a network.
@@ -645,7 +645,7 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32013` | `init` | **unsupported machine** — a GPU this server has no device for, or more vCPUs or memory than it will give. `init`'s own for the reason `UNSUPPORTED_MOUNT` is: what shapes a server can make is a fact about its build and its host, knowable as the frame is read. Apart from `BOOT_FAILED` because asking again will not make it true, and never used to narrow a session. |
 | `-32600` | any | invalid request. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty argv `cmd`, a mount that is not one, or two mounts asking for the same path. Apart from `UNSUPPORTED_MOUNT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
+| `-32602` | any | invalid params — an empty argv `cmd`, a mount that is not one, two mounts asking for the same path, a port on a session with `network: false`, a port of `0`, or a host port already taken on the server's machine. Apart from `UNSUPPORTED_MOUNT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
 | `-32603` | any | internal error |
 
 `-32010` through `-32012` are taken by parts of this protocol the document above does not yet describe, which is why they are not in the table; `-32003`, `-32004` and `-32014` name nothing and stay that way.

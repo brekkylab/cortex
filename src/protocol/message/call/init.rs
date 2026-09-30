@@ -68,7 +68,7 @@ use crate::image::ImageSource;
 /// There is no member for what a *command* gets — a share of the machine, an affinity, a
 /// limit. The machine is the unit of what this protocol hands out, and a session that wants
 /// two sizes of it is two sessions.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitCall {
     /// The base a session's commands run in.
     ///
@@ -91,7 +91,7 @@ pub struct InitCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Vec<u8>>,
 
-    /// Whether the session's commands reach a network at all. `None` leaves it to the server.
+    /// Whether the session's commands reach a network at all. Left out, it is on.
     ///
     /// **Said once, for the same reason the trees are.** What a command can reach is a
     /// property of the environment it runs in — on some backends a device that has to be
@@ -110,8 +110,12 @@ pub struct InitCall {
     /// [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) — a server whose
     /// commands run on this host cannot take the network away from them, so it refuses
     /// `false` rather than taking it and running them anyway.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<bool>,
+    ///
+    /// **On unless said otherwise**, because on is the one value every server can give: a
+    /// session that says nothing opens on any of them, and only one that turns it off asks
+    /// for something a server may not have.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub network: bool,
 
     /// Ports on the server's machine that lead into the session, each one spelled the way
     /// docker's `-p` spells it — see [`Port`]. Empty publishes none.
@@ -233,6 +237,31 @@ pub struct InitCall {
     /// is what has to change for these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountSpec>,
+}
+
+impl Default for InitCall {
+    fn default() -> Self {
+        InitCall {
+            image: None,
+            snapshot: None,
+            network: true,
+            ports: Vec::new(),
+            vcpus: None,
+            memory_mib: None,
+            gpu: None,
+            gpu_memory_mib: None,
+            disk_gib: None,
+            mounts: Vec::new(),
+        }
+    }
+}
+
+fn on() -> bool {
+    true
+}
+
+fn is_on(network: &bool) -> bool {
+    *network
 }
 
 /// A tree a session is given: where to get it, where it appears, and whether it may be

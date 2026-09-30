@@ -102,9 +102,8 @@ pub struct ConsoleClientBuilder {
     /// server's own filesystem holds, and this protocol has described none of it.
     mounts: Vec<Mounted>,
 
-    /// `None` leaves the network to the server, which is what a caller with no opinion wants —
-    /// and what every caller wanted before this existed.
-    network: Option<bool>,
+    /// Defaults to true(network enabled).
+    network: bool,
 
     /// The ports on the server's machine that lead into the session, in the order named.
     ports: Vec<Port>,
@@ -127,7 +126,7 @@ impl Default for ConsoleClientBuilder {
             image: None,
             snapshot: None,
             mounts: Vec::new(),
-            network: None,
+            network: true,
             ports: Vec::new(),
             vcpus: None,
             memory_mib: None,
@@ -270,10 +269,10 @@ impl ConsoleClientBuilder {
     /// from [`build`](Self::build) — a server whose commands run on this host refuses `false`.
     ///
     /// On is what the server's machine reaches, less its own loopback — see
-    /// [`InitCall::network`](crate::console::InitCall::network). Leaving it out leaves the
-    /// choice to the server.
+    /// [`InitCall::network`](crate::console::InitCall::network). Leaving it out leaves it
+    /// on.
     pub fn network(mut self, network: bool) -> Self {
-        self.network = Some(network);
+        self.network = network;
         self
     }
 
@@ -491,7 +490,7 @@ impl ConsoleClient {
     /// Take a channel and announce the session on it.
     ///
     /// `init` is here rather than a method a caller remembers, because a session's shape
-    /// is not something a console is ever without: the tree, the base and the reach are
+    /// is not something a console is ever without: the tree, the base and the network are
     /// what the builder was given, they outlive every execution, and there is no useful
     /// console in between having a channel and having said what is on it. So a `ConsoleClient`
     /// that exists is one the server has heard from and answered — which is the one thing
