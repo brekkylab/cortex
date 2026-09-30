@@ -1,10 +1,4 @@
 //! An in-memory [`FileSystem`] store.
-//!
-//! The tree lives behind `Arc<Mutex<..>>` links so every operation shares one store through
-//! `&self` and the store is `Send + Sync`, as [`FileSystem`] requires.
-//!
-//! Every call walks its path from the root: a path-addressed store has no open to amortize the
-//! walk across. In RAM that is one hash lookup per component.
 
 use std::{
     collections::HashMap,
@@ -36,7 +30,8 @@ fn checked_end(offset: u64, len: usize) -> io::Result<usize> {
     }
 }
 
-/// An interior-mutable link to a tree node, shared through the whole store.
+/// An interior-mutable link to a tree node, shared through the whole store, so every operation
+/// works through `&self` and the store is `Send + Sync`.
 type Link = Arc<Mutex<Node>>;
 
 enum Node {
@@ -211,6 +206,9 @@ impl InMemFs {
     }
 
     /// Walk from the root to the node addressed by `comps`.
+    ///
+    /// Every call walks from the root, as a path-addressed store has no open to amortize it
+    /// across; in RAM that is one hash lookup per component.
     fn navigate(&self, comps: &[String]) -> io::Result<Link> {
         let mut cur = self.root.clone();
         for name in comps {

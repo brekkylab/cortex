@@ -2,7 +2,6 @@
 //!
 //! [`Start`] and [`Stop`] are **resource management only**: a call that needs a booted
 //! session boots one, so they change what the far end holds, never what a session can do.
-//! [`Quit`] ends the session.
 //!
 //! Each has a member-less type so every method has one place its params are written, and
 //! adding a parameter later is a field rather than a new shape.
@@ -60,9 +59,10 @@ impl Notification {
 
 /// Boot now, so that no command has to. The `params` of `start`, which are none.
 ///
-/// Hides the cold start: [`ExecCall`](super::ExecCall), [`ReadCall`](super::ReadCall)
-/// and [`WriteCall`](super::WriteCall) boot on demand, so this only lets the boot overlap
-/// with the client's other work instead of the first command's latency.
+/// Hides the cold start: [`ExecCall`](super::ExecCall), [`ReadCall`](super::ReadCall),
+/// [`WriteCall`](super::WriteCall) and [`SnapshotCall`](super::SnapshotCall) boot on
+/// demand, so this only lets the boot overlap with the client's other work instead of the
+/// first command's latency.
 ///
 /// Unanswered because a failed boot and a not-yet-attempted one are the same session: the
 /// next call that needs a boot retries and gets [`BOOT_FAILED`](super::Error::BOOT_FAILED).

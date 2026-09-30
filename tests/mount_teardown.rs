@@ -1,25 +1,17 @@
-//! Taking a mount down while something else is going on: a second mount alive,
-//! or the process killed. That is how a console runs: a mount per session,
-//! sessions overlapping, eventually stopped with a signal.
-//!
-//! `#[ignore]`, because every body here mounts a real filesystem:
+//! Taking a mount down while something else is going on: a second mount alive, or the process
+//! killed. That is how a console runs: a mount per session, sessions overlapping, eventually
+//! stopped with a signal.
 //!
 //! ```sh
 //! cargo test --test mount_teardown -- --ignored --nocapture
 //! ```
 //!
-//! On Linux `fuser` mounts through `mount(2)` itself and needs no libfuse, so a
-//! container is enough, given `--device /dev/fuse` and `--cap-add SYS_ADMIN`.
+//! On Linux `fuser` mounts through `mount(2)` itself and needs no libfuse, so a container is
+//! enough, given `--device /dev/fuse` and `--cap-add SYS_ADMIN`.
 //!
-//! One set of bodies for both unix bindings, since [`Mount`]'s contract is what
-//! is under test.
-//!
-//! # Overlapping lifetimes
-//!
-//! A binding's library may assume one mount per process; libfuse-t does, keeping
-//! the FUSE-T helper's pid in a single process-global slot. So teardowns run with
-//! a second mount alive. Threads are not required, so one test uses a single
-//! thread.
+//! One set of bodies for both unix bindings, since [`Mount`]'s contract is what is under test.
+//! A binding's library may assume one mount per process (libfuse-t keeps the FUSE-T helper's
+//! pid in a single process-global slot), so teardowns run with a second mount alive.
 
 #![cfg(all(feature = "mount", unix))]
 

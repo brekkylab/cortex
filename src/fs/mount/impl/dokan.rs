@@ -1,38 +1,13 @@
-//! Binds a [`FileSystem`] to Dokany's user-mode filesystem API; [`DokanMount`] is all it
-//! exports.
+//! Binds a [`FileSystem`] to Dokany's user-mode filesystem API.
 //!
 //! **It does not go through [`Posix`](crate::fs::Posix).** Every callback carries the full
 //! path from the volume root (`\`, `\src\main.rs`) because the NT I/O manager resolves names
 //! itself, so there is no lookup or inode, and mapping paths to numbers and back would cost a
 //! round trip per callback for nothing.
 //!
-//! Shared with the other bindings: [`attr_for`] (attribute policy, timestamp fallbacks) and
-//! the synthetic capacity constants, so Windows readers see the same numbers. Its own: the
-//! error numbering ([`nt_status`]) and attribute type ([`FileInfo`]).
-//!
-//! # What Windows does differently
-//!
-//! * **One entry point.** [`create_file`](FileSystemHandler::create_file) is open, create,
-//!   `mkdir` and "open a directory to list it", distinguished by `create_disposition` and
-//!   `create_options`. Exclusivity is decided only by the store's own
-//!   [`create`](FileSystem::create).
-//! * **Deletion is a disposition, not a call.** `delete_file`/`delete_directory` only answer
-//!   *may this be deleted*; [`cleanup`] removes it once the last handle is gone. Since the name
-//!   outlives every handle, no silly-rename is needed and the store never sees a file vanish
-//!   under an open handle.
-//! * **Access is the kernel's to enforce.** The NT kernel checks `desired_access` before
-//!   building the IRP, and paging I/O (memory-mapped reads) arrives on handles whose access is
-//!   meaningless, so a second check here would reject allowed work.
-//!
-//! # Runtime, not build time
-//!
-//! The driver (`dokan2.sys`) comes from Dokany's installer; this links the user-mode DLL.
-//! `dokan-sys` links the *installed* library when `DokanLibrary2_LibraryPath_x64` is set (the
-//! installer sets it) and otherwise builds its vendored sources, whose version may not match
-//! the driver, which surfaces as [`FileSystemMountError::Version`] at mount time.
-//!
-//! **Testing needs a real mount against a real driver**: callbacks answer through objects only
-//! Dokan constructs. Only name translation and the status table are unit-tested.
+//! Shares [`attr_for`] (attribute policy, timestamp fallbacks) and the synthetic capacity
+//! constants with the other bindings, so Windows readers see the same numbers; errors are
+//! numbered by [`nt_status`] and attributes filled into [`FileInfo`].
 
 use std::{
     collections::hash_map::DefaultHasher,
@@ -105,6 +80,12 @@ const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A live Dokan mount: constructing one mounts, dropping it unmounts.
 ///
+/// Needs Dokany: the driver (`dokan2.sys`) comes from its installer, and this links the
+/// user-mode DLL. `dokan-sys` links the *installed* library when
+/// `DokanLibrary2_LibraryPath_x64` is set (the installer sets it) and otherwise builds its
+/// vendored sources, whose version may not match the driver, which surfaces as
+/// [`FileSystemMountError::Version`](::dokan::FileSystemMountError::Version) at mount time.
+///
 /// **No [`Claim`](super::super::claim::Claim)**: Dokany's driver tears the volume down when
 /// the registering process dies, however it dies, so nothing is left for a later run to
 /// reclaim.
@@ -124,7 +105,7 @@ impl DokanMount {
     /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
     /// `mountpoint` is a drive letter (`Z:\`) or an existing empty directory on an NTFS
-    /// volume. Needs Dokany installed — see the module docs.
+    /// volume. Needs Dokany installed.
     ///
     /// Returns once the driver reports the mount live, since `mount()` returns on
     /// registration, before the volume exists.
@@ -360,6 +341,10 @@ impl<'c, 'h: 'c, T: FileSystem + 'h> FileSystemHandler<'c, 'h> for Handler<T> {
     ///   `AlreadyExists` as success, so there is no stat-then-create race.
     /// * **Truncation second, only for a name that already existed**; a new file is empty.
     ///
+    /// `desired_access` is not checked: the NT kernel checks it before building the IRP, and
+    /// paging I/O (memory-mapped reads) arrives on handles whose access is meaningless, so a
+    /// second check here would reject allowed work.
+    ///
     /// `new_file_created` must be accurate: for the "or create" dispositions Dokan turns
     /// `false` into the informational `STATUS_OBJECT_NAME_COLLISION` (Win32's
     /// `ERROR_ALREADY_EXISTS` from a successful `CreateFile`).
@@ -440,7 +425,9 @@ impl<'c, 'h: 'c, T: FileSystem + 'h> FileSystemHandler<'c, 'h> for Handler<T> {
     /// Where a deletion actually happens.
     ///
     /// Windows decides a delete at open or mark time and performs it when the last handle
-    /// closes; `delete_file`/`delete_directory` are the check, this is the act.
+    /// closes; `delete_file`/`delete_directory` are the check, this is the act. Since the name
+    /// outlives every handle, no silly-rename is needed and the store never sees a file vanish
+    /// under an open handle.
     ///
     /// No return value: a store refusing here can only report on stderr, after the caller was
     /// told the delete would succeed, so those checks must be thorough.
@@ -864,6 +851,8 @@ fn file_index(path: &Path) -> u64 {
     hasher.finish()
 }
 
+/// Only name translation and the status table: callbacks answer through objects only Dokan
+/// constructs, so the rest needs a real mount against a real driver.
 #[cfg(test)]
 mod tests {
     use super::*;

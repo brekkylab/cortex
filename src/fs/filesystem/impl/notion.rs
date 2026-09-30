@@ -1,45 +1,5 @@
-//! A read-oriented [`FileSystem`] store over a Notion workspace.
-//!
-//! Notion pages/blocks are projected onto a filesystem tree:
-//! ```text
-//! /pages/<title>__<page-id>/page.json         — metadata + markdown body + raw blocks
-//! /pages/<title>__<page-id>/<child>__<id>/    — nested child pages, recursively
-//! /pages/<title>__<page-id>/<db>__db__<id>/   — a database in the page
-//! /pages/.../<db>__db__<id>/database.json     — its schema and a row index
-//! /pages/.../<db>__db__<id>/<row>__<id>/      — a row, which is a page like any other
-//! ```
-//! `/pages` lists only top-level (workspace) pages; the `<page-id>` is the part
-//! after the last `__`. `page.json` is rendered on read.
-//!
-//! One path level per page, whatever the block depth: sub-pages inside a two-column layout's
-//! `column`, two blocks below the page, still get a directory directly under it.
-//!
-//! A database row *is* a page (the API returns it as one, with properties and a block body),
-//! so a row directory is a page directory and the recursion continues inside it. Only the
-//! database is a new kind of node, told apart by [`DB_MARKER`] in its directory name.
-//!
-//! Each operation `.await`s the async (reqwest) client directly; no runtime lives here. A
-//! `page.json` is rendered once and cached, so a `stat` and the reads after it share one
-//! render, which lets a guest kernel see the real size (no `direct_io` here).
-//!
-//! # Render cost
-//!
-//! A render is a `retrieve` plus a walk of the block tree: one request per block with
-//! children, to [`MAX_BLOCK_DEPTH`]. That is seconds per page, charged to whichever
-//! operation asks first (usually the `stat` of `page.json`).
-//!
-//! So a render is served without asking Notion for [`FRESH`]. Past that, one `retrieve` checks
-//! whether the page was edited; an unchanged page keeps its render, so only a changed page
-//! pays the walk again.
-//!
-//! With [`NotionFs::with_cache_dir`] renders also outlive the process, since a restarted
-//! client's reader reopens the same pages. Each entry carries the edit stamp it was built
-//! from, so a restart costs one `retrieve` per page. Nothing is written without a directory,
-//! and what is written is the page's own json, under whatever protection the caller gives it.
-//!
-//! Read-only: page/block writes and the domain command channel are not exposed. Every
-//! mutating method keeps [`FileSystem`]'s `ReadOnlyFilesystem` default rather than answering
-//! `Unsupported`, so one read-only source does not disable writes for a whole mount.
+//! A read-oriented [`FileSystem`] store over a Notion workspace. [`NotionFs`] documents the
+//! tree it serves.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -238,7 +198,27 @@ struct Roots {
     names: Arc<Vec<String>>,
 }
 
-/// A Notion workspace's pages, served as a read-only tree; the module doc has the layout.
+/// A Notion workspace's pages, served as a read-only tree:
+///
+/// ```text
+/// /pages/<title>__<page-id>/page.json         — metadata + markdown body + raw blocks
+/// /pages/<title>__<page-id>/<child>__<id>/    — nested child pages, recursively
+/// /pages/<title>__<page-id>/<db>__db__<id>/   — a database in the page
+/// /pages/.../<db>__db__<id>/database.json     — its schema and a row index
+/// /pages/.../<db>__db__<id>/<row>__<id>/      — a row, which is a page like any other
+/// ```
+///
+/// `/pages` lists only top-level (workspace) pages; the `<page-id>` is the part after the last
+/// `__`. One path level per page, whatever the block depth: sub-pages inside a two-column
+/// layout's `column`, two blocks below the page, still get a directory directly under it. A row
+/// is a page because the API returns it as one, with properties and a block body.
+///
+/// `page.json` is rendered on read and kept, so a `stat` and the reads after it share one
+/// render, which lets a guest kernel see the real size (no `direct_io` here). A render is a
+/// `retrieve` plus a walk of the block tree, one request per block with children: seconds per
+/// page, charged to whichever operation asks first (usually the `stat` of `page.json`).
+///
+/// Each operation `.await`s the async (reqwest) client directly; no runtime lives here.
 pub struct NotionFs {
     client: reqwest::Client,
     api_key: String,
@@ -298,6 +278,10 @@ impl NotionFs {
     /// connection, and a config carrying a path would carry it to machines without it. The
     /// directory is created on first write and holds each page's rendered json, so it
     /// deserves whatever protection the pages do.
+    ///
+    /// A restarted client's reader reopens the same pages, and each entry carries the edit
+    /// stamp it was built from, so a restart costs one `retrieve` per page rather than a walk.
+    /// Without a directory nothing is written.
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self
@@ -819,7 +803,9 @@ impl NotionFs {
 }
 
 /// Every mutating method keeps the trait's `ReadOnlyFilesystem` default, so a writer hears
-/// it on the write; there is no open to hear it on.
+/// it on the write; there is no open to hear it on. Not `Unsupported`, so one read-only source
+/// does not disable writes for a whole mount. Page/block writes and the domain command channel
+/// are not exposed.
 impl FileSystem for NotionFs {
     fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move { self.forget_kept() })

@@ -1,43 +1,26 @@
 //! A Drive API that this repository does not write, driven through [`GdriveFs::new`].
 //!
-//! Every other gdrive test answers from a loopback mock in `gdrive_tests.rs`, which is the
-//! right tool for one question — *what did we ask for* — and the wrong one for another:
-//! **whether what we ask for is what Drive answers.** A mock encodes our understanding of
-//! the API, so it agrees with us by construction and stays green when the API moves. This
-//! file exists for the other half.
+//! Every other gdrive test answers from a loopback mock in `gdrive_tests.rs`, which answers
+//! *what did we ask for*. A mock encodes our understanding of the API, so it agrees with us
+//! by construction and stays green when the API moves; this suite asks **whether what we
+//! ask for is what Drive answers.**
 //!
 //! It drives **backlot** (the server in `brekkylab/enterprise-mock`), which follows the real
 //! Drive, Docs, Sheets and Slides shapes over a corpus rather than a live account: paging
 //! cursors, `orderBy`, the ACL-filtered view a token sees, the error *statuses* Google
 //! actually returns. When backlot changes to match Google, this is what notices.
 //!
-//! Skipped, not failed, when the host cannot be reached. A suite with no network stays
-//! green.
-//!
 //! ```sh
 //! cargo test --features gdrive --test gdrive_endpoint -- --ignored --nocapture
 //! ```
 //!
-//! Nothing to configure. The host is named below and the credentials come from it: backlot
-//! publishes a per-user token roster at `/_mock/users`, and its token endpoint's refresh
-//! grant takes one of those tokens and hands it back — so a `GdriveConfig` needs no secret
-//! kept anywhere. The corpus is discovered rather than assumed, so this survives it
-//! changing underneath.
+//! Nothing to configure: the host is named below, and backlot's per-user token roster at
+//! `/_mock/users` supplies the credentials, so no secret is kept anywhere. Skipped, not
+//! failed, when the host cannot be reached.
 //!
-//! ## What this cannot cover
-//!
-//! **Anything about a blob.** The corpus holds Docs-editors files in bulk and almost no
-//! binary ones, and those it has are reachable only through `Shared with me`, whose listing
-//! is truncated at `MAX_FOLDER_FILES` before reaching them. So the blob test below skips
-//! against this corpus, and runs once it gains one.
-//!
-//! `FIRST_SPAN` and `READ_SPAN` are larger than any file this corpus holds, so the span
-//! policy cannot be exercised here.
-//!
-//! **What we asked for.** No server reports the number of requests it received back to its
-//! caller, or the `Range` header on each. Every claim of the form "eight windows, one
-//! request" is a claim about our own behaviour, and it stays with the loopback mock in
-//! `gdrive_tests.rs`, which counts.
+//! Not covered: the span policy, since `FIRST_SPAN` and `READ_SPAN` are larger than any file
+//! this corpus holds; and what we asked for (request counts, each `Range` header), which no
+//! server reports back and which stays with the loopback mock, which counts.
 
 #![cfg(feature = "gdrive")]
 
@@ -198,7 +181,10 @@ async fn gdrive_endpoint_tree_and_reads() {
 /// A blob's bytes come back at the offset they were asked for, and the file ends where it
 /// says it does.
 ///
-/// Not the span *sizes* — the corpus has no blob near them, see the note at the top. What
+/// Skips against the current corpus: its few blobs are reachable only through `Shared with
+/// me`, whose listing is truncated at `MAX_FOLDER_FILES` before reaching them.
+///
+/// Not the span *sizes* — the corpus has no blob near them. What
 /// this asks is whether a server we did not write honours a ranged `GET` the way this store
 /// assumes it does: the window starts where it should, and past the last byte is an
 /// ordinary end rather than an error or a wrap.

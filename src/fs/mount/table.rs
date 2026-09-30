@@ -1,10 +1,8 @@
 //! The host's mount table, and taking a mount down without holding a thread on it.
 //!
-//! These mounts may not be this process's (a previous run's, or one a guard is releasing),
-//! and a mount whose server is gone is still registered with nothing answering, so `stat`ing
-//! it hangs. The mount table answers from the kernel's list immediately instead.
-//!
-//! `unmount(2)` has no timeout, so [`unmount_under`] bounds the wait from outside the process.
+//! These mounts may not be this process's (a previous run's, or one a guard is releasing), and
+//! a mount whose server is gone is still registered with nothing answering, so nothing here
+//! `stat`s a mount point; the table answers from the kernel's list immediately.
 
 use std::{
     ffi::OsString,

@@ -1,25 +1,5 @@
 //! What a store provides to be exposed as a filesystem: [`FileSystem`] and its vocabulary,
 //! [`Stat`], [`DirentKind`], [`Dirent`].
-//!
-//! This only describes a tree; being *mounted* is [`Mount`](crate::fs::Mount)'s concern (see
-//! [`fs`](crate::fs)). `OpenOptions` and `SetAttr` describe what a kernel asked for, which no
-//! store sees, so they live with [`Posix`](crate::fs::Posix).
-//!
-//! # Every method returns a boxed future
-//!
-//! The trait is held as `dyn` (a mount table stores backends of different types behind one
-//! pointer), and an `async fn` in a trait returns a type a `dyn` cannot name, so every method
-//! returns a [`BoxFuture`].
-//!
-//! That is one allocation per call, against a syscall or round trip. Written out rather than
-//! via `#[async_trait]`, the lifetimes are visible where the borrows are, and a forwarding impl
-//! returns the inner future instead of boxing it again.
-//!
-//! Each method binds its borrows and future to one lifetime, so `path` and `buf` may be
-//! shorter-lived than the backend, as they usually are: the buffer belongs to the request.
-//!
-//! [`Send`] because a mount is driven from whichever thread its binding owns; hence backends
-//! must be `Send` too.
 
 use std::{io, path::Path, sync::Arc, time::SystemTime};
 
@@ -215,6 +195,19 @@ impl Dirent {
 /// the executor worker for the syscall. An async-native frontend over one should wrap calls in
 /// `tokio::task::block_in_place` (multi-thread runtime only), free when the call is quick,
 /// rather than `spawn_blocking`.
+///
+/// # Boxed futures
+///
+/// Every method returns a [`BoxFuture`]: the trait is held as `dyn` (a mount table keeps
+/// backends of different types behind one pointer), and an `async fn` in a trait returns a type
+/// a `dyn` cannot name. That is one allocation per call, against a syscall or round trip.
+/// Written out rather than via `#[async_trait]`, the lifetimes are visible where the borrows
+/// are, and a forwarding impl returns the inner future instead of boxing it again.
+///
+/// Each method binds its borrows and future to one lifetime, so `path` and `buf` may be
+/// shorter-lived than the backend, as they usually are: the buffer belongs to the request.
+///
+/// [`Send`] because a mount is driven from whichever thread its binding owns.
 pub trait FileSystem: Send + Sync {
     /// Metadata for one entry (works on files *and* directories).
     fn stat<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>>;

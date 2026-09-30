@@ -1,18 +1,13 @@
 //! How cortex failures reach JavaScript, from consoles and image clients alike: an `Error`
 //! whose `code` names the kind, as Node's own errors carry `ENOENT`.
-//!
-//! - A server refusal's code is cortex's name for its number (`TIMED_OUT`, `NOT_FOUND`), so
-//!   callers compare readable strings; a number with no name is `CONSOLE_REFUSED`, with the
-//!   number in the message.
-//! - A broken channel is `CONSOLE_BROKEN`; nothing more will be heard on it.
-//! - Anything else (building a console, say) is `CORTEX_ERROR`.
-//! - Filesystem errors are [`std::io::Error`], coded by their [`ErrorKind`](std::io::ErrorKind)'s
-//!   name.
 
 use cortex::protocol::{Error, Failure};
 
 pub type Result<T> = napi::Result<T, String>;
 
+/// A refusal's code is cortex's name for its number (`TIMED_OUT`, `NOT_FOUND`), so callers
+/// compare readable strings; a number with no name is `CONSOLE_REFUSED`, with the number in the
+/// message. A broken channel, on which nothing more will be heard, is `CONSOLE_BROKEN`.
 pub fn failure(failure: Failure) -> napi::Error<String> {
     match failure {
         Failure::Refused(error) => match name(error.code) {
@@ -29,7 +24,7 @@ pub fn failure(failure: Failure) -> napi::Error<String> {
 }
 
 /// Building a console may fail with a [`Failure`] underneath (the server refusing `init`),
-/// which keeps its code as any refusal does.
+/// which keeps its code as any refusal does. Anything else is `CORTEX_ERROR`.
 pub fn anyhow(error: anyhow::Error) -> napi::Error<String> {
     match error.downcast::<Failure>() {
         Ok(f) => failure(f),
@@ -37,6 +32,7 @@ pub fn anyhow(error: anyhow::Error) -> napi::Error<String> {
     }
 }
 
+/// Coded by the error's [`ErrorKind`](std::io::ErrorKind) name.
 pub fn io(error: std::io::Error) -> napi::Error<String> {
     napi::Error::new(format!("{:?}", error.kind()), error.to_string())
 }

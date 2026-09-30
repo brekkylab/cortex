@@ -1,34 +1,11 @@
 //! Which mount points this process owns: in memory for the signal path, on disk for later
-//! runs.
+//! runs, since a `SIGKILL`ed mount can only be cleared by another run. Taking a claim records
+//! the mount point in both places; dropping it removes both.
 //!
-//! The signal handler needs the list now, in this process; [`reclaim_abandoned`] needs it in
-//! a later one, since a `SIGKILL`ed mount can only be cleared by another run. Taking a claim
-//! records the mount point in both places; dropping it removes both.
-//!
-//! # Why a register rather than the mount table
-//!
-//! The table cannot say which mounts are cortex's: a FUSE-T mount is spelled `nfs` there, and
-//! the mount point is an arbitrary caller-chosen path.
-//!
-//! # Why the pid
-//!
-//! Abandoned means "owned by a process that is gone"; without that test a second instance with
-//! a fixed mount point would unmount the first's live tree. The pid in the record's name
-//! allows `kill(pid, 0)`: `ESRCH` means abandoned, `EPERM` means alive under another user.
-//!
-//! A reused pid makes a dead owner look alive, so its mount waits for a later run. That is the
-//! safe direction: failing to reclaim, never reclaiming something in use.
-//!
-//! # The watchdog
-//!
-//! Some exits run none of this process's code: `SIGKILL`, a crash, the OOM killer, or a
-//! runtime that skips finalizers (Node on `process.exit()`). The first claim a process takes
-//! starts a watchdog: `/bin/sh` in its own process group (so a terminal's `^C` misses it),
-//! reading a pipe whose write end only this process holds. However this process ends, the
-//! kernel closes that end and the watchdog unmounts whatever this process's records still name
-//! (plain `umount`, then force), removing a record only once its mount is down so the rest
-//! stays for [`reclaim_abandoned`]. After an ordinary exit it finds no records and just exits.
-//!
+//! A register rather than the mount table, which cannot say which mounts are cortex's: a
+//! FUSE-T mount is spelled `nfs` there, and the mount point is an arbitrary caller-chosen path.
+//! Each record is named for its owner's pid, so abandoned means "owner gone" ([`gone`]).
+
 use std::{
     ffi::OsString,
     fs, io,
@@ -114,7 +91,7 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
     Claim { mountpoint, record }
 }
 
-/// The watchdog's script (see the module docs).
+/// The watchdog's script (see [`watch`]).
 ///
 /// `cat` returns once no process holds the pipe's write end; owner pid and registry come in
 /// the environment. Stop signals are ignored so it outlives the process they were sent to.
@@ -134,7 +111,15 @@ for record in "$CORTEX_MOUNT_REGISTRY/$CORTEX_MOUNT_OWNER"-*; do
 done
 "#;
 
-/// Start this process's watchdog once per pid (see the module docs).
+/// Start this process's watchdog, once per pid.
+///
+/// Covers exits that run none of this process's code: `SIGKILL`, a crash, the OOM killer, or a
+/// runtime that skips finalizers (Node on `process.exit()`). The watchdog is `/bin/sh` in its
+/// own process group (so a terminal's `^C` misses it), reading a pipe whose write end only
+/// this process holds. However this process ends, the kernel closes that end and the watchdog
+/// unmounts whatever this process's records still name (plain `umount`, then force), removing
+/// a record only once its mount is down so the rest stays for [`reclaim_abandoned`]. After an
+/// ordinary exit it finds no records.
 ///
 /// Per pid because a forked child inherits the parent's write end, which would keep the
 /// parent's watchdog waiting on the child too; a child that mounts replaces it with its own.
@@ -224,6 +209,9 @@ fn registry() -> Option<PathBuf> {
 /// Whether `pid` is gone.
 ///
 /// Only `ESRCH` from `kill(pid, 0)` means gone; `EPERM` is alive under another user.
+///
+/// A reused pid makes a dead owner look alive, so its mount waits for a later run: failing to
+/// reclaim, never reclaiming something in use.
 fn gone(pid: libc::pid_t) -> bool {
     // `kill` reads 0 and negatives as process groups, which would ask about ourselves.
     if pid <= 0 {
@@ -236,20 +224,22 @@ fn gone(pid: libc::pid_t) -> bool {
 
 /// Take down every mount left by a cortex process that is no longer running.
 ///
-/// Covers `SIGKILL`, where no handler runs and only the next run can help. Every binding's
-/// `try_new` calls it.
+/// Covers `SIGKILL`, where no handler runs and only the next run can help; the dead
+/// process's watchdog usually took its mounts down already, and this gets what it could not.
+/// Every binding's `try_new` calls it.
 ///
 /// **Call it directly before touching a mount point ahead of mounting:** `stat` blocks on a
 /// leftover mount nothing answers, so a `create_dir_all` under it would hang before `try_new`.
 ///
-/// Only a **dead** owner's mounts are touched, so a live sibling instance keeps its mounts;
-/// sweeping by path could not promise that, so no such call exists.
+/// Only a **dead** owner's mounts are touched, which is what makes calling it automatically
+/// safe: a live sibling instance keeps its mounts. A path says nothing about whose mount is on
+/// it, so no sweep-by-path call exists.
 ///
 /// Returns the mounts it tried and failed to take down, which a person must clear by hand;
 /// ones past the budget are left for the next call and not listed.
 ///
-/// A bounded number of unmounts per call (`BUDGET`), each with its own deadline. Never panics or fails; with
-/// nothing to reclaim it costs one directory read.
+/// A bounded number of unmounts per call (`BUDGET`), each with its own deadline. Never panics
+/// or fails; with nothing to reclaim it costs one directory read.
 pub fn reclaim_abandoned() -> Vec<PathBuf> {
     let mut left = Vec::new();
     let Some(dir) = registry() else {

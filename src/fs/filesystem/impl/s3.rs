@@ -1,28 +1,4 @@
 //! A read-only [`FileSystem`] store over an object store (S3 and compatibles).
-//!
-//! Object keys map to paths and a directory is a key prefix: there is no directory object to
-//! create or remove. Metadata comes from `head`, listings from `list_with_delimiter`, and file
-//! data from ranged GETs.
-//!
-//! # Read-only
-//!
-//! [`FileSystem::write_at`] addresses a byte offset. Over S3 that means reading the whole
-//! object, patching it, and putting it back: `object_store` has no byte-range patch, and its
-//! multipart parts must be at least 5 MiB where a guest writes at most 1 MiB. So a write needs
-//! staging, with a ceiling (the guest picks the offset, so the allocation is guest-chosen).
-//!
-//! And staging needs an end: a multipart upload must be *completed*, and this trait has no
-//! signal for when a writer is done (see *Durability* on [`FileSystem`]). So every write keeps
-//! the trait's `ReadOnlyFilesystem` default.
-//!
-//! `ReadOnlyFilesystem` and not [`Unsupported`](io::ErrorKind::Unsupported): the store *could*
-//! write, this implementation will not, and userspace acts on the difference.
-//!
-//! # Async
-//!
-//! Each operation `.await`s the `object_store` client directly; no runtime lives here. An
-//! async consumer drives it with its own runtime; a sync binding (fuse/fuse-t) `block_on`s at
-//! its callback boundary.
 
 use std::{
     collections::{BTreeSet, HashMap, VecDeque},
@@ -73,7 +49,22 @@ impl std::fmt::Debug for S3Config {
     }
 }
 
-/// An object store's keys, served as a read-only tree (see the module doc for why).
+/// An object store's keys, served as a read-only tree.
+///
+/// Keys map to paths and a directory is a key prefix: there is no directory object to create or
+/// remove. Metadata comes from `head`, listings from `list_with_delimiter`, and file data from
+/// ranged GETs, each `.await`ing the `object_store` client directly; no runtime lives here.
+///
+/// # Read-only
+///
+/// A write at a byte offset over S3 means reading the whole object, patching it, and putting it
+/// back: `object_store` has no byte-range patch, and its multipart parts must be at least 5 MiB
+/// where a guest writes at most 1 MiB. So a write needs staging, with a ceiling (the guest
+/// picks the offset, so the allocation is guest-chosen). And staging needs an end: a multipart
+/// upload must be *completed*, and nothing signals when a writer is done.
+///
+/// So every write answers `ReadOnlyFilesystem`, not `Unsupported`: the store *could* write,
+/// this implementation will not.
 pub struct S3Fs {
     store: Arc<dyn ObjectStore>,
     /// No leading or trailing `/`, so [`Self::key`] can join with `/` unconditionally.

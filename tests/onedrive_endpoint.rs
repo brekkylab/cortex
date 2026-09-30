@@ -1,22 +1,16 @@
 //! A Graph API that this repository does not write, driven through [`OnedriveFs::new`].
 //!
-//! Every other onedrive test answers from a loopback mock in `onedrive_tests.rs`, which is
-//! the right tool for one question — *what did we ask for* — and the wrong one for another:
-//! **whether what we ask for is what Graph answers.** A mock encodes our understanding of
-//! the API, so it agrees with us by construction and stays green when the API moves. This
-//! file exists for the other half.
+//! Every other onedrive test answers from a loopback mock in `onedrive_tests.rs`, which
+//! answers *what did we ask for*. A mock encodes our understanding of the API, so it agrees
+//! with us by construction and stays green when the API moves; this suite asks **whether
+//! what we ask for is what Graph answers.**
 //!
 //! No stand-in follows Microsoft Graph, so this drives the real service against a real
-//! account. That is a weaker guarantee in one way and a stronger one in another: it needs
-//! credentials and a network, and it is the only thing here that can notice Graph moving.
+//! account: it needs credentials and a network, and it is the only thing here that can
+//! notice Graph moving.
 //!
-//! For example, `$select` naming the download URL the way the *response* spells it is
-//! accepted and omits the field from every row, so a read fails outright with "has no
-//! download url" — which no mock can show.
-//!
-//! **What we asked for.** No server reports back the requests it received or the `Range`
-//! header on each. Claims about request counts are about our own behaviour, and stay with
-//! the loopback mock in `onedrive_tests.rs`, which counts.
+//! Not covered: what we asked for (request counts, each `Range` header), which no server
+//! reports back and which stays with the loopback mock, which counts.
 //!
 //!     set -a; . ./.env; set +a
 //!     cargo test -p cortex --features onedrive onedrive_endpoint -- --ignored --nocapture
@@ -46,6 +40,10 @@ fn config() -> Option<OnedriveConfig> {
 }
 
 /// Walk a real account, then read a real file by windows.
+///
+/// Catches what no mock can show: `$select` naming the download URL the way the *response*
+/// spells it is accepted and omits the field from every row, so a read fails outright with
+/// "has no download url".
 ///
 /// Skipped, not failed, when the credentials are absent: this needs an account, and a suite
 /// that has none should stay green.

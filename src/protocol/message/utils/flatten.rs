@@ -1,16 +1,4 @@
 //! Writing one value's members into an object someone else already opened.
-//!
-//! A JSON-RPC object is flat (`method` and `params` sit beside `jsonrpc` and `id`), but a
-//! derived [`Serialize`] opens its own object. [`FlatMapSerializer`] accepts only a map or
-//! struct and forwards each entry into an already-open [`SerializeMap`], so
-//! [`Call`](super::super::Call) can declare its wire shape with serde attributes and still
-//! land flat. serde's equivalent is in `__private`, hence this module.
-//!
-//! Every other shape is an error rather than a silent nesting: it has no members, and a
-//! nested value would be a shape nothing reads.
-//!
-//! Entries stream straight into the parent; building a document first would copy up to
-//! [`MAX_PAYLOAD`](super::super::MAX_PAYLOAD) of payload.
 
 use serde::{
     Serialize, Serializer,
@@ -18,6 +6,15 @@ use serde::{
 };
 
 /// Writes a value's members into `.0` rather than into an object of its own.
+///
+/// A JSON-RPC object is flat (`method` and `params` sit beside `jsonrpc` and `id`), but a
+/// derived [`Serialize`] opens its own object; forwarding each entry into the open
+/// [`SerializeMap`] lets [`Call`](super::super::Call) declare its wire shape with serde
+/// attributes and still land flat. serde's equivalent is in `__private`.
+///
+/// Only a map or struct is accepted: any other shape has no members, and nesting it would
+/// be a shape nothing reads. Entries stream straight into the parent; building a document
+/// first would copy up to [`MAX_PAYLOAD`](super::super::MAX_PAYLOAD) of payload.
 ///
 /// `&mut` because the parent keeps writing into its object and ends it itself.
 pub struct FlatMapSerializer<'a, M>(pub &'a mut M);

@@ -1,28 +1,4 @@
 //! The asking end over a framed channel: one call out, one response back.
-//!
-//! Only answers arrive on this channel, so a call is a send, a read and a match: no tasks,
-//! locks or pending table. The methods come from [`Client`]; this adds an id per call and
-//! waiting for the response carrying it.
-//!
-//! # The pipes and their process
-//!
-//! [`new`](StdioClient::new) starts the server program; the caller chooses the command,
-//! arguments and environment, and this end sets the protocol's descriptors.
-//!
-//! [`quit`](Client::quit) drops the writer (how the server learns the session is over) and
-//! waits for the process. Dropping an unquit client, or the whole process exiting, ends it
-//! the same way minus the wait, since nothing may await on drop.
-//!
-//! **The server is never killed**, so it can release what the session made (a machine, a
-//! disk, a built image) when its input ends. The cost: a server stuck in a call outlives
-//! the client until that call returns.
-//!
-//! The process lives here, not on [`ConsoleClient`], because only a pipe-to-child
-//! transport has one; a micro-VM guest channel has no process behind it.
-//! [`ConsoleClient`] is this plus the session it was built with, and is what a caller
-//! normally wants.
-//!
-//! [`ConsoleClient`]: crate::console::ConsoleClient
 
 use std::{io, process::Stdio, time::Duration};
 
@@ -40,10 +16,25 @@ use crate::protocol::{
 
 /// A [`Client`] over a server process's pipes, and the process itself.
 ///
+/// [`quit`](Client::quit) ends the session and waits for the process. Dropping an unquit
+/// client, or the whole process exiting, ends it the same way minus the wait, since
+/// nothing may await on drop.
+///
+/// **The server is never killed**, so it can release what the session made (a machine, a
+/// disk, a built image) when its input ends. The cost: a server stuck in a call outlives
+/// the client until that call returns.
+///
+/// The process lives here, not on [`ConsoleClient`], because only a pipe-to-child
+/// transport has one; a micro-VM guest channel has no process behind it.
+/// [`ConsoleClient`] is this plus the session it was built with, and is what a caller
+/// normally wants.
+///
 /// The directions are separate fields so [`call`](Client::call) can borrow both at once.
 ///
 /// Trait objects rather than the child's descriptor types, so the writer can be swapped
 /// for a sink at `quit` without an `Option`, and tests can drive a canned stream.
+///
+/// [`ConsoleClient`]: crate::console::ConsoleClient
 pub struct StdioClient {
     /// Where responses come from. Buffering is safe: the protocol owns this for the
     /// session's lifetime, so reading ahead takes no one else's bytes.

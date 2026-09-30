@@ -1,35 +1,20 @@
 //! A real host mount, driven through the operating system.
 //!
-//! Here the kernel asks, not the test: real requests over a real mount, in
-//! whatever order and with whatever flags the OS chooses. Each test ends with
-//! `drop(mount)`, the guard's only way to unmount.
-//!
-//! `#[ignore]` because it needs a mount provider and touches the real
-//! filesystem.
+//! Here the kernel asks, not the test: real requests over a real mount, in whatever order and
+//! with whatever flags the OS chooses.
 //!
 //! ```sh
 //! cargo test --test host_mount -- --ignored --nocapture
 //! ```
 //!
-//! # Which binding is under test
+//! The same bodies run through whichever binding the target has (`FuseMount` on Linux,
+//! `FuseTMount` on macOS, `DokanMount` on Windows). The Windows one reaches `FileSystem`
+//! directly while the FUSE ones go through `Posix`, so this checks that a cortex tree behaves
+//! the same whichever kernel asks.
 //!
-//! Whichever one the target has — `mount` compiles exactly one:
-//!
-//! | Platform | Binding |
-//! |---|---|
-//! | Linux | `FuseMount`: `fuser`, straight to `/dev/fuse` |
-//! | macOS | `FuseTMount`: libfuse-t's own session loop |
-//! | Windows | `DokanMount`: Dokany's driver, through `dokan` |
-//!
-//! **A missing provider fails, never silently skips.** On macOS FUSE-T is
-//! probed with pkg-config and fails at build time; Dokany's driver is a runtime
-//! fact, so there `try_new` fails with `mount_support`'s install instructions.
-//!
-//! # Shared bodies
-//!
-//! The Windows binding reaches `FileSystem` directly while the FUSE ones go
-//! through `Posix`, so running the same assertions through all of them checks
-//! that a cortex tree behaves the same whichever kernel asks.
+//! **A missing provider fails, never silently skips.** On macOS FUSE-T is probed with
+//! pkg-config and fails at build time; Dokany's driver is a runtime fact, so there `try_new`
+//! fails with `mount_support`'s install instructions.
 
 #![cfg(all(feature = "mount", any(unix, windows)))]
 

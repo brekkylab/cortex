@@ -11,6 +11,9 @@ use crate::protocol::message::utils::bytes;
 pub struct ReadCall {
     /// Built by joining onto the path the requester named the mount at, the one name both
     /// ends share.
+    ///
+    /// A `String`, not bytes, because both ends interpret it; the executor maps it onto
+    /// whatever filesystem it has.
     pub path: String,
 
     /// Where in the file to start. `None` is the beginning.

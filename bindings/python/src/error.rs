@@ -1,13 +1,11 @@
 //! How cortex failures reach Python.
 //!
-//! Console and image-client calls fail two ways, raised as two exceptions because callers act on
-//! them differently: [`Failure::Refused`] (`ConsoleRefused`) is the server answering with an
-//! error, such as a timeout or a missing file, and carries its code; [`Failure::Broken`]
-//! (`ConsoleBroken`) is the channel gone, after which nothing more will be heard. Both derive
-//! from `CortexError`, also raised for failures with no finer class (building a console, say).
-//!
-//! Filesystem errors are [`std::io::Error`], which pyo3 already raises as the matching `OSError`
-//! subclass.
+//! Console and image-client calls fail two ways, raised apart because callers act on them
+//! differently: [`Failure::Refused`] (`ConsoleRefused`) is the server answering with an error
+//! (a timeout, a missing file) and carries its `code`; [`Failure::Broken`] (`ConsoleBroken`) is
+//! the channel gone, after which nothing more will be heard. Both derive from `CortexError`,
+//! also raised for failures with no finer class (building a console, say). Filesystem errors
+//! are [`std::io::Error`], which pyo3 already raises as the matching `OSError` subclass.
 
 use cortex::protocol::{Error, Failure};
 use pyo3::{create_exception, exceptions::PyException, prelude::*, types::PyDict};

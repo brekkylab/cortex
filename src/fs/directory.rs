@@ -1,14 +1,4 @@
 //! A tree built from files held in memory and host directories grafted into it.
-//!
-//! A [`Directory`] is an [`InMemFs`] root under a longest-prefix mount table: each
-//! [`PassthroughFs`] is registered at a root-relative path and serves every request under it,
-//! re-based onto its own root. Everything no mount claims is the in-memory tree's. It is itself
-//! a [`FileSystem`], so bindings drive it like any single store.
-//!
-//! **The `mount` here is the table's, not the operating system's.**
-//! [`mount`](Directory::mount) grafts a host directory into *this* tree, invisible outside the
-//! process; a kernel sees it only via a binding's [`Mount`](crate::fs::Mount). A `Directory`
-//! with ten mounts may be mounted nowhere.
 
 use std::{
     collections::BTreeMap,
@@ -23,6 +13,11 @@ use crate::{
 };
 
 /// A tree assembled from in-memory files and host directories, served as one namespace.
+///
+/// An [`InMemFs`] root under a longest-prefix mount table: each [`PassthroughFs`] is registered
+/// at a root-relative path and serves every request under it, re-based onto its own root.
+/// Everything no mount claims is the in-memory tree's. Itself a [`FileSystem`], so bindings
+/// drive it like any single store.
 ///
 /// This is how a session's *context* (the tree it works in, as opposed to its rootfs) is
 /// built, behind one [`mount`](crate::console::ConsoleClientBuilder::mount). It composes many
@@ -95,6 +90,10 @@ impl Directory {
     /// [`InvalidInput`](io::ErrorKind::InvalidInput) at the root, inside or above another mount,
     /// and with [`AlreadyExists`](io::ErrorKind::AlreadyExists) where the in-memory tree has an
     /// entry. `host_dir` is not checked; a missing one fails at first use.
+    ///
+    /// The mount is this tree's table, not the operating system's: invisible outside the
+    /// process until a binding yields a [`Mount`](crate::fs::Mount), so a `Directory` with ten
+    /// mounts may be mounted nowhere.
     pub fn mount(
         &mut self,
         path: impl AsRef<Path>,

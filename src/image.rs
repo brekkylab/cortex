@@ -1,3 +1,6 @@
+//! Images a session runs on: declared as a [`Recipe`], named by [`ImageSource`], or built
+//! ahead of a session with [`ImageClient`].
+
 use std::{
     ffi::OsStr,
     fmt,

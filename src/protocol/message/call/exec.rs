@@ -5,10 +5,13 @@ use crate::protocol::message::utils::bytes;
 /// One execution. The `params` of `exec`.
 ///
 /// Only a command and a time bound: where it runs is the session's, what it runs with is
-/// the executor's, and its input is whatever a [`WriteCall`](super::WriteCall) staged beforehand.
+/// the executor's. It takes no stdin: stage input with a [`WriteCall`](super::WriteCall)
+/// beforehand and collect output files with a [`ReadCall`](super::ReadCall) after.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecCall {
     /// The argv. No shell is involved; for shell semantics send `["sh", "-c", "..."]`.
+    ///
+    /// UTF-8, since an argv is a list of `String`s by the time anything runs it.
     ///
     /// An empty argv is refused where the process is spawned, not when the call is read;
     /// see [`split`](Self::split).
@@ -35,9 +38,16 @@ impl ExecCall {
 /// A whole execution: everything it wrote, and how it ended. The `result` of `exec`.
 ///
 /// An execution with no result (killed at its timeout, never started) is an `error` with
-/// a code instead (see [`Error`](crate::protocol::Error)), since an exit code could be forged by `exit()`.
+/// a code instead (see [`Error`](crate::protocol::Error)), since an exit code (e.g.
+/// 126/127) could be forged by `exit()`.
 ///
-/// Sent unwrapped, so later additions are new members, which older peers ignore.
+/// Sent unwrapped, so later additions are new members, which older peers ignore; a tagged
+/// alternative would be a shape they fail on.
+///
+/// All at once when the command is over, never streamed: the caller is an agent that
+/// cannot act on partial output before its next inference, so streaming would buy
+/// unobserved latency for a second shape per ending and a second code path per consumer.
+/// JSON-RPC also gives a request one response.
 ///
 /// The session's current directory (see [`InitResp::cwd`](super::InitResp::cwd)) is not reported, even if the
 /// command moved it: a result describes the command, not the machine. Run `pwd` to ask.
@@ -58,7 +68,8 @@ pub struct ExecResp {
     /// beginning.
     ///
     /// A result must fit one message under [`MAX_PAYLOAD`](crate::protocol::MAX_PAYLOAD).
-    /// Flagged so an agent does not draw conclusions from output it thinks is complete.
+    /// That suits an agent, which could not read more either; flagged so it does not draw
+    /// conclusions from output it thinks is complete.
     #[serde(default)]
     pub truncated: bool,
 }

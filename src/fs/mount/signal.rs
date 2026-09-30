@@ -1,29 +1,4 @@
 //! Taking this process's mounts down on catchable signals.
-//!
-//! What is taken down is [`claim::live`](super::claim::live), kept in
-//! [`claim`](super::claim) because a later process needs it too.
-//!
-//! A signal runs no destructors, so without this a guard's mount stays registered with
-//! nothing answering it, and anything walking into the path (`git status` included) hangs.
-//!
-//! # Opt-in
-//!
-//! A signal disposition is process-global; installing one while mounting would overwrite
-//! whatever the embedding program arranged for `SIGTERM`. So nothing happens until
-//! [`unmount_on_signal`] is called, and it chains to what it replaced.
-//!
-//! # What the handler does
-//!
-//! `unmount` and the teardown (allocation, `fork`, `Mutex`) are not async-signal-safe, so the
-//! handler writes one byte to a pipe and returns. A thread reading the pipe unmounts, restores
-//! the previous disposition and re-raises, so the signal ends the process as it would have.
-//!
-//! # `SIGKILL`
-//!
-//! Uncatchable. The claim's watchdog takes the mount down from outside (see
-//! [`claim`](super::claim)), and [`reclaim_abandoned`](super::reclaim_abandoned) in the next
-//! `try_new` gets what it could not. So this module decides who unmounts on a caught signal:
-//! the process itself, before it ends, rather than the watchdog a moment after.
 
 use std::{
     io,
@@ -45,7 +20,16 @@ static WAKE: AtomicI32 = AtomicI32::new(-1);
 /// Take this process's mounts down when it is asked to stop.
 ///
 /// Handles `SIGINT`, `SIGTERM`, `SIGHUP` and `SIGQUIT` by unmounting everything this
-/// process has mounted, then letting the signal proceed. Idempotent.
+/// process has mounted, then restoring the previous disposition and re-raising, so the signal
+/// ends the process as it would have. Idempotent.
+///
+/// A signal runs no destructors, so a guard's mount outlives the process with nothing
+/// answering it, and anything walking the path (`git status` included) hangs until it comes
+/// down. Without this, the process's watchdog unmounts it a moment after the process ends, or
+/// [`reclaim_abandoned`](super::reclaim_abandoned) in a later run; this does it before.
+///
+/// Opt-in: a signal disposition is process-global, and installing one while mounting would
+/// overwrite whatever the embedding program arranged.
 ///
 /// **Limits:** `SIGKILL` is uncatchable, a handler installed later replaces this one, and a
 /// wedged mount may refuse to come down; the unmount is bounded, and survivors are reported
@@ -114,7 +98,8 @@ unsafe impl Send for Disposition {}
 
 static PREVIOUS: Mutex<Vec<(libc::c_int, Disposition)>> = Mutex::new(Vec::new());
 
-/// The handler: one async-signal-safe `write`.
+/// The handler: one async-signal-safe `write` that wakes [`watch`], since `unmount` and the
+/// teardown (allocation, `fork`, `Mutex`) are not async-signal-safe.
 extern "C" fn poke(signal: libc::c_int) {
     let fd = WAKE.load(Ordering::Relaxed);
     if fd < 0 {

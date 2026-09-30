@@ -1,7 +1,6 @@
-//! Concrete [`FileSystem`](super::FileSystem) stores.
-//!
-//! The `std`-only stores are always built. Each network store is behind its own feature, so a
-//! consumer serving local files does not compile an HTTP and TLS stack.
+//! Concrete [`FileSystem`](super::FileSystem) stores. The `std`-only ones are always built;
+//! each network store is behind its own feature, so a local-files build compiles no HTTP and
+//! TLS stack.
 
 #[cfg(feature = "gdrive")]
 mod gdrive;

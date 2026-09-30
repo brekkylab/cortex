@@ -4,10 +4,6 @@
 //! The first three are values, as in Rust (`Recipe` is `Clone` and its builder calls return a
 //! new one): every method returns a new object and none mutates its receiver, so a base recipe
 //! extended in two directions stays the base.
-//!
-//! `ImageClient` sits in an `Arc<Mutex<Option<..>>>`: each call clones it into a `'static`
-//! future on the binding's runtime, the lock makes calls take turns on the one channel, and it
-//! is dropped inside that runtime so `quit` goes out even from a Python finalizer.
 
 use std::{path::PathBuf, sync::Arc};
 

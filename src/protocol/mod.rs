@@ -5,23 +5,96 @@
 //! that "somewhere"; the methods, which end may ask what, and request/response pairing
 //! are defined once here so servers cannot drift apart on them.
 //!
-//! - `message` — [`Message`] and the methods, errors and payloads both ends agree on.
-//! - `base` — what each end does on a channel: a [`Client`] only asks, a [`Server`]
-//!   only answers. Neither reads meaning into a message.
-//! - [`stdio`] — framed JSON-RPC over a pipe, with [`StdioClient`](stdio::StdioClient)
-//!   (starts the server process it drives) and [`StdioServer`](stdio::StdioServer)
-//!   (answers on stdin and stdout).
-//! - [`ConsoleClient`](crate::console::ConsoleClient) — the public end: the channel driving a server, plus the session
-//!   it was opened with.
-//!
-//! Everything that waits is a future, so one runtime can drive many consoles. A single
-//! session is not concurrent: see [`Client`].
+//! - [`Client`] and [`Server`] — what each end does on a channel, independent of
+//!   transport: a client only asks, a server only answers, and neither reads meaning into
+//!   a message (where a command runs, what a session allows, when something has booted).
+//! - [`Message`] and the methods, errors and payloads both ends agree on.
+//! - [`stdio`] — the current transport; another (e.g. a micro-VM's virtio port) would
+//!   change nothing above it.
+//! - [`ConsoleClient`](crate::console::ConsoleClient) — the public end: the channel driving a
+//!   server, plus the session it was opened with.
 //!
 //! A server never issues a request, so neither end needs a pending table, a listener, or
 //! a reader that must not block on work only it can unblock.
 //!
-//! [`Message`] has the protocol's rationale, [`read`](stdio::read) and
-//! [`write`](stdio::write) the wire's.
+//! # The wire
+//!
+//! Every [`Message`] is a JSON-RPC 2.0 object, shown here as BSON Extended JSON:
+//!
+//! ```text
+//! {"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","ls"]}}
+//! {"jsonrpc":"2.0","id":2,"result":{"code":0,"stdout":<Binary>,"stderr":<Binary>,"truncated":false}}
+//! {"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"timed out after 1000ms"}}
+//! {"jsonrpc":"2.0","method":"quit"}
+//! ```
+//!
+//! **The object model is the spec's; the encoding is not.** Member presence decides a
+//! message's shape, `id` pairs a response with its request, and the error codes are
+//! JSON-RPC 2.0's. The bytes are BSON documents; framing is [`stdio`]'s.
+//!
+//! # Methods
+//!
+//! | Method | `params` | `result` | Errors |
+//! |---|---|---|---|
+//! | `version` | [`VersionCall`] | [`VersionResp`] | — |
+//! | `build_image` | [`BuildImageCall`] | [`BuildImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
+//! | `remove_image` | [`RemoveImageCall`] | [`RemoveImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
+//! | `list_images` | [`ListImagesCall`] | [`ListImagesResp`] | — |
+//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_MOUNT`](Error::UNSUPPORTED_MOUNT), [`UNSUPPORTED_NETWORK`](Error::UNSUPPORTED_NETWORK), [`UNSUPPORTED_IMAGE`](Error::UNSUPPORTED_IMAGE), [`UNKNOWN_IMAGE`](Error::UNKNOWN_IMAGE), [`UNSUPPORTED_MACHINE`](Error::UNSUPPORTED_MACHINE) |
+//! | `exec` | [`ExecCall`] | [`ExecResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `write` | [`WriteCall`] | [`WriteResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `snapshot` | [`SnapshotCall`] | [`SnapshotResp`] | [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `start` | — | *(notification — no response)* | — |
+//! | `stop` | — | *(notification — no response)* | — |
+//! | `quit` | — | *(notification — no response)* | — |
+//!
+//! # Design
+//!
+//! - **Booting is not a method.** Anything that needs a booted session boots one, so
+//!   [`Start`](Notification::Start) and [`Stop`](Notification::Stop) are resource
+//!   management only and go unanswered. `init` is a call because it says what the session
+//!   *is*, and its answer is the first thing a client can act on.
+//! - **Failure is an `error` with a code**, the only failure channel: a requester branches
+//!   on [`Error::code`], and an `error` cannot be mistaken for a command's exit status.
+//! - **An execution is one request and one response, never a stream.** The caller is an
+//!   agent that cannot act on partial output, so [`ExecResp`] arrives whole, bounded by
+//!   [`MAX_PAYLOAD`]. It takes no stdin (stage files with `write`, collect them with
+//!   `read`), and a command that never ends needs [`timeout_ms`](ExecCall::timeout_ms).
+//! - **Program bytes are bytes; names are text.** Output and file contents are raw bytes;
+//!   an argv and a path are UTF-8, since both ends must interpret them.
+//!
+//! ## Why the codec is BSON
+//!
+//! **Self-describing.** `{"method":..,"params":..}` is serde adjacent tagging, and
+//! `result` xor `error` is decided by which member is *present*; both need a deserializer
+//! that can look ahead, which postcard and bincode cannot.
+//!
+//! **A byte type.** Exec output and file contents are most of the traffic and are program
+//! bytes, not text. JSON would need base64 (1.37×, plus decoding); BSON's `Binary`
+//! carries them as themselves.
+//!
+//! ### What that costs
+//!
+//! An off-the-shelf JSON-RPC library: a peer needs a BSON codec. That matters little,
+//! since such a peer already needs bespoke framing and both ends live in this workspace.
+//!
+//! Not frame size where it matters. BSON writes array indices as keys (`cmd` becomes
+//! `{"0":"ls"}`) and names as C strings, so a control frame like `stop` is slightly
+//! *larger* than JSON; the large, frequent output frames shrink. MessagePack and CBOR
+//! beat BSON on both; BSON wins on being self-delimiting (which can retire the framing
+//! layer) and on `doc!`/Extended JSON keeping the wire readable to people and tests.
+//!
+//! # Every trait method hands back a boxed future
+//!
+//! Everything that waits is a future, so one runtime can drive many consoles at a task
+//! each rather than a thread parked on a pipe each. An `async fn` in a trait returns a
+//! type a `dyn` cannot name, and a [`ConsoleClient`](crate::console::ConsoleClient) holds
+//! a `dyn Client` so the transport stays out of its type. A [`BoxFuture`] costs one
+//! allocation per call, negligible against a pipe round trip; derived methods use the
+//! same shape.
+//!
+//! Futures and both ends are [`Send`] so a session can be handed to a task.
 
 mod base;
 mod message;
@@ -38,6 +111,10 @@ pub use message::*;
 /// A transport implements only [`call`](Self::call) and [`notify`](Self::notify); the
 /// per-method wrappers are derived here, which is also the one place a
 /// [`Response`] becomes what its method returns.
+///
+/// `&mut self` throughout, with no `&self`-plus-lock: one call is outstanding at a time,
+/// and a `read` interleaved with a running command is a question the server cannot answer
+/// yet. The exclusive borrow checks this; for concurrency, open a second console.
 pub trait Client: Send {
     /// Make one call and wait for its response.
     ///

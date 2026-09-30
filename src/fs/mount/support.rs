@@ -1,17 +1,16 @@
 //! Whether this host can mount at all, and what to install when it cannot.
-//!
-//! **A build with `mount` runs on a host without the provider.** On macOS the shim `dlopen`s
-//! libfuse-t on first use; on Windows `dokan2.dll` loads on a mount's first call into it. A
-//! missing provider costs a mount, not the process, and this finds it before a binding calls in.
-//!
-//! On Windows that needs the binary linked with `/DELAYLOAD:dokan2.dll`, which `rustc-link-arg`
-//! cannot request for a dependent (see the `mount` feature in `Cargo.toml`). Without it the
-//! DLL is needed to start at all.
 
 use std::io;
 
 /// Check this host has what its `mount` binding needs at run time, and if not, say what to
 /// install.
+///
+/// A build with `mount` runs on a host without the provider: on macOS the shim `dlopen`s
+/// libfuse-t on first use, and on Windows `dokan2.dll` loads on a mount's first call into it.
+/// A missing provider costs a mount, not the process, and this finds it before a binding calls
+/// in. On Windows that needs the binary linked with `/DELAYLOAD:dokan2.dll`, which
+/// `rustc-link-arg` cannot request for a dependent (see the `mount` feature in `Cargo.toml`);
+/// without it the DLL is needed to start at all.
 ///
 /// Every binding's `try_new` calls this first; call it directly only to know ahead, e.g. to
 /// hide a feature.

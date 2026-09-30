@@ -1,25 +1,5 @@
-//! POSIX bookkeeping over a path-addressed [`FileSystem`] store.
-//!
-//! [`Posix`] maps the store's paths onto stable inode numbers, tracks the kernel's per-inode
-//! reference counts, and keeps the open-file table file handles index. It is tied to no
-//! interface; a concrete binding drives it.
-//!
-//! It exists because a kernel addresses files by number and descriptor. A path-addressed
-//! consumer (e.g. HTTP) uses [`FileSystem`] directly.
-//!
-//! # What it holds that the store does not
-//!
-//! The store answers only about names and bytes, so everything an open means lives here:
-//!
-//! * **Numbers**: inode ↔ path, and the reference counts that say when a number may be
-//!   reclaimed.
-//! * **Descriptors**: a file handle resolves to an inode and its open options, never to a
-//!   path, so an open follows its file through a rename.
-//! * **Decomposition**: `O_CREAT|O_EXCL` becomes [`create`](FileSystem::create), `O_TRUNC`
-//!   becomes [`truncate`](FileSystem::truncate), and the access mode is checked here rather
-//!   than in every store. [`OpenOptions`] and [`SetAttr`] stop here; a store sees neither.
-//!
-//! A descriptor outliving its name is handled by [`unlink_child`](Posix::unlink_child).
+//! POSIX bookkeeping over a path-addressed [`FileSystem`] store: [`Posix`], and the kernel's
+//! requests ([`OpenOptions`], [`SetAttr`]), which stop here since no store sees them.
 
 // What a build reads depends on which bindings are enabled, in non-aligned subsets (none
 // without a kernel binding; `unix_time` only for C-`stat` bindings; `TTL` only for those
@@ -60,7 +40,7 @@ use crate::{
 /// atomically. A caller wanting it seeks to the end first.
 ///
 /// Built like an `open(2)` call: an access mode, then modifying flags. Fields are public for
-/// backends to read; `#[non_exhaustive]` stops callers outside the crate constructing it.
+/// bindings to read; `#[non_exhaustive]` stops callers outside the crate constructing it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct OpenOptions {
@@ -183,7 +163,19 @@ fn bad_handle() -> io::Error {
 
 /// A store, in the terms a kernel speaks: inode numbers and file handles.
 ///
-/// "Posix" names the vocabulary, not an interface; nothing here is shaped by a binding.
+/// "Posix" names the vocabulary, not an interface; nothing here is shaped by a binding, which
+/// only drives it. A path-addressed consumer (e.g. HTTP) uses the [`FileSystem`] directly.
+///
+/// The store answers only about names and bytes, so everything an open means lives here, where
+/// no store names it:
+///
+/// * **Numbers**: inode ↔ path, and the kernel's reference counts that say when a number may be
+///   reclaimed.
+/// * **Descriptors**: a file handle resolves to an inode and its open options, never to a path,
+///   so an open follows its file through a rename and outlives its name's unlink.
+/// * **Decomposition**: `O_CREAT|O_EXCL` becomes [`create`](FileSystem::create), `O_TRUNC`
+///   becomes [`truncate`](FileSystem::truncate), and the access mode is checked here rather
+///   than in every store.
 ///
 /// Fields are **private** so a binding can only translate: it cannot reach the tables to
 /// re-derive an operation that belongs here.

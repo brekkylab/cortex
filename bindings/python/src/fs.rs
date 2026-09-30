@@ -1,11 +1,4 @@
 //! `Directory` and `HostMount`: the trees a session's commands see.
-//!
-//! A `Directory` is mutated in place because the Rust type is not `Clone`: its files live in
-//! memory, so a copy would be a second tree, not a second handle on one. Mounting it *takes* it:
-//! the `HostMount` owns the tree, and the `Directory` is empty afterwards and refuses further use.
-//!
-//! `HostMount` names whichever guard this platform compiles (`FuseMount`, `FuseTMount` or
-//! `DokanMount`), so callers need not know which.
 
 #[cfg(feature = "mount")]
 use std::sync::Arc;
@@ -14,6 +7,7 @@ use std::{io, path::PathBuf};
 use cortex::fs::{Directory, Mount};
 use pyo3::{exceptions::PyValueError, prelude::*};
 
+// `HostMount` wraps whichever guard this platform compiles, so callers need not know which.
 #[cfg(all(feature = "mount", windows))]
 use cortex::fs::DokanMount as Platform;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
@@ -37,6 +31,10 @@ impl From<Content> for Vec<u8> {
     }
 }
 
+/// A tree assembled in place. Mounting it with `HostMount` takes it: the mount owns the tree,
+/// and this `Directory` is empty afterwards and refuses further use.
+// In place because the Rust type is not `Clone`: its files live in memory, so a copy would be a
+// second tree, not a second handle on one.
 #[pyclass(name = "Directory", module = "cortex")]
 pub struct PyDirectory(Option<Directory>);
 

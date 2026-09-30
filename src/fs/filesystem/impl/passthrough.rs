@@ -1,41 +1,5 @@
 //! A [`FileSystem`] store that passes every operation through to the local filesystem via
 //! `std::fs`.
-//!
-//! A [`PassthroughFs`] is anchored at a `root` directory. Request paths are relative to it:
-//! leading `/` and `.` are ignored, `..` is folded, and an OS prefix, or a `..` with nothing
-//! left to fold, is rejected.
-//!
-//! Folding `..` confines nothing on its own, since a symlink inside the root can point out of
-//! it. So a path through a link is resolved and must land under the root. Resolving *reads*
-//! links rather than following them: a link out of the root cannot be traversed, and one
-//! naming something not created yet is served.
-//!
-//! Only operations that follow a link are checked that way. `create`, `mkdir`, `unlink`,
-//! `rmdir` and `rename` act on a name and never touch what it points at, so containment covers
-//! only the directory holding the name; a link out of the root is still listed and removable.
-//!
-//! `..` is folded lexically, and has to be: a mount table routes on a normalized key and hands
-//! a store the folded remainder, and [`Posix`](crate::fs::Posix) never sends one (the kernel
-//! folds it against the parent inode). Any other fold would answer differently called directly
-//! than through the mount table.
-//!
-//! This departs from the kernel behind a directory link: `dirlink/..` returns to the link's own
-//! parent, not the target's. So `RESOLVE_BENEATH` matches the *escape* policy here but not the
-//! `..` handling, since that flag resolves in full before judging where it landed.
-//!
-//! The check and the operation are separate calls, so a link swapped between them is not
-//! caught. No binding implements `symlink`, so only another process on the same tree could.
-//!
-//! # A descriptor per call
-//!
-//! Every read and write opens the file, acts, and closes it: a store is addressed by path (see
-//! *No opens, only paths* on [`FileSystem`]), so no descriptor outlives its call.
-//!
-//! That is three syscalls instead of one, and a path walk each time: noise next to a request
-//! that crossed a virtio-fs ring or FUSE channel. The real cost is the POSIX guarantee a descriptor carries:
-//! a read after the name is gone answers `ENOENT` where an open file would keep working.
-//! Restoring that belongs to the layer holding descriptors
-//! (`Posix::unlink_child`).
 
 use std::{
     ffi::OsString,
@@ -55,6 +19,33 @@ use crate::{
 const MAX_LINK_HOPS: u32 = 32;
 
 /// A real on-disk directory, served as-is through `std::fs` under `root`.
+///
+/// Request paths are relative to `root`: leading `/` and `.` are ignored, `..` is folded
+/// lexically, and an OS prefix, or a `..` with nothing left to fold, is rejected.
+///
+/// # Containment
+///
+/// Folding `..` confines nothing on its own, since a symlink inside the root can point out of
+/// it. So for operations that follow a link (`stat`, `list`, the data plane), a path through
+/// one is resolved and must land under the root. Links are *read* rather than followed: a link
+/// out of the root cannot be traversed, and one naming something not created yet is served.
+///
+/// `create`, `mkdir`, `unlink`, `rmdir` and `rename` act on a name and never touch what it
+/// points at, so only the directory holding the name is checked; a link out of the root is
+/// still listed and removable.
+///
+/// Lexical `..` departs from the kernel behind a directory link: `dirlink/..` returns to the
+/// link's own parent, not the target's. So `RESOLVE_BENEATH` matches the *escape* policy here
+/// but not the `..` handling, since that flag resolves in full before judging where it landed.
+///
+/// The check and the operation are separate calls, so a link swapped between them is not
+/// caught. No binding implements `symlink`, so only another process on the same tree could.
+///
+/// # A descriptor per call
+///
+/// Every read and write opens the file, acts, and closes it, since a store is addressed by
+/// path. So a read after the name is gone answers `ENOENT` where an open file would keep
+/// working; restoring that belongs to the layer holding descriptors.
 pub struct PassthroughFs {
     root: PathBuf,
 
@@ -145,6 +136,10 @@ impl PassthroughFs {
 
     /// Fold a request onto `root`: `.` dropped, `..` applied, an OS prefix or a climb past the
     /// root refused. Containment is left to callers, which check different things.
+    ///
+    /// Lexical because a mount table routes on a normalized key and hands a store the folded
+    /// remainder, and [`Posix`](crate::fs::Posix) never sends `..` (the kernel folds it against
+    /// the parent inode); any other fold would answer differently than through the table.
     fn fold(&self, path: &Path) -> io::Result<Folded> {
         let mut folded = Folded {
             real: self.root.clone(),
@@ -208,6 +203,9 @@ impl PassthroughFs {
     }
 
     /// Open the file at `path` for the data plane.
+    ///
+    /// Per call: three syscalls instead of one, and a path walk, noise next to a request that
+    /// crossed a virtio-fs ring or FUSE channel.
     ///
     /// Never creates: only [`create`](FileSystem::create) makes a name, so a write to a name
     /// that went away errors rather than resurrecting it.

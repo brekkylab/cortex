@@ -1,24 +1,6 @@
 //! The public end: a console server to run commands in, over one channel.
 //!
-//! Only this end asks, so every [`ConsoleClient`] method is one round trip, [`exec`]
-//! included, with no pending table or listener.
-//!
-//! Everything is async so one runtime can drive many consoles at a task each rather than a
-//! thread parked on a pipe each. One console is not concurrent: its methods take
-//! `&mut self` (one outstanding request; see [`Client`]).
-//!
-//! # Ending one
-//!
-//! Drop it. The `quit` that lets the server exit gracefully is owed exactly once, when the
-//! console goes away, so it is a [`Drop`](ConsoleClient#impl-Drop-for-ConsoleClient) rather
-//! than a method to remember.
-//!
-//! [`start`](ConsoleClient::start) and [`stop`](ConsoleClient::stop) only manage what the far
-//! end holds: `stop` hands back the guest, socket and scratch directory while idle, and
-//! `start` pays the cold start early. The next command boots what it needs, so neither is
-//! required, and neither is answered.
-//!
-//! [`exec`]: ConsoleClient::exec
+//! [`ConsoleClientBuilder`] describes the session; [`ConsoleClient`] runs commands in it.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -326,6 +308,9 @@ struct Tree {
 /// everything goes away with the console. [`start`](Self::start) and [`stop`](Self::stop)
 /// are optional resource management.
 ///
+/// Every method is one round trip, [`exec`](Self::exec) included. One console is not
+/// concurrent: its methods take `&mut self` (see [`Client`]).
+///
 /// ```no_run
 /// use cortex::console::ConsoleClient;
 ///
@@ -524,6 +509,9 @@ impl Drop for ConsoleClient {
     /// Say `quit`, so the server exits gracefully; it also releases what a
     /// [`stop`](ConsoleClient::stop) would, so no `stop` is needed. The outcome (over stdio,
     /// the exit status) is discarded, since no caller is left to act on it.
+    ///
+    /// Owed exactly once, when the console goes away, so it is a `Drop` rather than a
+    /// method to remember.
     ///
     /// # Why the client is swapped rather than taken
     ///

@@ -1,11 +1,4 @@
-//! Binds a [`Posix`] to `fuser`'s host-side [`Filesystem`]; [`FuseMount`] is all it exports.
-//!
-//! The binding for every unix but macOS. `fuser` speaks the kernel FUSE protocol over the
-//! mount fd itself and opens `/dev/fuse`, so on Linux only a non-root user needs anything
-//! installed (`fusermount3`). Attributes are [`FileAttr`], and errnos are this host's.
-//!
-//! Symlinks, hard links and extended attributes stay on `fuser`'s `ENOSYS` defaults; the store
-//! contract has no notion of them.
+//! Binds a [`Posix`] to `fuser`'s host-side [`Filesystem`].
 //!
 //! **Testing needs a real mount**: a callback answers by consuming a `Reply*` only `fuser` can
 //! construct.
@@ -46,6 +39,9 @@ const FSNAME: &str = "cortex";
 
 /// A live mount on the kernel's own FUSE: constructing one mounts, dropping it unmounts.
 ///
+/// The binding for every unix but macOS. `fuser` speaks the kernel FUSE protocol over the
+/// mount fd itself and opens `/dev/fuse`.
+///
 /// Not generic in the store: `fuser`'s session owns the filesystem, so there is no raw
 /// pointer whose target something else must keep alive.
 pub struct FuseMount {
@@ -65,7 +61,8 @@ pub struct FuseMount {
 impl FuseMount {
     /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
-    /// `mountpoint` must already exist. On Linux only a non-root user needs anything installed.
+    /// `mountpoint` must already exist. On Linux only a non-root user needs anything installed
+    /// (`fusermount3`).
     ///
     /// The mount syscall completes before this returns, so the path is already a mount point.
     ///
@@ -183,6 +180,9 @@ fn to_file_type(kind: DirentKind) -> FileType {
     }
 }
 
+/// Symlinks, hard links and extended attributes stay on `fuser`'s `ENOSYS` defaults; the store
+/// contract has no notion of them.
+///
 /// The `'static` bound is `fuser`'s: a mounted session outlives the mount call, so the
 /// filesystem may not borrow.
 impl<T: FileSystem + 'static> Filesystem for Posix<T> {

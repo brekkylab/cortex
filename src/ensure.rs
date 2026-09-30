@@ -1,16 +1,4 @@
 //! Fetching the console server when this host has none.
-//!
-//! cortex-krun's `cargo xtask upload` publishes one archive per platform holding what its
-//! `cargo xtask install` puts in [`cache_root`]`/bin`: `cortex-krun`, the VM process, the
-//! guest, the guest kernel, and `abin/`. Layout under the bucket's public HTTPS endpoint:
-//!
-//! ```text
-//! cortex-krun/<os>-<arch>/latest                                    one line: a version
-//! cortex-krun/<os>-<arch>/<version>/cortex-krun-<os>-<arch>.tar.gz
-//! ```
-//!
-//! `<os>`/`<arch>` are as [`std::env::consts`] spells them. A version is a cortex-krun git sha;
-//! `latest` is per platform because each platform is built and uploaded by its own machine.
 
 use std::path::{Path, PathBuf};
 
@@ -29,6 +17,20 @@ const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east
 /// The version is `$CORTEX_KRUN_VERSION` if set, else this platform's `latest`. `cortex-krun`
 /// is placed last, so a partial fetch leaves a `bin/` the next call refetches rather than one
 /// that looks complete.
+///
+/// # Release layout
+///
+/// cortex-krun's `cargo xtask upload` publishes one archive per platform holding what its
+/// `cargo xtask install` puts in `bin/`: `cortex-krun`, the VM process, the guest, the guest
+/// kernel, and `abin/`. Under the bucket's public HTTPS endpoint:
+///
+/// ```text
+/// cortex-krun/<os>-<arch>/latest                                    one line: a version
+/// cortex-krun/<os>-<arch>/<version>/cortex-krun-<os>-<arch>.tar.gz
+/// ```
+///
+/// `<os>`/`<arch>` are as [`std::env::consts`] spells them. A version is a cortex-krun git sha;
+/// `latest` is per platform because each platform is built and uploaded by its own machine.
 pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     let root = cache_root();
     let bin = root.join("bin");

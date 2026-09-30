@@ -1,22 +1,12 @@
-//! Binds a [`Posix`] to FUSE-T through libfuse-t's lowlevel API; [`FuseTMount`] is all it
-//! exports.
+//! Binds a [`Posix`] to FUSE-T through libfuse-t's lowlevel API.
 //!
 //! Inode identity, handle lifetime, the readdir cursor, open decomposition, attributes and the
-//! host errno table live in [`posix`](crate::fs::filesystem::posix); this file only marshals.
+//! host errno table live in [`posix`](crate::fs::filesystem::posix); this file only marshals,
+//! through the flat vtable of the C shim in `contrib/fuse_t/`, which owns libfuse-t's structs.
 //!
 //! **Why not `fuser`?** `fuser` speaks the kernel FUSE protocol over the fd from `fuse_mount`
 //! itself. FUSE-T's fd is a socket to its helper, which expects libfuse-t's own loop: with a
 //! foreign reader, INIT completes, two probes arrive, and the helper hangs up with no mount.
-//! In exchange FUSE-T needs no kernel extension (macFUSE is a kext needing reduced-security
-//! boot on Apple Silicon).
-//!
-//! **The transport is a mount option.** The helper carries an NFSv4 server, an SMB server, and
-//! an FSKit module (see [`FuseTBackend`]); the vtable and callbacks here are the same for all.
-//!
-//! **Why a C shim?** `fuse_lowlevel_ops` has dozens of function pointers with
-//! `__APPLE__`-conditional members, `fuse_file_info` has bitfields, and `fuse_entry_param`
-//! embeds a host `struct stat`. A wrong layout in Rust is silent memory corruption, so
-//! `contrib/fuse_t/shim.c` owns them all and exposes a flat vtable of our own.
 
 use std::{
     ffi::{CStr, CString, OsStr, c_char, c_int, c_long, c_void},
@@ -514,7 +504,8 @@ impl FuseTMount {
     /// mount is real.
     ///
     /// `mountpoint` must already exist and be empty. Requires FUSE-T
-    /// (`brew install --cask fuse-t`) — no kernel extension, no reboot.
+    /// (`brew install --cask fuse-t`) — no kernel extension, no reboot (macFUSE is a kext
+    /// needing reduced-security boot on Apple Silicon).
     ///
     /// **Blocks until the mount is real.** `fuse_mount` returns a session early, but the kernel
     /// attaches it only after the serving thread answers the helper's opening

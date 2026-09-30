@@ -1,24 +1,4 @@
 //! The answering end over a framed channel: bring a message in, put a response out.
-//! What a request *means* is decided by whoever answers it.
-//!
-//! ```no_run
-//! use cortex::protocol::stdio::StdioServer;
-//! use cortex::protocol::{Message, Response, Server};
-//!
-//! # fn answer(call: cortex::protocol::Call) -> Response { unimplemented!() }
-//! # #[tokio::main]
-//! # async fn main() -> anyhow::Result<()> {
-//! // Takes stdin and stdout for the protocol; everything else goes to stderr.
-//! let mut server = StdioServer::stdio()?;
-//!
-//! while let Some(message) = server.recv().await? {
-//!     if let Message::Request { id, call } = message {
-//!         server.respond(id, answer(call)).await?;
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
 
 use std::{
     io,
@@ -41,6 +21,25 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 ///
 /// Trait objects rather than type parameters: behavior does not depend on the
 /// descriptor type. Holds no session state.
+///
+/// ```no_run
+/// use cortex::protocol::stdio::StdioServer;
+/// use cortex::protocol::{Message, Response, Server};
+///
+/// # fn answer(call: cortex::protocol::Call) -> Response { unimplemented!() }
+/// # #[tokio::main]
+/// # async fn main() -> anyhow::Result<()> {
+/// // Takes stdin and stdout for the protocol; everything else goes to stderr.
+/// let mut server = StdioServer::stdio()?;
+///
+/// while let Some(message) = server.recv().await? {
+///     if let Message::Request { id, call } = message {
+///         server.respond(id, answer(call)).await?;
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub struct StdioServer {
     /// Where requests come from. Buffering is safe: the protocol owns this for the
     /// session's lifetime, so reading ahead takes no one else's bytes.
@@ -64,10 +63,12 @@ impl StdioServer {
 
     /// Take stdin and stdout for the protocol, for the life of the process.
     ///
-    /// From here on **stdout carries frames only** (a rule, not enforced); diagnostics go
-    /// to stderr.
+    /// From here on **stdin and stdout carry frames only**; diagnostics go to stderr. A
+    /// rule, not enforced: a `println!` elsewhere reaches the same descriptor without
+    /// passing through this end and corrupts the stream, as with an MCP stdio server. Only
+    /// this end's own frames are kept from interleaving, by the writer's single owner.
     ///
-    /// Fails if called twice.
+    /// Fails if called twice: the claim is process-wide.
     pub fn stdio() -> anyhow::Result<Self> {
         if TAKEN.swap(true, Ordering::SeqCst) {
             anyhow::bail!("stdin and stdout are already the protocol's — there is one of each");

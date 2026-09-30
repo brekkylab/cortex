@@ -123,6 +123,20 @@ struct Child {
 }
 
 /// A OneDrive account as a read-only directory tree.
+///
+/// ```text
+/// /
+///   Documents/          the drive's own folders, from `/me/drive/root`
+///     report.docx       a file, served as its own bytes
+///   photo.jpg
+/// ```
+///
+/// The root is the drive root, with no virtual sections above it: an account is one drive.
+///
+/// Graph serves Office files as their real bytes, states an exact size on every item, and
+/// honours ranges, so a short read is the end of the file: nothing is rendered, and no
+/// length is guessed or padded. A listing is held for minutes, so a change just made in
+/// OneDrive may not show yet.
 pub struct OnedriveFs {
     accessor: OnedriveAccessor,
     /// Folder path → its children. Everything `stat` reports comes from here, so a

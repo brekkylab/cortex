@@ -1,36 +1,4 @@
 //! `ConsoleClient`, its builder, and their results.
-//!
-//! Every call that waits returns a `Promise` settled on napi's tokio runtime: a stdio client
-//! spawns its server and reads from it, which needs a reactor.
-//!
-//! # Why not `async fn`
-//!
-//! napi's `async fn` and `spawn_future` reject with a [`Status`](napi::Status) as the error's
-//! `code`, but the codes a caller acts on are cortex's (`TIMED_OUT`, `CONSOLE_BROKEN`). So
-//! [`promise`] runs the future to a plain `Result` and builds the JavaScript error back on the
-//! main thread, where one can be made. The synchronous part of a call runs when it is made:
-//! `build()` takes the builder immediately, not when the runtime polls the future.
-//!
-//! # Where the console lives
-//!
-//! A promise's future must be `'static`, so each call clones an `Arc<Mutex<..>>` into it. The
-//! lock also makes calls take turns, as `&mut self` does in Rust: one channel carries one call,
-//! so a second `exec` waits for the first rather than interleaving with it.
-//!
-//! # How it ends
-//!
-//! [`ConsoleClient`]'s `Drop` says `quit` only when dropped on a runtime, and a garbage-collection
-//! finalizer runs off one. So [`JsConsoleClient`] keeps the handle of the runtime it was built on
-//! and enters it before letting go: a collected console ends the same way as a closed one.
-//! `close()` ends it at a chosen line instead of whenever the collector runs.
-//!
-//! # Who else holds it
-//!
-//! The slot is a plain `Arc<Mutex<Option<ConsoleClient>>>` because that is the shape an agent
-//! holds its console in (ailoy's `AgentState::console`), so a binding that links this crate can
-//! hand [`JsConsoleClient::slot`] to one. Both then share one session: calls take turns on the
-//! lock, and `close()` ends it for both. Whichever holder lets go last ends it, so any other
-//! holder must also drop it inside [`JsConsoleClient::runtime`].
 
 use std::{future::Future, sync::Arc};
 
@@ -53,7 +21,11 @@ use crate::{
 
 /// Run `fut` on napi's runtime, rejecting with its error's own `code`.
 ///
-/// Public for bindings that link this crate.
+/// Not napi's `async fn` or `spawn_future`, which reject with a [`Status`](napi::Status) as the
+/// `code`: this runs `fut` to a plain `Result` and builds the JavaScript error back on the main
+/// thread, where one can be made. Work before the call is synchronous, so `build()` empties its
+/// builder at once rather than when the runtime polls the future. Public for bindings that link
+/// this crate.
 pub fn promise<'env, T, F>(env: &'env Env, fut: F) -> napi::Result<PromiseRaw<'env, T>>
 where
     T: ToNapiValue + Send + 'static,
@@ -249,6 +221,9 @@ fn held(slot: &mut Option<ConsoleClient>) -> Result<&mut ConsoleClient> {
 }
 
 /// A console slot: the console, or nothing once it has been closed.
+///
+/// Plain because that is how an agent holds its console (ailoy's `AgentState::console`), so
+/// [`JsConsoleClient::slot`] can be handed to one.
 pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 
 #[napi(js_name = "ConsoleClient")]
@@ -276,7 +251,11 @@ impl JsConsoleClient {
         }
     }
 
-    /// The slot this console lives in, for sharing it with another holder (see module docs).
+    /// The slot this console lives in, for sharing it with another holder.
+    ///
+    /// Both then share one session: calls take turns on the lock, and `close()` ends it for
+    /// both. Whichever lets go last ends it, so every other holder must also drop it inside
+    /// [`runtime`](Self::runtime).
     pub fn slot(&self) -> Slot {
         self.console.clone()
     }

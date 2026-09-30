@@ -239,6 +239,8 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
     raw.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
+/// Credentials for one mount. Takes a refresh token and does not mint one; the consent
+/// round trip belongs to whatever set the mount up.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GdriveConfig {
     pub client_id: String,

@@ -10,10 +10,6 @@
 //! ```sh
 //! cargo test --features s3 --test s3_endpoint -- --ignored --nocapture
 //! ```
-//!
-//! Nothing to configure: the mock mints an S3 keypair per caller and serves the roster at
-//! `/_mock/users`, so there is no secret to keep. The bucket's layout is discovered, so this
-//! survives the corpus changing.
 
 #![cfg(feature = "s3")]
 
@@ -45,6 +41,9 @@ struct Principal {
 }
 
 /// The mock's roster of callers, in the order it lists them.
+///
+/// The mock mints an S3 keypair per caller and serves them at `/_mock/users`, so there is
+/// nothing to configure and no secret to keep.
 ///
 /// `curl` rather than an HTTP client: a dev-dependency would be built by **every**
 /// `cargo test`, and a test that needs the network can afford to need `curl`. `None` when

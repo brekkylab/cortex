@@ -1,28 +1,4 @@
 //! `ConsoleClient`, its builder, and their results.
-//!
-//! Every call that waits is an awaitable run on the tokio runtime `pyo3-async-runtimes` keeps: a
-//! stdio client spawns its server and reads from it, which needs a reactor asyncio lacks.
-//!
-//! # Where the console lives
-//!
-//! A Python future must be `'static`, so each call clones an `Arc<Mutex<..>>` into it. The lock
-//! also makes calls take turns, as `&mut self` does in Rust: one channel carries one call, so a
-//! second `exec` awaited alongside the first waits for it rather than interleaving with it.
-//!
-//! # How it ends
-//!
-//! [`ConsoleClient`]'s `Drop` says `quit` only when dropped on a runtime, and a Python finalizer
-//! runs off one. So [`PyConsoleClient`] enters the binding's runtime before letting go: a
-//! garbage-collected console ends the same way as a closed one. `close()` and `async with` end it
-//! at a chosen line instead of whenever the collector runs.
-//!
-//! # Who else holds it
-//!
-//! The slot is a plain `Arc<Mutex<Option<ConsoleClient>>>` because that is the shape an agent
-//! holds its console in (ailoy's `AgentState::console`), so a binding that links this crate can
-//! hand [`PyConsoleClient::slot`] to one. Both then share one session: calls take turns on the
-//! lock, and `close()` ends it for both. Whichever holder lets go last ends it, so any other
-//! holder must also drop it inside the binding's runtime.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -193,6 +169,9 @@ fn held(slot: &mut Option<ConsoleClient>) -> PyResult<&mut ConsoleClient> {
 }
 
 /// A console slot: the console, or nothing once it has been closed.
+///
+/// Plain because that is how an agent holds its console (ailoy's `AgentState::console`), so
+/// [`PyConsoleClient::slot`] can be handed to one.
 pub type Slot = Arc<Mutex<Option<ConsoleClient>>>;
 
 #[pyclass(name = "ConsoleClient", module = "cortex", frozen)]
@@ -217,7 +196,11 @@ impl PyConsoleClient {
         }
     }
 
-    /// The slot this console lives in, for sharing it with another holder (see module docs).
+    /// The slot this console lives in, for sharing it with another holder.
+    ///
+    /// Both then share one session: calls take turns on the lock, and `close()` ends it for
+    /// both. Whichever lets go last ends it, so every other holder must also drop it inside the
+    /// binding's runtime.
     pub fn slot(&self) -> Slot {
         self.console.clone()
     }

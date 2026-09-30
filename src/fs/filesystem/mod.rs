@@ -1,14 +1,4 @@
-//! [`FileSystem`] (a tree described by path), the [`Posix`] layer that gives it inode
-//! identity, and the concrete stores that implement it.
-//!
-//! [`FileSystem`] is what a store answers, and all an implementor writes: a namespace plane and
-//! a data plane, both addressed by path, with nothing that stands for an open. [`Posix`] is what
-//! a kernel is told: it sits behind the trait, turns paths into inode numbers, file handles and
-//! open decomposition, and owns everything the bindings share. No store names it, so descriptor
-//! identity lives in one place.
-//!
-//! Stores are feature-gated: the network ones are re-exported behind features, so a consumer
-//! serving local files compiles none of them.
+//! [`FileSystem`] and the stores that implement it, and [`Posix`], the inode layer over it.
 
 mod filesystem;
 mod r#impl;
@@ -17,8 +7,6 @@ mod r#impl;
 pub(super) mod posix;
 
 pub use filesystem::*;
-// Network stores are each behind a non-default feature, so a local-files build compiles no
-// HTTP and TLS stack.
 #[cfg(feature = "gdrive")]
 pub use r#impl::{GdriveConfig, GdriveFs, GdriveOrigins};
 pub use r#impl::{InMemFs, PassthroughFs};

@@ -5,14 +5,10 @@
 //! Both are ordinary on purpose: an agent handed a filesystem and a shell already knows both
 //! interfaces, and every added capability arrives as a file to read or a command to run.
 //!
-//! * **What it sees is a filesystem.** Anything it should know about (a project directory, an
-//!   object store, a Notion workspace, an in-memory tree) implements
-//!   [`FileSystem`](fs::FileSystem). A [`Directory`](fs::Directory) is the one a caller
-//!   assembles: in-memory files plus host directories grafted in at chosen paths. A binding
-//!   mounts it on the host, so it is read with `cat`, `grep`, or anything else.
-//! * **What it does is run commands.** A [`ConsoleClient`](console::ConsoleClient) runs them on
-//!   this host or in a micro-VM over one channel: an `exec` carries an argv, and everything the
-//!   command wrote comes back.
+//! * **What it sees is a filesystem**, read with `cat`, `grep` or anything else once a
+//!   binding mounts it on the host.
+//! * **What it does is run commands**, each an argv sent over one channel, with everything the
+//!   command wrote coming back.
 //!
 //! ## Quickstart
 //!
@@ -50,32 +46,25 @@
 //!
 //! ## Structure
 //!
-//! Two modules sharing one seam.
+//! * [`fs`]: what the agent sees. Stores, the in-memory [`Directory`](fs::Directory), and the
+//!   bindings that mount them on the host.
+//! * [`console`]: what the agent does. [`ConsoleClient`](console::ConsoleClient) runs commands
+//!   in a session.
+//! * [`protocol`]: the wire between a console client and a console server. The server lives in
+//!   its own repository (cortex-krun).
+//! * [`image`]: the images a session runs on, declared or built ahead of time.
 //!
-//! * [`fs`] — expose any path-addressed store as a real filesystem. A store implements
-//!   [`FileSystem`](fs::FileSystem) and a binding puts it behind a concrete interface (host
-//!   FUSE, NFS, FSKit, anything addressing files by path).
-//! * [`console`] — run the commands on this host or in a micro-VM, over one JSON-RPC channel
-//!   where only the client asks.
-//!
-//! [`console`] never builds a tree, calls [`FileSystem`](fs::FileSystem) or touches a binding;
-//! it only takes [`Mount`](fs::Mount)s, trees already mounted, which a session places at paths
-//! its commands see, and under which a `read` and a command spell the same file. [`fs`] does
-//! not know a console exists. Both answer in [`std::io::Error`], classified by kind, so there
-//! is no shared error type.
-//!
-//! **A console server is built on both**, in its own repository (cortex-krun runs commands in
-//! a micro-VM). A tree reaches it already mounted, named by URL rather than described on the
-//! wire, since a tree is mounted by whoever wants it.
+//! [`fs`] and [`console`] meet only at [`Mount`](fs::Mount): a console takes trees already
+//! mounted and never builds one or touches a binding, and [`fs`] does not know a console
+//! exists. Both answer in [`std::io::Error`], classified by kind, so there is no shared error
+//! type.
 //!
 //! ## The file layout
 //!
 //! A module is a directory whose `mod.rs` holds its documentation and re-exports, and whose
-//! siblings hold the code, including one named after the module for its main type:
-//! `message/message.rs` has [`Message`](protocol::Message).
-//!
-//! `module_inception` is allowed deliberately: long module docs belong apart from any type,
-//! and a reader looking for `Message` should find it in a file of that name.
+//! siblings hold the code, including one named after the module for its main type
+//! (`message/message.rs` has [`Message`](protocol::Message)); hence `module_inception` is
+//! allowed.
 #![allow(clippy::module_inception)]
 
 pub mod console;
@@ -88,8 +77,7 @@ pub mod protocol;
 
 /// What every waiting method of a [`Client`] or [`Server`] returns.
 ///
-/// Re-exported so implementors can name it without depending on `futures_core`. Boxed rather
-/// than `async fn` because a trait's `async fn` returns a type a `dyn Client` cannot name.
+/// Re-exported so implementors can name it without depending on `futures_core`.
 ///
 /// [`Client`]: protocol::Client
 /// [`Server`]: protocol::Server

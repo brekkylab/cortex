@@ -1,8 +1,8 @@
 //! The envelope: what is true of every message regardless of method (`jsonrpc`, `id`,
 //! which of the three shapes the member set makes it) and the serde impls for it.
 //!
-//! Per-method members belong to [`Call`] and [`Response`], so adding a method does not
-//! touch the envelope.
+//! Per-method members belong to [`Call`], [`Notification`] and [`Response`], which each
+//! write their own `params`/`result`, so adding a method does not touch the envelope.
 
 use std::fmt;
 

@@ -1,11 +1,4 @@
 //! `Directory` and `HostMount`: the trees a session's commands see.
-//!
-//! A `Directory` is mutated in place because the Rust type is not `Clone`: its files live in
-//! memory, so a copy would be a second tree, not a second handle on one. Mounting it *takes* it:
-//! the `HostMount` owns the tree, and the `Directory` is empty afterwards and refuses further use.
-//!
-//! `HostMount` names whichever guard this platform compiles (`FuseMount`, `FuseTMount` or
-//! `DokanMount`), so callers need not know which.
 
 use std::{io, path::PathBuf};
 #[cfg(feature = "mount")]
@@ -19,6 +12,7 @@ use napi_derive::napi;
 
 use crate::error::{self, Result};
 
+// `HostMount` wraps whichever guard this platform compiles, so callers need not know which.
 #[cfg(all(feature = "mount", windows))]
 use cortex::fs::DokanMount as Platform;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
@@ -36,6 +30,10 @@ pub fn bytes(content: Content) -> Vec<u8> {
     }
 }
 
+/// A tree assembled in place. Mounting it with `HostMount` takes it: the mount owns the tree,
+/// and this `Directory` is empty afterwards and refuses further use.
+// In place because the Rust type is not `Clone`: its files live in memory, so a copy would be a
+// second tree, not a second handle on one.
 #[napi(js_name = "Directory")]
 pub struct JsDirectory(Option<Directory>);
 

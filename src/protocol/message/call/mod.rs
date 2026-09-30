@@ -1,6 +1,9 @@
 //! The answered methods: [`Call`] (what a request carries) and [`Response`] (what
 //! answers it), with one submodule per method for its params and result types.
 //!
+//! A method's answer is written in its call's vocabulary (the `ref` a `build_image` asks
+//! for is the `ref` it answers with), so the two halves stay in step.
+//!
 //! Unanswered methods are in `notification`.
 mod build_image;
 mod exec;

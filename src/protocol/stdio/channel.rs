@@ -1,59 +1,4 @@
 //! Framing: where one message ends and the next begins.
-//!
-//! ```text
-//! [u32 len][serialized Message]
-//! ```
-//!
-//! A length prefix means no delimiter to search for, and so none a payload could forge.
-//! Big-endian, as wire lengths conventionally are.
-//!
-//! # The header is redundant
-//!
-//! A BSON document already starts with its own length (little-endian `int32`, including
-//! those four bytes), so a reader could use that and drop the one bespoke layer no
-//! off-the-shelf peer can guess. It is kept for now because dropping it is a wire change.
-//! Doing so means: read [`HEADER`] bytes as a little-endian `u32`, check it against
-//! [`MAX_PAYLOAD`], read that many *minus* the four already in hand, and refuse anything
-//! under five (an empty document, `\x05\x00\x00\x00\x00`) instead of zero. The outcomes
-//! [`fill`] distinguishes stay the same.
-//!
-//! # stdin and stdout carry the protocol only
-//!
-//! A console server reads requests on **stdin** and writes responses on **stdout**, and
-//! nothing else may go there; **stderr** is free-form (logs, traces). As with an MCP stdio
-//! server, a stray `println!` corrupts the stream.
-//!
-//! This is a rule, not enforced: an end holds a [`tokio::io::Stdout`], and a `println!`
-//! elsewhere reaches the same descriptor without passing through it. Only our own frames
-//! are kept from interleaving, by the single owner of the writer.
-//!
-//! Taking the *process's* stdin/stdout is a process-wide, once-only claim, so it lives in
-//! [`StdioServer::stdio`](super::StdioServer::stdio); framing here works over any
-//! descriptor (pipe, virtio port, `Vec<u8>`).
-//!
-//! # The two directions are not paired
-//!
-//! [`write`](fn@write) and [`read`] each take one descriptor. A pipe pair is two independent
-//! streams sharing only the framing, and a struct holding both would need a type
-//! parameter per direction and would block borrowing both halves at once (write a
-//! request, then read its answer). Each end keeps whichever halves it has as fields.
-//!
-//! A command's own stdio never appears here; it is captured where the command runs and
-//! returned inside an [`ExecResp`](crate::protocol::ExecResp), so one descriptor pair suffices.
-//!
-//! # Neither is cancel-safe
-//!
-//! Dropping either future mid-await leaves the descriptor mid-frame (a header without its
-//! payload, or a payload half consumed), undetectably and unrecoverably. So neither goes
-//! in a [`select!`](tokio::select) branch; wait on other things around a frame, as
-//! [`StdioClient::call`](super::StdioClient#method.call) does by owning its descriptors for the
-//! whole round trip.
-//!
-//! # Why buffering is fine
-//!
-//! The descriptors belong to the protocol for the process's lifetime, so a byte read
-//! early is never one a command needed. Both ends wrap their reader in a
-//! [`BufReader`](tokio::io::BufReader) once, so a header and payload are not two syscalls.
 
 use std::io;
 
@@ -61,7 +6,15 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::{MAX_PAYLOAD, Message};
 
-/// The length prefix: a big-endian `u32`.
+/// The length prefix: a big-endian `u32`, as wire lengths conventionally are.
+///
+/// Redundant: a BSON document already starts with its own length (little-endian `int32`,
+/// including those four bytes), so a reader could use that and drop the one bespoke layer
+/// no off-the-shelf peer can guess. Kept because dropping it is a wire change, which
+/// means: read `HEADER` bytes as a little-endian `u32`, check it against [`MAX_PAYLOAD`],
+/// read that many *minus* the four already in hand, and refuse anything under five (an
+/// empty document, `\x05\x00\x00\x00\x00`) instead of zero. What [`read`](fn@read) tells apart
+/// stays the same.
 pub const HEADER: usize = 4;
 
 /// Write one frame and flush it.
@@ -85,6 +38,9 @@ where
 }
 
 /// Read one frame. `Ok(None)` is a clean end of channel.
+///
+/// Wrap `r` in a [`BufReader`](tokio::io::BufReader) once, so a header and payload are
+/// not two syscalls.
 pub async fn read<R>(r: &mut R) -> io::Result<Option<Message>>
 where
     R: AsyncRead + Unpin + ?Sized,

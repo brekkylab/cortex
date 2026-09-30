@@ -21,17 +21,9 @@ use std::{
 ///
 /// Guard-specific API such as `join` consumes the guard, so it cannot be on a `dyn Mount`.
 ///
-/// # The one exit that runs no destructor
-///
-/// A signal stops the process with every destructor unrun, leaving the mount registered with
-/// nothing answering it, and a path that never answers stalls everything that walks it. Two
-/// things cover it, deliberately not on this trait:
-///
-/// * [`unmount_on_signal`](crate::fs::unmount_on_signal), for catchable signals. Opt-in,
-///   because a signal disposition is process-global and claiming one would overwrite whatever
-///   the embedding program arranged.
-/// * [`reclaim_abandoned`](crate::fs::reclaim_abandoned), for `SIGKILL`, which reaches no
-///   handler, so whoever comes next reclaims the mount. Every `try_new` calls it.
+/// A signal runs no destructor; [`unmount_on_signal`](crate::fs::unmount_on_signal) and
+/// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) cover that, deliberately not on this
+/// trait.
 ///
 /// [`Send`] + [`Sync`] because the holder is usually a task that keeps it across awaits and
 /// hands out `&self` meanwhile.

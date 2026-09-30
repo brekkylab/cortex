@@ -34,6 +34,13 @@ const SHARED_WITH_ME_NAME: &str = "Shared with me";
 /// them — so the document's own API is the only form that carries everything:
 /// formulas, slide geometry, and the character indices an edit has to address.
 /// The suffix says which document it is, since the Drive name has no extension.
+///
+/// Not the Office export, which has no usable length: `files.export` refuses anything
+/// over its size cap, and `exportLinks` declares no length and ignores ranges, so the
+/// length exists only after a render that takes seconds. An OOXML reader seeks to the end
+/// from the length `stat` gave, Drive's listed size is too far off to stand in, and
+/// rendering at `stat` would render a whole folder for one `ls -l`. The JSON is read front
+/// to back, needs no render, and is much smaller than the export.
 const NATIVE_KINDS: &[(&str, NativeApi, &str)] = &[
     (
         "application/vnd.google-apps.document",
@@ -301,6 +308,42 @@ struct HeldSpan {
     bytes: Arc<Vec<u8>>,
 }
 
+/// Google Drive as a read-only [`FileSystem`]. Every read is network.
+///
+/// ```text
+/// My Drive/                   the folder tree, from Drive's own `root`
+///   q3_a1b2c3d4.pdf           a blob, served as its own bytes
+///   plan_e5f6a7b8.gdoc.json   a Docs-editors document, served as its API's JSON
+/// Shared with me/             what this account was given
+/// <shared drive>/             one directory per shared drive this account can see
+/// ```
+///
+/// The root mirrors Drive's sidebar rather than its folder tree, which alone cannot reach
+/// everything: a shared item carries no `parents`, and a shared drive is a root of its own.
+///
+/// Every entry below the root carries a tag off its own Drive id, since one Drive folder
+/// can hold two files of a name; a name depends on its own file alone.
+///
+/// A Docs-editors file holds no bytes, so it is served as its own API's JSON, the only
+/// form that carries formulas, slide geometry and the character indices an edit addresses.
+/// The extension tells it from a blob: an uploaded `.pptx` keeps its name, a Slides deck
+/// is `<name>.gslide.json`.
+///
+/// ```text
+/// <name>.gdoc.json     paragraphs, styles, tables, and the character indices an edit
+///                      addresses
+/// <name>.gsheet.json   tabs, named ranges, charts, and each tab's cell values under
+///                      `sheets[].values` (`sheets[].valuesOmitted` past the budget)
+/// <name>.gslide.json   pages, shapes, transforms, speaker notes
+/// ```
+///
+/// Their text is split across style runs, so `grep` finds words rather than phrases and
+/// `-A`/`-B` shows JSON siblings. Forms, Drawings, Maps and Apps Script are not listed:
+/// none can be read, and an unreadable name is worse than none.
+///
+/// Until a document is read its size is a **placeholder rather than a length**, so
+/// `ls -l` and `find -size` are wrong about it; after a read its exact length is reported.
+/// A listing is held for minutes, so a change just made in Drive may not show yet.
 pub struct GdriveFs {
     accessor: GdriveAccessor,
     /// A Docs-editors file's served length (file id → stamped length), learned when its
