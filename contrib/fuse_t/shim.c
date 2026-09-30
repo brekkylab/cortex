@@ -5,17 +5,21 @@
  * decision belongs to the shared layer on the Rust side.
  */
 
-#define FUSE_USE_VERSION 26
-
 #include "shim.h"
 
+/* libfuse-t's interface, declared rather than taken from FUSE-T's headers, so that this
+ * builds on a host without FUSE-T -- see `fuse_t.h`, and `check-abi.sh` for what keeps it
+ * right. */
+#include "fuse_t.h"
+
 #include <errno.h>
-#include <fuse_lowlevel.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 /* libfuse-t, opened at run time rather than linked.
  *

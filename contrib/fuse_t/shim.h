@@ -3,8 +3,9 @@
  * Everything fragile stays on the C side: `fuse_lowlevel_ops` (~50 function
  * pointers, `__APPLE__`-conditional members), `fuse_file_info` (bitfields), and
  * `fuse_entry_param` (embeds a host `struct stat`). A wrong layout in Rust is
- * silent memory corruption, not a compile error, so the C compiler — which has
- * the real headers — owns them and Rust sees only the flat types below.
+ * silent memory corruption, not a compile error, so the C compiler owns them --
+ * declared in `fuse_t.h`, and checked against FUSE-T's own headers by
+ * `check-abi.sh` -- and Rust sees only the flat types below.
  *
  * Rust supplies `cortex_fuse_t_ops`, a vtable of its own design. Operations
  * return 0 or a negative errno, as libfuse itself does.

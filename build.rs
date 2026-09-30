@@ -50,33 +50,36 @@ fn pin_server() {
     }
 }
 
-/// Compile the shim against FUSE-T's headers. **Headers only**: the shim opens libfuse-t
-/// with `dlopen` when a mount first asks for it, so nothing is linked and nothing needs an
-/// rpath -- which is also why a dependent's own link needs nothing from this.
+/// Compile the shim. **Nothing of FUSE-T's is needed to build it**: the shim declares the
+/// part of libfuse-t's interface it uses itself (`contrib/fuse_t/fuse_t.h`), and opens the
+/// library with `dlopen` when a mount first asks for it, so nothing is linked and nothing
+/// needs an rpath -- which is also why a dependent's own link needs nothing from this.
+///
+/// FUSE-T's `pkg-config` file is read if it is there, and only for where the library is:
+/// the shim looks there when the loader does not find it by its bare name, and in
+/// `/usr/local/lib`, where FUSE-T's installer puts it, otherwise.
 fn fuse_t_shim() {
-    let fuse_t = pkg_config::Config::new()
-        .cargo_metadata(false)
-        .probe("fuse-t")
-        .expect("the `mount` feature on macOS builds against FUSE-T's headers: brew install --cask fuse-t");
-
     let mut build = cc::Build::new();
     build
         .file("contrib/fuse_t/shim.c")
         .include("contrib/fuse_t")
-        // libfuse's headers pick struct layouts off this; a mismatch is a silent
-        // ABI break.
+        // The layouts in `fuse_t.h` are libfuse's with 64-bit offsets, which it is built
+        // for; `check-abi.sh` builds with the same flag.
         .define("_FILE_OFFSET_BITS", "64")
         .warnings(true);
-    for path in &fuse_t.include_paths {
-        build.include(path);
-    }
-    // Where to look when the loader does not find the library by its bare name.
-    if let Some(dir) = fuse_t.link_paths.first() {
+    let libdir = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .env_metadata(false)
+        .probe("fuse-t")
+        .ok()
+        .and_then(|fuse_t| fuse_t.link_paths.first().cloned());
+    if let Some(dir) = libdir {
         build.define(
             "CORTEX_FUSE_T_LIBDIR",
             format!("\"{}\"", dir.display()).as_str(),
         );
     }
+    println!("cargo::rerun-if-changed=contrib/fuse_t/fuse_t.h");
     build.compile("cortex_fuse_t_shim");
 }
 

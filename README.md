@@ -276,7 +276,7 @@ The `mount` feature, on by default, mounts a cortex filesystem on the host throu
 | Host  | Provider | Needed to build | Needed to mount |
 |-------|----------|-----------------|---------------|
 | Linux | `/dev/fuse` in the kernel | — | — |
-| macOS | [FUSE-T](https://www.fuse-t.org) | ✓ | ✓ |
+| macOS | [FUSE-T](https://www.fuse-t.org) | — | ✓ |
 | Windows | [Dokany](https://github.com/dokan-dev/dokany) | — | ✓ |
 
 A program built with `mount` runs on a host without the provider; only mounting fails, with an error that says what to install.

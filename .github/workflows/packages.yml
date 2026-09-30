@@ -169,14 +169,6 @@ jobs:
           cache: npm
           cache-dependency-path: bindings/node/package-lock.json
 
-      # The shim compiles against FUSE-T's headers; nothing links it.
-      - name: FUSE-T headers
-        if: runner.os == 'macOS'
-        run: |
-          brew install --cask fuse-t
-          command -v pkg-config || brew install pkgconf
-          pkg-config --cflags fuse-t
-
       - name: Node addon
         working-directory: bindings/node
         shell: bash
@@ -361,7 +353,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ env.REF }}
-          sparse-checkout: scripts/packages
+          sparse-checkout: |
+            scripts/packages
+            contrib/fuse_t
 
       - uses: actions/setup-node@v4
         with:
@@ -440,6 +434,16 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install --cask fuse-t
 
+      # What the shim declares of libfuse-t (`contrib/fuse_t/fuse_t.h`), which is what lets
+      # every build here go without FUSE-T, against FUSE-T's own headers: every layout and
+      # every signature. Here, where FUSE-T is installed anyway, and not in `build`, which
+      # proves the build needs none of it.
+      - name: The shim's libfuse-t matches FUSE-T's headers
+        if: runner.os == 'macOS'
+        run: |
+          command -v pkg-config || brew install pkgconf
+          contrib/fuse_t/check-abi.sh
+
       - name: Smoke, Node
         shell: bash
         env:
@@ -459,7 +463,7 @@ jobs:
       # this platform's toolchain, as a user's would be. A CARGO_HOME of its own, so that no
       # crates.io token is within reach, and a CORTEX_HOME of its own, so that
       # `ensure_cortex` fetches the release the crate pins rather than finding the one the
-      # other smokes left. After FUSE-T: on macOS the crate builds against its headers.
+      # other smokes left. After FUSE-T, so that on macOS the smoke mounts as well.
       - name: Smoke, Rust
         shell: bash
         env:

@@ -29,7 +29,8 @@ include = [
 members = ["bindings/node", "bindings/python"]
 
 [build-dependencies]
-# Compile `contrib/fuse_t/shim.c` for the `mount` feature on macOS. Only used then, but
+# Compile `contrib/fuse_t/shim.c` for the `mount` feature on macOS, and read where FUSE-T
+# keeps its library if it is installed -- not needed, only preferred. Only used then, but
 # build-dependencies cannot themselves be optional.
 cc = "1"
 pkg-config = "0.3"
@@ -195,7 +196,7 @@ default = ["mount", "ensure"]
 # | Target | Binding | Needs |
 # |---|---|---|
 # | Linux (any unix but macOS) | `fuser`, straight to `/dev/fuse` | nothing installed |
-# | macOS | libfuse-t's own session loop | FUSE-T to build and run (`brew install --cask fuse-t`) |
+# | macOS | libfuse-t's own session loop | FUSE-T to run (`brew install --cask fuse-t`) |
 # | Windows | Dokany's driver, through `dokan` | Dokany to run |
 #
 # All three also ask for `tokio/rt-multi-thread` and `tokio/net`: a binding is a
@@ -209,9 +210,11 @@ default = ["mount", "ensure"]
 # binding's `try_new` asks it first. This matters most to the Python and Node bindings,
 # whose import would otherwise fail for every caller, most of whom never mount.
 #
-# **On macOS, FUSE-T has to be installed to build, not to run.** `build.rs` probes
-# `fuse-t.pc` for the headers and fails without them; the shim links nothing, and opens
-# `libfuse-t.dylib` with `dlopen` when a mount first asks for it.
+# **On macOS, nothing of FUSE-T's is needed to build.** The shim declares the part of
+# libfuse-t's interface it uses (`contrib/fuse_t/fuse_t.h`), links nothing, and opens
+# `libfuse-t.dylib` with `dlopen` when a mount first asks for it. Declared rather than
+# included, the layouts are this crate's to keep right: `contrib/fuse_t/check-abi.sh`
+# compares them with FUSE-T's own headers, and CI runs it.
 #
 # **On Windows, a binary has to delay-load `dokan2.dll` to start without Dokany**, which
 # its own `build.rs` asks for — `/DELAYLOAD` is a `rustc-link-arg`, and one of those reaches
