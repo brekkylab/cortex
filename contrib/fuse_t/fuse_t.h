@@ -22,6 +22,17 @@
 #include <sys/statvfs.h>
 #include <sys/types.h>
 
+/* The FUSE-T these declarations were last checked against with `check-abi.sh`, and the
+ * releases the shim trusts them for: the same major version. A libfuse-t of another major
+ * version, or of another libfuse API than 2.x, is refused before any call is made into it
+ * -- a layout it disagrees with would be a crash, not an error -- unless
+ * `CORTEX_FUSE_T_UNCHECKED` says to go ahead. */
+#define CORTEX_FUSE_T_CHECKED "1.2.7"
+#define CORTEX_FUSE_T_MAJOR 1
+/* libfuse's own API version, `fuse_version()`: these are 2.x's, 2.6 to 2.9. */
+#define CORTEX_FUSE_T_API_MIN 26
+#define CORTEX_FUSE_T_API_MAX 29
+
 typedef unsigned long fuse_ino_t;
 typedef struct fuse_req *fuse_req_t;
 struct fuse_chan;
@@ -129,6 +140,7 @@ struct fuse_lowlevel_ops {
 
 /* The calls the shim makes. Declared only so that `__typeof__` gives each pointer its
  * type: nothing links against these names. */
+int fuse_version(void);
 size_t fuse_add_direntry(fuse_req_t req, char *buf, size_t bufsize, const char *name,
                          const struct stat *stbuf, off_t off);
 int fuse_chan_fd(struct fuse_chan *ch);

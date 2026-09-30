@@ -304,6 +304,8 @@ For macOS
 brew install --cask fuse-t
 ```
 
+cortex mounts through FUSE-T 1.x, and is checked against 1.2.7. A FUSE-T of another major version is refused before a mount, with the release to install instead, rather than risk a crash on a layout that changed; `CORTEX_FUSE_T_UNCHECKED=1` mounts with it anyway.
+
 And for windows
 
 ```powershell

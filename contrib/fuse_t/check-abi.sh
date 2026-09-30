@@ -52,7 +52,8 @@ def normal(decl):
     return re.sub(r"\s*([(),*])\s*", r"\1", decl).strip()
 
 real, ours, shim = (text(p) for p in sys.argv[1:4])
-calls = re.findall(r"X\((fuse_\w+)\)", shim)
+# `fuse_version` besides: the one call made before the shim knows what it has loaded.
+calls = re.findall(r"X\((fuse_\w+)\)", shim) + ["fuse_version"]
 used = re.findall(r"\.(\w+) = ll_\w+", shim)
 bad = []
 for name in calls:
@@ -69,3 +70,18 @@ if bad:
     sys.exit(1)
 print(f"check-abi: {len(calls)} calls and {len(used)} operations have FUSE-T's signatures")
 EOF
+
+# And the release: the shim trusts these declarations for FUSE-T's major version they were
+# checked against, so one of another major version is for a person to look at before the
+# shim may load it -- raise `CORTEX_FUSE_T_MAJOR` only once this has passed against it.
+release=$(pkg-config --modversion fuse-t)
+checked=$(sed -n 's/^#define CORTEX_FUSE_T_CHECKED "\(.*\)"$/\1/p' "$here/fuse_t.h")
+major=$(sed -n 's/^#define CORTEX_FUSE_T_MAJOR \([0-9]*\)$/\1/p' "$here/fuse_t.h")
+if [ "${release%%.*}" != "$major" ]; then
+    echo "check-abi: FUSE-T $release is installed, and fuse_t.h trusts FUSE-T $major.x: check it, then raise CORTEX_FUSE_T_MAJOR" >&2
+    exit 1
+fi
+if [ "$release" != "$checked" ]; then
+    echo "check-abi: note: checked FUSE-T $release; fuse_t.h says $checked was the last, so set CORTEX_FUSE_T_CHECKED to $release"
+fi
+echo "check-abi: FUSE-T $release, within the $major.x fuse_t.h trusts"
