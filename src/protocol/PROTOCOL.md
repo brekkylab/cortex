@@ -153,7 +153,7 @@ Member order is free — `params` may arrive before the `method` that types it.
 | `build_image` | `{recipe, ref?}` | `{ref, digest}` |
 | `remove_image` | `{image}` | `{}` |
 | `list_images` | `{}` | `{images}` |
-| `init` | `{image?, snapshot?, network?, vcpus?, memory_mib?, gpu?, gpu_memory_mib?, disk_gib?, mounts?}` | `{cwd?}` |
+| `init` | `{image?, snapshot?, network?, ports?, vcpus?, memory_mib?, gpu?, gpu_memory_mib?, disk_gib?, mounts?}` | `{cwd?}` |
 | `exec` | `{cmd, timeout_ms?}` | `{code, stdout, stderr, truncated}` |
 | `read` | `{path, offset?, len?}` | `{data, size}` |
 | `write` | `{path, data?, offset?}` | `{size}` |
@@ -299,6 +299,27 @@ Two entries at the same path, or one at a path this server cannot use, are a mal
 
 What the kinds are and how one tree is assembled from several stores is [`fs/ARCHITECTURE.md`](../fs/ARCHITECTURE.md); this protocol carries a URL, a path and whether it may be written.
 
+#### The network — on or off, and the ports in
+
+```json
+"network": true,
+"ports": ["8080:80", "5901:5900"]
+```
+
+`network` is whether a session's commands reach a network at all, and is on when left out: on is the one value every server can give.
+On is what a process on the server's machine reaches, less that machine's own loopback: the services listening there are the operator's, not the session's.
+Off is no network at all.
+There is nothing between the two, because a level between them is a firewall every backend would have to reimplement, and the server's machine is already the place that knows how to keep a process off part of a network.
+
+`ports` are the ways *in*, each spelled the way docker's `-p` spells it — host first, both numbers always: `"8080:80"` is a listener at `127.0.0.1:8080` on the server's machine that reaches port 80 in the session.
+
+- **Loopback, and TCP.** A port is a service on the server's own machine, never one on its interfaces, so there is no address in front of it and no `/udp` after it.
+- **The host port is the client's to choose**, so there is nothing for the result to answer: the port a client connects to is the one it wrote. One that is taken on the server's machine is refused with `-32602`, while the client can still pick another.
+- **A port is the session's, not a boot's.** It is held from `init` to `quit`, across every `stop` and the boot after it. A connection that arrives while nothing is booted waits for the next boot.
+- **A connection reaches whatever in the session listens on that port**, whichever address it listens on, and is closed when nothing does.
+
+A port on a session with `network: false`, and a port of `0` on either side, are refused with `-32602`.
+
 #### The machine — how big it is, whether it has a GPU, and how much it may write
 
 ```json
@@ -313,7 +334,7 @@ What the kinds are and how one tree is assembled from several stores is [`fs/ARC
 | `gpu_memory_mib` | how much memory that accelerator may hold, in mebibytes |
 | `disk_gib` | how much its commands may write, in gibibytes |
 
-Here and not on an `exec` for the reason the trees and the reach are: a machine is made before the first command and outlives the last one, so on a backend with a kernel of its own all of them are fixed before that kernel starts.
+Here and not on an `exec` for the reason the trees and the network are: a machine is made before the first command and outlives the last one, so on a backend with a kernel of its own all of them are fixed before that kernel starts.
 A number on an `exec` could only be honoured by making a different machine out from under the command that asked for it.
 
 **What is asked for is what is given.**
@@ -618,13 +639,13 @@ An `error` is the only failure channel, and the numeric `code` is what makes it 
 | `-32007` | `read`, `write` | **io failed** — the path named a file and the executor still could not go on: permissions, a full disk, a backend that went away mid-operation. |
 | `-32008` | `init` | **unsupported mount** — a URL whose scheme this server has no provider for, with the message naming which entry. `init`'s own and not deferred, because which kinds a build can realize is knowable as the frame is read, and taking a session whose tree can never be there would make every later path under it a lie. One code for every entry, because a session's trees are a list the client wrote and not a set of members with fixed names. Distinct from `BOOT_FAILED` because the fix is different: the mount is well formed and the *build* is wrong for it — a different binary, or a different URL. |
 | `-32009` | `exec`, `read`, `write`, `snapshot` | **mount failed** — a tree could not be put where `init` said it would be: no mount binding compiled in, no FUSE provider installed, the mount point busy, the store itself unreachable. Deferred like `BOOT_FAILED` and for the same reason — mounting happens at boot — so it reaches whoever asked for the call that needed one. The session is described correctly; the environment is what has to change. |
-| `-32010` | `init` | **unsupported network** — a reach this server cannot provide, named in the message. Two things arrive as this: a name no backend implements, and a name that is understood and cannot be honoured — a server whose commands run on this host cannot take the network away from them, so it answers only `full`. Never used to narrow a session. |
+| `-32010` | `init` | **unsupported network** — a network this server cannot give the way it was asked for: a server whose commands run on this host cannot take the network away from them, so it refuses `network: false`. Never used to narrow a session. |
 | `-32011` | `init` | **unsupported image** — the backend has no base to swap at all, because its commands run on the server's own filesystem. Not a reference that could not be fetched, which is a boot that failed. |
 | `-32012` | `init` | **unknown image** — the session named a built image this server does not have. Apart from `UNSUPPORTED_IMAGE` because a client hearing this one can build the thing. |
 | `-32013` | `init` | **unsupported machine** — a GPU this server has no device for, or more vCPUs or memory than it will give. `init`'s own for the reason `UNSUPPORTED_MOUNT` is: what shapes a server can make is a fact about its build and its host, knowable as the frame is read. Apart from `BOOT_FAILED` because asking again will not make it true, and never used to narrow a session. |
 | `-32600` | any | invalid request. |
 | `-32601` | any | method not found |
-| `-32602` | any | invalid params — an empty argv `cmd`, a mount that is not one, or two mounts asking for the same path. Apart from `UNSUPPORTED_MOUNT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
+| `-32602` | any | invalid params — an empty argv `cmd`, a mount that is not one, two mounts asking for the same path, a port on a session with `network: false`, a port of `0`, or a host port already taken on the server's machine. Apart from `UNSUPPORTED_MOUNT` because it says something different: the frame is wrong, rather than well formed and asking for a kind this build has not got. |
 | `-32603` | any | internal error |
 
 `-32010` through `-32012` are taken by parts of this protocol the document above does not yet describe, which is why they are not in the table; `-32003`, `-32004` and `-32014` name nothing and stay that way.
