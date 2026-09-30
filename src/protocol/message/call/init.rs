@@ -8,7 +8,7 @@ use crate::image::ImageSource;
 ///
 /// What is here outlives any one execution, which is what it is doing here rather than on
 /// an [`ExecCall`]: a tree has to be somewhere before a path can name a file in
-/// it, and the base and the reach are the environment a command runs in rather than
+/// it, and the base and the network are the environment a command runs in rather than
 /// anything a command says — so each is said once instead of on every command.
 ///
 /// # The trees are a list, and each one says where it goes
@@ -68,7 +68,7 @@ use crate::image::ImageSource;
 /// There is no member for what a *command* gets — a share of the machine, an affinity, a
 /// limit. The machine is the unit of what this protocol hands out, and a session that wants
 /// two sizes of it is two sessions.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitCall {
     /// The base a session's commands run in.
     ///
@@ -91,19 +91,46 @@ pub struct InitCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Vec<u8>>,
 
-    /// How much of a network the session's commands get. `None` leaves it to the server.
+    /// Whether the session's commands reach a network at all. Left out, it is on.
     ///
     /// **Said once, for the same reason the trees are.** What a command can reach is a
     /// property of the environment it runs in — on some backends a device that has to be
     /// attached before a kernel comes up — so it cannot be decided per `exec` without meaning
     /// a different session for every command.
     ///
-    /// Answered in [`InitResp::network`](super::InitResp::network) with what is actually in
-    /// force, which is the only way a client learns what it got: `None` here is not "no
-    /// network" but "the server's own choice", and a server that runs commands on the host
-    /// has no choice to make.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<NetworkAccess>,
+    /// **On or off, and nothing between.** On is what a process on the server's machine
+    /// reaches, less that machine's own loopback: the services listening there are the
+    /// operator's, and a session is let at one of them by nothing but the operator running it
+    /// somewhere a session could reach anyway. Off is no network at all. A level between the
+    /// two would be a firewall this protocol described and every backend reimplemented, and
+    /// where a session must be kept off some part of a network, the server's machine is the
+    /// place that already knows how.
+    ///
+    /// A value the server cannot honour is
+    /// [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) — a server whose
+    /// commands run on this host cannot take the network away from them, so it refuses
+    /// `false` rather than taking it and running them anyway.
+    ///
+    /// **On unless said otherwise**, because on is the one value every server can give: a
+    /// session that says nothing opens on any of them, and only one that turns it off asks
+    /// for something a server may not have.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub network: bool,
+
+    /// Ports on the server's machine that lead into the session, each one spelled the way
+    /// docker's `-p` spells it — see [`Port`]. Empty publishes none.
+    ///
+    /// **Only in, and only TCP.** A session's commands reach out through
+    /// [`network`](Self::network) and through nothing here; what this adds is a way *in*,
+    /// which no amount of reaching out gives, and which a program in the session serving
+    /// something — a VNC server, a dev server, a notebook — is useless without.
+    ///
+    /// Meaningless without a network, so a session that turns it off and names ports is a
+    /// contradiction a server refuses with
+    /// [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS) rather than a list it quietly
+    /// drops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<Port>,
 
     /// How many vCPUs the session's machine gets. `None` leaves the number to the server.
     ///
@@ -210,6 +237,31 @@ pub struct InitCall {
     /// is what has to change for these.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountSpec>,
+}
+
+impl Default for InitCall {
+    fn default() -> Self {
+        InitCall {
+            image: None,
+            snapshot: None,
+            network: true,
+            ports: Vec::new(),
+            vcpus: None,
+            memory_mib: None,
+            gpu: None,
+            gpu_memory_mib: None,
+            disk_gib: None,
+            mounts: Vec::new(),
+        }
+    }
+}
+
+fn on() -> bool {
+    true
+}
+
+fn is_on(network: &bool) -> bool {
+    *network
 }
 
 /// A tree a session is given: where to get it, where it appears, and whether it may be
@@ -464,119 +516,109 @@ impl std::fmt::Display for InvalidMount {
 
 impl std::error::Error for InvalidMount {}
 
-/// How much of a network a session's commands may reach.
+/// A port on the server's machine that leads into the session: `<host>:<console>`.
 ///
-/// # The name is the reach
+/// ```text
+/// "8080:80"   127.0.0.1:8080 on the server's machine reaches port 80 in the session
+/// ```
 ///
-/// | `reach` | means |
-/// |---|---|
-/// | `none` | no network at all |
-/// | `host` | enough to resolve a name, and whatever [`host_ports`](Self::host_ports) granted |
-/// | `public` | the public internet; not a private range, and not the server's own host |
-/// | `full` | whatever the server itself can reach, unrestricted |
+/// **Docker's spelling, host first**, because it is the one a person writing a port has
+/// already written somewhere, and a second order for the same two numbers is a session
+/// published backwards. What is left out of docker's is what would be a lie here: no address
+/// in front, because the port is on loopback and nowhere else, and no `/udp` after, because
+/// a port is TCP.
 ///
-/// A name this build has no answer for is refused at `init` with
-/// [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) naming it — the same
-/// treatment an unknown context scheme gets, and for the same reason: a peer that has never
-/// heard of a name still parses the frame, and refuses it for the reason it actually has.
+/// # Loopback, and held for the whole session
 ///
-/// **A name and not an enumeration**, so the wire schema does not grow every time a backend
-/// learns a new one. What the set of names *is* belongs to the servers that answer them, and a
-/// client that says something none of them knows is told so.
+/// The server listens at `127.0.0.1:<host>` from `init` until the session ends, across every
+/// `stop` and the boot after it, so a program that was given the port keeps it. A connection
+/// that arrives while nothing is booted waits for the next boot rather than being refused.
 ///
-/// # What is asked for is what is given
+/// A connection reaches whatever in the session listens on `console`, whichever address it
+/// listens on — its own loopback included — and is closed, as soon as it is accepted, when
+/// nothing does.
 ///
-/// A server provides the reach named here or refuses the session. It does not narrow one it
-/// finds too generous, and it certainly does not widen one — a session that quietly reached
-/// more than it asked to is the failure this member exists to prevent, and one that quietly
-/// reached less is a client debugging a refused connection it was told it would not get.
+/// # Both numbers, always
 ///
-/// # The reach is how far out, and the ports are which doors in
-///
-/// [`host_ports`](Self::host_ports) is a second axis and not a fifth name, because **widening
-/// what a session reaches outside must not widen what it reaches on the server's own machine.**
-/// A session named `public` to fetch a package is not thereby asking to talk to whatever else
-/// that machine is listening on, and one granted a port to reach a local model proxy is not
-/// asking for the internet.
-///
-/// So the two are said separately and neither implies the other. It is also what makes `host`
-/// worth asking for: on its own it resolves names and no more, and with a port it is how a
-/// session talks to something the operator put there on purpose.
-///
-/// # Why an object and not a string
-///
-/// The same reason [`MountSpec`] is one. A reach is not always a single word — the ports
-/// below are the first proof of it, and a list of hosts would be the next — and those belong
-/// beside the name rather than encoded into it.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NetworkAccess {
-    /// `none`, `host`, `public`, `full`.
-    pub reach: String,
+/// The host port is the client's to choose, like every other part of a session, so there is
+/// nothing for the server to answer about it: the port a client connects to is the one it
+/// wrote. A port of `0` on either side is no port at all, and is refused -- a host port that
+/// is taken is refused too, at `init`, while the client can still pick another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Port {
+    /// The port on the server's machine a connection is made to.
+    pub host: u16,
 
-    /// TCP ports on the server's own machine this session may open, on top of whatever
-    /// [`reach`](Self::reach) allows. Empty grants none.
-    ///
-    /// **One port at a time, and never a range meaning "the machine".** A grant is a door onto
-    /// something the operator is running there, and the whole reason it is spelled out is that
-    /// the convenient way to say "the host" says every port on it.
-    ///
-    /// Meaningless without a network, so a `none` session naming ports is a contradiction a
-    /// server refuses rather than a grant it quietly drops.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub host_ports: Vec<u16>,
+    /// The port in the session a connection reaches.
+    pub console: u16,
 }
 
-impl NetworkAccess {
-    pub fn new(reach: impl Into<String>) -> Self {
-        NetworkAccess {
-            reach: reach.into(),
-            host_ports: Vec::new(),
+impl Port {
+    /// `console` in the session, reached at `host` on the server's machine. Port 0 on either
+    /// side is no port, and is refused here as it is on the wire.
+    pub fn new(host: u16, console: u16) -> Result<Self, InvalidPort> {
+        if host == 0 || console == 0 {
+            return Err(InvalidPort {
+                why: "port 0 is no port",
+                spec: format!("{host}:{console}"),
+            });
         }
-    }
-
-    /// The TCP ports on the server's own machine this session may open.
-    ///
-    /// ```
-    /// # use cortex::console::NetworkAccess;
-    /// // Resolve names, talk to whatever is on 8080 here, and reach nothing else.
-    /// NetworkAccess::host().with_host_ports([8080]);
-    /// ```
-    ///
-    /// # Reaching one from inside
-    ///
-    /// `host.microsandbox.internal` is the name of the machine the server runs on, answered by
-    /// the session's own resolver. A command in the session fetches that name on port 8080 and
-    /// gets whatever is listening on 8080 here.
-    ///
-    /// It has to be a name rather than an address because there is no address to publish: the
-    /// backend assigns one per session, so nothing writing a command could know it. Resolving
-    /// the name grants nothing on its own, and a port that was not granted is refused whether it
-    /// is asked for by name or by number.
-    pub fn with_host_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
-        self.host_ports = ports.into_iter().collect();
-        self
-    }
-
-    /// No network at all.
-    pub fn none() -> Self {
-        NetworkAccess::new("none")
-    }
-
-    /// Enough to resolve a name, plus whatever ports were granted.
-    pub fn host() -> Self {
-        NetworkAccess::new("host")
-    }
-
-    /// The public internet.
-    pub fn public() -> Self {
-        NetworkAccess::new("public")
-    }
-
-    /// Whatever the server itself can reach.
-    pub fn full() -> Self {
-        NetworkAccess::new("full")
+        Ok(Port { host, console })
     }
 }
+
+impl std::fmt::Display for Port {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.console)
+    }
+}
+
+impl FromStr for Port {
+    type Err = InvalidPort;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        let invalid = |why| InvalidPort {
+            why,
+            spec: spec.to_string(),
+        };
+        let number = |part: &str| {
+            part.parse::<u16>()
+                .map_err(|_| invalid("not a port number"))
+        };
+        let (host, console) = spec
+            .split_once(':')
+            .ok_or_else(|| invalid("not <host>:<console>"))?;
+        Port::new(number(host)?, number(console)?).map_err(|_| invalid("port 0 is no port"))
+    }
+}
+
+impl Serialize for Port {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Port {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spec = String::deserialize(deserializer)?;
+        spec.parse().map_err(de::Error::custom)
+    }
+}
+
+/// Why a string is not a [`Port`], with the string it was reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidPort {
+    why: &'static str,
+    spec: String,
+}
+
+impl std::fmt::Display for InvalidPort {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}: {:?}", self.why, self.spec)
+    }
+}
+
+impl std::error::Error for InvalidPort {}
 
 /// What the server made of the session. The `result` of `init`.
 ///
@@ -626,6 +668,26 @@ pub struct InitResp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A port is docker's string on the wire, host first, with both numbers said.
+    #[test]
+    fn a_port_is_spelled_the_way_docker_spells_it() {
+        assert_eq!("8080:80".parse(), Port::new(8080, 80));
+        assert_eq!(
+            serde_json::to_value(Port::new(5901, 5900).unwrap()).unwrap(),
+            serde_json::json!("5901:5900")
+        );
+        assert_eq!(
+            serde_json::from_value::<Port>(serde_json::json!("8080:80")).unwrap(),
+            Port::new(8080, 80).unwrap()
+        );
+
+        for bad in [
+            "", "80", "80:", ":80", "0:80", "8080:0", "http", "70000:1", "1:2:3",
+        ] {
+            assert!(bad.parse::<Port>().is_err(), "{bad:?}");
+        }
+    }
 
     /// A mount is one string both ends read the same way, so what matters about it is that
     /// what goes out comes back as itself.

@@ -109,20 +109,18 @@ impl Error {
     /// correctly and the environment is what has to change.
     pub const MOUNT_FAILED: i64 = -32009;
 
-    /// `init`: a network reach this server cannot provide, named in the message.
+    /// `init`: a network this server cannot give the way it was asked for.
     ///
     /// `init`'s own, for the reason [`UNSUPPORTED_MOUNT`](Self::UNSUPPORTED_MOUNT) is:
-    /// which reaches a server can answer is a fact about the build and the machine, knowable
-    /// the moment the frame is read.
+    /// whether a server can take the network away is a fact about the build and the
+    /// machine, knowable the moment the frame is read.
     ///
-    /// Two things arrive as this. A name nobody has heard of — a client asking for something
-    /// no backend implements. And a name that is understood and cannot be honoured: a server
-    /// whose commands run on this host cannot take the network away from them, so it refuses
-    /// every reach but `full` rather than pretending. Both are the same fix — ask for
-    /// something else, or run against a different backend — which is why they are one code.
+    /// What arrives as this is a server whose commands run on this host, which cannot take
+    /// the network away from them and so refuses a session that turned it off rather than
+    /// pretending. The fix is to run against a different backend.
     ///
-    /// Never used to *narrow* a session. A server that could give less than was asked for
-    /// refuses instead: quietly granting a different reach than the one named is the failure
+    /// Never used to *narrow* a session: a server that quietly ran commands with a network
+    /// they were told they would not have is the failure
     /// [`InitCall::network`](crate::console::InitCall::network) exists to prevent.
     pub const UNSUPPORTED_NETWORK: i64 = -32010;
 

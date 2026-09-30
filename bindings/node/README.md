@@ -5,7 +5,7 @@ Node bindings for cortex, built with [napi-rs](https://napi.rs): the same `Conso
 waits returning a `Promise`.
 
 ```js
-const { ConsoleClient, Directory, HostMount, NetworkAccess, Recipe } = require('@brekkylab/cortex')
+const { ConsoleClient, Directory, HostMount, Recipe } = require('@brekkylab/cortex')
 
 const mount = new HostMount(new Directory().withFile('SKILL.md', '...'), '/tmp/skill')
 
@@ -14,7 +14,7 @@ const console_ = await ConsoleClient.builder()
   .image(new Recipe('python:3.12-slim-trixie').step('pip install duckdb'))
   .mountReadonly(mount, '/skills/example')
   .mount('./artifacts', '/artifacts')
-  .network(NetworkAccess.none())
+  .network(false)
   .vcpus(2)
   .memoryMib(2048)
   .build()

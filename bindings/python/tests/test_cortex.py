@@ -12,7 +12,6 @@ from cortex import (
     ImageClient,
     ImageSource,
     Recipe,
-    NetworkAccess,
     Step,
 )
 
@@ -39,11 +38,14 @@ def test_image_source():
     assert recipe.base == "alpine:3.20"
 
 
-def test_network_access():
-    network = NetworkAccess.host().with_host_ports([8080])
-    assert network.reach == "host"
-    assert network.host_ports == [8080]
-    assert NetworkAccess.none().host_ports == []
+def test_a_port_is_spelled_the_way_docker_spells_it():
+    builder = ConsoleClient.builder().network(True).ports(["8080:80", "5901:5900"])
+    with pytest.raises(ValueError):
+        builder.ports(["5900"])
+    with pytest.raises(ValueError):
+        builder.ports(["8080:0"])
+    with pytest.raises(ValueError):
+        builder.ports(["http"])
 
 
 def test_error_codes_are_cortex_s():
@@ -104,7 +106,7 @@ async def test_exec_read_write(tmp_path):
         .cmd([SERVER])
         .image(Recipe("python:3.12-slim-trixie"))
         .mount(tmp_path, "/work")
-        .network(NetworkAccess.none())
+        .network(False)
     )
     async with await builder.build() as console:
         assert console.mounts == ["/work"]
