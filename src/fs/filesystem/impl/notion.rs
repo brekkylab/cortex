@@ -25,8 +25,8 @@
 //! # Render cost
 //!
 //! A render is a `retrieve` plus a walk of the block tree: one request per block with
-//! children, to [`MAX_BLOCK_DEPTH`]. Measured from a desktop client, 0.4-2.5s per page,
-//! charged to whichever operation asks first (usually the `stat` of `page.json`).
+//! children, to [`MAX_BLOCK_DEPTH`]. That is seconds per page, charged to whichever
+//! operation asks first (usually the `stat` of `page.json`).
 //!
 //! So a render is served without asking Notion for [`FRESH`]. Past that, one `retrieve` checks
 //! whether the page was edited; an unchanged page keeps its render, so only a changed page

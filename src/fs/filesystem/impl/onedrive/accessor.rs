@@ -114,15 +114,13 @@ const ITEM_FIELDS: &[&str] = &[
 
 /// What `$select` has to name to be given a preauthenticated download URL.
 ///
-/// Not what the response calls it, and the difference is not cosmetic. Measured against the
-/// live service: a `$select` naming [`DOWNLOAD_URL_KEY`] is accepted, answers `200`, and the
-/// annotation is absent from every row — no error says so. `content.downloadUrl` returns it,
-/// still spelled [`DOWNLOAD_URL_KEY`] in the JSON.
+/// Not the key the response uses: a `$select` naming [`DOWNLOAD_URL_KEY`] is accepted and
+/// silently omits the annotation from every row, while `content.downloadUrl` returns it
+/// under [`DOWNLOAD_URL_KEY`].
 ///
-/// Asked for beside the fields above so a read does not cost a second round trip to learn
-/// where the bytes are. Getting it wrong does not degrade to that second trip either:
-/// [`OnedriveAccessor::get_item_by_id`] selects the same way, so a listing without the URL
-/// and the refetch meant to rescue it both come back without one.
+/// Asked for beside the fields above so a read needs no second round trip to find the
+/// bytes. [`OnedriveAccessor::get_item_by_id`] selects the same way, so a wrong spelling
+/// here also breaks the refetch meant to rescue a missing URL.
 const DOWNLOAD_URL_SELECT: &str = "content.downloadUrl";
 
 /// The instance annotation a download URL actually arrives under. See
@@ -155,8 +153,7 @@ const JITTER_MAX_MS: u64 = 1000;
 /// not answering anybody.
 ///
 /// A budget for the ladder rather than a cap on one sleep, because what blocks the mount is
-/// their **sum**: `MAX_RETRIES` waits of 30 s each is 150 s, which is what a per-sleep cap
-/// would permit while claiming a 30 s ceiling.
+/// their **sum**, which a per-sleep cap would let reach `MAX_RETRIES` times its ceiling.
 ///
 /// It bounds the waiting and not the whole call: each attempt may still spend up to the
 /// `reqwest` request timeout set in [`OnedriveAccessor::new`] on the wire. Requests are
@@ -202,7 +199,7 @@ impl std::fmt::Debug for OnedriveConfig {
     }
 }
 
-/// The HTTP half of the store: tokens, retries, and the four calls a read-only tree
+/// The HTTP half of the store: tokens, retries, and the calls a read-only tree
 /// makes. Knows nothing of paths as the mount means them, of `Stat`, or of `FileSystem` —
 /// it speaks `serde_json::Value` and `Vec<u8>`.
 pub struct OnedriveAccessor {
@@ -346,11 +343,9 @@ impl OnedriveAccessor {
     /// to *pause the client* — "failure to honor Retry-After may result in more throttling
     /// ... even though the calls fail, they still count toward usage limits" — so a
     /// give-up that leaves the next call free to fire immediately is worse than waiting.
-    /// Measured without this gate: twenty listings under a 900 s throttle sent twenty
-    /// requests in 14 ms, against the very limit that caused the throttle.
     ///
     /// A mount is the hostile case for this. Its callers re-ask constantly — Finder, the
-    /// NFS client under FUSE-T, a `find` walking a thousand directories — and a failed
+    /// NFS client under FUSE-T, a `find` walking a tree — and a failed
     /// listing is deliberately not cached, so every re-ask would be a fresh request.
     async fn refuse_while_throttled(&self) -> anyhow::Result<()> {
         let until = *self.throttled_until.lock().await;
@@ -476,9 +471,8 @@ impl OnedriveAccessor {
     /// the cached one has expired.
     ///
     /// By id rather than by path, and that is load-bearing rather than tidy. A path has
-    /// two Unicode spellings and the service answers only to the one it stored — measured
-    /// against the live service, `root:/문서:/children` is `200` composed and `404`
-    /// decomposed — while an id is opaque ASCII the service itself minted. This refresh
+    /// two Unicode spellings and the service answers only to the one it stored, while an
+    /// id is opaque ASCII the service itself minted. This refresh
     /// happens mid-read, where a `404` would surface as a file that vanished halfway
     /// through, so it is the last place that should depend on a spelling. It also survives
     /// a rename between the listing and the read, which a path does not.
@@ -632,9 +626,8 @@ fn encode_segment(seg: &str) -> String {
 /// policy and it is arithmetic: the ladder around it only sleeps and counts.
 ///
 /// `slept` is what the call has already spent, which is what makes [`MAX_RETRY_AFTER`] a
-/// budget for the ladder rather than a cap on one sleep. The two agree on a single long
-/// wait and diverge on a run of short ones — five waits of seven seconds is thirty-five,
-/// which a per-sleep cap permits while claiming a thirty-second ceiling.
+/// budget for the ladder rather than a cap on one sleep: the two diverge on a run of short
+/// waits whose sum passes it.
 fn next_wait(asked: Option<Duration>, slept: Duration, retries: u32) -> Option<Duration> {
     match asked {
         Some(d) if slept + d > MAX_RETRY_AFTER => None,

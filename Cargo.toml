@@ -85,9 +85,9 @@ dokan = { version = "0.3", optional = true }
 dokan-sys = { version = "0.3", optional = true }
 # UTF-16 strings, which every Dokan name is.
 #
-# **Pinned to `dokan`'s own 0.4, not the current 1.x.** `U16CStr` is in `dokan`'s public API,
-# so a second version is an unrelated type and every callback fails to match its trait, with
-# an error naming the same type twice.
+# **Pinned to the version `dokan` itself takes, not the latest.** `U16CStr` is in `dokan`'s
+# public API, so a second version is an unrelated type and every callback fails to match its
+# trait, with an error naming the same type twice.
 widestring = { version = "0.4", optional = true }
 # `NTSTATUS` and the `STATUS_*`/`FILE_ATTRIBUTE_*` codes a Windows filesystem answers in, and
 # `LoadLibraryW`, which `mount_support` uses to check for Dokany before any call into it.

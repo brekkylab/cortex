@@ -334,12 +334,12 @@ async fn spans_left_behind_stop_counting_and_stop_being_kept() {
 
 /// Files read in turn each keep their span, so nothing is fetched twice. See
 /// [`OnedriveFs::held`]. Each file is larger than a span, so a constant [`READ_SPAN`]
-/// would overrun the budget and the division is measured.
+/// would overrun the budget and only the division passes.
 #[tokio::test]
 async fn interleaved_files_each_keep_a_span() {
     const REAL: u64 = 32 * 1024 * 1024;
-    // 512 KiB chunks per file, as `grep -r` alternated over a local mount. Only the chunk
-    // matters, so the window is widened from 32 KiB to keep the walk cheap.
+    // Files alternate by chunk, as `grep -r` does. Only the chunk matters, so the window is
+    // wider than the kernel's to keep the walk cheap.
     const W: u64 = 256 * 1024;
     const CHUNK: u64 = 2 * W;
     let (mock, fs) = mount(
@@ -704,8 +704,7 @@ async fn start_full(
                         // with, so a test can ask for a failure that is *not* an absence.
                         // The body is the shape Graph sends: an inner error carrying a
                         // correlation id, which is hex and so sometimes spells `404` while
-                        // meaning nothing by it. A `429` carries `Retry-After` as the
-                        // service does, stating a wait far past what a mount may sleep.
+                        // meaning nothing by it.
                         Some(Value::Number(n)) => {
                             let code = n.as_u64().unwrap_or(500) as u16;
                             let body = br#"{"error":{"code":"accessDenied","innerError":

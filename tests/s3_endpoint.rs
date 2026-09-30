@@ -21,7 +21,7 @@ use std::{path::Path, process::Command};
 
 use cortex::fs::{DirentKind, FileSystem, S3Config, S3Fs};
 
-/// A mock of a dozen enterprise services' read APIs, S3 among them, over a fixed corpus.
+/// A mock of several enterprise services' read APIs, S3 among them, over a fixed corpus.
 const HOST: &str = "https://enterprise-mock.brekkylab.com";
 
 /// Path-style S3 lives under `/s3` on that host, not at the root.

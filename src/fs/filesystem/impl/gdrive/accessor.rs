@@ -116,9 +116,9 @@ const FILE_FIELDS: &[&str] = &[
     // shortcuts (backlot also omits it on native docs, so don't rely on either shape).
     //
     // Exact for a blob, but never a document's length: a document is served as its API's
-    // JSON, which Drive's number does not describe (4,775 listed against 133,625 of JSON
-    // on one document). Kept so `read_window` can refuse before a byte moves, and so a
-    // blob listed *without* a size is told apart from one sized zero.
+    // JSON, which Drive's number does not describe. Kept so `read_window` can refuse
+    // before a byte moves, and so a blob listed *without* a size is told apart from one
+    // sized zero.
     "size",
     "modifiedTime",
     "createdTime",
@@ -140,10 +140,8 @@ const JITTER_MAX_MS: u64 = 1000;
 /// A document has no ranges: a read of any part of it produces the whole thing, so its
 /// size sets the memory a single read costs — body, parsed tree, indented output.
 ///
-/// 64 MiB against a measured worst case of 2.5 MB leaves room far past any real document
-/// while bounding one read's footprint. The JSON stays small where an export does not: a
-/// 60 MB document is 2.5 MB of it, and a 401 MB workbook is 242,935 bytes, where its
-/// 382 MiB export would be far over this ceiling.
+/// Set far past any real document's JSON while bounding one read's footprint; the JSON
+/// stays small even where a file's export is huge.
 pub(super) const MAX_DOCUMENT_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Whether a 403 body names a limit that clears by waiting.
@@ -188,9 +186,7 @@ fn first_chars(s: &str, n: usize) -> &str {
 /// Read a response body, refusing at `limit` rather than after it.
 ///
 /// Checking `Content-Length` before buffering cannot work: none of these endpoints
-/// declares a length (measured on Docs, Slides, `spreadsheets.get` and `values:batchGet`:
-/// no `Content-Length`, no `Transfer-Encoding`, just an HTTP/2 stream). Reading frame by
-/// frame refuses before the whole body is allocated.
+/// declares a length. Reading frame by frame refuses before the whole body is allocated.
 async fn body_within(
     mut resp: reqwest::Response,
     limit: u64,
@@ -208,11 +204,10 @@ async fn body_within(
 
 /// A tab name as an A1 range: quoted, with any literal quote doubled.
 ///
-/// A bare name that looks like a cell reference is one. Measured on a real spreadsheet:
-/// `ranges=연간 요약` answered `'연간 요약'!A1:Z968`, while `ranges=A1` answered
-/// `'연간 요약'!A1` — the *first* sheet's cell, not a sheet of that name (`B2` and `A:A`
-/// likewise), so the caller would attach someone else's cells to the tab. Quoting is what
-/// A1 notation specifies for a name, and changes nothing for ordinary ones.
+/// A bare name that looks like a cell reference is one: `ranges=A1` answers the *first*
+/// sheet's cell, not a sheet of that name, so the caller would attach someone else's cells
+/// to the tab. Quoting is what A1 notation specifies for a name, and changes nothing for
+/// ordinary ones.
 fn quote_a1(tab: &str) -> String {
     format!("'{}'", tab.replace('\'', "''"))
 }
@@ -482,8 +477,7 @@ impl GdriveAccessor {
     /// API's JSON instead (see [`Self::document_json`] and friends).
     ///
     /// The range makes serving originals affordable; the caller sizes it. Without `Range`,
-    /// every chunk read would pull the whole object, so one `grep` over a folder of 5 MB
-    /// PDFs would transfer gigabytes to look at a few kilobytes.
+    /// every chunk read would pull the whole object.
     pub async fn download(
         &self,
         id: &str,
@@ -521,17 +515,15 @@ impl GdriveAccessor {
     /// A Google Doc's own structure (`documents.get`).
     ///
     /// Not an export: paragraphs, styles, tables, footnotes and — crucially for
-    /// editing — the character indices every `batchUpdate` addresses. Measured on
-    /// a real account: 59 KB to 2.4 MB, roughly 10-9,000x the exported text,
-    /// because every run carries its styling.
+    /// editing — the character indices every `batchUpdate` addresses. Far larger than
+    /// the exported text, because every run carries its styling.
     pub async fn document_json(&self, id: &str) -> anyhow::Result<Vec<u8>> {
         self.get_pretty(&format!("{}/documents/{id}", self.urls.docs))
             .await
     }
 
     /// A presentation's own structure (`presentations.get`): pages, shapes,
-    /// transforms, speaker notes. Measured 1.3-2.2 MB even for a 6 KB deck —
-    /// slide geometry dwarfs the text.
+    /// transforms, speaker notes. Slide geometry dwarfs the text.
     pub async fn presentation_json(&self, id: &str) -> anyhow::Result<Vec<u8>> {
         self.get_pretty(&format!("{}/presentations/{id}", self.urls.slides))
             .await
@@ -539,8 +531,8 @@ impl GdriveAccessor {
 
     /// A spreadsheet's structure, without cell data (`spreadsheets.get`).
     ///
-    /// 3.7-19.5 KB measured, and it carries what addressing a cell needs: sheet
-    /// ids, titles, grid extents, named ranges, charts, conditional formats.
+    /// Small, and it carries what addressing a cell needs: sheet ids, titles, grid
+    /// extents, named ranges, charts, conditional formats.
     pub async fn spreadsheet_json(&self, id: &str) -> anyhow::Result<Vec<u8>> {
         self.get_pretty(&format!("{}/spreadsheets/{id}", self.urls.sheets))
             .await
@@ -548,10 +540,8 @@ impl GdriveAccessor {
 
     /// Cell values for the named tabs (`spreadsheets.values.batchGet`).
     ///
-    /// Not `includeGridData=true`: that bills per **allocated** cell at 578-920 bytes
-    /// each (measured), and a tab allocates 1000x26 whether or not one cell is filled —
-    /// one real workbook had 210,125 allocated cells, an estimated 189 MB. `batchGet`
-    /// returns the used range only: 443 B to 105 KB per tab for that workbook.
+    /// Not `includeGridData=true`: that costs hundreds of bytes per **allocated** cell,
+    /// filled or not, while `batchGet` returns the used range only.
     ///
     /// Values are formatted as the sheet displays them, so what a reader greps is
     /// what a person sees in the cell.
@@ -601,8 +591,8 @@ impl GdriveAccessor {
     /// Shared drives visible to the account.
     ///
     /// One attempt, off the retry ladder: the caller treats a failure as "this account
-    /// has none", and five backoffs would block the first `ls` of a mount for ~33 s to
-    /// produce an answer that is then discarded.
+    /// has none", so backoffs would block the first `ls` of a mount for an answer that
+    /// is then discarded.
     pub async fn list_shared_drives(&self) -> anyhow::Result<Vec<Value>> {
         let mut drives = Vec::new();
         let mut page_token: Option<String> = None;
@@ -647,7 +637,7 @@ impl GdriveAccessor {
 mod tests {
     use super::*;
 
-    /// Five hosts in production, each overridable on its own, and the version suffix
+    /// Each production host is overridable on its own, and the version suffix
     /// is the official one either way, so nothing depends on a deployment's path layout.
     /// Checked through `endpoints`, where every origin is read.
     #[test]
@@ -685,8 +675,7 @@ mod tests {
     }
 
     /// A tab is named by a person but read as A1 notation, where a name that looks
-    /// like a cell reference *is* one (measured: `ranges=A1` returned the first
-    /// sheet's A1 cell, not the sheet named `A1`).
+    /// like a cell reference *is* one.
     #[test]
     fn a_tab_name_is_quoted_so_it_stays_a_name() {
         assert_eq!(quote_a1("연간 요약"), "'연간 요약'");

@@ -1,8 +1,7 @@
 //! Concrete [`FileSystem`](super::FileSystem) stores.
 //!
-//! The `std`-only stores are always built. Each network store is behind its own feature: `s3`
-//! alone adds over a hundred crates, and a consumer serving local files should not compile an
-//! HTTP and TLS stack.
+//! The `std`-only stores are always built. Each network store is behind its own feature, so a
+//! consumer serving local files does not compile an HTTP and TLS stack.
 
 #[cfg(feature = "gdrive")]
 mod gdrive;

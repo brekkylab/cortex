@@ -22,33 +22,30 @@ use crate::{
 /// listing, so the two are describing the same snapshot or they are lying about one.
 ///
 /// This is what bounds how stale the tree can be. A network filesystem always has such a
-/// number: macOS's own NFS client caches attributes 5 to 60 seconds (`acregmin`/`acregmax`)
-/// and serves them while the server moves on. Five minutes is longer because a listing here
-/// costs a round trip rather than a LAN hop.
+/// number: macOS's own NFS client caches attributes (`acregmin`/`acregmax`) and serves them
+/// while the server moves on. This one is longer because a listing here costs a round trip
+/// rather than a LAN hop.
 const DIR_TTL: Duration = Duration::from_secs(300);
 
 /// How much a read fetches once it is clear the reader is walking the file *and* nothing
 /// else is being walked, so a lone walk pays a round trip per span of this size rather
 /// than one per window.
 ///
-/// The kernel's window is 64 KiB and not ours to choose (32 KiB through FUSE-T, measured).
-/// One ranged request per window is what this avoids: against Google Drive, whose round
-/// trip has the same shape, it put a 641 MB archive at 0.04 MB/s.
+/// The kernel's window is 64 KiB (32 KiB through FUSE-T) and not ours to choose; one ranged
+/// request per window leaves a large read crawling at round-trip speed.
 ///
 /// It is a ceiling rather than the size every walk gets: [`HELD_BUDGET`] is divided among
-/// whatever is being walked, and this is what one reader's share comes to. Shrinking it
-/// instead of dividing it would cost every large read its round trips — a 4 GB file at a
-/// fixed 8 MiB is 512 requests against 65, and a request to the download host costs 0.232 s
-/// of round trip, measured over ten on one connection.
+/// whatever is being walked, and this is what a lone reader's share comes to. Shrinking it
+/// instead of dividing it would multiply every large read's round trips, each a sizable
+/// fraction of a second to the download host.
 const READ_SPAN: u64 = 64 * 1024 * 1024;
 
 /// How much a *first* read fetches, before anything says the reader is walking.
 ///
 /// Two sizes because a span is not free either: the tools that read a file's head and stop
-/// would pay a whole `READ_SPAN` for one buffer. It is 8 MiB rather than the bare window
-/// because NFS fires about a megabyte of read-ahead the moment a file is touched, and every
-/// window of that read-ahead looks like a walk — a smaller number is spent before the
-/// distinction can be made.
+/// would pay a whole `READ_SPAN` for one buffer. Well above the bare window because NFS
+/// fires read-ahead the moment a file is touched, and every window of it looks like a walk;
+/// a span smaller than that read-ahead is spent before the distinction can be made.
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
 /// Cap on how many children one listing will hold.
@@ -68,26 +65,22 @@ const HELD_BUDGET: u64 = READ_SPAN;
 /// Floor on one file's share of [`HELD_BUDGET`].
 ///
 /// For the case the count cannot tell apart: many files touched once beside one being
-/// walked. [`ACTIVE`] keeps a file counted for seconds after its single read, so a
-/// traversal past 500 small files divides the budget 500 ways while one large file is
-/// walked. Measured on the mock, that walk costs 8 requests with this floor and 256
-/// without.
+/// walked. [`ACTIVE`] keeps a file counted for seconds after its single read, so without a
+/// floor a traversal past many small files would slice the budget thin and multiply the
+/// requests of the one large file being walked.
 ///
-/// It costs traffic in the opposite case, where the files really are all being walked: at
-/// 100 of them, 6.4x the bytes against 3.8x with no floor. Past `HELD_BUDGET / MIN_SPAN`
-/// files the shares stop fitting and eviction comes back.
+/// It costs traffic when the files really are all being walked: past
+/// `HELD_BUDGET / MIN_SPAN` of them the shares stop fitting and eviction comes back.
 const MIN_SPAN: u64 = 4 * 1024 * 1024;
 
 /// How recently a span must have been read from for its file to count as one of the
 /// readers dividing [`HELD_BUDGET`].
 ///
-/// Being in the map is the wrong test: an entry lives for [`DIR_TTL`], so a traversal past
-/// eight files leaves eight behind and would divide the budget eight ways while one file is
-/// walked — measured, nineteen abandoned entries took a walk of one file from two requests
-/// to five. Seconds rather than milliseconds because a miss against Graph costs about that
-/// (see [`READ_SPAN`]), so two files alternating touch each other's spans a second or more
-/// apart; what matters is the interval between *misses* on one file, since a hit refreshes
-/// [`HeldSpan::used`].
+/// Being in the map is the wrong test: an entry lives for [`DIR_TTL`], so files a traversal
+/// abandoned would keep dividing the budget while one file is walked. Seconds rather than
+/// milliseconds because a miss against Graph costs about a second, so two files alternating
+/// touch each other's spans that far apart; what matters is the interval between *misses* on
+/// one file, since a hit refreshes [`HeldSpan::used`].
 const ACTIVE: Duration = Duration::from_secs(3);
 
 /// One span of one file, and where in it the span begins.
@@ -140,15 +133,11 @@ pub struct OnedriveFs {
     /// A map rather than one slot, because reads of two files interleave with neither
     /// threads nor a second process: FUSE ops are serialized, so alternating is enough.
     /// With one slot each read finds the other file's span there, no read ever counts as a
-    /// walk, and every window pays a whole [`FIRST_SPAN`] — measured live on the same span
-    /// policy against Google Drive, two files walked by `xargs -P 2 cat` reached 7.3 MiB of
-    /// progress after 328 MiB over 41 requests, against 4 requests and 53.9 MiB divided.
+    /// walk, and every window pays a whole [`FIRST_SPAN`].
     ///
     /// A single tool rarely interleaves on a network store: read-ahead overlaps files only
-    /// when it can outrun the reader, and a miss of about a second never lets it (`grep -r`
-    /// over six 24 MiB files: 6 path switches in 33 s on the real service, against 679 in
-    /// 0.5 s through a local [`PassthroughFs`](crate::fs::PassthroughFs) mount). So a trace
-    /// replayed from a fast store does not describe this one.
+    /// when it can outrun the reader, and a miss of about a second never lets it. So a trace
+    /// replayed from a fast local store does not describe this one.
     ///
     /// Bounded by *bytes* rather than count, so the ceiling is divided rather than owned by
     /// whoever fetched last, and each span is sized to that division so nothing has to be
@@ -168,7 +157,7 @@ impl OnedriveFs {
     /// One folder's children, from the cache when one is fresh.
     ///
     /// A failed listing is *not* cached. Caching the failure would turn one throttled
-    /// request into five minutes of an empty directory, which reads as "the folder is
+    /// request into a whole `DIR_TTL` of an empty directory, which reads as "the folder is
     /// gone" rather than "ask again".
     ///
     /// This is the one call left that addresses the service by a path, and a path has two
@@ -202,15 +191,8 @@ impl OnedriveFs {
 
     /// The folder a path names when the path, as spelled, names nothing.
     ///
-    /// The service answers to the spelling it stored and 404s every other one. Measured
-    /// against it, on one folder under one name:
-    ///
-    /// ```text
-    /// /me/drive/root:/문서:/children    composed    200
-    ///                                   decomposed  404
-    /// ```
-    ///
-    /// and macOS hands a lookup the decomposed spelling of whatever the listing printed.
+    /// The service answers to the spelling it stored and 404s every other one, and macOS
+    /// hands a lookup the decomposed spelling of whatever the listing printed.
     /// So after the path as given, two things are tried, cheapest first.
     ///
     /// **Composed.** One request, and it answers the ordinary case: a macOS reader asking
@@ -668,10 +650,9 @@ fn not_found_or_backend(e: anyhow::Error) -> io::Error {
 /// Whether the service answered this request `404`.
 ///
 /// Asked of the status the error carries rather than found in its message. A Graph error
-/// body states a correlation id, and a correlation id is hex: measured on a live token
-/// failure, `Correlation ID: 74bd5c8a-0083-434f-b5b2-9602fa4d4ca3`. About one in a hundred
-/// contains `404` and means nothing by it, so a substring search turns a backend failure
-/// into an absence, and the mount answers `ENOENT` for a file that is there.
+/// body states a correlation id, which is hex and so sometimes contains `404` while meaning
+/// nothing by it: a substring search would turn a backend failure into an absence, and the
+/// mount would answer `ENOENT` for a file that is there.
 ///
 /// Only a Graph error can be one: a failed download says its status without reqwest's
 /// error (see [`download`](OnedriveAccessor::download)), and a failed token exchange is a

@@ -189,8 +189,8 @@ impl Dirent {
 /// * [`ReadOnlyFilesystem`] (`EROFS`) is a store that could write and will not;
 ///   [`Unsupported`] is `ENOSYS`, "not implemented at all". `cp`, `rsync` and editors handle
 ///   the first and read the second as a broken filesystem. `ENOSYS` also does *not* stop a
-///   kernel asking: on a Linux guest over virtio-fs, `mkdir`, `unlink`, `rmdir`, `rename` and
-///   `write` reached the backend on three of three attempts.
+///   kernel asking: a Linux guest over virtio-fs keeps sending `mkdir`, `unlink`, `rmdir`,
+///   `rename` and `write` after it.
 /// * [`CrossesDevices`] (`EXDEV`) makes `mv`, `rsync` and editors copy then delete, so naming
 ///   it precisely lets a cross-backend move *succeed*.
 /// * [`PermissionDenied`] (`EACCES`) is skipped by `find`/`rsync`/`tar`, which abort on `EIO`;

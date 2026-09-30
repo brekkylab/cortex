@@ -248,7 +248,7 @@ fn gone(pid: libc::pid_t) -> bool {
 /// Returns the mounts it tried and failed to take down, which a person must clear by hand;
 /// ones past the budget are left for the next call and not listed.
 ///
-/// At most four unmounts per call, each with its own deadline. Never panics or fails; with
+/// A bounded number of unmounts per call (`BUDGET`), each with its own deadline. Never panics or fails; with
 /// nothing to reclaim it costs one directory read.
 pub fn reclaim_abandoned() -> Vec<PathBuf> {
     let mut left = Vec::new();

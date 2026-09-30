@@ -11,13 +11,12 @@
 //! credentials and a network, and it is the only thing here that can notice Graph moving.
 //!
 //! For example, `$select` naming the download URL the way the *response* spells it is
-//! accepted, answers `200`, and omits the field from every row, so a read fails outright
-//! with "has no download url" — which no mock can show.
+//! accepted and omits the field from every row, so a read fails outright with "has no
+//! download url" — which no mock can show.
 //!
-//! **What we asked for.** No server reports the number of requests it received back to its
-//! caller, or the `Range` header on each. Every claim of the form "eight windows, one
-//! request" is a claim about our own behaviour, and it stays with the loopback mock in
-//! `onedrive_tests.rs`, which counts.
+//! **What we asked for.** No server reports back the requests it received or the `Range`
+//! header on each. Claims about request counts are about our own behaviour, and stay with
+//! the loopback mock in `onedrive_tests.rs`, which counts.
 //!
 //!     set -a; . ./.env; set +a
 //!     cargo test -p cortex --features onedrive onedrive_endpoint -- --ignored --nocapture
@@ -28,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use cortex::fs::{DirentKind, FileSystem, OnedriveConfig, OnedriveFs};
 
-/// Bounds on the walk, so the same test runs against a five-file account and a large one
+/// Bounds on the walk, so the same test runs against a small account and a large one
 /// without becoming the slowest thing in the suite.
 const WALK_ENTRIES: usize = 10;
 

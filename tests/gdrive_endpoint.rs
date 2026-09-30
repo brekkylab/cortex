@@ -27,16 +27,12 @@
 //! ## What this cannot cover
 //!
 //! **Anything about a blob.** The corpus holds Docs-editors files in bulk and almost no
-//! binary ones — two PDFs, the larger 1,083 bytes, and nothing at all under `image/png`,
-//! `image/jpeg`, `application/zip`, `text/plain` or `application/octet-stream`. Both PDFs
-//! sit under a parent whose id is shaped like a shared drive's root, and backlot answers
-//! `drives.list` with none, so no shared-drive section is built for them: they surface only
-//! through `Shared with me`, which runs past `MAX_FOLDER_FILES` and is truncated before
-//! reaching them. So the blob test below skips against this corpus, and runs once it gains
-//! one.
+//! binary ones, and those it has are reachable only through `Shared with me`, whose listing
+//! is truncated at `MAX_FOLDER_FILES` before reaching them. So the blob test below skips
+//! against this corpus, and runs once it gains one.
 //!
-//! `FIRST_SPAN` is 8 MiB and `READ_SPAN` is 64 MiB in any case, so the span policy cannot be
-//! exercised at any size this corpus contains.
+//! `FIRST_SPAN` and `READ_SPAN` are larger than any file this corpus holds, so the span
+//! policy cannot be exercised here.
 //!
 //! **What we asked for.** No server reports the number of requests it received back to its
 //! caller, or the `Range` header on each. Every claim of the form "eight windows, one
@@ -49,12 +45,12 @@ use std::path::{Path, PathBuf};
 
 use cortex::fs::{DirentKind, FileSystem, GdriveConfig, GdriveFs, GdriveOrigins};
 
-/// The mock this drives — a stand-in for the read APIs of a dozen enterprise services,
+/// The mock this drives — a stand-in for the read APIs of several enterprise services,
 /// Drive among them. `BACKLOT_URL` overrides it for a local instance.
 const HOST: &str = "https://enterprise-mock.brekkylab.com";
 
-/// Bounds on the walk, so the same test runs against a five-file sample and a
-/// twenty-five-thousand-document corpus without becoming the slowest thing in the suite.
+/// Bounds on the walk, so the same test runs against a small sample and a large
+/// corpus without becoming the slowest thing in the suite.
 const WALK_DIRS: usize = 12;
 const WALK_FILES: usize = 40;
 
@@ -342,8 +338,8 @@ async fn read_to_end(fs: &GdriveFs, path: &Path) -> Vec<u8> {
 /// The first file in the corpus over `min` bytes whose name `want` accepts, breadth-first
 /// and bounded. Discovered rather than named, so the corpus can change underneath.
 async fn find_file(fs: &GdriveFs, min: u64, want: impl Fn(&str) -> bool) -> Option<(PathBuf, u64)> {
-    // The account's own drive first. A listing here can run to ten thousand entries and
-    // cost ten pages, so the order the sections are tried in is most of the wall clock.
+    // The account's own drive first. A listing can run to many pages, so the order the
+    // sections are tried in is most of the wall clock.
     let mut sections: Vec<PathBuf> = fs
         .list(Path::new("/"))
         .await

@@ -13,7 +13,7 @@
 //! **The transport is a mount option.** The helper carries an NFSv4 server, an SMB server, and
 //! an FSKit module (see [`FuseTBackend`]); the vtable and callbacks here are the same for all.
 //!
-//! **Why a C shim?** `fuse_lowlevel_ops` has ~50 function pointers with
+//! **Why a C shim?** `fuse_lowlevel_ops` has dozens of function pointers with
 //! `__APPLE__`-conditional members, `fuse_file_info` has bitfields, and `fuse_entry_param`
 //! embeds a host `struct stat`. A wrong layout in Rust is silent memory corruption, so
 //! `contrib/fuse_t/shim.c` owns them all and exposes a flat vtable of our own.

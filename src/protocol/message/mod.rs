@@ -29,7 +29,7 @@
 //!   result types ([`InitCall`]/[`InitResp`], [`ExecCall`]/[`ExecResp`], ...). A method's
 //!   answer is written in its call's vocabulary (the `ref` a `build_image` asks for is the
 //!   `ref` it answers with), so the two halves stay in step.
-//! - `notification` — [`Notification`], the three unanswered methods, and a member-less
+//! - `notification` — [`Notification`], the unanswered methods, and a member-less
 //!   type apiece for what each carries.
 //! - `method` — [`Method`], a method's wire name.
 //! - `error` — [`Error`] and its codes.
@@ -99,7 +99,7 @@
 //! live in this workspace.
 //!
 //! Not frame size where it matters. BSON writes array indices as keys (`cmd` becomes
-//! `{"0":"ls"}`) and names as C strings, so a control frame like `stop` is ~20 bytes
+//! `{"0":"ls"}`) and names as C strings, so a control frame like `stop` is slightly
 //! *larger* than JSON; the large, frequent output frames shrink. MessagePack and CBOR
 //! beat BSON on both; BSON wins on being self-delimiting (which can retire the framing
 //! layer) and on `doc!`/Extended JSON keeping the wire readable to people and tests.

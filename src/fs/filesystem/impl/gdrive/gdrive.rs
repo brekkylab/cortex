@@ -69,9 +69,8 @@ const DIR_TTL: Duration = Duration::from_secs(300);
 /// Ceiling on the cell values one spreadsheet's JSON will carry, spent tab by tab
 /// in the workbook's own order until it runs out.
 ///
-/// Values are proportional to what is actually filled in — 443 B to 105 KB per tab
-/// measured, an 8-tab workbook around 185 KB — so this bounds the outlier rather
-/// than the common case. A workbook of 634,410 cells exists in the corpus.
+/// Values are proportional to what is actually filled in, so this bounds the outlier
+/// rather than the common case.
 const GRID_BYTES_BUDGET: u64 = 8 * 1024 * 1024;
 /// Tabs whose values are requested in one `batchGet`. Each title rides in the
 /// query string, so an unbounded count would eventually build an unsendable URL.
@@ -80,60 +79,43 @@ const MAX_TABS: usize = 64;
 /// Size reported for a document whose length nobody has learned yet.
 ///
 /// A placeholder, not a measurement: `ls -l` and `find -size` see it until something reads
-/// the file, which from then on reports its exact length. Measured JSON lengths across the
-/// corpus were 7 KB to 3.4 MB.
+/// the file, which from then on reports its exact length.
 ///
 /// It cannot be 0: a client bounds a read by the length it was told, so a file reported
 /// empty hands back nothing however many bytes are behind it, and a search tool skips it.
 ///
 /// An over-estimate means the client asks for and takes back the whole claimed span, so
-/// [`FileSystem::read_at`] fills the part past the JSON. Zero fill there makes every JSON
-/// parser throw at the seam — measured on a live mount, a 1,574,113-byte deck read as
-/// 8,388,608 bytes of which 6,814,495 were zeros, and `json.load` raised.
+/// [`FileSystem::read_at`] fills the part past the JSON; zero fill there would make every
+/// JSON parser throw at the seam.
 ///
 /// An *under*-estimate has no recovery: the reader stops where it was told, every window
-/// full, so nothing reports a short read and the JSON ends mid-token (a 12,582,929-byte
-/// document under an 8 MiB placeholder read back as 8,388,608 bytes that do not parse).
-/// Equal to [`MAX_DOCUMENT_BYTES`] so that cannot happen: `get_pretty` bounds the *raw*
-/// body at that number and Google already returns 2-space pretty JSON (measured, raw
-/// 2,491,712 against 2,491,642 re-serialized), so served bytes cannot exceed it, and a
-/// larger document fails loudly in `body_within` instead.
+/// full, so nothing reports a short read and the JSON ends mid-token. Equal to
+/// [`MAX_DOCUMENT_BYTES`] so that cannot happen: `get_pretty` bounds the *raw* body at that
+/// number and Google already returns pretty JSON of about the re-serialized length, so
+/// served bytes cannot exceed it, and a larger document fails loudly in `body_within`
+/// instead.
 ///
-/// An exact length up front costs one render per document — measured 2.4 s for a
-/// six-document folder listing, 6.3 s when the kernel's per-entry `getattr` serializes
-/// them — and `stat` runs once per name, because FUSE-T serves over NFS and an NFS client
-/// fills an attribute for every entry it lists.
+/// An exact length up front costs one render per document, and `stat` runs once per name,
+/// because FUSE-T serves over NFS and an NFS client fills an attribute for every entry it
+/// lists.
 const UNKNOWN_LENGTH_SIZE: u64 = MAX_DOCUMENT_BYTES;
 
 /// How long a line the padding past a document's JSON is broken into.
 ///
 /// The padding is whitespace JSON ignores, so this only shapes the tail for line-oriented
-/// tools (measured in the padding step of this store's `read_at`).
+/// tools (see the padding step of this store's `read_at`).
 const PAD_LINE: u64 = 4096;
 
 /// How much a blob read fetches once it is clear the reader is walking the file, so a
 /// walk pays a round trip per span of this size rather than one per window.
 ///
 /// The kernel's window is 64 KiB and not ours to choose, and FUSE-T's NFS backend halves
-/// it to 32 (`rsize=32768`). One ranged request per window puts a 641 MB archive at two
-/// and a half hours: 10,250 requests, each 200 quota units however few bytes it moves.
+/// it to 32 KiB; one ranged request per window makes a large file cost a request, and its
+/// quota, per window.
 ///
-/// Measured against Drive, a ranged request costs a round trip and then bytes, and the
-/// two cross over around here:
-///
-/// ```text
-///            time to first byte   total     MB/s
-///   64 KiB         0.82 s         0.90 s    0.07
-///    8 MiB         0.97 s         1.57 s    5.09
-///   32 MiB         0.88 s         4.82 s    6.63
-///   64 MiB         0.86 s         5.63 s   11.37
-///  128 MiB         0.76 s        10.82 s   11.83
-/// ```
-///
-/// The trip is flat at about 0.9 s whatever is asked for, so bigger spans keep paying
-/// off until the transfer itself is the cost — which is at 64 MiB, where the rate tops
-/// out around 11 MB/s. Past it only the request count falls, and 128 MiB measured
-/// *slower* than 64 for the same archive.
+/// A ranged request costs a round trip of about the same length whatever its size, then
+/// bytes, so bigger spans pay off until the transfer itself dominates — around this size,
+/// past which only the request count falls.
 ///
 /// The *first* fetch takes [`FIRST_SPAN`] instead, so a reader that stops after a buffer
 /// never pays for a span it will not use. And a walk gets this only as a lone reader: its
@@ -145,12 +127,11 @@ const READ_SPAN: u64 = 64 * 1024 * 1024;
 /// It cannot be the window the kernel asked for, however little that reader wants. The
 /// mount is served over NFS, whose client fires around a megabyte of read-ahead the
 /// moment a file is touched, and every window of it continues the one before — which is
-/// a walk by any test this layer can apply. `head -c 8` measured 7.94 s that way: one
-/// window, and then [`READ_SPAN`] fetched for read-ahead nobody would read.
+/// a walk by any test this layer can apply, so a head-read would fetch [`READ_SPAN`] for
+/// read-ahead nobody reads.
 ///
-/// 8 MiB swallows that read-ahead whole, so a head-read is one fetch of 1.57 s and stops
-/// there. A reader that really is walking spends this span and gets [`READ_SPAN`] for the
-/// next one, which is where the rate tops out.
+/// This swallows that read-ahead whole, so a head-read is one fetch and stops there. A
+/// reader that really is walking spends this span and gets [`READ_SPAN`] for the next one.
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
 /// Ceiling on the bytes held across every file at once: one [`READ_SPAN`], so concurrent
@@ -161,21 +142,19 @@ const HELD_BUDGET: u64 = READ_SPAN;
 ///
 /// For the case the count cannot tell apart: many files touched once beside one being
 /// walked. [`ACTIVE`] keeps a file counted for seconds after its single read, so a
-/// traversal past 500 small files divides the budget 500 ways while one large file is
-/// walked. Measured on the mock, that walk costs 8 requests with this floor and 256
-/// without.
+/// traversal past many small files would otherwise shrink the walked file's span to
+/// almost nothing and multiply its requests.
 ///
-/// It costs traffic in the opposite case, where the files really are all being walked: at
-/// 100 of them, 6.4x the bytes against 3.8x with no floor. Past `HELD_BUDGET / MIN_SPAN`
-/// files the shares stop fitting and eviction comes back.
+/// It costs traffic in the opposite case, where the files really are all being walked.
+/// Past `HELD_BUDGET / MIN_SPAN` files the shares stop fitting and eviction comes back.
 const MIN_SPAN: u64 = 4 * 1024 * 1024;
 
 /// How recently a span must have been read from for its file to count as one of the readers
 /// dividing [`HELD_BUDGET`].
 ///
 /// Being in the map is the wrong test: an entry lives for [`DIR_TTL`], so a traversal past
-/// eight files leaves eight behind and would divide the budget eight ways while one file is
-/// walked. Seconds rather than milliseconds because a miss against Drive costs about that
+/// many files leaves them all behind and would divide the budget among them while one file
+/// is walked. Seconds rather than milliseconds because a miss against Drive costs about that
 /// (see [`READ_SPAN`]), so two files alternating touch each other's spans a second or more
 /// apart; what matters is the interval between *misses* on one file, since a hit refreshes
 /// [`HeldSpan::used`].
@@ -188,9 +167,8 @@ const ACTIVE: Duration = Duration::from_secs(3);
 /// the JSON either way.
 const MAX_REMEMBERED_LENGTHS: usize = 50_000;
 
-/// Safety ceiling on one folder's listing (10 pages). Beyond this the listing
-/// truncates (the accessor logs it) — a >10k-child folder is pathological to
-/// `ls` anyway.
+/// Safety ceiling on one folder's listing. Beyond this the listing truncates (the
+/// accessor logs it) — a folder that large is pathological to `ls` anyway.
 const MAX_FOLDER_FILES: usize = 10_000;
 
 /// How many characters of a Drive id every served name carries (see [`id_tag`] and
@@ -199,15 +177,13 @@ const ID_TAG_LEN: usize = 8;
 
 /// The longest name this store will hand out, measured the way the mount measures it.
 ///
-/// [`NAME_MAX`] is what `statfs` reports, and nothing below enforces it — a 258-byte name
-/// listed fine in testing. The reason to keep to it anyway is what happens on the way
-/// *out*: `cp`, `tar` and `rsync` write to filesystems that do enforce 255, and a name
-/// over it fails there rather than here.
+/// [`NAME_MAX`] is what `statfs` reports, and nothing below enforces it. The reason to
+/// keep to it anyway is what happens on the way *out*: `cp`, `tar` and `rsync` write to
+/// filesystems that do enforce it, and a name over it fails there rather than here.
 ///
 /// Counted decomposed, because that is the form the mount emits and it is not the form
-/// Drive stores. Korean costs three bytes a character composed and six or nine
-/// decomposed, so a name that fits comfortably as Drive holds it can be half again too
-/// long once served — measured on one account, 108 bytes arriving as 258.
+/// Drive stores. Decomposed Korean takes two to three times the bytes, so a name that fits
+/// comfortably as Drive holds it can be too long once served.
 const NAME_BUDGET: usize = NAME_MAX as usize;
 
 /// Whether Drive holds real bytes for this row. The Docs-editors types (and Forms,
@@ -292,15 +268,13 @@ struct Child {
     ///
     /// For a file Drive holds bytes for it is exact, and a reader can seek inside it. For
     /// a document it is the size of what Drive *stores*, which describes neither the JSON
-    /// served nor anything else a reader sees — 4,775 stored against 133,625 of JSON on
-    /// one measured document. It is kept for the ceiling check and nothing else; the
-    /// length an entry reports comes from `entry_size`.
+    /// served nor anything else a reader sees. It is kept for the ceiling check and nothing
+    /// else; the length an entry reports comes from `entry_size`.
     size: Option<u64>,
 }
 
 /// One folder's children as the cache holds them: shared, so a `stat` or a read
-/// borrows the listing instead of copying it (a shared folder in the corpus lists
-/// 10,000 entries).
+/// borrows the listing instead of copying it, which matters for a large folder.
 type CachedListing = (Instant, Arc<Vec<Child>>);
 
 /// A document's served length beside the `modifiedTime` it was measured at.
@@ -321,9 +295,8 @@ struct HeldSpan {
     when: Instant,
     /// When a read last came out of these bytes. The share count needs this rather than
     /// `when`, which a hit does not touch, so by `when` a file still being walked looks
-    /// abandoned after [`ACTIVE`] (measured: counting abandoned entries took a one-file walk
-    /// from two requests to five). Eviction orders by it too, where the two measure the
-    /// same.
+    /// abandoned after [`ACTIVE`] and its span shrinks. Eviction orders by it too, where the
+    /// two measure the same.
     used: Instant,
     bytes: Arc<Vec<u8>>,
 }
@@ -343,23 +316,17 @@ pub struct GdriveFs {
     ///
     /// A document lands here too, as a whole-file span at offset 0. Its API has no ranges,
     /// so a read of any window produces all of it, and the next window finds it here or
-    /// renders it again — a 3.4 MB document is 104 windows of 32 KiB, so 104 renders at
-    /// about 1.8 s each.
+    /// renders the whole document again.
     ///
     /// A map rather than one slot, because reads of two files interleave with neither
     /// threads nor a second process: FUSE ops are serialized, so alternating is enough.
     /// With one slot each read finds the other file there, no read ever counts as a walk,
-    /// and every window pays a whole [`FIRST_SPAN`] — live against Drive, two files walked
-    /// by `xargs -P 2 cat` reached 7.3 MiB of progress after 328 MiB over 41 requests,
-    /// against 4 requests and 53.9 MiB here. A request is 200 quota units however few bytes
-    /// it moves. A lost document is worse than a lost span, costing a re-render rather than
-    /// a re-fetch (a 3.4 MB document read beside one blob: 6 renders on one slot, 0 here).
+    /// and every window pays a whole [`FIRST_SPAN`] and a request's quota. A lost document
+    /// is worse than a lost span, costing a re-render rather than a re-fetch.
     ///
     /// A single tool rarely interleaves on this store: read-ahead overlaps files only when
-    /// it can outrun the reader, and a miss of about a second never lets it (`grep -r` over
-    /// six 24 MiB files: 6 path switches in 33 s, against 679 in 0.5 s through a local
-    /// [`PassthroughFs`](crate::fs::PassthroughFs) mount). So traces replayed from a fast store
-    /// do not describe this one.
+    /// it can outrun the reader, and a miss of about a second never lets it. So traces
+    /// replayed from a fast local store do not describe this one.
     ///
     /// Bounded by *bytes* rather than count, so the ceiling is divided rather than owned by
     /// whoever fetched last, and each span is sized to that division so nothing has to be
@@ -392,7 +359,7 @@ impl GdriveFs {
     /// walking the file, and gets its share of [`HELD_BUDGET`] — a whole [`READ_SPAN`] when
     /// it is the only reader, half that at two. Anything else — a different file, a jump to
     /// somewhere new — gets that share capped at [`FIRST_SPAN`], so a reader that stops
-    /// after a buffer pays for 8 MiB it mostly throws away rather than a walk's worth.
+    /// after a buffer pays for a first span it mostly throws away rather than a walk's worth.
     ///
     /// A span is never smaller than the window asked for, so an oversized read is
     /// answered whole rather than truncated.
@@ -466,9 +433,8 @@ impl GdriveFs {
     /// until [`HELD_BUDGET`] has room.
     ///
     /// Dividing the budget keeps this loop from running at all in the ordinary case, so
-    /// the order matters only past the point where a share hits [`MIN_SPAN`]. It does
-    /// matter there: over 30 files interleaved, evicting in *some* order costs 7.5x the
-    /// bytes against 9.6x for evicting arbitrarily.
+    /// the order matters only past the point where a share hits [`MIN_SPAN`], where
+    /// evicting the least recently read costs less traffic than evicting arbitrarily.
     ///
     /// The new span goes in even when it alone is over budget: it has already been paid
     /// for and the caller is about to read from it, so refusing to hold it would only cost
@@ -501,8 +467,8 @@ impl GdriveFs {
     /// own API otherwise.
     ///
     /// Held as a whole-file span at offset 0 with `to_eof`, in the same map as blob spans:
-    /// the API answers with the whole document or nothing, so without holding it a 3.4 MB
-    /// document read a window at a time is 104 renders of the same document.
+    /// the API answers with the whole document or nothing, so without holding it a document
+    /// read a window at a time is one render per window.
     async fn rendered_json(&self, child: &Child, api: NativeApi) -> io::Result<Arc<Vec<u8>>> {
         let id = child.id.as_str();
         {
@@ -572,7 +538,7 @@ impl GdriveFs {
         }
         let complete = listed.is_ok();
         if let Ok(mut drives) = listed {
-            // Sorted here: `drives.list` accepts `orderBy` and discards it (measured), and
+            // Sorted here: `drives.list` accepts `orderBy` and discards it, and
             // documents no order. Unsorted, two `ls /` could disagree, and `unique_name`
             // gives the plain name to whichever same-named drive it reaches first, so the
             // suffix would move between listings — a shared drive has no id tag to fall
@@ -681,8 +647,7 @@ impl GdriveFs {
         if complete {
             let mut cache = self.dir_cache.lock().await;
             // Drop what has aged out before adding: nothing else removes an entry, so one
-            // listing per folder ever visited would stay for the life of the mount (the
-            // corpus has a folder that lists 10,000 entries).
+            // listing per folder ever visited would stay for the life of the mount.
             cache.retain(|_, (at, _)| at.elapsed() < DIR_TTL);
             cache.insert(folder.to_string(), (Instant::now(), children.clone()));
         }
@@ -714,11 +679,10 @@ impl GdriveFs {
     /// under `values`.
     ///
     /// Two calls, because Sheets has no single one that answers both cheaply.
-    /// `spreadsheets.get` gives the workbook's shape (3.7-19.5 KB measured) and,
-    /// with it, the tab titles that name the ranges; `values:batchGet` then returns
-    /// the used range of every tab at once. `includeGridData=true` is no route: it bills
-    /// per *allocated* cell, and one real workbook allocated 210,125 for an estimated
-    /// 189 MB. See [`GdriveAccessor::sheet_values_batch`].
+    /// `spreadsheets.get` gives the workbook's shape and, with it, the tab titles that
+    /// name the ranges; `values:batchGet` then returns the used range of every tab at once.
+    /// `includeGridData=true` is no route: it bills per *allocated* cell. See
+    /// [`GdriveAccessor::sheet_values_batch`].
     ///
     /// A tab whose values exceed the budget is left out with a `valuesOmitted` note
     /// on it, so a reader sees a stated omission rather than an empty sheet.
@@ -750,10 +714,9 @@ impl GdriveFs {
     /// The length `stat` reports for a document, kept so it does not fall back to the
     /// placeholder.
     ///
-    /// Held apart from the bytes: the JSON is megabytes and expires on [`DIR_TTL`] under a
-    /// byte budget, while the length is eight bytes with no reason to expire, so an
-    /// unchanged document read minutes ago does not flip from 3.4 MB back to 64 MiB in
-    /// `ls -l`.
+    /// Held apart from the bytes: the JSON is large and expires on [`DIR_TTL`] under a
+    /// byte budget, while the length is tiny with no reason to expire, so an unchanged
+    /// document read minutes ago does not flip back to the placeholder in `ls -l`.
     ///
     /// Stamped with `modifiedTime` rather than aged by a clock: an unchanged document keeps
     /// its length indefinitely, and a changed one loses it the moment a listing says so,
@@ -918,8 +881,8 @@ impl GdriveFs {
                 // where plain `-` would wrap in release and ask Drive for the rest of the
                 // file to answer with nothing.
                 let want = r.end.saturating_sub(r.start);
-                // An empty window is not a read: `span` would widen it and fetch 8 MiB
-                // to answer with nothing.
+                // An empty window is not a read: `span` would widen it and fetch a whole
+                // span to answer with nothing.
                 if want == 0 {
                     return Ok(Vec::new());
                 }
@@ -996,10 +959,9 @@ impl FileSystem for GdriveFs {
             // comes back either covers the window or ran out of file.
             //
             // A short answer does not reach a caller as one: through a mount the client
-            // fills the rest out to the length `stat` claimed (measured: a document
-            // over-reported by 152,083 bytes came back from `cat` as exactly the claimed
-            // 60,063,731, tail all `0x00`, and `cp` copies that padding). So a document
-            // fills its own tail below, with a byte JSON can absorb.
+            // fills the rest out to the length `stat` claimed with `0x00`, and `cp` copies
+            // that padding. So a document fills its own tail below, with a byte JSON can
+            // absorb.
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
             // A full window is the common case and needs nothing more.
@@ -1013,19 +975,10 @@ impl FileSystem for GdriveFs {
             // parser throw at the seam.
             //
             // Spaces, broken by a newline every [`PAD_LINE`] bytes. Not all newlines: a
-            // line-oriented tool pays per line, and a 64 MiB tail of newlines is 67
-            // million of them:
-            //
-            //     tail                  jq      grep      sed      awk
-            //      8 MiB  newlines      1.42s    0.49s        -        -
-            //      8 MiB  spaces        0.06s    0.02s        -        -
-            //     64 MiB  newlines     10.98s    3.95s    6.18s    4.59s
-            //     64 MiB  spaces        0.53s    0.15s    0.03s    1.21s
-            //
-            // The periodic newline is what the all-spaces form gives up: it keeps the tail
-            // from being one 64 MB line, which a `readline` hands over as one 64 MB string.
-            // At 4 KiB it costs nothing measurable (jq 0.52s, grep 0.14s) and leaves
-            // `wc -l` a number a reader can look at.
+            // line-oriented tool pays per line, so a tail of newlines makes it slow where
+            // spaces do not. The periodic newline keeps the tail from being one huge line,
+            // which a `readline` would hand over as one huge string; it costs nothing
+            // noticeable and leaves `wc -l` a number a reader can look at.
             //
             // Asked only when the window came back short, so a walk does not pay a second
             // `resolve` per window.
@@ -1052,10 +1005,9 @@ fn entry_size(c: &Child) -> u64 {
         (true, _) => 0,
         (_, Some(n)) => n,
         // A document nobody has read yet (see UNKNOWN_LENGTH_SIZE). A *blob* lands here
-        // only if Drive listed it without a `size`, which it does not do (measured: all
-        // 182 non-native files on one account carried one). For a blob the placeholder
-        // would be wrong, since `read_at` pads only JSON and the kernel zero-fills the
-        // rest of a binary.
+        // only if Drive listed it without a `size`, which it does not do. For a blob the
+        // placeholder would be wrong, since `read_at` pads only JSON and the kernel
+        // zero-fills the rest of a binary.
         (_, None) => UNKNOWN_LENGTH_SIZE,
     }
 }
@@ -1168,8 +1120,8 @@ fn child_from_file(f: &Value) -> Option<Child> {
 ///
 /// A tab that ends up with no values says why: it was never requested, nothing came
 /// back for it, or its cells did not fit the budget. The budget is spent tab by tab
-/// and an oversized one does not consume the remainder — a 20-byte tab after a large
-/// one still fits.
+/// and an oversized one does not consume the remainder, so a small tab after it still
+/// fits.
 fn fold_values(workbook: &mut Value, batch: &Value, requested: &[String]) {
     let mut by_title: HashMap<String, Value> = HashMap::new();
     for vr in batch
@@ -1282,8 +1234,8 @@ fn tab_titles(workbook: &Value) -> Vec<String> {
 ///
 /// Pretty-printed, because that is the form the file is served in: a values array is
 /// rows of columns of short strings, and indenting one puts every cell on its own
-/// line. Measured on a 200x20 grid, that is 1.66x the compact form — so a budget
-/// checked against compact bytes admits a file half again as large as it allows.
+/// line, well past the compact form — so a budget checked against compact bytes would
+/// admit a file much larger than it allows.
 fn served_len(v: &Value) -> u64 {
     struct Counting(u64);
     impl std::io::Write for Counting {
@@ -1365,12 +1317,11 @@ fn shorten_for_tag(name: &str, serves: Serves, tag: &str) -> String {
 /// ordered by id a file's *position* among the ids changes.
 ///
 /// The tag goes in front of the extension, because appending it (`sheet.gsheet.json_1Bxi`)
-/// takes the entry out of every glob a reader would use: measured on a real account, two
-/// of 33 spreadsheets were invisible to `**/*.gsheet.json`.
+/// takes the entry out of every glob a reader would use, such as `**/*.gsheet.json`.
 ///
 /// **Grouped by composition, not by bytes**, because [`same_name`] resolves by composition
-/// and Drive stores whichever spelling the uploader sent (measured: ten composed names
-/// beside four decomposed in one folder). Two spellings of one name are one collision.
+/// and Drive stores whichever spelling the uploader sent, both within one folder. Two
+/// spellings of one name are one collision.
 ///
 /// A group whose ids also end alike takes whole ids, which keeps a tag and a number off
 /// the same name. Numbering remains only as a net for a Drive name already shaped like a
@@ -1394,7 +1345,7 @@ fn disambiguate(children: &mut [Child]) {
                 id_tag(&children[i].id).to_string()
             };
             // Cut with the tag in hand: a group promoted to whole ids needs more room than
-            // the short form (36 bytes more for a 44-char id).
+            // the short form.
             let tagged = shorten_for_tag(&children[i].vfs_name, children[i].serves, &tag);
             children[i].vfs_name = tagged;
         }
@@ -1424,12 +1375,9 @@ fn disambiguate(children: &mut [Child]) {
 
 /// The characters of a Drive id that a tagged name carries: the **last** ones.
 ///
-/// Not the first, because a Drive id is not uniform along its length. The older 28-char
-/// scheme front-loads a shared prefix — on one account, six files carried `0BxO-Nrmd-kR7`,
-/// thirteen identical characters, and of seventeen such ids only ten had a distinct first
-/// eight. Across that account's 205 ids the last eight characters collided *no* times
-/// against eight for the first eight: 28.0 bits of entropy against 17.1 within the legacy
-/// family.
+/// Not the first, because a Drive id is not uniform along its length: the older id scheme
+/// front-loads a prefix shared across many files, so the tail varies far more than the
+/// head.
 ///
 /// Byte-slicing is safe here: a Drive id is `[A-Za-z0-9_-]`, so every character is one
 /// byte and none of them needs sanitizing.
@@ -1493,9 +1441,9 @@ fn unique_name(name: &str, existing: &HashSet<String>) -> String {
 /// One name has two Unicode spellings — `한` is one code point composed or three jamo
 /// decomposed, and Japanese voiced marks likewise — and both arrive here: macOS hands a
 /// lookup the *decomposed* form of whatever a listing returned, and Drive stores whichever
-/// form the uploading client sent (measured: ten composed and four decomposed names in one
-/// folder). A byte comparison would answer `ENOENT` for a name `ls` just printed, for
-/// whichever files happened to be uploaded composed.
+/// form the uploading client sent, both within one folder. A byte comparison would answer
+/// `ENOENT` for a name `ls` just printed, for whichever files happened to be uploaded
+/// composed.
 ///
 /// Bytes first, which settles every ASCII name and most others; composition runs only when
 /// that fails. There is no ASCII shortcut: `NFC("\u{212A}")` (Kelvin sign) is `"K"` and

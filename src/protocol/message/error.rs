@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// `data` is optional extra context; nothing in this protocol requires it.
 ///
-/// `data` is boxed because a [`Bson`] is 112 bytes against 32 for the rest, which would
-/// bloat every `Result<_, Failure>` to 144 bytes. The box allocates only when `data` is
+/// `data` is boxed because a [`Bson`] is several times the size of the rest, which would
+/// bloat every `Result<_, Failure>`. The box allocates only when `data` is
 /// present and is invisible on the wire.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Error {
