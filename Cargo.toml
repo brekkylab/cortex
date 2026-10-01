@@ -1,6 +1,6 @@
 [package]
 name = "virtx"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 description = "Run tasks in disposable Linux VMs from your own code: the environment an agent works in."
 license = "Apache-2.0"
