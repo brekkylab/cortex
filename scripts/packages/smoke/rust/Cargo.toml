@@ -1,0 +1,15 @@
+# The crate as a user takes it: `virtx` from a registry -- `local`, the one the workflow
+# stands up on localhost -- built here, and run.
+[package]
+name = "virtx-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# A workspace of its own, not a member of the repository's.
+[workspace]
+
+[dependencies]
+virtx = { version = "0.1", registry = "local" }
+anyhow = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

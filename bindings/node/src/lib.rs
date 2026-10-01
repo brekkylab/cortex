@@ -1,20 +1,23 @@
 //! Node bindings for virtx, built with napi-rs.
 //!
-//! The shape is virtx's own, spelled in JavaScript: a [`ConsoleClient`](virtx::console::ConsoleClient)
-//! is built by a builder and awaited, a [`Directory`](virtx::fs::Directory) is assembled
-//! and handed to a host mount, a [`Recipe`](virtx::image::Recipe) is a base and its steps,
-//! and an [`ImageClient`](virtx::image::ImageClient) builds one ahead of the session that
-//! runs on it. Names are camelCased and nothing else changes — a caller reading virtx's Rust
-//! documentation should find the same names doing the same things.
+//! The API is virtx's own with camelCased names, so virtx's Rust docs apply. Modules mirror
+//! the crate: [`console`] runs commands in a [`ConsoleClient`](virtx::console::ConsoleClient)
+//! built by a builder and awaited, [`fs`] assembles a [`Directory`](virtx::fs::Directory) for
+//! a host mount, [`image`] covers a [`Recipe`](virtx::image::Recipe) (a base plus steps) and
+//! the [`ImageClient`](virtx::image::ImageClient) that builds it ahead of a session, [`error`]
+//! maps failures to JavaScript errors, and `ensure` fetches the console server.
 //!
-//! One module per half, as in the crate: [`console`] for running commands, [`fs`] for the
-//! trees they see, [`image`] for what they run on and the client that builds it, and [`error`] for how either half's
-//! failures arrive as JavaScript errors.
-
+//! Every call that waits returns a `Promise` settled on napi's tokio runtime, since a stdio
+//! client spawns and reads its server, which needs a reactor. `ConsoleClient` and `ImageClient`
+//! keep their Rust client in an `Arc<Mutex<Option<..>>>` beside the handle of the runtime it
+//! started on: each call clones the `Arc` into its `'static` future, and the lock makes calls
+//! take turns on the one channel, as `&mut self` does in Rust. The Rust client's `Drop` says
+//! `quit` only on a runtime, and a garbage-collection finalizer runs off one, so the last holder
+//! drops it inside the kept runtime: a collected client ends like a closed one, and `close()`
+//! only picks when.
 //!
-//! The modules are public for a binding that links this crate into an addon of its own — see
-//! the `rlib` in `Cargo.toml`. Linking it is all that takes: napi registers every class here
-//! into whichever addon it is linked into.
+//! The modules are public for a binding that links this crate into its own addon (the `rlib` in
+//! `Cargo.toml`). Linking is enough: napi registers every class here into whichever addon links it.
 
 pub mod console;
 #[cfg(feature = "ensure")]

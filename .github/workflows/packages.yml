@@ -1,0 +1,525 @@
+# Build every package virtx is published as -- the Node and Python bindings for every
+# platform, and the Rust crate -- pack them as they would be published, and install and run
+# them the way a user would.
+#
+# Nothing here publishes. The npm packages go to a registry on the test runner's own
+# localhost, so `npm install @brekkylab/virtx` resolves its optional platform packages by
+# os/cpu/libc exactly as it would from npmjs; the wheels are installed with pip choosing one
+# from a directory, as it would choose from PyPI; and the crate is published to
+# cargo-http-registry on localhost, for a project of its own to take `virtx` from and build
+# on each platform, as it would from crates.io.
+#
+# # Platforms
+#
+# | package suffix  | runner            | built                         | the test can                 |
+# |-----------------|-------------------|-------------------------------|------------------------------|
+# | darwin-arm64    | macos-15          | native                        | mount (FUSE-T), fetch, serve |
+# | linux-x64-gnu   | ubuntu-24.04      | `--use-napi-cross`, glibc 2.17 | mount, fetch, serve, boot    |
+# | linux-arm64-gnu | ubuntu-24.04-arm  | `--use-napi-cross`, glibc 2.17 | mount, fetch, serve          |
+# | win32-x64-msvc  | windows-2025      | native                        | load without Dokany, fetch, serve |
+#
+# "serve" is the fetched server answering, and its boot starting far enough to say what it
+# can make -- everything short of a VM. macOS runners are virtual M1s without nested
+# virtualization, the arm64 Linux runners have no /dev/kvm, and the Windows ones have no
+# Hypervisor Platform, so only linux-x64 boots a session.
+#
+# # When it runs, and the server it pins
+#
+# Only for a release: when one is published, or when dispatched with the tag to release.
+# virtx and virtx-uvm are released together, under one version tag, and `resolve`
+# refuses a run that would break that:
+#
+# - the ref has to be a version tag, `vX.Y.Z`, and every manifest here -- the crate, the
+#   bindings' crates, npm's packages, the wheel -- has to say that version;
+# - virtx-uvm has to have released the same tag already, whole: its dist workflow fills
+#   `virtx-uvm/<tag>/` with all four platforms' archives at once, and only once all four
+#   are built, and `resolve` checks the four are there and are of one build.
+#
+# Every package is then built from that tag and pinned to it (`VIRTX_UVM_PINNED_VERSION`,
+# see `src/ensure.rs`), so one version of virtx fetches `virtx-uvm/<tag>/`: the virtx-uvm
+# it was released with, and was tested against here. The crate is compiled by
+# its user rather than here, so it carries the version as a file instead
+# (`virtx-uvm.version`, see `build.rs`).
+name: packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: The version tag to release (vX.Y.Z), the same in brekkylab/virtx-uvm; with build-only, any ref
+        required: true
+      build-only:
+        description: Build and pack every package, and stop -- no test, and no virtx-uvm release needed
+        type: boolean
+        default: false
+
+# One run per tag, and never one cut short: a release that stopped halfway is one nobody can
+# tell from a finished one without looking.
+concurrency:
+  group: packages-${{ github.event.release.tag_name || inputs.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DIST_URL: https://virtx-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com
+  CARGO_TERM_COLOR: always
+  # The tag this run releases: the release's own, or the one it was dispatched with.
+  REF: ${{ github.event.release.tag_name || inputs.ref }}
+  # A dispatch that only builds: whether every package still builds and packs, from any ref,
+  # without a virtx-uvm release to pin -- so unpinned, following `latest` -- and untested.
+  BUILD_ONLY: ${{ inputs.build-only == true }}
+
+jobs:
+  # What this release is, and the virtx-uvm release it pins -- or no release at all.
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      krun: ${{ steps.krun.outputs.krun }}
+    steps:
+      # First, and before any checkout: the tag may be one this repository has not made yet
+      # either, and what to do first is the same then -- release virtx-uvm.
+      - id: krun
+        name: virtx-uvm has released this tag, on every platform
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          if [ "$BUILD_ONLY" = true ]; then
+            echo "build-only: no virtx-uvm release is needed, and none is pinned"
+            echo "krun=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [[ "$REF" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]] \
+            || fail "$REF is not a version tag: a release is tagged vX.Y.Z"
+          # virtx-uvm's dist names a release for its tag only once all four platforms'
+          # archives are up, and all four at once; each carries the sha it was built from.
+          shas=""
+          for p in macos-aarch64 linux-x86_64 linux-aarch64 windows-x86_64; do
+            head=$(curl -fsSI "$DIST_URL/virtx-uvm/$REF/virtx-uvm-$p.tar.gz") \
+              || fail "virtx-uvm has not released $REF for $p: tag it there first, and let its dist workflow finish"
+            sha=$(printf '%s' "$head" | awk 'tolower($1)=="x-amz-meta-sha:"{print $2}' | tr -d '\r')
+            echo "virtx-uvm/$REF/virtx-uvm-$p.tar.gz: ${sha:-no sha}"
+            [ -n "$sha" ] || fail "virtx-uvm/$REF/virtx-uvm-$p.tar.gz says no sha: it was not named by virtx-uvm's dist"
+            shas="$shas $sha"
+          done
+          [ "$(printf '%s\n' $shas | sort -u | wc -l)" -eq 1 ] \
+            || fail "virtx-uvm/$REF holds archives of different builds:$shas"
+          echo "krun=$REF" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - id: resolve
+        name: Every manifest is the tag's version
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          toml() { sed -n 's/^version = "\(.*\)"$/\1/p' "$1" | head -1; }
+          # A build of a ref that is not a version tag is of whatever version its manifests say.
+          if ! [[ "$REF" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]]; then
+            [ "$BUILD_ONLY" = true ] || fail "$REF is not a version tag: a release is tagged vX.Y.Z"
+            version=$(toml Cargo.toml)
+            echo "build-only: $REF is not a version tag; building version $version, as Cargo.toml says"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version=${BASH_REMATCH[1]}
+          json() { node -p "require('./$1').version"; }
+          wrong=""
+          for f in Cargo.toml bindings/node/Cargo.toml bindings/python/Cargo.toml bindings/python/pyproject.toml; do
+            [ "$(toml "$f")" = "$version" ] || wrong="$wrong $f=$(toml "$f")"
+          done
+          for f in bindings/node/package.json bindings/node/npm/*/package.json; do
+            [ "$(json "$f")" = "$version" ] || wrong="$wrong $f=$(json "$f")"
+          done
+          [ -z "$wrong" ] || fail "$REF is version $version, but these manifests say otherwise:$wrong"
+          echo "virtx $version ($REF), pinned to virtx-uvm ${{ steps.krun.outputs.krun || '(none, build-only)' }}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            manylinux: "off"
+          - platform: linux-x64-gnu
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            napi-flags: --use-napi-cross
+            manylinux: "2_17"
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            napi-flags: --use-napi-cross
+            manylinux: "2_17"
+          - platform: win32-x64-msvc
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            manylinux: "off"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      VIRTX_UVM_PINNED_VERSION: ${{ needs.resolve.outputs.krun }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+
+      - name: Node addon
+        working-directory: bindings/node
+        shell: bash
+        run: |
+          npm ci
+          npx napi build --platform --release --target ${{ matrix.target }} ${{ matrix.napi-flags }} --output-dir "$GITHUB_WORKSPACE/dist/node"
+          ls -la "$GITHUB_WORKSPACE/dist/node"
+
+      - name: Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out ${{ github.workspace }}/dist/wheels
+          docker-options: -e VIRTX_UVM_PINNED_VERSION
+
+      # What the addon and the extension need from the loader to be loaded at all. Neither
+      # may need a DLL Windows does not ship: the C runtime is linked in (`.cargo/config.toml`)
+      # and Dokany is delay-loaded, so a host without either still imports the package, and
+      # `mount_support` says what to install.
+      - name: The DLLs each Windows artifact loads
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          readobj="/c/Program Files/LLVM/bin/llvm-readobj.exe"
+          cd dist
+          unzip -oq wheels/*.whl -d wheel
+          for f in node/*.node wheel/virtx/*.pyd; do
+            echo "== $f"
+            "$readobj" --coff-imports "$f" | awk '/^Import \{/{k="load"} /^DelayImport \{/{k="delay"} /Name: .*\.dll/{print "  " k ": " $2}' | sort -u | tee imports.txt
+            if grep -iE "load: (vcruntime|msvcp|dokan)" imports.txt; then
+              echo "::error::$f needs the DLLs above to load"; fail=1
+            fi
+          done
+          exit ${fail:-0}
+
+      - name: The glibc each Linux artifact needs
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cd dist
+          unzip -oq wheels/*.whl -d wheel
+          for f in node/*.node wheel/virtx/*.so; do
+            need=$(objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+            echo "$f needs $need"
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.platform }}
+          path: dist/node/*.node
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+
+  assemble:
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: bindings/node/package-lock.json
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: node-*
+          path: bindings/node/artifacts
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist/wheels
+          merge-multiple: true
+
+      # `napi artifacts` refuses to run unless every configured target has its binary,
+      # which is the gate a release wants: no root package names a platform with nothing
+      # behind it.
+      - name: npm packages
+        working-directory: bindings/node
+        run: |
+          npm ci
+          npx napi artifacts --output-dir artifacts
+          node ../../scripts/packages/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
+          ls -la "$GITHUB_WORKSPACE/dist/npm"
+          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-virtx-${{ needs.resolve.outputs.version }}.tgz package/package.json
+
+      - name: wheels
+        run: |
+          ls -la dist/wheels
+          pipx run twine check --strict dist/wheels/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm/*.tgz
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: dist/wheels/*.whl
+          if-no-files-found: error
+
+  # The crate, packed once: it is source, and each platform's test builds it for itself.
+  crate:
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: crate
+
+      # Not on a build-only run, which pins nothing: without the file, the crate follows `latest`.
+      - name: Pin the server release
+        if: needs.resolve.outputs.krun != ''
+        run: echo "${{ needs.resolve.outputs.krun }}" > virtx-uvm.version
+
+      # Verified as cargo verifies it: the packed source, alone, built. `--allow-dirty` for
+      # `virtx-uvm.version`, written above and in no commit.
+      - name: Pack
+        run: |
+          cargo package --allow-dirty
+          cargo package --list --allow-dirty
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate
+          path: target/package/*.crate
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.platform }})
+    needs: [resolve, assemble, crate]
+    # Not on a build-only dispatch. A release has no inputs, and always tests.
+    if: ${{ !inputs.build-only }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+            mount: "1"
+            server: "1"
+            vm: "0"
+          - platform: linux-x64-gnu
+            runner: ubuntu-24.04
+            mount: "1"
+            server: "1"
+            vm: "1"
+          - platform: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            mount: "1"
+            server: "1"
+            vm: "0"
+          - platform: win32-x64-msvc
+            runner: windows-2025
+            mount: "0"
+            server: "1"
+            vm: "0"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      SMOKE_SERVER: ${{ matrix.server }}
+      SMOKE_VM: ${{ matrix.vm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.REF }}
+          sparse-checkout: |
+            scripts/packages
+            contrib/fuse_t
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/wheels
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: crate
+          path: dist/crate
+
+      - name: Let this user open /dev/kvm
+        if: matrix.vm == '1'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+
+      # A registry on localhost holding only what `assemble` packed. Published with an
+      # explicit --registry and a config of its own: the packages' publishConfig names
+      # npmjs, and nothing here may reach it.
+      - name: Install from a local registry
+        shell: bash
+        run: |
+          cd scripts/packages
+          npx -y verdaccio@6 --config ./verdaccio.yaml --listen 4873 > "$RUNNER_TEMP/verdaccio.log" 2>&1 &
+          for _ in $(seq 60); do curl -sf http://localhost:4873/-/ping >/dev/null && break; sleep 1; done
+          token=$(curl -sf -X PUT -H 'content-type: application/json' \
+            -d '{"name":"ci","password":"ci-local-only"}' \
+            http://localhost:4873/-/user/org.couchdb.user:ci | node -pe 'JSON.parse(require("fs").readFileSync(0)).token')
+          npmrc="$RUNNER_TEMP/npmrc"
+          printf 'registry=http://localhost:4873/\n//localhost:4873/:_authToken=%s\n' "$token" > "$npmrc"
+          for tgz in "$GITHUB_WORKSPACE"/dist/npm/*.tgz; do
+            npm publish "$tgz" --userconfig "$npmrc" --registry http://localhost:4873/
+          done
+          mkdir -p "$RUNNER_TEMP/project" && cd "$RUNNER_TEMP/project"
+          echo '{"name":"project","private":true,"type":"module"}' > package.json
+          npm install @brekkylab/virtx --userconfig "$npmrc" --registry http://localhost:4873/
+          ls node_modules/@brekkylab
+
+      - name: Install the wheel pip picks
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          py="$RUNNER_TEMP/venv/bin/python"; [ -x "$py" ] || py="$RUNNER_TEMP/venv/Scripts/python.exe"
+          "$py" -m pip install --no-index --find-links dist/wheels virtx-py
+          "$py" -m pip show virtx-py
+          echo "SMOKE_PYTHON=$py" >> "$GITHUB_ENV"
+
+      # On macOS, first without FUSE-T, which a user may not have: the import and every
+      # call but a mount must work, and a mount must say what to install.
+      - name: Smoke, without FUSE-T
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          SMOKE_MOUNT: "0"
+        run: |
+          cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
+          "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"
+
+      - name: FUSE-T
+        if: runner.os == 'macOS'
+        run: brew install --cask fuse-t
+
+      # What the shim declares of libfuse-t (`contrib/fuse_t/fuse_t.h`), which is what lets
+      # every build here go without FUSE-T, against FUSE-T's own headers: every layout and
+      # every signature. Here, where FUSE-T is installed anyway, and not in `build`, which
+      # proves the build needs none of it.
+      - name: The shim's libfuse-t matches FUSE-T's headers
+        if: runner.os == 'macOS'
+        run: |
+          command -v pkg-config || brew install pkgconf
+          contrib/fuse_t/check-abi.sh
+
+      - name: Smoke, Node
+        shell: bash
+        env:
+          SMOKE_MOUNT: ${{ matrix.mount }}
+        run: cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
+
+      - name: Smoke, Python
+        shell: bash
+        env:
+          SMOKE_MOUNT: ${{ matrix.mount }}
+        run: '"$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # A registry on localhost holding only the packed crate, published from that archive
+      # as it is, and a project of its own that takes `virtx` from it -- built here, with
+      # this platform's toolchain, as a user's would be. A CARGO_HOME of its own, so that no
+      # crates.io token is within reach, and a VIRTX_HOME of its own, so that
+      # `ensure_virtx` fetches the release the crate pins rather than finding the one the
+      # other smokes left. After FUSE-T, so that on macOS the smoke mounts as well.
+      - name: Smoke, Rust
+        shell: bash
+        env:
+          SMOKE_MOUNT: ${{ matrix.mount }}
+        run: |
+          cargo install --locked --quiet cargo-http-registry
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home" VIRTX_HOME="$RUNNER_TEMP/virtx-home-rust"
+          mkdir -p "$CARGO_HOME" "$RUNNER_TEMP/crate"
+          printf '[registries.local]\nindex = "http://127.0.0.1:35503/git"\n\n[net]\ngit-fetch-with-cli = true\n' > "$CARGO_HOME/config.toml"
+          cargo-http-registry --addr 127.0.0.1:35503 "$RUNNER_TEMP/registry" > "$RUNNER_TEMP/registry.log" 2>&1 &
+          for _ in $(seq 60); do [ -f "$RUNNER_TEMP/registry/config.json" ] && break; sleep 1; done
+
+          # From stdin: GNU tar takes the `D:` of a Windows path for a remote host.
+          (cd "$RUNNER_TEMP/crate" && tar -xzf - < "$(ls "$GITHUB_WORKSPACE"/dist/crate/*.crate)")
+          package=$(ls -d "$RUNNER_TEMP"/crate/*/)
+          (cd "$package" && cargo publish --registry local --no-verify --token local)
+
+          cp -R "$GITHUB_WORKSPACE/scripts/packages/smoke/rust" "$RUNNER_TEMP/smoke-rust"
+          cd "$RUNNER_TEMP/smoke-rust"
+          cargo build --quiet
+          grep -q 'registry+http://127.0.0.1:35503' Cargo.lock \
+            || { echo "::error::virtx did not come from the local registry"; exit 1; }
+          echo "PASS virtx came from the local registry"
+          pin=$(cat "$package/virtx-uvm.version")
+          exe=target/debug/virtx-smoke; [ -f "$exe" ] || exe=$exe.exe
+          grep -aq "$pin" "$exe" \
+            || { echo "::error::the build does not carry the pinned virtx-uvm $pin"; exit 1; }
+          echo "PASS the build fetches virtx-uvm $pin by default"
+          "$exe"
+
+      - name: registry logs
+        if: failure()
+        shell: bash
+        run: |
+          cat "$RUNNER_TEMP/verdaccio.log" || true
+          cat "$RUNNER_TEMP/registry.log" || true

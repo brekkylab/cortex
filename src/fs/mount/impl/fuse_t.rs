@@ -1,29 +1,12 @@
-//! Binds a [`Posix`] to FUSE-T through libfuse-t's lowlevel API. [`FuseTMount`] is the whole of
-//! what it exports.
+//! Binds a [`Posix`] to FUSE-T through libfuse-t's lowlevel API.
 //!
-//! Everything it needs — inode identity, handle lifetime, the readdir cursor, the open
-//! decomposition, the attribute policy, the host errno table — already lives in
-//! [`posix`](crate::fs::filesystem::posix), so what is left here is marshalling.
+//! Inode identity, handle lifetime, the readdir cursor, open decomposition, attributes and the
+//! host errno table live in [`posix`](crate::fs::filesystem::posix); this file only marshals,
+//! through the flat vtable of the C shim in `contrib/fuse_t/`, which owns libfuse-t's structs.
 //!
-//! **Why a binding of its own, rather than `fuser` as on Linux?** They differ in who drives the
-//! session. `fuser` takes the fd from `fuse_mount` and speaks the kernel FUSE protocol over
-//! it itself, which works when that fd is macFUSE's real device. FUSE-T's is a socket to its
-//! own helper, which expects to be driven *by* libfuse-t's loop: hand it to a foreign
-//! protocol reader and the INIT handshake completes, two probes arrive, then the helper hangs
-//! up with no mount appearing. In exchange FUSE-T needs no kernel extension, where macFUSE is
-//! a kext needing reduced-security boot on Apple Silicon.
-//!
-//! **Which mount the kernel ends up with is a choice**, and one this file barely sees. The
-//! helper carries three transports — an NFSv4 server, an SMB server, and an FSKit module
-//! whose extension ships signed inside `fuse-t.app` — and picking one is a mount option (see
-//! [`FuseTBackend`]). Everything below is the same either way: the vtable, the callbacks, and
-//! what the guest is told are decided here, and what carries them is decided there.
-//!
-//! **Why a C shim?** `fuse_lowlevel_ops` has ~50 function pointers with
-//! `__APPLE__`-conditional members, `fuse_file_info` has bitfields, and
-//! `fuse_entry_param` embeds a host `struct stat`. A wrong layout in Rust is silent memory
-//! corruption, not a compile error, so `contrib/fuse_t/shim.c` owns all of them and
-//! exposes a flat vtable of our own design instead.
+//! **Why not `fuser`?** `fuser` speaks the kernel FUSE protocol over the fd from `fuse_mount`
+//! itself. FUSE-T's fd is a socket to its helper, which expects libfuse-t's own loop: with a
+//! foreign reader, INIT completes, two probes arrive, and the helper hangs up with no mount.
 
 use std::{
     ffi::{CStr, CString, OsStr, c_char, c_int, c_long, c_void},
@@ -53,9 +36,8 @@ const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
     create_new: libc::O_EXCL,
 };
 
-/// Mirror of `struct virtx_stat` in `contrib/fuse_t/shim.h`. All fixed-width with an
-/// explicit pad, so keeping the two in step is a matter of reading rather than of trusting
-/// alignment rules.
+/// Mirror of `struct virtx_stat` in `contrib/fuse_t/shim.h`. Fixed-width fields and an
+/// explicit pad, so the layouts match without relying on alignment rules.
 #[repr(C)]
 #[derive(Default)]
 struct VirtxStat {
@@ -97,7 +79,7 @@ fn to_virtx_stat(inode: u64, stat: &Stat) -> VirtxStat {
 }
 
 /// Emits one directory entry, returning non-zero once the kernel's buffer is full.
-/// Implemented on the C side, which owns `fuse_add_direntry`'s accounting.
+/// Implemented in C, which owns `fuse_add_direntry`'s accounting.
 type DirentSink = unsafe extern "C" fn(*mut c_void, u64, *const c_char, u32, u64) -> c_int;
 
 /// Mirror of `struct virtx_fuse_t_ops`. Field order is the contract.
@@ -152,7 +134,7 @@ unsafe extern "C" {
 ///
 /// # Safety
 /// `fs` must be the pointer given to `virtx_fuse_t_mount`, and the `Posix<T>` behind it must
-/// outlive the session — [`FuseTMount`] boxes it and keeps it until after the loop returns.
+/// outlive the session ([`FuseTMount`] keeps it boxed until the loop returns).
 unsafe fn recover<'a, T: FileSystem>(fs: *mut c_void) -> &'a Posix<T> {
     unsafe { &*(fs as *const Posix<T>) }
 }
@@ -165,8 +147,8 @@ fn code(result: io::Result<()>) -> c_int {
     }
 }
 
-// Each callback is generic in `T` and monomorphised per store by `ops_for`, so the
-// filesystem type stays static — no trait object, no downcast.
+// Callbacks are generic in `T` and monomorphised per store by `ops_for`: no trait object, no
+// downcast.
 
 unsafe extern "C" fn lookup<T: FileSystem>(
     fs: *mut c_void,
@@ -196,9 +178,7 @@ unsafe extern "C" fn getattr<T: FileSystem>(
     }))
 }
 
-/// The `fh` the shim passes is dropped. A resize names a path either way, and the inode
-/// arriving beside it is already that path — there is no per-handle state a store keeps
-/// that a file handle could reach instead.
+/// `fh` is ignored: the inode already names the path, and stores keep no per-handle state.
 unsafe extern "C" fn setattr<T: FileSystem>(
     fs: *mut c_void,
     inode: u64,
@@ -346,9 +326,8 @@ unsafe extern "C" fn rmdir<T: FileSystem>(
     code(super::block_on(fs.rmdir_child(parent, name)))
 }
 
-/// No flags parameter, because libfuse-t's `rename` has none — so
-/// `RENAME_NOREPLACE`/`RENAME_EXCHANGE` never reach this binding and there is nothing here
-/// to refuse.
+/// No flags: libfuse-t's `rename` has none, so `RENAME_NOREPLACE`/`RENAME_EXCHANGE` never
+/// arrive.
 unsafe extern "C" fn rename<T: FileSystem>(
     fs: *mut c_void,
     parent: u64,
@@ -376,8 +355,7 @@ unsafe extern "C" fn readdir<T: FileSystem>(
         inode,
         offset,
         |child_inode, child, cursor| {
-            // An interior NUL cannot be handed to C, and cannot have come from a
-            // well-behaved store either.
+            // An interior NUL cannot go to C, and no well-behaved store produces one.
             let name = CString::new(child.name.as_bytes())
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidFilename))?;
             let stop = unsafe {
@@ -424,10 +402,8 @@ fn ops_for<T: FileSystem>() -> Ops {
     }
 }
 
-/// What the mount reports as its source — the name `df` and Finder show.
-///
-/// Fixed, because nothing has wanted another one, and a `CStr` literal so there is neither
-/// an allocation nor an invalid-name case to answer for.
+/// The mount's source name, as `df` and Finder show it. A `CStr` literal, so there is no
+/// allocation or invalid-name case.
 const FSNAME: &CStr = c"virtx";
 
 /// How long to wait for FUSE-T to finish mounting. Generous: the helper has to start,
@@ -439,35 +415,28 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// already been accepted. Short: this is bookkeeping settling, not work being done.
 const UNMOUNT_SETTLE: Duration = Duration::from_secs(3);
 
-/// How long a drop waits for the serving thread to notice that its channel is gone.
-///
-/// Generous, because overrunning it costs a leaked session and a leaked thread — but
-/// bounded, because the alternative is a destructor that never returns. A loop that
-/// has not come back in this long is not going to.
+/// How long a drop waits for the serving thread to notice its channel is gone. Generous, since
+/// overrunning leaks the session and thread; bounded, so the destructor always returns.
 const LOOP_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Which of FUSE-T's transports serves the mount.
 ///
-/// The helper carries all three and the choice is one mount option, so nothing on this side
-/// changes with it: the same vtable answers the same requests, and what differs is what the
-/// kernel thinks it is talking to.
+/// A single mount option; the same vtable serves every transport, and only what the kernel
+/// talks to differs.
 ///
-/// Not passed at all by [`FuseTMount::try_new`], which leaves the choice to FUSE-T's own
-/// `fuse-t.ini`. Naming one here overrides that, so a caller should only do it when the
-/// difference is the point.
+/// [`FuseTMount::try_new`] passes none, leaving the choice to `fuse-t.ini`; naming one
+/// overrides that.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FuseTBackend {
-    /// An NFSv4 server in FUSE-T's helper, which the kernel mounts as an NFS client. The
-    /// original design, and what `fuse-t.ini` defaults to.
+    /// An NFSv4 server in FUSE-T's helper, mounted as an NFS client. The `fuse-t.ini` default.
     Nfs,
 
-    /// FUSE-T's FSKit module — macOS 15's file-system extension framework, with the extension
-    /// shipped and signed inside `fuse-t.app` rather than built here.
+    /// FUSE-T's FSKit module (macOS 15's file-system extension framework), shipped signed
+    /// inside `fuse-t.app`.
     ///
-    /// The reason this is a mount option and not a binding of its own: implementing FSKit
-    /// directly would mean a Swift app extension, its entitlement, and a filesystem living in
-    /// a process the system launches rather than in the one that mounted. FUSE-T's helper has
-    /// already paid all of that, and bridges its own RPC to the extension.
+    /// A mount option rather than a binding: direct FSKit needs a Swift app extension, its
+    /// entitlement, and a filesystem in a system-launched process. FUSE-T's helper already
+    /// has those and bridges its RPC to the extension.
     FsKit,
 
     /// An SMB server in the helper, mounted as an SMB client.
@@ -488,16 +457,14 @@ impl FuseTBackend {
 /// The session pointer, sent to the serving thread.
 ///
 /// # Safety
-/// Touched only by the serving thread and by [`FuseTMount`]'s `Drop`, which runs after that thread
-/// is joined — never from two threads at once.
+/// Touched only by the serving thread and by [`FuseTMount`]'s `Drop`, which frees it only
+/// after that thread is joined.
 struct SessionPtr(*mut c_void);
 unsafe impl Send for SessionPtr {}
 
 impl SessionPtr {
-    /// Reached through a method, not the field, so a `move` closure captures the whole
-    /// wrapper. Since Rust 2021 a closure captures only the fields it names, and naming `.0`
-    /// directly would capture the bare `*mut c_void` — which is not `Send`, defeating the
-    /// wrapper entirely.
+    /// A method so a `move` closure captures the whole `Send` wrapper: since Rust 2021, naming
+    /// `.0` would capture only the bare, non-`Send` `*mut c_void`.
     fn get(&self) -> *mut c_void {
         self.0
     }
@@ -505,71 +472,49 @@ impl SessionPtr {
 
 /// A live FUSE-T mount: constructing one mounts, dropping it unmounts.
 ///
-/// The whole call surface of this binding, and a guard rather than a handle — there is no way
-/// to hold a mounted filesystem without holding the thing that takes it down, and no way to
-/// reach the inode numbers or the open files behind it, which stay the binding's own.
-///
-/// **Not** generic in the store, though [`try_new`](Self::try_new) is. The store's type is
-/// what makes the vtable typed — `ops_for::<T>` monomorphises every callback so `recover` can
-/// reach a `Posix<T>` with no downcast — and that is all decided while the mount is being
-/// made. Afterwards nothing here needs the type back, so carrying it would only spread a
-/// parameter onto everything that holds a mount.
+/// **Not** generic in the store, though [`try_new`](Self::try_new) is: the type only matters
+/// for building the vtable, so carrying it would spread a parameter onto every holder.
 pub struct FuseTMount {
     session: *mut c_void,
 
-    /// `None` once [`join`](Self::join) has taken it, which is how `Drop` knows not to wait
-    /// for a thread that has already been collected.
+    /// `None` once [`join`](Self::join) collected it, so `Drop` does not wait again.
     thread: Option<JoinHandle<c_int>>,
 
     mountpoint: PathBuf,
 
-    /// The filesystem, owned and never looked at again: the shim keeps a raw pointer into it
-    /// and the serving thread dereferences that on every request, so something has to keep it
-    /// alive for the life of the mount.
+    /// Kept alive for the mount's life because the shim holds a raw pointer into it that the
+    /// serving thread dereferences on every request.
     ///
-    /// A struct's fields go after its own `drop` body, so on the ordinary path this is freed
-    /// once `destroy` has returned and no request can reach it. `Drop` takes it out of the
-    /// `Option` and forgets it on the one path where the serving thread outlived its
-    /// deadline: the loop still holds the shim's pointer into this, and freeing it there is
-    /// the same use-after-free the leaked session avoids.
+    /// Fields drop after the `drop` body, so normally this is freed after `destroy`. If the
+    /// serving thread outlived its deadline, `Drop` forgets it instead, since the loop still
+    /// holds the pointer.
     ///
-    /// `dyn Send + Sync` rather than `dyn Any`: the two erase equally well, and this one does
-    /// not also advertise a downcast nothing should ever perform.
+    /// `dyn Send + Sync`, not `dyn Any`, so it does not advertise a downcast.
     _fs: Option<Box<dyn Send + Sync>>,
 
-    /// This process's ownership of the mount point — what an opt-in
-    /// [`unmount_on_signal`](crate::fs::unmount_on_signal) reads now, and what a later run's
-    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) reads if this one is killed. Held
-    /// rather than read: dropping it is what gives the mount point up.
+    /// Names the mount point to [`unmount_on_signal`](crate::fs::unmount_on_signal) and, if
+    /// this process is killed, to a later run's [`reclaim_abandoned`].
     _claim: Claim,
 }
 
 impl FuseTMount {
-    /// Mount `fs` at `mountpoint`, serve it from a background thread, and return once the
-    /// mount is real.
+    /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
     /// `mountpoint` must already exist and be empty. Requires FUSE-T
-    /// (`brew install --cask fuse-t`) — no kernel extension, no reboot.
+    /// (`brew install --cask fuse-t`).
     ///
-    /// **Blocks until the mount is real**, which is not the same as until it is made: FUSE-T's
-    /// `fuse_mount` hands back a session as soon as it has one, but the kernel finishes
-    /// attaching it only once the thread below has answered the helper's opening
-    /// INIT/STATFS/GETATTR. A caller that touched the path in that window would see the bare
-    /// directory underneath, or block on a half-built mount — so the waiting happens here,
-    /// once, instead of in every caller.
+    /// **Blocks until the mount is real.** `fuse_mount` returns early, but the kernel
+    /// attaches it only after the serving thread answers the helper's opening
+    /// INIT/STATFS/GETATTR; touching the path before then would see the bare directory or
+    /// block on a half-built mount.
     ///
-    /// Which transport serves it is FUSE-T's own choice, from `fuse-t.ini`. Use
-    /// [`try_new_with`](Self::try_new_with) to name one.
-    ///
-    /// `'static`, because the store is served from that thread for as long as the mount
-    /// lives.
+    /// The transport comes from `fuse-t.ini`; [`try_new_with`](Self::try_new_with) names one.
+    /// `'static` because the store is served from that thread for the mount's lifetime.
     pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
         Self::mount(fs, mountpoint, std::ptr::null())
     }
 
-    /// [`try_new`](Self::try_new), with the transport named rather than configured.
-    ///
-    /// The only thing this changes is what the kernel is talking to — see [`FuseTBackend`].
+    /// [`try_new`](Self::try_new) with the transport named; see [`FuseTBackend`].
     pub fn try_new_with<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
@@ -578,27 +523,22 @@ impl FuseTMount {
         Self::mount(fs, mountpoint, backend.option().as_ptr())
     }
 
-    /// The two above, differing only in whether they name a backend. `backend` is a C string
-    /// or null, which is what the shim reads as "leave it to FUSE-T".
+    /// `backend` is a C string, or null to leave the choice to FUSE-T.
     fn mount<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
         backend: *const c_char,
     ) -> io::Result<Self> {
-        // First, before anything below reaches the shim: without FUSE-T every libfuse-t
-        // function it calls is a weak import that resolved to null.
+        // Before anything reaches the shim: without FUSE-T its `dlsym` pointers are null.
         crate::fs::mount_support()?;
 
-        // What a `SIGKILL`ed run left behind is nobody's but the next run's, and this
-        // is the next run. Only mounts whose owning process is gone are touched, so a
-        // sibling instance keeps its own.
+        // Clears mounts a `SIGKILL`ed run left; live siblings' mounts are untouched.
         reclaim_abandoned();
 
         let c_mountpoint = CString::new(mountpoint.as_os_str().as_bytes())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidFilename))?;
 
-        // Boxed and never moved again, so the pointer the shim keeps stays valid for as long
-        // as the mount lives.
+        // Boxed and never moved, so the shim's pointer stays valid for the mount's life.
         let fs: Box<Posix<T>> = Box::new(Posix::new(fs));
         let fs_ptr = &*fs as *const Posix<T> as *mut c_void;
         let ops = ops_for::<T>();
@@ -625,14 +565,12 @@ impl FuseTMount {
             .name("virtx-fuse-t".into())
             .spawn(move || unsafe { virtx_fuse_t_loop(sendable.get()) })
             .inspect_err(|_| {
-                // The one failure no guard can clean up after, because it is what keeps the
-                // guard from existing: nothing is serving, so tear the mount back down here
-                // rather than leave it wedged.
+                // No guard exists yet to clean up, and nothing is serving, so tear down here
+                // rather than leave the mount wedged.
                 unsafe { virtx_fuse_t_destroy(session) };
             })?;
 
-        // From here on the guard exists, so every way out of this function unmounts by
-        // dropping it — including the `Err` below, which needs no cleanup of its own.
+        // From here every exit, including the `Err` below, unmounts by dropping the guard.
         let mount = FuseTMount {
             session,
             thread: Some(thread),
@@ -652,19 +590,11 @@ impl FuseTMount {
         Ok(mount)
     }
 
-    /// Serve until the mount goes away, then take it down.
+    /// Serve until something else ends the mount (`umount`, `diskutil unmount`, or the helper
+    /// dying). **It does not unmount**; to end the mount, drop the guard.
     ///
-    /// For a program whose whole job is the mount: `try_new` puts it up without blocking, and
-    /// this waits for something else to end it — `umount`, `diskutil unmount`, or a helper
-    /// that dies. **It does not unmount**, so a caller with other work to do drops the guard
-    /// instead of joining it.
-    ///
-    /// The thread is taken out here, so the `Drop` that follows skips the join it has already
-    /// done and goes straight to releasing the session.
-    ///
-    /// `Err` is the serving loop ending badly, or its thread having panicked — which cannot
-    /// be told apart from a normal exit any other way, since a panic in an `extern "C"`
-    /// callback aborts and never reaches this.
+    /// `Err` if the serving loop ended badly or its thread panicked. (A panic in an
+    /// `extern "C"` callback aborts instead.)
     pub fn join(mut self) -> io::Result<()> {
         let Some(thread) = self.thread.take() else {
             return Ok(());
@@ -684,14 +614,10 @@ impl FuseTMount {
 
     /// Poll until the mountpoint is a mount point, or give up.
     ///
-    /// Decided the unix way — a directory whose device id differs from its parent's has
-    /// something mounted on it — which holds whatever the mount is. That matters here: what a
-    /// FUSE-T mount *is* depends on the backend serving it, and none of the three is a FUSE
-    /// mount, so a test that looked for one would answer differently per transport.
+    /// A device id differing from the parent's means something is mounted, whichever backend
+    /// serves it (none of them is a FUSE mount).
     ///
-    /// Sleeps between polls, so this holds whichever thread mounted for as long as FUSE-T
-    /// takes — a few polls in practice, and the timeout only when something is wrong. A caller
-    /// that cannot give up a thread for that mounts from one it can spare.
+    /// Sleeps between polls, holding the mounting thread; usually a few polls.
     fn wait_until_mounted(&self, timeout: Duration) -> bool {
         use std::os::unix::fs::MetadataExt;
 
@@ -715,72 +641,41 @@ impl FuseTMount {
     }
 }
 
-/// Nothing to arrange: the guard already is the mount, and already knows where it is.
 impl Mount for FuseTMount {
     fn mountpoint(&self) -> &Path {
         &self.mountpoint
     }
 }
 
-/// The session pointer is what keeps these from being derived, and it is not what makes the
-/// guard shareable or movable.
+/// Not derived only because of the session pointer. [`Mount`] requires both.
 ///
 /// # Safety
-/// Nothing reachable through `&FuseTMount` touches the pointer: the trait above reads
-/// `mountpoint` and there is no other method on a shared borrow, so no amount of sharing can
-/// produce a second caller into libfuse-t. The pointer is used by exactly two things — the
-/// serving thread, which was handed it at `mount` and holds it alone, and `Drop`, which has
-/// `&mut self` and so runs after every borrow is gone and joins that thread before releasing
-/// the session.
-///
-/// Which thread that `Drop` runs on does not matter, and already does not: the loop is spawned
-/// onto a thread of its own while the caller keeps the guard, so unmount and destroy were
-/// never called from the thread doing the serving.
-///
-/// [`Mount`] requires both, and a mount that could not be shared or sent would be one a task
-/// could not hold — which is what a mount is *for* here.
+/// Nothing reachable through `&FuseTMount` touches the pointer. Only the serving thread
+/// (handed it at `mount`) and `Drop` (`&mut self`, joining that thread before releasing the
+/// session) use it. `Drop` never runs on the serving thread, so which thread it runs on does
+/// not matter.
 unsafe impl Send for FuseTMount {}
 unsafe impl Sync for FuseTMount {}
 
 impl Drop for FuseTMount {
-    /// Unmount → stop the loop → join → unmount again if it was busy → release the session,
-    /// in that order and at most once.
+    /// Unmount, stop the loop, join, unmount again if it was busy, release the session; in
+    /// that order and at most once.
     ///
-    /// The unmount is attempted twice on purpose. The first is while the mount is still being
-    /// served, so anything the kernel has cached can be written back and a plain `umount`
-    /// refuses rather than pulls the tree out from under a reader. The second is after the
-    /// loop has stopped, which is what makes a reader let go — a mount with traffic on it
-    /// answers the first attempt with `EBUSY` and the second without complaint.
+    /// Two unmounts on purpose: the first runs while still served, so cached writes flush and
+    /// a busy mount refuses (`EBUSY`) rather than being pulled from under a reader; the second
+    /// runs after the loop stops, which makes readers let go.
     ///
-    /// # Why the unmount does not go through libfuse-t
+    /// # Why not `fuse_unmount`
     ///
-    /// `fuse_unmount` cannot be called while a second mount is alive in this process.
-    /// libfuse-t keeps the FUSE-T helper's pid in one process-global slot (`_cpid`, written by
-    /// `fuse_mount_core` after its `fork`) and `fuse_kern_unmount` ends in a *blocking*
-    /// `waitpid` on whatever is in it. Every mount overwrites the slot, so an unmount waits on
-    /// whichever session mounted last — a helper that is still serving and will not exit until
-    /// its own mount goes. With two mounts up, `drop(a); drop(b)` therefore never reaches the
-    /// second line: both teardowns sit in `wait4` while the mounts stay in the table.
-    /// `_mount_wait_thread`, joined a few instructions later, is a single global in the same
-    /// way. The whole path is written for one mount per process, and virtx mounts one per
-    /// session.
+    /// It breaks with two mounts in one process: libfuse-t keeps the helper's pid in one global
+    /// (`_cpid`, overwritten by every mount) and `fuse_kern_unmount` blocks in `waitpid` on it,
+    /// so `drop(a)` waits on `b`'s helper, which will not exit until its own mount goes. So
+    /// unmounting is a bounded `umount` in a child process; the rest is per-session: the shim
+    /// ends the loop, this joins its thread, the shim frees the session.
     ///
-    /// So the mount comes down the way a mount whose owner is *gone* has to come down anyway
-    /// — `umount`, in a child process, bounded. That is one mechanism for both a guard's own
-    /// teardown and [`reclaim_abandoned`](crate::fs::reclaim_abandoned), and it depends on
-    /// nothing libfuse-t keeps in a global.
+    /// Every step is bounded; a mount refusing both attempts is reported on stderr.
     ///
-    /// What is left for the shim is releasing the session that was serving it, which is
-    /// per-session and safe: end the loop, join its thread, free.
-    ///
-    /// The contract is unchanged — the mount is taken down here and there is still no
-    /// `unmount` to call. What this cannot promise is that the kernel agreed: every step is
-    /// bounded, so a mount that refuses both rungs of the ladder with nothing serving it
-    /// leaves this returning anyway, having said so on stderr. The alternative is a
-    /// destructor that never returns, which is the bug above wearing different clothes.
-    ///
-    /// Nothing here panics. A `Drop` that panics mid-unwind aborts the process, which in a
-    /// failing test replaces the real assertion with a bare abort.
+    /// Never panics: a panic mid-unwind aborts, hiding a failing test's real assertion.
     fn drop(&mut self) {
         if self.session.is_null() {
             return;
@@ -788,43 +683,36 @@ impl Drop for FuseTMount {
         let session = std::mem::replace(&mut self.session, std::ptr::null_mut());
         let mountpoint = resolved(&self.mountpoint);
 
-        // First while the mount is still being served, so an unmount that has to flush a
-        // cached write still has something to flush it to.
+        // While still served, so a cached write can flush.
         let was_busy = !unmount_under(&mountpoint);
 
-        // Then stop serving, whether or not that worked. It is what releases anything still
-        // reading through the mount, and a caller that has dropped the guard has already
-        // said the mount is over.
+        // Stop serving regardless; that releases anything still reading through the mount.
         unsafe { virtx_fuse_t_stop(session) };
 
-        // Joined before the session is freed, because the loop reads it — and joined with a
-        // deadline, because a thread that did not notice the shutdown must not become a hang
-        // in a destructor. The session is then deliberately leaked: freeing it under a live
-        // loop is a use-after-free, and a leaked allocation is the cheaper of the two.
+        // Joined before freeing the session, which the loop reads, with a deadline so a stuck
+        // thread cannot hang the destructor. On overrun the session is leaked, since freeing
+        // it under a live loop is a use-after-free.
         let collected = match self.thread.take() {
             Some(thread) if thread_ends(&thread, LOOP_EXIT_TIMEOUT) => {
                 let _ = thread.join();
                 true
             }
             Some(_) => false,
-            // Already collected by `join`, so there was nothing to wait for.
+            // Already collected by `join`.
             None => true,
         };
 
-        // A mount that was busy a moment ago is not busy now that nothing is being served
-        // through it, so the rungs that refused the first time are worth one more try.
+        // Nothing is served now, so a mount that was busy is worth one more try.
         let left = if was_busy {
             unmount_under(&mountpoint);
-            // Polled rather than read once: a forceful unmount is *accepted* before the
-            // table catches up, so a single read here reports a mount that is already on
-            // its way out. That report would be a false alarm on every busy teardown.
+            // Polled: the table lags an accepted forceful unmount, so one read would falsely
+            // report every busy teardown.
             settle(&mountpoint, UNMOUNT_SETTLE)
         } else {
             Vec::new()
         };
 
-        // Reported rather than propagated, and never a panic: what is left is left for
-        // someone to clear by hand, so saying so is the least this can do.
+        // Reported, not propagated: what is left must be cleared by hand.
         for survivor in left {
             eprintln!(
                 "virtx: {} would not unmount — take it down by hand",
@@ -837,8 +725,7 @@ impl Drop for FuseTMount {
                  leaving its session and filesystem allocated",
                 self.mountpoint.display()
             );
-            // Leaked with it: the loop dereferences the shim's pointer into the filesystem on
-            // every request, and it is still running.
+            // Leaked too: the still-running loop dereferences the shim's pointer into it.
             std::mem::forget(self._fs.take());
             return;
         }
@@ -846,11 +733,8 @@ impl Drop for FuseTMount {
     }
 }
 
-/// Wait for the mount table to stop naming anything at `mountpoint`, and report whatever it
-/// still names when the time is up.
-///
-/// Empty is the good answer. Anything else is a mount that has had both rungs of the ladder
-/// aimed at it, with nothing serving it, and is still there.
+/// Wait for the mount table to stop naming anything at `mountpoint`; returns what it still
+/// names at the deadline (empty on success).
 fn settle(mountpoint: &Path, timeout: Duration) -> Vec<PathBuf> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -864,8 +748,7 @@ fn settle(mountpoint: &Path, timeout: Duration) -> Vec<PathBuf> {
 
 /// Whether `thread` finishes inside `timeout`.
 ///
-/// Polled, because `JoinHandle::join` has no timed form and the whole point here is to not
-/// wait forever on one.
+/// Polled, because `JoinHandle::join` has no timed form.
 fn thread_ends(thread: &JoinHandle<c_int>, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while !thread.is_finished() {

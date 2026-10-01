@@ -1,13 +1,11 @@
-//! napi's link setup, and delay-loading `dokan2.dll` when the `mount` feature is on for a
-//! Windows MSVC target.
+//! napi's link setup, plus delay-loading `dokan2.dll` for Windows MSVC with the `mount` feature.
 //!
-//! virtx's own `build.rs` asks for the delay-load, but a `rustc-link-arg` applies only to
-//! the targets of the package that printed it — so a dependent that is itself linked, as
-//! this cdylib is, has to ask again. Without it `require` fails in the loader on a host
-//! without Dokany, including for the callers that never mount; with it the DLL is loaded
-//! by the first mount, which `virtx::fs::mount_support` checks for first.
+//! virtx's `build.rs` asks for the delay-load too, but `rustc-link-arg` applies only to the
+//! printing package's targets, so this cdylib must ask again. Without it `require` fails in the
+//! loader on hosts without Dokany, even for callers that never mount; with it the DLL loads at
+//! the first mount, which `virtx::fs::mount_support` checks for first.
 //!
-//! macOS needs nothing here: the FUSE-T shim opens libfuse-t itself, at run time.
+//! macOS needs nothing: the FUSE-T shim opens libfuse-t itself at run time.
 fn main() {
     napi_build::setup();
     if std::env::var_os("CARGO_FEATURE_MOUNT").is_some()

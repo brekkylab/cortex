@@ -1,35 +1,4 @@
-//! Writing one value's members into an object somebody else already opened.
-//!
-//! A JSON-RPC object is flat: `method` and `params` are siblings of `jsonrpc` and `id`,
-//! not members of something nested under them. A derived [`Serialize`] is not flat — it
-//! opens an object of its own and writes into that. [`FlatMapSerializer`] is the join
-//! between the two: a [`Serializer`] that accepts exactly the values with members to
-//! give — a map or a struct — and forwards each entry into a [`SerializeMap`] that is
-//! already being filled.
-//!
-//! What that buys is where a shape gets to be declared. [`Call`](super::super::Call)
-//! says what it puts on the wire with an attribute on itself, which is the one place a
-//! reader looks for it, and still lands beside `jsonrpc` rather than under a member.
-//! Without this, the choice would be between a wire that nests to suit serde and a
-//! hand-written arm per method in the envelope.
-//!
-//! serde has one of these and keeps it in `__private`, which is the whole reason this
-//! module exists. It is not a reimplementation of anything subtle: two traits forwarding
-//! to a parent, and every other shape refused.
-//!
-//! # Why the rest is an error
-//!
-//! A number, a string or a sequence has no members, so there is nothing it could
-//! contribute to an open object. Each is a method here that returns an error rather than
-//! one that quietly nests, because a type reaching one cannot be written flat at all —
-//! and a silent nesting would put it on the wire in a shape nothing is looking for.
-//!
-//! # Nothing is buffered
-//!
-//! Entries stream into the parent as the derive produces them. The alternative — build
-//! the value into a document, then take it apart into the parent — costs a full copy of
-//! whatever it carried, and what this channel carries is up to [`MAX_PAYLOAD`](super::super::MAX_PAYLOAD) of file
-//! or output bytes.
+//! Writing one value's members into an object someone else already opened.
 
 use serde::{
     Serialize, Serializer,
@@ -38,8 +7,16 @@ use serde::{
 
 /// Writes a value's members into `.0` rather than into an object of its own.
 ///
-/// Held as `&mut` because the parent keeps filling its object afterwards: an `id` is
-/// already in there, and the envelope's `end` is still to come.
+/// A JSON-RPC object is flat (`method` and `params` sit beside `jsonrpc` and `id`), but a
+/// derived [`Serialize`] opens its own object; forwarding each entry into the open
+/// [`SerializeMap`] lets [`Call`](super::super::Call) declare its wire shape with serde
+/// attributes and still land flat. serde's equivalent is in `__private`.
+///
+/// Only a map or struct is accepted: any other shape has no members, and nesting it would
+/// be a shape nothing reads. Entries stream straight into the parent; building a document
+/// first would copy up to [`MAX_PAYLOAD`](super::super::MAX_PAYLOAD) of payload.
+///
+/// `&mut` because the parent keeps writing into its object and ends it itself.
 pub struct FlatMapSerializer<'a, M>(pub &'a mut M);
 
 /// What every shape that is not a map or a struct gets.
@@ -47,9 +24,7 @@ fn not_flat<E: ser::Error>() -> E {
     E::custom("only a map or a struct has members to write into an open object")
 }
 
-/// The one-line refusals, which are the bulk of [`Serializer`] and say nothing
-/// individually. Spelled by a macro so that what is written out is what does
-/// something.
+/// The one-line refusals that make up most of [`Serializer`].
 macro_rules! refuse {
     ($($method:ident($($arg:ty),*);)*) => {
         $(fn $method(self $(, _: $arg)*) -> Result<Self::Ok, Self::Error> {
@@ -62,8 +37,7 @@ impl<'a, M: SerializeMap> Serializer for FlatMapSerializer<'a, M> {
     type Ok = ();
     type Error = M::Error;
 
-    /// Both are the same forwarder: a struct's fields and a map's entries are the
-    /// same thing once they are in the parent's object.
+    /// One forwarder: struct fields and map entries are the same once in the parent.
     type SerializeMap = FlatMap<'a, M>;
     type SerializeStruct = FlatMap<'a, M>;
 
@@ -94,17 +68,12 @@ impl<'a, M: SerializeMap> Serializer for FlatMapSerializer<'a, M> {
         serialize_unit_variant(&'static str, u32, &'static str);
     }
 
-    /// A map is what this is for: its entries are the parent's.
-    ///
-    /// The length is dropped rather than passed on — the parent's object was opened
-    /// with a length of its own, and is longer than this by whatever it had already
-    /// written.
+    /// The length is dropped: the parent's object already holds other entries.
     fn serialize_map(self, _len: Option<usize>) -> Result<FlatMap<'a, M>, M::Error> {
         Ok(FlatMap(self.0))
     }
 
-    /// A struct is a map whose keys are known at compile time, and flattens the
-    /// same. This is the one a derive reaches for.
+    /// What a derive reaches for; flattens like a map.
     fn serialize_struct(
         self,
         _name: &'static str,
@@ -118,8 +87,7 @@ impl<'a, M: SerializeMap> Serializer for FlatMapSerializer<'a, M> {
         value.serialize(self)
     }
 
-    /// Transparent for the same reason: a newtype struct is its inner value with a
-    /// name on it, and the name is not a member.
+    /// Transparent: the newtype's name is not a member.
     fn serialize_newtype_struct<T: ?Sized + Serialize>(
         self,
         _name: &'static str,
@@ -128,10 +96,9 @@ impl<'a, M: SerializeMap> Serializer for FlatMapSerializer<'a, M> {
         value.serialize(self)
     }
 
-    /// Not transparent, unlike the two above: a newtype *variant* is a member — the
-    /// variant name keys the value — so which member it should become is a question
-    /// this cannot answer. An enum meant to flatten says so with `tag` and `content`
-    /// and arrives at [`serialize_struct`](Self::serialize_struct) instead.
+    /// Refused: the variant name would key the value, so there is no member set to
+    /// flatten. An enum meant to flatten uses `tag` and `content` and arrives at
+    /// [`serialize_struct`](Self::serialize_struct).
     fn serialize_newtype_variant<T: ?Sized + Serialize>(
         self,
         _name: &'static str,
@@ -179,10 +146,9 @@ impl<'a, M: SerializeMap> Serializer for FlatMapSerializer<'a, M> {
     }
 }
 
-/// The parent's object, being written into by somebody who thinks it is their own.
+/// The parent's object, written into as if it were the child's own.
 ///
-/// `end` closes nothing, which is the whole of what makes this flat: the object
-/// stays open for whoever opened it, and only they may end it.
+/// `end` closes nothing: only the parent may end its object.
 pub struct FlatMap<'a, M>(&'a mut M);
 
 impl<M: SerializeMap> SerializeMap for FlatMap<'_, M> {
@@ -214,8 +180,7 @@ impl<M: SerializeMap> SerializeStruct for FlatMap<'_, M> {
         self.0.serialize_entry(key, value)
     }
 
-    /// A skipped field is one the parent never hears about — which is how a variant
-    /// carrying nothing gets no `params` rather than a null one.
+    /// A skipped field is omitted, not written as a null member.
     fn skip_field(&mut self, _key: &'static str) -> Result<(), M::Error> {
         Ok(())
     }

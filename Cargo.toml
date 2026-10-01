@@ -2,47 +2,58 @@
 name = "virtx"
 version = "0.1.0"
 edition = "2024"
+description = "Run tasks in disposable Linux VMs from your own code: the environment an agent works in."
+license = "Apache-2.0"
+repository = "https://github.com/brekkylab/virtx"
+readme = "README.md"
+keywords = ["vm", "sandbox", "agent", "fuse", "microvm"]
+categories = ["virtualization", "filesystem", "development-tools"]
+# What a dependent builds, and nothing it does not: the bindings are packages of their own,
+# and CI's scripts and settings are this repository's. `virtx-uvm.version` is the server
+# release a published crate fetches by default -- see `build.rs` -- and is written by the
+# workflow that packs it, so a checkout has none.
+include = [
+    "/src/**",
+    "/build.rs",
+    "/contrib/**",
+    "/examples/**",
+    "/README.md",
+    "/LICENSE",
+    "/virtx-uvm.version",
+]
 
-# The bindings are members so that they build against this crate in the same target
-# directory and lockfile. A `cargo build` or `cargo test` here still builds only `virtx`:
-# the root package is the default member.
+# Members share this crate's target directory and lockfile. A bare `cargo build`/`cargo test`
+# still builds only `virtx`, the default member.
 [workspace]
 members = ["bindings/node", "bindings/python"]
 
 [build-dependencies]
-# Compile `contrib/fuse_t/shim.c` for the `mount` feature on macOS. Only used then, but
-# build-dependencies cannot themselves be optional.
+# Compile `contrib/fuse_t/shim.c` for `mount` on macOS, and read where FUSE-T keeps its
+# library if installed (preferred, not needed).
 cc = "1"
 pkg-config = "0.3"
 
 [dependencies]
 anyhow = "1"
-# The console wire. The protocol's shape needs a *self-describing* codec — `params`
-# and `result` are typed by a method that may arrive after them, and `result` xor
-# `error` is decided by which member is present — and BSON is the self-describing
-# one with a native byte type, which is most of what this channel carries.
+# The console wire. It needs a self-describing codec (`params`/`result` are typed by a
+# method that may arrive after them, and `result` xor `error` is decided by which is
+# present), and BSON is one with a native byte type, which most payloads are.
 bson = { version = "3", features = ["serde"] }
-# `BoxFuture`, which is what every method on `Client` and `Server` hands back — see
-# `console::base` for why they are boxed rather than `async fn`.
+# `BoxFuture`, which every `Client` and `Server` method returns; `protocol` says why
+# they are boxed rather than `async fn`.
 futures-core = "0.3"
-# The `errno` values a POSIX filesystem answers in: `Posix` maps an `io::ErrorKind` onto one,
-# and a binding hands that number to the kernel. Unconditional, unlike the bindings' other
-# dependencies: `tokio/process` already activates it on every unix build, so naming it here
-# adds no crate to anyone's graph.
+# The `errno` values `Posix` maps an `io::ErrorKind` onto for the kernel. Unconditional:
+# `tokio/process` already pulls it into every unix build, so it adds no crate.
 libc = "0.2"
-# A read-only S3 backend. `default-features = false` on purpose: the default set
-# is `["fs"]`, which is object_store's *own* local-filesystem store and drags in
-# walkdir/nix/same-file for a thing we already have in `PassthroughVolume`. The
-# `memory` module is ungated, so the in-memory store the tests build on survives.
+# A read-only S3 backend. No default features: the default `fs` is object_store's own
+# local store, pulling walkdir/nix/same-file for what `PassthroughFs` already does. The
+# ungated `memory` store is what the tests build on.
 object_store = { version = "0.14", default-features = false, features = [
     "aws",
 ], optional = true }
-# The Notion and Google Drive backends: an async HTTP client, plus the two things
-# their payloads are made of — Notion's page ids are UUIDs, and timestamps are
-# RFC 3339. reqwest 0.13 renamed `rustls-tls` → `rustls` and made `query`/`form`
-# optional; Notion's pagination uses `.query()` and both token endpoints take a form
-# body — Google's and Microsoft's, the latter for the refresh grant — so both are
-# named.
+# HTTP for the Notion, Google Drive and OneDrive backends and `ensure_virtx`; `uuid` for
+# Notion's page ids, `chrono` for RFC 3339 timestamps. `query` is for Notion's pagination,
+# `form` for the Google and Microsoft token endpoints.
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "rustls",
@@ -50,8 +61,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "form",
 ], optional = true }
 uuid = { version = "1", optional = true }
-# The archive `ensure_virtx` unpacks: a gzipped tar, as virtx-uvm's `cargo xtask upload`
-# writes one.
+# The gzipped tar `ensure_virtx` unpacks (what virtx-uvm's `cargo xtask upload` writes).
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 chrono = { version = "0.4", optional = true }
@@ -59,14 +69,11 @@ serde = { version = "1", features = ["derive"] }
 # Notion answers in JSON and `page.json` is rendered back to it, so the backend
 # holds pages as `Value` rather than a mirror of a schema it does not own.
 serde_json = { version = "1", optional = true }
-# The digest a built image is named by. Small and pure Rust. Unconditional rather
-# than behind a feature, because `image` is a public API and an API that is off by
-# default is one callers have to discover twice.
+# The digest a built image is named by. Small and pure Rust; unconditional because
+# `image` is public API, and an API off by default has to be discovered twice.
 sha2 = "0.10"
-# One name, two spellings. macOS hands a lookup the decomposed form of whatever a
-# listing returned, and a store may hold either — so a filesystem that compares names
-# by their bytes answers `ENOENT` for a name it had just printed. Two crates, against
-# `s3`'s 131.
+# macOS looks a name up in decomposed form whatever the listing returned, and a store may
+# hold either, so comparing names by bytes answers `ENOENT` for a name just listed.
 unicode-normalization = { version = "0.1", optional = true }
 # `process` for the server a `StdioClient` starts, `macros` for the `#[tokio::test]`s.
 tokio = { version = "1", features = [
@@ -78,40 +85,33 @@ tokio = { version = "1", features = [
     "time",
 ] }
 
-# Each binding's dependencies sit under the target it binds on, and are optional there so that
-# `mount` is what pulls them in: a build turns on one binding, the one its OS has, and a
-# `--all-features` build finds nothing on a target without one rather than a dependency that
-# cannot compile. The binding modules carry the matching `#[cfg(all(feature = "mount", …))]`.
+# Each binding's dependencies sit under its target and are optional, so `mount` pulls in only
+# the one this OS has, and `--all-features` finds nothing uncompilable on other targets. The
+# binding modules carry the matching `#[cfg(all(feature = "mount", …))]`.
 #
-# The macOS binding has no entry: FUSE-T is reached through `contrib/fuse_t/shim.c`, which
-# `build.rs` compiles.
+# macOS has no entry: FUSE-T is reached through `contrib/fuse_t/shim.c`, which `build.rs`
+# compiles.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-# Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl`
-# on `Posix` itself rather than a wrapper holding one — the same shape the FUSE-T one takes,
-# over the same `Mutex`-held inode and open tables.
+# Host-side FUSE. Its `Filesystem` methods take `&self`, so the binding is an `impl` on
+# `Posix` itself rather than a wrapper.
 fuser = { version = "0.17", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-# The safe wrapper. What it links is Dokany's *user-mode* DLL, dynamically, which is what
-# keeps its LGPL to the library and off a consumer of this crate — see the `mount` feature
-# below. The kernel driver beside it is installed on the host and never linked.
+# Links Dokany's user-mode DLL dynamically, which keeps its LGPL off consumers (see the
+# `mount` feature). The kernel driver is installed on the host and never linked.
 dokan = { version = "0.3", optional = true }
-# The NT-level `FILE_CREATE`/`FILE_DIRECTORY_FILE` numbering a `create_file` decodes. `dokan`
-# re-exports the library's types but not these constants, and it already depends on this
-# crate, so naming it directly adds nothing to the graph — the same argument `libc` makes.
+# The `FILE_CREATE`/`FILE_DIRECTORY_FILE` constants `create_file` decodes, which `dokan` does
+# not re-export. Already in `dokan`'s graph, so naming it adds nothing.
 dokan-sys = { version = "0.3", optional = true }
-# UTF-16 strings, which every name Dokan hands over is one of.
+# UTF-16 strings, which every Dokan name is.
 #
-# **Pinned to what `dokan` itself takes**, which is the old 0.4 rather than the current 1.x.
-# `U16CStr` is in `dokan`'s public API, so two versions in one build are two unrelated types
-# and every callback fails to match the trait it is implementing — with an error that names
-# the same type twice.
+# **Pinned to the version `dokan` itself takes, not the latest.** `U16CStr` is in `dokan`'s
+# public API, so a second version is an unrelated type and every callback fails to match its
+# trait, with an error naming the same type twice.
 widestring = { version = "0.4", optional = true }
-# `NTSTATUS` and the `STATUS_*`/`FILE_ATTRIBUTE_*` numbering a Windows filesystem answers in —
-# what `libc`'s `errno` values are to the FUSE bindings — and `LoadLibraryW`, which is how
-# `mount_support` asks whether Dokany is there before the binding calls into it. Only the
-# modules those read: winapi gates every module behind a feature, and the default set is
-# empty.
+# `NTSTATUS` and the `STATUS_*`/`FILE_ATTRIBUTE_*` codes a Windows filesystem answers in, and
+# `LoadLibraryW`, which `mount_support` uses to check for Dokany before any call into it.
+# winapi gates every module behind a feature (none by default), so only these are named.
 winapi = { version = "0.3", features = [
     "libloaderapi",
     "ntdef",
@@ -120,44 +120,28 @@ winapi = { version = "0.3", features = [
 ], optional = true }
 
 [dev-dependencies]
-# `kill(pid, sig)`, to signal a child that is holding a mount. The `kill(1)`
-# binary would do the same and is one fewer dependency, but it is not in every
-# base image a Linux run happens in — `procps` is not installed in a slim
-# Debian, and a test that cannot find it fails for the wrong reason.
+# `kill(pid, sig)` to signal a child holding a mount. Not the `kill(1)` binary: `procps` is
+# missing from slim Debian images, and a test that cannot find it fails for the wrong reason.
 libc = "0.2"
-# A concrete format to round-trip a `Recipe` through. The type is format-agnostic —
-# whatever a caller stores it as is theirs — so this is here to test that and not to
-# name the one it must be.
+# A concrete format to round-trip a `Recipe` through; the type itself is format-agnostic.
 serde_json = "1"
-# A directory standing in for a mounted tree, which is what a `Mount` is from the far side: a
-# path any process can open — and the build contexts the `image` tests hash, which want a
-# real directory for the same reason.
+# Real directories: stand-ins for a mounted tree.
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
-# `mount` by default, because mounting a tree on the host is what a consumer of this crate
-# does. It is also the one default with a cost: on macOS and Windows it brings a FUSE
-# provider with it, which the build or the binary then needs installed (see `mount`
-# below). The crate's own layers — `FileSystem`, `Directory`, the inode bookkeeping, the
-# console — need none of it, so a consumer that mounts over HTTP, or only runs commands,
-# takes this crate with `default-features = false` and links no libfuse.
+# `mount` by default, because mounting a tree on the host is what a consumer does. It is the
+# one default with a cost: on macOS and Windows it needs a FUSE provider installed (see
+# `mount` below). `FileSystem`, `Directory`, the inode bookkeeping and the console need none
+# of it, so a consumer that mounts over HTTP or only runs commands takes
+# `default-features = false` and links no libfuse.
 #
-# Count them with
+# A feature's dependency count (normal edges only, so build-deps are excluded):
 #
 #   cargo tree --features <f> -e normal --prefix none | grep -v '^virtx' \
 #       | sed 's/ (\*)$//' | sort -u | grep -c .
 #
-# Normal edges only, so the unconditional build-deps `cc`/`pkg-config` are not
-# counted.
-#
-# The numbers themselves are deliberately not written down: they go stale on every
-# dependency bump, and the conclusion does not depend on what they are — `mount`
-# brings a FUSE provider and `s3` the whole HTTP and TLS stack under
-# `object_store`, whatever this month's count is.
-#
-# Consequence worth knowing: a bare `cargo test` runs a subset of the unit tests,
-# because a feature's tests only exist when it is on. Full coverage is a sweep:
+# A bare `cargo test` runs only the default features' tests. Full coverage is a sweep:
 #
 #   for f in "--no-default-features" "" "--features s3" "--features notion" \
 #            "--features gdrive" "--features onedrive" \
@@ -165,55 +149,48 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 #       cargo test $f --all-targets
 #   done
 #
-# Note `cargo test $f` needs `$f` word-split, which zsh does not do for an
-# unquoted expansion — under zsh pass the flags as separate arguments.
+# `$f` must word-split, which zsh does not do; under zsh pass the flags as separate arguments.
 #
-# Editors build the default set, so `mount`'s binding is live code and the other
-# features' are not until enabled (rust-analyzer: `"cargo.features": "all"`).
+# Editors build the default set, so other features' code is inert until enabled
+# (rust-analyzer: `"cargo.features": "all"`).
 default = ["mount", "ensure"]
 # Mount a virtx filesystem on the host, through the one binding this OS has:
 #
 # | Target | Binding | Needs |
 # |---|---|---|
-# | Linux (any unix but macOS) | `fuser`, straight to `/dev/fuse` | nothing installed |
-# | macOS | libfuse-t's own session loop | FUSE-T to build and run (`brew install --cask fuse-t`) |
+# | Linux (any unix but macOS) | `fuser`, straight to `/dev/fuse` | `fusermount3` for a non-root user |
+# | macOS | libfuse-t's own session loop | FUSE-T to run (`brew install --cask fuse-t`) |
 # | Windows | Dokany's driver, through `dokan` | Dokany to run |
 #
-# All three also ask for `tokio/rt-multi-thread` and `tokio/net`: a binding is a
-# *synchronous* callback over async stores, so it blocks on one process-wide runtime
-# (`fs::mount::block_on`), and `Builder::enable_all` is cfg'd on `net` and `time` —
-# built without them the runtime silently has no I/O driver. `time` is already in the
-# base set the console asks for.
+# All three need `tokio/rt-multi-thread` and `tokio/net`: a binding is a synchronous
+# callback over async stores, so it blocks on one process-wide runtime, and
+# `Builder::enable_all` is cfg'd on `net` and `time` (without them the runtime silently has
+# no I/O driver). `time` is already in the base set.
 #
-# **A binary built with it starts on a host without the provider**, and what the provider
-# missing costs is a mount: `fs::mount_support` says so, with what to install, and every
-# binding's `try_new` asks it first. This matters most to the Python and Node bindings,
-# whose import would otherwise fail for every caller, most of whom never mount.
+# **A binary built with it starts on a host without the provider**; only mounting fails.
+# `fs::mount_support` reports what to install, and every binding's `try_new` asks it first,
+# so importing the Python or Node binding never fails for callers who don't mount.
 #
-# **On macOS, FUSE-T has to be installed to build, not to run.** `build.rs` probes
-# `fuse-t.pc` for the headers and fails without them; the shim links nothing, and opens
-# `libfuse-t.dylib` with `dlopen` when a mount first asks for it.
+# **On macOS, nothing of FUSE-T's is needed to build.** The shim declares the part of
+# libfuse-t it uses (`contrib/fuse_t/fuse_t.h`), links nothing, and `dlopen`s
+# `libfuse-t.dylib` on first mount. Declared rather than included, the layouts are this
+# crate's to keep right; `contrib/fuse_t/check-abi.sh` checks them against FUSE-T's headers
+# in CI.
 #
-# **On Windows, a binary has to delay-load `dokan2.dll` to start without Dokany**, which
-# its own `build.rs` asks for — `/DELAYLOAD` is a `rustc-link-arg`, and one of those reaches
-# only the package that prints it. The bindings' `build.rs` are the two lines to copy.
-# Linked without it, a binary needs the DLL to start, as before.
+# **On Windows, a binary must delay-load `dokan2.dll` to start without Dokany.** `/DELAYLOAD`
+# is a `rustc-link-arg`, which reaches only the package that prints it, so each binary's own
+# `build.rs` must ask; the README's `mount` section has the two lines to copy.
 #
-# **On Windows, Dokany has to be installed to run** — the kernel driver (`dokan2.sys`)
-# comes from Dokany's own installer and is what actually owns the volume. Building
-# needs only a C compiler: `dokan-sys` links the installed user-mode library when the
-# installer's `DokanLibrary2_LibraryPath_x64` is in the environment, and otherwise
-# builds one from its vendored sources. Prefer the former — a self-built DLL can
-# disagree with the installed driver's version, which fails at mount time rather than
-# at build time.
+# **On Windows, Dokany must be installed to run**: its installer provides the kernel driver
+# (`dokan2.sys`) that owns the volume. Building needs only a C compiler: `dokan-sys` links the
+# installed user-mode library when `DokanLibrary2_LibraryPath_x64` is set, otherwise builds
+# its vendored copy. Prefer the installed one; a self-built DLL can mismatch the driver
+# version, which fails at mount time rather than build time.
 #
-# **On Windows it constrains a consumer's licence, and it is the only feature here
-# that does.** Dokany's user-mode library is LGPL-3.0 and is linked dynamically, which
-# is what keeps that to the library: a proprietary program may link it, and must leave
-# it replaceable — which `dokan-sys` does for us by linking through an import library
-# rather than statically. Nothing here may be rolled into a static binary without
-# taking on LGPL §4(d0), which means shipping relinkable object code for the program
-# around it.
+# **On Windows it constrains a consumer's licence, the only feature that does.** Dokany's
+# user-mode library is LGPL-3.0, linked dynamically through an import library, so a
+# proprietary program may link it but must leave it replaceable. Nothing here may go into a
+# static binary without taking on LGPL §4(d0): shipping relinkable object code.
 mount = [
     "dep:fuser",
     "dep:dokan",
@@ -224,13 +201,11 @@ mount = [
     "tokio/rt-multi-thread",
 ]
 # `ensure_virtx`: fetch the console server virtx-uvm publishes, over HTTPS, into
-# `cache_root()/bin` when a host has none. Brings the HTTP and TLS stack the Notion and
-# Google Drive backends use.
+# `cache_root()/bin` when a host has none. Brings in an HTTP and TLS stack.
 #
-# On by default, because a consumer that runs commands needs a server to run them in.
-# The server itself is the one that opts out: virtx-uvm takes this crate for the
-# protocol, and its guest is a static musl binary whose TLS stack would need a C
-# cross-compiler to build.
+# On by default, because a consumer that runs commands needs a server. virtx-uvm opts
+# out: it takes this crate for the protocol, and its static musl guest's TLS stack would
+# need a C cross-compiler.
 ensure = ["dep:reqwest", "dep:flate2", "dep:tar", "tokio/net"]
 s3 = ["dep:object_store", "tokio/net", "tokio/rt-multi-thread"]
 # Google Drive as a read-only backend: the folder tree as directories, and the
@@ -255,9 +230,8 @@ notion = [
     "tokio/rt-multi-thread",
 ]
 # A OneDrive account as a read-only tree, over Microsoft Graph. `tokio/sync` because the
-# token cache is held across the `.await` that mints one, which `std::sync::Mutex` cannot
-# be; `unicode-normalization` because macOS looks a name up in a spelling the listing did
-# not necessarily use.
+# token cache is held across the `.await` that mints a token, which `std::sync::Mutex`
+# cannot be.
 onedrive = [
     "dep:reqwest",
     "dep:chrono",

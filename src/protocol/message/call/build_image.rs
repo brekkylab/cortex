@@ -5,7 +5,6 @@ use crate::image::Recipe;
 /// A recipe to build. The `params` of `build_image`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildImageCall {
-    /// What to build.
     pub recipe: Recipe,
 
     /// The name to store the build under, as `name:tag`. `None` has the server pick one,

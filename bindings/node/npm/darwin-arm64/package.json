@@ -1,0 +1,29 @@
+{
+  "name": "@brekkylab/virtx-darwin-arm64",
+  "version": "0.1.0",
+  "cpu": [
+    "arm64"
+  ],
+  "main": "virtx.darwin-arm64.node",
+  "files": [
+    "virtx.darwin-arm64.node"
+  ],
+  "description": "The environment an agent works in: what it can see, and what it can do.",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/brekkylab/virtx/tree/main/bindings/node#readme",
+  "engines": {
+    "node": ">= 18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/brekkylab/virtx.git",
+    "directory": "bindings/node"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "os": [
+    "darwin"
+  ]
+}

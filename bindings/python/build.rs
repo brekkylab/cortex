@@ -1,13 +1,11 @@
 //! Delay-loads `dokan2.dll` when the `mount` feature is on for a Windows MSVC target.
 //!
-//! virtx's own `build.rs` asks for the same, but a `rustc-link-arg` applies only to the
-//! targets of the package that printed it — so a dependent that is itself linked, as this
-//! cdylib is, has to ask again. Without it the import fails in the loader with
-//! `DLL load failed` on a host without Dokany, including for the callers that never mount;
-//! with it the DLL is loaded by the first mount, which `virtx::fs::mount_support` checks
-//! for first.
+//! virtx's `build.rs` asks for the same, but `rustc-link-arg` applies only to the printing
+//! package's targets, so this cdylib must ask again. Without it the import fails in the loader
+//! with `DLL load failed` on hosts without Dokany, even for callers that never mount; with it
+//! the DLL loads at the first mount, which `virtx::fs::mount_support` checks for first.
 //!
-//! macOS needs nothing here: the FUSE-T shim opens libfuse-t itself, at run time.
+//! macOS needs nothing: the FUSE-T shim opens libfuse-t itself at run time.
 fn main() {
     if std::env::var_os("CARGO_FEATURE_MOUNT").is_some()
         && std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")

@@ -1,35 +1,100 @@
 //! The two ends of a console, and the wire between them.
 //!
-//! A *console server* is a process that speaks JSON-RPC over stdio and runs the
-//! commands it is asked to run somewhere — on this host, inside a micro-VM,
-//! wherever. A *console client* is whoever drives one. What differs between
-//! servers is only that "somewhere"; the methods they answer, which end may ask
-//! what, and how a request is paired with its response are decided once, here, so
-//! two servers cannot drift apart on them.
+//! A *console server* speaks JSON-RPC over stdio and runs commands somewhere: this
+//! host, a micro-VM, wherever. A *console client* drives one. Servers differ only in
+//! that "somewhere"; the methods, which end may ask what, and request/response pairing
+//! are defined once here so servers cannot drift apart on them.
 //!
-//! - `message` — [`Message`] and the methods, errors and payloads both ends agree on.
-//! - `base` — what each end can *do* on a channel: a [`Client`] only asks, a
-//!   [`Server`] only answers. Both move messages and neither reads a meaning into
-//!   one.
-//! - [`stdio`] — the transport there is: framed JSON-RPC over a pipe, and the two
-//!   ends over it ([`StdioClient`](stdio::StdioClient), which starts the server process
-//!   it drives, and [`StdioServer`](stdio::StdioServer), which answers on stdin and
-//!   stdout).
-//! - [`ConsoleClient`] — the public end, and what a caller normally reaches for: the channel
-//!   that drives a server, and the session it was opened with.
+//! - [`Client`] and [`Server`] — what each end does on a channel, independent of
+//!   transport: a client only asks, a server only answers, and neither reads meaning into
+//!   a message (where a command runs, what a session allows, when something has booted).
+//! - [`Message`] and the methods, errors and payloads both ends agree on.
+//! - [`stdio`] — the current transport; another (e.g. a micro-VM's virtio port) would
+//!   change nothing above it.
+//! - [`ConsoleClient`](crate::console::ConsoleClient) — the public end: the channel driving a
+//!   server, plus the session it was opened with.
 //!
-//! Everything that waits is a future. A console spends nearly all of its time waiting —
-//! on a pipe, on a command, on a backend bringing a kernel up — so a caller with several
-//! of them drives them all from one runtime, and every method that could wait is
-//! something to `await`. What is *not* concurrent is a single session: see [`Client`] for
-//! the borrow that says so.
+//! A server never issues a request, so neither end needs a pending table, a listener, or
+//! a reader that must not block on work only it can unblock.
 //!
-//! Each end of a channel does one job and only that one. There is no request a server
-//! issues, so nothing on either side needs a pending table, a listener, or a reader that
-//! must not block on work only it can unblock.
+//! # The wire
 //!
-//! [`Message`] has the reasoning for the protocol,
-//! [`read`](stdio::read) and [`write`](stdio::write) for the wire.
+//! Every [`Message`] is a JSON-RPC 2.0 object, shown here as BSON Extended JSON:
+//!
+//! ```text
+//! {"jsonrpc":"2.0","id":2,"method":"exec","params":{"cmd":["sh","-c","ls"]}}
+//! {"jsonrpc":"2.0","id":2,"method":"exec","result":{"code":0,"stdout":<Binary>,"stderr":<Binary>,"truncated":false}}
+//! {"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"timed out after 1000ms"}}
+//! {"jsonrpc":"2.0","method":"quit"}
+//! ```
+//!
+//! **The object model is the spec's; the encoding is not.** Member presence decides a
+//! message's shape, `id` pairs a response with its request, and the error codes are
+//! JSON-RPC 2.0's. The bytes are BSON documents; framing is [`stdio`]'s.
+//!
+//! # Methods
+//!
+//! | Method | `params` | `result` | Errors |
+//! |---|---|---|---|
+//! | `version` | [`VersionCall`] | [`VersionResp`] | — |
+//! | `build_image` | [`BuildImageCall`] | [`BuildImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
+//! | `remove_image` | [`RemoveImageCall`] | [`RemoveImageResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS) |
+//! | `list_images` | [`ListImagesCall`] | [`ListImagesResp`] | — |
+//! | `init` | [`InitCall`] | [`InitResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`UNSUPPORTED_MOUNT`](Error::UNSUPPORTED_MOUNT), [`UNSUPPORTED_NETWORK`](Error::UNSUPPORTED_NETWORK), [`UNSUPPORTED_IMAGE`](Error::UNSUPPORTED_IMAGE), [`UNKNOWN_IMAGE`](Error::UNKNOWN_IMAGE), [`UNSUPPORTED_MACHINE`](Error::UNSUPPORTED_MACHINE) |
+//! | `exec` | [`ExecCall`] | [`ExecResp`] | [`INVALID_PARAMS`](Error::INVALID_PARAMS), [`TIMED_OUT`](Error::TIMED_OUT), [`NOT_EXECUTABLE`](Error::NOT_EXECUTABLE), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `read` | [`ReadCall`] | [`ReadResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `write` | [`WriteCall`] | [`WriteResp`] | [`NOT_FOUND`](Error::NOT_FOUND), [`IS_A_DIRECTORY`](Error::IS_A_DIRECTORY), [`IO_FAILED`](Error::IO_FAILED), [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `snapshot` | [`SnapshotCall`] | [`SnapshotResp`] | [`BOOT_FAILED`](Error::BOOT_FAILED), [`MOUNT_FAILED`](Error::MOUNT_FAILED) |
+//! | `start` | — | *(notification — no response)* | — |
+//! | `stop` | — | *(notification — no response)* | — |
+//! | `quit` | — | *(notification — no response)* | — |
+//!
+//! # Design
+//!
+//! - **Booting is not a method.** Anything that needs a booted session boots one, so
+//!   [`Start`](Notification::Start) and [`Stop`](Notification::Stop) are resource
+//!   management only and go unanswered. `init` is a call because it says what the session
+//!   *is*, and its answer is the first thing a client can act on.
+//! - **Failure is an `error` with a code**, the only failure channel: a requester branches
+//!   on [`Error::code`], and an `error` cannot be mistaken for a command's exit status.
+//! - **An execution is one request and one response, never a stream.** The caller is an
+//!   agent that cannot act on partial output, so [`ExecResp`] arrives whole, bounded by
+//!   [`MAX_PAYLOAD`]. It takes no stdin (stage files with `write`, collect them with
+//!   `read`), and a command that never ends needs [`timeout_ms`](ExecCall::timeout_ms).
+//! - **Program bytes are bytes; names are text.** Output and file contents are raw bytes;
+//!   an argv and a path are UTF-8, since both ends must interpret them.
+//!
+//! ## Why the codec is BSON
+//!
+//! **Self-describing.** `{"method":..,"params":..}` is serde adjacent tagging, and
+//! `result` xor `error` is decided by which member is *present*; both need a deserializer
+//! that can look ahead, which postcard and bincode cannot.
+//!
+//! **A byte type.** Exec output and file contents are most of the traffic and are program
+//! bytes, not text. JSON would need base64 (1.33×, plus decoding); BSON's `Binary`
+//! carries them as themselves.
+//!
+//! ### What that costs
+//!
+//! An off-the-shelf JSON-RPC library: a peer needs a BSON codec. That matters little,
+//! since such a peer already needs bespoke framing and both ends live in this workspace.
+//!
+//! Not frame size where it matters. BSON writes array indices as keys (`cmd` becomes
+//! `{"0":"ls"}`) and names as C strings, so a control frame like `stop` is slightly
+//! *larger* than JSON; the large, frequent output frames shrink. MessagePack and CBOR
+//! beat BSON on both; BSON wins on being self-delimiting (which can retire the framing
+//! layer) and on `doc!`/Extended JSON keeping the wire readable to people and tests.
+//!
+//! # Every trait method hands back a boxed future
+//!
+//! Everything that waits is a future, so one runtime can drive many consoles at a task
+//! each rather than a thread parked on a pipe each. An `async fn` in a trait returns a
+//! type a `dyn` cannot name, and a [`ConsoleClient`](crate::console::ConsoleClient) holds
+//! a `dyn Client` so the transport stays out of its type. A [`BoxFuture`] costs one
+//! allocation per call, negligible against a pipe round trip; derived methods use the
+//! same shape.
+//!
+//! Futures and both ends are [`Send`] so a session can be handed to a task.
 
 mod base;
 mod message;
@@ -43,35 +108,28 @@ pub use message::*;
 
 /// The asking end of a channel: issue a call, get its answer back.
 ///
-/// Two things are a transport's: putting a call on the wire and coming back with the
-/// response that answers *that* call, and putting a notification on the wire. The
-/// rest of the methods below are neither, so they are written once here — which is also
-/// the one place a [`Response`](crate::console::Response) becomes what its method returns.
+/// A transport need implement only [`call`](Self::call) and [`notify`](Self::notify); the
+/// per-method wrappers are derived here, which is also the one place a
+/// [`Response`] becomes what its method returns.
+///
+/// `&mut self` throughout, with no `&self`-plus-lock: one call is outstanding at a time,
+/// and a `read` interleaved with a running command is a question the server cannot answer
+/// yet. The exclusive borrow checks this; for concurrency, open a second console.
 pub trait Client: Send {
     /// Make one call and wait for its response.
     ///
-    /// Allocating the id and pairing it with what comes back is the transport's, because
-    /// so is anything else that may arrive while it waits — and the number is a fact about
-    /// the wire and not about the answer, which is why it does not come back out.
+    /// The transport allocates the id and pairs the response with it; the id is a wire
+    /// detail, so it is not returned.
     ///
-    /// What comes back is a [`Response`](crate::console::Response), typed by the `method`
-    /// the frame echoed — so this end reads an answer without holding a table of what it
-    /// asked. Turning it into the one variant a given method returns is the derived
-    /// methods' below.
+    /// An [`Error`](crate::protocol::Response::Error) arrives as
+    /// [`Refused`](Failure::Refused), so a caller handles "no answer" in one shape.
     ///
-    /// An [`Error`](crate::console::Response::Error) arrives as
-    /// [`Refused`](Failure::Refused) rather than as a `Response`, because a caller that got
-    /// no answer has one thing to handle and not two shapes of it — and which of the two
-    /// happened is what `Failure` says.
-    ///
-    /// Dropping this future part way is dropping the session with it. The call may
-    /// already be on the wire, and a transport that owns a descriptor for the length of
-    /// a round trip has no way to put back what it half read — so a caller that wants to
-    /// stop waiting stops using the client too. A [`timeout`](ExecCall::timeout_ms) is what
-    /// bounds an execution; cancelling the wait for one is not.
+    /// Not cancel-safe: dropping this future mid-call may leave a half-read frame, so the
+    /// client is unusable afterwards. Bound an execution with
+    /// [`timeout_ms`](ExecCall::timeout_ms), not by cancelling the wait.
     fn call(&mut self, call: Call) -> BoxFuture<'_, Result<Response, Failure>>;
 
-    /// Send something nothing answers, so there is nothing to wait for.
+    /// Send a notification; nothing answers it.
     fn notify(&mut self, notification: Notification) -> BoxFuture<'_, Result<(), Failure>>;
 
     /// Which protocol version the server speaks.
@@ -84,9 +142,9 @@ pub trait Client: Send {
         })
     }
 
-    /// Build a recipe, and hear the ref and digest it is stored under.
+    /// Build a recipe; returns the ref and digest it is stored under.
     ///
-    /// Needs no session, so it may be called with or without an [`init`](Self::init).
+    /// Needs no session, so [`init`](Self::init) is optional.
     fn build_image(
         &mut self,
         build: BuildImageCall,
@@ -122,16 +180,10 @@ pub trait Client: Send {
         })
     }
 
-    /// Say what this session is: the tree it works in, and what its commands run in and
-    /// may reach.
+    /// Describe this session: its trees, and what its commands run in and may reach.
     ///
-    /// Nothing is booted or mounted by it. What returning means is that there is a server
-    /// on the far end, that it speaks this protocol, and that it has what it was told —
-    /// which is the only thing about a session a client can hear before it asks for work.
-    ///
-    /// What comes back is where that tree will be: an [`InitResp`], carrying the path
-    /// every later `read` and `write` is spelled in. Whether it is the path that was asked
-    /// for is the server's to decide, which is why it is answered rather than assumed.
+    /// Returning means a server is there, speaks this protocol and accepted the
+    /// description; the [`InitResp`] carries the starting directory, which the server decides.
     fn init(&mut self, init: InitCall) -> BoxFuture<'_, Result<InitResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Init(init)).await? {
@@ -141,11 +193,11 @@ pub trait Client: Send {
         })
     }
 
-    /// Run one command, and return everything it produced.
+    /// Run one command and return everything it produced.
     ///
-    /// An `Ok` is the whole execution; a command that merely failed is an `Ok` with a
-    /// non-zero [`code`](ExecResp::code), and a [`Refused`](Failure::Refused) is the
-    /// execution having no result at all — it timed out, or there was nothing there to run.
+    /// A command that failed is still `Ok`, with a non-zero [`code`](ExecResp::code).
+    /// [`Refused`](Failure::Refused) means no result at all: it timed out, or there was
+    /// nothing to run, or the session could not be brought up.
     fn exec(&mut self, exec: ExecCall) -> BoxFuture<'_, Result<ExecResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Exec(exec)).await? {
@@ -157,9 +209,8 @@ pub trait Client: Send {
 
     /// Read part of a file where the executor runs things.
     ///
-    /// One message holds the answer, so a file larger than that comes back in pieces:
-    /// [`size`](ReadResp::size) against what arrived says whether there are more,
-    /// and a further `read` from further along is how to get them.
+    /// A file larger than one message comes back in pieces: compare
+    /// [`size`](ReadResp::size) with what arrived, and `read` again from further along.
     fn read(&mut self, read: ReadCall) -> BoxFuture<'_, Result<ReadResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Read(read)).await? {
@@ -169,8 +220,7 @@ pub trait Client: Send {
         })
     }
 
-    /// Put bytes in a file where the executor runs things, and hear how big it is
-    /// afterwards.
+    /// Write bytes to a file where the executor runs things; returns its size afterwards.
     fn write(&mut self, write: WriteCall) -> BoxFuture<'_, Result<WriteResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Write(write)).await? {
@@ -180,18 +230,10 @@ pub trait Client: Send {
         })
     }
 
-    /// Take everything this session has written, as a blob another can start on.
+    /// Take everything this session has written, as the layer tar [`InitCall::snapshot`]
+    /// takes; a caller just keeps the bytes and hands them over.
     ///
-    /// The other half of [`InitCall::snapshot`]: what comes back is exactly what that
-    /// takes, so a session is carried on by opening a new one with this in hand. What is
-    /// in it is the far end's business — it is that executor's own encoding of the changes,
-    /// read back only by an executor of the same kind — and a caller's part is to keep the
-    /// bytes and hand them over.
-    ///
-    /// One message holds the answer, unlike [`read`](Self::read), which comes back in
-    /// pieces. A snapshot cannot: it is read back as a filesystem, and the front of one is
-    /// not a smaller session but a broken tree — so a session that has written more than a
-    /// message holds is refused rather than shortened.
+    /// Refused, not truncated, when it outgrows one message.
     fn snapshot(&mut self) -> BoxFuture<'_, Result<SnapshotResp, Failure>> {
         Box::pin(async move {
             match self.call(Call::Snapshot(SnapshotCall {})).await? {
@@ -201,25 +243,18 @@ pub trait Client: Send {
         })
     }
 
-    /// Boot now, to hide the cold start.
+    /// Boot now, to hide the cold start; optional, since any call that needs a boot boots
+    /// on demand.
     ///
-    /// Optional: [`exec`](Self::exec), [`read`](Self::read) and [`write`](Self::write)
-    /// are served by a server that boots one if there is none, so this unlocks nothing
-    /// and only moves who waits for the boot — off the first command and onto whatever
-    /// the caller is doing between here and there.
-    ///
-    /// `Ok` is the notification having gone out and not the server having booted, so a
-    /// boot that fails is heard as a [`BOOT_FAILED`](Error::BOOT_FAILED) on the next call
-    /// that needed one.
+    /// `Ok` means the notification went out, not that the boot succeeded; a failed boot
+    /// surfaces as [`BOOT_FAILED`](Error::BOOT_FAILED) on the next call that needs one.
     fn start(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async move { self.notify(Notification::Start).await })
     }
 
-    /// Release what booting took, to stop occupying it while nothing is running.
+    /// Release what booting took (guest, mounted tree, scratch directory) while idle.
     ///
-    /// The other half of [`start`](Self::start)'s trade: a guest, a mounted tree and a
-    /// scratch directory are memory, descriptors and disk held on the far end, and the next call
-    /// that needs a booted session boots one — so handing them back costs one boot later
+    /// The next call that needs a booted session boots again, so this costs one boot later
     /// and nothing else.
     fn stop(&mut self) -> BoxFuture<'_, Result<(), Failure>> {
         Box::pin(async move { self.notify(Notification::Stop).await })
@@ -233,10 +268,9 @@ pub trait Client: Send {
 
 /// A peer that answered one method with another's result.
 ///
-/// Unreachable against a peer that is keeping its place — one call is outstanding, and the
-/// transport already dropped anything not carrying its `id` — so this is a peer that has
-/// lost track of itself and there is nothing usable either way. That is what
-/// [`INTERNAL_ERROR`](Error::INTERNAL_ERROR) is for, and the reason belongs in a log.
+/// Unreachable against a sane peer (one call is outstanding and the transport already
+/// dropped frames with other ids), so it is reported as
+/// [`INTERNAL_ERROR`](Error::INTERNAL_ERROR).
 fn mismatched(wanted: Method, got: Response) -> Failure {
     Failure::from(Error::new(
         Error::INTERNAL_ERROR,
@@ -249,25 +283,18 @@ fn mismatched(wanted: Method, got: Response) -> Failure {
 
 /// The answering end of a channel: take what arrived, put an answer out.
 ///
-/// Both halves of that are a transport's, and there is nothing else. What a message
-/// means, where a command runs, what a session allows when — none of it is here. This
-/// trait moves frames and holds no state.
+/// Moves frames and holds no state; what a message means is the backend's.
 pub trait Server: Send {
     /// The next message. `Ok(None)` is the other end closing the channel cleanly.
     ///
-    /// Not cancel-safe: a dropped `recv` may have taken part of a frame off the
-    /// descriptor and has nowhere to put it back. An end waiting on something besides
-    /// the channel waits on it between messages rather than instead of one.
+    /// Not cancel-safe: a dropped `recv` may have consumed part of a frame. Wait on other
+    /// things between messages, not in a `select!` against this.
     fn recv(&mut self) -> BoxFuture<'_, io::Result<Option<Message>>>;
 
     /// Put out one response, with the id of the request it answers.
     ///
-    /// One value and not a `Result` around one: a
-    /// [`Response`](crate::console::Response) is the answer *or* the
-    /// [`Error`](crate::console::Response::Error) saying there is none, which is the whole
-    /// of what a response can be — see [`Response`](crate::console::Response).
-    ///
-    /// It is also what a backend that *relays* one hands straight on. A response names its
-    /// own method, so a relay never has to re-type an answer it did not compose.
+    /// Not a `Result`: a [`Response`] already covers both the
+    /// answer and the [`Error`](crate::protocol::Response::Error). It names its own method,
+    /// so a relaying backend hands one on without re-typing it.
     fn respond(&mut self, id: RequestId, result: Response) -> BoxFuture<'_, io::Result<()>>;
 }

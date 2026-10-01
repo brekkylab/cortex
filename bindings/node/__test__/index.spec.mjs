@@ -57,7 +57,7 @@ test('a HostMount serves the Directory', { skip: !virtx.HostMount && 'built with
 })
 
 test('building without a server fails and spends the builder', async () => {
-  // The default server is looked up here, where there is none.
+  // Point the default server lookup at an empty directory.
   process.env.VIRTX_STDIO_SERVER_PATH = tempDir()
   const builder = ConsoleClient.builder()
   await assert.rejects(builder.build(), { code: 'VIRTX_ERROR' })

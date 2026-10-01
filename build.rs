@@ -1,11 +1,12 @@
-//! What the `mount` feature needs from the target's filesystem provider at build time: on
-//! macOS the FUSE-T shim, compiled; on Windows the Dokany DLL, delay-loaded. See
-//! `contrib/fuse_t/shim.h` for why the shim exists, and `src/fs/mount/support.rs` for why
-//! neither provider is a dependency a binary needs in order to start.
+//! Build-time needs of the `mount` feature: on macOS, compile the FUSE-T shim; on Windows,
+//! delay-load the Dokany DLL. Neither provider is needed for a binary to start (see
+//! `src/fs/mount/support.rs`; `contrib/fuse_t/shim.h` explains the shim). Also pins the
+//! server release `ensure_virtx` fetches by default (see [`pin_server`]).
 
 fn main() {
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.c");
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.h");
+    pin_server();
 
     if std::env::var_os("CARGO_FEATURE_MOUNT").is_none() {
         return;
@@ -18,40 +19,72 @@ fn main() {
     }
 }
 
-/// Compile the shim against FUSE-T's headers. **Headers only**: the shim opens libfuse-t
-/// with `dlopen` when a mount first asks for it, so nothing is linked and nothing needs an
-/// rpath -- which is also why a dependent's own link needs nothing from this.
-fn fuse_t_shim() {
-    let fuse_t = pkg_config::Config::new()
-        .cargo_metadata(false)
-        .probe("fuse-t")
-        .expect("the `mount` feature on macOS builds against FUSE-T's headers: brew install --cask fuse-t");
+/// Pin the virtx-uvm release this build fetches by default, from `virtx-uvm.version` when
+/// the environment names none.
+///
+/// A package built by CI -- the Node addon, a wheel -- is compiled there, with
+/// `VIRTX_UVM_PINNED_VERSION` set to the release it was tested with. A published crate is
+/// compiled on its user's machine, where nobody sets it; so the workflow that packs the crate
+/// writes the version into the package as `virtx-uvm.version`, and this reads it. A checkout
+/// has no such file, and follows `latest`.
+///
+/// Watched only where it exists: Cargo counts a watched path that is missing as changed, and
+/// would run this script again on every build of a checkout.
+fn pin_server() {
+    const ENV: &str = "VIRTX_UVM_PINNED_VERSION";
+    println!("cargo::rerun-if-env-changed={ENV}");
+    if std::env::var_os(ENV).is_some() {
+        return;
+    }
+    let file = std::path::Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
+        .join("virtx-uvm.version");
+    let Ok(version) = std::fs::read_to_string(&file) else {
+        return;
+    };
+    println!("cargo::rerun-if-changed={}", file.display());
+    let version = version.trim();
+    if !version.is_empty() {
+        println!("cargo::rustc-env={ENV}={version}");
+    }
+}
 
+/// Compile the shim. **Nothing of FUSE-T's is needed to build it**: the shim declares the
+/// part of libfuse-t's interface it uses itself (`contrib/fuse_t/fuse_t.h`), and opens the
+/// library with `dlopen` when a mount first asks for it, so nothing is linked and nothing
+/// needs an rpath -- which is also why a dependent's own link needs nothing from this.
+///
+/// FUSE-T's `pkg-config` file is read if it is there, and only for where the library is:
+/// the shim looks there when the loader does not find it by its bare name, and in
+/// `/usr/local/lib`, where FUSE-T's installer puts it, otherwise.
+fn fuse_t_shim() {
     let mut build = cc::Build::new();
     build
         .file("contrib/fuse_t/shim.c")
         .include("contrib/fuse_t")
-        // libfuse's headers pick struct layouts off this; a mismatch is a silent
-        // ABI break.
+        // `fuse_t.h` declares libfuse's layouts with 64-bit offsets; `check-abi.sh` builds
+        // with the same flag.
         .define("_FILE_OFFSET_BITS", "64")
         .warnings(true);
-    for path in &fuse_t.include_paths {
-        build.include(path);
-    }
-    // Where to look when the loader does not find the library by its bare name.
-    if let Some(dir) = fuse_t.link_paths.first() {
+    let libdir = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .env_metadata(false)
+        .probe("fuse-t")
+        .ok()
+        .and_then(|fuse_t| fuse_t.link_paths.first().cloned());
+    if let Some(dir) = libdir {
         build.define(
             "VIRTX_FUSE_T_LIBDIR",
             format!("\"{}\"", dir.display()).as_str(),
         );
     }
+    println!("cargo::rerun-if-changed=contrib/fuse_t/fuse_t.h");
     build.compile("virtx_fuse_t_shim");
 }
 
-/// Load `dokan2.dll` at its first call rather than at process start, for this package's
-/// own tests and examples. A dependent's binary has to ask for the same from its own
-/// `build.rs` -- a `rustc-link-arg` reaches only the package that prints it -- as the
-/// bindings' do. `/DELAYLOAD` is MSVC's; a GNU target links the DLL at start as before.
+/// Load `dokan2.dll` at first call rather than process start, for this package's own tests
+/// and examples. A `rustc-link-arg` reaches only the package printing it, so a dependent's
+/// binary must request the same in its own `build.rs`. `/DELAYLOAD` is MSVC-only; a GNU
+/// target links the DLL at start.
 fn delay_load_dokan() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo::rustc-link-arg=/DELAYLOAD:dokan2.dll");

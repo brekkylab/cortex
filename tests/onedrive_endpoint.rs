@@ -1,24 +1,9 @@
-//! A Graph API that this repository does not write, driven through [`OnedriveFs::new`].
+//! Live check against real Microsoft Graph, driven through [`OnedriveFs::new`].
 //!
-//! Every other onedrive test answers from a loopback mock in `onedrive_tests.rs`, which is
-//! the right tool for one question — *what did we ask for* — and the wrong one for another:
-//! **whether what we ask for is what Graph answers.** A mock encodes our understanding of
-//! the API, so it agrees with us by construction and stays green when the API moves. This
-//! file exists for the other half.
-//!
-//! Unlike the Drive store, which drives backlot (`brekkylab/enterprise-mock`), there is no
-//! stand-in that follows Microsoft Graph, so this drives the real service against a real
-//! account. That is a weaker guarantee in one way and a stronger one in another: it needs
-//! credentials and a network, and it is the only thing here that can notice Graph moving.
-//!
-//! It has already earned its place once. `$select` naming the download URL the way the
-//! *response* spells it is accepted, answers `200`, and omits the field from every row, so a
-//! read failed outright with "has no download url" and no mock could have said so.
-//!
-//! **What we asked for.** No server reports the number of requests it received back to its
-//! caller, or the `Range` header on each. Every claim of the form "eight windows, one
-//! request" is a claim about our own behaviour, and it stays with the loopback mock in
-//! `onedrive_tests.rs`, which counts.
+//! The loopback mock in `onedrive_tests.rs` encodes our understanding of the API, so it
+//! agrees with us by construction and stays green when the API moves; this suite checks
+//! **whether what we ask for is what Graph answers.** It needs credentials and a network.
+//! Request counts and `Range` headers stay with the mock, since no server reports them back.
 //!
 //!     set -a; . ./.env; set +a
 //!     cargo test -p virtx --features onedrive onedrive_endpoint -- --ignored --nocapture
@@ -29,15 +14,11 @@ use std::path::{Path, PathBuf};
 
 use virtx::fs::{DirentKind, FileSystem, OnedriveConfig, OnedriveFs};
 
-/// Bounds on the walk, so the same test runs against a five-file account and a large one
+/// Bounds on the walk, so the same test runs against a small account and a large one
 /// without becoming the slowest thing in the suite.
 const WALK_ENTRIES: usize = 10;
 
 /// The credentials, or `None` when this host has none.
-///
-/// `client_secret` is optional because a personal-account app registration is normally a
-/// public client, which has none. Absent here means absent from the token form too, which
-/// is a shape of the registration rather than a failure.
 fn config() -> Option<OnedriveConfig> {
     Some(OnedriveConfig {
         client_id: std::env::var("ONEDRIVE_CLIENT_ID").ok()?,
@@ -49,8 +30,11 @@ fn config() -> Option<OnedriveConfig> {
 
 /// Walk a real account, then read a real file by windows.
 ///
-/// Skipped, not failed, when the credentials are absent: this needs an account, and a suite
-/// that has none should stay green.
+/// Catches against the real service what the mock only encodes: `$select` naming the
+/// download URL the way the *response* spells it is accepted and omits the field from every
+/// row, so a read fails outright with "has no download url".
+///
+/// Skipped, not failed, without credentials.
 #[tokio::test]
 #[ignore = "requires ONEDRIVE_* env + network"]
 async fn onedrive_endpoint_tree_and_reads() {
@@ -73,7 +57,7 @@ async fn onedrive_endpoint_tree_and_reads() {
         };
         eprintln!("  {:<44} {:>12} {kind}", e.name, st.size);
         // Every attribute comes off the listing, so this states the real length and never a
-        // placeholder — the thing Drive cannot do — and costs nothing to ask again.
+        // placeholder, and costs nothing to ask again.
         assert_eq!(
             fs.stat(&PathBuf::from("/").join(&e.name))
                 .await
@@ -109,8 +93,8 @@ async fn onedrive_endpoint_tree_and_reads() {
 
 /// `len` bytes at `offset`, however many reads that takes.
 ///
-/// `read_at` may answer short of the buffer, and a short answer is end of file — so this
-/// asks again from where the last one stopped until it is satisfied or the file ends.
+/// `read_at` may answer short of the buffer, so this asks again from where the last one
+/// stopped until it is satisfied or a read returns zero.
 async fn read_at(fs: &OnedriveFs, path: &Path, offset: u64, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut got = 0usize;

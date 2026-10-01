@@ -6,235 +6,131 @@ use crate::image::ImageSource;
 
 /// What a session is. The `params` of `init`.
 ///
-/// What is here outlives any one execution, which is what it is doing here rather than on
-/// an [`ExecCall`]: a tree has to be somewhere before a path can name a file in
-/// it, and the base and the network are the environment a command runs in rather than
-/// anything a command says — so each is said once instead of on every command.
+/// Everything here outlives one execution and is part of the environment rather than the
+/// command (a tree must exist before a path can name a file in it; the base, network and
+/// machine are fixed before a VM kernel starts), so it is said once, not per
+/// [`ExecCall`](super::ExecCall).
 ///
-/// # The trees are a list, and each one says where it goes
+/// # Trees
 ///
-/// [`mounts`](Self::mounts) is every tree the session gets. Each is a [`MountSpec`]: where
-/// to get the tree, the absolute path it appears at, and whether a command may write in it.
+/// [`mounts`](Self::mounts) lists every tree the session gets, each a [`MountSpec`]: where
+/// to get it, the absolute path it appears at, and whether commands may write in it.
 ///
-/// **What a tree is *for* is the client's and is not on the wire.** A project to read and a
-/// directory to leave output in are two entries that differ in their URL, their path and
-/// their `ro` — which is the whole of what a server has to know to realize either, and the
-/// whole of what this protocol can hold a server to. A member per purpose would be the same
-/// three facts under a name that changes none of them, and would cap a session at the
-/// purposes this file happened to enumerate.
+/// **A tree's purpose is the client's and is not on the wire.** A project to read and an
+/// output directory differ only in URL, path and `ro`; per-purpose members would cap
+/// sessions at the purposes enumerated here. Trees are separate namespaces the client
+/// places itself, not stores composed under one root.
 ///
-/// So a session that is given somebody's project and leaves its result somewhere the caller
-/// collects from names two trees, a session that composes six stores names six, and the
-/// reason each is there is the client's own. What the protocol settles is the part both ends
-/// have to agree on: which tree is at which path, and which of them a write may land in.
+/// No tree is needed for scratch space: a session already stands on a writable filesystem
+/// that goes away with it. An empty list is a valid session that sees only the executor's
+/// own filesystem.
 ///
-/// Room to work in is not one of them. A session already stands on a filesystem it may write
-/// to and that goes away with it, so a command that unpacks an archive or builds something
-/// has somewhere to put it without the client naming a tree for it — and a tree named for
-/// that purpose would be one more thing to mount, place and answer for, in exchange for what
-/// the session's own root already gives.
-///
-/// It is a departure from [`Directory`](crate::fs::Directory)'s composition, which is how a
-/// session gets *many stores* in one tree, and the two answer different questions. Several
-/// stores under one root are one namespace a command walks; these are separate namespaces
-/// the client places itself.
-///
-/// An empty list is a session with nothing mounted, which is still a session — a command
-/// then sees whatever the executor's own filesystem holds and nothing this protocol
-/// described.
-///
-/// # The machine is asked for, and what is asked for is what is given
+/// # Machine
 ///
 /// [`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib), [`gpu`](Self::gpu),
-/// [`gpu_memory_mib`](Self::gpu_memory_mib) and [`disk_gib`](Self::disk_gib) are the shape of
-/// the thing the session runs in, and they are here rather than on an [`ExecCall`] because a
-/// machine is made before the first command and outlives the last one: a backend with a
-/// kernel of its own has fixed all of them before that kernel starts.
+/// [`gpu_memory_mib`](Self::gpu_memory_mib) and [`disk_gib`](Self::disk_gib) shape the
+/// machine, which is made before the first command and outlives the last.
 ///
-/// **A server provides what is named or refuses the session**, which is
-/// [`network`](Self::network)'s rule applied to the rest of the machine, and it is what makes
-/// them worth saying rather than measuring afterwards. A session quietly given two vCPUs
-/// where it asked for eight, or no accelerator where it asked for one, is not a narrower
-/// session — it is a client drawing conclusions from how long its commands took, about a
-/// machine nothing ever told it the shape of. A shape this server cannot make is
-/// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE), said at `init` while
-/// the client can still ask for something else.
+/// **A server provides exactly what is named or refuses** with
+/// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE) at `init`: a
+/// silently smaller machine would leave the client inferring its shape from how long
+/// commands take.
 ///
-/// **Each is separately optional, and `None` is the common case.** Leaving one out is not a
-/// default this file names: it is the server's own, which is the only end that knows what the
-/// host it runs on has. So a client with an opinion about memory and none about the rest says
-/// one member and the machine is otherwise whatever that server makes.
+/// Each is separately optional; `None` (the common case) is the server's own default,
+/// since only it knows what its host has. `0` for any numeric member is
+/// [`INVALID_PARAMS`](crate::protocol::Error::INVALID_PARAMS), not another way to say `None`.
 ///
-/// There is no member for what a *command* gets — a share of the machine, an affinity, a
-/// limit. The machine is the unit of what this protocol hands out, and a session that wants
-/// two sizes of it is two sessions.
+/// There is no per-command share, affinity or limit: the machine is the unit handed out,
+/// and two sizes means two sessions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitCall {
-    /// The base a session's commands run in.
-    ///
-    /// It is essential if it runs on VM environment.
+    /// The base a session's commands run in. Required by VM backends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageSource>,
 
-    /// Optional snapshot of what an earlier session changed from the base image — what a
-    /// [`snapshot`](SnapshotCall) answered with, handed back.
+    /// What an earlier session changed from the base image, as a
+    /// [`snapshot`](super::SnapshotCall) returned it; the session starts with those changes in place.
     ///
-    /// Useful when a session does not start from scratch: it starts with those changes already
-    /// in place, as though it were the same session carrying on.
-    ///
-    /// **A layer tar**: the files that session wrote, with the ones it deleted carried as OCI
-    /// whiteouts. Not an image of the filesystem they lived on, and the difference is what
-    /// makes this a thing a frame can hold — a filesystem image brings its own metadata, its
-    /// journal and all the room it was formatted to, none of which is the session's work. It
-    /// also costs an executor nothing to apply: a layer is what one already knows how to put
-    /// in front of a base.
+    /// **A layer tar**: the files written, with deletions as OCI whiteouts. Not a filesystem
+    /// image, whose metadata, journal and formatted free space would not fit a frame; and a
+    /// layer is something an executor already knows how to put over a base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Vec<u8>>,
 
-    /// Whether the session's commands reach a network at all. Left out, it is on.
+    /// Whether the session's commands reach a network at all. On unless said otherwise,
+    /// since on is the one value every server can give.
     ///
-    /// **Said once, for the same reason the trees are.** What a command can reach is a
-    /// property of the environment it runs in — on some backends a device that has to be
-    /// attached before a kernel comes up — so it cannot be decided per `exec` without meaning
-    /// a different session for every command.
+    /// **On or off, nothing between.** On is what a process on the server's machine reaches,
+    /// less that machine's own loopback, whose services are the operator's. A level between
+    /// would be a firewall every backend reimplemented; where a session must be kept off part
+    /// of a network, the server's machine already knows how.
     ///
-    /// **On or off, and nothing between.** On is what a process on the server's machine
-    /// reaches, less that machine's own loopback: the services listening there are the
-    /// operator's, and a session is let at one of them by nothing but the operator running it
-    /// somewhere a session could reach anyway. Off is no network at all. A level between the
-    /// two would be a firewall this protocol described and every backend reimplemented, and
-    /// where a session must be kept off some part of a network, the server's machine is the
-    /// place that already knows how.
-    ///
-    /// A value the server cannot honour is
-    /// [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK) — a server whose
-    /// commands run on this host cannot take the network away from them, so it refuses
-    /// `false` rather than taking it and running them anyway.
-    ///
-    /// **On unless said otherwise**, because on is the one value every server can give: a
-    /// session that says nothing opens on any of them, and only one that turns it off asks
-    /// for something a server may not have.
+    /// A server that cannot honour it refuses with
+    /// [`UNSUPPORTED_NETWORK`](crate::protocol::Error::UNSUPPORTED_NETWORK): one whose commands
+    /// run on this host cannot take the network away, so it refuses `false`.
     #[serde(default = "on", skip_serializing_if = "is_on")]
     pub network: bool,
 
-    /// Ports on the server's machine that lead into the session, each one spelled the way
-    /// docker's `-p` spells it — see [`Port`]. Empty publishes none.
+    /// Ports on the server's machine that lead into the session, spelled as docker's `-p`
+    /// (see [`Port`]). Empty publishes none.
     ///
-    /// **Only in, and only TCP.** A session's commands reach out through
-    /// [`network`](Self::network) and through nothing here; what this adds is a way *in*,
-    /// which no amount of reaching out gives, and which a program in the session serving
-    /// something — a VNC server, a dev server, a notebook — is useless without.
+    /// **Only in, and only TCP.** Reaching out is [`network`](Self::network)'s; this is the
+    /// way in that a program serving something (a VNC server, a dev server, a notebook) needs.
     ///
-    /// Meaningless without a network, so a session that turns it off and names ports is a
-    /// contradiction a server refuses with
-    /// [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS) rather than a list it quietly
-    /// drops.
+    /// Ports with the network off are a contradiction, refused with
+    /// [`INVALID_PARAMS`](crate::protocol::Error::INVALID_PARAMS) rather than dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<Port>,
 
-    /// How many vCPUs the session's machine gets. `None` leaves the number to the server.
-    ///
-    /// **Said once, for the same reason the reach is.** A vCPU count is settled when a
-    /// machine is made — on a backend with a kernel of its own, before that kernel is
-    /// started — so a number on an `exec` would be a number that could only be honoured by
-    /// making a different session out from under the command that asked for it.
-    ///
-    /// `0` is a machine nothing can run on, and is
-    /// [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS) rather than a way to spell
-    /// leaving it out — which is what `None` already is, and what nearly every client wants:
-    /// the end that knows what the host it runs on can spare is the server, not the caller.
+    /// How many vCPUs the session's machine gets. `None` leaves it to the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vcpus: Option<u8>,
 
-    /// How much memory the session's machine gets, in mebibytes. `None` leaves it to the
-    /// server.
-    ///
-    /// **The unit is in the name because a number this size implies none.** Bytes, MiB and
-    /// GiB are all readings a person writing `2048` could have meant, and the two wrong ones
-    /// are a machine a thousand times the size of the one that was asked for — so the member
-    /// says which, the way [`timeout_ms`](ExecCall::timeout_ms) does.
-    ///
-    /// `0` is [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS), for the reason a
-    /// vCPU count of zero is.
+    /// Memory for the session's machine, in MiB. `None` leaves it to the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u32>,
 
     /// Whether the session's commands get a GPU. `None` leaves it to the server.
     ///
-    /// **A boolean and not a device**, because what a protocol can hold a server to here is
-    /// that a command finds an accelerator and not which one it finds: what gets attached is
-    /// the backend's — a virtio-gpu carrying Vulkan on one, whatever the host has on
-    /// another — and a member naming a model or an API would be a promise only that
-    /// backend's build could keep, on a wire schema that grew with every vendor. A session
-    /// that needs a particular device asks the session: the command that would use it is the
-    /// one that can see what is there.
+    /// **A boolean, not a device:** what is attached is the backend's (virtio-gpu with
+    /// Vulkan on one, the host's GPU on another), and naming a model or API would be a
+    /// promise only some builds could keep. A command that needs a specific device inspects
+    /// what is there.
     ///
-    /// **`false` is not the same as saying nothing.** `None` is the server's choice, which is
-    /// what a client with no opinion sends and what every client sent before this member
-    /// existed; `false` is a session that must not have one, which is worth being able to say
-    /// on a backend that would otherwise give one — a device, a renderer and the boot time
-    /// they cost are not free to a session that will never open it.
+    /// **`false` differs from `None`:** it forbids a GPU on a backend that would otherwise
+    /// attach one, saving the device, renderer and boot time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<bool>,
 
-    /// How much memory the session's GPU may hold, in mebibytes. `None` leaves it to the
-    /// server.
+    /// Memory the session's GPU may hold, in MiB. `None` leaves it to the server.
     ///
-    /// **Beside [`memory_mib`](Self::memory_mib), not a share of it.** What the accelerator
-    /// holds is memory of its own on one backend and the host's on another -- on a GPU that
-    /// shares the host's memory, every buffer a command maps is host memory the machine's RAM
-    /// does not count -- and a session that fills both has taken the two together.
+    /// **In addition to [`memory_mib`](Self::memory_mib), not a share of it**, even on a GPU
+    /// that shares host memory (its mapped buffers are not counted as machine RAM).
     ///
-    /// **Given as asked, and what the commands see.** A server attaches an accelerator whose
-    /// memory is this size -- the device the commands enumerate reports it, so a program
-    /// sizes itself to what it has rather than finding out at the allocation that fails --
-    /// or refuses with [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE),
-    /// the way it refuses a GPU it has none of.
+    /// The attached device reports exactly this size to commands, so a program sizes itself
+    /// up front instead of failing an allocation.
     ///
-    /// A size is a property of an accelerator, so it is only something to say about a session
-    /// that has one: beside a [`gpu`](Self::gpu) of `false`, or of `None` on a server that
-    /// gives none, it is [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS). So is `0`,
-    /// for the reason a vCPU count of zero is.
+    /// [`INVALID_PARAMS`](crate::protocol::Error::INVALID_PARAMS) without a GPU: beside a
+    /// [`gpu`](Self::gpu) of `false`, or `None` on a server that gives none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_memory_mib: Option<u32>,
 
-    /// How much the session's commands may write, in gibibytes. `None` leaves it to the
-    /// server.
+    /// How much the session's commands may write, in GiB (MiB is too fine for a disk).
+    /// `None` leaves it to the server.
     ///
-    /// **Room for writes, not the size of the image.** What the base ships is not counted:
-    /// this bounds what the session adds on top of it -- every file its commands create or
-    /// change, and a [`snapshot`](Self::snapshot) handed back at `init` along with them --
-    /// and a command that writes past it finds a full disk.
+    /// **Room for writes, not image size:** it bounds what the session adds over the base,
+    /// including an `init` [`snapshot`](Self::snapshot); writing past it hits a full disk.
     ///
-    /// **A ceiling and not an allocation.** A server need not set this much aside up front,
-    /// so a session that asks for more room than it will fill costs the host what it wrote
-    /// and not what it asked for. A size a server cannot give is
-    /// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE).
-    ///
-    /// The unit is gibibytes rather than the mebibytes memory is said in because a disk is
-    /// sized in them: a mebibyte is too fine a step to mean anything here. `0` is
-    /// [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS), for the reason a vCPU count
-    /// of zero is.
+    /// **A ceiling, not an allocation:** the host pays for what was written, not what was
+    /// asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk_gib: Option<u32>,
 
-    /// The trees this session works in, each one named and placed by a [`MountSpec`].
+    /// **Ordered** to nest trees: mounts are realized in order, so `/work/out` after `/work`
+    /// lands inside it, and not the other way round. Nothing else depends on order.
     ///
-    /// **In order**, and the order is what a client uses to put one tree inside another: a
-    /// server realizes them as they are written, so a mount at `/work/out` that follows one
-    /// at `/work` lands inside it, and the two written the other way round do not. Nothing
-    /// else depends on the order.
-    ///
-    /// A scheme this build has no provider for is refused at `init` with
-    /// [`UNSUPPORTED_MOUNT`](crate::console::Error::UNSUPPORTED_MOUNT), naming the entry — and
-    /// refused there rather than deferred to the call that needs a session, because which
-    /// kinds a server can realize is a fact about the *build*: taking a session whose trees
-    /// can never be there would be one in which every later path is a lie.
-    ///
-    /// Two entries at the same path, or one whose path this server cannot use, are a
-    /// malformed request and are [`INVALID_PARAMS`](crate::console::Error::INVALID_PARAMS) —
-    /// the difference being that a build is what has to change for the first and the request
-    /// is what has to change for these.
+    /// Duplicate paths, or a path this server cannot use, are
+    /// [`INVALID_PARAMS`](crate::protocol::Error::INVALID_PARAMS).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<MountSpec>,
 }
@@ -276,13 +172,8 @@ fn is_on(network: &bool) -> bool {
 /// file:///srv/out:/work/out
 /// ```
 ///
-/// **One string, because a mount is one fact.** It is also the spelling a reader already
-/// has — `mount`, `fstab` and every container runtime say a source, a destination and a
-/// list of options in this order — so a person reading a frame, quoting one in a bug report
-/// or writing one into a config file is reading the thing they already know. An object of
-/// three members would be the same three facts spread over a shape that has to be built
-/// before it can be said, and a wire schema that grows a member every time a mount gains an
-/// option.
+/// **One string**, in the source/destination/options order `mount`, `fstab` and container
+/// runtimes use, so it reads familiarly and new options do not grow the wire schema.
 ///
 /// # The scheme is the kind
 ///
@@ -291,26 +182,18 @@ fn is_on(network: &bool) -> bool {
 /// | `file:///srv/project` | a directory on the server's own filesystem |
 /// | `http://…`, `https://…` | a tree reached over HTTP — **on the wire, implemented nowhere** |
 ///
-/// A URL and not a tagged object, because there is exactly one thing this protocol does with
-/// it: hand it to whatever realizes that kind. A tagged object would put every kind's
-/// settings in this file and make the wire schema grow with the set of providers, where a
-/// string leaves the schema alone and leaves each kind's spelling to the kind — a peer that
-/// has never heard of a scheme still parses it, and refuses it for the reason it actually
-/// has, which is that its *build* has no provider. That refusal is
-/// [`UNSUPPORTED_MOUNT`](crate::console::Error::UNSUPPORTED_MOUNT), which is what `http` and
-/// `https` get everywhere today.
+/// A URL, not a tagged object: the protocol only hands it to whatever realizes that kind,
+/// so the schema does not grow with providers. A peer that has never heard of a scheme
+/// still parses it and refuses it with
+/// [`UNSUPPORTED_MOUNT`](crate::protocol::Error::UNSUPPORTED_MOUNT).
 ///
 /// # The guest path is the client's to choose
 ///
-/// [`guest_path`](Self::guest_path) is where the tree appears to the session's commands,
-/// said by the end that is going to spell paths under it. So every path in the session is known before `init`
-/// goes out: a [`read`](ReadCall) names a file under one of these, so does a
-/// [`write`](WriteCall), and so does the command that opens the same file by the same name.
-/// Nothing has to be read back, and there is no moment where a client holds a tree it cannot
-/// yet name a file in.
+/// [`guest_path`](Self::guest_path) is where the tree appears to commands, chosen by the
+/// end that spells paths under it, so every [`read`](super::ReadCall), [`write`](super::WriteCall) and
+/// command path is known before `init` goes out and nothing has to be read back.
 ///
-/// It is absolute, because a relative one would be relative to a working directory nobody
-/// named and neither end could resolve.
+/// It is absolute; a relative one would have no working directory to resolve against.
 ///
 /// # The options
 ///
@@ -319,22 +202,16 @@ fn is_on(network: &bool) -> bool {
 /// | `ro` | the session reads this tree and does not write in it |
 /// | `rw` | a command may write in it — the default, and sayable so a client can be explicit |
 ///
-/// **Read-only is per tree, because it is a property of the mount and not of the tree's
-/// purpose.** A [`write`](WriteCall) naming a path under an `ro` mount is refused with
-/// [`IO_FAILED`](crate::console::Error::IO_FAILED), the code a read-only filesystem already
-/// answers one with. How far that reaches is the backend's: one with a kernel of its own
-/// mounts the tree read-only and a command's writes fail too, where one running commands on
-/// the host can only answer for the calls it performs itself, and says so. That is what lets
-/// a caller hand over somebody's project and get it back unchanged rather than a promise
-/// that nothing touched it.
+/// **Read-only is per mount.** A [`write`](super::WriteCall) under an `ro` mount is refused with
+/// [`IO_FAILED`](crate::protocol::Error::IO_FAILED), as a read-only filesystem would. A VM
+/// backend mounts the tree read-only so commands' writes fail too; a host backend can only
+/// enforce it on the calls it performs itself, and says so.
 ///
 /// # How it is read
 ///
-/// From the right: trailing colon-separated segments that are options are options, the first
-/// segment from the right that begins with `/` is the guest path, and everything before it is
-/// the host URL. Which is what makes a URL carrying a colon of its own — a port, say —
-/// unambiguous without quoting, and what the two rules above cost: the guest path is absolute
-/// and carries no colon.
+/// From the right: trailing option segments, then the first segment starting with `/` is
+/// the guest path, and the rest is the host URL. This lets a URL carry its own colons (a
+/// port) without quoting, at the cost that the guest path is absolute and colon-free.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountSpec {
     host_url: String,
@@ -343,11 +220,9 @@ pub struct MountSpec {
 }
 
 impl MountSpec {
-    /// A writable mount of `host_url` at `guest_path`, or why the two do not make one.
+    /// A writable mount of `host_url` at `guest_path`.
     ///
-    /// Checked here rather than at whoever sends it, so that a value of this type is one
-    /// that can be written and read back as itself — see the type's docs for the two rules
-    /// the spelling needs.
+    /// Validated here so every value round-trips through its string spelling.
     pub fn new(
         host_url: impl Into<String>,
         guest_path: impl Into<String>,
@@ -381,19 +256,18 @@ impl MountSpec {
         })
     }
 
-    /// The same mount, read-only — `ro`.
+    /// The same mount, read-only (`ro`).
     pub fn read_only(mut self) -> Self {
         self.readonly = true;
         self
     }
 
-    /// Where to get the tree, on the side that holds it — `file:///srv/project`.
+    /// Where to get the tree, e.g. `file:///srv/project`.
     pub fn host_url(&self) -> &str {
         &self.host_url
     }
 
-    /// Where it appears to the session's commands, which is what every path in the session
-    /// is spelled under.
+    /// Where it appears to the session's commands.
     pub fn guest_path(&self) -> &Path {
         Path::new(&self.guest_path)
     }
@@ -403,10 +277,7 @@ impl MountSpec {
         self.readonly
     }
 
-    /// The scheme, which is the kind — `"file"`, `"https"`.
-    ///
-    /// What a server branches on to decide whether it has a provider, and what it names in
-    /// the refusal when it has not; see the type's docs for which code that is.
+    /// The scheme, which is the kind: `"file"`, `"https"`. A server picks a provider by it.
     pub fn scheme(&self) -> &str {
         self.host_url
             .split_once("://")
@@ -415,18 +286,10 @@ impl MountSpec {
 
     /// The directory a `file://` URL names, or `None` for any other scheme.
     ///
-    /// The path is what follows the scheme, **as it stands**: nothing is percent-decoded,
-    /// because a reader would then have to decode it before it was a path again, which is a
-    /// second thing to get right about one directory.
+    /// The path is what follows the scheme, **not percent-decoded**. The caller checks that
+    /// it is absolute, since a relative path is a malformed request, not a missing provider.
     ///
-    /// Whether it is absolute is the caller's to check and refuse, because that refusal is a
-    /// different one: a relative path is a malformed request where an unknown scheme is a
-    /// build without a provider.
-    ///
-    /// Here rather than in each backend because every server that realizes `file://` has to
-    /// read it the same way. Two that disagree would be two servers a client cannot tell
-    /// apart answering the same URL differently, which is the failure a shared protocol type
-    /// exists to prevent.
+    /// Shared here so every server reads a `file://` URL the same way.
     pub fn file_path(&self) -> Option<&Path> {
         self.host_url.strip_prefix("file://").map(Path::new)
     }
@@ -453,9 +316,8 @@ impl FromStr for MountSpec {
             })
         };
 
-        // The URL's own `://` is not a separator, and neither is anything inside it, so the
-        // search starts past it — which is also what makes a missing scheme the first thing
-        // this refuses rather than a URL read as a path.
+        // Search past the URL's own `://`, so a missing scheme is refused first rather than
+        // read as a path.
         let Some(scheme) = spec.find("://") else {
             return refuse("a mount URL needs a scheme");
         };
@@ -466,8 +328,7 @@ impl FromStr for MountSpec {
             let Some((before, last)) = rest.rsplit_once(':') else {
                 return refuse("a mount needs a guest path to appear at");
             };
-            // An absolute guest path is what ends the options, which is the rule that lets
-            // a URL carry colons of its own.
+            // An absolute guest path ends the options, so the URL may carry its own colons.
             if last.starts_with('/') {
                 let mount = MountSpec::new(format!("{head}{before}"), last)?;
                 return Ok(if readonly { mount.read_only() } else { mount });
@@ -475,9 +336,7 @@ impl FromStr for MountSpec {
             match last {
                 "ro" => readonly = true,
                 "rw" => readonly = false,
-                // The same refusal covers a guest path that forgot its leading slash,
-                // because from here the two are one thing: a trailing segment that is
-                // neither an option nor a path.
+                // Also covers a guest path missing its leading slash: neither is an option.
                 _ => return refuse("a mount trails an absolute guest path with `ro` or `rw`"),
             }
             rest = before;
@@ -500,8 +359,7 @@ impl<'de> Deserialize<'de> for MountSpec {
 
 /// Why a string is not a [`MountSpec`].
 ///
-/// Carries the string it was reading, because a session names several trees and a peer
-/// hearing only what was wrong with one of them cannot tell which.
+/// Carries the offending string, since a session names several trees.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidMount {
     why: &'static str,
@@ -522,28 +380,22 @@ impl std::error::Error for InvalidMount {}
 /// "8080:80"   127.0.0.1:8080 on the server's machine reaches port 80 in the session
 /// ```
 ///
-/// **Docker's spelling, host first**, because it is the one a person writing a port has
-/// already written somewhere, and a second order for the same two numbers is a session
-/// published backwards. What is left out of docker's is what would be a lie here: no address
-/// in front, because the port is on loopback and nowhere else, and no `/udp` after, because
-/// a port is TCP.
+/// **Docker's spelling, host first**, since a second order for the same two numbers would
+/// publish a session backwards. No address (the port is on loopback only) and no `/udp` (a
+/// port is TCP).
 ///
-/// # Loopback, and held for the whole session
+/// # Loopback, held for the whole session
 ///
 /// The server listens at `127.0.0.1:<host>` from `init` until the session ends, across every
-/// `stop` and the boot after it, so a program that was given the port keeps it. A connection
-/// that arrives while nothing is booted waits for the next boot rather than being refused.
-///
-/// A connection reaches whatever in the session listens on `console`, whichever address it
-/// listens on — its own loopback included — and is closed, as soon as it is accepted, when
-/// nothing does.
+/// `stop` and the boot after it. A connection arriving while nothing is booted waits for the
+/// next boot. It reaches whatever in the session listens on `console`, on any address
+/// including its own loopback, and is closed on accept when nothing does.
 ///
 /// # Both numbers, always
 ///
-/// The host port is the client's to choose, like every other part of a session, so there is
-/// nothing for the server to answer about it: the port a client connects to is the one it
-/// wrote. A port of `0` on either side is no port at all, and is refused -- a host port that
-/// is taken is refused too, at `init`, while the client can still pick another.
+/// The host port is the client's choice, so the server has nothing to answer about it. Port
+/// `0` on either side is refused, and so is a host port already taken, at `init` while the
+/// client can still pick another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Port {
     /// The port on the server's machine a connection is made to.
@@ -622,45 +474,18 @@ impl std::error::Error for InvalidPort {}
 
 /// What the server made of the session. The `result` of `init`.
 ///
-/// Answered rather than left to a notification because this is the one thing about a
-/// session a client can hear before it asks for work — that there is a server on the far
-/// end, that it read the frame, that it speaks this protocol, and that it has taken what it
-/// was told.
-///
-/// **It says nothing about where the trees went, because the call already did.** A
-/// [`MountSpec`](super::MountSpec) carries the path its tree appears at, so every path in
-/// the session is settled by the end that is going to spell them and there is nothing here
-/// to read back. What is left is the one fact about a session the client could not have
-/// worked out from what it sent: where it stands.
+/// Mount locations are not echoed: each [`MountSpec`] already says where
+/// its tree appears.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InitResp {
-    /// Where the session stands to begin with — the working directory the base image
-    /// declared, and whatever the server stands a session in when it declared none.
+    /// The session's starting working directory: the one the base image declared, or the
+    /// server's default if it declared none. `None` if the server will not say.
     ///
-    /// **The image, because the image is what the session runs on.** An image that says
-    /// where a process starts is describing the thing it was built to run, and a session
-    /// that stood somewhere else would be one where that image's own instructions are
-    /// wrong. Standing in a tree the client named instead would make that tree the default
-    /// destination of every relative path a command writes — somebody's project, when that
-    /// is what the tree is, and a mount the client asked to be read-only at that.
+    /// **The image's, by convention**, since it describes what the image was built to run;
+    /// starting in a client tree would make it (maybe a read-only project) the default
+    /// target of every relative path. A server that differs just reports it here.
     ///
-    /// Which is a convention and not a rule this protocol enforces: it is one member saying
-    /// one thing, and a server that stands somewhere else says so here and is read.
-    ///
-    /// **A session has a current directory, and the server is what keeps it.** That is why
-    /// an [`ExecCall`](super::ExecCall) asking for a command says nothing about where to run it:
-    /// there is one answer at any moment and the far end holds it.
-    ///
-    /// **To begin with**, and nothing here says otherwise afterwards. A command can move
-    /// the session — `cd` is a shell builtin, so a backend that offers it at all answers it
-    /// itself — and no result reports that it did. A client that wants to know where it
-    /// stands runs `pwd`, the way a person at a terminal does; see [`ExecResp`] for why
-    /// that is the trade rather than a gap.
-    ///
-    /// So what this is worth is the *first* answer: before a client has run anything, this
-    /// is the only way it can say where a relative path would land. Absent is a server that
-    /// will not say, and a client is then no worse off than it was before the field existed
-    /// — every path it sends is one it built itself.
+    /// The server keeps the current directory, so an [`ExecCall`](super::ExecCall) names none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
 }
@@ -689,8 +514,7 @@ mod tests {
         }
     }
 
-    /// A mount is one string both ends read the same way, so what matters about it is that
-    /// what goes out comes back as itself.
+    /// A mount's spelling round-trips.
     #[test]
     fn a_mount_survives_its_spelling() {
         for spec in [
@@ -703,8 +527,7 @@ mod tests {
             assert_eq!(read.to_string(), spec);
         }
 
-        // `rw` is the default and is sayable, so a client may be explicit — which is the one
-        // spelling that does not come back as itself.
+        // Explicit `rw` is the one spelling that does not round-trip: it is the default.
         let explicit: MountSpec = "file:///srv/project:/work:rw".parse().unwrap();
         assert_eq!(explicit.to_string(), "file:///srv/project:/work");
     }
@@ -720,15 +543,14 @@ mod tests {
         assert_eq!(mount.scheme(), "file");
         assert_eq!(mount.file_path(), Some(Path::new("/srv/project")));
 
-        // A scheme with no provider is still read: what refuses it is the build, not this.
+        // A scheme with no provider still parses; the build refuses it, not the parser.
         let remote: MountSpec = "s3://bucket/prefix:/work".parse().unwrap();
         assert_eq!(remote.scheme(), "s3");
         assert_eq!(remote.file_path(), None);
         assert!(!remote.is_read_only());
     }
 
-    /// What is not a mount, and what each refusal says — a session names several trees, so
-    /// each one names the string it was reading.
+    /// Each refusal names the rule and the offending string.
     #[test]
     fn what_is_not_a_mount_says_which_rule_it_broke() {
         for (spec, why) in [
@@ -755,8 +577,7 @@ mod tests {
             assert!(refused.contains(spec), "{spec}: {refused}");
         }
 
-        // And the same rules hold for one built rather than read, so that a value of this
-        // type is always one that can be written and read back.
+        // The same rules hold for a constructed mount, so every value round-trips.
         assert!(MountSpec::new("file:///srv/project", "work").is_err());
         assert!(MountSpec::new("file:///srv/project", "/wo:rk").is_err());
     }
@@ -784,8 +605,7 @@ mod tests {
         assert_eq!(bson::deserialize_from_bson::<InitCall>(wire).unwrap(), init);
     }
 
-    /// The machine's shape is five members and each is absent unless it was asked for, so a
-    /// client with no opinion sends the frame it always sent.
+    /// Each machine member is absent from the frame unless set.
     #[test]
     fn a_session_says_only_the_shape_it_asked_for() {
         let quiet = bson::serialize_to_bson(&InitCall::default()).unwrap();
@@ -794,7 +614,7 @@ mod tests {
         let init = InitCall {
             vcpus: Some(4),
             memory_mib: Some(4096),
-            // Explicitly none, which is a thing to say and not a thing to leave out.
+            // Explicitly no GPU, distinct from leaving it out.
             gpu: Some(false),
             ..InitCall::default()
         };

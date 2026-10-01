@@ -2,7 +2,7 @@
 //
 //     node examples/hello.mjs
 //
-// Needs the console server under `~/.cache/virtx/bin` (or `VIRTX_STDIO_SERVER_PATH`).
+// Needs `virtx-uvm` in the virtx cache `bin` (`$VIRTX_HOME/bin` if set); `ensureVirtx()` fetches it.
 
 import { createRequire } from 'node:module'
 

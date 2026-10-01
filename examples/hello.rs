@@ -4,7 +4,7 @@
 //! cargo run --example hello
 //! ```
 //!
-//! Needs the console server under `~/.cache/virtx/bin` (or `VIRTX_STDIO_SERVER_PATH`).
+//! Needs `virtx-uvm` in `cache_root()/bin` (`$VIRTX_HOME/bin` if set); `ensure_virtx` fetches it.
 
 use virtx::{console::ConsoleClient, image::Recipe};
 

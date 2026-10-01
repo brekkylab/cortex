@@ -2,7 +2,7 @@
 
     uv run python examples/hello.py
 
-Needs the console server under `~/.cache/virtx/bin` (or `VIRTX_STDIO_SERVER_PATH`).
+Needs `virtx-uvm` in the virtx cache `bin` (`$VIRTX_HOME/bin` if set); `ensure_virtx()` fetches it.
 """
 
 import asyncio

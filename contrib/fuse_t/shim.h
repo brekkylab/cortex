@@ -1,13 +1,13 @@
 /* The boundary between virtx and libfuse-t.
  *
- * Everything fragile stays on the C side: `fuse_lowlevel_ops` (~50 function
- * pointers, `__APPLE__`-conditional members), `fuse_file_info` (bitfields), and
- * `fuse_entry_param` (embeds a host `struct stat`). A wrong layout in Rust is
- * silent memory corruption, not a compile error, so the C compiler — which has
- * the real headers — owns them and Rust sees only the flat types below.
+ * `fuse_lowlevel_ops` (~50 function pointers, `__APPLE__`-conditional members),
+ * `fuse_file_info` (bitfields) and `fuse_entry_param` (embeds a host
+ * `struct stat`) stay in C: a wrong layout in Rust is silent memory corruption.
+ * They are declared in `fuse_t.h` and checked against FUSE-T's own headers by
+ * `check-abi.sh`. Rust sees only the flat types below.
  *
- * Rust supplies `virtx_fuse_t_ops`, a vtable of its own design. Operations
- * return 0 or a negative errno, as libfuse itself does.
+ * Rust supplies `virtx_fuse_t_ops`. Operations return 0 or a negative errno,
+ * as libfuse does.
  */
 
 #ifndef VIRTX_FUSE_T_SHIM_H
@@ -16,8 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* A `struct stat` reduced to what virtx reports. All fixed-width with an
- * explicit pad, so the Rust mirror is trivially correct; C widens it. */
+/* A `struct stat` reduced to what virtx reports. Fixed-width with an explicit
+ * pad so the Rust mirror is trivially correct; C widens it. */
 struct virtx_stat {
     uint64_t ino;
     uint64_t size;
@@ -35,7 +35,7 @@ struct virtx_stat {
 };
 
 /* Emits one directory entry: 0 while there is room, 1 once the kernel's buffer
- * is full — the same "stop" signal the other bindings use. */
+ * is full. */
 typedef int (*virtx_dirent_sink)(void *sink, uint64_t ino, const char *name,
                                   uint32_t mode, uint64_t next_offset);
 
@@ -61,8 +61,8 @@ struct virtx_fuse_t_ops {
                  struct virtx_stat *out);
     int (*unlink)(void *fs, uint64_t parent, const char *name);
     int (*rmdir)(void *fs, uint64_t parent, const char *name);
-    /* No flags argument: libfuse-t's `rename` has none, so the Rust side
-     * cannot be handed `RENAME_NOREPLACE`/`RENAME_EXCHANGE` here at all. */
+    /* No flags: libfuse-t's `rename` has none, so `RENAME_NOREPLACE`/
+     * `RENAME_EXCHANGE` never reach Rust. */
     int (*rename)(void *fs, uint64_t parent, const char *name, uint64_t newparent,
                   const char *newname);
     int (*readdir)(void *fs, uint64_t ino, uint64_t offset, void *sink,
@@ -75,19 +75,32 @@ struct virtx_fuse_t_ops {
     uint32_t name_max;
 };
 
-/* Open libfuse-t, once per process, and answer nonzero if it and every
- * function the shim calls were found. The shim does not link it, so every
- * other function here calls through what this resolved: ask this first, and
- * call nothing else when it answers 0. Thread-safe. */
-int virtx_fuse_t_available(void);
+/* What `virtx_fuse_t_status` answers. */
+#define VIRTX_FUSE_T_MISSING 0 /* no libfuse-t, or one without a function the shim calls */
+#define VIRTX_FUSE_T_OK 1
+#define VIRTX_FUSE_T_OTHER_API 2 /* a libfuse API other than 2.x: `virtx_fuse_t_api` */
+#define VIRTX_FUSE_T_OTHER_MAJOR 3 /* a FUSE-T release of another major version: `virtx_fuse_t_release` */
+
+/* Open libfuse-t once per process, check the shim's declarations fit it, and resolve every
+ * function the shim calls. The shim does not link it, so call nothing else here unless this
+ * answered VIRTX_FUSE_T_OK. Thread-safe. */
+int virtx_fuse_t_status(void);
+
+/* The loaded libfuse-t's `fuse_version()`, or 0 when none was loaded. */
+int virtx_fuse_t_api(void);
+
+/* The loaded FUSE-T release, as its installer names the file
+ * (`libfuse-t-<release>.dylib`), or "" when that name does not say. */
+const char *virtx_fuse_t_release(void);
+
+/* The FUSE-T release `fuse_t.h` was last checked against. */
+const char *virtx_fuse_t_checked(void);
 
 /* Mount and build a session. Returns NULL on failure. The returned pointer owns
  * the channel and session and must be freed with `virtx_fuse_t_destroy`.
  *
- * `backend` names which of FUSE-T's transports serves the mount — "nfs", "smb"
- * or "fskit" — or is NULL to leave the choice to FUSE-T, which reads it from
- * `fuse-t.ini` and defaults to nfs. Nothing else about the session changes with
- * it: the vtable below is what answers either way. */
+ * `backend` is FUSE-T's transport ("nfs", "smb" or "fskit"), or NULL for
+ * `fuse-t.ini`'s choice (default nfs). The same vtable answers either way. */
 void *virtx_fuse_t_mount(const char *mountpoint, const char *fsname,
                           const char *backend, void *fs,
                           const struct virtx_fuse_t_ops *ops);
@@ -95,18 +108,16 @@ void *virtx_fuse_t_mount(const char *mountpoint, const char *fsname,
 /* Serve requests until the session ends. Blocks; call from a dedicated thread. */
 int virtx_fuse_t_loop(void *session);
 
-/* End the serving loop, so `virtx_fuse_t_loop` returns and its thread can be
+/* End the serving loop so `virtx_fuse_t_loop` returns and its thread can be
  * joined. Idempotent.
  *
- * **Does not unmount.** libfuse-t's `fuse_unmount` cannot be used while a second
- * mount is alive in the process: it ends in a blocking `waitpid` on a
- * process-global pid that every mount overwrites, so it waits on another
- * session's helper. The mount is taken down through the operating system
- * instead — see `fs::mount::unmount_under` — and this only releases the session
- * that was serving it. */
+ * **Does not unmount.** `fuse_unmount` breaks with a second mount alive: it
+ * ends in a blocking `waitpid` on a process-global pid every mount overwrites,
+ * so it waits on another session's helper. The caller unmounts through the
+ * operating system instead. */
 void virtx_fuse_t_stop(void *session);
 
-/* Release the session and channel. Must follow a `virtx_fuse_t_loop` return. */
+/* Release the session and channel. Must not run while `virtx_fuse_t_loop` does. */
 void virtx_fuse_t_destroy(void *session);
 
 #endif

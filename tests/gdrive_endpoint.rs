@@ -1,48 +1,19 @@
 //! A Drive API that this repository does not write, driven through [`GdriveFs::new`].
 //!
-//! Every other gdrive test answers from a loopback mock in `gdrive_tests.rs`, which is the
-//! right tool for one question — *what did we ask for* — and the wrong one for another:
-//! **whether what we ask for is what Drive answers.** A mock encodes our understanding of
-//! the API, so it agrees with us by construction and stays green when the API moves. This
-//! file exists for the other half.
-//!
-//! It drives **backlot** (the server in `brekkylab/enterprise-mock`), which follows the real
-//! Drive, Docs, Sheets and Slides shapes over a corpus rather than a live account: paging
-//! cursors, `orderBy`, the ACL-filtered view a token sees, the error *statuses* Google
-//! actually returns. When backlot is corrected to match Google — as it was for `orderBy` in
-//! `enterprise-mock#28` — this is what notices.
-//!
-//! Skipped, not failed, when the host cannot be reached. A suite with no network stays
-//! green.
+//! The loopback mock in `gdrive_tests.rs` encodes our reading of the API, so it agrees with
+//! us by construction and stays green when the API moves. This suite asks **whether what we
+//! ask for is what Drive answers**, against **backlot** (`brekkylab/enterprise-mock`), which
+//! follows the real Drive, Docs, Sheets and Slides shapes over a corpus: paging cursors,
+//! `orderBy`, the ACL-filtered view a token sees, the error statuses Google returns.
 //!
 //! ```sh
 //! cargo test --features gdrive --test gdrive_endpoint -- --ignored --nocapture
 //! ```
 //!
-//! Nothing to configure. The host is named below and the credentials come from it: backlot
-//! publishes a per-user token roster at `/_mock/users`, and its token endpoint's refresh
-//! grant takes one of those tokens and hands it back — so a `GdriveConfig` needs no secret
-//! kept anywhere. The corpus is discovered rather than assumed, so this survives it
-//! changing underneath.
-//!
-//! ## What this cannot cover
-//!
-//! **Anything about a blob.** The corpus holds Docs-editors files in bulk and almost no
-//! binary ones — two PDFs, the larger 1,083 bytes, and nothing at all under `image/png`,
-//! `image/jpeg`, `application/zip`, `text/plain` or `application/octet-stream`. Both PDFs
-//! sit under a parent whose id is shaped like a shared drive's root, and backlot answers
-//! `drives.list` with none, so no shared-drive section is built for them: they surface only
-//! through `Shared with me`, which runs past `MAX_FOLDER_FILES` and is truncated before
-//! reaching them. So the blob test below skips against this corpus, and will start running
-//! the day it gains one — the assertions are written and waiting.
-//!
-//! `FIRST_SPAN` is 8 MiB and `READ_SPAN` is 64 MiB in any case, so the policy that made a
-//! 641 MB archive readable could not be exercised at any size this corpus contains.
-//!
-//! **What we asked for.** No server reports the number of requests it received back to its
-//! caller, or the `Range` header on each. Every claim of the form "eight windows, one
-//! request" is a claim about our own behaviour, and it stays with the loopback mock in
-//! `gdrive_tests.rs`, which counts.
+//! Credentials come from backlot's token roster at `/_mock/users`, so no secret is kept;
+//! skipped, not failed, when the host cannot be reached. Not covered: the span policy (both
+//! spans exceed every corpus file) and request counts or `Range` headers, which only the
+//! loopback mock sees.
 
 #![cfg(feature = "gdrive")]
 
@@ -50,12 +21,12 @@ use std::path::{Path, PathBuf};
 
 use virtx::fs::{DirentKind, FileSystem, GdriveConfig, GdriveFs, GdriveOrigins};
 
-/// The mock this drives — a stand-in for the read APIs of a dozen enterprise services,
+/// The mock this drives — a stand-in for the read APIs of several enterprise services,
 /// Drive among them. `BACKLOT_URL` overrides it for a local instance.
 const HOST: &str = "https://enterprise-mock.brekkylab.com";
 
-/// Bounds on the walk, so the same test runs against a five-file sample and a
-/// twenty-five-thousand-document corpus without becoming the slowest thing in the suite.
+/// Bounds on the walk, so the same test runs against a small sample and a large
+/// corpus without becoming the slowest thing in the suite.
 const WALK_DIRS: usize = 12;
 const WALK_FILES: usize = 40;
 
@@ -92,8 +63,7 @@ async fn config() -> Option<GdriveConfig> {
         .ok()?;
 
     // The admin token bypasses ACL filtering, which is what a crawl of the whole corpus
-    // wants. A per-user token is the other interesting case and is left to a test that
-    // asks about ACLs.
+    // wants.
     let token = roster
         .get("admin_token")
         .and_then(|t| t.as_str())
@@ -201,17 +171,12 @@ async fn gdrive_endpoint_tree_and_reads() {
 }
 
 /// A blob's bytes come back at the offset they were asked for, and the file ends where it
-/// says it does.
+/// says it does: a server we did not write honours a ranged `GET` as this store assumes,
+/// and past the last byte is an ordinary end rather than an error or a wrap.
 ///
-/// Not the span *sizes* — the corpus has no blob near them, see the note at the top. What
-/// this asks is whether a server we did not write honours a ranged `GET` the way this store
-/// assumes it does: the window starts where it should, and past the last byte is an
-/// ordinary end rather than an error or a wrap.
-///
-/// Small is the interesting case here anyway. A blob under one span is fetched whole and
-/// then cut locally, so the arithmetic that turns a file offset into an offset into the
-/// held span is what answers — and getting that wrong reads as the right length of the
-/// wrong bytes.
+/// A blob under one span is fetched whole and cut locally, so a slip in the offset into the
+/// held span reads as the right length of the wrong bytes. Skips when no blob is reachable
+/// within the walk bounds.
 #[tokio::test]
 #[ignore = "requires backlot (BACKLOT_URL, or the host named in this file)"]
 async fn gdrive_endpoint_reads_a_blob_at_the_offset_asked_for() {
@@ -219,9 +184,7 @@ async fn gdrive_endpoint_reads_a_blob_at_the_offset_asked_for() {
     let fs = GdriveFs::new(&cfg).unwrap();
 
     let Some((path, size)) = find_file(&fs, 64, |name| !name.ends_with(".json")).await else {
-        // Expected against the corpus as it stands — see the note at the top of this file.
-        // Not an assertion, because the day a blob appears this should run rather than
-        // having been deleted for being inconvenient.
+        // Not an assertion, so the test runs the day a blob appears.
         eprintln!(
             "  no blob reachable in {WALK_DIRS} directories; \
              the corpus keeps its two behind a truncated listing"
@@ -255,11 +218,8 @@ async fn gdrive_endpoint_reads_a_blob_at_the_offset_asked_for() {
     );
 }
 
-/// A Docs-editors file arrives as its own API's JSON, and parses.
-///
-/// The mock hands back a fixture shaped the way we believe the Docs API shapes one. This
-/// asks a server that implements the API instead — and the answer has to be JSON a parser
-/// accepts after the tail this store pads it with.
+/// A Docs-editors file arrives as its own API's JSON, from a real implementation, and
+/// parses after this store's whitespace padding.
 #[tokio::test]
 #[ignore = "requires backlot (BACKLOT_URL, or the host named in this file)"]
 async fn gdrive_endpoint_serves_a_document_as_json() {
@@ -271,9 +231,7 @@ async fn gdrive_endpoint_serves_a_document_as_json() {
         let Some((path, _)) = find_file(&fs, 0, |name| name.ends_with(suffix)).await else {
             continue;
         };
-        // The way a reader reads it: to the end, then trim the whitespace this store pads
-        // the declared length out with. JSON is defined to ignore what follows a value,
-        // which is the whole reason that padding is whitespace.
+        // Read to the end, as a reader does; `read_to_end` trims the padding.
         let whole = read_to_end(&fs, &path).await;
         let v: serde_json::Value = serde_json::from_slice(&whole)
             .unwrap_or_else(|e| panic!("{} did not parse: {e}", path.display()));
@@ -297,10 +255,8 @@ async fn gdrive_endpoint_serves_a_document_as_json() {
 // Helpers — the public surface only, which is the point of an integration test
 // ---------------------------------------------------------------------------
 
-/// `len` bytes at `offset`, however many reads that takes.
-///
-/// `read_at` may answer short of the buffer, and a short answer is end of file — so this
-/// asks again from where the last one stopped until it is satisfied or the file ends.
+/// `len` bytes at `offset`, or fewer at end of file; keeps reading until satisfied or a
+/// read returns 0.
 async fn read_at(fs: &GdriveFs, path: &Path, offset: u64, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
     let mut got = 0usize;
@@ -341,11 +297,11 @@ async fn read_to_end(fs: &GdriveFs, path: &Path) -> Vec<u8> {
     out
 }
 
-/// The first file in the corpus over `min` bytes whose name `want` accepts, breadth-first
+/// The first file in the corpus of at least `min` bytes whose name `want` accepts, breadth-first
 /// and bounded. Discovered rather than named, so the corpus can change underneath.
 async fn find_file(fs: &GdriveFs, min: u64, want: impl Fn(&str) -> bool) -> Option<(PathBuf, u64)> {
-    // The account's own drive first. A listing here can run to ten thousand entries and
-    // cost ten pages, so the order the sections are tried in is most of the wall clock.
+    // The account's own drive first. A listing can run to many pages, so the order the
+    // sections are tried in is most of the wall clock.
     let mut sections: Vec<PathBuf> = fs
         .list(Path::new("/"))
         .await

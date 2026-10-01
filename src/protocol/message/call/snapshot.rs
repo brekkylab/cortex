@@ -10,12 +10,10 @@ pub struct SnapshotCall {}
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotResp {
     /// The session's writes, in the form [`InitCall::snapshot`](super::InitCall::snapshot)
-    /// takes — so that an `init` given this back starts where this session stopped.
+    /// takes, so an `init` given this starts where this session stopped.
     ///
-    /// Bounded by what one frame holds, like every other result here. A session that has
-    /// written more than that is answered with an error rather than a shortened blob: a
-    /// snapshot is read back as a filesystem, and half of one is not a smaller session's
-    /// work but a broken tree.
+    /// Must fit one frame. A larger session gets an error rather than a truncated blob,
+    /// which would be a broken tree.
     #[serde(with = "bytes")]
     pub blob: Vec<u8>,
 }

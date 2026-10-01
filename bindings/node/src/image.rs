@@ -1,14 +1,9 @@
-//! `Recipe`, `Step` and `ImageSource`: what a session's commands run on — and `ImageClient`,
-//! which builds, lists and removes them.
+//! `Recipe`, `Step` and `ImageSource` (what a session's commands run on), and `ImageClient`,
+//! which builds, lists and removes images.
 //!
-//! The first three are values, as they are in Rust — `Recipe` is `Clone` and a builder call
-//! there hands back a new one — so here every method returns a new object and none mutates
-//! the one it was called on. A base recipe built once and extended in two directions stays
-//! the base.
-//!
-//! `ImageClient` is held the way a `ConsoleClient` is, for the same reasons: its calls are
-//! promises on napi's runtime, they take turns on one channel, and letting go of it says
-//! `quit` on that runtime — see [`crate::console`].
+//! The first three are values, as in Rust (`Recipe` is `Clone` and its builder calls return a
+//! new one): every method returns a new object and none mutates its receiver, so a base recipe
+//! extended in two directions stays the base.
 
 use std::sync::Arc;
 
@@ -65,8 +60,7 @@ impl JsStep {
     }
 }
 
-/// A step as a caller may spell one: a `Step`, or a string meaning `Step.run(..)` — the
-/// same conversion `From<&str> for Step` makes in Rust.
+/// A `Step`, or a string meaning `Step.run(..)`, as `From<&str> for Step` converts in Rust.
 pub type StepLike<'env> = Either<ClassInstance<'env, JsStep>, String>;
 
 fn step(step: StepLike) -> Step {
@@ -168,9 +162,8 @@ impl JsImageSource {
     }
 }
 
-/// An image as a caller may name one: an `ImageSource`, or a `Recipe` meaning
-/// `ImageSource.recipe(..)` — the same conversion `From<Recipe> for ImageSource` makes in
-/// Rust.
+/// An `ImageSource`, or a `Recipe` meaning `ImageSource.recipe(..)`, as
+/// `From<Recipe> for ImageSource` converts in Rust.
 pub type ImageSourceLike<'env> =
     Either<ClassInstance<'env, JsImageSource>, ClassInstance<'env, JsRecipe>>;
 
@@ -225,12 +218,12 @@ fn held(slot: &mut Option<ImageClient>) -> Result<&mut ImageClient> {
 pub struct JsImageClient {
     client: Arc<Mutex<Option<ImageClient>>>,
 
-    /// The runtime the client was started on, which is where its `quit` has to go out.
+    /// The runtime the client was started on; its `quit` must go out from there.
     runtime: Handle,
 }
 
 impl JsImageClient {
-    /// Built inside the future that started it, so the current runtime is the one to keep.
+    /// Must run inside the future that started the client, since it keeps the current runtime.
     fn new(client: ImageClient) -> Self {
         JsImageClient {
             client: Arc::new(Mutex::new(Some(client))),
@@ -239,8 +232,7 @@ impl JsImageClient {
     }
 }
 
-/// Let go of the client on the runtime, so its `quit` goes out — as
-/// [`JsConsoleClient`](crate::console::JsConsoleClient) does.
+/// Only the last holder drops the client, inside its runtime so `quit` goes out.
 impl Drop for JsImageClient {
     fn drop(&mut self) {
         if let Some(slot) = Arc::get_mut(&mut self.client) {
@@ -252,8 +244,7 @@ impl Drop for JsImageClient {
 
 #[napi]
 impl JsImageClient {
-    /// `virtx-uvm` under the stdio server directory, settling with the client once the
-    /// server has answered.
+    /// Start `virtx-uvm` from virtx's cache `bin`; settles once the server answers.
     #[napi(ts_return_type = "Promise<ImageClient>")]
     pub fn try_new(env: &Env) -> napi::Result<PromiseRaw<'_, JsImageClient>> {
         promise(env, async move {
@@ -330,7 +321,7 @@ impl JsImageClient {
     pub fn close<'env>(&self, env: &'env Env) -> napi::Result<PromiseRaw<'env, ()>> {
         let client = self.client.clone();
         promise(env, async move {
-            // Dropped here, on the runtime, which is what lets `quit` go out.
+            // Dropping on the runtime is what lets `quit` go out.
             client.lock().await.take();
             Ok(())
         })

@@ -1,14 +1,4 @@
 //! `Directory` and `HostMount`: the trees a session's commands see.
-//!
-//! A `Directory` is assembled in place, unlike an `Image`, because the Rust type is not
-//! `Clone` — its files live in memory and a copy would be a second tree rather than a second
-//! handle on one. Mounting it *takes* it: a `HostMount` owns the tree it serves, and the
-//! `Directory` it was built from is empty afterwards and refuses further use.
-//!
-//! `HostMount` is one name for three types. virtx names each binding's guard after the
-//! binding — `FuseMount`, `FuseTMount`, `DokanMount` — and only the one this platform has is
-//! compiled, so a JavaScript caller who wants "mount this on the host" should not have to
-//! know which it is.
 
 use std::{io, path::PathBuf};
 #[cfg(feature = "mount")]
@@ -22,6 +12,7 @@ use napi_derive::napi;
 
 use crate::error::{self, Result};
 
+// `HostMount` wraps whichever guard this platform compiles, so callers need not know which.
 #[cfg(all(feature = "mount", windows))]
 use virtx::fs::DokanMount as Platform;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
@@ -39,6 +30,10 @@ pub fn bytes(content: Content) -> Vec<u8> {
     }
 }
 
+/// A tree assembled in place. Mounting it with `HostMount` takes it: the mount owns the tree,
+/// and this `Directory` is empty afterwards and refuses further use.
+// In place because the Rust type is not `Clone`: its files live in memory, so a copy would be a
+// second tree, not a second handle on one.
 #[napi(js_name = "Directory")]
 pub struct JsDirectory(Option<Directory>);
 
@@ -85,7 +80,7 @@ impl JsDirectory {
         self.get()?.unmount(path).map_err(error::io)
     }
 
-    /// `addFile`, handing back this same `Directory` so calls chain.
+    /// `addFile`, returning this same `Directory` so calls chain.
     #[napi]
     pub fn with_file<'env>(
         &mut self,
@@ -97,7 +92,7 @@ impl JsDirectory {
         Ok(this)
     }
 
-    /// `mount`, handing back this same `Directory` so calls chain.
+    /// `mount`, returning this same `Directory` so calls chain.
     #[napi]
     pub fn with_mount<'env>(
         &mut self,
@@ -110,26 +105,25 @@ impl JsDirectory {
     }
 }
 
-/// A tree mounted on this host, until `unmount` or until nothing holds it.
+/// A tree mounted on this host until `unmount()` or until nothing holds it.
 ///
-/// Held behind an [`Arc`] so that passing one to a console builder does not take it from
-/// the JavaScript object: both hold the mount, and without an `unmount` it comes down when
-/// the last of them lets go — the builder's copy with the console, the JavaScript one with
-/// garbage collection.
+/// Passing it to a console builder shares it rather than taking it: without `unmount()` it
+/// comes down when the last holder lets go (the builder's copy with the console, this object
+/// with garbage collection).
 ///
-/// **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and
-/// none at all on a signal or a crash, so a mount left to one is taken down by virtx's
-/// watchdog, from outside the process, once the process is gone. `unmount` is how a
-/// program that wants it down *now* says so.
+/// **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and none
+/// on a signal or crash; a mount left to one is taken down from outside the process once it
+/// is gone (by virtx's watchdog on unix, by Dokany on Windows). Call `unmount()` to take it
+/// down *now*.
 #[cfg(feature = "mount")]
 #[napi(js_name = "HostMount")]
 pub struct JsHostMount(Arc<Shared>);
 
 /// The guard behind a `HostMount`, shared with every console it was handed to.
 ///
-/// Held in an `Option` so that `unmount` can take it down while a console still holds the
-/// `Arc` — which is what makes it an unmount rather than a release of one reference among
-/// several. The mount point is kept beside it, since a console asks for it after as well.
+/// The `Option` lets `unmount` take the mount down while consoles still hold the `Arc`, making
+/// it a real unmount rather than the release of one reference. The mount point is kept beside
+/// it because consoles still ask for it afterwards.
 #[cfg(feature = "mount")]
 pub struct Shared {
     guard: std::sync::Mutex<Option<Platform>>,
@@ -164,12 +158,11 @@ impl JsHostMount {
 
     /// Take the mount down now, and settle once it is down.
     ///
-    /// Whoever else holds it — a console it was handed to — holds a mount point that is no
-    /// longer mounted from here on, so this belongs after the console using it is closed.
-    /// A second call, or one after the mount already came down, settles at once.
+    /// Consoles it was handed to are left with an unmounted mount point, so call this after
+    /// closing them. A repeat call, or one after the mount already came down, settles at once.
     ///
-    /// Off the JavaScript thread: a guard comes down by unmounting and then waiting for the
-    /// thread serving it, which waits for every holder of the tree to let go.
+    /// Runs off the JavaScript thread: dropping a guard unmounts and then waits for the thread
+    /// serving it, which waits for every holder of the tree to let go.
     #[napi(ts_return_type = "Promise<void>")]
     pub fn unmount<'env>(
         &self,
@@ -194,9 +187,8 @@ impl JsHostMount {
 
 /// Throw, saying what to install, if this host cannot mount.
 ///
-/// `HostMount` checks the same before it mounts, so this is for a caller that wants to know
-/// ahead of asking for one. An addon built with `mount` loads on a host without the
-/// provider: what a missing FUSE-T or Dokany costs is a mount, never the `require`.
+/// `HostMount` checks the same before mounting; this lets a caller find out ahead. An addon
+/// built with `mount` still loads without FUSE-T or Dokany: only mounting fails, never `require`.
 #[cfg(feature = "mount")]
 #[napi]
 pub fn mount_support() -> Result<()> {
@@ -217,8 +209,8 @@ pub fn into_mount(mount: MountLike) -> Result<Box<dyn Mount>> {
     };
     #[cfg(not(feature = "mount"))]
     let path = mount;
-    // Absolute, because a mount is named to the server as a `file://` URL, and a relative
-    // path from JavaScript is relative to wherever the process stands.
+    // Absolute, because the server receives a mount as a `file://` URL, and a relative path
+    // would resolve against the process's working directory.
     Ok(Box::new(
         std::path::absolute(PathBuf::from(path)).map_err(error::io)?,
     ))
