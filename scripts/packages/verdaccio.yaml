@@ -7,10 +7,7 @@ auth:
     max_users: 10
 uplinks: {}
 packages:
-  'virtx':
-    access: $all
-    publish: $authenticated
-  'virtx-*':
+  '@brekkylab/*':
     access: $all
     publish: $authenticated
   '**':

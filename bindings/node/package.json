@@ -1,5 +1,5 @@
 {
-  "name": "virtx",
+  "name": "@brekkylab/virtx",
   "version": "0.1.0",
   "description": "The environment an agent works in: what it can see, and what it can do.",
   "license": "Apache-2.0",

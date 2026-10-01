@@ -27,14 +27,11 @@ const until = async (cond, ms) => {
   return cond()
 }
 
-const virtx = require('virtx')
+const virtx = require('@brekkylab/virtx')
 check(typeof virtx.ConsoleClient === 'function', 'the package loads')
 
 // Only this platform's binary, as npm's os/cpu/libc filter chose it.
-const installed = fs
-  .readdirSync(path.join(process.cwd(), 'node_modules'))
-  .filter((name) => name === 'virtx' || name.startsWith('virtx-'))
-  .sort()
+const installed = fs.readdirSync(path.join(process.cwd(), 'node_modules', '@brekkylab')).sort()
 console.log(`  installed: ${installed.join(' ')}`)
 check(installed.length === 2, 'exactly one platform package was installed beside the root')
 
@@ -56,7 +53,7 @@ if (fuse) {
 
   if (process.platform !== 'win32') {
     const child = fs.mkdtempSync(path.join(os.tmpdir(), 'virtx-smoke-killed-'))
-    const script = `const c=require(${JSON.stringify(require.resolve('virtx'))});` +
+    const script = `const c=require(${JSON.stringify(require.resolve('@brekkylab/virtx'))});` +
       `globalThis.m=new c.HostMount(new c.Directory().withFile('a.txt','hi'),${JSON.stringify(child)});` +
       `require('fs').writeFileSync(${JSON.stringify(child + '.ready')},'');setInterval(()=>{},1e9)`
     const p = spawn(process.execPath, ['-e', script], { stdio: 'ignore' })

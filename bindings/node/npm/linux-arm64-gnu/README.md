@@ -1,3 +1,3 @@
-# `virtx-linux-arm64-gnu`
+# `@brekkylab/virtx-linux-arm64-gnu`
 
-This is the **aarch64-unknown-linux-gnu** binary for `virtx`
+This is the **aarch64-unknown-linux-gnu** binary for `@brekkylab/virtx`
