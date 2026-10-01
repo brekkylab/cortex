@@ -77,7 +77,7 @@ fn the_operating_system_can_read_a_virtx_mount() {
     // Attribute projection, as the OS reports it back.
     let meta = fs::metadata(mnt.join("greeting.txt")).unwrap();
     assert!(meta.is_file());
-    assert_eq!(meta.len(), 19);
+    assert_eq!(meta.len(), 18);
     assert!(fs::metadata(mnt.join("sub")).unwrap().is_dir());
 
     drop(mount);

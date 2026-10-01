@@ -65,7 +65,7 @@ permissions:
   contents: read
 
 env:
-  DIST_URL: https://virtx-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com
+  DIST_URL: https://virtx-dist.s3.us-east-1.amazonaws.com
   CARGO_TERM_COLOR: always
   # The tag this run releases: the release's own, or the one it was dispatched with.
   REF: ${{ github.event.release.tag_name || inputs.ref }}
@@ -80,17 +80,17 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.resolve.outputs.version }}
-      krun: ${{ steps.krun.outputs.krun }}
+      uvm: ${{ steps.uvm.outputs.uvm }}
     steps:
       # First, and before any checkout: the tag may be one this repository has not made yet
       # either, and what to do first is the same then -- release virtx-uvm.
-      - id: krun
+      - id: uvm
         name: virtx-uvm has released this tag, on every platform
         run: |
           fail() { echo "::error::$*"; exit 1; }
           if [ "$BUILD_ONLY" = true ]; then
             echo "build-only: no virtx-uvm release is needed, and none is pinned"
-            echo "krun=" >> "$GITHUB_OUTPUT"
+            echo "uvm=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           [[ "$REF" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]] \
@@ -108,7 +108,7 @@ jobs:
           done
           [ "$(printf '%s\n' $shas | sort -u | wc -l)" -eq 1 ] \
             || fail "virtx-uvm/$REF holds archives of different builds:$shas"
-          echo "krun=$REF" >> "$GITHUB_OUTPUT"
+          echo "uvm=$REF" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -137,7 +137,7 @@ jobs:
             [ "$(json "$f")" = "$version" ] || wrong="$wrong $f=$(json "$f")"
           done
           [ -z "$wrong" ] || fail "$REF is version $version, but these manifests say otherwise:$wrong"
-          echo "virtx $version ($REF), pinned to virtx-uvm ${{ steps.krun.outputs.krun || '(none, build-only)' }}"
+          echo "virtx $version ($REF), pinned to virtx-uvm ${{ steps.uvm.outputs.uvm || '(none, build-only)' }}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
@@ -168,7 +168,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
-      VIRTX_UVM_PINNED_VERSION: ${{ needs.resolve.outputs.krun }}
+      VIRTX_UVM_PINNED_VERSION: ${{ needs.resolve.outputs.uvm }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -322,8 +322,8 @@ jobs:
 
       # Not on a build-only run, which pins nothing: without the file, the crate follows `latest`.
       - name: Pin the server release
-        if: needs.resolve.outputs.krun != ''
-        run: echo "${{ needs.resolve.outputs.krun }}" > virtx-uvm.version
+        if: needs.resolve.outputs.uvm != ''
+        run: echo "${{ needs.resolve.outputs.uvm }}" > virtx-uvm.version
 
       # Verified as cargo verifies it: the packed source, alone, built. `--allow-dirty` for
       # `virtx-uvm.version`, written above and in no commit.

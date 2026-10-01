@@ -14,7 +14,7 @@ const PINNED: Option<&str> = match option_env!("VIRTX_UVM_PINNED_VERSION") {
 };
 
 /// Where releases are fetched from unless `$VIRTX_DIST_URL` says otherwise.
-const DIST_URL: &str = "https://virtx-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com";
+const DIST_URL: &str = "https://virtx-dist.s3.us-east-1.amazonaws.com";
 
 /// Fetch the console server into [`cache_root`]`/bin` if absent, and return that directory.
 ///
