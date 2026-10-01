@@ -438,8 +438,8 @@ jobs:
         run: |
           python -m venv "$RUNNER_TEMP/venv"
           py="$RUNNER_TEMP/venv/bin/python"; [ -x "$py" ] || py="$RUNNER_TEMP/venv/Scripts/python.exe"
-          "$py" -m pip install --no-index --find-links dist/wheels virtx-py
-          "$py" -m pip show virtx-py
+          "$py" -m pip install --no-index --find-links dist/wheels virtx
+          "$py" -m pip show virtx
           echo "SMOKE_PYTHON=$py" >> "$GITHUB_ENV"
 
       # On macOS, first without FUSE-T, which a user may not have: the import and every

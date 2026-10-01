@@ -3,7 +3,7 @@ requires = ["maturin>=1.9,<2"]
 build-backend = "maturin"
 
 [project]
-name = "virtx-py"
+name = "virtx"
 version = "0.1.0"
 description = "The environment an agent works in: what it can see, and what it can do."
 readme = "README.md"

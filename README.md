@@ -13,7 +13,7 @@ Create, use, and dispose of VMs directly from your code.
 ### Python
 
 ```sh
-pip install virtx-py
+pip install virtx
 ```
 
 ```python
