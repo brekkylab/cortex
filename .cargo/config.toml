@@ -1,0 +1,7 @@
+# The C runtime linked in, on Windows. The default imports it from `VCRUNTIME140.dll`, which is
+# the Visual C++ Redistributable's and not Windows' own: `node.exe` does not carry it, so on a
+# host without the Redistributable the Node addon fails to load at all -- `require` throws
+# before anything of cortex runs. Linked statically, the addon and the wheel need nothing
+# Windows does not ship. `cc-rs` builds the C dependencies to match by itself.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

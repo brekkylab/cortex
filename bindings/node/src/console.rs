@@ -4,7 +4,7 @@ use std::{future::Future, sync::Arc};
 
 use cortex::{
     console::{ConsoleClient, ConsoleClientBuilder},
-    protocol::{ExecResp, NetworkAccess, ReadResp},
+    protocol::{ExecResp, Port, ReadResp},
 };
 use napi::{
     Env, JsError,
@@ -37,53 +37,6 @@ where
 /// Our error as a thrown JavaScript error, for paths that must return napi's own error type.
 pub fn thrown(env: &Env, error: napi::Error<String>) -> napi::Error {
     napi::Error::from(JsError::from(error).into_unknown(*env))
-}
-
-#[napi(js_name = "NetworkAccess")]
-#[derive(Clone)]
-pub struct JsNetworkAccess(NetworkAccess);
-
-#[napi]
-impl JsNetworkAccess {
-    #[napi(constructor)]
-    pub fn new(reach: String) -> Self {
-        JsNetworkAccess(NetworkAccess::new(reach))
-    }
-
-    #[napi(factory)]
-    pub fn none() -> Self {
-        JsNetworkAccess(NetworkAccess::none())
-    }
-
-    #[napi(factory)]
-    pub fn host() -> Self {
-        JsNetworkAccess(NetworkAccess::host())
-    }
-
-    #[napi(factory)]
-    pub fn public() -> Self {
-        JsNetworkAccess(NetworkAccess::public())
-    }
-
-    #[napi(factory)]
-    pub fn full() -> Self {
-        JsNetworkAccess(NetworkAccess::full())
-    }
-
-    #[napi]
-    pub fn with_host_ports(&self, ports: Vec<u16>) -> JsNetworkAccess {
-        JsNetworkAccess(self.0.clone().with_host_ports(ports))
-    }
-
-    #[napi(getter)]
-    pub fn reach(&self) -> String {
-        self.0.reach.clone()
-    }
-
-    #[napi(getter)]
-    pub fn host_ports(&self) -> Vec<u16> {
-        self.0.host_ports.clone()
-    }
 }
 
 /// A [`ConsoleClientBuilder`], mutated in place (the Rust one is consumed per call and is not
@@ -155,12 +108,19 @@ impl JsConsoleClientBuilder {
     }
 
     #[napi]
-    pub fn network<'env>(
-        &mut self,
-        this: This<'env>,
-        #[napi(ts_arg_type = "NetworkAccess")] network: &JsNetworkAccess,
-    ) -> Result<This<'env>> {
-        self.update(this, |b| Ok(b.network(network.0.clone())))
+    pub fn network<'env>(&mut self, this: This<'env>, network: bool) -> Result<This<'env>> {
+        self.update(this, |b| Ok(b.network(network)))
+    }
+
+    /// Ports on the server's machine that lead into the session, as docker's `-p` spells
+    /// them: `"8080:80"`, host first.
+    #[napi]
+    pub fn ports<'env>(&mut self, this: This<'env>, ports: Vec<String>) -> Result<This<'env>> {
+        let ports = ports
+            .iter()
+            .map(|port| port.parse::<Port>().map_err(error::invalid))
+            .collect::<Result<Vec<_>>>()?;
+        self.update(this, |b| Ok(b.ports(ports)))
     }
 
     #[napi]

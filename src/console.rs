@@ -16,8 +16,8 @@ use crate::{
     fs::Mount,
     image::ImageSource,
     protocol::{
-        Call, Client, ExecCall, ExecResp, Failure, InitCall, MountSpec, NetworkAccess,
-        Notification, ReadCall, ReadResp, Response, WriteCall, WriteResp, stdio::StdioClient,
+        Call, Client, ExecCall, ExecResp, Failure, InitCall, MountSpec, Notification, Port,
+        ReadCall, ReadResp, Response, WriteCall, WriteResp, stdio::StdioClient,
     },
 };
 
@@ -53,8 +53,11 @@ pub struct ConsoleClientBuilder {
     /// only the server's own filesystem.
     mounts: Vec<Mounted>,
 
-    /// `None` leaves the reach to the server.
-    network: Option<NetworkAccess>,
+    /// On unless turned off.
+    network: bool,
+
+    /// Ports on the server's machine that lead into the session, in the order named.
+    ports: Vec<Port>,
 
     vcpus: Option<u8>,
 
@@ -74,7 +77,8 @@ impl Default for ConsoleClientBuilder {
             image: None,
             snapshot: None,
             mounts: Vec::new(),
-            network: None,
+            network: true,
+            ports: Vec::new(),
             vcpus: None,
             memory_mib: None,
             gpu: None,
@@ -173,25 +177,43 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// How much of a network the session's commands get.
+    /// Whether the session's commands reach a network at all; on unless turned off.
     ///
     /// ```no_run
-    /// # use cortex::{console::ConsoleClient, protocol::NetworkAccess};
+    /// # use cortex::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
-    /// let console = ConsoleClient::builder()
-    ///     .network(NetworkAccess::public())
-    ///     .build()
-    ///     .await?;
+    /// let console = ConsoleClient::builder().network(true).build().await?;
     /// # Ok(()) }
     /// ```
     ///
     /// **The server gives exactly this or refuses:** [`build`](Self::build) fails with
     /// [`UNSUPPORTED_NETWORK`](crate::protocol::Error::UNSUPPORTED_NETWORK). A host backend
-    /// cannot take the network away, so it accepts only [`full`](NetworkAccess::full).
+    /// cannot take the network away, so it refuses `false`. What "on" reaches is on
+    /// [`InitCall::network`](crate::protocol::InitCall::network).
+    pub fn network(mut self, network: bool) -> Self {
+        self.network = network;
+        self
+    }
+
+    /// Ports on the server's machine that lead into the session, as docker's `-p` spells
+    /// them (`"8080:80"`, host first). Replaces what an earlier call said.
     ///
-    /// Left out, the server chooses.
-    pub fn network(mut self, network: NetworkAccess) -> Self {
-        self.network = Some(network);
+    /// ```no_run
+    /// # use cortex::console::ConsoleClient;
+    /// # async fn f() -> anyhow::Result<()> {
+    /// // A VNC server in the session, at 127.0.0.1:5901 here.
+    /// let console = ConsoleClient::builder()
+    ///     .network(true)
+    ///     .ports(["5901:5900".parse()?])
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Ports with [`network`](Self::network) off are refused. See [`Port`] for what a
+    /// connection to one reaches.
+    pub fn ports(mut self, ports: impl IntoIterator<Item = Port>) -> Self {
+        self.ports = ports.into_iter().collect();
         self
     }
 
@@ -219,6 +241,30 @@ impl ConsoleClientBuilder {
     }
 
     /// Whether the session's commands get a GPU; `false` forbids one.
+    ///
+    /// **The image must bring the guest's half of Vulkan**: a loader (`libvulkan.so.1`) and
+    /// the venus driver that reaches the host's GPU. The server attaches the device but cannot
+    /// install libraries; without the loader nothing finds a device, and without venus Vulkan
+    /// falls back to a CPU renderer.
+    ///
+    /// | | Alpine | Debian |
+    /// |---|---|---|
+    /// | loader | `vulkan-loader` | `libvulkan1` |
+    /// | venus driver | `mesa-vulkan-virtio` | `mesa-vulkan-drivers`, trixie or later |
+    ///
+    /// ```no_run
+    /// # use cortex::{console::ConsoleClient, image::Recipe};
+    /// # async fn f() -> anyhow::Result<()> {
+    /// let console = ConsoleClient::builder()
+    ///     .image(
+    ///         Recipe::new("alpine:latest")
+    ///             .step("apk add --no-cache vulkan-loader mesa-vulkan-virtio vulkan-tools"),
+    ///     )
+    ///     .gpu(true)
+    ///     .build()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
     pub fn gpu(mut self, gpu: bool) -> Self {
         self.gpu = Some(gpu);
         self
@@ -231,9 +277,13 @@ impl ConsoleClientBuilder {
     /// [`InitCall::gpu_memory_mib`](crate::console::InitCall::gpu_memory_mib)).
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use cortex::{console::ConsoleClient, image::Recipe};
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
+    ///     // A loader and the venus driver -- see `gpu`.
+    ///     .image(
+    ///         Recipe::new("alpine:latest").step("apk add --no-cache vulkan-loader mesa-vulkan-virtio"),
+    ///     )
     ///     .gpu(true)
     ///     .gpu_memory_mib(8192)
     ///     .build()
@@ -339,6 +389,7 @@ impl ConsoleClient {
             image,
             mounts,
             network,
+            ports,
             snapshot,
             vcpus,
             memory_mib,
@@ -364,7 +415,8 @@ impl ConsoleClient {
         let session = InitCall {
             mounts: specs,
             image,
-            network: network.clone(),
+            network,
+            ports,
             snapshot,
             vcpus,
             memory_mib,

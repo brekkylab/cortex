@@ -5,17 +5,21 @@
  * the Rust side.
  */
 
-#define FUSE_USE_VERSION 26
-
 #include "shim.h"
 
+/* libfuse-t's interface, declared rather than taken from FUSE-T's headers, so that this
+ * builds on a host without FUSE-T -- see `fuse_t.h`, and `check-abi.sh` for what keeps it
+ * right. */
+#include "fuse_t.h"
+
 #include <errno.h>
-#include <fuse_lowlevel.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <unistd.h>
 
 /* libfuse-t, opened at run time rather than linked.
  *
@@ -25,10 +29,11 @@
  * dependent, and without it a weak import is null anyway.
  *
  * Each function called is a `dlsym`-filled pointer here, with a macro so call
- * sites use libfuse's own names. `cortex_fuse_t_available` fills them once;
- * call nothing before it answers nonzero. The list must be complete: a missing
- * entry is a link error, since the library is not on the link line. */
+ * sites use libfuse's own names. `cortex_fuse_t_status` fills them once; call
+ * nothing before it answers CORTEX_FUSE_T_OK. The list must be complete: a
+ * missing entry is a link error, since the library is not on the link line. */
 #include <dlfcn.h>
+#include <limits.h>
 #include <pthread.h>
 
 #define CORTEX_FUSE_T_FNS(X)                                                  \
@@ -64,8 +69,37 @@ CORTEX_FUSE_T_FNS(CORTEX_FUSE_T_POINTER)
 #define CORTEX_FUSE_T_LIBDIR "/usr/local/lib"
 #endif
 
-static int cortex_fuse_t_loaded;
+static int cortex_fuse_t_state = CORTEX_FUSE_T_MISSING;
+static int cortex_fuse_t_api_version;
+static char cortex_fuse_t_release_name[32];
 static pthread_once_t cortex_fuse_t_once = PTHREAD_ONCE_INIT;
+
+/* The release the file `symbol` is in says it is, by the name FUSE-T's installer gives it:
+ * `libfuse-t.dylib` is a link to `libfuse-t-<release>.dylib`. Left empty when the name is
+ * not of that form. The library itself carries no version: its `LC_ID_DYLIB` says 0.0.0,
+ * and `fuse_version()` is libfuse's API, not FUSE-T's release. */
+static void cortex_fuse_t_read_release(void *symbol) {
+    static const char prefix[] = "libfuse-t-", suffix[] = ".dylib";
+    const size_t pre = sizeof prefix - 1, suf = sizeof suffix - 1;
+    Dl_info info;
+    char real[PATH_MAX];
+    if (!dladdr(symbol, &info) || !info.dli_fname || !realpath(info.dli_fname, real)) return;
+    const char *base = strrchr(real, '/');
+    base = base ? base + 1 : real;
+    size_t n = strlen(base);
+    if (n <= pre + suf || strncmp(base, prefix, pre) || strcmp(base + n - suf, suffix)) return;
+    size_t len = n - pre - suf;
+    if (len >= sizeof cortex_fuse_t_release_name) return;
+    memcpy(cortex_fuse_t_release_name, base + pre, len);
+    cortex_fuse_t_release_name[len] = 0;
+}
+
+/* `CORTEX_FUSE_T_UNCHECKED`, set to anything but empty or `0`: use a libfuse-t these
+ * declarations were not checked against, at the risk of a crash. */
+static int cortex_fuse_t_unchecked(void) {
+    const char *v = getenv("CORTEX_FUSE_T_UNCHECKED");
+    return v && *v && strcmp(v, "0") != 0;
+}
 
 static void cortex_fuse_t_load(void) {
     void *lib = dlopen("libfuse-t.dylib", RTLD_NOW | RTLD_LOCAL);
@@ -73,17 +107,56 @@ static void cortex_fuse_t_load(void) {
         lib = dlopen(CORTEX_FUSE_T_LIBDIR "/libfuse-t.dylib", RTLD_NOW | RTLD_LOCAL);
     if (!lib)
         return;
+
+    /* Which libfuse-t this is, before anything is called that shares a layout with it:
+     * `fuse_version` takes nothing and returns an int, so it is safe to call whatever
+     * the library is. */
+    int (*version)(void) = (int (*)(void))dlsym(lib, "fuse_version");
+    if (!version)
+        return;
+    cortex_fuse_t_api_version = version();
+    cortex_fuse_t_read_release((void *)version);
+    if (!cortex_fuse_t_unchecked()) {
+        if (cortex_fuse_t_api_version < CORTEX_FUSE_T_API_MIN ||
+            cortex_fuse_t_api_version > CORTEX_FUSE_T_API_MAX) {
+            cortex_fuse_t_state = CORTEX_FUSE_T_OTHER_API;
+            return;
+        }
+        /* A release the name does not say -- no name of that form, or one that does not
+         * start with a number -- is let through on its API alone: refusing it would
+         * refuse an install that is only named differently. */
+        const char *r = cortex_fuse_t_release_name;
+        if (r[0] >= '0' && r[0] <= '9' && atoi(r) != CORTEX_FUSE_T_MAJOR) {
+            cortex_fuse_t_state = CORTEX_FUSE_T_OTHER_MAJOR;
+            return;
+        }
+    }
+
     /* Never closed: every mount this process makes calls through these. */
 #define CORTEX_FUSE_T_RESOLVE(name)                                           \
     if (!(cortex_p_##name = (__typeof__(name) *)dlsym(lib, #name)))           \
         return;
     CORTEX_FUSE_T_FNS(CORTEX_FUSE_T_RESOLVE)
-    cortex_fuse_t_loaded = 1;
+    cortex_fuse_t_state = CORTEX_FUSE_T_OK;
 }
 
-int cortex_fuse_t_available(void) {
+int cortex_fuse_t_status(void) {
     pthread_once(&cortex_fuse_t_once, cortex_fuse_t_load);
-    return cortex_fuse_t_loaded;
+    return cortex_fuse_t_state;
+}
+
+int cortex_fuse_t_api(void) {
+    pthread_once(&cortex_fuse_t_once, cortex_fuse_t_load);
+    return cortex_fuse_t_api_version;
+}
+
+const char *cortex_fuse_t_release(void) {
+    pthread_once(&cortex_fuse_t_once, cortex_fuse_t_load);
+    return cortex_fuse_t_release_name;
+}
+
+const char *cortex_fuse_t_checked(void) {
+    return CORTEX_FUSE_T_CHECKED;
 }
 
 #define fuse_add_direntry cortex_p_fuse_add_direntry

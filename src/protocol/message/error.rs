@@ -70,11 +70,10 @@ impl Error {
     /// described correctly; the environment is what has to change.
     pub const MOUNT_FAILED: i64 = -32009;
 
-    /// `init`: a network reach this server cannot provide, named in the message.
+    /// `init`: a network this server cannot give the way it was asked for.
     ///
-    /// Covers both an unknown name and an understood one that cannot be honoured (a host
-    /// backend cannot take the network away, so it refuses all but `full`); the fix is the
-    /// same: ask for something else, or use another backend.
+    /// A server whose commands run on this host cannot take the network away, so it refuses
+    /// `network: false` rather than running them with one; the fix is another backend.
     pub const UNSUPPORTED_NETWORK: i64 = -32010;
 
     /// `init`: this backend cannot swap the base image at all (its commands run on the

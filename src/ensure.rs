@@ -6,6 +6,13 @@ use anyhow::Context as _;
 
 use crate::cache_root;
 
+/// The server release this build fetches by default, set at build time -- a sha or a tag.
+/// `None` in a build nobody pinned, which follows `latest`.
+const PINNED: Option<&str> = match option_env!("CORTEX_KRUN_PINNED_VERSION") {
+    Some(version) if !version.is_empty() => Some(version),
+    _ => None,
+};
+
 /// Where releases are fetched from unless `$CORTEX_DIST_URL` says otherwise.
 const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com";
 
@@ -14,9 +21,10 @@ const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east
 /// **Present is enough**: a `bin/` that already has `cortex-krun` (from here or from
 /// `cargo xtask install`) is left alone; this does not keep it up to date.
 ///
-/// The version is `$CORTEX_KRUN_VERSION` if set, else this platform's `latest`. `cortex-krun`
-/// is placed last, so a partial fetch leaves a `bin/` the next call refetches rather than one
-/// that looks complete.
+/// The release is `$CORTEX_KRUN_VERSION` if set; else the one this build was pinned to
+/// (`CORTEX_KRUN_PINNED_VERSION`, set for a published package so it fetches the server it was
+/// tested with); else `latest`. `cortex-krun` is placed last, so a partial fetch leaves a
+/// `bin/` the next call refetches rather than one that looks complete.
 ///
 /// # Release layout
 ///
@@ -24,12 +32,12 @@ const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east
 /// endpoint:
 ///
 /// ```text
-/// cortex-krun/<os>-<arch>/latest                                    one line: a version
-/// cortex-krun/<os>-<arch>/<version>/cortex-krun-<os>-<arch>.tar.gz
+/// cortex-krun/<ref>/cortex-krun-<os>-<arch>.tar.gz
 /// ```
 ///
-/// `<os>`/`<arch>` are as [`std::env::consts`] spells them. A version is a cortex-krun git sha;
-/// `latest` is per platform, since each platform is uploaded separately.
+/// `<os>`/`<arch>` are as [`std::env::consts`] spells them. `<ref>` is any name a release goes
+/// by (a cortex-krun git sha, a version tag, or `latest`), so fetching is one URL whichever
+/// name is given.
 pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     let root = cache_root();
     let bin = root.join("bin");
@@ -43,27 +51,19 @@ pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
         .ok()
         .filter(|url| !url.is_empty())
         .unwrap_or_else(|| DIST_URL.to_string());
-    let base = format!("{}/cortex-krun/{platform}", base.trim_end_matches('/'));
-
-    let version = match std::env::var("CORTEX_KRUN_VERSION")
+    let release = std::env::var("CORTEX_KRUN_VERSION")
         .ok()
         .filter(|v| !v.is_empty())
-    {
-        Some(version) => version,
-        None => {
-            let latest = fetch(&format!("{base}/latest"))
-                .await
-                .with_context(|| format!("no cortex-krun release is published for {platform}"))?;
-            String::from_utf8(latest)
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .with_context(|| format!("{base}/latest does not name a version"))?
-        }
-    };
+        .or_else(|| PINNED.map(str::to_string))
+        .unwrap_or_else(|| "latest".to_string());
 
-    let url = format!("{base}/{version}/cortex-krun-{platform}.tar.gz");
-    let archive = fetch(&url).await?;
+    let url = format!(
+        "{}/cortex-krun/{release}/cortex-krun-{platform}.tar.gz",
+        base.trim_end_matches('/')
+    );
+    let archive = fetch(&url).await.with_context(|| {
+        format!("no cortex-krun release is published for {platform} as `{release}`")
+    })?;
     tokio::task::spawn_blocking(move || unpack(&archive, &root, &server))
         .await
         .context("unpacking cortex-krun panicked")??;

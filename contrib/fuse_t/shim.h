@@ -2,8 +2,9 @@
  *
  * `fuse_lowlevel_ops` (~50 function pointers, `__APPLE__`-conditional members),
  * `fuse_file_info` (bitfields) and `fuse_entry_param` (embeds a host
- * `struct stat`) stay in C, which has the real headers: a wrong layout in Rust
- * is silent memory corruption. Rust sees only the flat types below.
+ * `struct stat`) stay in C: a wrong layout in Rust is silent memory corruption.
+ * They are declared in `fuse_t.h` and checked against FUSE-T's own headers by
+ * `check-abi.sh`. Rust sees only the flat types below.
  *
  * Rust supplies `cortex_fuse_t_ops`. Operations return 0 or a negative errno,
  * as libfuse does.
@@ -74,10 +75,26 @@ struct cortex_fuse_t_ops {
     uint32_t name_max;
 };
 
-/* Open libfuse-t once per process; nonzero if it and every function the shim
- * calls were found. The shim does not link it, so call nothing else here unless
- * this answered nonzero. Thread-safe. */
-int cortex_fuse_t_available(void);
+/* What `cortex_fuse_t_status` answers. */
+#define CORTEX_FUSE_T_MISSING 0 /* no libfuse-t, or one without a function the shim calls */
+#define CORTEX_FUSE_T_OK 1
+#define CORTEX_FUSE_T_OTHER_API 2 /* a libfuse API other than 2.x: `cortex_fuse_t_api` */
+#define CORTEX_FUSE_T_OTHER_MAJOR 3 /* a FUSE-T release of another major version: `cortex_fuse_t_release` */
+
+/* Open libfuse-t once per process, check the shim's declarations fit it, and resolve every
+ * function the shim calls. The shim does not link it, so call nothing else here unless this
+ * answered CORTEX_FUSE_T_OK. Thread-safe. */
+int cortex_fuse_t_status(void);
+
+/* The loaded libfuse-t's `fuse_version()`, or 0 when none was loaded. */
+int cortex_fuse_t_api(void);
+
+/* The loaded FUSE-T release, as its installer names the file
+ * (`libfuse-t-<release>.dylib`), or "" when that name does not say. */
+const char *cortex_fuse_t_release(void);
+
+/* The FUSE-T release `fuse_t.h` was last checked against. */
+const char *cortex_fuse_t_checked(void);
 
 /* Mount and build a session. Returns NULL on failure. The returned pointer owns
  * the channel and session and must be freed with `cortex_fuse_t_destroy`.

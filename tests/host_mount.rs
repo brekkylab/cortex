@@ -12,9 +12,8 @@
 //! directly while the FUSE ones go through `Posix`, so this checks that a cortex tree behaves
 //! the same whichever kernel asks.
 //!
-//! **A missing provider fails, never silently skips.** On macOS FUSE-T is probed with
-//! pkg-config and fails at build time; Dokany's driver is a runtime fact, so there `try_new`
-//! fails with `mount_support`'s install instructions.
+//! **A missing provider fails, never silently skips.** No provider is needed to build, so
+//! `try_new` is what finds one missing, and answers with what to install.
 
 #![cfg(all(feature = "mount", any(unix, windows)))]
 

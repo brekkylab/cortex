@@ -38,7 +38,12 @@ export declare class ConsoleClientBuilder {
   mountReadonly(mount: HostMount | string, at: string): this
   image(image: ImageSource | Recipe): this
   snapshot(snapshot: Buffer): this
-  network(network: NetworkAccess): this
+  network(network: boolean): this
+  /**
+   * Ports on the server's machine that lead into the session, as docker's `-p` spells
+   * them: `"8080:80"`, host first.
+   */
+  ports(ports: Array<string>): this
   vcpus(vcpus: number): this
   memoryMib(memoryMib: number): this
   gpu(gpu: boolean): this
@@ -116,18 +121,6 @@ export declare class ImageSource {
   toString(): string
 }
 export type JsImageSource = ImageSource
-
-export declare class NetworkAccess {
-  constructor(reach: string)
-  static none(): NetworkAccess
-  static host(): NetworkAccess
-  static public(): NetworkAccess
-  static full(): NetworkAccess
-  withHostPorts(ports: Array<number>): NetworkAccess
-  get reach(): string
-  get hostPorts(): Array<number>
-}
-export type JsNetworkAccess = NetworkAccess
 
 export declare class Recipe {
   constructor(base: string, steps?: Array<Step | string>)

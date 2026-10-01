@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import { createRequire } from 'node:module'
 
 const cortex = createRequire(import.meta.url)('../index.js')
-const { ConsoleClient, Directory, ImageClient, ImageSource, NetworkAccess, Recipe, Step } = cortex
+const { ConsoleClient, Directory, ImageClient, ImageSource, Recipe, Step } = cortex
 
 const tempDir = () => mkdtempSync(join(tmpdir(), 'cortex-'))
 
@@ -32,11 +32,11 @@ test('ImageSource', () => {
   assert.equal(recipe.base, 'alpine:3.20')
 })
 
-test('NetworkAccess', () => {
-  const network = NetworkAccess.host().withHostPorts([8080])
-  assert.equal(network.reach, 'host')
-  assert.deepEqual(network.hostPorts, [8080])
-  assert.deepEqual(NetworkAccess.none().hostPorts, [])
+test('a port is spelled the way docker spells it', () => {
+  const builder = ConsoleClient.builder().network(true).ports(['8080:80', '5901:5900'])
+  assert.throws(() => builder.ports(['5900']), { code: 'INVALID_ARG' })
+  assert.throws(() => builder.ports(['8080:0']), { code: 'INVALID_ARG' })
+  assert.throws(() => builder.ports(['http']), { code: 'INVALID_ARG' })
 })
 
 test('a Directory refuses a file under a mount', () => {
@@ -83,7 +83,7 @@ test('exec, read and write', { skip: !SERVER && 'set $CORTEX_CONSOLE' }, async (
     .cmd([SERVER])
     .image(new Recipe('python:3.12-slim-trixie'))
     .mount(tempDir(), '/work')
-    .network(NetworkAccess.none())
+    .network(false)
     .build()
   try {
     assert.deepEqual(console_.mounts, ['/work'])

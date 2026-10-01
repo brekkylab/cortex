@@ -4,7 +4,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use cortex::{
     console::{ConsoleClient, ConsoleClientBuilder},
-    protocol::{ExecResp, NetworkAccess, ReadResp},
+    protocol::{ExecResp, Port, ReadResp},
 };
 use pyo3::{exceptions::PyValueError, prelude::*};
 use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
@@ -15,59 +15,6 @@ use crate::{
     fs::{Content, MountLike},
     image::ImageSourceLike,
 };
-
-#[pyclass(name = "NetworkAccess", module = "cortex", frozen, from_py_object)]
-#[derive(Clone)]
-pub struct PyNetworkAccess(NetworkAccess);
-
-#[pymethods]
-impl PyNetworkAccess {
-    #[new]
-    fn new(reach: String) -> Self {
-        PyNetworkAccess(NetworkAccess::new(reach))
-    }
-
-    #[staticmethod]
-    fn none() -> Self {
-        PyNetworkAccess(NetworkAccess::none())
-    }
-
-    #[staticmethod]
-    fn host() -> Self {
-        PyNetworkAccess(NetworkAccess::host())
-    }
-
-    #[staticmethod]
-    fn public() -> Self {
-        PyNetworkAccess(NetworkAccess::public())
-    }
-
-    #[staticmethod]
-    fn full() -> Self {
-        PyNetworkAccess(NetworkAccess::full())
-    }
-
-    fn with_host_ports(&self, ports: Vec<u16>) -> Self {
-        PyNetworkAccess(self.0.clone().with_host_ports(ports))
-    }
-
-    #[getter]
-    fn reach(&self) -> &str {
-        &self.0.reach
-    }
-
-    #[getter]
-    fn host_ports(&self) -> Vec<u16> {
-        self.0.host_ports.clone()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "NetworkAccess(reach={:?}, host_ports={:?})",
-            self.0.reach, self.0.host_ports
-        )
-    }
-}
 
 /// A [`ConsoleClientBuilder`], mutated in place (the Rust one is consumed per call and is not
 /// `Clone`) and emptied by `build()`; every method returns this same object, so calls chain.
@@ -125,8 +72,21 @@ impl PyConsoleClientBuilder {
         Self::update(slf, |b| Ok(b.snapshot(snapshot)))
     }
 
-    fn network(slf: PyRef<'_, Self>, network: PyNetworkAccess) -> PyResult<PyRef<'_, Self>> {
-        Self::update(slf, |b| Ok(b.network(network.0)))
+    fn network(slf: PyRef<'_, Self>, network: bool) -> PyResult<PyRef<'_, Self>> {
+        Self::update(slf, |b| Ok(b.network(network)))
+    }
+
+    /// Ports on the server's machine that lead into the session, as docker's `-p` spells
+    /// them: `"8080:80"`, host first.
+    fn ports(slf: PyRef<'_, Self>, ports: Vec<String>) -> PyResult<PyRef<'_, Self>> {
+        let ports = ports
+            .iter()
+            .map(|port| {
+                port.parse::<Port>()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        Self::update(slf, |b| Ok(b.ports(ports)))
     }
 
     fn vcpus(slf: PyRef<'_, Self>, vcpus: u8) -> PyResult<PyRef<'_, Self>> {
@@ -383,7 +343,6 @@ impl PyReadResult {
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyNetworkAccess>()?;
     m.add_class::<PyConsoleClientBuilder>()?;
     m.add_class::<PyConsoleClient>()?;
     m.add_class::<PyExecResult>()?;
