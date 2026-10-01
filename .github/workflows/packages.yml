@@ -232,6 +232,12 @@ jobs:
           npx napi build --platform --release --target ${{ matrix.target }} --output-dir "$GITHUB_WORKSPACE/dist/node"
           ls -la "$GITHUB_WORKSPACE/dist/node"
 
+      # maturin-action, building in the container itself, installs what it needs with
+      # `python3 -m pip`: the image's own Python, since AlmaLinux's has no pip.
+      - name: Python (Linux)
+        if: matrix.container
+        run: echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+
       - name: Python wheel
         uses: PyO3/maturin-action@v1
         with:
