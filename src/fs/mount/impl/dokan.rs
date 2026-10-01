@@ -843,7 +843,9 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 /// The store path a Dokan file name denotes.
 ///
-/// Dokan's NT spelling (`\`, `\src\main.rs`) becomes the stores' rooted `/`-separated path.
+/// Dokan's NT spelling (`\`, `\src\main.rs`) becomes a rooted path built with
+/// [`PathBuf::push`], which on Windows separates with `\` too, so stores split it by component
+/// rather than on `/`.
 ///
 /// Split by hand: [`PathBuf`] on Windows would read a leading `C:` as a drive prefix.
 ///
