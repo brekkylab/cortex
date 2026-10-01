@@ -134,8 +134,11 @@ impl DokanMount {
     /// session: a service's mount is invisible to the desktop unless the mount manager
     /// publishes it.
     ///
-    /// [`MountFlags::CASE_SENSITIVE`] is added whatever `flags` says: the stores tell names
-    /// apart by case, and a driver that does not mistakes one file for another.
+    /// [`MountFlags::CASE_SENSITIVE`] is added whatever `flags` says, and cannot be turned off:
+    /// the stores tell names apart by case, and a driver that does not mistakes one file for
+    /// another. The cost is over a store that does not, such as a passthrough to an NTFS
+    /// directory: `a.txt` and `A.TXT` are one host file there but two to the driver, so an
+    /// exclusive open or a lock on one does not keep the other from being opened.
     pub fn try_new_with<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
