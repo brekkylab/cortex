@@ -1,13 +1,32 @@
 # Build every package virtx is published as -- the Node and Python bindings for every
-# platform, and the Rust crate -- pack them as they would be published, and install and run
-# them the way a user would.
+# platform, and the Rust crate -- pack them as they would be published, install and run
+# them the way a user would, and then publish them.
 #
-# Nothing here publishes. The npm packages go to a registry on the test runner's own
+# The test publishes nothing. The npm packages go to a registry on the test runner's own
 # localhost, so `npm install virtx` resolves its optional platform packages by
 # os/cpu/libc exactly as it would from npmjs; the wheels are installed with pip choosing one
 # from a directory, as it would choose from PyPI; and the crate is published to
 # cargo-http-registry on localhost, for a project of its own to take `virtx` from and build
 # on each platform, as it would from crates.io.
+#
+# # Publishing
+#
+# Only once every platform's test has passed, and only what those tests installed: the
+# `publish-*` jobs take the very archives `assemble` and `crate` uploaded, and build nothing.
+# One job per registry, so one that fails leaves the others published and is re-run alone.
+# Each skips what its registry already holds at this version, which is what makes a re-run
+# safe -- a registry refuses a version twice, and none of them takes one back.
+#
+# - npm: every platform package first, then `virtx`, whose optional dependencies name them.
+# - PyPI: every wheel.
+# - crates.io: the packed crate, `virtx-uvm.version` and all.
+#
+# A release always publishes. A dispatch publishes unless told not to (`publish`), so a
+# release can be tried here end to end first.
+#
+# It needs three secrets, the organization's: `NPM_TOKEN` (an npm automation or granular
+# token that may publish `virtx` and `virtx-*`), `PYPI_TOKEN` (an API token for `virtx`) and
+# `CARGO_REGISTRY_TOKEN` (a crates.io token with publish-new and publish-update).
 #
 # # Platforms
 #
@@ -54,6 +73,10 @@ on:
         description: Build and pack every package, and stop -- no test, and no virtx-uvm release needed
         type: boolean
         default: false
+      publish:
+        description: Publish to npm, PyPI and crates.io once every test passes
+        type: boolean
+        default: true
 
 # One run per tag, and never one cut short: a release that stopped halfway is one nobody can
 # tell from a finished one without looking.
@@ -523,3 +546,107 @@ jobs:
         run: |
           cat "$RUNNER_TEMP/verdaccio.log" || true
           cat "$RUNNER_TEMP/registry.log" || true
+
+  # The npm packages the tests installed. Every platform package before `virtx`, so that by
+  # the time anyone can install `virtx`, each optional dependency it names is there to resolve.
+  publish-npm:
+    needs: [resolve, test]
+    if: github.event_name == 'release' || (inputs.publish && !inputs.build-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-packages
+          path: dist/npm
+
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          root="dist/npm/virtx-$VERSION.tgz"
+          [ -f "$root" ] || { echo "::error::$root is not among the packed packages"; exit 1; }
+          publish() {
+            name=$(tar -xzOf "$1" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0)).name')
+            if [ "$(npm view "$name@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+              echo "$name@$VERSION is on npm already"
+              return
+            fi
+            npm publish "$1" --access public
+            echo "published $name@$VERSION"
+          }
+          for tgz in dist/npm/*.tgz; do
+            [ "$tgz" = "$root" ] || publish "$tgz"
+          done
+          publish "$root"
+
+  # The wheels the tests installed, one per platform.
+  publish-pypi:
+    needs: [resolve, test]
+    if: github.event_name == 'release' || (inputs.publish && !inputs.build-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: dist/wheels
+
+      - name: Publish
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          for whl in dist/wheels/*.whl; do
+            case "$(basename "$whl")" in
+              "virtx-$VERSION-"*) ;;
+              *) echo "::error::$whl is not a wheel of virtx $VERSION"; exit 1 ;;
+            esac
+          done
+          pipx run twine upload --non-interactive --skip-existing dist/wheels/*.whl
+
+  # The crate the tests built, published from its archive as the local registry was: the
+  # packed source with `virtx-uvm.version` in it, which no commit holds. `--no-verify`
+  # because `crate` built exactly this already.
+  publish-crate:
+    needs: [resolve, test]
+    if: github.event_name == 'release' || (inputs.publish && !inputs.build-only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: crate
+          path: dist/crate
+
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          UVM: ${{ needs.resolve.outputs.uvm }}
+        run: |
+          fail() { echo "::error::$*"; exit 1; }
+          crate="dist/crate/virtx-$VERSION.crate"
+          [ -f "$crate" ] || fail "$crate is not the packed crate: $(ls dist/crate)"
+          held=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A 'virtx release (https://github.com/brekkylab/virtx)' \
+            "https://crates.io/api/v1/crates/virtx/$VERSION")
+          if [ "$held" = 200 ]; then
+            echo "virtx $VERSION is on crates.io already"
+            exit 0
+          fi
+          mkdir -p "$RUNNER_TEMP/crate"
+          tar -xzf "$crate" -C "$RUNNER_TEMP/crate"
+          cd "$RUNNER_TEMP/crate/virtx-$VERSION"
+          [ "$(cat virtx-uvm.version)" = "$UVM" ] \
+            || fail "the crate pins virtx-uvm $(cat virtx-uvm.version), and this release is $UVM"
+          cargo publish --no-verify
