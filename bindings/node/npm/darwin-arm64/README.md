@@ -1,3 +1,3 @@
-# `@brekkylab/cortex-darwin-arm64`
+# `virtx-darwin-arm64`
 
-This is the **aarch64-apple-darwin** binary for `@brekkylab/cortex`
+This is the **aarch64-apple-darwin** binary for `virtx`

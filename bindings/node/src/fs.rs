@@ -4,7 +4,7 @@ use std::{io, path::PathBuf};
 #[cfg(feature = "mount")]
 use std::{path::Path, sync::Arc};
 
-use cortex::fs::{Directory, Mount};
+use virtx::fs::{Directory, Mount};
 #[cfg(feature = "mount")]
 use napi::bindgen_prelude::ClassInstance;
 use napi::bindgen_prelude::{Buffer, Either, This};
@@ -14,11 +14,11 @@ use crate::error::{self, Result};
 
 // `HostMount` wraps whichever guard this platform compiles, so callers need not know which.
 #[cfg(all(feature = "mount", windows))]
-use cortex::fs::DokanMount as Platform;
+use virtx::fs::DokanMount as Platform;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
-use cortex::fs::FuseMount as Platform;
+use virtx::fs::FuseMount as Platform;
 #[cfg(all(feature = "mount", target_os = "macos"))]
-use cortex::fs::FuseTMount as Platform;
+use virtx::fs::FuseTMount as Platform;
 
 /// File content as a caller may spell it: a `Buffer` as it is, a string as its UTF-8.
 pub type Content = Either<Buffer, String>;
@@ -113,7 +113,7 @@ impl JsDirectory {
 ///
 /// **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and none
 /// on a signal or crash; a mount left to one is taken down from outside the process once it
-/// is gone (by cortex's watchdog on unix, by Dokany on Windows). Call `unmount()` to take it
+/// is gone (by virtx's watchdog on unix, by Dokany on Windows). Call `unmount()` to take it
 /// down *now*.
 #[cfg(feature = "mount")]
 #[napi(js_name = "HostMount")]
@@ -192,7 +192,7 @@ impl JsHostMount {
 #[cfg(feature = "mount")]
 #[napi]
 pub fn mount_support() -> Result<()> {
-    cortex::fs::mount_support().map_err(error::io)
+    virtx::fs::mount_support().map_err(error::io)
 }
 
 /// What a console builder mounts: a `HostMount`, or a host directory by its path.

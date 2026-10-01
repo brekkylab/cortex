@@ -1,11 +1,11 @@
-//! How cortex failures reach JavaScript, from consoles and image clients alike: an `Error`
+//! How virtx failures reach JavaScript, from consoles and image clients alike: an `Error`
 //! whose `code` names the kind, as Node's own errors carry `ENOENT`.
 
-use cortex::protocol::{Error, Failure};
+use virtx::protocol::{Error, Failure};
 
 pub type Result<T> = napi::Result<T, String>;
 
-/// A refusal's code is cortex's name for its number (`TIMED_OUT`, `NOT_FOUND`), so callers
+/// A refusal's code is virtx's name for its number (`TIMED_OUT`, `NOT_FOUND`), so callers
 /// compare readable strings; a number with no name is `CONSOLE_REFUSED`, with the number in the
 /// message. A broken channel, on which nothing more will be heard, is `CONSOLE_BROKEN`.
 pub fn failure(failure: Failure) -> napi::Error<String> {
@@ -24,11 +24,11 @@ pub fn failure(failure: Failure) -> napi::Error<String> {
 }
 
 /// Building a console may fail with a [`Failure`] underneath (the server refusing `init`),
-/// which keeps its code as any refusal does. Anything else is `CORTEX_ERROR`.
+/// which keeps its code as any refusal does. Anything else is `VIRTX_ERROR`.
 pub fn anyhow(error: anyhow::Error) -> napi::Error<String> {
     match error.downcast::<Failure>() {
         Ok(f) => failure(f),
-        Err(error) => napi::Error::new("CORTEX_ERROR".to_string(), format!("{error:#}")),
+        Err(error) => napi::Error::new("VIRTX_ERROR".to_string(), format!("{error:#}")),
     }
 }
 
@@ -63,7 +63,7 @@ fn name(code: i64) -> Option<&'static str> {
     })
 }
 
-/// A JavaScript number where cortex takes a `u64` (offset, length, timeout).
+/// A JavaScript number where virtx takes a `u64` (offset, length, timeout).
 ///
 /// napi converts numbers to `i64`; a negative one is rejected here rather than wrapped into a
 /// huge length.

@@ -1,10 +1,10 @@
-//! Python bindings for cortex, imported as `cortex._cortex`.
+//! Python bindings for virtx, imported as `virtx._virtx`.
 //!
-//! The API is cortex's own with no extra layer, so cortex's Rust docs apply. Modules mirror
-//! the crate: [`console`] runs commands in a [`ConsoleClient`](cortex::console::ConsoleClient)
-//! built by a builder and awaited, [`fs`] assembles a [`Directory`](cortex::fs::Directory) for
-//! a host mount, [`image`] covers a [`Recipe`](cortex::image::Recipe) (a base plus steps) and
-//! the [`ImageClient`](cortex::image::ImageClient) that builds it ahead of a session, [`error`]
+//! The API is virtx's own with no extra layer, so virtx's Rust docs apply. Modules mirror
+//! the crate: [`console`] runs commands in a [`ConsoleClient`](virtx::console::ConsoleClient)
+//! built by a builder and awaited, [`fs`] assembles a [`Directory`](virtx::fs::Directory) for
+//! a host mount, [`image`] covers a [`Recipe`](virtx::image::Recipe) (a base plus steps) and
+//! the [`ImageClient`](virtx::image::ImageClient) that builds it ahead of a session, [`error`]
 //! maps failures to exceptions, and `ensure` fetches the console server.
 //!
 //! Every call that waits is an awaitable run on the tokio runtime `pyo3-async-runtimes` keeps,
@@ -26,7 +26,7 @@ pub mod fs;
 pub mod image;
 
 #[pymodule]
-fn _cortex(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _virtx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register(m)
 }
 

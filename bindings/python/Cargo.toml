@@ -1,22 +1,22 @@
 [package]
-name = "cortex-python"
+name = "virtx-python"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [lib]
-# Imported as `cortex._cortex` and re-exported by `python/cortex/__init__.py`. Must match the
+# Imported as `virtx._virtx` and re-exported by `python/virtx/__init__.py`. Must match the
 # `#[pymodule]` name, or the import finds a library with no init function.
 #
-# `rlib` for a binding that builds cortex into its own extension (e.g. ailoy). Two extension
-# modules cannot pass each other a `ConsoleClient`, since each links its own cortex and runtime, so
+# `rlib` for a binding that builds virtx into its own extension (e.g. ailoy). Two extension
+# modules cannot pass each other a `ConsoleClient`, since each links its own virtx and runtime, so
 # such a binding links this crate and registers its classes through `register` (src/lib.rs).
-name = "_cortex"
+name = "_virtx"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # No default features, so this crate's `[features]` alone decide what a wheel carries.
-cortex = { path = "../..", default-features = false }
+virtx = { path = "../..", default-features = false }
 # `abi3-py310`: one wheel per platform, not per interpreter. `extension-module` lives in
 # `pyproject.toml` because it leaves libpython unlinked: right for the interpreter, wrong
 # for `cargo test`.
@@ -29,8 +29,8 @@ tokio = { version = "1", features = ["sync"] }
 
 [features]
 default = ["mount", "ensure"]
-mount = ["cortex/mount"]
-ensure = ["cortex/ensure"]
-s3 = ["cortex/s3"]
-gdrive = ["cortex/gdrive"]
-notion = ["cortex/notion"]
+mount = ["virtx/mount"]
+ensure = ["virtx/ensure"]
+s3 = ["virtx/s3"]
+gdrive = ["virtx/gdrive"]
+notion = ["virtx/notion"]

@@ -1,22 +1,22 @@
 {
-  "name": "@brekkylab/cortex-linux-arm64-gnu",
+  "name": "virtx-linux-arm64-gnu",
   "version": "0.1.0",
   "cpu": [
     "arm64"
   ],
-  "main": "cortex.linux-arm64-gnu.node",
+  "main": "virtx.linux-arm64-gnu.node",
   "files": [
-    "cortex.linux-arm64-gnu.node"
+    "virtx.linux-arm64-gnu.node"
   ],
   "description": "The environment an agent works in: what it can see, and what it can do.",
   "license": "Apache-2.0",
-  "homepage": "https://github.com/brekkylab/cortex/tree/main/bindings/node#readme",
+  "homepage": "https://github.com/brekkylab/virtx/tree/main/bindings/node#readme",
   "engines": {
     "node": ">= 18"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/brekkylab/cortex.git",
+    "url": "git+https://github.com/brekkylab/virtx.git",
     "directory": "bindings/node"
   },
   "publishConfig": {

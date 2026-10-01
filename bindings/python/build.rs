@@ -1,9 +1,9 @@
 //! Delay-loads `dokan2.dll` when the `mount` feature is on for a Windows MSVC target.
 //!
-//! cortex's `build.rs` asks for the same, but `rustc-link-arg` applies only to the printing
+//! virtx's `build.rs` asks for the same, but `rustc-link-arg` applies only to the printing
 //! package's targets, so this cdylib must ask again. Without it the import fails in the loader
 //! with `DLL load failed` on hosts without Dokany, even for callers that never mount; with it
-//! the DLL loads at the first mount, which `cortex::fs::mount_support` checks for first.
+//! the DLL loads at the first mount, which `virtx::fs::mount_support` checks for first.
 //!
 //! macOS needs nothing: the FUSE-T shim opens libfuse-t itself at run time.
 fn main() {

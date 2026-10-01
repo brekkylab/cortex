@@ -16,7 +16,7 @@ trap 'rm -rf "$work"' EXIT
 
 # The flag `build.rs` builds the shim with, and FUSE-T's headers insist on.
 # shellcheck disable=SC2086
-cc -Wall -Werror -D_FILE_OFFSET_BITS=64 -DCORTEX_ABI_REAL $cflags -o "$work/real" "$here/abi_check.c"
+cc -Wall -Werror -D_FILE_OFFSET_BITS=64 -DVIRTX_ABI_REAL $cflags -o "$work/real" "$here/abi_check.c"
 cc -Wall -Werror -D_FILE_OFFSET_BITS=64 -I"$here" -o "$work/ours" "$here/abi_check.c"
 "$work/real" > "$work/real.txt"
 "$work/ours" > "$work/ours.txt"
@@ -41,7 +41,7 @@ def text(path):
 
 def ops(src):
     body = re.search(r"struct fuse_lowlevel_ops \{(.*?)\};", src).group(1)
-    # A member is `ret (*name)(...)`, or `cortex_fuse_t_unused_op name` for one the shim
+    # A member is `ret (*name)(...)`, or `virtx_fuse_t_unused_op name` for one the shim
     # never sets.
     def name(decl):
         pointer = re.search(r"\(\s*\*\s*(\w+)\s*\)", decl)
@@ -73,15 +73,15 @@ EOF
 
 # And the release: the shim trusts these declarations for FUSE-T's major version they were
 # checked against, so one of another major version is for a person to look at before the
-# shim may load it -- raise `CORTEX_FUSE_T_MAJOR` only once this has passed against it.
+# shim may load it -- raise `VIRTX_FUSE_T_MAJOR` only once this has passed against it.
 release=$(pkg-config --modversion fuse-t)
-checked=$(sed -n 's/^#define CORTEX_FUSE_T_CHECKED "\(.*\)"$/\1/p' "$here/fuse_t.h")
-major=$(sed -n 's/^#define CORTEX_FUSE_T_MAJOR \([0-9]*\)$/\1/p' "$here/fuse_t.h")
+checked=$(sed -n 's/^#define VIRTX_FUSE_T_CHECKED "\(.*\)"$/\1/p' "$here/fuse_t.h")
+major=$(sed -n 's/^#define VIRTX_FUSE_T_MAJOR \([0-9]*\)$/\1/p' "$here/fuse_t.h")
 if [ "${release%%.*}" != "$major" ]; then
-    echo "check-abi: FUSE-T $release is installed, and fuse_t.h trusts FUSE-T $major.x: check it, then raise CORTEX_FUSE_T_MAJOR" >&2
+    echo "check-abi: FUSE-T $release is installed, and fuse_t.h trusts FUSE-T $major.x: check it, then raise VIRTX_FUSE_T_MAJOR" >&2
     exit 1
 fi
 if [ "$release" != "$checked" ]; then
-    echo "check-abi: note: checked FUSE-T $release; fuse_t.h says $checked was the last, so set CORTEX_FUSE_T_CHECKED to $release"
+    echo "check-abi: note: checked FUSE-T $release; fuse_t.h says $checked was the last, so set VIRTX_FUSE_T_CHECKED to $release"
 fi
 echo "check-abi: FUSE-T $release, within the $major.x fuse_t.h trusts"

@@ -1,10 +1,10 @@
-//! Node bindings for cortex, built with napi-rs.
+//! Node bindings for virtx, built with napi-rs.
 //!
-//! The API is cortex's own with camelCased names, so cortex's Rust docs apply. Modules mirror
-//! the crate: [`console`] runs commands in a [`ConsoleClient`](cortex::console::ConsoleClient)
-//! built by a builder and awaited, [`fs`] assembles a [`Directory`](cortex::fs::Directory) for
-//! a host mount, [`image`] covers a [`Recipe`](cortex::image::Recipe) (a base plus steps) and
-//! the [`ImageClient`](cortex::image::ImageClient) that builds it ahead of a session, [`error`]
+//! The API is virtx's own with camelCased names, so virtx's Rust docs apply. Modules mirror
+//! the crate: [`console`] runs commands in a [`ConsoleClient`](virtx::console::ConsoleClient)
+//! built by a builder and awaited, [`fs`] assembles a [`Directory`](virtx::fs::Directory) for
+//! a host mount, [`image`] covers a [`Recipe`](virtx::image::Recipe) (a base plus steps) and
+//! the [`ImageClient`](virtx::image::ImageClient) that builds it ahead of a session, [`error`]
 //! maps failures to JavaScript errors, and `ensure` fetches the console server.
 //!
 //! Every call that waits returns a `Promise` settled on napi's tokio runtime, since a stdio

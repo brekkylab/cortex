@@ -1,18 +1,18 @@
-//! How cortex failures reach Python.
+//! How virtx failures reach Python.
 //!
 //! Console and image-client calls fail two ways, raised apart because callers act on them
 //! differently: [`Failure::Refused`] (`ConsoleRefused`) is the server answering with an error
 //! (a timeout, a missing file) and carries its `code`; [`Failure::Broken`] (`ConsoleBroken`) is
-//! the channel gone, after which nothing more will be heard. Both derive from `CortexError`,
+//! the channel gone, after which nothing more will be heard. Both derive from `VirtxError`,
 //! also raised for failures with no finer class (building a console, say). Filesystem errors
 //! are [`std::io::Error`], which pyo3 already raises as the matching `OSError` subclass.
 
-use cortex::protocol::{Error, Failure};
+use virtx::protocol::{Error, Failure};
 use pyo3::{create_exception, exceptions::PyException, prelude::*, types::PyDict};
 
-create_exception!(cortex, CortexError, PyException);
-create_exception!(cortex, ConsoleRefused, CortexError);
-create_exception!(cortex, ConsoleBroken, CortexError);
+create_exception!(virtx, VirtxError, PyException);
+create_exception!(virtx, ConsoleRefused, VirtxError);
+create_exception!(virtx, ConsoleBroken, VirtxError);
 
 pub fn failure(failure: Failure) -> PyErr {
     match failure {
@@ -31,17 +31,17 @@ pub fn failure(failure: Failure) -> PyErr {
 pub fn anyhow(error: anyhow::Error) -> PyErr {
     match error.downcast::<Failure>() {
         Ok(f) => failure(f),
-        Err(error) => CortexError::new_err(format!("{error:#}")),
+        Err(error) => VirtxError::new_err(format!("{error:#}")),
     }
 }
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
-    m.add("CortexError", py.get_type::<CortexError>())?;
+    m.add("VirtxError", py.get_type::<VirtxError>())?;
     m.add("ConsoleRefused", py.get_type::<ConsoleRefused>())?;
     m.add("ConsoleBroken", py.get_type::<ConsoleBroken>())?;
 
-    // `ConsoleRefused` codes by name, exported so the only list is cortex's.
+    // `ConsoleRefused` codes by name, exported so the only list is virtx's.
     let codes = PyDict::new(py);
     for (name, code) in [
         ("TIMED_OUT", Error::TIMED_OUT),

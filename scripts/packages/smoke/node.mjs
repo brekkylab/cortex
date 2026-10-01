@@ -1,9 +1,9 @@
 // The Node package as a user installs it, on the platform this runs on.
 //
-// Run from a project that installed `@brekkylab/cortex`, so it resolves the way that
+// Run from a project that installed `virtx`, so it resolves the way that
 // project's code would. What this platform can do is said in the environment:
 //   SMOKE_MOUNT   1 if a FUSE provider is installed here, else 0
-//   SMOKE_SERVER  1 if a cortex-krun release is published for this platform, else 0
+//   SMOKE_SERVER  1 if a virtx-uvm release is published for this platform, else 0
 //   SMOKE_VM      1 if this machine can boot one (KVM or HVF), else 0
 import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -27,18 +27,20 @@ const until = async (cond, ms) => {
   return cond()
 }
 
-const cortex = require('@brekkylab/cortex')
-check(typeof cortex.ConsoleClient === 'function', 'the package loads')
+const virtx = require('virtx')
+check(typeof virtx.ConsoleClient === 'function', 'the package loads')
 
 // Only this platform's binary, as npm's os/cpu/libc filter chose it.
-const scope = path.join(process.cwd(), 'node_modules', '@brekkylab')
-const installed = fs.readdirSync(scope).sort()
+const installed = fs
+  .readdirSync(path.join(process.cwd(), 'node_modules'))
+  .filter((name) => name === 'virtx' || name.startsWith('virtx-'))
+  .sort()
 console.log(`  installed: ${installed.join(' ')}`)
 check(installed.length === 2, 'exactly one platform package was installed beside the root')
 
 let fuse = true
 try {
-  cortex.mountSupport()
+  virtx.mountSupport()
 } catch (e) {
   fuse = false
   console.log(`  mountSupport: ${e.message}`)
@@ -46,15 +48,15 @@ try {
 check(fuse === want('SMOKE_MOUNT'), `mountSupport says ${fuse ? 'yes' : 'no'}`)
 
 if (fuse) {
-  const point = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-smoke-'))
-  const m = new cortex.HostMount(new cortex.Directory().withFile('a.txt', 'hi'), point)
+  const point = fs.mkdtempSync(path.join(os.tmpdir(), 'virtx-smoke-'))
+  const m = new virtx.HostMount(new virtx.Directory().withFile('a.txt', 'hi'), point)
   check(fs.readFileSync(path.join(point, 'a.txt'), 'utf8') === 'hi', 'HostMount serves its tree')
   await m.unmount()
   check(!fs.existsSync(path.join(point, 'a.txt')), 'HostMount.unmount() takes it down')
 
   if (process.platform !== 'win32') {
-    const child = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-smoke-killed-'))
-    const script = `const c=require(${JSON.stringify(require.resolve('@brekkylab/cortex'))});` +
+    const child = fs.mkdtempSync(path.join(os.tmpdir(), 'virtx-smoke-killed-'))
+    const script = `const c=require(${JSON.stringify(require.resolve('virtx'))});` +
       `globalThis.m=new c.HostMount(new c.Directory().withFile('a.txt','hi'),${JSON.stringify(child)});` +
       `require('fs').writeFileSync(${JSON.stringify(child + '.ready')},'');setInterval(()=>{},1e9)`
     const p = spawn(process.execPath, ['-e', script], { stdio: 'ignore' })
@@ -68,38 +70,38 @@ if (fuse) {
 
 let server = null
 try {
-  server = await cortex.ensureCortex()
-  console.log(`  ensureCortex: ${server}`)
+  server = await virtx.ensureVirtx()
+  console.log(`  ensureVirtx: ${server}`)
 } catch (e) {
-  console.log(`  ensureCortex: ${e.message}`)
-  check(!want('SMOKE_SERVER') && e.message.includes('no cortex-krun release is published'), 'ensureCortex says no release is published here')
+  console.log(`  ensureVirtx: ${e.message}`)
+  check(!want('SMOKE_SERVER') && e.message.includes('no virtx-uvm release is published'), 'ensureVirtx says no release is published here')
 }
 if (server) {
-  check(want('SMOKE_SERVER'), 'ensureCortex fetched the server')
+  check(want('SMOKE_SERVER'), 'ensureVirtx fetched the server')
   const exe = process.platform === 'win32' ? '.exe' : ''
-  check(fs.existsSync(path.join(server, `cortex-krun${exe}`)), `cortex-krun${exe} is in ${server}`)
+  check(fs.existsSync(path.join(server, `virtx-uvm${exe}`)), `virtx-uvm${exe} is in ${server}`)
   // The server runs on this machine, and answers -- no VM needed to ask its version.
-  const images = await cortex.ImageClient.tryNew()
+  const images = await virtx.ImageClient.tryNew()
   const version = await images.version()
   await images.close()
   check(typeof version === 'string' && version.length > 0, `the server answers (protocol ${version})`)
   // And the VM process it would spawn starts, and says what it can make here.
   let caps = null
   try {
-    caps = execFileSync(path.join(server, `cortex-krun-host${exe}`), ['--capabilities'], { encoding: 'utf8' })
-    console.log(`  cortex-krun-host --capabilities: [${caps.trim().split(/\s+/).filter(Boolean).join(' ')}]`)
+    caps = execFileSync(path.join(server, `virtx-uvm-host${exe}`), ['--capabilities'], { encoding: 'utf8' })
+    console.log(`  virtx-uvm-host --capabilities: [${caps.trim().split(/\s+/).filter(Boolean).join(' ')}]`)
   } catch (e) {
-    console.log(`  cortex-krun-host --capabilities: ${e.message}`)
+    console.log(`  virtx-uvm-host --capabilities: ${e.message}`)
   }
-  check(caps !== null, 'cortex-krun-host starts')
+  check(caps !== null, 'virtx-uvm-host starts')
 }
 
 if (server && want('SMOKE_VM')) {
-  const host = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-smoke-host-'))
+  const host = fs.mkdtempSync(path.join(os.tmpdir(), 'virtx-smoke-host-'))
   fs.writeFileSync(path.join(host, 'from-host.txt'), 'by path')
-  let b = cortex.ConsoleClient.builder().image(new cortex.Recipe('alpine:latest')).mount(host, '/host')
-  const point = fs.mkdtempSync(path.join(os.tmpdir(), 'cortex-smoke-vm-'))
-  const m = fuse ? new cortex.HostMount(new cortex.Directory().withFile('a.txt', 'a Directory'), point) : null
+  let b = virtx.ConsoleClient.builder().image(new virtx.Recipe('alpine:latest')).mount(host, '/host')
+  const point = fs.mkdtempSync(path.join(os.tmpdir(), 'virtx-smoke-vm-'))
+  const m = fuse ? new virtx.HostMount(new virtx.Directory().withFile('a.txt', 'a Directory'), point) : null
   if (m) b = b.mount(m, '/work')
   const c = await b.build()
   const r = await c.exec(['sh', '-c', 'uname -m; cat /host/from-host.txt; echo; [ -d /work ] && cat /work/a.txt; echo written > /host/from-vm.txt'], 120000)

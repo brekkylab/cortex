@@ -199,7 +199,7 @@ impl<T: FileSystem> Posix<T> {
 ///
 /// It must live in the same directory, hence in the caller's namespace (as NFS's `.nfsXXXX`
 /// does), so a *real* file with this prefix is hidden from listings.
-const HELD_PREFIX: &str = ".cortex-unlinked-";
+const HELD_PREFIX: &str = ".virtx-unlinked-";
 
 /// How long a kernel may cache a lookup or attribute reply; short because a write stays
 /// invisible that long.
@@ -226,7 +226,7 @@ const S_IFREG: u32 = 0o100000;
 
 /// The attribute values every binding reports for one entry.
 ///
-/// The foreign structs (`FileAttr`, `struct cortex_stat`, `FileInfo`) are built per binding, but
+/// The foreign structs (`FileAttr`, `struct virtx_stat`, `FileInfo`) are built per binding, but
 /// the numbers are derived once here so bindings cannot drift.
 ///
 /// No `uid`/`gid`: a guest sees ids inside the VM, while a host mount must report the mounting
@@ -241,7 +241,7 @@ pub(in crate::fs) struct Attr {
     pub mtime: SystemTime,
     pub atime: SystemTime,
     pub ctime: SystemTime,
-    /// Birth time; only `fuser` and Dokan have a field for it (FUSE-T's `struct cortex_stat` has
+    /// Birth time; only `fuser` and Dokan have a field for it (FUSE-T's `struct virtx_stat` has
     /// none).
     #[cfg_attr(
         not(all(feature = "mount", unix, not(target_os = "macos"))),

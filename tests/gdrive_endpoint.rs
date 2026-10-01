@@ -19,7 +19,7 @@
 
 use std::path::{Path, PathBuf};
 
-use cortex::fs::{DirentKind, FileSystem, GdriveConfig, GdriveFs, GdriveOrigins};
+use virtx::fs::{DirentKind, FileSystem, GdriveConfig, GdriveFs, GdriveOrigins};
 
 /// The mock this drives — a stand-in for the read APIs of several enterprise services,
 /// Drive among them. `BACKLOT_URL` overrides it for a local instance.

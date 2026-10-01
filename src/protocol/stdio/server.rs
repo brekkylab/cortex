@@ -23,10 +23,10 @@ static TAKEN: AtomicBool = AtomicBool::new(false);
 /// descriptor type. Holds no session state.
 ///
 /// ```no_run
-/// use cortex::protocol::stdio::StdioServer;
-/// use cortex::protocol::{Message, Response, Server};
+/// use virtx::protocol::stdio::StdioServer;
+/// use virtx::protocol::{Message, Response, Server};
 ///
-/// # fn answer(call: cortex::protocol::Call) -> Response { unimplemented!() }
+/// # fn answer(call: virtx::protocol::Call) -> Response { unimplemented!() }
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
 /// // Takes stdin and stdout for the protocol; everything else goes to stderr.

@@ -1,15 +1,15 @@
 [package]
-name = "cortex"
+name = "virtx"
 version = "0.1.0"
 edition = "2024"
 description = "Run tasks in disposable Linux VMs from your own code: the environment an agent works in."
 license = "Apache-2.0"
-repository = "https://github.com/brekkylab/cortex"
+repository = "https://github.com/brekkylab/virtx"
 readme = "README.md"
 keywords = ["vm", "sandbox", "agent", "fuse", "microvm"]
 categories = ["virtualization", "filesystem", "development-tools"]
 # What a dependent builds, and nothing it does not: the bindings are packages of their own,
-# and CI's scripts and settings are this repository's. `cortex-krun.version` is the server
+# and CI's scripts and settings are this repository's. `virtx-uvm.version` is the server
 # release a published crate fetches by default -- see `build.rs` -- and is written by the
 # workflow that packs it, so a checkout has none.
 include = [
@@ -19,11 +19,11 @@ include = [
     "/examples/**",
     "/README.md",
     "/LICENSE",
-    "/cortex-krun.version",
+    "/virtx-uvm.version",
 ]
 
 # Members share this crate's target directory and lockfile. A bare `cargo build`/`cargo test`
-# still builds only `cortex`, the default member.
+# still builds only `virtx`, the default member.
 [workspace]
 members = ["bindings/node", "bindings/python"]
 
@@ -51,7 +51,7 @@ libc = "0.2"
 object_store = { version = "0.14", default-features = false, features = [
     "aws",
 ], optional = true }
-# HTTP for the Notion, Google Drive and OneDrive backends and `ensure_cortex`; `uuid` for
+# HTTP for the Notion, Google Drive and OneDrive backends and `ensure_virtx`; `uuid` for
 # Notion's page ids, `chrono` for RFC 3339 timestamps. `query` is for Notion's pagination,
 # `form` for the Google and Microsoft token endpoints.
 reqwest = { version = "0.13", default-features = false, features = [
@@ -61,7 +61,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "form",
 ], optional = true }
 uuid = { version = "1", optional = true }
-# The gzipped tar `ensure_cortex` unpacks (what cortex-krun's `cargo xtask upload` writes).
+# The gzipped tar `ensure_virtx` unpacks (what virtx-uvm's `cargo xtask upload` writes).
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 chrono = { version = "0.4", optional = true }
@@ -138,7 +138,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 #
 # A feature's dependency count (normal edges only, so build-deps are excluded):
 #
-#   cargo tree --features <f> -e normal --prefix none | grep -v '^cortex' \
+#   cargo tree --features <f> -e normal --prefix none | grep -v '^virtx' \
 #       | sed 's/ (\*)$//' | sort -u | grep -c .
 #
 # A bare `cargo test` runs only the default features' tests. Full coverage is a sweep:
@@ -154,7 +154,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # Editors build the default set, so other features' code is inert until enabled
 # (rust-analyzer: `"cargo.features": "all"`).
 default = ["mount", "ensure"]
-# Mount a cortex filesystem on the host, through the one binding this OS has:
+# Mount a virtx filesystem on the host, through the one binding this OS has:
 #
 # | Target | Binding | Needs |
 # |---|---|---|
@@ -200,10 +200,10 @@ mount = [
     "tokio/net",
     "tokio/rt-multi-thread",
 ]
-# `ensure_cortex`: fetch the console server cortex-krun publishes, over HTTPS, into
+# `ensure_virtx`: fetch the console server virtx-uvm publishes, over HTTPS, into
 # `cache_root()/bin` when a host has none. Brings in an HTTP and TLS stack.
 #
-# On by default, because a consumer that runs commands needs a server. cortex-krun opts
+# On by default, because a consumer that runs commands needs a server. virtx-uvm opts
 # out: it takes this crate for the protocol, and its static musl guest's TLS stack would
 # need a C cross-compiler.
 ensure = ["dep:reqwest", "dep:flate2", "dep:tar", "tokio/net"]

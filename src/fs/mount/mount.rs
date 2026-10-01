@@ -9,7 +9,7 @@ use std::{
 /// see them. A `Mount` is the state of having been mounted: a binding's guard, or a path the
 /// host attached. Its one fact is [`mountpoint`](Self::mountpoint), a path any process on this
 /// host can `open`, which is how anything outside this library (a guest included) reads a
-/// cortex tree.
+/// virtx tree.
 ///
 /// # The tree is there for as long as the value is
 ///

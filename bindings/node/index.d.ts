@@ -76,7 +76,7 @@ export type JsDirectory = Directory
  * garbage collection.
  *
  * **Garbage collection is not an exit.** Node runs no finalizer on `process.exit()`, and
- * none at all on a signal or a crash, so a mount left to one is taken down by cortex's
+ * none at all on a signal or a crash, so a mount left to one is taken down by virtx's
  * watchdog, from outside the process, once the process is gone. `unmount` is how a
  * program that wants it down *now* says so.
  */
@@ -99,7 +99,7 @@ export type JsHostMount = HostMount
 
 export declare class ImageClient {
   /**
-   * `cortex-krun` under the stdio server directory, settling with the client once the
+   * `virtx-uvm` under the stdio server directory, settling with the client once the
    * server has answered.
    */
   static tryNew(): Promise<ImageClient>
@@ -149,12 +149,12 @@ export interface BuildImageResult {
 }
 
 /**
- * Fetch the console server into cortex's cache if it is not there, and settle with the
+ * Fetch the console server into virtx's cache if it is not there, and settle with the
  * directory it is in.
  *
  * A server already there is left alone, whether it was fetched or installed by hand.
  */
-export declare function ensureCortex(): Promise<string>
+export declare function ensureVirtx(): Promise<string>
 
 export interface ExecResult {
   code: number

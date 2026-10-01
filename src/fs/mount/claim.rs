@@ -3,7 +3,7 @@
 //! the mount point in both places; dropping it removes both, the disk one only once the mount
 //! is down.
 //!
-//! A register rather than the mount table, which cannot say which mounts are cortex's: a
+//! A register rather than the mount table, which cannot say which mounts are virtx's: a
 //! FUSE-T mount is spelled `nfs` there, and the mount point is an arbitrary caller-chosen path.
 //! Each record is named for its owner's pid, so abandoned means "owner gone" ([`gone`]).
 
@@ -32,7 +32,7 @@ use {
 use super::table::{mounts_under, unmount_under};
 
 /// Records directory, under the temporary directory.
-const DIR: &str = "cortex-mounts";
+const DIR: &str = "virtx-mounts";
 
 /// How many abandoned mounts one call will try to unmount; only mounts still present are charged.
 ///
@@ -97,7 +97,7 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
 const WATCHDOG_SCRIPT: &str = r#"
 trap '' INT TERM HUP QUIT PIPE
 cat >/dev/null
-for record in "$CORTEX_MOUNT_REGISTRY/$CORTEX_MOUNT_OWNER"-*; do
+for record in "$VIRTX_MOUNT_REGISTRY/$VIRTX_MOUNT_OWNER"-*; do
     [ -f "$record" ] || continue
     mountpoint=$(cat "$record") || continue
     if [ -z "$mountpoint" ]; then rm -f "$record"; continue; fi
@@ -140,9 +140,9 @@ fn watch(registry: &Path) {
         return;
     }
     let spawned = Command::new("/bin/sh")
-        .args(["-c", WATCHDOG_SCRIPT, "cortex-mount-watchdog"])
-        .env("CORTEX_MOUNT_OWNER", pid.to_string())
-        .env("CORTEX_MOUNT_REGISTRY", registry)
+        .args(["-c", WATCHDOG_SCRIPT, "virtx-mount-watchdog"])
+        .env("VIRTX_MOUNT_OWNER", pid.to_string())
+        .env("VIRTX_MOUNT_REGISTRY", registry)
         .current_dir("/")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -219,7 +219,7 @@ fn gone(pid: libc::pid_t) -> bool {
     answer == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Take down every mount left by a cortex process that is no longer running.
+/// Take down every mount left by a virtx process that is no longer running.
 ///
 /// Covers `SIGKILL`, where no handler runs and only the next run can help; the dead
 /// process's watchdog usually took its mounts down already, and this gets what it could not.
@@ -301,7 +301,7 @@ mod tests {
     /// A held claim is in both registers; a dropped one is in neither.
     #[test]
     fn a_claim_lasts_exactly_as_long_as_it_is_held() {
-        let path = std::env::temp_dir().join("cortex-claim-probe");
+        let path = std::env::temp_dir().join("virtx-claim-probe");
         let resolved = resolved(&path);
 
         // Checks this path only: the register is process-wide and tests run in parallel.
@@ -322,7 +322,7 @@ mod tests {
     /// first's tree.
     #[test]
     fn a_live_process_keeps_its_own_records() {
-        let path = std::env::temp_dir().join("cortex-claim-live-probe");
+        let path = std::env::temp_dir().join("virtx-claim-live-probe");
         let held = claim(&path);
         let record = held.record.clone().expect("a record was written");
 
@@ -345,7 +345,7 @@ mod tests {
         use crate::fs::{FileSystem, InMemFs};
 
         let path =
-            std::env::temp_dir().join(format!("cortex-claim-live-mount-{}", std::process::id()));
+            std::env::temp_dir().join(format!("virtx-claim-live-mount-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("temp dir is writable");
 
@@ -377,8 +377,8 @@ mod tests {
             panic!("the registry is usable under $TMPDIR");
         };
         // Above any pid these systems hand out, so it never names a live process.
-        let record = dir.join(format!("{}-cortex-test", libc::pid_t::MAX));
-        let mountpoint = std::env::temp_dir().join("cortex-claim-dead-probe");
+        let record = dir.join(format!("{}-virtx-test", libc::pid_t::MAX));
+        let mountpoint = std::env::temp_dir().join("virtx-claim-dead-probe");
         fs::create_dir_all(&mountpoint).unwrap();
         fs::write(&record, mountpoint.as_os_str().as_bytes()).unwrap();
 

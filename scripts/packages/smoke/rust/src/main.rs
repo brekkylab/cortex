@@ -3,16 +3,16 @@
 //!
 //!   SMOKE_MOUNT   1 if a FUSE provider is installed here, else 0
 //!   SMOKE_VM      1 if this machine can boot one (KVM or HVF), else 0
-use cortex::console::ConsoleClient;
-use cortex::fs::{Directory, mount_support};
-use cortex::image::{ImageClient, Recipe};
+use virtx::console::ConsoleClient;
+use virtx::fs::{Directory, mount_support};
+use virtx::image::{ImageClient, Recipe};
 
 #[cfg(windows)]
-use cortex::fs::DokanMount as HostMount;
+use virtx::fs::DokanMount as HostMount;
 #[cfg(target_os = "linux")]
-use cortex::fs::FuseMount as HostMount;
+use virtx::fs::FuseMount as HostMount;
 #[cfg(target_os = "macos")]
-use cortex::fs::FuseTMount as HostMount;
+use virtx::fs::FuseTMount as HostMount;
 
 fn want(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     // binary, which is what a delay-load is for. Reaching here at all is the binary starting
     // without the provider -- on Windows, the `/DELAYLOAD` in `build.rs` -- and without one, a
     // mount has to be an error rather than a crash.
-    let point = std::env::temp_dir().join(format!("cortex-smoke-rust-mount-{}", std::process::id()));
+    let point = std::env::temp_dir().join(format!("virtx-smoke-rust-mount-{}", std::process::id()));
     std::fs::create_dir_all(&point)?;
     let tree = Directory::new().with_file("a.txt", "hi".as_bytes())?;
     match HostMount::try_new(tree, &point) {
@@ -61,10 +61,10 @@ async fn main() -> anyhow::Result<()> {
 
     // The release this crate was packed with, unless the environment says otherwise -- see
     // `build.rs`.
-    let bin = cortex::ensure_cortex().await?;
-    println!("  ensure_cortex: {}", bin.display());
+    let bin = virtx::ensure_virtx().await?;
+    println!("  ensure_virtx: {}", bin.display());
     let exe = if cfg!(windows) { ".exe" } else { "" };
-    check(bin.join(format!("cortex-krun{exe}")).is_file(), "ensure_cortex fetched the server");
+    check(bin.join(format!("virtx-uvm{exe}")).is_file(), "ensure_virtx fetched the server");
 
     let mut images = ImageClient::try_new().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let version = images.version().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     check(!version.is_empty(), &format!("the server answers (protocol {version})"));
 
     if want("SMOKE_VM") {
-        let host = std::env::temp_dir().join(format!("cortex-smoke-rust-{}", std::process::id()));
+        let host = std::env::temp_dir().join(format!("virtx-smoke-rust-{}", std::process::id()));
         std::fs::create_dir_all(&host)?;
         std::fs::write(host.join("from-host.txt"), "by path")?;
         let mut console = ConsoleClient::builder()

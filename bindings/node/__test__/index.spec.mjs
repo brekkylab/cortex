@@ -5,10 +5,10 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { createRequire } from 'node:module'
 
-const cortex = createRequire(import.meta.url)('../index.js')
-const { ConsoleClient, Directory, ImageClient, ImageSource, Recipe, Step } = cortex
+const virtx = createRequire(import.meta.url)('../index.js')
+const { ConsoleClient, Directory, ImageClient, ImageSource, Recipe, Step } = virtx
 
-const tempDir = () => mkdtempSync(join(tmpdir(), 'cortex-'))
+const tempDir = () => mkdtempSync(join(tmpdir(), 'virtx-'))
 
 test('a Recipe is a value', () => {
   const base = new Recipe('python:3.12-slim')
@@ -44,12 +44,12 @@ test('a Directory refuses a file under a mount', () => {
   assert.throws(() => directory.addFile('project/notes.md', 'under a mount'), { code: 'InvalidInput' })
 })
 
-test('a HostMount serves the Directory', { skip: !cortex.HostMount && 'built without `mount`' }, () => {
+test('a HostMount serves the Directory', { skip: !virtx.HostMount && 'built without `mount`' }, () => {
   const mountpoint = join(tempDir(), 'mnt')
   mkdirSync(mountpoint)
   const directory = new Directory().withFile('notes/today.md', Buffer.from('ship the release'))
 
-  const mount = new cortex.HostMount(directory, mountpoint)
+  const mount = new virtx.HostMount(directory, mountpoint)
   assert.equal(mount.mountpoint, mountpoint)
   assert.equal(readFileSync(join(mountpoint, 'notes', 'today.md'), 'utf8'), 'ship the release')
   // The mount owns the tree now.
@@ -58,27 +58,27 @@ test('a HostMount serves the Directory', { skip: !cortex.HostMount && 'built wit
 
 test('building without a server fails and spends the builder', async () => {
   // Point the default server lookup at an empty directory.
-  process.env.CORTEX_STDIO_SERVER_PATH = tempDir()
+  process.env.VIRTX_STDIO_SERVER_PATH = tempDir()
   const builder = ConsoleClient.builder()
-  await assert.rejects(builder.build(), { code: 'CORTEX_ERROR' })
+  await assert.rejects(builder.build(), { code: 'VIRTX_ERROR' })
   assert.throws(() => builder.vcpus(2), { code: 'INVALID_ARG' })
 })
 
 test('building against a missing binary fails', async () => {
   await assert.rejects(
-    ConsoleClient.builder().cmd(['cortex-no-such-console-server']).build(),
-    { code: 'CORTEX_ERROR' },
+    ConsoleClient.builder().cmd(['virtx-no-such-console-server']).build(),
+    { code: 'VIRTX_ERROR' },
   )
 })
 
 test('an image client against a missing binary fails', async () => {
-  await assert.rejects(ImageClient.tryFromCmd(['cortex-no-such-console-server']), { code: 'CONSOLE_BROKEN' })
+  await assert.rejects(ImageClient.tryFromCmd(['virtx-no-such-console-server']), { code: 'CONSOLE_BROKEN' })
 })
 
-// Against a real console server, named by `$CORTEX_CONSOLE` (`cortex-krun`, say).
-const SERVER = process.env.CORTEX_CONSOLE
+// Against a real console server, named by `$VIRTX_CONSOLE` (`virtx-uvm`, say).
+const SERVER = process.env.VIRTX_CONSOLE
 
-test('exec, read and write', { skip: !SERVER && 'set $CORTEX_CONSOLE' }, async () => {
+test('exec, read and write', { skip: !SERVER && 'set $VIRTX_CONSOLE' }, async () => {
   const console_ = await ConsoleClient.builder()
     .cmd([SERVER])
     .image(new Recipe('python:3.12-slim-trixie'))
@@ -101,13 +101,13 @@ test('exec, read and write', { skip: !SERVER && 'set $CORTEX_CONSOLE' }, async (
   }
 })
 
-test('build, list and remove', { skip: !SERVER && 'set $CORTEX_CONSOLE' }, async () => {
+test('build, list and remove', { skip: !SERVER && 'set $VIRTX_CONSOLE' }, async () => {
   const images = await ImageClient.tryFromCmd([SERVER])
   try {
     assert.ok(await images.version())
 
-    const built = await images.build(new Recipe('alpine:3.20'), 'cortex-node-test:latest')
-    assert.equal(built.reference, 'cortex-node-test:latest')
+    const built = await images.build(new Recipe('alpine:3.20'), 'virtx-node-test:latest')
+    assert.equal(built.reference, 'virtx-node-test:latest')
     assert.ok((await images.list()).some((entry) => entry.digest === built.digest))
 
     await images.remove(ImageSource.reference(built.reference))

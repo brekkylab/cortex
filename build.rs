@@ -1,7 +1,7 @@
 //! Build-time needs of the `mount` feature: on macOS, compile the FUSE-T shim; on Windows,
 //! delay-load the Dokany DLL. Neither provider is needed for a binary to start (see
 //! `src/fs/mount/support.rs`; `contrib/fuse_t/shim.h` explains the shim). Also pins the
-//! server release `ensure_cortex` fetches by default (see [`pin_server`]).
+//! server release `ensure_virtx` fetches by default (see [`pin_server`]).
 
 fn main() {
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.c");
@@ -19,25 +19,25 @@ fn main() {
     }
 }
 
-/// Pin the cortex-krun release this build fetches by default, from `cortex-krun.version` when
+/// Pin the virtx-uvm release this build fetches by default, from `virtx-uvm.version` when
 /// the environment names none.
 ///
 /// A package built by CI -- the Node addon, a wheel -- is compiled there, with
-/// `CORTEX_KRUN_PINNED_VERSION` set to the release it was tested with. A published crate is
+/// `VIRTX_UVM_PINNED_VERSION` set to the release it was tested with. A published crate is
 /// compiled on its user's machine, where nobody sets it; so the workflow that packs the crate
-/// writes the version into the package as `cortex-krun.version`, and this reads it. A checkout
+/// writes the version into the package as `virtx-uvm.version`, and this reads it. A checkout
 /// has no such file, and follows `latest`.
 ///
 /// Watched only where it exists: Cargo counts a watched path that is missing as changed, and
 /// would run this script again on every build of a checkout.
 fn pin_server() {
-    const ENV: &str = "CORTEX_KRUN_PINNED_VERSION";
+    const ENV: &str = "VIRTX_UVM_PINNED_VERSION";
     println!("cargo::rerun-if-env-changed={ENV}");
     if std::env::var_os(ENV).is_some() {
         return;
     }
     let file = std::path::Path::new(&std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
-        .join("cortex-krun.version");
+        .join("virtx-uvm.version");
     let Ok(version) = std::fs::read_to_string(&file) else {
         return;
     };
@@ -73,12 +73,12 @@ fn fuse_t_shim() {
         .and_then(|fuse_t| fuse_t.link_paths.first().cloned());
     if let Some(dir) = libdir {
         build.define(
-            "CORTEX_FUSE_T_LIBDIR",
+            "VIRTX_FUSE_T_LIBDIR",
             format!("\"{}\"", dir.display()).as_str(),
         );
     }
     println!("cargo::rerun-if-changed=contrib/fuse_t/fuse_t.h");
-    build.compile("cortex_fuse_t_shim");
+    build.compile("virtx_fuse_t_shim");
 }
 
 /// Load `dokan2.dll` at first call rather than process start, for this package's own tests

@@ -2,7 +2,7 @@
 
 use std::{future::Future, sync::Arc};
 
-use cortex::{
+use virtx::{
     console::{ConsoleClient, ConsoleClientBuilder},
     protocol::{ExecResp, Port, ReadResp},
 };
@@ -173,7 +173,7 @@ impl JsConsoleClientBuilder {
 /// The console a slot holds, or the error for one that has been closed.
 fn held(slot: &mut Option<ConsoleClient>) -> Result<&mut ConsoleClient> {
     slot.as_mut()
-        .ok_or_else(|| napi::Error::new("CORTEX_ERROR".to_string(), "this console has been closed"))
+        .ok_or_else(|| napi::Error::new("VIRTX_ERROR".to_string(), "this console has been closed"))
 }
 
 /// A console slot: the console, or `None` once closed. A plain type, so an agent can hold

@@ -13,7 +13,7 @@
 //! registered with nothing answering it. [`unmount_on_signal`] covers catchable signals and
 //! [`reclaim_abandoned`] `SIGKILL`. Neither needs a binding: they concern mounts the host has,
 //! and the run cleaning up after a killed process is usually not the one that mounted. Both
-//! reuse the guards' own teardown, so a cortex mount comes down one way whether its owner is
+//! reuse the guards' own teardown, so a virtx mount comes down one way whether its owner is
 //! alive or not. Unix only: a claim is a pid and a mode, and a sweep is `kill(pid, 0)`.
 
 #[cfg(unix)]

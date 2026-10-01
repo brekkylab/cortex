@@ -1,5 +1,5 @@
-//! What a binary that takes cortex with `mount` needs on Windows, as the README says: the
-//! delay-load of `dokan2.dll`, which cortex's own `build.rs` cannot ask for on a dependent's
+//! What a binary that takes virtx with `mount` needs on Windows, as the README says: the
+//! delay-load of `dokan2.dll`, which virtx's own `build.rs` cannot ask for on a dependent's
 //! behalf. Without it this binary would not start on a host without Dokany.
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")

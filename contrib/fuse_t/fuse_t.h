@@ -13,8 +13,8 @@
  * signature; CI runs it wherever FUSE-T is installed. Change this file only with it.
  */
 
-#ifndef CORTEX_FUSE_T_H
-#define CORTEX_FUSE_T_H
+#ifndef VIRTX_FUSE_T_H
+#define VIRTX_FUSE_T_H
 
 #include <stddef.h>
 #include <stdint.h>
@@ -26,12 +26,12 @@
  * releases the shim trusts them for: the same major version. A libfuse-t of another major
  * version, or of another libfuse API than 2.x, is refused before any call is made into it
  * -- a layout it disagrees with would be a crash, not an error -- unless
- * `CORTEX_FUSE_T_UNCHECKED` says to go ahead. */
-#define CORTEX_FUSE_T_CHECKED "1.2.7"
-#define CORTEX_FUSE_T_MAJOR 1
+ * `VIRTX_FUSE_T_UNCHECKED` says to go ahead. */
+#define VIRTX_FUSE_T_CHECKED "1.2.7"
+#define VIRTX_FUSE_T_MAJOR 1
 /* libfuse's own API version, `fuse_version()`: these are 2.x's, 2.6 to 2.9. */
-#define CORTEX_FUSE_T_API_MIN 26
-#define CORTEX_FUSE_T_API_MAX 29
+#define VIRTX_FUSE_T_API_MIN 26
+#define VIRTX_FUSE_T_API_MAX 29
 
 typedef unsigned long fuse_ino_t;
 typedef struct fuse_req *fuse_req_t;
@@ -76,27 +76,27 @@ struct fuse_entry_param {
 
 /* A member the shim never sets. Every member is a function pointer, so its type does not
  * change the layout; only the position does. */
-typedef void (*cortex_fuse_t_unused_op)(void);
+typedef void (*virtx_fuse_t_unused_op)(void);
 
 /* Every member, in order, macOS ones included, so that `sizeof` is the library's: it is
  * the `op_size` handed to `fuse_lowlevel_new`. */
 struct fuse_lowlevel_ops {
-    cortex_fuse_t_unused_op init;
-    cortex_fuse_t_unused_op destroy;
+    virtx_fuse_t_unused_op init;
+    virtx_fuse_t_unused_op destroy;
     void (*lookup)(fuse_req_t req, fuse_ino_t parent, const char *name);
     void (*forget)(fuse_req_t req, fuse_ino_t ino, unsigned long nlookup);
     void (*getattr)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     void (*setattr)(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to_set,
                     struct fuse_file_info *fi);
-    cortex_fuse_t_unused_op readlink;
-    cortex_fuse_t_unused_op mknod;
+    virtx_fuse_t_unused_op readlink;
+    virtx_fuse_t_unused_op mknod;
     void (*mkdir)(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode);
     void (*unlink)(fuse_req_t req, fuse_ino_t parent, const char *name);
     void (*rmdir)(fuse_req_t req, fuse_ino_t parent, const char *name);
-    cortex_fuse_t_unused_op symlink;
+    virtx_fuse_t_unused_op symlink;
     void (*rename)(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent,
                    const char *newname);
-    cortex_fuse_t_unused_op link;
+    virtx_fuse_t_unused_op link;
     void (*open)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     void (*read)(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                  struct fuse_file_info *fi);
@@ -105,37 +105,37 @@ struct fuse_lowlevel_ops {
     void (*flush)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     void (*release)(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi);
     void (*fsync)(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi);
-    cortex_fuse_t_unused_op opendir;
+    virtx_fuse_t_unused_op opendir;
     void (*readdir)(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
                     struct fuse_file_info *fi);
-    cortex_fuse_t_unused_op releasedir;
-    cortex_fuse_t_unused_op fsyncdir;
+    virtx_fuse_t_unused_op releasedir;
+    virtx_fuse_t_unused_op fsyncdir;
     void (*statfs)(fuse_req_t req, fuse_ino_t ino);
-    cortex_fuse_t_unused_op setxattr;
-    cortex_fuse_t_unused_op getxattr;
-    cortex_fuse_t_unused_op listxattr;
-    cortex_fuse_t_unused_op removexattr;
-    cortex_fuse_t_unused_op access;
+    virtx_fuse_t_unused_op setxattr;
+    virtx_fuse_t_unused_op getxattr;
+    virtx_fuse_t_unused_op listxattr;
+    virtx_fuse_t_unused_op removexattr;
+    virtx_fuse_t_unused_op access;
     void (*create)(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode,
                    struct fuse_file_info *fi);
-    cortex_fuse_t_unused_op getlk;
-    cortex_fuse_t_unused_op setlk;
-    cortex_fuse_t_unused_op bmap;
-    cortex_fuse_t_unused_op ioctl;
-    cortex_fuse_t_unused_op poll;
-    cortex_fuse_t_unused_op write_buf;
-    cortex_fuse_t_unused_op retrieve_reply;
-    cortex_fuse_t_unused_op forget_multi;
-    cortex_fuse_t_unused_op flock;
-    cortex_fuse_t_unused_op fallocate;
-    cortex_fuse_t_unused_op reserved00;
-    cortex_fuse_t_unused_op reserved01;
-    cortex_fuse_t_unused_op monitor;
-    cortex_fuse_t_unused_op renamex;
-    cortex_fuse_t_unused_op setvolname;
-    cortex_fuse_t_unused_op exchange;
-    cortex_fuse_t_unused_op getxtimes;
-    cortex_fuse_t_unused_op setattr_x;
+    virtx_fuse_t_unused_op getlk;
+    virtx_fuse_t_unused_op setlk;
+    virtx_fuse_t_unused_op bmap;
+    virtx_fuse_t_unused_op ioctl;
+    virtx_fuse_t_unused_op poll;
+    virtx_fuse_t_unused_op write_buf;
+    virtx_fuse_t_unused_op retrieve_reply;
+    virtx_fuse_t_unused_op forget_multi;
+    virtx_fuse_t_unused_op flock;
+    virtx_fuse_t_unused_op fallocate;
+    virtx_fuse_t_unused_op reserved00;
+    virtx_fuse_t_unused_op reserved01;
+    virtx_fuse_t_unused_op monitor;
+    virtx_fuse_t_unused_op renamex;
+    virtx_fuse_t_unused_op setvolname;
+    virtx_fuse_t_unused_op exchange;
+    virtx_fuse_t_unused_op getxtimes;
+    virtx_fuse_t_unused_op setattr_x;
 };
 
 /* The calls the shim makes. Declared only so that `__typeof__` gives each pointer its

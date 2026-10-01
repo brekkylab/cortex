@@ -5,7 +5,7 @@ SMOKE_MOUNT, SMOKE_SERVER, SMOKE_VM.
 """
 import asyncio, os, signal, subprocess, sys, tempfile, time
 
-import cortex
+import virtx
 
 want = lambda name: os.environ.get(name) == "1"
 failures = []
@@ -27,10 +27,10 @@ def until(cond, secs):
 
 
 async def main():
-    check(hasattr(cortex, "ConsoleClient"), f"the package loads from {os.path.dirname(cortex.__file__)}")
+    check(hasattr(virtx, "ConsoleClient"), f"the package loads from {os.path.dirname(virtx.__file__)}")
 
     try:
-        cortex.mount_support()
+        virtx.mount_support()
         fuse = True
     except OSError as e:
         fuse = False
@@ -38,17 +38,17 @@ async def main():
     check(fuse == want("SMOKE_MOUNT"), f"mount_support says {'yes' if fuse else 'no'}")
 
     if fuse:
-        point = tempfile.mkdtemp(prefix="cortex-smoke-")
-        m = cortex.HostMount(cortex.Directory().with_file("a.txt", "hi"), point)
+        point = tempfile.mkdtemp(prefix="virtx-smoke-")
+        m = virtx.HostMount(virtx.Directory().with_file("a.txt", "hi"), point)
         check(open(os.path.join(point, "a.txt")).read() == "hi", "HostMount serves its tree")
         del m
         check(not os.path.exists(os.path.join(point, "a.txt")), "dropping the HostMount takes it down")
 
         if sys.platform != "win32":
-            child = tempfile.mkdtemp(prefix="cortex-smoke-killed-")
+            child = tempfile.mkdtemp(prefix="virtx-smoke-killed-")
             code = (
-                "import cortex, time\n"
-                f"m = cortex.HostMount(cortex.Directory().with_file('a.txt', 'hi'), {child!r})\n"
+                "import virtx, time\n"
+                f"m = virtx.HostMount(virtx.Directory().with_file('a.txt', 'hi'), {child!r})\n"
                 f"open({child + '.ready'!r}, 'w').close()\n"
                 "time.sleep(1e6)\n"
             )
@@ -61,32 +61,32 @@ async def main():
 
     server = None
     try:
-        server = await cortex.ensure_cortex()
-        print(f"  ensure_cortex: {server}")
+        server = await virtx.ensure_virtx()
+        print(f"  ensure_virtx: {server}")
     except Exception as e:
-        print(f"  ensure_cortex: {e}")
-        check(not want("SMOKE_SERVER") and "no cortex-krun release is published" in str(e), "ensure_cortex says no release is published here")
+        print(f"  ensure_virtx: {e}")
+        check(not want("SMOKE_SERVER") and "no virtx-uvm release is published" in str(e), "ensure_virtx says no release is published here")
     if server:
-        check(want("SMOKE_SERVER"), "ensure_cortex fetched the server")
+        check(want("SMOKE_SERVER"), "ensure_virtx fetched the server")
         exe = ".exe" if sys.platform == "win32" else ""
-        check(os.path.isfile(os.path.join(server, f"cortex-krun{exe}")), f"cortex-krun{exe} is in {server}")
+        check(os.path.isfile(os.path.join(server, f"virtx-uvm{exe}")), f"virtx-uvm{exe} is in {server}")
         # The server runs on this machine, and answers -- no VM needed to ask its version.
-        images = await cortex.ImageClient.try_new()
+        images = await virtx.ImageClient.try_new()
         version = await images.version()
         await images.close()
         check(bool(version), f"the server answers (protocol {version})")
         # And the VM process it would spawn starts, and says what it can make here.
-        caps = subprocess.run([os.path.join(server, f"cortex-krun-host{exe}"), "--capabilities"], capture_output=True, text=True)
-        print(f"  cortex-krun-host --capabilities: [{' '.join(caps.stdout.split())}]")
-        check(caps.returncode == 0, "cortex-krun-host starts")
+        caps = subprocess.run([os.path.join(server, f"virtx-uvm-host{exe}"), "--capabilities"], capture_output=True, text=True)
+        print(f"  virtx-uvm-host --capabilities: [{' '.join(caps.stdout.split())}]")
+        check(caps.returncode == 0, "virtx-uvm-host starts")
 
     if server and want("SMOKE_VM"):
-        host = tempfile.mkdtemp(prefix="cortex-smoke-host-")
+        host = tempfile.mkdtemp(prefix="virtx-smoke-host-")
         open(os.path.join(host, "from-host.txt"), "w").write("by path")
-        b = cortex.ConsoleClient.builder().image(cortex.Recipe("alpine:latest")).mount(host, "/host")
+        b = virtx.ConsoleClient.builder().image(virtx.Recipe("alpine:latest")).mount(host, "/host")
         m = None
         if fuse:
-            m = cortex.HostMount(cortex.Directory().with_file("a.txt", "a Directory"), tempfile.mkdtemp(prefix="cortex-smoke-vm-"))
+            m = virtx.HostMount(virtx.Directory().with_file("a.txt", "a Directory"), tempfile.mkdtemp(prefix="virtx-smoke-vm-"))
             b = b.mount(m, "/work")
         async with await b.build() as c:
             r = await c.exec(["sh", "-c", "uname -m; cat /host/from-host.txt; echo; [ -d /work ] && cat /work/a.txt; echo written > /host/from-vm.txt"], 120_000)

@@ -1,12 +1,12 @@
 [package]
-name = "cortex-node"
+name = "virtx-node"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
 [lib]
-# `rlib` for a binding that builds cortex into its own addon (e.g. ailoy). Two addons cannot
-# pass each other a `ConsoleClient`, since each links its own cortex and runtime, so such a binding
+# `rlib` for a binding that builds virtx into its own addon (e.g. ailoy). Two addons cannot
+# pass each other a `ConsoleClient`, since each links its own virtx and runtime, so such a binding
 # links this crate and napi registers these classes into its addon.
 crate-type = ["cdylib", "rlib"]
 
@@ -15,15 +15,15 @@ napi-build = "2"
 
 [dependencies]
 anyhow = "1"
-cortex = { path = "../..", default-features = false }
+virtx = { path = "../..", default-features = false }
 napi = { version = "3", default-features = false, features = ["napi8", "async", "tokio_rt"] }
 napi-derive = "3"
 tokio = { version = "1", features = ["sync"] }
 
 [features]
 default = ["mount", "ensure"]
-mount = ["cortex/mount"]
-ensure = ["cortex/ensure"]
-s3 = ["cortex/s3"]
-gdrive = ["cortex/gdrive"]
-notion = ["cortex/notion"]
+mount = ["virtx/mount"]
+ensure = ["virtx/ensure"]
+s3 = ["virtx/s3"]
+gdrive = ["virtx/gdrive"]
+notion = ["virtx/notion"]

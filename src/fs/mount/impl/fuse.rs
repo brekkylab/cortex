@@ -35,7 +35,7 @@ const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
 };
 
 /// The mount's source name, as `df` shows it.
-const FSNAME: &str = "cortex";
+const FSNAME: &str = "virtx";
 
 /// A live mount on the kernel's own FUSE: constructing one mounts, dropping it unmounts.
 ///
@@ -133,7 +133,7 @@ impl Drop for FuseMount {
         }
         // Left for someone to clear by hand, so say so, with `fuser`'s reason.
         eprintln!(
-            "cortex: unmounting {} failed: {refused}",
+            "virtx: unmounting {} failed: {refused}",
             self.mountpoint.display()
         );
     }

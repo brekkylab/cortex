@@ -39,7 +39,7 @@ pub struct ConsoleClientBuilder {
     /// A factory, not a client, because starting a program can fail; deferring that to
     /// [`build`](Self::build) keeps every setter infallible.
     ///
-    /// Defaults to `cortex-krun` under the cache's `bin` directory.
+    /// Defaults to `virtx-uvm` under the cache's `bin` directory.
     client_factory: ClientFactory,
 
     /// `None` leaves it to the server: a host backend needs none, and a VM backend refuses
@@ -73,7 +73,7 @@ pub struct ConsoleClientBuilder {
 impl Default for ConsoleClientBuilder {
     fn default() -> Self {
         ConsoleClientBuilder {
-            client_factory: stdio_factory(&[cache_root().join("bin").join("cortex-krun")]),
+            client_factory: stdio_factory(&[cache_root().join("bin").join("virtx-uvm")]),
             image: None,
             snapshot: None,
             mounts: Vec::new(),
@@ -105,7 +105,7 @@ impl ConsoleClientBuilder {
 
     /// Drive a server this console starts itself: `cmd`, over its own pipes.
     ///
-    /// `cmd` is a program and its arguments: `["cortex-local-console"]`,
+    /// `cmd` is a program and its arguments: `["virtx-local-console"]`,
     /// `["sh", "-c", "…"]`. For an environment or directory, build the [`Command`], pass it
     /// to [`StdioClient::new`], and hand the result to [`client`](Self::client).
     ///
@@ -154,8 +154,8 @@ impl ConsoleClientBuilder {
     /// The base the session's commands run in.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
-    /// # use cortex::image::Recipe;
+    /// # use virtx::console::ConsoleClient;
+    /// # use virtx::image::Recipe;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .image(
@@ -180,7 +180,7 @@ impl ConsoleClientBuilder {
     /// Whether the session's commands reach a network at all; on unless turned off.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder().network(true).build().await?;
     /// # Ok(()) }
@@ -199,7 +199,7 @@ impl ConsoleClientBuilder {
     /// them (`"8080:80"`, host first). Replaces what an earlier call said.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// // A VNC server in the session, at 127.0.0.1:5901 here.
     /// let console = ConsoleClient::builder()
@@ -226,7 +226,7 @@ impl ConsoleClientBuilder {
     /// How much memory the session's machine gets, in mebibytes.
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .vcpus(4)
@@ -253,7 +253,7 @@ impl ConsoleClientBuilder {
     /// | venus driver | `mesa-vulkan-virtio` | `mesa-vulkan-drivers`, trixie or later |
     ///
     /// ```no_run
-    /// # use cortex::{console::ConsoleClient, image::Recipe};
+    /// # use virtx::{console::ConsoleClient, image::Recipe};
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .image(
@@ -277,7 +277,7 @@ impl ConsoleClientBuilder {
     /// [`InitCall::gpu_memory_mib`](crate::console::InitCall::gpu_memory_mib)).
     ///
     /// ```no_run
-    /// # use cortex::{console::ConsoleClient, image::Recipe};
+    /// # use virtx::{console::ConsoleClient, image::Recipe};
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     // A loader and the venus driver -- see `gpu`.
@@ -301,7 +301,7 @@ impl ConsoleClientBuilder {
     /// [`InitCall::disk_gib`](crate::console::InitCall::disk_gib)).
     ///
     /// ```no_run
-    /// # use cortex::console::ConsoleClient;
+    /// # use virtx::console::ConsoleClient;
     /// # async fn f() -> anyhow::Result<()> {
     /// let console = ConsoleClient::builder()
     ///     .disk_gib(32)
@@ -347,7 +347,7 @@ struct Tree {
 /// concurrent: its methods take `&mut self` (see [`Client`]).
 ///
 /// ```no_run
-/// use cortex::console::ConsoleClient;
+/// use virtx::console::ConsoleClient;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
@@ -731,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn a_stdio_console_starts_its_server_when_it_is_built() {
         let Err(e) = ConsoleClient::builder()
-            .cmd(&["cortex-no-such-console"])
+            .cmd(&["virtx-no-such-console"])
             .build()
             .await
         else {

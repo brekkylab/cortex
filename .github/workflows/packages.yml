@@ -1,12 +1,12 @@
-# Build every package cortex is published as -- the Node and Python bindings for every
+# Build every package virtx is published as -- the Node and Python bindings for every
 # platform, and the Rust crate -- pack them as they would be published, and install and run
 # them the way a user would.
 #
 # Nothing here publishes. The npm packages go to a registry on the test runner's own
-# localhost, so `npm install @brekkylab/cortex` resolves its optional platform packages by
+# localhost, so `npm install virtx` resolves its optional platform packages by
 # os/cpu/libc exactly as it would from npmjs; the wheels are installed with pip choosing one
 # from a directory, as it would choose from PyPI; and the crate is published to
-# cargo-http-registry on localhost, for a project of its own to take `cortex` from and build
+# cargo-http-registry on localhost, for a project of its own to take `virtx` from and build
 # on each platform, as it would from crates.io.
 #
 # # Platforms
@@ -26,20 +26,20 @@
 # # When it runs, and the server it pins
 #
 # Only for a release: when one is published, or when dispatched with the tag to release.
-# cortex and cortex-krun are released together, under one version tag, and `resolve`
+# virtx and virtx-uvm are released together, under one version tag, and `resolve`
 # refuses a run that would break that:
 #
 # - the ref has to be a version tag, `vX.Y.Z`, and every manifest here -- the crate, the
 #   bindings' crates, npm's packages, the wheel -- has to say that version;
-# - cortex-krun has to have released the same tag already, whole: its dist workflow fills
-#   `cortex-krun/<tag>/` with all four platforms' archives at once, and only once all four
+# - virtx-uvm has to have released the same tag already, whole: its dist workflow fills
+#   `virtx-uvm/<tag>/` with all four platforms' archives at once, and only once all four
 #   are built, and `resolve` checks the four are there and are of one build.
 #
-# Every package is then built from that tag and pinned to it (`CORTEX_KRUN_PINNED_VERSION`,
-# see `src/ensure.rs`), so one version of cortex fetches `cortex-krun/<tag>/`: the cortex-krun
+# Every package is then built from that tag and pinned to it (`VIRTX_UVM_PINNED_VERSION`,
+# see `src/ensure.rs`), so one version of virtx fetches `virtx-uvm/<tag>/`: the virtx-uvm
 # it was released with, and was tested against here. The crate is compiled by
 # its user rather than here, so it carries the version as a file instead
-# (`cortex-krun.version`, see `build.rs`).
+# (`virtx-uvm.version`, see `build.rs`).
 name: packages
 
 on:
@@ -48,10 +48,10 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: The version tag to release (vX.Y.Z), the same in brekkylab/cortex-krun; with build-only, any ref
+        description: The version tag to release (vX.Y.Z), the same in brekkylab/virtx-uvm; with build-only, any ref
         required: true
       build-only:
-        description: Build and pack every package, and stop -- no test, and no cortex-krun release needed
+        description: Build and pack every package, and stop -- no test, and no virtx-uvm release needed
         type: boolean
         default: false
 
@@ -65,50 +65,50 @@ permissions:
   contents: read
 
 env:
-  DIST_URL: https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com
+  DIST_URL: https://virtx-dist.s3.us-east-1.amazonaws.com
   CARGO_TERM_COLOR: always
   # The tag this run releases: the release's own, or the one it was dispatched with.
   REF: ${{ github.event.release.tag_name || inputs.ref }}
   # A dispatch that only builds: whether every package still builds and packs, from any ref,
-  # without a cortex-krun release to pin -- so unpinned, following `latest` -- and untested.
+  # without a virtx-uvm release to pin -- so unpinned, following `latest` -- and untested.
   BUILD_ONLY: ${{ inputs.build-only == true }}
 
 jobs:
-  # What this release is, and the cortex-krun release it pins -- or no release at all.
+  # What this release is, and the virtx-uvm release it pins -- or no release at all.
   resolve:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       version: ${{ steps.resolve.outputs.version }}
-      krun: ${{ steps.krun.outputs.krun }}
+      uvm: ${{ steps.uvm.outputs.uvm }}
     steps:
       # First, and before any checkout: the tag may be one this repository has not made yet
-      # either, and what to do first is the same then -- release cortex-krun.
-      - id: krun
-        name: cortex-krun has released this tag, on every platform
+      # either, and what to do first is the same then -- release virtx-uvm.
+      - id: uvm
+        name: virtx-uvm has released this tag, on every platform
         run: |
           fail() { echo "::error::$*"; exit 1; }
           if [ "$BUILD_ONLY" = true ]; then
-            echo "build-only: no cortex-krun release is needed, and none is pinned"
-            echo "krun=" >> "$GITHUB_OUTPUT"
+            echo "build-only: no virtx-uvm release is needed, and none is pinned"
+            echo "uvm=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           [[ "$REF" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$ ]] \
             || fail "$REF is not a version tag: a release is tagged vX.Y.Z"
-          # cortex-krun's dist names a release for its tag only once all four platforms'
+          # virtx-uvm's dist names a release for its tag only once all four platforms'
           # archives are up, and all four at once; each carries the sha it was built from.
           shas=""
           for p in macos-aarch64 linux-x86_64 linux-aarch64 windows-x86_64; do
-            head=$(curl -fsSI "$DIST_URL/cortex-krun/$REF/cortex-krun-$p.tar.gz") \
-              || fail "cortex-krun has not released $REF for $p: tag it there first, and let its dist workflow finish"
+            head=$(curl -fsSI "$DIST_URL/virtx-uvm/$REF/virtx-uvm-$p.tar.gz") \
+              || fail "virtx-uvm has not released $REF for $p: tag it there first, and let its dist workflow finish"
             sha=$(printf '%s' "$head" | awk 'tolower($1)=="x-amz-meta-sha:"{print $2}' | tr -d '\r')
-            echo "cortex-krun/$REF/cortex-krun-$p.tar.gz: ${sha:-no sha}"
-            [ -n "$sha" ] || fail "cortex-krun/$REF/cortex-krun-$p.tar.gz says no sha: it was not named by cortex-krun's dist"
+            echo "virtx-uvm/$REF/virtx-uvm-$p.tar.gz: ${sha:-no sha}"
+            [ -n "$sha" ] || fail "virtx-uvm/$REF/virtx-uvm-$p.tar.gz says no sha: it was not named by virtx-uvm's dist"
             shas="$shas $sha"
           done
           [ "$(printf '%s\n' $shas | sort -u | wc -l)" -eq 1 ] \
-            || fail "cortex-krun/$REF holds archives of different builds:$shas"
-          echo "krun=$REF" >> "$GITHUB_OUTPUT"
+            || fail "virtx-uvm/$REF holds archives of different builds:$shas"
+          echo "uvm=$REF" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -137,7 +137,7 @@ jobs:
             [ "$(json "$f")" = "$version" ] || wrong="$wrong $f=$(json "$f")"
           done
           [ -z "$wrong" ] || fail "$REF is version $version, but these manifests say otherwise:$wrong"
-          echo "cortex $version ($REF), pinned to cortex-krun ${{ steps.krun.outputs.krun || '(none, build-only)' }}"
+          echo "virtx $version ($REF), pinned to virtx-uvm ${{ steps.uvm.outputs.uvm || '(none, build-only)' }}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
@@ -168,7 +168,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     env:
-      CORTEX_KRUN_PINNED_VERSION: ${{ needs.resolve.outputs.krun }}
+      VIRTX_UVM_PINNED_VERSION: ${{ needs.resolve.outputs.uvm }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -203,7 +203,7 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --out ${{ github.workspace }}/dist/wheels
-          docker-options: -e CORTEX_KRUN_PINNED_VERSION
+          docker-options: -e VIRTX_UVM_PINNED_VERSION
 
       # What the addon and the extension need from the loader to be loaded at all. Neither
       # may need a DLL Windows does not ship: the C runtime is linked in (`.cargo/config.toml`)
@@ -216,7 +216,7 @@ jobs:
           readobj="/c/Program Files/LLVM/bin/llvm-readobj.exe"
           cd dist
           unzip -oq wheels/*.whl -d wheel
-          for f in node/*.node wheel/cortex/*.pyd; do
+          for f in node/*.node wheel/virtx/*.pyd; do
             echo "== $f"
             "$readobj" --coff-imports "$f" | awk '/^Import \{/{k="load"} /^DelayImport \{/{k="delay"} /Name: .*\.dll/{print "  " k ": " $2}' | sort -u | tee imports.txt
             if grep -iE "load: (vcruntime|msvcp|dokan)" imports.txt; then
@@ -231,7 +231,7 @@ jobs:
         run: |
           cd dist
           unzip -oq wheels/*.whl -d wheel
-          for f in node/*.node wheel/cortex/*.so; do
+          for f in node/*.node wheel/virtx/*.so; do
             need=$(objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
             echo "$f needs $need"
           done
@@ -285,7 +285,7 @@ jobs:
           npx napi artifacts --output-dir artifacts
           node ../../scripts/packages/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
           ls -la "$GITHUB_WORKSPACE/dist/npm"
-          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-cortex-${{ needs.resolve.outputs.version }}.tgz package/package.json
+          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/virtx-${{ needs.resolve.outputs.version }}.tgz package/package.json
 
       - name: wheels
         run: |
@@ -322,11 +322,11 @@ jobs:
 
       # Not on a build-only run, which pins nothing: without the file, the crate follows `latest`.
       - name: Pin the server release
-        if: needs.resolve.outputs.krun != ''
-        run: echo "${{ needs.resolve.outputs.krun }}" > cortex-krun.version
+        if: needs.resolve.outputs.uvm != ''
+        run: echo "${{ needs.resolve.outputs.uvm }}" > virtx-uvm.version
 
       # Verified as cargo verifies it: the packed source, alone, built. `--allow-dirty` for
-      # `cortex-krun.version`, written above and in no commit.
+      # `virtx-uvm.version`, written above and in no commit.
       - name: Pack
         run: |
           cargo package --allow-dirty
@@ -430,16 +430,16 @@ jobs:
           done
           mkdir -p "$RUNNER_TEMP/project" && cd "$RUNNER_TEMP/project"
           echo '{"name":"project","private":true,"type":"module"}' > package.json
-          npm install @brekkylab/cortex --userconfig "$npmrc" --registry http://localhost:4873/
-          ls node_modules/@brekkylab
+          npm install virtx --userconfig "$npmrc" --registry http://localhost:4873/
+          ls -d node_modules/virtx*
 
       - name: Install the wheel pip picks
         shell: bash
         run: |
           python -m venv "$RUNNER_TEMP/venv"
           py="$RUNNER_TEMP/venv/bin/python"; [ -x "$py" ] || py="$RUNNER_TEMP/venv/Scripts/python.exe"
-          "$py" -m pip install --no-index --find-links dist/wheels cortex-py
-          "$py" -m pip show cortex-py
+          "$py" -m pip install --no-index --find-links dist/wheels virtx
+          "$py" -m pip show virtx
           echo "SMOKE_PYTHON=$py" >> "$GITHUB_ENV"
 
       # On macOS, first without FUSE-T, which a user may not have: the import and every
@@ -482,10 +482,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # A registry on localhost holding only the packed crate, published from that archive
-      # as it is, and a project of its own that takes `cortex` from it -- built here, with
+      # as it is, and a project of its own that takes `virtx` from it -- built here, with
       # this platform's toolchain, as a user's would be. A CARGO_HOME of its own, so that no
-      # crates.io token is within reach, and a CORTEX_HOME of its own, so that
-      # `ensure_cortex` fetches the release the crate pins rather than finding the one the
+      # crates.io token is within reach, and a VIRTX_HOME of its own, so that
+      # `ensure_virtx` fetches the release the crate pins rather than finding the one the
       # other smokes left. After FUSE-T, so that on macOS the smoke mounts as well.
       - name: Smoke, Rust
         shell: bash
@@ -493,7 +493,7 @@ jobs:
           SMOKE_MOUNT: ${{ matrix.mount }}
         run: |
           cargo install --locked --quiet cargo-http-registry
-          export CARGO_HOME="$RUNNER_TEMP/cargo-home" CORTEX_HOME="$RUNNER_TEMP/cortex-home-rust"
+          export CARGO_HOME="$RUNNER_TEMP/cargo-home" VIRTX_HOME="$RUNNER_TEMP/virtx-home-rust"
           mkdir -p "$CARGO_HOME" "$RUNNER_TEMP/crate"
           printf '[registries.local]\nindex = "http://127.0.0.1:35503/git"\n\n[net]\ngit-fetch-with-cli = true\n' > "$CARGO_HOME/config.toml"
           cargo-http-registry --addr 127.0.0.1:35503 "$RUNNER_TEMP/registry" > "$RUNNER_TEMP/registry.log" 2>&1 &
@@ -508,13 +508,13 @@ jobs:
           cd "$RUNNER_TEMP/smoke-rust"
           cargo build --quiet
           grep -q 'registry+http://127.0.0.1:35503' Cargo.lock \
-            || { echo "::error::cortex did not come from the local registry"; exit 1; }
-          echo "PASS cortex came from the local registry"
-          pin=$(cat "$package/cortex-krun.version")
-          exe=target/debug/cortex-smoke; [ -f "$exe" ] || exe=$exe.exe
+            || { echo "::error::virtx did not come from the local registry"; exit 1; }
+          echo "PASS virtx came from the local registry"
+          pin=$(cat "$package/virtx-uvm.version")
+          exe=target/debug/virtx-smoke; [ -f "$exe" ] || exe=$exe.exe
           grep -aq "$pin" "$exe" \
-            || { echo "::error::the build does not carry the pinned cortex-krun $pin"; exit 1; }
-          echo "PASS the build fetches cortex-krun $pin by default"
+            || { echo "::error::the build does not carry the pinned virtx-uvm $pin"; exit 1; }
+          echo "PASS the build fetches virtx-uvm $pin by default"
           "$exe"
 
       - name: registry logs

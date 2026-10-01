@@ -4,9 +4,9 @@
 //! cargo run --example hello
 //! ```
 //!
-//! Needs `cortex-krun` in `cache_root()/bin` (`$CORTEX_HOME/bin` if set); `ensure_cortex` fetches it.
+//! Needs `virtx-uvm` in `cache_root()/bin` (`$VIRTX_HOME/bin` if set); `ensure_virtx` fetches it.
 
-use cortex::{console::ConsoleClient, image::Recipe};
+use virtx::{console::ConsoleClient, image::Recipe};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -17,7 +17,7 @@ async fn main() -> anyhow::Result<()> {
 
     let result = console
         .exec(
-            ["sh", "-c", r#"echo '{"hello": "cortex"}' | jq -r .hello"#],
+            ["sh", "-c", r#"echo '{"hello": "virtx"}' | jq -r .hello"#],
             None,
         )
         .await?;

@@ -4,7 +4,7 @@
  *
  * A bitfield has no offset to print, so `fuse_file_info` is also printed as bytes, once
  * per field set on its own: that is the layout as the library reads it. */
-#ifdef CORTEX_ABI_REAL
+#ifdef VIRTX_ABI_REAL
 #define FUSE_USE_VERSION 26
 #include <fuse_lowlevel.h>
 #else

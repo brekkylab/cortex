@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use cortex::{
+use virtx::{
     image::{ImageClient, ImageEntry, ImageSource, Recipe, Step},
     protocol::BuildImageResp,
 };
@@ -208,7 +208,7 @@ impl From<ImageEntry> for JsImageEntry {
 fn held(slot: &mut Option<ImageClient>) -> Result<&mut ImageClient> {
     slot.as_mut().ok_or_else(|| {
         napi::Error::new(
-            "CORTEX_ERROR".to_string(),
+            "VIRTX_ERROR".to_string(),
             "this image client has been closed",
         )
     })
@@ -244,7 +244,7 @@ impl Drop for JsImageClient {
 
 #[napi]
 impl JsImageClient {
-    /// Start `cortex-krun` from cortex's cache `bin`; settles once the server answers.
+    /// Start `virtx-uvm` from virtx's cache `bin`; settles once the server answers.
     #[napi(ts_return_type = "Promise<ImageClient>")]
     pub fn try_new(env: &Env) -> napi::Result<PromiseRaw<'_, JsImageClient>> {
         promise(env, async move {

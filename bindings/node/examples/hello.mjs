@@ -2,7 +2,7 @@
 //
 //     node examples/hello.mjs
 //
-// Needs `cortex-krun` in the cortex cache `bin` (`$CORTEX_HOME/bin` if set); `ensureCortex()` fetches it.
+// Needs `virtx-uvm` in the virtx cache `bin` (`$VIRTX_HOME/bin` if set); `ensureVirtx()` fetches it.
 
 import { createRequire } from 'node:module'
 
@@ -13,7 +13,7 @@ const console_ = await ConsoleClient.builder()
   .build()
 
 try {
-  const result = await console_.exec(['sh', '-c', `echo '{"hello": "cortex"}' | jq -r .hello`])
+  const result = await console_.exec(['sh', '-c', `echo '{"hello": "virtx"}' | jq -r .hello`])
   process.stdout.write(result.stdout)
   process.stderr.write(result.stderr)
   console.log(`exit code: ${result.code}`)

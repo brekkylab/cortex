@@ -7,12 +7,12 @@ _Content = bytes | str
 
 ERROR_CODES: dict[str, int]
 
-class CortexError(Exception): ...
+class VirtxError(Exception): ...
 
-class ConsoleRefused(CortexError):
+class ConsoleRefused(VirtxError):
     code: int
 
-class ConsoleBroken(CortexError): ...
+class ConsoleBroken(VirtxError): ...
 
 class Step:
     @staticmethod
@@ -153,10 +153,10 @@ class ConsoleClient:
         tb: TracebackType | None,
     ) -> None: ...
 
-async def ensure_cortex() -> str:
-    """Fetch the console server into cortex's cache if missing; resolves to its directory.
+async def ensure_virtx() -> str:
+    """Fetch the console server into virtx's cache if missing; resolves to its directory.
 
-    Console builders and ``ImageClient`` start ``cortex-krun`` from that cache, which a host
+    Console builders and ``ImageClient`` start ``virtx-uvm`` from that cache, which a host
     that installed only this package lacks, so such a host calls this first. An existing
     server, fetched or installed by hand, is left alone.
     """

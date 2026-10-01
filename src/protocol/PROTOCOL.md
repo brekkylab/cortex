@@ -258,7 +258,7 @@ Such a session's commands see whatever the executor's own filesystem holds, and 
 | `file:///srv/project` | a directory in a filesystem the server can already open |
 | `http://…`, `https://…` | a tree reached over HTTP — on the wire, implemented nowhere |
 
-A `file://` URL is usually a directory the *client* put there: a cortex tree mounted in front of a kernel on this host, whose path is then the whole of what the server has to be told about it.
+A `file://` URL is usually a directory the *client* put there: a virtx tree mounted in front of a kernel on this host, whose path is then the whole of what the server has to be told about it.
 
 A URL and not a tagged object, because there is one thing this protocol does with it: hand it to whatever realizes that kind.
 A tagged object would grow the wire schema with every provider anyone adds; a string leaves the schema alone and leaves each kind's spelling to the kind — so a peer that has never heard of a scheme still parses the frame, and refuses it for the reason it actually has.
@@ -285,7 +285,7 @@ This is what [`ConsoleClient`](client.rs) keeps apart by holding both: the mount
 **One spelling, and it is this one.**
 Every path that comes out of a session afterwards has to be spelled the way the call wrote it, because the client's only way to relate one to the other is the characters — including what a command's own `pwd` prints, which is a path a client will turn around and send back in a `read`.
 That is not automatic and it is where a backend will get it wrong: `getcwd(2)` answers the *physical* path, so a tree mounted at `/var/x` is seen from inside as `/private/var/x`, and a `cd` that canonicalized would land there too. Both are the same directory and neither is one the client named.
-So a server holds the spelling it was given and puts what it observes back into it. `cortex-local-console` does this in two places, and both were bugs before they were code.
+So a server holds the spelling it was given and puts what it observes back into it. `virtx-local-console` does this in two places, and both were bugs before they were code.
 
 **Nothing is mounted by sending it**, any more than anything is booted by it.
 The guest path is where the tree *will be*: the mount happens when the session boots, so a client holding a path holds a name before it holds a directory.

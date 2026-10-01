@@ -6,19 +6,19 @@ directories, mounted on the host with ``HostMount``. What it does is run command
 ``ImageSource`` or declared by a ``Recipe``. ``ImageClient`` builds, lists and removes those
 images ahead of any session.
 
-Names and behaviour are cortex's own; see the Rust crate's documentation for details.
+Names and behaviour are virtx's own; see the Rust crate's documentation for details.
 """
 
 from enum import IntEnum
 
-from . import _cortex
-from ._cortex import (
+from . import _virtx
+from ._virtx import (
     BuildImageResult,
     ConsoleBroken,
     ConsoleClient,
     ConsoleClientBuilder,
     ConsoleRefused,
-    CortexError,
+    VirtxError,
     Directory,
     ExecResult,
     ImageClient,
@@ -29,8 +29,8 @@ from ._cortex import (
     Step,
 )
 
-# The numbers a `ConsoleRefused.code` may hold, named as cortex names them.
-ErrorCode = IntEnum("ErrorCode", _cortex.ERROR_CODES)
+# The numbers a `ConsoleRefused.code` may hold, named as virtx names them.
+ErrorCode = IntEnum("ErrorCode", _virtx.ERROR_CODES)
 
 __all__ = [
     "BuildImageResult",
@@ -38,7 +38,7 @@ __all__ = [
     "ConsoleClient",
     "ConsoleClientBuilder",
     "ConsoleRefused",
-    "CortexError",
+    "VirtxError",
     "Directory",
     "ErrorCode",
     "ExecResult",
@@ -51,13 +51,13 @@ __all__ = [
 ]
 
 # Present only when the extension was built with the `ensure` feature, which is the default.
-if hasattr(_cortex, "ensure_cortex"):
-    from ._cortex import ensure_cortex
+if hasattr(_virtx, "ensure_virtx"):
+    from ._virtx import ensure_virtx
 
-    __all__.append("ensure_cortex")
+    __all__.append("ensure_virtx")
 
 # Present only when the extension was built with the `mount` feature, which is the default.
-if hasattr(_cortex, "HostMount"):
-    from ._cortex import HostMount, mount_support
+if hasattr(_virtx, "HostMount"):
+    from ._virtx import HostMount, mount_support
 
     __all__ += ["HostMount", "mount_support"]
