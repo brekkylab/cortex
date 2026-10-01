@@ -7,8 +7,8 @@
 //! also raised for failures with no finer class (building a console, say). Filesystem errors
 //! are [`std::io::Error`], which pyo3 already raises as the matching `OSError` subclass.
 
-use virtx::protocol::{Error, Failure};
 use pyo3::{create_exception, exceptions::PyException, prelude::*, types::PyDict};
+use virtx::protocol::{Error, Failure};
 
 create_exception!(virtx, VirtxError, PyException);
 create_exception!(virtx, ConsoleRefused, VirtxError);

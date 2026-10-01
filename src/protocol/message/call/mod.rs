@@ -18,25 +18,23 @@ mod write;
 use std::fmt;
 
 use bson::{Bson, Document, doc};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, DeserializeOwned, MapAccess, Visitor},
-    ser::SerializeMap,
-};
-
 pub use build_image::{BuildImageCall, BuildImageResp};
 pub use exec::{ExecCall, ExecResp};
 pub use init::{InitCall, InitResp, InvalidMount, InvalidPort, MountSpec, Port};
 pub use list_images::{ListImagesCall, ListImagesResp};
 pub use read::{ReadCall, ReadResp};
 pub use remove_image::{RemoveImageCall, RemoveImageResp};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, DeserializeOwned, MapAccess, Visitor},
+    ser::SerializeMap,
+};
 pub use snapshot::{SnapshotCall, SnapshotResp};
 pub use version::{VersionCall, VersionResp};
 pub use write::{WriteCall, WriteResp};
 
-use crate::protocol::Error;
-
 use super::Method;
+use crate::protocol::Error;
 
 /// A method and its parameters: what a request carries.
 ///

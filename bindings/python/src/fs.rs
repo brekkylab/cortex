@@ -4,9 +4,7 @@
 use std::sync::Arc;
 use std::{io, path::PathBuf};
 
-use virtx::fs::{Directory, Mount};
 use pyo3::{exceptions::PyValueError, prelude::*};
-
 // `HostMount` wraps whichever guard this platform compiles, so callers need not know which.
 #[cfg(all(feature = "mount", windows))]
 use virtx::fs::DokanMount as Platform;
@@ -14,6 +12,7 @@ use virtx::fs::DokanMount as Platform;
 use virtx::fs::FuseMount as Platform;
 #[cfg(all(feature = "mount", target_os = "macos"))]
 use virtx::fs::FuseTMount as Platform;
+use virtx::fs::{Directory, Mount};
 
 /// File content as a caller may spell it: bytes as they are, a string as its UTF-8.
 #[derive(FromPyObject)]

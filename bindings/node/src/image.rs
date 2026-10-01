@@ -7,16 +7,16 @@
 
 use std::sync::Arc;
 
-use virtx::{
-    image::{ImageClient, ImageEntry, ImageSource, Recipe, Step},
-    protocol::BuildImageResp,
-};
 use napi::{
     Env,
     bindgen_prelude::{ClassInstance, Either, PromiseRaw},
 };
 use napi_derive::napi;
 use tokio::{runtime::Handle, sync::Mutex};
+use virtx::{
+    image::{ImageClient, ImageEntry, ImageSource, Recipe, Step},
+    protocol::BuildImageResp,
+};
 
 use crate::{
     console::promise,

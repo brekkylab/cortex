@@ -1,12 +1,9 @@
-use std::path::Path;
-use std::sync::Mutex as StdMutex;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::{path::Path, sync::Mutex as StdMutex};
 
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::super::GdriveOrigins;
-use super::*;
+use super::{super::GdriveOrigins, *};
 
 /// The size a listing row came with (every row carries a [`Stat`]; see [`dirent_for`]).
 fn size_of(e: &Dirent) -> u64 {

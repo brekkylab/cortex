@@ -2,7 +2,6 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
 use tokio::sync::Mutex;
 
 /// The OAuth origin. One endpoint mints tokens for every Graph service.
