@@ -118,7 +118,7 @@ impl DokanMount {
     /// Returns once the path answers as the mounted volume, so it is openable by the time the
     /// caller has the guard. That takes two waits, as on FUSE-T: `mount()` returns on
     /// registration, before the volume exists, and the driver reports the volume live before
-    /// the mount point is sure to lead to it (see [`answers`]).
+    /// the mount point is sure to lead to it.
     ///
     /// `'static` because the store is served from that thread for the mount's lifetime.
     pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
