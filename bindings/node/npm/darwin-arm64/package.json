@@ -1,6 +1,6 @@
 {
-  "name": "virtx-darwin-arm64",
-  "version": "0.1.0",
+  "name": "@brekkylab/virtx-darwin-arm64",
+  "version": "0.1.1",
   "cpu": [
     "arm64"
   ],

@@ -1,6 +1,6 @@
 {
-  "name": "virtx-linux-arm64-gnu",
-  "version": "0.1.0",
+  "name": "@brekkylab/virtx-linux-arm64-gnu",
+  "version": "0.1.1",
   "cpu": [
     "arm64"
   ],

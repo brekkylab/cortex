@@ -1,6 +1,6 @@
 {
-  "name": "virtx-win32-x64-msvc",
-  "version": "0.1.0",
+  "name": "@brekkylab/virtx-win32-x64-msvc",
+  "version": "0.1.1",
   "cpu": [
     "x64"
   ],
