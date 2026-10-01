@@ -45,11 +45,11 @@ asyncio.run(main())
 ### Node
 
 ```sh
-npm install @brekkylab/virtx
+npm install virtx
 ```
 
 ```js
-import { ConsoleClient, Recipe, ensureVirtx } from '@brekkylab/virtx'
+import { ConsoleClient, Recipe, ensureVirtx } from 'virtx'
 
 // Fetches the console server into virtx's cache the first time; a no-op after.
 await ensureVirtx()

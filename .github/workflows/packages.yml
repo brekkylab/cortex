@@ -3,7 +3,7 @@
 # them the way a user would.
 #
 # Nothing here publishes. The npm packages go to a registry on the test runner's own
-# localhost, so `npm install @brekkylab/virtx` resolves its optional platform packages by
+# localhost, so `npm install virtx` resolves its optional platform packages by
 # os/cpu/libc exactly as it would from npmjs; the wheels are installed with pip choosing one
 # from a directory, as it would choose from PyPI; and the crate is published to
 # cargo-http-registry on localhost, for a project of its own to take `virtx` from and build
@@ -285,7 +285,7 @@ jobs:
           npx napi artifacts --output-dir artifacts
           node ../../scripts/packages/pack-npm.mjs "$GITHUB_WORKSPACE/dist/npm"
           ls -la "$GITHUB_WORKSPACE/dist/npm"
-          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/brekkylab-virtx-${{ needs.resolve.outputs.version }}.tgz package/package.json
+          tar -xzOf "$GITHUB_WORKSPACE"/dist/npm/virtx-${{ needs.resolve.outputs.version }}.tgz package/package.json
 
       - name: wheels
         run: |
@@ -430,8 +430,8 @@ jobs:
           done
           mkdir -p "$RUNNER_TEMP/project" && cd "$RUNNER_TEMP/project"
           echo '{"name":"project","private":true,"type":"module"}' > package.json
-          npm install @brekkylab/virtx --userconfig "$npmrc" --registry http://localhost:4873/
-          ls node_modules/@brekkylab
+          npm install virtx --userconfig "$npmrc" --registry http://localhost:4873/
+          ls -d node_modules/virtx*
 
       - name: Install the wheel pip picks
         shell: bash

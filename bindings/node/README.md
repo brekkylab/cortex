@@ -5,7 +5,7 @@ Node bindings for virtx, built with [napi-rs](https://napi.rs): the same `Consol
 waits returning a `Promise`.
 
 ```js
-const { ConsoleClient, Directory, HostMount, Recipe } = require('@brekkylab/virtx')
+const { ConsoleClient, Directory, HostMount, Recipe } = require('virtx')
 
 const mount = new HostMount(new Directory().withFile('SKILL.md', '...'), '/tmp/skill')
 
@@ -34,7 +34,7 @@ An image can also be built ahead of the session that runs on it, and then named 
 its digest:
 
 ```js
-const { ImageClient, ImageSource, Recipe } = require('@brekkylab/virtx')
+const { ImageClient, ImageSource, Recipe } = require('virtx')
 
 const images = await ImageClient.tryNew()
 const built = await images.build(new Recipe('alpine:3.20').step('apk add jq'), 'myimg:latest')

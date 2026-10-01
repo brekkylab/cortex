@@ -1,5 +1,5 @@
 {
-  "name": "@brekkylab/virtx-linux-x64-gnu",
+  "name": "virtx-linux-x64-gnu",
   "version": "0.1.0",
   "cpu": [
     "x64"

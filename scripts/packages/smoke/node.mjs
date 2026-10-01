@@ -1,6 +1,6 @@
 // The Node package as a user installs it, on the platform this runs on.
 //
-// Run from a project that installed `@brekkylab/virtx`, so it resolves the way that
+// Run from a project that installed `virtx`, so it resolves the way that
 // project's code would. What this platform can do is said in the environment:
 //   SMOKE_MOUNT   1 if a FUSE provider is installed here, else 0
 //   SMOKE_SERVER  1 if a virtx-uvm release is published for this platform, else 0
@@ -27,12 +27,14 @@ const until = async (cond, ms) => {
   return cond()
 }
 
-const virtx = require('@brekkylab/virtx')
+const virtx = require('virtx')
 check(typeof virtx.ConsoleClient === 'function', 'the package loads')
 
 // Only this platform's binary, as npm's os/cpu/libc filter chose it.
-const scope = path.join(process.cwd(), 'node_modules', '@brekkylab')
-const installed = fs.readdirSync(scope).sort()
+const installed = fs
+  .readdirSync(path.join(process.cwd(), 'node_modules'))
+  .filter((name) => name === 'virtx' || name.startsWith('virtx-'))
+  .sort()
 console.log(`  installed: ${installed.join(' ')}`)
 check(installed.length === 2, 'exactly one platform package was installed beside the root')
 
@@ -54,7 +56,7 @@ if (fuse) {
 
   if (process.platform !== 'win32') {
     const child = fs.mkdtempSync(path.join(os.tmpdir(), 'virtx-smoke-killed-'))
-    const script = `const c=require(${JSON.stringify(require.resolve('@brekkylab/virtx'))});` +
+    const script = `const c=require(${JSON.stringify(require.resolve('virtx'))});` +
       `globalThis.m=new c.HostMount(new c.Directory().withFile('a.txt','hi'),${JSON.stringify(child)});` +
       `require('fs').writeFileSync(${JSON.stringify(child + '.ready')},'');setInterval(()=>{},1e9)`
     const p = spawn(process.execPath, ['-e', script], { stdio: 'ignore' })
