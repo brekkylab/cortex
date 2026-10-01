@@ -337,6 +337,52 @@ fn a_write_protected_volume_is_enforced_by_the_driver() {
     fs::remove_dir_all(&mnt).ok();
 }
 
+/// Two names that differ only in case are two files, even while both are open.
+///
+/// A driver that matches names without regard to case took the second open for the first
+/// file, so `Greeting.txt` read `greeting.txt`'s bytes. Windows-only because that matching is
+/// the driver's; the FUSE kernels hand a store the name as asked.
+#[cfg(windows)]
+#[test]
+#[ignore = "needs a mount provider and mounts a real filesystem"]
+fn names_that_differ_only_in_case_stay_two_files_while_both_are_open() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mnt = mountpoint("case");
+    let mount = HostMount::try_new(volume(), &mnt).expect("mount");
+    fs::write(mnt.join("Greeting.txt"), b"a second file\n").unwrap();
+
+    let open = |name: &str| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(mnt.join(name))
+            .unwrap()
+    };
+    let (mut lower, mut upper) = (open("greeting.txt"), open("Greeting.txt"));
+    let (mut read_lower, mut read_upper) = (String::new(), String::new());
+    lower.read_to_string(&mut read_lower).unwrap();
+    upper.read_to_string(&mut read_upper).unwrap();
+    assert_eq!(read_lower, "Hello from virtx!\n");
+    assert_eq!(read_upper, "a second file\n");
+
+    upper.seek(SeekFrom::Start(0)).unwrap();
+    upper.write_all(b"CHANGED").unwrap();
+    drop((lower, upper));
+    assert_eq!(
+        fs::read_to_string(mnt.join("greeting.txt")).unwrap(),
+        "Hello from virtx!\n"
+    );
+    assert!(
+        fs::read_to_string(mnt.join("Greeting.txt"))
+            .unwrap()
+            .starts_with("CHANGED")
+    );
+
+    drop(mount);
+    fs::remove_dir_all(&mnt).ok();
+}
+
 /// A mount point is handed back the way it was taken, so the same directory mounts again; the
 /// second mount is the assertion.
 ///

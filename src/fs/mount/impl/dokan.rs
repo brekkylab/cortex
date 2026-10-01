@@ -21,7 +21,7 @@ use std::{
         mpsc::{self, SyncSender},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use ::dokan::{
@@ -45,9 +45,12 @@ use winapi::{
             STATUS_OBJECT_NAME_NOT_FOUND, STATUS_UNEXPECTED_IO_ERROR, STATUS_UNSUCCESSFUL,
         },
     },
-    um::winnt::{
-        ACCESS_MASK, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_CASE_PRESERVED_NAMES,
-        FILE_CASE_SENSITIVE_SEARCH, FILE_UNICODE_ON_DISK,
+    um::{
+        fileapi::GetVolumeInformationW,
+        winnt::{
+            ACCESS_MASK, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
+            FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_UNICODE_ON_DISK,
+        },
     },
 };
 
@@ -75,8 +78,13 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long [`DokanMount::try_new`] waits for the driver to report the mount is live.
 ///
 /// A backstop for a driver that accepts the filesystem but never calls
-/// [`mounted`](FileSystemHandler::mounted); most failures fail `mount()` outright.
+/// [`mounted`](FileSystemHandler::mounted); most failures fail `mount()` outright. It also
+/// bounds the wait after that for the mount point to lead to the volume (see [`answers`]).
 const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often [`DokanMount::try_new`] asks whether the mount point leads to the volume yet.
+/// Short, because what is being waited out is measured in tens of milliseconds.
+const ANSWER_POLL: Duration = Duration::from_millis(5);
 
 /// A live Dokan mount: constructing one mounts, dropping it unmounts.
 ///
@@ -107,8 +115,10 @@ impl DokanMount {
     /// `mountpoint` is a drive letter (`Z:\`) or an existing empty directory on an NTFS
     /// volume.
     ///
-    /// Returns once the driver reports the mount live, since `mount()` returns on
-    /// registration, before the volume exists.
+    /// Returns once the path answers as the mounted volume, so it is openable by the time the
+    /// caller has the guard. That takes two waits, as on FUSE-T: `mount()` returns on
+    /// registration, before the volume exists, and the driver reports the volume live before
+    /// the mount point is sure to lead to it.
     ///
     /// `'static` because the store is served from that thread for the mount's lifetime.
     pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
@@ -123,6 +133,12 @@ impl DokanMount {
     /// [`MountFlags::CURRENT_SESSION`] matters because a drive letter belongs to a logon
     /// session: a service's mount is invisible to the desktop unless the mount manager
     /// publishes it.
+    ///
+    /// [`MountFlags::CASE_SENSITIVE`] is added whatever `flags` says, and cannot be turned off:
+    /// the stores tell names apart by case, and a driver that does not mistakes one file for
+    /// another. The cost is over a store that does not, such as a passthrough to an NTFS
+    /// directory: `a.txt` and `A.TXT` are one host file there but two to the driver, so an
+    /// exclusive open or a lock on one does not keep the other from being opened.
     pub fn try_new_with<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
@@ -149,12 +165,33 @@ impl DokanMount {
                 .spawn(move || serve(fs, wide, flags, ready))?
         };
 
+        let deadline = Instant::now() + MOUNT_TIMEOUT;
         match mounted.recv_timeout(MOUNT_TIMEOUT) {
-            Ok(Ok(())) => Ok(DokanMount {
-                mountpoint: mountpoint.to_path_buf(),
-                wide,
-                serving: Some(serving),
-            }),
+            Ok(Ok(())) => {
+                let mount = DokanMount {
+                    mountpoint: mountpoint.to_path_buf(),
+                    wide,
+                    serving: Some(serving),
+                };
+                loop {
+                    match answers(&mount.wide) {
+                        Ok(()) => return Ok(mount),
+                        Err(last) if Instant::now() >= deadline => {
+                            // The guard exists, so its drop is what takes the volume down.
+                            drop(mount);
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!(
+                                    "dokan reported the mount live, but the mount point did \
+                                     not answer as the volume within {MOUNT_TIMEOUT:?}; its \
+                                     last answer: {last}"
+                                ),
+                            ));
+                        }
+                        Err(_) => std::thread::sleep(ANSWER_POLL),
+                    }
+                }
+            }
             // Never mounted, so nothing to take down.
             Ok(Err(err)) => {
                 let _ = serving.join();
@@ -263,6 +300,59 @@ impl DokanMount {
     }
 }
 
+/// Whether the mount point leads to the mounted volume yet, and if not, what it answered.
+///
+/// [`mounted`](FileSystemHandler::mounted) says the volume exists, not that the mount point
+/// leads to it; with several mounts coming up at once the two are tens of milliseconds apart,
+/// and a file opened in between fails with `ERROR_INVALID_FUNCTION` or
+/// `ERROR_INVALID_PARAMETER`.
+///
+/// The volume answers [`VOLUME_NAME`] and a serial of 0, which no host volume answers both of.
+/// The query opens the root first, so each poll reaches the store as a `create_file("\")` and
+/// a `stat("/")`. A store whose root `stat` fails never answers, and the error is the reason.
+fn answers(mountpoint: &U16CStr) -> io::Result<()> {
+    const BACKSLASH: u16 = b'\\' as u16;
+
+    // A mounted folder is named as a root, with its trailing separator.
+    let mut root = mountpoint.as_slice().to_vec();
+    if root.last() != Some(&BACKSLASH) {
+        root.push(BACKSLASH);
+    }
+    root.push(0);
+
+    let mut label = [0u16; 64];
+    let mut serial = 0u32;
+    // SAFETY: `root` is nul-terminated, and `label` is as long as the length passed with it.
+    // The outputs not asked for are null, which the call allows.
+    let answered = unsafe {
+        GetVolumeInformationW(
+            root.as_ptr(),
+            label.as_mut_ptr(),
+            label.len() as u32,
+            &mut serial,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if answered == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = label
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(label.len());
+    let label = String::from_utf16_lossy(&label[..len]);
+    if serial == 0 && label == VOLUME_NAME {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "a volume labelled {label:?} with serial {serial:#010x}, not this one"
+        )))
+    }
+}
+
 /// Initialise the Dokan library, once per process.
 ///
 /// `DokanShutdown` is **never called**: it is undefined while any mount is up, and callers
@@ -290,7 +380,10 @@ fn serve<T: FileSystem>(
         ready: Mutex::new(Some(ready)),
     };
     let options = MountOptions {
-        flags,
+        // Whatever the caller asked for: the stores compare names by their bytes, as
+        // `get_volume_information` already says. Without it the driver matches its searches and
+        // open files without regard to case, so two open files differing only in case were one.
+        flags: flags | MountFlags::CASE_SENSITIVE,
         timeout: OPERATION_TIMEOUT,
         // Matches the free-space reply's block; the library default (`0`) would not.
         allocation_unit_size: BLOCK_SIZE as u32,
@@ -753,7 +846,9 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 /// The store path a Dokan file name denotes.
 ///
-/// Dokan's NT spelling (`\`, `\src\main.rs`) becomes the stores' rooted `/`-separated path.
+/// Dokan's NT spelling (`\`, `\src\main.rs`) becomes a rooted path built with
+/// [`PathBuf::push`], which on Windows separates with `\` too, so stores split it by component
+/// rather than on `/`.
 ///
 /// Split by hand: [`PathBuf`] on Windows would read a leading `C:` as a drive prefix.
 ///

@@ -925,12 +925,20 @@ fn valid_notion_id(s: &str) -> bool {
     matches!(s.len(), 32 | 36) && uuid::Uuid::try_parse(s).is_ok()
 }
 
+/// The names a path is made of, root first.
+///
+/// By component, not by splitting on `/`: on Windows `Path::join` puts `\` between
+/// components, and every path from the Dokan binding is built that way. A `..` stays a
+/// segment and names nothing.
 fn segments(path: &Path) -> Vec<String> {
-    path.to_string_lossy()
-        .trim_matches('/')
-        .split('/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
+    use std::path::Component;
+
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            Component::ParentDir => Some("..".to_string()),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        })
         .collect()
 }
 
@@ -1334,6 +1342,33 @@ fn blocks_to_markdown(blocks: &[Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A path splits the same whether spelled with `/` or built with `join`, which puts `\`
+    /// between components on Windows, as in every path from the Dokan binding.
+    #[test]
+    fn a_path_is_split_the_same_whatever_joined_it() {
+        let want = [
+            "pages",
+            "Plan__1ae2589f-40ea-8015-8c0e-d299b0e93091",
+            "page.json",
+        ];
+        assert_eq!(
+            segments(Path::new(
+                "/pages/Plan__1ae2589f-40ea-8015-8c0e-d299b0e93091/page.json"
+            )),
+            want
+        );
+        assert_eq!(
+            segments(
+                &Path::new("/pages")
+                    .join("Plan__1ae2589f-40ea-8015-8c0e-d299b0e93091")
+                    .join("page.json")
+            ),
+            want
+        );
+        assert!(segments(Path::new("/")).is_empty());
+        assert_eq!(segments(Path::new("/pages/../x")), ["pages", "..", "x"]);
+    }
 
     /// A render carrying `edited` as the page's last edit, the only field revalidation reads.
     fn rendered(edited: Option<&str>) -> Rendered {
