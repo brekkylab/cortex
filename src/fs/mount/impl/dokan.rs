@@ -170,19 +170,24 @@ impl DokanMount {
                     wide,
                     serving: Some(serving),
                 };
-                while !answers(&mount.wide) {
-                    if Instant::now() >= deadline {
-                        // The guard exists, so its drop is what takes the volume down.
-                        drop(mount);
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "dokan reported the mount live, and the mount point never came to \
-                             lead to it",
-                        ));
+                loop {
+                    match answers(&mount.wide) {
+                        Ok(()) => return Ok(mount),
+                        Err(last) if Instant::now() >= deadline => {
+                            // The guard exists, so its drop is what takes the volume down.
+                            drop(mount);
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!(
+                                    "dokan reported the mount live, but the mount point did \
+                                     not answer as the volume within {MOUNT_TIMEOUT:?}; its \
+                                     last answer: {last}"
+                                ),
+                            ));
+                        }
+                        Err(_) => std::thread::sleep(ANSWER_POLL),
                     }
-                    std::thread::sleep(ANSWER_POLL);
                 }
-                Ok(mount)
             }
             // Never mounted, so nothing to take down.
             Ok(Err(err)) => {
@@ -292,21 +297,17 @@ impl DokanMount {
     }
 }
 
-/// Whether the mount point leads to the mounted volume yet.
+/// Whether the mount point leads to the mounted volume yet, and if not, what it answered.
 ///
-/// [`mounted`](FileSystemHandler::mounted) is the driver saying the volume exists, not that
-/// the mount point has come to lead to it, and with several mounts coming up at once in one
-/// process the two are tens of milliseconds apart: a file opened under the mount point in
-/// between fails with `ERROR_INVALID_FUNCTION` or `ERROR_INVALID_PARAMETER`. Measured here,
-/// four mounts made together had three first reads fail and succeed 20-60 ms later; one on
-/// its own read at once.
+/// [`mounted`](FileSystemHandler::mounted) says the volume exists, not that the mount point
+/// leads to it; with several mounts coming up at once the two are tens of milliseconds apart,
+/// and a file opened in between fails with `ERROR_INVALID_FUNCTION` or
+/// `ERROR_INVALID_PARAMETER`.
 ///
-/// Asked of the volume and not of a file under it, because a volume query is answered by
-/// [`get_volume_information`](FileSystemHandler::get_volume_information) and never reaches
-/// the store -- a store across a network is not made to answer a request nobody asked. What
-/// that answers is [`VOLUME_NAME`] and a serial of 0, which no volume of the host answers
-/// both of, and the mount point is a directory on one of those until the mount is through.
-fn answers(mountpoint: &U16CStr) -> bool {
+/// The volume answers [`VOLUME_NAME`] and a serial of 0, which no host volume answers both of.
+/// The query opens the root first, so each poll reaches the store as a `create_file("\")` and
+/// a `stat("/")`. A store whose root `stat` fails never answers, and the error is the reason.
+fn answers(mountpoint: &U16CStr) -> io::Result<()> {
     const BACKSLASH: u16 = b'\\' as u16;
 
     // A mounted folder is named as a root, with its trailing separator.
@@ -332,11 +333,21 @@ fn answers(mountpoint: &U16CStr) -> bool {
             0,
         )
     };
+    if answered == 0 {
+        return Err(io::Error::last_os_error());
+    }
     let len = label
         .iter()
         .position(|&unit| unit == 0)
         .unwrap_or(label.len());
-    answered != 0 && serial == 0 && String::from_utf16_lossy(&label[..len]) == VOLUME_NAME
+    let label = String::from_utf16_lossy(&label[..len]);
+    if serial == 0 && label == VOLUME_NAME {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "a volume labelled {label:?} with serial {serial:#010x}, not this one"
+        )))
+    }
 }
 
 /// Initialise the Dokan library, once per process.
