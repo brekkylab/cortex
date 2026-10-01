@@ -247,7 +247,9 @@ jobs:
           # Already in the manylinux container on Linux: maturin builds where it is, rather
           # than in a container of its own.
           container: ${{ matrix.container && 'off' || '' }}
-          args: --release --out ${{ github.workspace }}/dist/wheels
+          # Relative: in a container job `github.workspace` is the runner's path, not the
+          # container's, and a wheel written there is gone with the container.
+          args: --release --out ../../dist/wheels
           docker-options: -e VIRTX_UVM_PINNED_VERSION
 
       # What the addon and the extension need from the loader to be loaded at all. Neither
