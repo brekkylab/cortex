@@ -7,16 +7,23 @@
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-cflags=$(pkg-config --cflags fuse-t) || {
-    echo "check-abi: FUSE-T's headers are not installed: brew install --cask fuse-t" >&2
-    exit 1
-}
+# FUSE-T's own copy first. Its pkg-config names /usr/local/include/fuse, which is macFUSE's
+# when both are installed -- and checking against macFUSE's headers passes for the wrong
+# library: the two differ, `reserved02` here being `monitor` there.
+ours="/Library/Application Support/fuse-t/include/fuse"
+if [ -f "$ours/fuse_lowlevel.h" ]; then
+    include=$ours
+else
+    include=$(pkg-config --variable=includedir fuse-t) || {
+        echo "check-abi: FUSE-T's headers are not installed: brew install --cask fuse-t" >&2
+        exit 1
+    }
+fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
 # The flag `build.rs` builds the shim with, and FUSE-T's headers insist on.
-# shellcheck disable=SC2086
-cc -Wall -Werror -D_FILE_OFFSET_BITS=64 -DVIRTX_ABI_REAL $cflags -o "$work/real" "$here/abi_check.c"
+cc -Wall -Werror -D_FILE_OFFSET_BITS=64 -DVIRTX_ABI_REAL -I"$include" -o "$work/real" "$here/abi_check.c"
 cc -Wall -Werror -D_FILE_OFFSET_BITS=64 -I"$here" -o "$work/ours" "$here/abi_check.c"
 "$work/real" > "$work/real.txt"
 "$work/ours" > "$work/ours.txt"
@@ -30,8 +37,7 @@ echo "check-abi: $(wc -l < "$work/ours.txt" | tr -d ' ') layouts agree"
 # and each operation it sets, spaced alike and compared as text.
 printf '#define FUSE_USE_VERSION 26\n#include <fuse_lowlevel.h>\n' > "$work/real.c"
 printf '#include "fuse_t.h"\n' > "$work/ours.c"
-# shellcheck disable=SC2086
-cc -E -P -D_FILE_OFFSET_BITS=64 $cflags "$work/real.c" > "$work/real.i"
+cc -E -P -D_FILE_OFFSET_BITS=64 -I"$include" "$work/real.c" > "$work/real.i"
 cc -E -P -D_FILE_OFFSET_BITS=64 -I"$here" "$work/ours.c" > "$work/ours.i"
 python3 - "$work/real.i" "$work/ours.i" "$here/shim.c" <<'EOF'
 import re, sys

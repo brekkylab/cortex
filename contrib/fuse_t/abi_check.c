@@ -37,7 +37,7 @@ static void bytes(const char *what, const void *p, size_t n) {
     X(flush) X(release) X(fsync) X(opendir) X(readdir) X(releasedir) X(fsyncdir)        \
     X(statfs) X(setxattr) X(getxattr) X(listxattr) X(removexattr) X(access) X(create)   \
     X(getlk) X(setlk) X(bmap) X(ioctl) X(poll) X(write_buf) X(retrieve_reply)           \
-    X(forget_multi) X(flock) X(fallocate) X(reserved00) X(reserved01) X(monitor)        \
+    X(forget_multi) X(flock) X(fallocate) X(reserved00) X(reserved01) X(reserved02)        \
     X(renamex) X(setvolname) X(exchange) X(getxtimes) X(setattr_x)
 #define OP_OFFSET(m) OFFSET(struct fuse_lowlevel_ops, m);
 

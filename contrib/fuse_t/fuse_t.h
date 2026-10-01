@@ -130,7 +130,7 @@ struct fuse_lowlevel_ops {
     virtx_fuse_t_unused_op fallocate;
     virtx_fuse_t_unused_op reserved00;
     virtx_fuse_t_unused_op reserved01;
-    virtx_fuse_t_unused_op monitor;
+    virtx_fuse_t_unused_op reserved02; /* macFUSE's `monitor`, in the same slot */
     virtx_fuse_t_unused_op renamex;
     virtx_fuse_t_unused_op setvolname;
     virtx_fuse_t_unused_op exchange;
