@@ -1,17 +1,16 @@
 """One console: boot alpine with `jq` installed, run one command in it, and end.
 
     uv run python examples/hello.py
-
-Needs `virtx-uvm` in the virtx cache `bin` (`$VIRTX_HOME/bin` if set); `ensure_virtx()` fetches it.
 """
 
 import asyncio
 import sys
 
-from virtx import ConsoleClient, Recipe
+from virtx import ConsoleClient, Recipe, ensure_virtx
 
 
 async def main() -> None:
+    await ensure_virtx()
     console = await (
         ConsoleClient.builder()
         .image(Recipe("alpine:latest").step("apk add --no-cache jq"))

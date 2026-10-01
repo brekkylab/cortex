@@ -68,10 +68,11 @@ try {
 ### Rust
 
 ```rust
-use virtx::{console::ConsoleClient, image::Recipe};
+use virtx::{console::ConsoleClient, ensure_virtx, image::Recipe};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    ensure_virtx().await?;
     let mut console = ConsoleClient::builder()
         .image(Recipe::new("alpine:latest").step("apk add --no-cache jq"))
         .build()
