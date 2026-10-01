@@ -1,14 +1,8 @@
-//! The envelope: which of the three shapes an object is, and what puts it on the
-//! wire.
+//! The envelope: what is true of every message regardless of method (`jsonrpc`, `id`,
+//! which of the three shapes the member set makes it) and the serde impls for it.
 //!
-//! What is here is true of every message regardless of method — the `jsonrpc`
-//! member, the `id` that pairs a response with its request, which of the three
-//! shapes the member set makes it — and the serde impls that read and write all of
-//! it.
-//!
-//! What a particular method carries is [`Call`]'s and [`Response`]'s — the request half
-//! and the answering half — and each says what its own members are, so adding a method
-//! means touching the side it belongs to and not the envelope.
+//! Per-method members belong to [`Call`], [`Notification`] and [`Response`], which each
+//! write their own `params`/`result`, so adding a method does not touch the envelope.
 
 use std::fmt;
 
@@ -28,40 +22,29 @@ pub const VERSION: &str = "2.0";
 
 /// Pairs a response with the request it answers.
 ///
-/// Allocated by the client, which is the only end that asks, and counted from zero
-/// by one. Nothing on the answering side reads a meaning into the number.
+/// Allocated by the client, counting up from zero; the server attaches no meaning to it.
+/// With one request outstanding, the id buys certainty rather than concurrency: an
+/// answer carrying an unissued id is from a peer that lost its place, and is dropped.
 ///
-/// There is a single request outstanding at a time, so what the id earns is not
-/// concurrency but certainty about what an answer answers: one carrying a number
-/// nobody issued is a peer that has lost its place, and can be dropped rather than
-/// mistaken for the answer that was due.
-///
-/// JSON-RPC also allows a string or null id. This protocol issues numbers, which
-/// is what an off-the-shelf peer will happily accept; nothing reads any other
-/// meaning into the value.
+/// JSON-RPC also allows string or null ids; this protocol issues only numbers.
 pub type RequestId = u64;
 
-/// Refuses a frame length that could only be corruption or malice, rather than
-/// allocating it and finding out.
+/// Largest frame accepted; anything longer is treated as corruption or malice instead
+/// of being allocated.
 ///
-/// Here rather than in the framing code because it is part of the contract: both
-/// ends have to agree on it, or one will accept what the other would not send.
-///
-/// Since a response carries a whole execution's output, this is also the ceiling
-/// on how much a command may write — see [`truncated`](super::ExecResp::truncated).
+/// Part of the contract, not just framing: both ends must agree on it. It also caps a
+/// command's output — see [`truncated`](super::ExecResp::truncated).
 pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 
 /// One JSON-RPC object.
 ///
-/// The three shapes the spec defines, told apart the way the spec tells them
-/// apart: by which members are present. `method` with an `id` is a request,
-/// `method` without one is a notification, and `result` or `error` is a response.
+/// Told apart by which members are present: `method` with an `id` is a request,
+/// `method` without one a notification, and `result` or `error` a response.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     /// `{"jsonrpc":"2.0","id":N,"method":..,"params":..}`
     ///
-    /// Exactly one [`Response`](Message::Response) with the same `id` will answer
-    /// it.
+    /// Exactly one [`Response`](Message::Response) with the same `id` answers it.
     Request { id: RequestId, call: Call },
 
     /// `{"jsonrpc":"2.0","method":..}` — no `id`, because nothing answers it.
@@ -69,18 +52,12 @@ pub enum Message {
 
     /// `{"jsonrpc":"2.0","id":N,"method":..,"result":..}` or `{..,"error":..}`
     ///
-    /// `result` xor `error`, and both are [`Response`] — a response either is the answer
-    /// or is the reason there is none, which is one question with one type. Nothing here
-    /// wraps it in a second one to say which of the two it turned out to be.
-    ///
-    /// The `result` side is typed, which is what the echoed `method` is for; see
-    /// [`Response`].
+    /// Both shapes are one [`Response`].
     Response { id: RequestId, result: Response },
 }
 
 impl Message {
-    /// The request this message is, or answers. `None` for a notification, which
-    /// is neither.
+    /// The request this message is, or answers. `None` for a notification.
     pub fn id(&self) -> Option<RequestId> {
         match self {
             Message::Request { id, .. } | Message::Response { id, .. } => Some(*id),
@@ -88,9 +65,8 @@ impl Message {
         }
     }
 
-    /// Which method this message concerns. `None` for a response, whose method is
-    /// carried by the request its `id` came from and not on the wire — that is
-    /// JSON-RPC's rule, and the reason an end has to remember what it asked.
+    /// Which method this message concerns. `None` for a response; see
+    /// [`Response::method`] for that.
     pub fn method(&self) -> Option<Method> {
         match self {
             Message::Request { call, .. } => Some(call.method()),
@@ -100,28 +76,20 @@ impl Message {
     }
 }
 
-// A JSON-RPC object is not any one serde shape: the member set decides what it is,
-// `params` and `result` are typed by the method rather than by position, and a
-// notification is a request with a member missing. Deriving would mean choosing a
-// tagging scheme the spec does not use, so the mapping is written out instead —
-// which is also where `jsonrpc` gets checked, rather than being someone's job later.
+// Hand-written because the member set decides the shape, `params`/`result` are typed
+// by the method, and a notification is a request missing `id`: no serde tagging scheme
+// fits. It is also where `jsonrpc` is checked.
 //
-// What a method carries is not decided here: a `Call` declares its own `params`, a
-// `Notification` writes its own, and a `Response` says which of `result` and `error` it
-// is. This half only knows which of the three shapes it is looking at, and — for a
-// request or a response — hands that half an object already open so that its members
-// land in this one. See [`flatten`](super::utils::flatten).
+// Per-method members are written by `Call`, `Notification` and `Response` into the map
+// opened here, so they land flat in this object. See [`flatten`](super::utils::flatten).
 impl Serialize for Message {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        // 4 is the largest a JSON-RPC object gets: jsonrpc, id, method, params.
         let mut map = s.serialize_map(None)?;
         map.serialize_entry("jsonrpc", VERSION)?;
 
         match self {
             Message::Request { id, call } => {
                 map.serialize_entry("id", id)?;
-                // `method` and `params` are the call's own, and it writes them here
-                // rather than under a member of its own — see [`flatten`](super::utils::flatten).
                 call.serialize(FlatMapSerializer(&mut map))?;
             }
 
@@ -132,10 +100,6 @@ impl Serialize for Message {
 
             Message::Response { id, result } => {
                 map.serialize_entry("id", id)?;
-                // Which members those are — `method` and `result`, or `error` — is the
-                // response's own business, the way a call's are, and they land here
-                // rather than under a member of their own for the same reason — see
-                // [`flatten`](super::utils::flatten).
                 result.serialize(FlatMapSerializer(&mut map))?;
             }
         }
@@ -163,9 +127,8 @@ impl<'de> Visitor<'de> for MessageVisitor {
         let mut jsonrpc: Option<String> = None;
         let mut id: Option<RequestId> = None;
         let mut method: Option<String> = None;
-        // `params`, `result` and `error` are held as values because member order is
-        // not guaranteed: `method` may arrive after the `params` it types, and which
-        // shape a message is cannot be known until every member has been seen.
+        // Held as values: member order is not guaranteed, so `method` may follow the
+        // `params` it types, and the shape is known only after every member is seen.
         let mut params: Option<Bson> = None;
         let mut result: Option<Bson> = None;
         let mut error: Option<Bson> = None;
@@ -173,16 +136,14 @@ impl<'de> Visitor<'de> for MessageVisitor {
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "jsonrpc" => jsonrpc = Some(map.next_value()?),
-                // A null id is legal JSON-RPC and is what an error response uses
-                // when the request could not be read at all. Nothing here can
-                // answer one, so it is taken and left as absent.
+                // A null id (legal, used when a request was unreadable) cannot be
+                // answered, so it is treated as absent.
                 "id" => id = map.next_value::<Option<RequestId>>()?,
                 "method" => method = Some(map.next_value()?),
                 "params" => params = Some(map.next_value()?),
                 "result" => result = Some(map.next_value()?),
                 "error" => error = Some(map.next_value()?),
-                // Unknown members are ignored rather than refused: that is what
-                // lets a peer add one without breaking us.
+                // Ignored, not refused, so a peer can add members without breaking us.
                 _ => {
                     map.next_value::<de::IgnoredAny>()?;
                 }
@@ -207,9 +168,8 @@ impl<'de> Visitor<'de> for MessageVisitor {
             None => None,
         };
 
-        // Which of the three shapes this is, is decided by the members that carry a
-        // *payload* and not by `method`: a request and a response both name one now, and
-        // what tells them apart is `params` against `result` xor `error`.
+        // Shape is decided by the payload members, not `method`: requests and responses
+        // both name a method, so `params` vs `result`/`error` is what tells them apart.
         if result.is_some() || error.is_some() {
             if params.is_some() {
                 return Err(de::Error::custom(
@@ -218,15 +178,12 @@ impl<'de> Visitor<'de> for MessageVisitor {
                 ));
             }
             let id = id.ok_or_else(|| de::Error::custom("a response needs an id"))?;
-            // Which of `result` and `error` is there, and whether the one that is can be
-            // read, is the response's own business — the way a call's `params` is a
-            // call's. The three members go back to it as they arrived.
+            // Validating `result` xor `error` and typing it is the response's job.
             let result = Response::from_members(method, result, error)?;
             return Ok(Message::Response { id, result });
         }
 
-        // No result and no error, so a request or a notification — and an `id` is what
-        // says which. `params` is typed by the method, which is why it waited.
+        // A request or a notification; the `id` says which.
         let Some(method) = method else {
             return Err(de::Error::custom(
                 "a message has no method, result or error",
@@ -259,11 +216,10 @@ mod tests {
         *,
     };
 
-    /// What a peer would have sent, and what it reads back as.
+    /// What a peer would have sent.
     ///
-    /// Ids and error codes are `i64` on the wire because they are `u64` and `i64` in
-    /// Rust and BSON has no unsigned type — so a `doc!` comparing against one writes
-    /// `2i64`, not `2`, which would be an `Int32` and not equal.
+    /// Ids and codes are `Int64` on the wire (BSON has no unsigned type), so a `doc!`
+    /// compared against one writes `2i64`; a bare `2` is an `Int32` and not equal.
     fn wire(message: &Message) -> Document {
         bson::serialize_to_document(message).unwrap()
     }
@@ -274,20 +230,13 @@ mod tests {
 
     fn exec() -> ExecCall {
         ExecCall {
-            // A multi-line `sh -c` script is one argument, and argv's last element
-            // can be empty — both are ordinary argv.
+            // A multi-line script and an empty last element are both ordinary argv.
             cmd: vec!["sh".into(), "-c".into(), "echo a\necho b".into(), "".into()],
             timeout_ms: Some(1_000),
         }
     }
 
-    /// A whole session on one channel, in order: announce it, boot it, run something,
-    /// release it, exit.
-    ///
-    /// Every request is the client's and every response the server's throughout, and the
-    /// three notifications go unanswered because nothing answers one. That is the shape
-    /// worth reading: an execution is one request and one response, however long the
-    /// command took.
+    /// A whole session on one channel, in order: describe, boot, run, release, exit.
     fn session() -> Vec<Message> {
         vec![
             Message::Request {
@@ -305,8 +254,7 @@ mod tests {
                 id: 0,
                 result: Response::Init(InitResp::default()),
             },
-            // Optional, and nothing answers it: booting early rather than inside the
-            // execution below.
+            // Optional and unanswered: boots before the exec rather than inside it.
             Message::Notification(Notification::Start),
             Message::Request {
                 id: 1,
@@ -326,12 +274,12 @@ mod tests {
         ]
     }
 
-    /// Everything a session above does not happen to contain.
+    /// Other messages the session above does not happen to contain.
     fn all() -> Vec<Message> {
         session()
             .into_iter()
             .chain([
-                // A session that describes nothing, and waits forever, is a session too.
+                // An empty description is still a valid session.
                 Message::Request {
                     id: 6,
                     call: Call::Init(InitCall::default()),
@@ -340,8 +288,7 @@ mod tests {
                     id: 6,
                     result: Response::Init(InitResp::default()),
                 },
-                // Booting is nothing's own request, so a backend that cannot come up
-                // says so to whatever asked for the thing that needed one.
+                // A failed boot is reported to the call that needed it.
                 Message::Response {
                     id: 1,
                     result: Response::Error(Error::new(Error::BOOT_FAILED, "no kvm")),
@@ -350,8 +297,7 @@ mod tests {
                     id: 1,
                     result: Response::Error(Error::new(Error::TIMED_OUT, "killed after 1000ms")),
                 },
-                // The file plane. A read bounded on both ends, whose answer is shorter
-                // than the file it came from.
+                // A read bounded on both ends, whose answer is shorter than the file.
                 Message::Request {
                     id: 7,
                     call: Call::Read(ReadCall {
@@ -371,7 +317,7 @@ mod tests {
                     id: 7,
                     result: Response::Error(Error::new(Error::NOT_FOUND, "out/log.txt")),
                 },
-                // And a whole-file write, which is the offset being absent.
+                // A whole-file write: no offset.
                 Message::Request {
                     id: 8,
                     call: Call::Write(WriteCall {
@@ -384,7 +330,7 @@ mod tests {
                     id: 8,
                     result: Response::Write(WriteResp { size: 4 }),
                 },
-                // Asked before anything else, and needing no session either.
+                // Needs no session.
                 Message::Request {
                     id: 12,
                     call: Call::Version(super::super::VersionCall {}),
@@ -445,9 +391,7 @@ mod tests {
         }
     }
 
-    /// The whole reason for the manual impls: these are the members the spec calls
-    /// for, member for member. BSON changes how they are spelled in bytes, not which
-    /// of them are there.
+    /// Exactly the members the spec calls for; BSON changes only their byte spelling.
     #[test]
     fn the_wire_is_json_rpc_2_0() {
         assert_eq!(
@@ -473,9 +417,7 @@ mod tests {
             },
         );
 
-        // An execution's ending is an ordinary `result`: the members of the ending itself,
-        // with nothing wrapping them — beside the `method` that says which method's answer
-        // they are, which is the whole of what a response carries that the spec's does not.
+        // An unwrapped `result`, plus the echoed `method`: the only non-spec member.
         assert_eq!(
             wire(&Message::Response {
                 id: 2,
@@ -503,8 +445,7 @@ mod tests {
             },
         );
 
-        // The file plane spells its bytes as `Binary` like everything else, and the
-        // bounds it was given as plain members.
+        // File bytes are `Binary`; bounds are plain members.
         assert_eq!(
             wire(&Message::Request {
                 id: 5,
@@ -544,9 +485,8 @@ mod tests {
             },
         );
 
-        // A notification has no id, and none of them takes parameters — so no `params`
-        // either, which the spec allows leaving out and where `null` is not one of the
-        // two types it permits.
+        // No id and no `params`: the spec allows omitting it, and `null` is not a
+        // permitted type.
         assert_eq!(
             wire(&Message::Notification(Notification::Start)),
             doc! {"jsonrpc": "2.0", "method": "start"},
@@ -560,7 +500,6 @@ mod tests {
             doc! {"jsonrpc": "2.0", "method": "quit"},
         );
 
-        // And the session's one call, which is a request like any other.
         assert_eq!(
             wire(&Message::Request {
                 id: 0,
@@ -582,14 +521,12 @@ mod tests {
         );
     }
 
-    /// Output travels as bytes and not as text — the whole reason the codec is BSON.
+    /// Output travels as bytes, not base64.
     ///
-    /// Asserted on the frame itself, because a round trip cannot tell the difference:
-    /// base64 out and base64 back is symmetric. What proves it is that the payload's
-    /// own bytes are *in* the frame, and its base64 spelling is not.
+    /// Checked on the raw frame, since a base64 round trip would be symmetric.
     #[test]
     fn output_travels_as_bytes_not_text() {
-        // Not utf-8, and the byte a text framing would have had to escape.
+        // Not UTF-8, and includes a byte a text framing would escape.
         let payload = vec![0xff, 0xfe, 0x00, b'\n', 0x00];
         let message = Message::Response {
             id: 1,
@@ -613,9 +550,8 @@ mod tests {
         assert_eq!(read(wire(&message)).unwrap(), message);
     }
 
-    /// Member order is the sender's business, not ours — `params` may arrive
-    /// before the `method` that types it. A BSON document keeps the order it was
-    /// built in, so this really is out of order on the wire.
+    /// `params` may arrive before the `method` that types it. A BSON document keeps
+    /// build order, so this is really out of order on the wire.
     #[test]
     fn members_may_arrive_in_any_order() {
         let doc = doc! {
@@ -634,8 +570,7 @@ mod tests {
         assert_eq!(exec.cmd, vec!["ls".to_string()]);
     }
 
-    /// Nothing a peer could send that is not one of the three shapes gets through
-    /// as one of them.
+    /// Anything that is not one of the three shapes is rejected.
     #[test]
     fn malformed_objects_are_refused() {
         let refused = |doc: Document, because: &str| {
@@ -656,15 +591,14 @@ mod tests {
         );
         // A request without an id has no way to be answered.
         refused(doc! {"jsonrpc": "2.0", "method": "exec"}, "needs an id");
-        // And a notification cannot be answered, so it cannot ask to be — which is the
-        // whole of what the `id` decides, for every one of the three.
+        // A notification's method cannot carry an id.
         for name in ["start", "stop", "quit"] {
             refused(
                 doc! {"jsonrpc": "2.0", "id": 1i64, "method": name},
                 "cannot carry an id",
             );
         }
-        // `result` xor `error`, and one of them.
+        // Exactly one of `result` and `error`.
         refused(
             doc! {
                 "jsonrpc": "2.0",
@@ -678,8 +612,7 @@ mod tests {
             doc! {"jsonrpc": "2.0", "id": 1i64},
             "no method, result or error",
         );
-        // A response names the method it answers, so `params` beside a `result` is a
-        // message trying to be both.
+        // `params` beside a `result` is trying to be both a request and a response.
         refused(
             doc! {
                 "jsonrpc": "2.0",
@@ -690,7 +623,7 @@ mod tests {
             },
             "neither a request nor a response",
         );
-        // A result with nothing to type it is one nothing can read.
+        // A result without a method cannot be typed.
         refused(
             doc! {"jsonrpc": "2.0", "id": 1i64, "result": {"code": 0i32}},
             "needs the method it answers",
@@ -700,7 +633,7 @@ mod tests {
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "result": Bson::Null},
             "exec result",
         );
-        // And a method nothing answers cannot be answered.
+        // A notification method cannot be answered.
         refused(
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "quit", "result": Bson::Null},
             "is not answered",
@@ -710,8 +643,7 @@ mod tests {
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "params": {"cmd": "ls"}},
             "exec params",
         );
-        // An `exec`'s `cmd` is an argv and nothing else, so an object there is params
-        // that are not what the method takes rather than a second shape to try.
+        // An object as `cmd` is invalid params, not an alternative shape.
         refused(
             doc! {"jsonrpc": "2.0", "id": 1i64, "method": "exec", "params": {"cmd": {}}},
             "exec params",
@@ -732,8 +664,7 @@ mod tests {
         );
     }
 
-    /// Every request in a session is answered exactly once, and only a
-    /// notification goes unanswered.
+    /// Every request is answered exactly once; only notifications go unanswered.
     #[test]
     fn a_session_pairs_every_request_with_one_response() {
         let mut outstanding: Vec<(RequestId, Method)> = Vec::new();

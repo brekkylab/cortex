@@ -1,46 +1,6 @@
-//! The public end: a console server to run commands in, and the one channel it takes.
+//! The public end: a console server to run commands in, over one channel.
 //!
-//! # One channel, one direction of asking
-//!
-//! A console is one conversation, and only one end of it ever asks. This end sends a
-//! request and the server answers it; there is no request the server issues, so this end
-//! has no pending table, no listener, and no task waiting on something it also has to
-//! read.
-//!
-//! What that leaves is a [`ConsoleClient`] whose methods are round trips: one call out, one
-//! answer back, and the answer is to the call that was just made. [`exec`](ConsoleClient::exec)
-//! is the largest of them and is still exactly that.
-//!
-//! # Waiting is the point, and a console does none of it in a thread
-//!
-//! Everything here is something to `await`: a command runs for as long as it runs, and a
-//! backend with a kernel to bring up spends a cold start before the first one does. A
-//! caller with several consoles wants all of them going at once, which is what an async
-//! API gives for the price of a task each — where a thread each would have been a thread
-//! parked on a pipe.
-//!
-//! What is *not* concurrent is one console. Its methods take `&mut self`, because the
-//! protocol is one outstanding request at a time — see [`Client`] for why an exclusive
-//! borrow is the honest way to say that.
-//!
-//! # Ending one
-//!
-//! Dropping it, and nothing else. A server exists for as long as a client does, so the
-//! `quit` that lets it exit gracefully is owed exactly once and at exactly one moment —
-//! when the console goes away. That is a lifetime, not a decision, so it is a
-//! [`Drop`](ConsoleClient#impl-Drop-for-ConsoleClient) and not a method somebody has to remember.
-//!
-//! [`start`](ConsoleClient::start) and [`stop`](ConsoleClient::stop) are neither an ending nor
-//! something to remember. They are **how a caller manages what the far end is holding**,
-//! and that is the whole of what they do: a `stop` hands back the guest, the socket and
-//! the scratch directory a booted session occupies while nothing is running, and a
-//! `start` pays the cold start early so the first command does not pay it in its own
-//! latency. Nothing is unlocked by either — the next command boots what it needs — so a
-//! console that sends neither works, and one that sends both is one that knows when it
-//! will be busy and when it will be idle.
-//!
-//! Neither is awaited for an answer, because there is nothing a caller would do
-//! differently if one failed.
+//! [`ConsoleClientBuilder`] describes the session; [`ConsoleClient`] runs commands in it.
 
 use std::{
     ffi::{OsStr, OsString},
@@ -61,51 +21,42 @@ use crate::{
     },
 };
 
-/// Whatever it takes to have a channel, deferred until there is a console to hold one.
+/// Whatever it takes to have a channel, deferred until [`build`](ConsoleClientBuilder::build).
 ///
-/// [`Send`], because [`build`](ConsoleClientBuilder::build) awaits the `init` it sends and so
-/// holds this across an await — which is what makes a builder something a task can be
-/// spawned around, like everything else here. It costs nothing: a [`Client`] is already
-/// `Send`, and so is what either setter captures.
+/// [`Send`] so a builder can be built inside a spawned task.
 pub(crate) type ClientFactory = Box<dyn FnOnce() -> anyhow::Result<Box<dyn Client>> + Send>;
 
 /// Assembles a [`ConsoleClient`] from the parts it needs.
 ///
-/// A builder rather than arguments because a console is going to acquire more of them —
-/// limits, a backend of its own choosing — and each should be something a caller can leave
-/// out, as [`mount`](Self::mount) already is.
+/// Every part is optional. Nothing starts until [`build`](Self::build).
 ///
-/// Nothing here starts anything. The channel is described, not driven, until something
-/// is asked over it.
+/// The machine's shape ([`vcpus`](Self::vcpus), [`memory_mib`](Self::memory_mib),
+/// [`gpu`](Self::gpu), [`gpu_memory_mib`](Self::gpu_memory_mib), [`disk_gib`](Self::disk_gib))
+/// is given exactly or refused: one the server cannot give fails [`build`](Self::build) with
+/// [`UNSUPPORTED_MACHINE`](crate::protocol::Error::UNSUPPORTED_MACHINE), never a smaller
+/// machine or the CPU. Left out, the server picks.
 pub struct ConsoleClientBuilder {
-    /// Not a client but the making of one, because some clients are a process away:
-    /// [`cmd`](Self::cmd) is handed a program and not a channel, and starting a program
-    /// can fail. Deferring that to [`build`](Self::build) keeps every setter infallible and
-    /// leaves one place where a console either exists or says what it lacked.
+    /// A factory, not a client, because starting a program can fail; deferring that to
+    /// [`build`](Self::build) keeps every setter infallible.
     ///
-    /// Starts as `cortex-krun` under the stdio server directory, as an
-    /// [`ImageClient`](crate::image::ImageClient) does.
+    /// Defaults to `cortex-krun` under the cache's `bin` directory.
     client_factory: ClientFactory,
 
-    /// The image a session's commands run in, and `None` to leave it to the server: a
-    /// backend that runs commands on the host it is already on has nothing to boot, and one
-    /// that boots a machine says so rather than guessing a base on the caller's behalf.
+    /// `None` leaves it to the server: a host backend needs none, and a VM backend refuses
+    /// rather than guess a base.
     image: Option<ImageSource>,
 
-    /// What a previous session wrote, for a console that does not start from scratch, and
-    /// `None` for one that does. Currently an ext4 blob.
+    /// What a previous session wrote; `None` starts from scratch.
     snapshot: Option<Vec<u8>>,
 
-    /// Every tree this console gives the session, in the order they will be mounted.
-    ///
-    /// Empty is a console with nothing mounted: such a session's commands see whatever the
-    /// server's own filesystem holds, and this protocol has described none of it.
+    /// Every tree this console gives the session, in mount order. Empty means commands see
+    /// only the server's own filesystem.
     mounts: Vec<Mounted>,
 
-    /// Defaults to true(network enabled).
+    /// On unless turned off.
     network: bool,
 
-    /// The ports on the server's machine that lead into the session, in the order named.
+    /// Ports on the server's machine that lead into the session, in the order named.
     ports: Vec<Port>,
 
     vcpus: Option<u8>,
@@ -144,10 +95,9 @@ impl ConsoleClientBuilder {
 
     /// Drive the server over `client`.
     ///
-    /// Anything that asks will do — a [`StdioClient`](crate::console::stdio::StdioClient)
-    /// over a server it started, a virtio port into a guest, both ends in one process for
-    /// a test. Whatever it took to have a channel is the client's, including a process if
-    /// that is what it runs over, so there is nothing else here about where a server is.
+    /// Any [`Client`]: a [`StdioClient`] over a server it
+    /// started, a virtio port into a guest, or both ends in one process for a test. The
+    /// client owns whatever the channel needs, including a process.
     pub fn client(mut self, client: impl Client + 'static) -> Self {
         self.client_factory = Box::new(move || Ok(Box::new(client)));
         self
@@ -155,15 +105,12 @@ impl ConsoleClientBuilder {
 
     /// Drive a server this console starts itself: `cmd`, over its own pipes.
     ///
-    /// `cmd` is a program and its arguments — `["cortex-local-console"]`,
-    /// `["sh", "-c", "…"]` — and that is the whole of what this shape of caller decides,
-    /// since the two descriptors the protocol runs on are the client's. A caller who
-    /// wants more of the command than that — an environment, a directory — builds the [`Command`] itself and hands it to
-    /// [`StdioClient::new`], then the client to [`client`](Self::client).
+    /// `cmd` is a program and its arguments: `["cortex-local-console"]`,
+    /// `["sh", "-c", "…"]`. For an environment or directory, build the [`Command`], pass it
+    /// to [`StdioClient::new`], and hand the result to [`client`](Self::client).
     ///
-    /// Starting it is [`build`](Self::build)'s, not this method's — nothing here starts
-    /// anything, and a program that cannot be started, like a `cmd` with no program in
-    /// it, is one of the ways building a console fails.
+    /// Started by [`build`](Self::build), which fails if it cannot be (including an empty
+    /// `cmd`).
     pub fn cmd(mut self, cmd: &[impl AsRef<OsStr>]) -> Self {
         self.client_factory = stdio_factory(cmd);
         self
@@ -171,35 +118,17 @@ impl ConsoleClientBuilder {
 
     /// Give the session a tree, mounted at `at`.
     ///
-    /// `at` is where the tree appears to the session's commands, and it is this end's to
-    /// choose: [`build`](Self::build) names it in the `init`, so every path the console will
-    /// send is known before the session exists. A [`read`](ConsoleClient::read) names a file under
-    /// it, so does a [`write`](ConsoleClient::write), and so does the command that opens the same
-    /// file by the same name. It has to be absolute — a relative one would be relative to a
-    /// working directory nobody named — and a console whose mount point cannot be spelled as
-    /// a URL does not build.
+    /// `at` is where commands see the tree, and the path [`read`](ConsoleClient::read) and
+    /// [`write`](ConsoleClient::write) join onto. It must be absolute, and the mount point must
+    /// be expressible as a URL (see [`Mount::url`]), or [`build`](Self::build) fails.
     ///
-    /// Mounting *this* end is the caller's, not the console's. Which binding puts a tree in
-    /// front of a kernel is a build's business, and what the server is told about it is the
-    /// URL and the path — see [`Mount::url`].
+    /// The mount is held by value so the tree stays up for the whole session (see
+    /// [`Mount`]); pass an `Arc<..>` to share it. A plain [`PathBuf`] is a [`Mount`] for an
+    /// existing host directory, with nothing to put up or take down.
     ///
-    /// Takes the mount by value, so a console holds it and the tree is there for at least as
-    /// long as the session is (see [`Mount`]). A caller that needs it elsewhere as well hands
-    /// over an `Arc<..>` of it, which is a [`Mount`] too: how long a mount is held is the
-    /// lifetime of the value, and whose lifetime that is, is the caller's to decide rather
-    /// than something this end arranges behind it.
+    /// **Order is kept**: mount a nested tree after the tree containing it.
     ///
-    /// A plain [`PathBuf`] is a [`Mount`], which is what a caller hands over for a directory
-    /// the host already has: there is nothing to put up for one, and nothing this end takes
-    /// down at the end of the session.
-    ///
-    /// **Called as many times as there are trees, and the order is kept.** A session that is
-    /// given somebody's project and somewhere to leave its result names two, and a tree meant
-    /// to sit inside another is named after it. What each tree is *for* is the caller's own
-    /// and is nowhere in the protocol — what a tree is at a path, and whether a write may
-    /// land in it, is the whole of what both ends agree on.
-    ///
-    /// Writable. [`mount_readonly`](Self::mount_readonly) is the other half of that choice.
+    /// Writable; see [`mount_readonly`](Self::mount_readonly).
     pub fn mount(mut self, mount: impl Mount + 'static, at: impl Into<PathBuf>) -> Self {
         self.mounts.push(Mounted {
             mount: Box::new(mount),
@@ -211,14 +140,8 @@ impl ConsoleClientBuilder {
 
     /// Give the session a tree it may read and not write, at `at`.
     ///
-    /// [`mount`](Self::mount) on every other count. **What it buys is getting the tree back
-    /// unchanged rather than a promise that nothing touched it:** a [`write`](ConsoleClient::write)
-    /// naming a path under it is refused, and a server with a kernel of its own mounts it
-    /// read-only so that a command cannot write there either.
-    ///
-    /// Which is what to hand somebody's project over as — and what makes a second, writable
-    /// tree worth naming beside it, since a session that writes its output into the tree it
-    /// was given leaves the caller to work out which files are new.
+    /// Otherwise as [`mount`](Self::mount). A [`write`](ConsoleClient::write) under it is
+    /// refused, and a VM backend mounts it read-only so commands cannot write there either.
     pub fn mount_readonly(mut self, mount: impl Mount + 'static, at: impl Into<PathBuf>) -> Self {
         self.mounts.push(Mounted {
             mount: Box::new(mount),
@@ -254,7 +177,7 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// Whether the session's commands reach a network at all.
+    /// Whether the session's commands reach a network at all; on unless turned off.
     ///
     /// ```no_run
     /// # use cortex::console::ConsoleClient;
@@ -263,21 +186,17 @@ impl ConsoleClientBuilder {
     /// # Ok(()) }
     /// ```
     ///
-    /// **A server gives what is named here or refuses to open the session**, which is what
-    /// makes this worth saying rather than checking afterwards. A network the far end cannot
-    /// take away arrives as [`UNSUPPORTED_NETWORK`](crate::console::Error::UNSUPPORTED_NETWORK)
-    /// from [`build`](Self::build) — a server whose commands run on this host refuses `false`.
-    ///
-    /// On is what the server's machine reaches, less its own loopback — see
-    /// [`InitCall::network`](crate::console::InitCall::network). Leaving it out leaves it
-    /// on.
+    /// **The server gives exactly this or refuses:** [`build`](Self::build) fails with
+    /// [`UNSUPPORTED_NETWORK`](crate::protocol::Error::UNSUPPORTED_NETWORK). A host backend
+    /// cannot take the network away, so it refuses `false`. What "on" reaches is on
+    /// [`InitCall::network`](crate::protocol::InitCall::network).
     pub fn network(mut self, network: bool) -> Self {
         self.network = network;
         self
     }
 
-    /// Ports on the server's machine that lead into the session, spelled the way docker's
-    /// `-p` spells them — `"8080:80"`, host first. Replaces what an earlier call said.
+    /// Ports on the server's machine that lead into the session, as docker's `-p` spells
+    /// them (`"8080:80"`, host first). Replaces what an earlier call said.
     ///
     /// ```no_run
     /// # use cortex::console::ConsoleClient;
@@ -291,19 +210,14 @@ impl ConsoleClientBuilder {
     /// # Ok(()) }
     /// ```
     ///
-    /// Needs a network: a session with [`network`](Self::network) off that names a port is
-    /// refused. See [`Port`] for what a connection to one reaches.
+    /// Ports with [`network`](Self::network) off are refused. See [`Port`] for what a
+    /// connection to one reaches.
     pub fn ports(mut self, ports: impl IntoIterator<Item = Port>) -> Self {
         self.ports = ports.into_iter().collect();
         self
     }
 
     /// How many vCPUs the session's machine gets.
-    ///
-    /// Left out, the server picks — see [`InitCall::vcpus`](crate::console::InitCall::vcpus)
-    /// for why that is the usual case. A count this server cannot give arrives as
-    /// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE) from
-    /// [`build`](Self::build) rather than as a smaller machine.
     pub fn vcpus(mut self, vcpus: u8) -> Self {
         self.vcpus = Some(vcpus);
         self
@@ -326,21 +240,12 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// Whether the session's commands get a GPU.
+    /// Whether the session's commands get a GPU; `false` forbids one.
     ///
-    /// **A server gives one or refuses to open the session**, so a console that exists is one
-    /// whose commands have the accelerator that was asked for — the alternative is a session
-    /// that silently ran on the CPU and took an hour to say so. A backend with none to give
-    /// answers [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE).
-    ///
-    /// `false` is a session that must not have one, and leaving it out is the server's own
-    /// choice — the two are different, and only the second is what a caller with no opinion
-    /// wants.
-    ///
-    /// **The image has to bring the guest's half of Vulkan**: a loader (`libvulkan.so.1`) and
-    /// the venus driver that reaches the host's GPU. The server attaches the device; it cannot
-    /// install a program's libraries. Without the loader nothing in the guest finds a device,
-    /// and without venus Vulkan falls back to a software renderer on the CPU.
+    /// **The image must bring the guest's half of Vulkan**: a loader (`libvulkan.so.1`) and
+    /// the venus driver that reaches the host's GPU. The server attaches the device but cannot
+    /// install libraries; without the loader nothing finds a device, and without venus Vulkan
+    /// falls back to a CPU renderer.
     ///
     /// | | Alpine | Debian |
     /// |---|---|---|
@@ -365,15 +270,11 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// How much memory the session's GPU may hold, in mebibytes, beside the machine's
+    /// How much memory the session's GPU may hold, in MiB, in addition to
     /// [`memory_mib`](Self::memory_mib).
     ///
-    /// The commands see an accelerator of this size, so a program that sizes itself to the
-    /// device it finds fits in what it was given. Only for a session with a GPU -- see
-    /// [`InitCall::gpu_memory_mib`](crate::console::InitCall::gpu_memory_mib); a size this
-    /// server cannot give arrives as
-    /// [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE) from
-    /// [`build`](Self::build).
+    /// Commands see a device of this size. Only valid with a GPU (see
+    /// [`InitCall::gpu_memory_mib`](crate::console::InitCall::gpu_memory_mib)).
     ///
     /// ```no_run
     /// # use cortex::{console::ConsoleClient, image::Recipe};
@@ -394,13 +295,10 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// How much the session's commands may write, in gibibytes, on top of what the image
-    /// ships.
+    /// How much the session's commands may write, in GiB, on top of what the image ships.
     ///
-    /// A ceiling and not an allocation -- see
-    /// [`InitCall::disk_gib`](crate::console::InitCall::disk_gib); a size this server cannot
-    /// give arrives as [`UNSUPPORTED_MACHINE`](crate::console::Error::UNSUPPORTED_MACHINE)
-    /// from [`build`](Self::build).
+    /// A ceiling, not an allocation (see
+    /// [`InitCall::disk_gib`](crate::console::InitCall::disk_gib)).
     ///
     /// ```no_run
     /// # use cortex::console::ConsoleClient;
@@ -416,97 +314,59 @@ impl ConsoleClientBuilder {
         self
     }
 
-    /// Fails for whatever having a channel took (over stdio, a server process that would not
-    /// start), and for the `init` this then sends.
+    /// Opens the channel (starting the server process over stdio) and sends `init`.
     ///
-    /// A runtime has to be under it: a console over a program — the default one, or one
-    /// given to [`cmd`](Self::cmd) — starts a process, and a process is registered with the
-    /// runtime that will reap it.
-    /// Building one from outside a task or `main` is a panic, not an `Err` — the missing
-    /// runtime is the caller's own shape and not something the channel could report.
+    /// Panics outside a Tokio runtime when it starts a process (the default, or
+    /// [`cmd`](Self::cmd)), since the runtime reaps the child.
     ///
-    /// Usually one message. The exception is [`image`](Self::image), which this may have to
-    /// build before there is a session to be had — see there for what that costs.
+    /// The server may have to build an [`image`](Self::image) before answering `init`.
     pub async fn build(self) -> anyhow::Result<ConsoleClient> {
         ConsoleClient::new(self).await
     }
 }
 
+/// One of a session's trees: the mount this end holds, and where the session sees it.
+struct Tree {
+    /// Never read: holding it keeps the tree up for the session's lifetime (see [`Mount`]).
+    #[allow(dead_code)]
+    mount: Box<dyn Mount>,
+
+    /// Where the session sees it, as `init` named it; not necessarily the host mount point.
+    path: PathBuf,
+}
+
 /// A console: something to run commands in.
 ///
-/// An [`exec`](Self::exec) per command, and dropping it to end the session. That is the
-/// whole of what a caller has to do: what the session *is* was said when the console was
-/// built, booting happens under the first command that needs it, and whatever it took
-/// goes away with the console.
+/// An [`exec`](Self::exec) per command, and drop it to end the session. The session was
+/// described at build, booting happens under the first command that needs it, and
+/// everything goes away with the console. [`start`](Self::start) and [`stop`](Self::stop)
+/// are optional resource management.
 ///
-/// [`start`](Self::start) and [`stop`](Self::stop) are how a caller manages what the far
-/// end is holding — pay the cold start early, hand the resources back while idle — and
-/// neither is required: a console that sends neither runs the same commands to the same
-/// results.
+/// Every method that reaches the server is one message, [`exec`](Self::exec) included; only
+/// [`start`](Self::start) and [`stop`](Self::stop) go unanswered. One console is not
+/// concurrent: its methods take `&mut self` (see [`Client`]).
 ///
 /// ```no_run
 /// use cortex::console::ConsoleClient;
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
-/// // Whichever console server this is: the client starts it and owns it from here.
-/// // Building also says what the session is — the tree it works in if there is one — so
-/// // a console that exists is one the server has answered. Nothing is booted by that;
-/// // the command below pays for the boot, unless a `start` gets there first.
+/// // Starts the server and sends `init`; nothing boots yet.
 /// let mut console = ConsoleClient::builder()
 ///     .build()
 ///     .await?;
 ///
-/// // `None`: this command has no opinion about how long it may take, so the console's
-/// // default stands. `Some(ms)` is how one says otherwise.
 /// let result = console.exec(["sh", "-c", "echo hi"], None).await?;
 /// assert_eq!(result.stdout, b"hi\n");
-///
-/// // And the session ends when the console goes — here, at the end of the scope. The
-/// // server hears `quit` and exits rather than being killed, releasing what it booted
-/// // on the way out, so no `stop` is owed.
 /// # Ok(())
 /// # }
 /// ```
-/// One of a session's trees: the mount this end holds, and where the session sees it.
-///
-/// **The two are one value because they are one fact.** A tree this console holds up is a
-/// tree it named a path for, so a mount with no path and a path with no mount are both
-/// states this end would have to decide what to do about, and neither can happen.
-struct Tree {
-    /// **Never read, and that is the whole job.** A mount is only promised to be there for
-    /// as long as the value is (see [`Mount`]), so holding one here is what keeps the tree
-    /// up for as long as the session is: a console that let go of a mount it had put up
-    /// would go on naming paths at a directory the kernel no longer answers for. What the
-    /// protocol is *spelled* in is [`path`](Self::path), which is the server's answer and
-    /// not this.
-    ///
-    /// Whether this is the last holder is the caller's business — what arrives here is
-    /// whatever was passed to the builder, an `Arc<..>` included.
-    #[allow(dead_code)]
-    mount: Box<dyn Mount>,
-
-    /// Where the session sees it, as `init` named it.
-    ///
-    /// **The paths this protocol speaks are these.** A [`read`](ConsoleClient::read) names a file
-    /// under one, and so does a [`write`](ConsoleClient::write). It is not the mount point above:
-    /// a host-local server may put the tree at the same place, and one with a guest puts it
-    /// where the session can see it, which need not be a path this host has at all.
-    ///
-    /// Where the session *stands* is not here and is not kept anywhere on this side: the
-    /// current directory is the far end's state machine, `init` says where it starts, and
-    /// after that a caller asks with `pwd` like anyone at a terminal. A copy here would be
-    /// a second answer to a question that already has one — wrong from the first `cd`.
-    path: PathBuf,
-}
-
 pub struct ConsoleClient {
-    /// A console has one, always. What ending needs is not for this to become absent but
-    /// for it to be *replaced* — see [`ConsoleClient::drop`](ConsoleClient#impl-Drop-for-ConsoleClient).
+    /// Always present; ending replaces it rather than emptying it — see
+    /// [`ConsoleClient::drop`](ConsoleClient#impl-Drop-for-ConsoleClient).
     client: Box<dyn Client>,
 
-    /// Every tree this session was given, in the order they were named — empty when this
-    /// console has nothing mounted.
+    /// Every tree this session was given, in the order named.
     mounts: Vec<Tree>,
 }
 
@@ -515,26 +375,14 @@ impl ConsoleClient {
         ConsoleClientBuilder::default()
     }
 
-    /// Take a channel and announce the session on it.
+    /// Open a channel and send `init` on it.
     ///
-    /// `init` is here rather than a method a caller remembers, because a session's shape
-    /// is not something a console is ever without: the tree, the base and the network are
-    /// what the builder was given, they outlive every execution, and there is no useful
-    /// console in between having a channel and having said what is on it. So a `ConsoleClient`
-    /// that exists is one the server has heard from and answered — which is the one thing
-    /// about a session a caller can act on before asking for work.
+    /// `init` is sent here, not by the caller, because there is no useful console between
+    /// having a channel and describing the session: a `ConsoleClient` that exists is one the
+    /// server has answered. Boots and mounts nothing.
     ///
-    /// Where each tree goes is settled here and not read back: a mount carries the path it
-    /// appears at, so the paths every later `read` and `write` is spelled in are this end's
-    /// own and are known before the `init` goes out.
-    ///
-    /// Nothing is booted or mounted by it. The first command that needs a session boots
-    /// one, unless a [`start`](Self::start) gets there first.
-    ///
-    /// A failure here takes the channel with it. The client is dropped rather than told
-    /// `quit`, because there is no `ConsoleClient` to owe one: over stdio that kills the server
-    /// process instead of asking it to leave, which is the same ending a console dropped
-    /// off a runtime gets.
+    /// On failure the client is dropped without `quit`; over stdio the server sees its
+    /// input close and exits.
     pub async fn new(builder: ConsoleClientBuilder) -> anyhow::Result<Self> {
         let ConsoleClientBuilder {
             client_factory,
@@ -552,11 +400,8 @@ impl ConsoleClient {
 
         let mut client = client_factory()?;
 
-        // Every tree is turned into what the server is told about it before anything goes
-        // out, by the rule the client factory above follows: a console either exists or says
-        // what it lacked. A mount point with no URL to it and a guest path this protocol
-        // cannot spell are both that, and both are this end's own mistake rather than
-        // something to hear back from a server.
+        // Name every tree before sending anything: an unnameable mount is this end's own
+        // mistake, not something to hear back from a server.
         let mut specs = Vec::with_capacity(mounts.len());
         let mut held = Vec::with_capacity(mounts.len());
         for mounted in mounts {
@@ -588,77 +433,45 @@ impl ConsoleClient {
         })
     }
 
-    /// Where each of this session's trees appears, in the order they were named — what
-    /// every path this console sends is relative to.
+    /// Where each of this session's trees appears, in the order named.
     ///
-    /// A caller builds a [`read`](Self::read) or a [`write`](Self::write) path by joining
-    /// onto one of these, and reaches the same files on this host by joining onto the mount
-    /// point it handed over instead. The two are not required to be the same directory and
-    /// on a server with a guest they are not — which is why what a path is spelled in is the
-    /// guest path this end named rather than whatever the mount point happened to be.
-    ///
-    /// Empty is a console with nothing mounted: a `read` or a `write` has nowhere to join
-    /// onto, so this is what to ask before building a path rather than after failing to.
+    /// Join [`read`](Self::read) and [`write`](Self::write) paths onto these, not onto the
+    /// host mount point, which differs on a guest backend. Empty when nothing is mounted.
     pub fn mounts(&self) -> impl ExactSizeIterator<Item = &Path> {
         self.mounts.iter().map(|tree| tree.path.as_path())
     }
 
     /// Boot the far end now, to hide the cold start.
     ///
-    /// Entirely optional, and it unlocks nothing: an [`exec`](Self::exec),
-    /// [`read`](Self::read) or [`write`](Self::write) that reaches a stopped session is
-    /// served by a server that boots one first. **What it buys is who waits.** Booting is
-    /// the expensive part on a backend with a kernel to bring up, and a caller that sends
-    /// this as soon as it has a console pays for it in parallel with whatever it does
-    /// next — deciding what to run, waiting on a model, reading a file — instead of
-    /// inside the latency of its first command.
+    /// Optional: [`exec`](Self::exec), [`read`](Self::read) and [`write`](Self::write) boot
+    /// on demand. Sending this early lets the boot overlap with the caller's other work.
     ///
-    /// So it is worth sending exactly when a caller knows a console will be used and does
-    /// not yet know what for, which is most of them.
-    ///
-    /// `Ok` is the message having gone out and not the server having booted: nothing
-    /// answers it. A boot that fails is heard by whoever asks for the next thing that
-    /// needed one, as [`BOOT_FAILED`](crate::console::Error::BOOT_FAILED).
+    /// `Ok` means the message went out, not that the boot succeeded; a failed boot surfaces
+    /// as [`BOOT_FAILED`](crate::protocol::Error::BOOT_FAILED) on the next call that needs one.
     pub async fn start(&mut self) -> Result<(), Failure> {
         self.client.start().await
     }
 
-    /// Release what booting took, to stop occupying it while nothing is running.
+    /// Release what booting took (guest memory, socket, scratch directory) while idle.
     ///
-    /// Not the end of anything, and not owed: the next call that needs a booted session
-    /// gets one, and dropping the console releases everything anyway. **What it buys is
-    /// what a booted session is not holding in the meantime** — a guest's memory, a
-    /// socket, a scratch directory — which is worth a message when a caller knows it is
-    /// going idle, and worth nothing between two commands a second apart.
+    /// Not an ending and not owed: dropping the console releases everything. The next
+    /// command pays a cold start again, so use it before long idle stretches only.
     ///
-    /// The other half of [`start`](Self::start)'s trade, and the cost is the same one:
-    /// the next command pays a cold start again. A caller that will be idle for minutes
-    /// takes that gladly; one that will be idle for a moment should not.
-    ///
-    /// `Ok` is the message having gone out. Like [`start`](Self::start), nothing answers
-    /// it.
+    /// `Ok` means the message went out; nothing answers it.
     pub async fn stop(&mut self) -> Result<(), Failure> {
         self.client.stop().await
     }
 
     /// Run one command, and return everything it produced.
     ///
-    /// The command is an argv — `["echo", "hi"]` — and nothing here consults a shell, so
-    /// a caller that wants shell semantics asks for them outright: `["sh", "-c", ".."]`.
+    /// The command is an argv (`["echo", "hi"]`) with no shell; for shell semantics send
+    /// `["sh", "-c", ".."]`.
     ///
-    /// Where it runs is where the session stands, which is the far
-    /// end's to keep: this carries no directory, because a second answer to that question
-    /// would disagree with the first the moment a command ran `cd`. A caller that wants one
-    /// command somewhere else says so in the command — `sh -c 'cd there && ..'`.
+    /// It runs in the session's current directory, kept by the server; to run elsewhere,
+    /// say so in the command (`sh -c 'cd there && ..'`).
     ///
-    /// `timeout_ms` bounds this execution, and `None` leaves it to run until it finishes
-    /// — or forever, if it is the kind of command that does not finish.
-    ///
-    /// Which is the only way to bound one, and the reason the parameter is here rather
-    /// than something a caller arranges outside. Dropping this future leaves the server
-    /// running a command nobody is waiting for and a channel with an answer still to come
-    /// on it — so a caller that wants to stop waiting says so to the server, which is the
-    /// end that can also stop the command.
+    /// `timeout_ms` is the only way to bound it; `None` may run forever. Dropping this
+    /// future instead leaves the command running and an answer pending on the channel.
     pub async fn exec(
         &mut self,
         cmd: impl IntoIterator<Item = impl AsRef<str>>,
@@ -674,14 +487,11 @@ impl ConsoleClient {
 
     /// Read part of a file where commands run.
     ///
-    /// The path is the session's — under one of [`mounts`](Self::mounts), which is what a
-    /// caller joins onto — so this names the file a command would open by the same name, and
-    /// is how a caller sees what an execution wrote to a file rather than to its output.
+    /// The path is in the session's filesystem, under one of [`mounts`](Self::mounts): the
+    /// file a command would open by that name.
     ///
-    /// `offset` is where to start, `None` being the beginning; `len` is how much to ask
-    /// for, `None` being the rest. Neither is a promise about what comes back — a file
-    /// too large for one message arrives in pieces, and [`ReadResp::size`] against what
-    /// did arrive is the only thing that says there are more.
+    /// `offset` defaults to the beginning and `len` to the rest. A file too large for one
+    /// message arrives in pieces; compare [`ReadResp::size`] with what arrived.
     pub async fn read(
         &mut self,
         path: impl AsRef<str>,
@@ -698,27 +508,20 @@ impl ConsoleClient {
 
     /// Take everything this session has written, as a blob another session can start on.
     ///
-    /// The other half of [`ConsoleClientBuilder::snapshot`]: what comes back is what that takes, so a
-    /// session is carried on by building a new one with these bytes in hand. What is in them
-    /// is the server's own encoding of the changes and not a caller's to read — keeping them
-    /// and handing them back is the whole of the contract.
+    /// Pass the bytes to [`ConsoleClientBuilder::snapshot`] to carry the session on: a
+    /// layer tar of the session's writes, kept as bytes by the caller.
     ///
-    /// Everything since the session began, and not since the last time this was asked: a
-    /// snapshot is where a session *is*, so two taken in a row give the same thing twice and
-    /// the second is not the difference between them.
+    /// Cumulative since the session began, not since the last snapshot.
     pub async fn snapshot(&mut self) -> Result<Vec<u8>, Failure> {
         self.client.snapshot().await.map(|answer| answer.blob)
     }
 
-    /// Put bytes in a file where commands run, and hear how big it is afterwards.
+    /// Put bytes in a file where commands run; returns its size afterwards.
     ///
-    /// The other direction of [`read`](Self::read), and the way to put something where
-    /// a command will find it. The path is the server's, the same way.
+    /// The path is under one of [`mounts`](Self::mounts), as for [`read`](Self::read).
     ///
-    /// `offset` is the difference between replacing a file and writing into one. `None`
-    /// makes the file *be* `data` — created if it was not there, cut to length if it was
-    /// — where `Some(0)` writes the same bytes at the same place and leaves whatever lay
-    /// past them. A caller that means to replace a file sends `None`.
+    /// `None` makes the file exactly `data` (created or truncated); `Some(0)` writes the
+    /// same bytes but keeps whatever lay past them.
     pub async fn write(
         &mut self,
         path: impl AsRef<str>,
@@ -735,54 +538,25 @@ impl ConsoleClient {
 }
 
 impl Drop for ConsoleClient {
-    /// Say `quit`, which is what lets the server exit rather than be killed.
+    /// Say `quit`, so the server exits gracefully; it also releases what a
+    /// [`stop`](ConsoleClient::stop) would, so no `stop` is needed. The outcome (over stdio,
+    /// the exit status) is discarded, since no caller is left to act on it.
     ///
-    /// A server exists for as long as the client driving it does, so this is owed exactly
-    /// once and this is the moment: nothing else can happen on the channel afterwards.
-    /// Only `quit` — a server that hears it releases whatever a
-    /// [`stop`](ConsoleClient::stop) would have released, on its way out — so an ending is one
-    /// message and not two.
+    /// Owed exactly once, when the console goes away, so it is a `Drop` rather than a
+    /// method to remember.
     ///
-    /// Nobody hears what it answered. There is no caller left to tell by the time a
-    /// console is being dropped, and over stdio what `quit` reports is the server
-    /// process's exit status, which nothing could act on anyway.
-    ///
-    /// # Why the client is swapped rather than taken
-    ///
-    /// Saying `quit` is an `await` and a `drop` cannot wait for one, so it goes to a task
-    /// — which needs the client to own. A field cannot be *moved* out of a type that has
-    /// a destructor, because the destructor would then run on whatever was left behind
-    /// and there is no `Box` that means "nothing".
-    ///
-    /// It can be *swapped*, though, and the value swapped in is right here: a client that
-    /// answers nothing, which is exactly what a console whose session is over has. So the
-    /// field above stays an unconditional `Box` — a console has a client, always — where
-    /// an `Option` would have put a state that cannot happen into every method that asks.
-    ///
-    /// Off a runtime, or on one that shuts down before the task is polled, the client is
-    /// dropped without the message. That is still an ending: over stdio the server's input
-    /// closes with it, and the server takes itself down as if it had heard `quit`.
-    ///
-    /// # Why the mounts go with the task
-    ///
-    /// A server is still serving them until it has heard the ending — a guest's virtio-fs
-    /// share holds the files open — and a binding's guard cannot come down under a mount
-    /// that is in use: it unmounts and then waits for its serving thread, which waits for
-    /// every holder to let go. Dropped here, before the `quit`, that wait blocks the thread
-    /// the task is to run on, and on a current-thread runtime there is no other: the server
-    /// never hears `quit`, the guest never lets go, and the drop never returns. So they are
-    /// handed to [`hang_up`] and dropped after the client, when the server has let them go.
+    /// The mounts go after the client: the server serves them until it hears the ending (a
+    /// guest's virtio-fs share holds files open), and a binding's guard unmounts then waits
+    /// for every holder, which dropped here would block the task's thread, deadlocking a
+    /// current-thread runtime.
     fn drop(&mut self) {
         hang_up(&mut self.client, std::mem::take(&mut self.mounts));
     }
 }
 
 /// Start `cmd` as a console server, over its own pipes, once the factory is run.
-///
-/// Every builder that takes a program rather than a channel makes its client this way.
 pub(crate) fn stdio_factory(cmd: &[impl AsRef<OsStr>]) -> ClientFactory {
-    // Owned before the closure, because the closure outlives this borrow and what it
-    // was given has to still be there when `build` runs it.
+    // Owned, since the closure outlives this borrow.
     let cmd: Vec<OsString> = cmd.iter().map(|s| s.as_ref().to_owned()).collect();
 
     Box::new(move || {
@@ -798,19 +572,16 @@ pub(crate) fn stdio_factory(cmd: &[impl AsRef<OsStr>]) -> ClientFactory {
     })
 }
 
-/// Say `quit` on a task, leaving a client behind that answers nothing, and let `keep` go
-/// only once the server has been told.
+/// Say `quit` on a task, leaving a client behind that answers nothing, and drop `keep`
+/// only after the client.
 ///
-/// What a console's `drop` does, for any console that holds a client: see
-/// [`ConsoleClient::drop`](ConsoleClient#impl-Drop-for-ConsoleClient) for why the client is swapped rather
-/// than taken, and what happens off a runtime.
+/// Swapping (not taking) lets a type with a destructor hand its client to a task, and keeps
+/// the field a plain `Box` rather than an `Option` every method must check. Off a runtime,
+/// or if the task never runs, the client is dropped without `quit`, closing the server's input.
 ///
-/// `keep` is what the server may still be using -- a console's mounts -- and it goes after the
-/// client whichever way this ends: once `quit` is answered, or, off a runtime or on one that
-/// never polls the task, right behind the client that closes the server's input.
+/// `keep` is what the server may still be using (a console's mounts).
 pub(crate) fn hang_up<K: Send + 'static>(client: &mut Box<dyn Client>, keep: K) {
-    /// Answers nothing, because by the time this is reachable there is nothing left
-    /// to answer with.
+    /// Stands in once the session has ended.
     struct Spent;
 
     impl Client for Spent {
@@ -823,12 +594,11 @@ pub(crate) fn hang_up<K: Send + 'static>(client: &mut Box<dyn Client>, keep: K) 
         }
     }
 
-    // Zero-sized, so this `Box` is a dangling pointer rather than an allocation.
+    // Zero-sized, so boxing it allocates nothing.
     let client = std::mem::replace(client, Box::new(Spent));
 
-    // One tuple, because a tuple drops its fields in order and nothing else here promises an
-    // order: dropped whole -- here off a runtime, or as a task that was never polled -- or at
-    // the end of the task, the client goes first and what it was serving after it.
+    // A tuple drops its fields in order, so however it is dropped (off a runtime, as an
+    // unpolled task, or at the task's end) the client goes before what it was serving.
     let ending = (client, keep);
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         runtime.spawn(async move {
@@ -838,20 +608,14 @@ pub(crate) fn hang_up<K: Send + 'static>(client: &mut Box<dyn Client>, keep: K) 
     }
 }
 
-/// A tree the caller handed over, as the builder holds it until there is a session to name
-/// it in.
+/// A tree the caller handed over, held by the builder until `init`.
 struct Mounted {
     mount: Box<dyn Mount>,
     at: PathBuf,
     readonly: bool,
 }
 
-/// A mount this end holds, as the one string the far end is told to realize.
-///
-/// Both halves can fail and both fail here: a mount point that cannot be spelled as a URL
-/// has no name that travels, and a guest path this protocol cannot read back is one the
-/// server would refuse. Neither is worth a round trip to find out, and neither leaves a
-/// caller anything to do but fix the call.
+/// A mount this end holds, as the spec string the server is told to realize.
 fn named(mounted: &Mounted) -> anyhow::Result<MountSpec> {
     let url = mounted.mount.url().with_context(|| {
         format!(
@@ -867,8 +631,7 @@ fn named(mounted: &Mounted) -> anyhow::Result<MountSpec> {
         )
     })?;
 
-    // The refusal already names the spec it was reading, which is both halves of what a
-    // caller would have to be told to fix it.
+    // The error already names the spec.
     let spec = MountSpec::new(url, at)?;
 
     Ok(if mounted.readonly {
@@ -887,11 +650,10 @@ mod tests {
     use super::*;
     use crate::protocol::{Call, Error, InitResp, Method, Notification, Response};
 
-    /// What a [`Recorder`] was handed, readable while it is still lent out.
+    /// What a [`Recorder`] was handed, readable while it is lent out.
     ///
-    /// Two lists because they answer different questions: `methods` is what went out and
-    /// in what order, including the `quit`, which is a notification and so never a `Call`;
-    /// `calls` is what those carried.
+    /// `methods` is every message in order, notifications included; `calls` holds only the
+    /// calls' contents.
     #[derive(Clone)]
     struct Log {
         methods: Arc<Mutex<Vec<Method>>>,
@@ -920,8 +682,7 @@ mod tests {
             self.log.methods.lock().unwrap().push(call.method());
             self.log.calls.lock().unwrap().push(call);
             let answer = if self.answers.is_empty() {
-                // Not a panic: an ending stops a console best-effort, and a test that has
-                // said all it means to say should not have to answer that too.
+                // Not a panic, so tests need not script an answer for the ending.
                 Err(Failure::broken("nothing left to answer with"))
             } else {
                 match self.answers.remove(0) {
@@ -952,12 +713,12 @@ mod tests {
         )
     }
 
-    /// A session taken, which is the whole of what a server owes an `init`.
+    /// A default `init` response.
     fn initialized() -> Response {
         Response::Init(InitResp::default())
     }
 
-    /// An execution that ran and ended.
+    /// A successful `exec` response.
     fn ran(stdout: &[u8]) -> Response {
         Response::Exec(ExecResp {
             code: 0,
@@ -966,8 +727,7 @@ mod tests {
         })
     }
 
-    /// Every way building can fail says which one it was, and all of them are here rather
-    /// than spread over the first few methods a caller would have reached for.
+    /// Every channel failure surfaces at build, saying which one it was.
     #[tokio::test]
     async fn a_stdio_console_starts_its_server_when_it_is_built() {
         let Err(e) = ConsoleClient::builder()
@@ -979,17 +739,14 @@ mod tests {
         };
         assert!(e.to_string().contains("starting the console server"), "{e}");
 
-        // A command with nothing to run is the same kind of failure and reported the same
-        // way: at build, saying what it lacked.
+        // An empty command also fails at build.
         let Err(e) = ConsoleClient::builder().cmd(&[] as &[&str]).build().await else {
             panic!("a console over no program at all should not build");
         };
         assert!(e.to_string().contains("needs a program to run"), "{e}");
 
-        // And a program that starts but does not speak the protocol fails here too, which
-        // is what moved when `init` became the builder's: it is answered or the console
-        // does not exist. `cat` echoes the request back, so what arrives is a request and
-        // not the response that was due — arguments are the caller's, and go to the
+        // So does a program that does not speak the protocol, since build awaits `init`:
+        // `cat` echoes the request back, which a client cannot answer. Arguments reach the
         // program as given.
         let Err(e) = ConsoleClient::builder().cmd(&["cat", "-u"]).build().await else {
             panic!("a console over a program that cannot answer should not build");
@@ -997,11 +754,7 @@ mod tests {
         assert!(e.to_string().contains("cannot answer"), "{e}");
     }
 
-    /// Nothing about the session is kept on this side once `init` has gone out: what a
-    /// caller asks for goes out as asked, in that order, and the answer is the server's.
-    ///
-    /// Which is also what makes an execution one round trip. There is no second message
-    /// underneath a command, so the methods below are exactly what the caller asked for.
+    /// After `init`, each caller method is exactly one message, in order.
     #[tokio::test]
     async fn a_session_is_the_servers_to_keep() {
         let (client, log) = recorder(vec![initialized(), ran(b"hi\n")]);
@@ -1011,19 +764,16 @@ mod tests {
             .await
             .unwrap();
 
-        // Optional, and unanswered: only the timing of the boot below changes.
+        // Optional and unanswered; only moves when the boot happens.
         console.start().await.unwrap();
         assert_eq!(
             console.exec(["echo", "hi"], None).await.unwrap().stdout,
             b"hi\n"
         );
-        // A `stop` in the middle: what booting took is handed back and the session stays
-        // open, which is the only thing `stop` is for.
+        // Releases boot resources; the session stays open.
         console.stop().await.unwrap();
 
-        // And ending is the console going away — one `quit`, and nothing else. What the
-        // server releases on hearing it is the server's business, so no second `stop`
-        // goes out to ask for it.
+        // Dropping sends one `quit` and no extra `stop`.
         drop(console);
         tokio::task::yield_now().await;
 
@@ -1038,15 +788,13 @@ mod tests {
             ]
         );
 
-        // `init` is the first thing on the channel, before anything a caller asked for,
-        // and a console with nothing mounted describes a session by saying nothing.
+        // `init` goes first, and an unconfigured console sends a default one.
         let Call::Init(init) = log.call(0) else {
             panic!("{:?} is not an init", log.call(0));
         };
         assert_eq!(init, InitCall::default());
 
-        // The command went out as the caller wrote it, carrying nothing else: where it
-        // runs is the far end's, and this end has nothing to add.
+        // The command goes out as written, with nothing added.
         let Call::Exec(exec) = log.call(1) else {
             panic!("{:?} is not an exec", log.call(1));
         };
@@ -1059,8 +807,7 @@ mod tests {
         );
     }
 
-    /// A session the server refuses to have is not a console, so there is nothing for a
-    /// caller to hold and nothing to end.
+    /// A refused `init` yields no console, and so no `quit`.
     #[tokio::test]
     async fn a_console_the_server_will_not_have_does_not_exist() {
         let (client, log) = recorder(vec![Response::Error(Error::new(
@@ -1072,13 +819,13 @@ mod tests {
         };
         assert!(e.to_string().contains("file://"), "{e}");
 
-        // And no `quit`: what would owe one is a `ConsoleClient`, and there is not one.
+        // No `quit`: there is no `ConsoleClient` to owe one.
         tokio::task::yield_now().await;
         assert_eq!(log.methods(), [Method::Init]);
     }
 
-    /// A console that was never started is ended the same way, because what `quit` is for
-    /// is the server going away and a server exists whether or not it was ever booted.
+    /// A never-started console still sends `quit` on drop: the server exists regardless of
+    /// boot.
     #[tokio::test]
     async fn dropping_a_console_ends_its_session() {
         let (client, log) = recorder(vec![initialized()]);
@@ -1090,17 +837,15 @@ mod tests {
 
         drop(console);
 
-        // The ending is somebody else's turn to run, so wait for one.
+        // `quit` runs on a spawned task; let it.
         tokio::task::yield_now().await;
         assert_eq!(log.methods(), [Method::Init, Method::Quit]);
     }
 
-    /// The mounts this end holds are what `init` names, each as one string carrying where
-    /// the tree is, where the session sees it, and whether a command may write in it.
+    /// `init` names each mount as one spec string.
     ///
-    /// The mount point and the guest path are different here on purpose, to make visible
-    /// which of them the session is spelled in: the one this end chose for the session, not
-    /// the directory the tree happens to sit in on this host.
+    /// Mount point and guest path differ on purpose, to show paths are spelled in the guest
+    /// path.
     #[tokio::test]
     async fn a_console_names_its_mounts_and_where_it_put_them() {
         let (client, log) = recorder(vec![initialized()]);
@@ -1126,20 +871,14 @@ mod tests {
             ]
         );
 
-        // And what a caller joins a `read` or a `write` onto is the guest path it named, in
-        // the order it named them.
+        // `mounts()` yields the guest paths, in order.
         assert_eq!(
             console.mounts().collect::<Vec<_>>(),
             [Path::new("/work"), Path::new("/work/out")]
         );
     }
 
-    /// A tree the protocol could not name is not a session: every path the caller would send
-    /// for it afterwards would be a guess, so this end says what it lacked rather than
-    /// sending a session it cannot spell.
-    ///
-    /// Both halves are refused before anything goes out, because both are knowable here —
-    /// which is why the recorder below is never asked for an answer.
+    /// An unnameable mount fails the build before anything is sent.
     #[tokio::test]
     async fn a_mount_this_end_cannot_name_is_not_a_session() {
         let (client, log) = recorder(vec![initialized()]);
@@ -1154,8 +893,7 @@ mod tests {
         assert!(e.to_string().contains("cannot be named"), "{e}");
         assert_eq!(log.methods(), [] as [Method; 0]);
 
-        // And a guest path that is not one the session could join onto is the same kind of
-        // nothing — it would be relative to a working directory nobody named.
+        // A relative guest path fails the same way.
         let (client, _) = recorder(vec![initialized()]);
         let Err(e) = ConsoleClient::builder()
             .client(client)

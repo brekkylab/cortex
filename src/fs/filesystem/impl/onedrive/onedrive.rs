@@ -14,42 +14,26 @@ use crate::{
     fs::filesystem::{Dirent, DirentKind, FileSystem, Stat},
 };
 
-/// Per-directory listing TTL.
+/// Per-directory listing TTL, shared by the spans held under it.
 ///
-/// One number for the listing and for the span held under it, deliberately. Two would mean
-/// a window in which `ls` answers from one snapshot while a read of the same file answers
-/// from another — and everything a `stat` reports (size, mtime, etag) comes off the parent
-/// listing, so the two are describing the same snapshot or they are lying about one.
-///
-/// This is what bounds how stale the tree can be. A network filesystem always has such a
-/// number: macOS's own NFS client caches attributes 5 to 60 seconds (`acregmin`/`acregmax`)
-/// and serves them while the server moves on. Five minutes is longer because a listing here
-/// costs a round trip rather than a LAN hop.
+/// One number for both: `stat` (size, mtime, etag) comes off the parent listing, so a read
+/// must not answer from a different snapshot than `ls`. It bounds how stale the tree can
+/// be; minutes, since a listing costs a round trip.
 const DIR_TTL: Duration = Duration::from_secs(300);
 
-/// How much a read fetches once it is clear the reader is walking the file *and* nothing
-/// else is being walked, so a lone walk pays a round trip per span of this size rather
-/// than one per window.
+/// Span a read fetches once the reader is walking the file *and* walks alone.
 ///
-/// The kernel's window is 64 KiB and not ours to choose (32 KiB through FUSE-T, measured).
-/// Sending each one down as its own ranged request is the pathology this exists to avoid —
-/// measured against Drive, whose round trip is the same shape, it put a 641 MB archive at
-/// 0.04 MB/s.
-///
-/// It is a ceiling rather than the size every walk gets: [`HELD_BUDGET`] is divided among
-/// whatever is being walked, and this is what one reader's share comes to. Shrinking it
-/// instead of dividing it would cost every large read its round trips — a 4 GB file at a
-/// fixed 8 MiB is 512 requests against 65, and a request to the download host costs 0.232 s
-/// of round trip, measured over ten on one connection.
+/// The kernel window is 64 KiB (32 KiB via FUSE-T); one ranged request per window leaves a
+/// large read crawling at round-trip speed. A ceiling, not the size every walk gets:
+/// concurrent walks divide [`HELD_BUDGET`].
 const READ_SPAN: u64 = 64 * 1024 * 1024;
 
 /// How much a *first* read fetches, before anything says the reader is walking.
 ///
 /// Two sizes because a span is not free either: the tools that read a file's head and stop
-/// would pay a whole `READ_SPAN` for one buffer. It is 8 MiB rather than the bare window
-/// because NFS fires about a megabyte of read-ahead the moment a file is touched, and every
-/// window of that read-ahead looks like a walk — a smaller number is spent before the
-/// distinction can be made.
+/// would pay a whole `READ_SPAN` for one buffer. Well above the bare window because NFS
+/// fires read-ahead the moment a file is touched, and every window of it looks like a walk;
+/// a span smaller than that read-ahead is spent before the distinction can be made.
 const FIRST_SPAN: u64 = 8 * 1024 * 1024;
 
 /// Cap on how many children one listing will hold.
@@ -63,32 +47,28 @@ type CachedListing = (Instant, Arc<Vec<Child>>);
 
 /// Ceiling on the bytes held across every file at once. See [`OnedriveFs::held`].
 ///
-/// One [`READ_SPAN`], so the peak is what a single slot already cost.
+/// One [`READ_SPAN`], so concurrent readers divide what a lone walk holds.
 const HELD_BUDGET: u64 = READ_SPAN;
 
 /// Floor on one file's share of [`HELD_BUDGET`].
 ///
 /// For the case the count cannot tell apart: many files touched once beside one being
-/// walked. [`ACTIVE`] keeps a file counted for seconds after its single read, so a
-/// traversal past 500 small files divides the budget 500 ways while one large file is
-/// walked. Measured on the mock, that walk costs 8 requests with this floor and 256
-/// without.
+/// walked. [`ACTIVE`] keeps a file counted for seconds after its single read, so without a
+/// floor a traversal past many small files would slice the budget thin and multiply the
+/// requests of the one large file being walked.
 ///
-/// It costs traffic in the opposite case, where the files really are all being walked: at
-/// 100 of them, 6.4x the bytes against 3.8x with no floor. Past `HELD_BUDGET / MIN_SPAN`
-/// files the shares stop fitting and eviction comes back.
+/// It costs traffic when the files really are all being walked: past
+/// `HELD_BUDGET / MIN_SPAN` of them the shares stop fitting and eviction comes back.
 const MIN_SPAN: u64 = 4 * 1024 * 1024;
 
 /// How recently a span must have been read from for its file to count as one of the
 /// readers dividing [`HELD_BUDGET`].
 ///
-/// Being in the map is the wrong test: an entry lives for [`DIR_TTL`], so a traversal past
-/// eight files leaves eight behind and would divide the budget eight ways while one file is
-/// walked — measured, nineteen abandoned entries took a walk of one file from two requests
-/// to five. Seconds rather than milliseconds because a miss against Graph costs about that
-/// (see [`READ_SPAN`]), so two files alternating touch each other's spans a second or more
-/// apart; what matters is the interval between *misses* on one file, since a hit refreshes
-/// [`HeldSpan::used`].
+/// Being in the map is the wrong test: an entry lives for [`DIR_TTL`], so files a traversal
+/// abandoned would keep dividing the budget while one file is walked. Seconds rather than
+/// milliseconds because a miss against Graph costs about a second, so two files alternating
+/// touch each other's spans that far apart; what matters is the interval between *misses* on
+/// one file, since a hit refreshes [`HeldSpan::used`].
 const ACTIVE: Duration = Duration::from_secs(3);
 
 /// One span of one file, and where in it the span begins.
@@ -106,32 +86,37 @@ struct HeldSpan {
 /// One resolved entry, as the mount means it.
 #[derive(Clone)]
 struct Child {
-    /// The item's own id, which is how anything asked of the service *after* the listing
-    /// addresses it. Opaque ASCII the service minted, so unlike a path it has one
-    /// spelling and it survives a rename. See
-    /// [`get_item_by_id`](OnedriveAccessor::get_item_by_id).
+    /// Service-minted id, used for every request after the listing.
     id: String,
     /// Listing name: the item's own name, sanitized into a single path segment.
     name: String,
     is_dir: bool,
-    /// Exact, for every file. This is the whole reason this store is smaller than the
-    /// Google Drive one: nothing has to be produced to learn it, so nothing has to stand
-    /// in for it.
     size: u64,
     mtime: Option<SystemTime>,
     created: Option<SystemTime>,
     /// `cTag` where there is one, else `eTag`. The content tag is the one a revalidating
     /// reader wants; a folder has no `cTag` at all.
     etag: Option<String>,
-    /// A preauthenticated URL for the bytes, as the listing returned it.
-    ///
-    /// Held only as long as the listing that carried it. Microsoft calls it short-lived
-    /// and says outright that it "can't be cached"; an expired one answers 4xx, which
-    /// [`OnedriveFs::span`] turns into exactly one refetch.
+    /// Preauthenticated URL from the listing, held only as long as it; an expired one is
+    /// refetched once in [`OnedriveFs::span`].
     download_url: Option<String>,
 }
 
 /// A OneDrive account as a read-only directory tree.
+///
+/// ```text
+/// /
+///   Documents/          the drive's own folders, from `/me/drive/root`
+///     report.docx       a file, served as its own bytes
+///   photo.jpg
+/// ```
+///
+/// The root is the drive root, with no virtual sections above it: an account is one drive.
+///
+/// Graph serves Office files as their real bytes, states an exact size on every item, and
+/// honours ranges, so a short read is the end of the file: nothing is rendered, and no
+/// length is guessed or padded. A listing is held for minutes, so a change just made in
+/// OneDrive may not show yet.
 pub struct OnedriveFs {
     accessor: OnedriveAccessor,
     /// Folder path → its children. Everything `stat` reports comes from here, so a
@@ -139,32 +124,14 @@ pub struct OnedriveFs {
     dir_cache: Mutex<HashMap<String, CachedListing>>,
     /// File path → the span last read from it, bounded in bytes by [`HELD_BUDGET`].
     ///
-    /// This was one slot, on the reasoning that a reader works through one file at a time —
-    /// `cat`, `grep` and `cp` all do — so what the next window needs is what the last one
-    /// had, and a map would hold [`READ_SPAN`] per file ever touched.
+    /// A map rather than one slot, because reads of two files interleave with neither
+    /// threads nor a second process: FUSE ops are serialized, so alternating is enough.
+    /// With one slot each read finds the other file's span there, no read ever counts as a
+    /// walk, and every window pays a whole [`FIRST_SPAN`].
     ///
-    /// The premise fails the moment reads of a *second* file interleave, and that needs
-    /// neither threads nor a second process: FUSE ops are serialized, so alternating is
-    /// all it takes. Each read then finds the other file's span in the slot, so `walking`
-    /// is false forever and every window pays a whole [`FIRST_SPAN`].
-    ///
-    /// What that costs was measured on the Drive twin of this code, live: two files walked
-    /// by `xargs -P 2 cat` reached 7.3 MiB of progress after 328 MiB downloaded over 41
-    /// requests, and was abandoned rather than completed. The same work divided is 4
-    /// requests and 53.9 MiB.
-    ///
-    /// Two concurrent readers is the whole requirement, and also the limit of what was
-    /// reproduced. A single tool does not do it on a network store: `grep -r` over six
-    /// 24 MiB files costs 1.0x even on one slot, because read-ahead overlaps files only when
-    /// it can outrun the reader, and a miss costing about a second never lets it. Traced
-    /// through a local [`PassthroughFs`](super::PassthroughFs) mount it interleaves heavily
-    /// — 679 path switches in 0.5 s against 6 in 33 s on the real service — so a trace
-    /// replayed from there describes a fast store, not this one.
-    ///
-    /// Two things together fix it and neither is enough alone. A map bounded by *bytes*
-    /// rather than by count, so the ceiling is unchanged and divided rather than owned by
-    /// whoever fetched last. And a span sized to that division rather than to a constant, so
-    /// nothing has to be evicted for a new span to fit. See [`READ_SPAN`] and [`ACTIVE`].
+    /// Bounded by *bytes* rather than count, so the ceiling is divided rather than owned by
+    /// whoever fetched last, and each span is sized to that division so nothing has to be
+    /// evicted for a new span to fit. See [`READ_SPAN`] and [`ACTIVE`].
     held: Mutex<HashMap<String, HeldSpan>>,
 }
 
@@ -180,11 +147,11 @@ impl OnedriveFs {
     /// One folder's children, from the cache when one is fresh.
     ///
     /// A failed listing is *not* cached. Caching the failure would turn one throttled
-    /// request into five minutes of an empty directory, which reads as "the folder is
+    /// request into a whole `DIR_TTL` of an empty directory, which reads as "the folder is
     /// gone" rather than "ask again".
     ///
-    /// This is the one call left that addresses the service by a path, and a path has two
-    /// Unicode spellings. See the fallback below.
+    /// Addresses by path, which has two Unicode spellings; a 404 falls back to
+    /// [`list_unspellable`](Self::list_unspellable).
     async fn list_dir(&self, folder: &str) -> io::Result<Arc<Vec<Child>>> {
         {
             let cache = self.dir_cache.lock().await;
@@ -202,9 +169,8 @@ impl OnedriveFs {
         let children: Vec<Child> = rows.iter().filter_map(child_from_item).collect();
         let children = Arc::new(children);
         let mut cache = self.dir_cache.lock().await;
-        // Drop what has aged out on the way in. Nothing else removes an entry, so without
-        // this a listing stays for the life of the mount long after its TTL made it
-        // unusable — one entry per folder ever visited.
+        // Drop what has aged out on the way in: nothing else removes an entry, so one
+        // listing per folder ever visited would otherwise stay for the life of the mount.
         cache.retain(|_, (at, _)| at.elapsed() < DIR_TTL);
         if cache.len() >= MAX_CACHED_DIRS {
             cache.clear();
@@ -215,37 +181,22 @@ impl OnedriveFs {
 
     /// The folder a path names when the path, as spelled, names nothing.
     ///
-    /// The service answers to the spelling it stored and 404s every other one. Measured
-    /// against it, on one folder under one name:
+    /// The service 404s every spelling but the one it stored, and macOS hands a lookup the
+    /// decomposed form of what the listing printed. Tried after the path as given, cheapest
+    /// first:
     ///
-    ///     /me/drive/root:/문서:/children    composed    200
-    ///                                       decomposed  404
+    /// **Composed.** One request, covering the usual case. The path as given goes first
+    /// because the two spellings can name two different sibling folders.
     ///
-    /// and macOS hands a lookup the decomposed spelling of whatever the listing printed.
-    /// So two things are tried, cheapest first.
+    /// **Then segment by segment.** A tree touched by two clients can mix forms per segment
+    /// (web-made folder, macOS-synced child), which would `stat` (since
+    /// [`resolve`](Self::resolve) normalizes per segment) but `list` as ENOENT. So resolve
+    /// through the parent's listing, where `same_name` settles each segment, and list by
+    /// the id. Only a failing path pays, and parents are usually cached from the kernel's
+    /// lookups on the way down.
     ///
-    /// **Composed.** One request, and it answers the ordinary case: a macOS reader asking
-    /// for a folder the service stored composed. As given was tried first because the two
-    /// spellings can name two different sibling folders, and only that order returns the
-    /// one the caller's bytes meant.
-    ///
-    /// **Then segment by segment.** Composing the whole path tries exactly two spellings,
-    /// all-decomposed and all-composed, and a tree touched by two clients has neither: a
-    /// folder made on the web under a child made by the macOS sync client is composed then
-    /// decomposed, and matches no single spelling of the path. That is not a hypothetical
-    /// shape, and the symptom is the one this store opened with — `stat` answers while
-    /// `list` says ENOENT, because [`resolve`](Self::resolve) matches a *name* against a
-    /// listing and normalizes per segment while a path does not.
-    ///
-    /// So the last resort is what the Google Drive store does by construction: resolve the
-    /// folder through its parent's listing, where `same_name` settles each segment on its
-    /// own, and list by the id that comes back. Drive has no paths at all, so it pays a
-    /// listing per level always and is immune to this; here that cost is paid only by a
-    /// path that was going to fail, and the parents are usually already cached because the
-    /// kernel looked each one up on the way down.
-    ///
-    /// The recursion terminates at the root, which is addressed as `/me/drive/root` and
-    /// has no spelling to get wrong.
+    /// Recursion ends at the root, addressed as `/me/drive/root` with no spelling to get
+    /// wrong.
     async fn list_unspellable(
         &self,
         folder: &str,
@@ -316,10 +267,9 @@ impl OnedriveFs {
         let (walking, sharers) = {
             let mut held = self.held.lock().await;
             // Every *other* file read within [`ACTIVE`], plus this one, which is about to
-            // hold a span whether or not it already has an entry. Counting the map's own
-            // entry for `path` instead misses this reader exactly when its last span has
-            // gone stale — and then a lone active neighbour is told it is alone, takes the
-            // whole budget, and evicts the very span the division exists to keep.
+            // hold a span whether or not it has an entry. Counting `path`'s own entry would
+            // miss this reader once its span went stale, and a lone active neighbour would
+            // then take the whole budget and evict the span the division exists to keep.
             let sharers = held
                 .iter()
                 .filter(|(k, h)| k.as_str() != path && h.used.elapsed() < ACTIVE)
@@ -331,13 +281,10 @@ impl OnedriveFs {
                         && (start.saturating_add(want) <= h.at.saturating_add(h.bytes.len() as u64)
                             || h.to_eof)
                     {
-                        // Served, so the file goes on counting for *everyone else's* share.
-                        // It always counts for its own, which is `count() + 1`; what this
-                        // buys is that a neighbour computing a share does not skip this
-                        // file, decide it is alone, and take a share large enough to evict
-                        // this span. Reasoned rather than measured, and no test covers it:
-                        // hits are microseconds apart, so ACTIVE only lapses between them
-                        // for a reader that pauses seconds mid-file.
+                        // Served, so the file keeps counting toward *everyone else's*
+                        // share: a neighbour must not decide it is alone and take enough
+                        // to evict this span. Hits are microseconds apart, so ACTIVE only
+                        // lapses between them for a reader that pauses seconds mid-file.
                         h.used = Instant::now();
                         return Ok((h.at, h.bytes.clone()));
                     }
@@ -351,10 +298,9 @@ impl OnedriveFs {
             };
             (walking, sharers)
         };
-        // A span sized so that everything being walked fits in the budget at once. The
-        // alternative is a constant, and a constant equal to the budget is the one value
-        // that cannot work: two files each wanting all of it means one is always evicted,
-        // whatever the eviction order. Dividing removes the reason to evict.
+        // Sized so everything being walked fits in the budget at once. A constant equal to
+        // the budget is the one value that cannot work: two files each wanting all of it
+        // means one is always evicted, whatever the eviction order.
         let share = (HELD_BUDGET / sharers).max(MIN_SPAN);
         let len = want.max(if walking {
             share
@@ -412,8 +358,8 @@ impl OnedriveFs {
         let len = span.bytes.len() as u64;
         let mut held = self.held.lock().await;
         held.remove(path);
-        // Dropped on the way in, the way a listing is: nothing else removes an entry, so a
-        // span read once would otherwise stay for the life of the mount.
+        // Dropped on the way in: nothing else removes an entry, so a span read once would
+        // otherwise stay for the life of the mount.
         held.retain(|_, h| h.when.elapsed() < DIR_TTL);
         while !held.is_empty()
             && held.values().map(|h| h.bytes.len() as u64).sum::<u64>() + len > HELD_BUDGET
@@ -432,14 +378,12 @@ impl OnedriveFs {
         held.insert(path.to_string(), span);
     }
 
-    /// A download URL straight from the service, for when the listing's has expired.
+    /// A download URL straight from the service, for when the listing's is missing or has
+    /// expired.
     ///
     /// Costs one request and does not disturb the listing: the rest of that snapshot is
     /// still good, and re-listing the folder to refresh one URL would throw away every
     /// other entry's.
-    ///
-    /// By the item's id and not by its path, because this runs in the middle of a read.
-    /// See [`get_item_by_id`](OnedriveAccessor::get_item_by_id).
     async fn fresh_download_url(&self, child: &Child) -> io::Result<String> {
         let item = self
             .accessor
@@ -492,10 +436,8 @@ impl OnedriveFs {
             return Ok(Vec::new());
         }
         let (at, bytes) = self.span(&child, path, r.start, want).await?;
-        // `at <= r.start` on both of `span`'s return paths: the hit branch carries it as
-        // a conjunct, and a fetch returns where the response said the bytes begin, which
-        // is `r.start` for a `206` and `0` for a whole file. So neither subtraction here
-        // goes backwards.
+        // `at <= r.start` on both `span` paths (a hit checks it; a fetch starts at `r.start`
+        // or 0), so neither subtraction goes backwards.
         let from = r.start.saturating_sub(at);
         Ok(slice(&bytes, Some(from..r.end.saturating_sub(at))))
     }
@@ -582,10 +524,6 @@ impl FileSystem for OnedriveFs {
             // Short is EOF and nothing else, which holds because a span never splits a
             // window: `span` fetches from where the read begins and at least as far as it
             // asks, so what comes back either covers the window or ran out of file.
-            //
-            // Nothing is padded here. The Google Drive store fills a document's tail with
-            // whitespace because it had to guess the length; a driveItem states it, so a
-            // read that comes up short has genuinely reached the end.
             let n = bytes.len().min(buf.len());
             buf[..n].copy_from_slice(&bytes[..n]);
             Ok(n)
@@ -618,17 +556,10 @@ fn stat_of(c: &Child) -> Stat {
 
 /// One listing row into an entry, or `None` for a row this tree does not show.
 ///
-/// A **package** — a OneNote notebook is the one you meet — is dropped. Microsoft
-/// describes it as "a package instead of a folder or file", treated as a folder by some
-/// clients and a file by others; it has no bytes to read and no children this API will
-/// list. A name that cannot be read is worse than an absence, so it is not shown.
-///
-/// An item that is neither `file` nor `folder` is dropped for the same reason.
-///
-/// So is a row with no `id`, which is the same judgement one more time: an item that
-/// cannot be addressed after the listing is one whose read would fail the moment its
-/// download URL expired. Graph states an id on every driveItem and this code `$select`s
-/// it, so the case is a malformed row rather than a shape of the API.
+/// Dropped, since a name that cannot be read is worse than an absence: a **package** (e.g.
+/// a OneNote notebook, "a package instead of a folder or file", with no bytes to read and
+/// no listable children), any item that is neither `file` nor `folder`, and a row with no
+/// `id` (malformed; its read would fail once the download URL expired).
 fn child_from_item(v: &Value) -> Option<Child> {
     if v.get("package").is_some() {
         return None;
@@ -673,12 +604,8 @@ fn time_field(v: &Value, key: &str) -> Option<SystemTime> {
     (secs >= 0).then(|| std::time::UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
-/// An `anyhow` error from the accessor into an `io` one, keeping "not found" apart from
-/// everything else — a reader distinguishes them and a mount has to as well.
-///
-/// The distinction is what a caller acts on, and it only goes one way safely. `NotFound`
-/// on a path is a name that is gone, which a traversal skips; anything else is the backend
-/// failing, which it must not read as an absence. See [`is_not_found`].
+/// An accessor error into an `io` one, `NotFound` only for a real absence: a traversal
+/// skips a missing name, so a backend failure must never read as one. See [`is_not_found`].
 fn not_found_or_backend(e: anyhow::Error) -> io::Error {
     if is_not_found(&e) {
         io::Error::from(io::ErrorKind::NotFound)
@@ -690,11 +617,9 @@ fn not_found_or_backend(e: anyhow::Error) -> io::Error {
 /// Whether the service answered this request `404`.
 ///
 /// Asked of the status the error carries rather than found in its message. A Graph error
-/// body states a correlation id, and a correlation id is hex: measured on a live token
-/// failure, `Correlation ID: 74bd5c8a-0083-434f-b5b2-9602fa4d4ca3`. About one in a hundred
-/// contains `404` and means nothing by it, so a substring search turns a backend failure
-/// into an absence, and the mount answers `ENOENT` for a file that is there. The Google
-/// Drive store classifies the same way, for the same reason.
+/// body states a correlation id, which is hex and so sometimes contains `404` while meaning
+/// nothing by it: a substring search would turn a backend failure into an absence, and the
+/// mount would answer `ENOENT` for a file that is there.
 ///
 /// Only a Graph error can be one: a failed download says its status without reqwest's
 /// error (see [`download`](OnedriveAccessor::download)), and a failed token exchange is a

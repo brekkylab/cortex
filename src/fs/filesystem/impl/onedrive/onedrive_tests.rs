@@ -332,14 +332,14 @@ async fn spans_left_behind_stop_counting_and_stop_being_kept() {
     }
 }
 
-/// Files read in turn each keep their span, so nothing is fetched twice. One slot could not;
-/// see [`OnedriveFs::held`]. Each file is larger than a span, so a constant [`READ_SPAN`]
-/// would overrun the budget and the division is measured.
+/// Files read in turn each keep their span, so nothing is fetched twice. See
+/// [`OnedriveFs::held`]. Each file is larger than its share of the budget, so a constant
+/// [`READ_SPAN`] would overrun the budget and only the division passes.
 #[tokio::test]
 async fn interleaved_files_each_keep_a_span() {
     const REAL: u64 = 32 * 1024 * 1024;
-    // 512 KiB chunks per file, as `grep -r` alternated over a local mount. Only the chunk
-    // matters, so the window is widened from 32 KiB to keep the walk cheap.
+    // Files alternate by chunk, as `grep -r` does. Only the chunk matters, so the window is
+    // wider than the kernel's to keep the walk cheap.
     const W: u64 = 256 * 1024;
     const CHUNK: u64 = 2 * W;
     let (mock, fs) = mount(
@@ -363,7 +363,7 @@ async fn interleaved_files_each_keep_a_span() {
     }
 
     // Nothing fetched twice, up to under a window of overlap per span boundary. No ceiling on
-    // the span count: reverting the share sizing fetches *fewer*, wastefully larger, spans.
+    // the span count: unshared, whole-`READ_SPAN` spans would be *fewer* but wasteful.
     let spans = mock.content_ranges().len() as u64;
     let waste = mock.bytes_sent().saturating_sub(3 * REAL);
     assert!(waste < spans * W, "{waste} wasted over {spans} spans");
@@ -683,9 +683,8 @@ async fn start_full(
                         // What an expired preauthenticated URL answers.
                         reply(401, br#"{"error":"expired"}"#.to_vec())
                     } else {
-                        // A blob the fixture does not carry is a 404, not an empty file.
-                        // Serving empty bytes would make a download failure unreachable
-                        // from a test, which is the shape the read path classifies on.
+                        // A missing blob is a 404, not empty bytes, so a test can reach a
+                        // download failure.
                         match blobs.get(id) {
                             Some(blob) => serve_content(blob.clone(), range.as_deref(), range_mode),
                             None => reply(404, br#"{"error":"itemNotFound"}"#.to_vec()),
@@ -704,8 +703,7 @@ async fn start_full(
                         // with, so a test can ask for a failure that is *not* an absence.
                         // The body is the shape Graph sends: an inner error carrying a
                         // correlation id, which is hex and so sometimes spells `404` while
-                        // meaning nothing by it. A `429` carries `Retry-After` as the
-                        // service does, stating a wait far past what a mount may sleep.
+                        // meaning nothing by it.
                         Some(Value::Number(n)) => {
                             let code = n.as_u64().unwrap_or(500) as u16;
                             let body = br#"{"error":{"code":"accessDenied","innerError":
@@ -785,8 +783,7 @@ fn serve_content(blob: Vec<u8>, range: Option<&str>, mode: RangeMode) -> (Vec<u8
         (out, bytes.len())
     };
     let asked = range.and_then(parse_range);
-    // No range asked, or one this origin ignores — the whole file, which Microsoft
-    // documents as a legitimate answer to a range it cannot generate.
+    // No range asked, or one this origin ignores: the whole file.
     let Some((from, to)) = asked.filter(|_| mode != RangeMode::Ignore) else {
         return body(200, &blob, None);
     };
@@ -854,10 +851,8 @@ fn folder_path_of_id(tree: &Value, encoded: &str) -> Option<String> {
 
 /// The row whose id encodes to `encoded`.
 ///
-/// Encoding the fixtures forwards rather than decoding the request: the accessor's own
-/// encoder is the definition of what an id becomes on the wire, so a mock that compares
-/// against it cannot disagree with the thing under test about what was asked for. A
-/// second, hand-written decoder here could.
+/// Encodes fixture ids with the accessor's own encoder instead of decoding the request, so
+/// the mock cannot disagree with the code under test about the wire form.
 fn find_item_by_id(tree: &Value, encoded: &str) -> Option<Value> {
     tree.as_object()?
         .values()
@@ -878,8 +873,7 @@ fn find_item_by_id(tree: &Value, encoded: &str) -> Option<Value> {
 ///
 /// That last part is the one place this mock is deliberately as unhelpful as the service:
 /// Graph accepts a `$select` naming the URL by the key it answers under, and then omits it
-/// from every row without saying so. A mock that answered anyway would hide the mistake,
-/// which is exactly what it did until a live read failed.
+/// from every row without saying so. A mock that answered anyway would hide the mistake.
 fn with_host(row: &Value, host: &str, fresh: bool, query: &str) -> Value {
     let mut row = row.clone();
     let Some(u) = row.get(DOWNLOAD_URL_KEY).and_then(|u| u.as_str()) else {

@@ -1,15 +1,8 @@
 //! The host's mount table, and taking a mount down without holding a thread on it.
 //!
-//! Everything here is about mounts *this process may not own* — the ones a
-//! previous run left behind, and the ones a guard is about to release. Neither
-//! can be asked about through the filesystem: a mount whose server is gone is
-//! still registered, and nothing answers it, so `stat`ing the path to see
-//! whether it is there is the exact hang this exists to avoid. The mount table
-//! answers from the kernel's own list instead, and answers immediately.
-//!
-//! [`unmount_under`] is the other half. `unmount(2)` is a syscall with no
-//! timeout, so the wait has to be bounded from outside the process that makes
-//! it — see the comments there.
+//! These mounts may not be this process's (a previous run's, or one a guard is releasing), and
+//! a mount whose server is gone is still registered with nothing answering, so nothing here
+//! `stat`s a mount point; the table answers from the kernel's list immediately.
 
 use std::{
     ffi::OsString,
@@ -17,10 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// How long one `umount` gets before it is given up on.
-///
-/// A mount that does not come back in this long is one a person will have to
-/// deal with, and waiting longer only makes whoever is sweeping pay for it too.
+/// How long one `umount` gets. Past this a person has to deal with the mount, and waiting
+/// longer only stalls the sweep.
 const UNMOUNT_DEADLINE: Duration = Duration::from_secs(3);
 
 /// How often a child `umount` is checked on while it runs.
@@ -28,37 +19,23 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Every mount point the operating system has at or under `root`.
 ///
-/// Asked of the mount table and never of the filesystem, for the reason in this
-/// module's docs — which is also what makes this the only way to ask whether
-/// something is mounted without risking the hang: `exists`, `metadata` and every
-/// other `std` answer goes through the path itself.
+/// Includes `root` itself when it is a mount point. Never touches the path, since `exists`,
+/// `metadata` and the like would hang on a wedged mount.
 ///
-/// `root` is taken as given and resolved here. The comparison against the table
-/// is textual (`starts_with`, whole components) and the table spells paths the
-/// long way — on macOS `$TMPDIR` is `/var/folders/…`, `/var` is a symlink to
-/// `private/var`, and the table says `/private/var/folders/…` — so an unresolved
-/// root would match no row and answer "nothing is mounted" about a mount that is.
-/// Resolving is safe to do to a mount point precisely because only the *parent* is
-/// resolved — never the path itself, which may be the wedged one — so doing it here
-/// costs the caller nothing to get right.
+/// `root` is resolved here: the comparison is textual (whole components) and the table spells
+/// paths resolved, e.g. macOS `$TMPDIR` `/var/folders/…` appears as `/private/var/folders/…`,
+/// so an unresolved root would miss a real mount.
 ///
-/// Includes `root` itself when `root` is the mount point, which is the common
-/// case for a single guard.
-///
-/// `getfsstat` and not `getmntinfo`, which is the obvious call and the wrong one:
-/// it hands back a pointer to a buffer it owns and reuses, so two threads asking
-/// at once get each other's answer or a half-written one. Every guard's teardown
-/// polls this, so "two at once" is the normal case here rather than an unusual
-/// one. `getfsstat` fills a buffer the caller owns.
+/// `getfsstat`, not `getmntinfo`: the latter returns a shared internal buffer, which races
+/// when guards tear down concurrently.
 #[cfg(target_os = "macos")]
 pub(crate) fn mounts_under(root: &Path) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
 
     let root = resolved(root);
 
-    // `MNT_NOWAIT` so that it cannot block on a wedged filesystem — which means
-    // the per-filesystem numbers may be stale, though the list of mounts itself
-    // is current. Nothing here reads anything but the mount point.
+    // `MNT_NOWAIT` cannot block on a wedged filesystem; only per-fs stats may be stale, and
+    // only the mount point is read.
     //
     // SAFETY: a null buffer asks only for the count, which is what the argument
     // pair says.
@@ -84,9 +61,7 @@ pub(crate) fn mounts_under(root: &Path) -> Vec<PathBuf> {
         .filter_map(|entry| {
             // SAFETY: `f_mntonname` is a NUL-terminated C string in a fixed array.
             let name = unsafe { std::ffi::CStr::from_ptr(entry.f_mntonname.as_ptr()) };
-            // Bytes rather than `to_str`: a mount point is a path and need not
-            // be UTF-8, and one that is not is still a path that has to come
-            // down.
+            // Bytes, since a mount point need not be UTF-8.
             let path = PathBuf::from(OsString::from_vec(name.to_bytes().to_vec()));
             path.starts_with(&root).then_some(path)
         })
@@ -112,18 +87,11 @@ pub(crate) fn mounts_under(root: &Path) -> Vec<PathBuf> {
 
 /// How a mount is asked to come down, in the order it is asked.
 ///
-/// Plain `umount` first, because it is the one that fails safely: it refuses a
-/// mount that is still in use (`EBUSY`, "Resource busy") rather than pulling it
-/// out from under whoever is using it. A mount with readers on it refuses every
-/// time, which is why the first rung is never the whole answer.
+/// Plain `umount` first, since it fails safely: a mount in use refuses with `EBUSY`.
 ///
-/// Then force, because a caller that has dropped its guard has already said the
-/// mount is over, and a mount nobody can take down is the failure this whole
-/// module exists to avoid. On macOS that is `diskutil`, which is the tool that
-/// works: `umount -f` needs root and answers `EPERM`, while `diskutil unmount
-/// force` took down a busy mount that plain `umount` had just refused. On Linux
-/// it is a lazy detach, which unlinks the mount now and lets the last reference
-/// finish on its own.
+/// Then force, since dropping the guard already declared the mount over. On macOS that is
+/// `diskutil unmount force` (`umount -f` needs root and answers `EPERM`); on Linux a lazy
+/// detach, which unlinks now and lets the last reference finish.
 #[cfg(target_os = "macos")]
 const LADDER: [&[&str]; 2] = [&["umount"], &["diskutil", "unmount", "force"]];
 
@@ -132,25 +100,16 @@ const LADDER: [&[&str]; 2] = [&["umount"], &["umount", "-l"]];
 
 /// Take down every mount at or under `root`.
 ///
-/// Each attempt runs in a **child process**, because that is the only shape that
-/// can be given up on: `libc::unmount` is a syscall with no timeout, and a
-/// timeout around a worker thread would bound only how long this waits — the
-/// thread itself would be leaked, blocked forever, one more per wedged mount this
-/// ever meets. Every rung of the ladder is bounded that way, which is what makes
-/// trying a forceful one safe: `diskutil` has been seen to hang, and a hang in a
-/// child is a child that gets killed.
+/// Each attempt runs in a **child process**, the only thing that can be abandoned:
+/// `unmount(2)` has no timeout, and a timed-out thread would leak blocked forever. That makes
+/// the forceful rung safe too, since `diskutil` can hang and a hung child gets killed.
 ///
-/// `true` when nothing is mounted under `root` any more. Whoever wants to say *what*
-/// survived already knows the path it asked about.
+/// `true` when nothing is mounted under `root` any more.
 ///
-/// Whether a mount came down is read off the mount table between rungs, never
-/// from an exit status, which cannot tell the two cases apart: `umount` exits 1
-/// both for a mount it could not release and for a path that was never mounted.
-/// Since [`mounts_under`] may name a mount already gone, reading a failed
-/// `umount` as "it survived" would report a phantom every time.
+/// Success is read off the mount table, never an exit status: `umount` exits 1 both for a
+/// mount it could not release and for a path no longer mounted.
 ///
-/// `root` is taken as given: [`mounts_under`] resolves it, so a caller that holds
-/// `$TMPDIR/…` hands that over and does not have to know how the table spells it.
+/// `root` need not be resolved.
 pub(crate) fn unmount_under(root: &Path) -> bool {
     for mountpoint in mounts_under(root) {
         for rung in LADDER {
@@ -158,19 +117,15 @@ pub(crate) fn unmount_under(root: &Path) -> bool {
             let spawned = std::process::Command::new(command)
                 .args(leading)
                 .arg(&mountpoint)
-                // Silenced, because the first rung refusing a busy mount is the
-                // expected path to the second one — printing its "Resource busy"
-                // would make every successful forceful teardown look like a
-                // failure. What survived is reported by the caller instead.
+                // Silenced: the first rung's "Resource busy" is expected and would make a
+                // successful forced teardown look like a failure. Callers report survivors.
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn();
             if let Ok(mut child) = spawned {
                 wait_briefly(&mut child);
             }
-            // Asked again before the next rung, so a mount that came down does
-            // not get a forceful one aimed at it — by which time the path may
-            // belong to something else entirely.
+            // Rechecked so a forceful rung never hits a path that may now be something else.
             if !mounts_under(&mountpoint).iter().any(|m| m == &mountpoint) {
                 break;
             }
@@ -182,11 +137,9 @@ pub(crate) fn unmount_under(root: &Path) -> bool {
 
 /// Wait for `child` up to [`UNMOUNT_DEADLINE`], then give up on it.
 ///
-/// Signalled but **not reaped** on overrun: `kill` only queues `SIGKILL`, and a
-/// child wedged in the kernel on this very mount does not act on it until its
-/// syscall returns — which is the case this bounding exists to survive. A
-/// `wait()` here would block forever and put the hang back one layer down. A
-/// zombie is the cheaper leak.
+/// Killed but **not reaped** on overrun: a child wedged in the kernel on this mount does not
+/// act on `SIGKILL` until its syscall returns, so `wait()` could block forever. A zombie is
+/// the cheaper leak.
 fn wait_briefly(child: &mut std::process::Child) {
     let deadline = Instant::now() + UNMOUNT_DEADLINE;
     loop {
@@ -201,16 +154,12 @@ fn wait_briefly(child: &mut std::process::Child) {
     }
 }
 
-/// `path` with its parent resolved — the spelling the mount table uses.
+/// `path` with its parent resolved, the spelling the mount table uses.
 ///
-/// Only the parent is resolved, never `path` itself: the parent is an ordinary
-/// directory, where `path` may be a mount point whose server is gone, and
-/// `canonicalize` on that is a `stat` on the wedged path.
+/// Never `path` itself: it may be a mount whose server is gone, and `canonicalize` would
+/// `stat` it and hang.
 ///
-/// Not public, because nothing outside has to think about it: [`mounts_under`]
-/// and [`unmount_under`] resolve what they are given, and a guard resolves its own
-/// mount point once when it claims it. What is left here is the one caller that
-/// wants to resolve *once* and compare many times.
+/// For callers that resolve once and compare many times.
 pub(crate) fn resolved(path: &Path) -> PathBuf {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return path.to_path_buf();
@@ -247,9 +196,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// An unresolved `$TMPDIR` matches no row on macOS, which is the failure
-    /// `resolved` exists to prevent — so the resolved form has to differ from
-    /// the raw one, or the guard is not doing anything.
+    /// An unresolved macOS `$TMPDIR` matches no table row, so resolving must change it.
     #[test]
     #[cfg(target_os = "macos")]
     fn resolving_a_temp_path_changes_it() {

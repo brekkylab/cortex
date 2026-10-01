@@ -1,22 +1,7 @@
-//! Binds a [`Posix`] to `fuser`'s host-side [`Filesystem`]. [`FuseMount`] is the whole of
-//! what it exports.
+//! Binds a [`Posix`] to `fuser`'s host-side [`Filesystem`].
 //!
-//! Sibling of the `fuse_t` binding: the same [`Posix`] operations through a different interface,
-//! so everything here is translation. What differs from that side is who drives the session —
-//! `fuser` speaks the kernel FUSE protocol over the mount fd itself, which is exactly what
-//! FUSE-T's helper will not tolerate — and the attribute type ([`FileAttr`] rather than a
-//! `stat` this crate lays out by hand). The errno numbering is shared: both answer this
-//! host's kernel.
-//!
-//! The binding for every unix but macOS, which has the `fuse_t` binding instead. On Linux
-//! `fuser` opens `/dev/fuse` itself, so nothing has to be installed.
-//!
-//! What stays on `fuser`'s `ENOSYS` defaults is what the store contract has no notion of:
-//! symlinks, hard links, extended attributes.
-//!
-//! **Hard to test in isolation, and structurally so**: a callback here answers by consuming a
-//! `Reply*` object only `fuser` can construct, so there is nothing to hand it and nothing it
-//! hands back. Exercising it means a real mount.
+//! **Testing needs a real mount**: a callback answers by consuming a `Reply*` only `fuser` can
+//! construct.
 
 use std::{
     ffi::OsStr,
@@ -49,56 +34,45 @@ const HOST_OPEN_FLAGS: OpenFlagBits = OpenFlagBits {
     create_new: libc::O_EXCL,
 };
 
-/// What the mount reports as its source — the name `df` and Finder show.
-///
-/// Fixed, because nothing has wanted another one.
+/// The mount's source name, as `df` shows it.
 const FSNAME: &str = "cortex";
 
 /// A live mount on the kernel's own FUSE: constructing one mounts, dropping it unmounts.
 ///
-/// The whole call surface of this binding, and the counterpart of
-/// [`FuseTMount`](super::FuseTMount) — same shape, different interface underneath.
+/// The binding for every unix but macOS. `fuser` speaks the kernel FUSE protocol over the
+/// mount fd itself and opens `/dev/fuse`.
 ///
-/// Not generic in the store, and needs no erasure to manage it: `fuser`'s session owns the
-/// filesystem it was handed, so unlike the FUSE-T binding there is no raw pointer here whose
-/// target something else has to keep alive.
+/// Not generic in the store: `fuser`'s session owns the filesystem.
 pub struct FuseMount {
-    /// `Option` so `Drop` can take ownership: both of `fuser`'s exits consume the session, and
-    /// `Drop` has only `&mut self`. `None` once [`join`](Self::join) or `Drop` has taken it.
+    /// `Option` because both of `fuser`'s exits consume the session and `Drop` has only
+    /// `&mut self`. `None` once [`join`](Self::join) or `Drop` took it.
     session: Option<fuser::BackgroundSession>,
 
     mountpoint: PathBuf,
 
-    /// This process's ownership of the mount point — what an opt-in
-    /// [`unmount_on_signal`](crate::fs::unmount_on_signal) reads now, and what a later run's
-    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) reads if this one is killed. Held
-    /// rather than read: dropping it is what gives the mount point up.
+    /// Names the mount point to [`unmount_on_signal`](crate::fs::unmount_on_signal) and, if
+    /// this process is killed, to a later run's
+    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned).
     _claim: Claim,
 }
 
 impl FuseMount {
     /// Mount `fs` at `mountpoint` and serve it from a background thread.
     ///
-    /// `mountpoint` must already exist. On Linux this needs nothing installed.
+    /// `mountpoint` must already exist. On Linux only a non-root user needs anything installed
+    /// (`fusermount3`).
     ///
-    /// Returns as soon as the mount is real, and needs no waiting to say so: the mount syscall
-    /// happens before this returns, so the path is a mount point by the time a caller has the
-    /// guard. (The FUSE-T binding has to poll for that, because its kernel-side mount is
-    /// completed by a helper it has not answered yet.)
+    /// The mount syscall completes before this returns, so the path is already a mount point.
     ///
-    /// `'static`, because the store is served from that thread for as long as the mount lives.
+    /// `'static` because the store is served from that thread for the mount's lifetime.
     pub fn try_new<T: FileSystem + 'static>(fs: T, mountpoint: &Path) -> io::Result<Self> {
         Self::try_new_with(fs, mountpoint, vec![MountOption::FSName(FSNAME.into())])
     }
 
     /// [`try_new`](Self::try_new) with the mount options spelled out.
     ///
-    /// [`MountOption::RO`] is the one worth reaching for: it makes the *kernel* reject writes
-    /// before they reach a store, which is stronger than every store answering
-    /// `ReadOnlyFilesystem` by hand — and it covers the ones that would have answered `Ok`.
-    ///
-    /// The options are `fuser`'s own, and this is the only binding that has any: FUSE-T takes a
-    /// different set entirely, which is why its `try_new_with` chooses a transport instead.
+    /// [`MountOption::RO`] is the useful one: the *kernel* rejects writes before any store
+    /// sees them, including stores that would have answered `Ok`.
     pub fn try_new_with<T: FileSystem + 'static>(
         fs: T,
         mountpoint: &Path,
@@ -106,13 +80,10 @@ impl FuseMount {
     ) -> io::Result<Self> {
         crate::fs::mount_support()?;
 
-        // What a `SIGKILL`ed run left behind is nobody's but the next run's, and this
-        // is the next run. Only mounts whose owning process is gone are touched, so a
-        // sibling instance keeps its own.
+        // Clears mounts a `SIGKILL`ed run left; live siblings' mounts are untouched.
         reclaim_abandoned();
 
-        // `Config` is `#[non_exhaustive]`, so it cannot be built with a struct literal from
-        // outside `fuser` — start from the default and assign.
+        // `Config` is `#[non_exhaustive]`, so no struct literal.
         let mut config = Config::default();
         config.mount_options = options;
         let session = fuser::spawn_mount2(Posix::new(fs), mountpoint, &config)?;
@@ -123,16 +94,10 @@ impl FuseMount {
         })
     }
 
-    /// Serve until the mount goes away, then take it down.
+    /// Serve until something else ends the mount (`umount`, `fusermount -u`, or the kernel
+    /// dropping the connection). **It does not unmount**; to end the mount, drop the guard.
     ///
-    /// For a program whose whole job is the mount: `try_new` puts it up without blocking, and
-    /// this waits for something else to end it — `umount`, `fusermount -u`, or the kernel
-    /// tearing the connection down. **It does not unmount**, so a caller with other work to do
-    /// drops the guard instead of joining it.
-    ///
-    /// The session is taken out here, so the `Drop` that follows has nothing left to do.
-    ///
-    /// `Err` is the serving thread having failed or panicked.
+    /// `Err` if the serving thread failed or panicked.
     pub fn join(mut self) -> io::Result<()> {
         match self.session.take() {
             Some(session) => session.join(),
@@ -141,7 +106,6 @@ impl FuseMount {
     }
 }
 
-/// Nothing to arrange: the guard already is the mount, and already knows where it is.
 impl Mount for FuseMount {
     fn mountpoint(&self) -> &Path {
         &self.mountpoint
@@ -151,19 +115,11 @@ impl Mount for FuseMount {
 impl Drop for FuseMount {
     /// `fuser`'s own unmount, then the operating system's if that was refused.
     ///
-    /// `umount_and_join` is `mount.umount()?` followed by the join, so a refused unmount
-    /// returns before the join and leaves the mount up — and a mount with readers on it *is*
-    /// refused, with `EBUSY`. Stopping there would leave the mount behind, which breaks the
-    /// contract rather than merely putting a message on stderr.
+    /// `umount_and_join` returns before joining when the unmount is refused (`EBUSY` whenever
+    /// the mount has readers), which would leave it up. Dropping the guard declares the mount
+    /// over, so a refusal escalates: a bounded child per attempt, ending in a lazy detach.
     ///
-    /// So the refusal is not the end of it. A caller that has dropped the guard has said the
-    /// mount is over, and what follows is the escalation the FUSE-T binding and
-    /// [`reclaim_abandoned`](crate::fs::reclaim_abandoned) also use — a bounded child per
-    /// attempt, ending in a lazy detach — so a busy mount comes down the same way whoever is
-    /// taking it down.
-    ///
-    /// Nothing here panics. A `Drop` that panics mid-unwind aborts the process, which in a
-    /// failing test replaces the real assertion with a bare abort.
+    /// Never panics: a panic mid-unwind aborts, hiding a failing test's real assertion.
     fn drop(&mut self) {
         let Some(session) = self.session.take() else {
             return;
@@ -175,8 +131,7 @@ impl Drop for FuseMount {
         if unmount_under(&resolved(&self.mountpoint)) {
             return;
         }
-        // Not silent: a mount that would not come down is left behind for someone to clear by
-        // hand, so saying so — and saying what `fuser` made of it — is the least this can do.
+        // Left for someone to clear by hand, so say so, with `fuser`'s reason.
         eprintln!(
             "cortex: unmounting {} failed: {refused}",
             self.mountpoint.display()
@@ -184,15 +139,14 @@ impl Drop for FuseMount {
     }
 }
 
-/// Wrap the shared host-errno table in `fuser`'s newtype. The table is shared with the FUSE-T
-/// binding: both answer this host's kernel.
+/// The host-errno table in `fuser`'s newtype, since replies go to this host's kernel.
 fn to_errno(err: io::Error) -> Errno {
     Errno::from_i32(host_errno(&err))
 }
 
-/// Lay the shared attribute policy into `fuser`'s struct, which splits what `st_mode` packs
-/// into a separate `kind` and `perm`. Ownership is the *mounting user's*: a mount whose files
-/// belong to someone else cannot be traversed.
+/// The shared attributes in `fuser`'s struct, which splits `st_mode` into `kind` and `perm`.
+/// Owned by the *mounting user*, since a mount whose files belong to someone else cannot be
+/// traversed.
 fn to_file_attr(inode: u64, stat: &Stat) -> FileAttr {
     let attr = attr_for(stat);
     FileAttr {
@@ -222,6 +176,9 @@ fn to_file_type(kind: DirentKind) -> FileType {
     }
 }
 
+/// Symlinks and hard links stay on `fuser`'s `EPERM` defaults, extended attributes on its
+/// `ENOSYS` ones; the store contract has no notion of them.
+///
 /// The `'static` bound is `fuser`'s: a mounted session outlives the mount call, so the
 /// filesystem may not borrow.
 impl<T: FileSystem + 'static> Filesystem for Posix<T> {
@@ -296,8 +253,7 @@ impl<T: FileSystem + 'static> Filesystem for Posix<T> {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        // The cursor protocol is the shared operation's; this closure only encodes. `add`
-        // returning true is the `stop` flag.
+        // `add` returning true (buffer full) is the `stop` flag.
         let streamed =
             super::block_on(
                 self.for_each_dirent(ino.0, offset, |child_inode, child, cursor| {
@@ -431,10 +387,8 @@ impl<T: FileSystem + 'static> Filesystem for Posix<T> {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` cannot be served: libfuse-t's `rename` takes no
-        // flags at all, so a contract carrying them would be unhonourable in one of the
-        // bindings. EINVAL is Linux's own answer for a rename flag it does not implement, and
-        // unlike ENOSYS it does not make the kernel stop sending renames for the whole mount.
+        // `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are outside the shared contract; EINVAL is
+        // Linux's answer for an unimplemented rename flag.
         if !flags.is_empty() {
             reply.error(Errno::from_i32(libc::EINVAL));
             return;
@@ -464,9 +418,7 @@ impl<T: FileSystem + 'static> Filesystem for Posix<T> {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        // `fuser` has already decoded the validity mask into these `Option`s. The file handle
-        // it may also carry is dropped: a resize names a path either way, and the inode
-        // arriving beside it is already that path.
+        // Any file handle is ignored: the inode already names the path to resize.
         let want = SetAttr {
             size,
             mode,

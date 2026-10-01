@@ -1,51 +1,11 @@
-//! Which mount points this process owns — in memory for the signal path, on disk
-//! for the run that comes after this one.
+//! Which mount points this process owns: in memory for the signal path, on disk for later
+//! runs, since a `SIGKILL`ed mount can only be cleared by another run. Taking a claim records
+//! the mount point in both places; dropping it removes both, the disk one only once the mount
+//! is down.
 //!
-//! A guard is the owner of a mount while it lives, and both things that outlive a
-//! guard need to know what it owned. The signal handler needs it *now*, in this
-//! address space. [`reclaim_abandoned`] needs it in a **later process**, because
-//! the run that has to clear a `SIGKILL`ed mount is by definition not the run that
-//! made it. One claim covers both: taking one records the mount point in memory
-//! and in a file, dropping it removes both.
-//!
-//! # Why a register at all, rather than reading the mount table
-//!
-//! The mount table cannot say which mounts are cortex's. A FUSE-T mount is spelled
-//! `nfs` there, and the mount point is a path the *caller* chose — cortex takes an
-//! arbitrary `&Path` and has no naming convention to recognise later. So what is
-//! swept has to be what was written down.
-//!
-//! # Why the pid, and what it costs
-//!
-//! “Abandoned” is not “under a root I know about” — it is “owned by a process that
-//! is gone”. Without that test a second instance of a program with a fixed mount
-//! point would unmount the first instance's *live* tree. The pid in the file name
-//! is what makes the test possible: `kill(pid, 0)` answering `ESRCH` is the one
-//! answer that means abandoned, where `EPERM` means alive under another user.
-//!
-//! A pid can be reused, and then a dead owner looks alive and its mount is left for
-//! a later run to meet again. That is the safe direction to be wrong in: the
-//! mistake is failing to reclaim, never reclaiming something still in use.
-//!
-//! # The watchdog, for the exits nothing in this process sees
-//!
-//! A guard covers every exit that runs a destructor, and [`unmount_on_signal`] the
-//! signals that can be caught once a program asks for it. What neither can cover is
-//! the exit that runs no code of this process's at all: `SIGKILL`, a crash, the OOM
-//! killer -- and, as ordinary as any of those, a runtime that ends without running
-//! its finalizers, as Node does on `process.exit()`. Each of those used to leave a
-//! mount with nothing answering it until a later run reclaimed it.
-//!
-//! So the first claim a process takes starts a watchdog: `/bin/sh`, in a process
-//! group of its own so a terminal's `^C` does not reach it, holding the read end of
-//! a pipe whose write end only this process has. However this process ends, the
-//! kernel closes that end, the watchdog's read returns, and it takes down whatever
-//! this process's records still name -- with the same rungs as
-//! [`unmount_under`], and removing a record only once its mount came down, so what
-//! it could not clear is still [`reclaim_abandoned`]'s to try. An ordinary exit
-//! finds no records left and costs the watchdog nothing but its exit.
-//!
-//! [`unmount_on_signal`]: super::unmount_on_signal
+//! A register rather than the mount table, which cannot say which mounts are cortex's: a
+//! FUSE-T mount is spelled `nfs` there, and the mount point is an arbitrary caller-chosen path.
+//! Each record is named for its owner's pid, so abandoned means "owner gone" ([`gone`]).
 
 use std::{
     ffi::OsString,
@@ -71,17 +31,13 @@ use {
 
 use super::table::{mounts_under, unmount_under};
 
-/// Where the records live, under the temporary directory.
+/// Records directory, under the temporary directory.
 const DIR: &str = "cortex-mounts";
 
-/// How many abandoned mount points one call will spend an unmount on.
+/// How many abandoned mounts one call will try to unmount; only mounts still present are charged.
 ///
-/// Each costs a bounded wait, and this runs on the thread that is trying to mount,
-/// so an unbounded scan would make a host's accumulated wreckage everybody's
-/// startup latency. Whatever is left over is the next run's to try.
-///
-/// Only mounts that were actually there are charged; a record whose mount is
-/// already gone costs a `read` and a `remove_file`.
+/// Each costs a bounded wait on the thread trying to mount, so an unbounded sweep would turn
+/// a host's accumulated leftovers into startup latency.
 const BUDGET: usize = 4;
 
 /// Distinguishes two mounts made by one process — a pid alone does not.
@@ -90,34 +46,23 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 
 /// Every mount this process has up, resolved as the mount table spells them.
 ///
-/// Written by every guard, whether or not a signal handler was ever installed: a
-/// consumer that calls [`unmount_on_signal`](super::unmount_on_signal) *after*
-/// mounting has to find the mounts that already exist, and a register that only
-/// started counting at installation would miss exactly those.
+/// Kept even with no signal handler installed, so
+/// [`unmount_on_signal`](super::unmount_on_signal) called after mounting still sees them.
 static LIVE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// What this process currently has mounted.
 pub(crate) fn live() -> Vec<PathBuf> {
-    // Poisoning is ignored: a panic elsewhere must not turn every later mount into
-    // an unrecoverable one.
+    // Poisoning ignored, so one panic does not make every later mount unrecoverable.
     LIVE.lock().map(|live| live.clone()).unwrap_or_default()
 }
 
 /// A guard's ownership of one mount point, held for as long as the mount is.
-///
-/// Gated on there being a binding to claim with: with none compiled in, nothing in
-/// this process can mount. [`reclaim_abandoned`] stays ungated — clearing what a
-/// *previous* run left needs no binding at all, only the register and a path.
-///
-/// Dropping it gives the mount point up in both registers, so an ordinary teardown
-/// leaves nothing for the signal path or for a later run to find.
 #[cfg(feature = "mount")]
 pub(crate) struct Claim {
     mountpoint: PathBuf,
 
-    /// The record on disk. `None` when there was nowhere trustworthy to write one,
-    /// which costs recovery-after-`SIGKILL` and nothing else — the mount still
-    /// works and still comes down on drop.
+    /// The record on disk. `None` when there was nowhere trustworthy to write one, which
+    /// costs only recovery after `SIGKILL`.
     record: Option<PathBuf>,
 }
 
@@ -137,19 +82,17 @@ pub(crate) fn claim(mountpoint: &Path) -> Claim {
             NEXT.fetch_add(1, Ordering::Relaxed)
         );
         let path = dir.join(name);
-        // Bytes, not a string: a mount point is a path and need not be UTF-8, and
-        // one that is not is still a path that has to come down.
+        // Bytes, since a mount point need not be UTF-8.
         let _ = fs::write(&path, mountpoint.as_os_str().as_bytes());
         path
     });
     Claim { mountpoint, record }
 }
 
-/// What the watchdog runs -- see the module docs.
+/// The watchdog's script (see [`watch`]).
 ///
-/// `cat` returns when no process holds the pipe's write end any more; the owner's pid
-/// and the registry come in the environment. Signals a person or a supervisor sends
-/// are ignored, since the whole point is to outlive the process they were sent to.
+/// `cat` returns once no process holds the pipe's write end; owner pid and registry come in
+/// the environment. Stop signals are ignored so it outlives the process they were sent to.
 #[cfg(feature = "mount")]
 const WATCHDOG_SCRIPT: &str = r#"
 trap '' INT TERM HUP QUIT PIPE
@@ -166,15 +109,20 @@ for record in "$CORTEX_MOUNT_REGISTRY/$CORTEX_MOUNT_OWNER"-*; do
 done
 "#;
 
-/// Start this process's watchdog, once -- see the module docs.
+/// Start this process's watchdog, once per pid.
 ///
-/// Once per *pid*, not per process image: a forked child inherits the parent's end of the
-/// parent's pipe and would keep that watchdog waiting on the child as well, so a child
-/// that mounts drops the inherited end and starts one of its own.
+/// Covers exits that run none of this process's code: `SIGKILL`, a crash, the OOM killer, or a
+/// runtime that skips finalizers (Node on `process.exit()`). The watchdog is `/bin/sh` in its
+/// own process group (so a terminal's `^C` misses it), reading a pipe whose write end only
+/// this process holds. However this process ends, the kernel closes that end and the watchdog
+/// unmounts whatever this process's records still name (plain `umount`, then force), removing
+/// a record only once its mount is down so the rest stays for [`reclaim_abandoned`]. After an
+/// ordinary exit it finds no records.
 ///
-/// Best effort. A watchdog that cannot be started costs what it would have saved --
-/// the mount comes down on the next run's reclaim instead -- and is not a reason to
-/// refuse the mount.
+/// Per pid because a forked child inherits the parent's write end, which would keep the
+/// parent's watchdog waiting on the child too; a child that mounts replaces it with its own.
+///
+/// Best effort: without a watchdog the next run's reclaim clears the mount instead.
 #[cfg(feature = "mount")]
 fn watch(registry: &Path) {
     use std::{
@@ -201,9 +149,8 @@ fn watch(registry: &Path) {
         .stderr(Stdio::null())
         .process_group(0)
         .spawn();
-    // The `Child` is let go without a wait: the watchdog outlives this process by
-    // design, and until then it is blocked on a read that only this process's end can
-    // end. The pipe's end is `CLOEXEC`, so nothing this process spawns holds it.
+    // Never waited on: the watchdog outlives this process by design. The write end is
+    // `CLOEXEC`, so nothing this process spawns holds it.
     if let Ok(mut child) = spawned
         && let Some(stdin) = child.stdin.take()
     {
@@ -214,20 +161,14 @@ fn watch(registry: &Path) {
 #[cfg(feature = "mount")]
 impl Drop for Claim {
     fn drop(&mut self) {
-        // Dropped unconditionally, unlike the record below: this is the list a signal
-        // unmounts, and an entry no guard stands behind is a path this process would
-        // take down whatever ends up mounted there later.
+        // Always removed: a signal unmounts this list, and a stale entry would take down
+        // whatever gets mounted there later.
         if let Ok(mut live) = LIVE.lock()
             && let Some(at) = live.iter().position(|p| p == &self.mountpoint)
         {
             live.swap_remove(at);
         }
-        // The record outlives the guard when the mount does, so a later run meets it
-        // again rather than forgetting a mount that is still in the way. Both exits
-        // that report a mount they could not take down reach this with it still up.
-        //
-        // Asked of the mount table rather than passed in: the guard knows what it
-        // attempted, the table knows what is there.
+        // Kept while the mount is still up (a failed teardown), so a later run reclaims it.
         if let Some(record) = &self.record
             && mounts_under(&self.mountpoint).is_empty()
         {
@@ -238,14 +179,11 @@ impl Drop for Claim {
 
 /// The directory the records live in, created if it is not there.
 ///
-/// `None` rather than an error, and `None` for anything the least bit wrong: this
-/// directory decides what a later run will `umount`, so a version of it somebody
-/// else can write into is a way to be told to unmount an arbitrary path. Mode
-/// `0700` and owned by us, or it is not used.
+/// `None` unless it is ours and not group/world-writable: its contents decide what a later
+/// run will `umount`, so a writable one lets anyone request unmounting an arbitrary path.
 ///
-/// The check is not redundant with the mode passed to `create`: a directory that
-/// already exists keeps the mode and the owner it already had, and on Linux
-/// `/tmp` is world-writable, so anyone could have made this one first.
+/// Checked after `create` because an existing directory keeps its mode and owner, and on
+/// Linux anyone could have made it first in world-writable `/tmp`.
 fn registry() -> Option<PathBuf> {
     let dir = std::env::temp_dir().join(DIR);
     fs::DirBuilder::new()
@@ -267,50 +205,37 @@ fn registry() -> Option<PathBuf> {
 
 /// Whether `pid` is gone.
 ///
-/// `kill` with signal 0 sends nothing and only reports whether the pid could be
-/// signalled. `ESRCH` — no such process — is the one answer that means the mount
-/// is abandoned; `EPERM` says it is alive under another user, and that is not ours
-/// to take down.
+/// Only `ESRCH` from `kill(pid, 0)` means gone; `EPERM` is alive under another user.
+///
+/// A reused pid makes a dead owner look alive, so its mount waits for a later run: failing to
+/// reclaim, never reclaiming something in use.
 fn gone(pid: libc::pid_t) -> bool {
-    // Nothing but a real process id is asked about. `kill` reads 0 as "every
-    // process in my group" and a negative number as "the group named by its
-    // absolute value", so a record whose name parsed to one of those would ask a
-    // question about *ourselves* and be answered "alive" — never reclaimed, but by
-    // accident rather than by rule.
+    // `kill` reads 0 and negatives as process groups, which would ask about ourselves.
     if pid <= 0 {
         return false;
     }
-    // SAFETY: signal 0 performs only the permission and existence check; it cannot
-    // affect this or any other process.
+    // SAFETY: signal 0 only checks existence and permission.
     let answer = unsafe { libc::kill(pid, 0) };
     answer == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Take down every mount this host has that belonged to a cortex process which is
-/// no longer running, and report what that met.
+/// Take down every mount left by a cortex process that is no longer running.
 ///
-/// This is the `SIGKILL` half of the contract. Nothing a dying process does can
-/// help there — no handler runs — so the mount point is cleared by whoever comes
-/// next, which is what this is. A binding's `try_new` calls it, so an ordinary
-/// consumer gets it without asking.
+/// Covers `SIGKILL`, where no handler runs and only the next run can help; the dead
+/// process's watchdog usually took its mounts down already, and this gets what it could not.
+/// Every unix binding's `try_new` calls it.
 ///
-/// **Call it directly when something has to touch the mount point before mounting.**
-/// A leftover mount that nothing answers makes `stat` on that path block, so a
-/// `create_dir_all` under it hangs *before* `try_new` is ever reached. Sweeping
-/// first is what stops that, and needs no argument: what to reclaim is on the
-/// register, not in a path the caller has to name.
+/// **Call it directly before touching a mount point ahead of mounting:** `stat` blocks on a
+/// leftover mount nothing answers, so a `create_dir_all` under it would hang before `try_new`.
 ///
-/// Only mounts owned by a **dead** process are touched, which is what makes it safe
-/// to call unasked: a live sibling instance keeps its mounts however its paths are
-/// spelled. Sweeping by *path* could not promise that, which is why no such call is
-/// offered.
+/// Only a **dead** owner's mounts are touched, which is what makes calling it automatically
+/// safe: a live sibling instance keeps its mounts. A path says nothing about whose mount is on
+/// it, so no sweep-by-path call exists.
 ///
-/// Answers with what is still mounted after the attempt — empty when everything
-/// abandoned came down, and otherwise what a person has to clear by hand.
-///
-/// Bounded: at most four abandoned mounts are unmounted per call, each with
-/// its own deadline. Never panics, never fails — a host with nothing to reclaim
-/// costs one directory read.
+/// Returns the mounts it tried and failed to take down, which a person must clear by hand.
+/// At most `BUDGET` unmounts per call, each with its own deadline; the rest wait for the next
+/// call and are not listed. Never panics or fails; with nothing to reclaim it costs one
+/// directory read.
 pub fn reclaim_abandoned() -> Vec<PathBuf> {
     let mut left = Vec::new();
     let Some(dir) = registry() else {
@@ -327,9 +252,8 @@ pub fn reclaim_abandoned() -> Vec<PathBuf> {
             .file_name()
             .to_str()
             .and_then(|name| name.split('-').next()?.parse::<libc::pid_t>().ok());
-        // Every record this writes is named for a real pid, so one that is not is
-        // something an older version or a stray hand left. Nothing can be asked
-        // about its owner, which means keeping it is keeping it forever.
+        // Records are named for a real pid; one that is not has no owner to ask about, so
+        // keeping it would be forever.
         let Some(pid) = named.filter(|pid| *pid > 0) else {
             let _ = fs::remove_file(&record);
             continue;
@@ -338,8 +262,7 @@ pub fn reclaim_abandoned() -> Vec<PathBuf> {
             continue;
         }
 
-        // Unreadable or empty: the owner is gone and the record says nothing, so
-        // there is nothing to unmount and no reason to keep it.
+        // Unreadable or empty: nothing to unmount.
         let Ok(bytes) = fs::read(&record) else {
             let _ = fs::remove_file(&record);
             continue;
@@ -349,18 +272,14 @@ pub fn reclaim_abandoned() -> Vec<PathBuf> {
             continue;
         }
         let mountpoint = PathBuf::from(OsString::from_vec(bytes));
-        // Asked before the budget is consulted, because a record whose mount is
-        // already gone costs one syscall to be rid of. Letting a spent budget stop
-        // *that* would leave the registry growing behind a backlog it is not part
-        // of, and would make what gets cleared depend on the order a directory
-        // happens to be read in.
+        // Before the budget check: clearing a stale record is cheap, and a spent budget
+        // must not let the registry grow or make cleanup depend on directory order.
         if mounts_under(&mountpoint).is_empty() {
             let _ = fs::remove_file(&record);
             continue;
         }
         if budget == 0 {
-            // The rest is the next run's. Better than making this mount wait on a
-            // backlog somebody else's crashes left.
+            // The rest is the next run's.
             break;
         }
 
@@ -368,8 +287,7 @@ pub fn reclaim_abandoned() -> Vec<PathBuf> {
         if unmount_under(&mountpoint) {
             let _ = fs::remove_file(&record);
         } else {
-            // The record is kept, so a later run meets this again rather than
-            // forgetting a mount that is still in the way.
+            // Kept so a later run tries again.
             left.push(mountpoint);
         }
     }
@@ -380,15 +298,13 @@ pub fn reclaim_abandoned() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
-    /// The register is what the signal path reads and what a later run sweeps, so
-    /// a mount that is up has to be on it and one that is gone has to be off it.
+    /// A held claim is in both registers; a dropped one is in neither.
     #[test]
     fn a_claim_lasts_exactly_as_long_as_it_is_held() {
         let path = std::env::temp_dir().join("cortex-claim-probe");
         let resolved = resolved(&path);
 
-        // This path and no other. The register is process-wide and these tests run
-        // beside each other, so its *total* length is somebody else's business too.
+        // Checks this path only: the register is process-wide and tests run in parallel.
         let held = claim(&path);
         assert!(live().contains(&resolved), "the register takes the path");
         let record = held.record.clone().expect("a record was written");
@@ -402,8 +318,8 @@ mod tests {
         assert!(!record.exists(), "the record goes with the claim");
     }
 
-    /// Our own pid is alive, so our own records must never be reclaimed — the
-    /// property that keeps a second instance from unmounting the first's tree.
+    /// A live owner's records are never reclaimed, so a second instance cannot unmount the
+    /// first's tree.
     #[test]
     fn a_live_process_keeps_its_own_records() {
         let path = std::env::temp_dir().join("cortex-claim-live-probe");
@@ -418,9 +334,7 @@ mod tests {
         drop(held);
     }
 
-    /// Both guards have an exit reached with the mount still up, and after it the
-    /// record is all that lets a later run meet that mount again. Dropping the
-    /// claim must not be what forgets it.
+    /// A claim dropped while its mount is still up keeps the record for a later run.
     #[test]
     #[ignore = "mounts a real filesystem"]
     fn a_record_outlives_a_claim_dropped_over_a_live_mount() {
@@ -441,8 +355,8 @@ mod tests {
             .expect("fresh store");
         let mount = HostMount::try_new(volume, &path).expect("the volume mounts");
 
-        // A second claim on the same point, so dropping it leaves the mount up —
-        // which is the state the guards' failure exits hand to `Claim::drop`.
+        // A second claim on the same point, so dropping it leaves the mount up, as a failed
+        // teardown does.
         let held = claim(&path);
         let record = held.record.clone().expect("a record was written");
         drop(held);
@@ -456,15 +370,13 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
     }
 
-    /// A record left by a pid that cannot exist is abandoned by definition, and
-    /// naming no mount it costs nothing to clear.
+    /// A record from a pid that cannot exist is abandoned and cleared.
     #[test]
     fn a_record_from_a_dead_owner_is_cleared() {
         let Some(dir) = registry() else {
             panic!("the registry is usable under $TMPDIR");
         };
-        // Above the largest pid any of these systems hands out, so it names nothing
-        // running and cannot come to name something later.
+        // Above any pid these systems hand out, so it never names a live process.
         let record = dir.join(format!("{}-cortex-test", libc::pid_t::MAX));
         let mountpoint = std::env::temp_dir().join("cortex-claim-dead-probe");
         fs::create_dir_all(&mountpoint).unwrap();

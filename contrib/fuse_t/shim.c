@@ -1,8 +1,8 @@
 /* Translation between libfuse-t's lowlevel callbacks and cortex's flat vtable.
  *
- * Handing the session loop back to libfuse-t is the whole reason this exists —
- * see `src/mountable/adapter/fuse_t.rs`. No logic beyond marshalling; every
- * decision belongs to the shared layer on the Rust side.
+ * Exists so libfuse-t's own loop drives the session (see
+ * `src/fs/mount/impl/fuse_t.rs`). Marshalling only; every decision is made on
+ * the Rust side.
  */
 
 #include "shim.h"
@@ -23,19 +23,15 @@
 
 /* libfuse-t, opened at run time rather than linked.
  *
- * Nothing here is a link-time reference to it, so a binary with this shim in
- * it starts whether or not FUSE-T is installed -- and, for a Python or Node
- * extension, imports: most of their callers never mount. A link would also
- * need an `LC_RPATH` in every binary that ends up holding this object, which
- * a `rustc-link-arg` cannot give a dependent, and a weak import resolves to
- * null when that rpath is missing -- the same answer as not installed.
+ * So a binary (or Python/Node extension) holding this shim starts or imports
+ * without FUSE-T installed; most callers never mount. Linking would also need
+ * an `LC_RPATH` in every final binary, which `rustc-link-arg` cannot give a
+ * dependent, and without it a weak import is null anyway.
  *
- * Each function the file calls is a pointer here, filled by `dlsym`, and the
- * macro after it points the call sites at the pointer, so the code below is
- * written against libfuse's own names. `cortex_fuse_t_status` opens the
- * library and fills them, once; nothing else may be called before it has
- * answered CORTEX_FUSE_T_OK. The list has to be complete: a function called below and
- * left out is a link error, since the library is not on the link line. */
+ * Each function called is a `dlsym`-filled pointer here, with a macro so call
+ * sites use libfuse's own names. `cortex_fuse_t_status` fills them once; call
+ * nothing before it answers CORTEX_FUSE_T_OK. The list must be complete: a
+ * missing entry is a link error, since the library is not on the link line. */
 #include <dlfcn.h>
 #include <limits.h>
 #include <pthread.h>
@@ -66,10 +62,9 @@
 #define CORTEX_FUSE_T_POINTER(name) static __typeof__(name) *cortex_p_##name;
 CORTEX_FUSE_T_FNS(CORTEX_FUSE_T_POINTER)
 
-/* Where FUSE-T's installer puts the library, as `pkg-config` reported it when
- * this was built; `build.rs` defines it. The bare name is tried first, so a
- * library the loader would find on its own -- `DYLD_LIBRARY_PATH`, or its
- * fallback paths -- wins over the one this was built against. */
+/* The library's install path as `pkg-config` reported it at build time
+ * (defined by `build.rs`). The bare name is tried first, so one the loader
+ * finds itself (`DYLD_LIBRARY_PATH`, fallback paths) wins. */
 #ifndef CORTEX_FUSE_T_LIBDIR
 #define CORTEX_FUSE_T_LIBDIR "/usr/local/lib"
 #endif
@@ -186,13 +181,9 @@ const char *cortex_fuse_t_checked(void) {
 #define fuse_session_loop cortex_p_fuse_session_loop
 #define fuse_unmount cortex_p_fuse_unmount
 
-/* Mirrors the Rust side's TTL. Spelled here rather than plumbed through the
- * vtable, because libfuse wants it as a double.
- *
- * Two copies of one number, with nothing checking they agree: changing
- * `posix::TTL` and not this leaves the FUSE-T mount caching for a different
- * window than the other bindings, silently. Plumb it through
- * `cortex_fuse_t_ops` if it ever needs to be configurable. */
+/* Must equal `posix::TTL`; nothing checks it, and a mismatch silently changes
+ * this mount's cache window. Duplicated because libfuse wants a double; plumb
+ * it through `cortex_fuse_t_ops` if it must become configurable. */
 #define CORTEX_TTL 1.0
 
 struct session {
@@ -200,8 +191,8 @@ struct session {
     struct fuse_session *se;
     char *mountpoint;
     void *fs;
-    /* The serving loop has been told to stop. Makes stopping idempotent, which
-     * is what lets `cortex_fuse_t_destroy` call it unconditionally. */
+    /* Set once told to stop, so `cortex_fuse_t_destroy` can stop
+     * unconditionally. */
     int stopped;
     struct cortex_fuse_t_ops ops;
 };
@@ -276,7 +267,7 @@ static void ll_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int to
     struct session *s = ctx(req);
     int has_size = (to_set & FUSE_SET_ATTR_SIZE) != 0;
     uint64_t size = has_size ? (uint64_t)attr->st_size : 0;
-    /* Mode, ownership, and timestamps are dropped; see `setattr_inode`. */
+    /* Only size is forwarded; mode, ownership and timestamps are dropped. */
     struct cortex_stat cs;
     int err = s->ops.setattr(s->fs, ino, fi ? fi->fh : 0, fi ? 1 : 0, size, has_size, &cs);
     if (replied_error(req, err)) return;
@@ -391,8 +382,8 @@ static void ll_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
     fuse_reply_err(req, -s->ops.rename(s->fs, parent, name, newparent, newname));
 }
 
-/* Accumulates entries into libfuse's buffer — the one part of `readdir` the
- * caller cannot do itself, since `fuse_add_direntry` needs the request. */
+/* Accumulates entries into libfuse's buffer; done here because
+ * `fuse_add_direntry` needs the request. */
 struct dirbuf {
     fuse_req_t req;
     char *buf;
@@ -448,8 +439,8 @@ static void ll_statfs(fuse_req_t req, fuse_ino_t ino) {
     fuse_reply_statfs(req, &v);
 }
 
-/* Only what cortex implements. libfuse answers the rest with ENOSYS, matching
- * the other bindings: symlinks, hard links, xattrs, locks. */
+/* Only what cortex implements. libfuse answers the rest (symlinks, hard links,
+ * xattrs, locks) with ENOSYS. */
 static const struct fuse_lowlevel_ops LL_OPS = {
     .lookup = ll_lookup,
     .forget = ll_forget,
@@ -484,17 +475,13 @@ void *cortex_fuse_t_mount(const char *mountpoint, const char *fsname,
     if (fuse_opt_add_arg(&args, "cortex") != 0) goto fail_args;
     if (fuse_opt_add_arg(&args, "-o") != 0) goto fail_args;
     {
-        /* One `-o`, because libfuse takes a comma-separated list and a second
-         * argument would have to be paired with its own `-o`. Truncation is not
-         * a risk worth branching on: both values are ours and short, and
-         * `snprintf` bounds the buffer either way. */
+        /* One comma-separated `-o`. Both values are ours and short, and
+         * `snprintf` bounds the buffer, so truncation is not checked. */
         char opt[256];
         int n = snprintf(opt, sizeof opt, "fsname=%s", fsname);
         if (n < 0) goto fail_args;
         if (backend && (size_t)n < sizeof opt) {
-            /* Omitted entirely when NULL, so FUSE-T applies whatever
-             * `fuse-t.ini` says — passing "nfs" here would override a user who
-             * had configured something else. */
+            /* Omitted when NULL so a user's `fuse-t.ini` choice applies. */
             snprintf(opt + n, sizeof opt - (size_t)n, ",backend=%s", backend);
         }
         if (fuse_opt_add_arg(&args, opt) != 0) goto fail_args;
@@ -529,25 +516,19 @@ void cortex_fuse_t_stop(void *session) {
     if (!s || s->stopped) return;
     s->stopped = 1;
 
-    /* Exit flag first: the loop checks it between requests. On its own it is not
-     * enough — the loop spends its time blocked in `recvfrom` on the channel and
-     * only looks at the flag once a request wakes it — so the shutdown below is
-     * what actually ends it. */
+    /* The loop checks the exit flag only between requests; it is blocked in
+     * `recvfrom`, so the shutdown below is what wakes it. */
     if (s->se) fuse_session_exit(s->se);
     if (!s->ch) return;
 
-    /* `shutdown` and not `close`: it wakes the blocked `recvfrom` with an
-     * end-of-file while leaving the descriptor in place, so the
-     * `fuse_chan_destroy` reached from `fuse_session_destroy` closes the number
-     * exactly once. Closing here as well would put a second close on a number
-     * another thread may have been handed in between.
+    /* `shutdown`, not `close`: it wakes `recvfrom` with EOF but keeps the
+     * descriptor, so `fuse_session_destroy` closes it exactly once; a second
+     * close could hit a number reused by another thread.
      *
-     * The channel also stays *attached* to the session, and `fuse_chan_destroy`
-     * takes it off later — reached from `fuse_session_destroy`, where the loop is
-     * provably done with it. Detaching here instead would set `ch->se` to NULL
-     * under the serving thread, which a reply already on its way out asserts on
-     * (`fuse_kern_chan_send`: "se != NULL"), and would leave `se->ch` NULL so that
-     * `fuse_chan_destroy` never runs and the channel leaks. */
+     * The channel stays attached until `fuse_session_destroy`, when the loop is
+     * done. Detaching here would NULL `ch->se` under the serving thread (an
+     * in-flight reply asserts "se != NULL" in `fuse_kern_chan_send`) and NULL
+     * `se->ch`, so `fuse_chan_destroy` would never run and the channel leaks. */
     int fd = fuse_chan_fd(s->ch);
     if (fd >= 0) shutdown(fd, SHUT_RDWR);
 }

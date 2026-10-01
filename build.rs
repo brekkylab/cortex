@@ -1,9 +1,7 @@
-//! What the `mount` feature needs from the target's filesystem provider at build time: on
-//! macOS the FUSE-T shim, compiled; on Windows the Dokany DLL, delay-loaded. See
-//! `contrib/fuse_t/shim.h` for why the shim exists, and `src/fs/mount/support.rs` for why
-//! neither provider is a dependency a binary needs in order to start.
-//!
-//! And the server release `ensure_cortex` fetches by default -- see [`pin_server`].
+//! Build-time needs of the `mount` feature: on macOS, compile the FUSE-T shim; on Windows,
+//! delay-load the Dokany DLL. Neither provider is needed for a binary to start (see
+//! `src/fs/mount/support.rs`; `contrib/fuse_t/shim.h` explains the shim). Also pins the
+//! server release `ensure_cortex` fetches by default (see [`pin_server`]).
 
 fn main() {
     println!("cargo::rerun-if-changed=contrib/fuse_t/shim.c");
@@ -63,8 +61,8 @@ fn fuse_t_shim() {
     build
         .file("contrib/fuse_t/shim.c")
         .include("contrib/fuse_t")
-        // The layouts in `fuse_t.h` are libfuse's with 64-bit offsets, which it is built
-        // for; `check-abi.sh` builds with the same flag.
+        // `fuse_t.h` declares libfuse's layouts with 64-bit offsets; `check-abi.sh` builds
+        // with the same flag.
         .define("_FILE_OFFSET_BITS", "64")
         .warnings(true);
     let libdir = pkg_config::Config::new()
@@ -83,10 +81,10 @@ fn fuse_t_shim() {
     build.compile("cortex_fuse_t_shim");
 }
 
-/// Load `dokan2.dll` at its first call rather than at process start, for this package's
-/// own tests and examples. A dependent's binary has to ask for the same from its own
-/// `build.rs` -- a `rustc-link-arg` reaches only the package that prints it -- as the
-/// bindings' do. `/DELAYLOAD` is MSVC's; a GNU target links the DLL at start as before.
+/// Load `dokan2.dll` at first call rather than process start, for this package's own tests
+/// and examples. A `rustc-link-arg` reaches only the package printing it, so a dependent's
+/// binary must request the same in its own `build.rs`. `/DELAYLOAD` is MSVC-only; a GNU
+/// target links the DLL at start.
 fn delay_load_dokan() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo::rustc-link-arg=/DELAYLOAD:dokan2.dll");

@@ -1,15 +1,20 @@
 //! Python bindings for cortex, imported as `cortex._cortex`.
 //!
-//! The shape is cortex's own, spelled in Python: a [`ConsoleClient`](cortex::console::ConsoleClient)
-//! is built by a builder and awaited, a [`Directory`](cortex::fs::Directory) is assembled and
-//! handed to a host mount, a [`Recipe`](cortex::image::Recipe) is a base and its steps, and an
-//! [`ImageClient`](cortex::image::ImageClient) builds one ahead of the session that runs on it.
-//! Nothing here adds a layer of its own over that — a Python caller reading cortex's Rust
-//! documentation should find the same names doing the same things.
+//! The API is cortex's own with no extra layer, so cortex's Rust docs apply. Modules mirror
+//! the crate: [`console`] runs commands in a [`ConsoleClient`](cortex::console::ConsoleClient)
+//! built by a builder and awaited, [`fs`] assembles a [`Directory`](cortex::fs::Directory) for
+//! a host mount, [`image`] covers a [`Recipe`](cortex::image::Recipe) (a base plus steps) and
+//! the [`ImageClient`](cortex::image::ImageClient) that builds it ahead of a session, [`error`]
+//! maps failures to exceptions, and `ensure` fetches the console server.
 //!
-//! One module per half, as in the crate: [`console`] for running commands, [`fs`] for the
-//! trees they see, [`image`] for what they run on and the client that builds it, and [`error`] for how either half's
-//! failures arrive as exceptions.
+//! Every call that waits is an awaitable run on the tokio runtime `pyo3-async-runtimes` keeps,
+//! since a stdio client spawns and reads its server, which needs a reactor asyncio lacks.
+//! `ConsoleClient` and `ImageClient` keep their Rust client in an `Arc<Mutex<Option<..>>>`:
+//! each call clones the `Arc` into its `'static` future, and the lock makes calls take turns on
+//! the one channel, as `&mut self` does in Rust. The Rust client's `Drop` says `quit` only on a
+//! runtime, and a Python finalizer runs off one, so the last holder drops it inside the
+//! binding's runtime: a garbage-collected client ends like a closed one, and `close()` or
+//! `async with` only pick when.
 
 use pyo3::prelude::*;
 
@@ -25,10 +30,8 @@ fn _cortex(m: &Bound<'_, PyModule>) -> PyResult<()> {
     register(m)
 }
 
-/// Add every class, exception and constant this module has to `m`.
-///
-/// The module's own init, and also what a binding that links this crate calls to put cortex
-/// into an extension of its own — see the `rlib` in `Cargo.toml`.
+/// Add every class, exception and constant to `m`; public so a binding linking this crate (the
+/// `rlib` in `Cargo.toml`) can add them to its own extension.
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     error::register(m)?;
     image::register(m)?;

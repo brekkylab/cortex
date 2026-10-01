@@ -1,14 +1,4 @@
 //! `Directory` and `HostMount`: the trees a session's commands see.
-//!
-//! A `Directory` is assembled in place, unlike an `Image`, because the Rust type is not
-//! `Clone` — its files live in memory and a copy would be a second tree rather than a second
-//! handle on one. Mounting it *takes* it: a `HostMount` owns the tree it serves, and the
-//! `Directory` it was built from is empty afterwards and refuses further use.
-//!
-//! `HostMount` is one name for three types. cortex names each binding's guard after the
-//! binding — `FuseMount`, `FuseTMount`, `DokanMount` — and only the one this platform has is
-//! compiled, so a Python caller who wants "mount this on the host" should not have to know
-//! which it is.
 
 #[cfg(feature = "mount")]
 use std::sync::Arc;
@@ -17,6 +7,7 @@ use std::{io, path::PathBuf};
 use cortex::fs::{Directory, Mount};
 use pyo3::{exceptions::PyValueError, prelude::*};
 
+// `HostMount` wraps whichever guard this platform compiles, so callers need not know which.
 #[cfg(all(feature = "mount", windows))]
 use cortex::fs::DokanMount as Platform;
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
@@ -40,6 +31,10 @@ impl From<Content> for Vec<u8> {
     }
 }
 
+/// A tree assembled in place. Mounting it with `HostMount` takes it: the mount owns the tree,
+/// and this `Directory` is empty afterwards and refuses further use.
+// In place because the Rust type is not `Clone`: its files live in memory, so a copy would be a
+// second tree, not a second handle on one.
 #[pyclass(name = "Directory", module = "cortex")]
 pub struct PyDirectory(Option<Directory>);
 
@@ -82,7 +77,7 @@ impl PyDirectory {
         Ok(self.get()?.unmount(path)?)
     }
 
-    /// [`add_file`](Self::add_file), handing back this same `Directory` so calls chain.
+    /// [`add_file`](Self::add_file), returning this same `Directory` so calls chain.
     fn with_file(
         mut slf: PyRefMut<'_, Self>,
         path: PathBuf,
@@ -92,7 +87,7 @@ impl PyDirectory {
         Ok(slf)
     }
 
-    /// [`mount`](Self::mount), handing back this same `Directory` so calls chain.
+    /// [`mount`](Self::mount), returning this same `Directory` so calls chain.
     fn with_mount(
         mut slf: PyRefMut<'_, Self>,
         path: PathBuf,
@@ -105,9 +100,9 @@ impl PyDirectory {
 
 /// A tree mounted on this host, for as long as something holds it.
 ///
-/// Held behind an [`Arc`] so that passing one to a console builder does not take it from
-/// the Python object: both hold the mount, and it comes down when the last of them lets go
-/// — the builder's copy with the console, the Python one with garbage collection.
+/// Passing it to a console builder shares it rather than taking it: it comes down when the
+/// last holder lets go (the builder's copy with the console, this object with garbage
+/// collection).
 #[cfg(feature = "mount")]
 #[pyclass(name = "HostMount", module = "cortex", frozen)]
 pub struct PyHostMount(pub Arc<Platform>);
@@ -118,7 +113,7 @@ impl PyHostMount {
     #[new]
     fn new(py: Python<'_>, fs: &Bound<'_, PyDirectory>, mountpoint: PathBuf) -> PyResult<Self> {
         let directory = fs.borrow_mut().take()?;
-        // Mounting waits on the host's FUSE provider, which has no reason to wait on the GIL.
+        // Mounting waits on the host's FUSE provider; no need to hold the GIL meanwhile.
         let mount = py.detach(|| Platform::try_new(directory, &mountpoint))?;
         Ok(PyHostMount(Arc::new(mount)))
     }
@@ -146,8 +141,8 @@ impl MountLike {
         Ok(match self {
             #[cfg(feature = "mount")]
             MountLike::Host(mount) => Box::new(mount.get().0.clone()),
-            // Absolute, because a mount is named to the server as a `file://` URL, and a
-            // relative path from Python is relative to where the interpreter stands.
+            // Absolute, because the server receives a mount as a `file://` URL, and a
+            // relative path would resolve against the interpreter's working directory.
             MountLike::Path(path) => Box::new(std::path::absolute(path)?),
         })
     }
@@ -155,9 +150,8 @@ impl MountLike {
 
 /// Raise `OSError`, saying what to install, if this host cannot mount.
 ///
-/// `HostMount` checks the same before it mounts, so this is for a caller that wants to know
-/// ahead of asking for one. An extension built with `mount` imports on a host without the
-/// provider: what a missing FUSE-T or Dokany costs is a mount, never the import.
+/// `HostMount` checks the same before mounting; this lets a caller find out ahead. An
+/// extension built with `mount` still imports without FUSE-T or Dokany: only mounting fails.
 #[cfg(feature = "mount")]
 #[pyfunction]
 fn mount_support() -> PyResult<()> {

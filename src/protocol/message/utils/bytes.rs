@@ -1,30 +1,14 @@
-//! Raw bytes, as themselves.
-//!
-//! BSON has a byte type — `Binary`, subtype `Generic` — so the bulk of what this channel
-//! carries goes across at 1.0× rather than as text. This is the whole reason the codec is
-//! BSON and not JSON: JSON has no byte type, so `stdout` had to be base64 (1.37×) to
-//! avoid being an array of numbers (`[104,105,10]`, 4×).
-//!
-//! A module of its own because the types that carry bytes are on both sides of the
-//! exchange — an [`ExecResp`](super::super::ExecResp)'s output and a [`ReadResp`](super::super::ReadResp)'s
-//! data going one way, a [`WriteCall`](super::super::WriteCall)'s the other — and how bytes reach the
-//! wire is the codec's business rather than either half's.
+//! Raw bytes as BSON `Binary` (subtype `Generic`), at 1.0× rather than base64's 1.33×.
 //!
 //! # Why this does not ask the codec
 //!
-//! [`is_human_readable`](serde::Serializer::is_human_readable) is the obvious way for one
-//! helper to serve a textual codec and a binary one, and it cannot be used here, because
-//! it silently loses. A message's `params` and `result` are held as a
-//! [`Bson`](bson::Bson) before they reach the wire — they have to be, since a `result` is
-//! typed by a method only the caller knows — and `bson`'s *value-level* serializer
-//! reports `is_human_readable() == true`. So the branch would encode base64 on the way
-//! into the `Bson`, and the wire would faithfully carry a string: 1.37×, the byte type
-//! unused, and nothing to show it had happened. `bson`'s `SerializerOptions` is
-//! `pub(crate)`, so it cannot be told otherwise.
+//! Branching on [`is_human_readable`](serde::Serializer::is_human_readable) would silently
+//! produce base64: `params` and `result` pass through a [`Bson`](bson::Bson) value first,
+//! and `bson`'s value-level serializer reports itself human-readable (its
+//! `SerializerOptions` is `pub(crate)`, so that cannot be changed).
 //!
-//! One codec, and it has bytes. If a textual wire is ever wanted for a person to read,
-//! BSON's own projection is the thing to reach for — `Bson::into_relaxed_extjson` spells
-//! `Binary` as `{"$binary": ..}` — rather than a second spelling in here.
+//! For a human-readable view, use `Bson::into_relaxed_extjson`, which spells `Binary` as
+//! `{"$binary": ..}`.
 
 use serde::{
     Deserializer, Serializer,
@@ -56,9 +40,8 @@ impl<'de> Visitor<'de> for Raw {
         Ok(v)
     }
 
-    /// A peer that spelled its bytes as an array is read rather than refused: BSON
-    /// has arrays too, and `[104,105,10]` is unambiguous even though nothing here
-    /// writes it.
+    /// Bytes spelled as an array (`[104,105,10]`) are accepted: unambiguous, though
+    /// nothing here writes them.
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
         let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
         while let Some(b) = seq.next_element()? {

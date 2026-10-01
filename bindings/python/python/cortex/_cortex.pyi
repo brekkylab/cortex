@@ -76,7 +76,9 @@ class ImageClient:
     ) -> None: ...
 
 class Directory:
-    """A tree assembled in place. Mounting it with ``HostMount`` takes it."""
+    """A tree assembled in place. Mounting it with ``HostMount`` takes it: the mount owns the
+    tree, and this ``Directory`` is empty afterwards and refuses further use.
+    """
 
     def __init__(self) -> None: ...
     def add_file(self, path: _Path, content: _Content) -> None: ...
@@ -152,4 +154,9 @@ class ConsoleClient:
     ) -> None: ...
 
 async def ensure_cortex() -> str:
-    """Fetch the console server into cortex's cache if it is not there; the directory it is in."""
+    """Fetch the console server into cortex's cache if missing; resolves to its directory.
+
+    Console builders and ``ImageClient`` start ``cortex-krun`` from that cache, which a host
+    that installed only this package lacks, so such a host calls this first. An existing
+    server, fetched or installed by hand, is left alone.
+    """

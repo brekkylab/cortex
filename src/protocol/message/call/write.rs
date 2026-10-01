@@ -5,8 +5,8 @@ use crate::protocol::message::utils::bytes;
 /// Bytes to put in a file. The `params` of `write`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteCall {
-    /// Resolved as [`ReadCall::path`] is. Any directory above it has to
-    /// exist already; the file itself does not.
+    /// A path in the executor's filesystem, under one of the session's mounts. Parent
+    /// directories must already exist; the file need not.
     pub path: String,
 
     #[serde(default, with = "bytes", skip_serializing_if = "Vec::is_empty")]
@@ -14,13 +14,9 @@ pub struct WriteCall {
 
     /// Where in the file to put them.
     ///
-    /// `None` makes the file be exactly `data`: created if it was not there, cut to
-    /// length if it was. `Some(n)` overwrites from `n` and leaves whatever lies past
-    /// the bytes written, extending the file with zeroes if `n` is beyond its end.
-    ///
-    /// So the whole-file case says nothing about what was there before and the
-    /// positioned case says nothing about the rest of the file, which is why a
-    /// requester that means to replace a file sends `None` rather than `Some(0)`.
+    /// `None` makes the file exactly `data` (created or truncated). `Some(n)` overwrites
+    /// from `n`, keeps whatever lies past the written bytes, and zero-fills if `n` is past
+    /// the end. To replace a file, send `None`, not `Some(0)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
 }
@@ -28,7 +24,7 @@ pub struct WriteCall {
 /// How big the file is now. The `result` of `write`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteResp {
-    /// Where a positioned write should carry on from, and confirmation that a
-    /// whole-file write left the length it meant to.
+    /// The whole file's size, where an appending write carries on from; for a whole-file
+    /// write, confirms the length.
     pub size: u64,
 }

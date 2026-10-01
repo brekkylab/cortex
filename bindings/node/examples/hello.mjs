@@ -2,7 +2,7 @@
 //
 //     node examples/hello.mjs
 //
-// Needs the console server under `~/.cache/cortex/bin` (or `CORTEX_STDIO_SERVER_PATH`).
+// Needs `cortex-krun` in the cortex cache `bin` (`$CORTEX_HOME/bin` if set); `ensureCortex()` fetches it.
 
 import { createRequire } from 'node:module'
 

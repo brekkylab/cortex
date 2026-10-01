@@ -76,7 +76,7 @@ def test_host_mount_serves_the_directory(tmp_path):
 
 
 async def test_building_without_a_server_fails_and_spends_the_builder(tmp_path, monkeypatch):
-    # The default server is looked up here, where there is none.
+    # Point the default server lookup at an empty directory.
     monkeypatch.setenv("CORTEX_STDIO_SERVER_PATH", str(tmp_path))
     builder = ConsoleClient.builder()
     with pytest.raises(CortexError):

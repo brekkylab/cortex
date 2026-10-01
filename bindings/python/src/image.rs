@@ -1,14 +1,9 @@
-//! `Recipe`, `Step` and `ImageSource`: what a session's commands run on — and `ImageClient`,
-//! which builds, lists and removes them.
+//! `Recipe`, `Step` and `ImageSource` (what a session's commands run on), and `ImageClient`,
+//! which builds, lists and removes images.
 //!
-//! The first three are values, as they are in Rust — `Recipe` is `Clone` and a builder call
-//! there hands back a new one — so here every method returns a new object and none mutates
-//! the one it was called on. A base recipe built once and extended in two directions stays
-//! the base.
-//!
-//! `ImageClient` is held the way a `ConsoleClient` is, for the same reasons: its calls are
-//! awaitables on the binding's runtime, they take turns on one channel, and dropping it says
-//! `quit` on that runtime — see [`crate::console`].
+//! The first three are values, as in Rust (`Recipe` is `Clone` and its builder calls return a
+//! new one): every method returns a new object and none mutates its receiver, so a base recipe
+//! extended in two directions stays the base.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -57,8 +52,7 @@ impl PyStep {
     }
 }
 
-/// A step as a caller may spell one: a `Step`, or a string meaning `Step.run(..)` — the
-/// same conversion `From<&str> for Step` makes in Rust.
+/// A `Step`, or a string meaning `Step.run(..)`, as `From<&str> for Step` converts in Rust.
 #[derive(FromPyObject)]
 pub enum StepLike {
     Step(PyStep),
@@ -147,9 +141,8 @@ impl PyImageSource {
     }
 }
 
-/// An image as a caller may name one: an `ImageSource`, or a `Recipe` meaning
-/// `ImageSource.recipe(..)` — the same conversion `From<Recipe> for ImageSource` makes in
-/// Rust.
+/// An `ImageSource`, or a `Recipe` meaning `ImageSource.recipe(..)`, as
+/// `From<Recipe> for ImageSource` converts in Rust.
 #[derive(FromPyObject)]
 pub enum ImageSourceLike {
     Source(PyImageSource),
@@ -227,10 +220,7 @@ impl PyImageClient {
     }
 }
 
-/// Let go of the client on the runtime, so its `quit` goes out — as [`PyConsoleClient`]
-/// does.
-///
-/// [`PyConsoleClient`]: crate::console::PyConsoleClient
+/// Only the last holder drops the client, inside the runtime so `quit` goes out.
 impl Drop for PyImageClient {
     fn drop(&mut self) {
         if let Some(slot) = Arc::get_mut(&mut self.0) {
@@ -242,8 +232,7 @@ impl Drop for PyImageClient {
 
 #[pymethods]
 impl PyImageClient {
-    /// `cortex-krun` under the stdio server directory — an awaitable, as
-    /// `ImageClient::try_new` is a future.
+    /// Start `cortex-krun` from cortex's cache `bin`; the awaitable resolves to the client.
     #[staticmethod]
     fn try_new(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {
@@ -313,7 +302,7 @@ impl PyImageClient {
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.0.clone();
         future_into_py(py, async move {
-            // Dropped here, on the runtime, which is what lets `quit` go out.
+            // Dropping on the runtime is what lets `quit` go out.
             client.lock().await.take();
             Ok(())
         })

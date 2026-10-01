@@ -1,54 +1,5 @@
-//! A read-oriented [`FileSystem`] store over a Notion workspace.
-//!
-//! Notion pages/blocks are projected onto a filesystem tree:
-//! ```text
-//! /pages/<title>__<page-id>/page.json         — metadata + markdown body + raw blocks
-//! /pages/<title>__<page-id>/<child>__<id>/    — nested child pages, recursively
-//! /pages/<title>__<page-id>/<db>__db__<id>/   — a database in the page
-//! /pages/.../<db>__db__<id>/database.json     — its schema and a row index
-//! /pages/.../<db>__db__<id>/<row>__<id>/      — a row, which is a page like any other
-//! ```
-//! `/pages` lists only top-level (workspace) pages; the `<page-id>` is the part
-//! after the last `__`. `page.json` is rendered on read.
-//!
-//! One path level per page, whatever the block depth: Notion's own two-column
-//! layouts put a page's sub-pages inside a `column`, two blocks below the page,
-//! and those get a directory directly under their page like any other.
-//!
-//! A database row *is* a page — the API returns it as one, with properties and a
-//! block body — so a row directory is a page directory, and a page nested inside a
-//! row continues the same recursion. Only the database itself is a new kind of
-//! node, and [`DB_MARKER`] in its directory name is what tells the two apart.
-//!
-//! The Notion API is async (reqwest) and so is this store — each operation `.await`s the
-//! client directly; no runtime lives here. A `page.json`'s bytes are rendered once and cached,
-//! so the `stat` that reports a size and the reads that follow it cost one render between them
-//! — which is what lets a guest kernel see the real size (no `direct_io` here).
-//!
-//! # What a render costs, and how often it is paid
-//!
-//! Rendering a page is a `retrieve` plus a walk of its whole block tree: one request per block
-//! that has children, to [`MAX_BLOCK_DEPTH`]. Measured from a desktop client browsing a
-//! workspace, that is 0.4-2.5s per page, and it is charged to whichever operation asks first —
-//! usually the `stat` of `page.json`, since a reader stats before it reads.
-//!
-//! So the render is kept, and [`FRESH`] is how long it is served without asking Notion
-//! anything. Past that it is not thrown away: one `retrieve` answers whether the page has been
-//! edited since, and an unchanged page keeps the render it already has. That is the difference
-//! between paying one request to look again and paying the whole walk — the walk is only redone
-//! for a page that actually changed.
-//!
-//! Given a directory ([`NotionFs::with_cache_dir`]) the renders outlive the process too, which
-//! is the case that was left: a client restarted is a client that pays the walk for every page
-//! its reader opens again, and a reader opens the same pages. On disk the entry carries the
-//! edit stamp it was built from, so a restart costs the same one `retrieve` a stale entry does.
-//! Nothing is written without a directory to write to, and what is written is the page's own
-//! json — the same content the reader is being shown, under whatever protection the caller
-//! gives that directory.
-//!
-//! Read-only: page/block writes and the domain command channel are not exposed. Every
-//! mutating method keeps [`FileSystem`]'s `ReadOnlyFilesystem` default rather than answering
-//! `Unsupported`, so one read-only source does not disable writes for a whole mount.
+//! A read-oriented [`FileSystem`] store over a Notion workspace. [`NotionFs`] documents the
+//! tree it serves.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -73,45 +24,36 @@ const MAX_BLOCK_DEPTH: usize = 10;
 const RETRY_BACKOFF: [Duration; 2] = [Duration::from_millis(500), Duration::from_secs(2)];
 /// Upper bound on a single retry wait, so a large `Retry-After` can't wedge an op.
 const MAX_BACKOFF: Duration = Duration::from_secs(3);
-/// How long a render is served without asking Notion anything at all.
+/// How long a render is served without asking Notion anything.
 ///
-/// Short, because nothing here can know that a page was edited in a browser a second ago.
-/// Past it the render is revalidated rather than dropped, so the cost of being wrong for
-/// longer is one `retrieve` and not another block walk.
+/// Short, since nothing here learns of an edit made in a browser. Past it the render is
+/// revalidated, not dropped, so looking again costs one `retrieve`, not a block walk.
 const FRESH: Duration = Duration::from_secs(15);
 
 /// How long a *listing* is served from what is kept, without asking Notion anything.
 ///
-/// Longer than [`FRESH`], and deliberately: a listing needs the names and nothing else. A name
-/// that has moved on costs a click that then revalidates; a size or a body that has moved on is
-/// a reader shown the wrong file. So the tree may be a minute behind and the content may not be
-/// behind at all — see `render_cached`, which no listing goes through while this holds.
+/// Longer than [`FRESH`]: a stale name costs a click that then revalidates, but a stale size
+/// or body shows the wrong file. So the tree may lag a minute, content only [`FRESH`].
 const LISTING_TTL: Duration = Duration::from_secs(60);
 
-/// What the top-level listing is kept in. Not an id, so the sweep leaves it alone.
+/// The top-level listing's file. Not an id, so the sweep leaves it alone.
 const ROOTS_FILE: &str = "_roots.json";
 
 /// How many renders are kept on disk, when there is a directory for them.
 const DISK_CAP: usize = 1000;
 
-/// How many writes pass between sweeps of the directory. A sweep is a `read_dir`, and it is
-/// only worth what it costs when there might be something over the cap to drop.
+/// Writes between sweeps of the directory, so the sweep's `read_dir` is not paid per write.
 const SWEEP_EVERY: u32 = 64;
 
 /// How many renders are kept.
 ///
-/// A bound rather than a TTL sweep: an entry costs a page's json and its child-directory
-/// names, a reader that walks a large workspace touches every page once, and nothing else in
-/// this store would ever drop one. The object store's read cache admits the same way, and for
-/// the same reason.
+/// A count bound rather than a TTL sweep: a reader walking a large workspace touches every
+/// page once, and nothing else would ever drop an entry.
 const CACHE_CAP: usize = 256;
-
-// `NotionConfig` lives in `volume/spec.rs`, for the reason `S3Config` does: a build
-// without this feature still parses a spec that names a Notion volume.
 
 /// Connection settings for a [`NotionFs`].
 ///
-/// Redacted in `Debug` for the reason [`S3Config`](crate::fs::S3Config) is.
+/// `Debug` redacts the key, since a log is not where a caller keeps its configuration.
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NotionConfig {
     pub api_key: String,
@@ -125,17 +67,15 @@ impl std::fmt::Debug for NotionConfig {
     }
 }
 
-/// A rendered `page.json`: its bytes, the page's timestamps, and the sub-page
+/// A rendered `page.json`: its bytes, the page's timestamps, and the child
 /// directories that go beside it.
 ///
-/// The directories come from the same tree the bytes do, which is what keeps the
-/// two from disagreeing: a `child_page` block renders as a marker on the grounds
-/// that its own directory carries the content, so the directory has to exist for
-/// exactly the blocks the render marked.
+/// Both come from one block tree, so every `child_page` marker in the bytes has its directory.
 #[derive(Clone)]
 struct Rendered {
     bytes: Arc<Vec<u8>>,
-    /// `<sanitized-title>__<id>` per `child_page` block, at whatever depth it sat.
+    /// A directory name per `child_page`/`child_database` block, at whatever depth it sat; per
+    /// row, for a database.
     child_dirs: Arc<Vec<String>>,
     mtime: Option<SystemTime>,
     ctime: Option<SystemTime>,
@@ -150,16 +90,14 @@ impl Rendered {
     }
 }
 
-/// One render, and the three things that decide what it may still answer.
+/// One render, and what decides what it may still answer.
 #[derive(Clone)]
 struct Kept {
-    /// Which `forget` this was admitted under. A reader who asks for a refresh is saying
-    /// that what is kept is not what they want, and the cheapest way to mean it is to stop
-    /// answering from anything admitted before they said so.
+    /// The `forget` epoch this was admitted under; anything from an earlier one no longer
+    /// answers.
     epoch: u64,
-    /// When Notion last confirmed this render describes the page. `None` for one read back from
-    /// disk, which nothing in this run has checked — it may be served as a *listing* and must
-    /// not be served as content.
+    /// When Notion last confirmed this render. `None` for one read from disk and unchecked
+    /// this run: it may answer a *listing*, never content.
     checked: Option<Instant>,
     /// When this render was last put in place, confirmed or not.
     seen: Instant,
@@ -170,21 +108,21 @@ struct Kept {
 #[derive(Default)]
 struct Renders {
     by_id: HashMap<String, Kept>,
-    /// Ids in the order they were first rendered, so the oldest goes first at the cap. Not
-    /// least-recently-used: a reader walks a tree once, so insertion order is what it visited,
-    /// and keeping a second index in step with every read would cost more than it saves here.
+    /// Ids in first-rendered order, oldest dropped first at the cap. Not LRU: a reader walks a
+    /// tree once, so insertion order is visit order, and a use index would cost more than it
+    /// saves.
     order: VecDeque<String>,
 }
 
 impl Renders {
-    /// What is kept for `id` under `epoch`, as a copy: every caller would have to clone it anyway, and
-    /// holding the lock past this line is how a re-entrant lock gets taken by accident.
+    /// What is kept for `id` under `epoch`, as a copy, so no caller holds the lock past this
+    /// and re-enters it by accident.
     fn get(&self, id: &str, epoch: u64) -> Option<Kept> {
         self.by_id.get(id).filter(|k| k.epoch == epoch).cloned()
     }
 
-    /// Say that Notion still has what this render describes. A page that is checked and found
-    /// unchanged is as good as one just rendered, so both windows start again.
+    /// Record that Notion confirmed this render unchanged; both windows restart, as for a
+    /// fresh render.
     fn confirm(&mut self, id: &str) {
         if let Some(kept) = self.by_id.get_mut(id) {
             let now = Instant::now();
@@ -198,8 +136,7 @@ impl Renders {
         self.order.clear();
     }
 
-    /// Keep `rendered`. `checked` says whether Notion confirmed it in this run — false for one
-    /// read back from disk, which may answer a listing and may not answer for content.
+    /// Keep `rendered`. `checked` is false for one read from disk: see [`Kept::checked`].
     fn admit(&mut self, id: String, rendered: Rendered, checked: bool, epoch: u64) {
         let kept = Kept {
             epoch,
@@ -220,21 +157,20 @@ impl Renders {
 
 /// A render, as it is kept between runs.
 ///
-/// Times as epoch milliseconds rather than the strings Notion sent: what is compared is the
-/// `SystemTime` the render was built with, and a format is one more thing to agree about.
-/// The bytes are the rendered json itself, which is valid UTF-8 by construction — it is what
-/// `serde_json` just produced.
+/// Times are epoch milliseconds, not Notion's strings: what is compared is the render's
+/// `SystemTime`, and a format is one more thing to agree about. `bytes` is the rendered json,
+/// UTF-8 since `serde_json` produced it.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Stored {
-    /// `last_edited_time` of the page this was rendered from. Without it an entry could never
-    /// be revalidated, so an entry without it is never written.
+    /// The page's `last_edited_time`; required, since without it an entry could never be
+    /// revalidated.
     edited_ms: u64,
     created_ms: Option<u64>,
     child_dirs: Vec<String>,
     bytes: String,
 }
 
-/// Directory names as dirents, which is what every listing here ends in.
+/// Directory names as dirents.
 fn dirs_of(names: &[String]) -> Vec<Dirent> {
     names
         .iter()
@@ -252,39 +188,53 @@ fn at_ms(ms: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_millis(ms)
 }
 
-/// A Notion workspace's pages, served as a tree.
-///
-/// Read-only. Each `page.json` is rendered on read; the module doc has the layout.
 /// The workspace's top-level page directories, and when they were last read.
 ///
-/// Its own thing rather than a render: it comes from `search`, which has nothing to compare
-/// against — no page to retrieve, no edit stamp — so this one is a TTL and nothing cleverer.
+/// Plain TTL, not revalidated: it comes from `search`, with no page to retrieve and no edit
+/// stamp to compare.
 struct Roots {
     seen: Instant,
     names: Arc<Vec<String>>,
 }
 
+/// A Notion workspace's pages, served as a read-only tree:
+///
+/// ```text
+/// /pages/<title>__<page-id>/page.json         — metadata + markdown body + raw blocks
+/// /pages/<title>__<page-id>/<child>__<id>/    — nested child pages, recursively
+/// /pages/<title>__<page-id>/<db>__db__<id>/   — a database in the page
+/// /pages/.../<db>__db__<id>/database.json     — its schema and a row index
+/// /pages/.../<db>__db__<id>/<row>__<id>/      — a row, which is a page like any other
+/// ```
+///
+/// `/pages` lists only top-level (workspace) pages; the `<page-id>` is the part after the last
+/// `__`. One path level per page, whatever the block depth: sub-pages inside a two-column
+/// layout's `column`, two blocks below the page, still get a directory directly under it. A row
+/// is a page because the API returns it as one, with properties and a block body.
+///
+/// `page.json` is rendered on read and kept, so a `stat` and the reads after it share one
+/// render, which lets a guest kernel see the real size (no `direct_io` here). A render is a
+/// `retrieve` plus a walk of the block tree, one request per block with children: seconds per
+/// page, charged to whichever operation asks first (usually the `stat` of `page.json`).
+///
+/// Each operation `.await`s the async (reqwest) client directly; no runtime lives here.
 pub struct NotionFs {
     client: reqwest::Client,
     api_key: String,
     renders: Mutex<Renders>,
     roots: Mutex<Option<Roots>>,
-    /// How many times a reader has asked for a refresh. Nothing kept from before the last
-    /// one answers again — see [`NotionFs::forget`].
+    /// Refreshes asked for; nothing kept from before the last one answers again.
     epoch: std::sync::atomic::AtomicU64,
-    /// Where renders outlive the process, when a caller has said where. See
-    /// [`NotionFs::with_cache_dir`].
+    /// Where renders outlive the process; see [`NotionFs::with_cache_dir`].
     cache_dir: Option<PathBuf>,
-    /// Writes since the directory was last swept, so the sweep is not a `read_dir` per page.
+    /// Writes since the directory was last swept.
     writes: Mutex<u32>,
 }
 
 impl NotionFs {
     pub fn new(cfg: &NotionConfig) -> io::Result<Self> {
-        // Bound every request: a hung upstream call would otherwise wedge the FUSE
-        // op (and any process touching the mount) indefinitely. The client builds
-        // synchronously; requests run later on whatever runtime drives the async
-        // ops.
+        // A hung upstream call would otherwise wedge the FUSE op, and any process touching
+        // the mount, indefinitely.
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
@@ -305,16 +255,11 @@ impl NotionFs {
         self.epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Ask the source again for everything.
+    /// Stop everything kept, in memory or on disk, from answering again; nothing is fetched
+    /// here, pages re-render as they are visited.
     ///
-    /// A reader reaches for this when they can see that Notion has moved on in a way nothing
-    /// here can: a page deleted leaves the parent's listing wrong, and a listing is served
-    /// from a render precisely so that it costs no request. Nothing kept from before this
-    /// call answers again — not the renders in memory, not the ones on disk, and not the
-    /// top-level listing, whose file goes with them. The pages a reader visits afterwards are
-    /// rendered once more, which is what they asked for.
-    ///
-    /// The pages they do *not* visit cost nothing: this drops what is kept, it does not fetch.
+    /// For changes nothing here can see, such as a deleted page still in its parent's kept
+    /// listing.
     fn forget_kept(&self) {
         self.epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -327,10 +272,13 @@ impl NotionFs {
 
     /// Keep renders in `dir`, so they survive this process.
     ///
-    /// Not part of [`NotionConfig`]: where a cache lives is a fact about the host and not about
-    /// the connection, and a spec that carried a path would carry it to machines that do not
-    /// have it. The directory is created on the first write and holds one file per page, each
-    /// the page's own rendered json — so it deserves whatever protection the pages do.
+    /// Not part of [`NotionConfig`]: a cache location is a fact about the host, not the
+    /// connection, and a config carrying a path would carry it to machines without it. The
+    /// directory is created on first write and holds each page's rendered json, so it
+    /// deserves whatever protection the pages do.
+    ///
+    /// Each entry carries its edit stamp, so after a restart a page costs one `retrieve`, not a
+    /// walk.
     pub fn with_cache_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = Some(dir.into());
         self
@@ -338,8 +286,7 @@ impl NotionFs {
 
     /// The render kept for `id` between runs, if there is one and it parses.
     ///
-    /// Every failure here is a miss: a cache that cannot be read is a render to redo, never an
-    /// error to hand a reader who asked for a file.
+    /// Every failure is a miss: an unreadable cache means re-rendering, never an error.
     fn kept_on_disk(&self, id: &str) -> Option<Rendered> {
         let path = self.entry_path(id)?;
         let stored: Stored = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
@@ -351,8 +298,8 @@ impl NotionFs {
         })
     }
 
-    /// Keep `rendered` for the next run. A render with no edit stamp is not written, since
-    /// nothing could ever decide whether it is still current.
+    /// Keep `rendered` for the next run. One with no edit stamp is skipped, since nothing
+    /// could decide whether it is current.
     fn keep_on_disk(&self, id: &str, rendered: &Rendered) {
         let (Some(path), Some(edited_ms)) =
             (self.entry_path(id), rendered.mtime.and_then(epoch_ms))
@@ -372,9 +319,8 @@ impl NotionFs {
         if std::fs::create_dir_all(dir).is_err() {
             return;
         }
-        // Through a temporary and renamed into place: a reader that finds a half-written entry
-        // would take a truncated render for the page, and the parse that rejects it is not
-        // guaranteed to — json can be valid and short.
+        // Written to a temporary and renamed: a half-written entry could still parse as valid,
+        // truncated json and be taken for the page.
         let tmp = path.with_extension("tmp");
         if serde_json::to_vec(&stored)
             .ok()
@@ -389,9 +335,8 @@ impl NotionFs {
 
     /// The top-level directories kept from an earlier run, whatever their age.
     ///
-    /// Age is not a condition here, and that is the point: after a restart the tree paints
-    /// without a request, and [`LISTING_TTL`] from that moment the next listing asks Notion
-    /// again. A workspace page added since shows up then.
+    /// Age is ignored so the tree paints after a restart without a request; [`LISTING_TTL`]
+    /// later the next listing asks Notion again and picks up new pages.
     fn roots_on_disk(&self) -> Option<Vec<String>> {
         let path = self.cache_dir.as_ref()?.join(ROOTS_FILE);
         serde_json::from_slice(&std::fs::read(path).ok()?).ok()
@@ -418,8 +363,7 @@ impl NotionFs {
 
     /// Where `id`'s entry lives, for an id that could be one.
     ///
-    /// `valid_notion_id` is what keeps this from being a path: an id is a uuid, so there is no
-    /// separator and no `..` to smuggle through a file name.
+    /// `valid_notion_id` ensures a uuid, so no separator or `..` can be smuggled into the name.
     fn entry_path(&self, id: &str) -> Option<PathBuf> {
         let dir = self.cache_dir.as_ref()?;
         valid_notion_id(id).then(|| dir.join(format!("{id}.json")))
@@ -440,7 +384,7 @@ impl NotionFs {
         let mut found: Vec<(SystemTime, PathBuf)> = entries
             .flatten()
             .filter_map(|e| {
-                // Pages only: the roots file is not one, and it is not the sweep's to drop.
+                // Pages only; the roots file is not the sweep's to drop.
                 let path = e.path();
                 if !valid_notion_id(path.file_stem()?.to_str()?) {
                     return None;
@@ -465,9 +409,8 @@ impl NotionFs {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder) -> io::Result<Value> {
-        // `attempt` indexes `RETRY_BACKOFF`, but the range is `0..=len` (one past,
-        // the final no-backoff try) and the index also gates that last attempt, so
-        // an `.iter()` rewrite would not capture the loop — keep the range.
+        // `0..=len`: the extra last attempt has no backoff, and the index gates it, so
+        // `.iter()` cannot express this loop.
         #[allow(clippy::needless_range_loop)]
         for attempt in 0..=RETRY_BACKOFF.len() {
             let Some(this) = req.try_clone() else {
@@ -489,7 +432,7 @@ impl NotionFs {
         unreachable!("the final attempt returns instead of retrying")
     }
 
-    /// Pages shared with the integration (search filtered to pages), all pages.
+    /// Every page shared with the integration, via `search` filtered to pages.
     async fn search_pages(&self) -> io::Result<Vec<Value>> {
         let mut results = Vec::new();
         let mut cursor: Option<String> = None;
@@ -536,10 +479,9 @@ impl NotionFs {
 
     /// Every row of a database, paging through the query.
     ///
-    /// A row comes back as a full page object — its `properties` are the row, and
-    /// its blocks are read through its own directory. Notion leaves a database's
-    /// *templates* out of this answer even though they are parented to it, which
-    /// is why the tree shows rows and not templates.
+    /// A row is a full page object: its `properties` are the row, and its blocks are read
+    /// through its own directory. Notion omits a database's *templates* here though they are
+    /// parented to it, so the tree shows rows only.
     async fn query_database(&self, id: &str) -> io::Result<Vec<Value>> {
         if !valid_notion_id(id) {
             return Err(io::ErrorKind::NotFound.into());
@@ -580,8 +522,7 @@ impl NotionFs {
         let mut results = Vec::new();
         let mut cursor: Option<String> = None;
         loop {
-            // `.query()` encodes the pairs (and any escaping) rather than us
-            // splicing them into the URL by hand.
+            // `.query()` handles escaping.
             let mut params: Vec<(&str, String)> = vec![("page_size", "100".to_string())];
             if let Some(c) = &cursor {
                 params.push(("start_cursor", c.clone()));
@@ -607,10 +548,9 @@ impl NotionFs {
         Ok(results)
     }
 
-    /// Block children recursively, embedding nested blocks under a `children`
-    /// key. A `child_page` is not descended into — its own directory is where its
-    /// blocks are read — and neither is a `child_database`, whose rows are a query
-    /// this backend does not make. Recursion stops at [`MAX_BLOCK_DEPTH`].
+    /// Block children recursively, nested under a `children` key, to [`MAX_BLOCK_DEPTH`].
+    /// `child_page` and `child_database` are not descended into: their own directories
+    /// serve their contents.
     fn list_block_tree<'a>(
         &'a self,
         id: String,
@@ -647,11 +587,10 @@ impl NotionFs {
 
     // ---- Render + cache ------------------------------------------------------
 
-    /// The rendered `page.json` for `page_id`, from the cache where that is still the answer.
+    /// The rendered `page.json` for `page_id`.
     ///
-    /// Three outcomes, and the middle one is the point: inside [`FRESH`] nothing is asked; past
-    /// it, one `retrieve` says whether the page has been edited, and an unchanged page keeps
-    /// the render it has. Only a page that actually changed pays for the block walk again.
+    /// Inside [`FRESH`] nothing is asked; past it, one `retrieve` says whether the page was
+    /// edited, and an unchanged page keeps its render. Only a changed page pays the block walk.
     async fn render_cached(&self, page_id: &str) -> io::Result<Rendered> {
         let epoch = self.epoch();
         let cached = self.renders.lock().unwrap().get(page_id, epoch);
@@ -668,11 +607,7 @@ impl NotionFs {
             self.renders.lock().unwrap().confirm(page_id);
             return Ok(kept.rendered.clone());
         }
-        // Nothing in memory, but perhaps something from a previous run: the same retrieve
-        // answers for it, so a restart costs what a stale entry costs rather than a walk.
-        // Not after a refresh: a render from a previous run is exactly what the reader said
-        // they did not want, and `last_edited_time` is not a promise that a child page
-        // removed from this one moved it.
+        // Not after a refresh: removing a child page need not move `last_edited_time`.
         if epoch == 0
             && let Some(rendered) = self.kept_on_disk(page_id)
             && still_current(&rendered, &page)
@@ -703,12 +638,11 @@ impl NotionFs {
         Ok(rendered)
     }
 
-    /// The rendered `database.json` for `db_id`, served from the same cache a page
-    /// render uses — a database id and a page id are both UUIDs and never collide.
+    /// The rendered `database.json` for `db_id`, in the page render cache: database and page
+    /// ids are both UUIDs and never collide.
     ///
-    /// Shaped like a page render on purpose: bytes plus the directories that go
-    /// beside them, which here are the rows. One query answers both, so an `ls` of
-    /// a database and the read of its `database.json` cost one query between them.
+    /// Its `child_dirs` are the rows, so an `ls` of a database and a read of its
+    /// `database.json` share one query.
     async fn render_database_cached(&self, db_id: &str) -> io::Result<Rendered> {
         let epoch = self.epoch();
         let cached = self.renders.lock().unwrap().get(db_id, epoch);
@@ -719,8 +653,7 @@ impl NotionFs {
         }
 
         let db = self.get_database(db_id).await?;
-        // The same bargain as a page: the retrieve above is the cheap half, the query below is
-        // the one that grows with the number of rows.
+        // The retrieve is cheap; the query below grows with the number of rows.
         if let Some(kept) = &cached
             && still_current(&kept.rendered, &db)
         {
@@ -768,10 +701,9 @@ impl NotionFs {
 
     /// The render behind a `<dir>/<file>.json` path.
     ///
-    /// [`NotFound`](io::ErrorKind::NotFound) when the file name and the directory
-    /// kind disagree: `database.json` names nothing inside a page directory, and
-    /// neither does `page.json` inside a database's. One resolver for both readers,
-    /// so `stat` cannot answer for a file `read_at` would refuse.
+    /// [`NotFound`](io::ErrorKind::NotFound) when file name and directory kind disagree
+    /// (`database.json` in a page directory, `page.json` in a database's). Shared by `stat`
+    /// and `read_at` so they cannot disagree.
     async fn render_for_file(&self, rest: &[String]) -> io::Result<Rendered> {
         // `/pages/page.json` has no enclosing directory.
         let [.., dir, file] = rest else {
@@ -784,11 +716,7 @@ impl NotionFs {
         }
     }
 
-    /// Top-level (workspace) pages as `<title>__<id>` dir entries.
-    ///
-    /// Kept for [`LISTING_TTL`], and read back from disk at any age: a `search` is the one
-    /// request between a reader and the first thing they see, and it is paged, so a workspace
-    /// of any size pays it more than once.
+    /// Top-level (workspace) pages as `<title>__<id>` dir entries, kept for [`LISTING_TTL`].
     async fn top_level_page_dirs(&self) -> io::Result<Vec<Dirent>> {
         if let Some(roots) = self.roots.lock().unwrap().as_ref()
             && roots.seen.elapsed() < LISTING_TTL
@@ -826,11 +754,10 @@ impl NotionFs {
         Ok(dirs_of(&names))
     }
 
-    /// The names a listing of `id` shows, from whatever is kept — and nothing asked for.
+    /// The names a listing of `id` shows, from what is kept, with no request.
     ///
-    /// A listing needs names. A render read back from disk carries them, and one Notion has not
-    /// confirmed in this run is still a fine answer to "what is in this directory": the click
-    /// that follows goes through `render_cached`, which does confirm. See [`LISTING_TTL`].
+    /// An unconfirmed render from disk still answers a listing: opening the content goes
+    /// through [`Self::render_cached`], which confirms. See [`LISTING_TTL`].
     fn kept_child_dirs(&self, id: &str) -> Option<Arc<Vec<String>>> {
         let epoch = self.epoch();
         if let Some(kept) = self.renders.lock().unwrap().get(id, epoch)
@@ -838,8 +765,7 @@ impl NotionFs {
         {
             return Some(kept.rendered.child_dirs.clone());
         }
-        // A render from a previous run answers a listing — but not once a reader has asked
-        // for a refresh, which is the one thing they can say about a page that was deleted.
+        // Not after a refresh, the reader's only way to report a deleted page.
         if epoch != 0 {
             return None;
         }
@@ -852,13 +778,8 @@ impl NotionFs {
         Some(names)
     }
 
-    /// Contents of a page dir: `page.json` plus a subdir per `child_page` block.
-    ///
-    /// Served from the render, not from one level of blocks: a child page sits
-    /// wherever the page's layout puts it, and the immediate children of a
-    /// two-column page are the columns. Reading the render costs the fetch a
-    /// `stat` of `page.json` would have paid anyway, and the cache means an `ls`
-    /// and the read after it share it.
+    /// Contents of a page dir: `page.json` plus a subdir per `child_page` block at any depth,
+    /// taken from the render so an `ls` and the read after it share one.
     async fn page_dir_entries(&self, page_id: &str) -> io::Result<Vec<Dirent>> {
         let names = match self.kept_child_dirs(page_id) {
             Some(names) => names,
@@ -870,9 +791,8 @@ impl NotionFs {
     }
 }
 
-/// Three methods, which is all a read-only store implements: everything that would change
-/// something keeps the trait's `ReadOnlyFilesystem` default, and a caller hears that on the
-/// write rather than on the open — there being no open to hear it on.
+/// Every mutating method keeps the trait's `ReadOnlyFilesystem` default, so a writer hears
+/// it on the write; there is no open to hear it on. Page/block writes are not exposed.
 impl FileSystem for NotionFs {
     fn forget<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move { self.forget_kept() })
@@ -890,9 +810,8 @@ impl FileSystem for NotionFs {
                         // Render so the guest kernel sees the real size (no direct_io).
                         return Ok(self.render_for_file(rest).await?.stat());
                     }
-                    // A render carries the same two times this reports, so a directory whose
-                    // page was rendered a moment ago is already answered — which is most of
-                    // them, a reader having just listed the parent.
+                    // A fresh render carries this directory's times; one exists once this
+                    // directory was listed or its file read.
                     let (Node::Page(id) | Node::Database(id)) = node(last);
                     if let Some(kept) = self.renders.lock().unwrap().get(&id, self.epoch())
                         && kept.checked.is_some_and(|at| at.elapsed() < FRESH)
@@ -902,8 +821,8 @@ impl FileSystem for NotionFs {
                         st.ctime = kept.rendered.ctime;
                         return Ok(st);
                     }
-                    // Otherwise confirm the directory exists (and pick up its times) cheaply —
-                    // one retrieve, where listing it would be a whole render.
+                    // Otherwise one retrieve confirms it exists and gives its times, where a
+                    // listing would be a whole render.
                     let obj = match node(last) {
                         Node::Page(id) => self.get_page(&id).await?,
                         Node::Database(id) => self.get_database(&id).await?,
@@ -939,11 +858,8 @@ impl FileSystem for NotionFs {
         })
     }
 
-    /// Served from the render cache, which is what makes a path plane cheap here: the bytes
-    /// were produced by the [`stat`](Self::stat) that told the kernel how big the file is, and
-    /// they are still under `RENDER_TTL` when the reads arrive. A read that outlives the TTL
-    /// renders again — which is the same work the old open-and-hold did, just triggered by age
-    /// rather than by a descriptor going away.
+    /// Served from the render cache: the [`stat`](Self::stat) that reported the size produced
+    /// the bytes, and they are usually still within `FRESH` when the reads arrive.
     fn read_at<'a>(
         &'a self,
         path: &'a Path,
@@ -952,8 +868,7 @@ impl FileSystem for NotionFs {
     ) -> BoxFuture<'a, io::Result<usize>> {
         Box::pin(async move {
             let segs = segments(path);
-            // `page.json` and `database.json` are the only files in this tree; everything
-            // else that resolves is a directory, which is what a read of one has to say.
+            // `page.json` and `database.json` are the only files; anything else is a directory.
             if segs.len() < 3
                 || segs[0] != "pages"
                 || !matches!(
@@ -991,9 +906,8 @@ async fn finish(resp: reqwest::Response) -> io::Result<Value> {
         }
         return Err(io_other(format!("notion API {status}: {body}")));
     }
-    // A 2xx whose body will not parse is a broken response, not an empty page —
-    // surface it rather than letting `normalize_page`'s field defaults render a
-    // silently-blank page.json.
+    // An unparsable 2xx is a broken response; surfaced so field defaults do not render a
+    // silently blank page.json.
     serde_json::from_str(&body).map_err(io_other)
 }
 
@@ -1022,11 +936,9 @@ fn segments(path: &Path) -> Vec<String> {
 
 /// What a directory segment in the tree names.
 ///
-/// Both kinds are `<title>__<uuid>` and a Notion id says nothing about what it
-/// identifies, so the name has to carry it: [`DB_MARKER`] is the difference. That
-/// keeps a path resolvable on its own — no ancestor is fetched to learn what a
-/// segment is, which matters because [`FileSystem`] addresses by path and hands no
-/// parent along.
+/// A Notion id does not say what it identifies, so the name carries it via [`DB_MARKER`].
+/// That keeps a path resolvable on its own, with no ancestor fetched: [`FileSystem`]
+/// addresses by path and passes no parent.
 enum Node {
     Page(String),
     Database(String),
@@ -1034,8 +946,7 @@ enum Node {
 
 /// Marks a database directory: `<title>__db__<database-id>`.
 ///
-/// Unambiguous because [`sanitize_name`] folds runs of `_` to one, so a sanitized
-/// title can never contain `__` and this sequence can only be the marker.
+/// Unambiguous: [`sanitize_name`] folds runs of `_`, so a title never contains `__`.
 const DB_MARKER: &str = "__db__";
 
 fn node(dir_name: &str) -> Node {
@@ -1045,7 +956,7 @@ fn node(dir_name: &str) -> Node {
     }
 }
 
-/// Page id encoded as the part after the last `__` in a directory name.
+/// The part of a directory name after the last `__`.
 fn page_id(dir_name: &str) -> String {
     dir_name
         .rsplit_once("__")
@@ -1054,12 +965,8 @@ fn page_id(dir_name: &str) -> String {
         .to_string()
 }
 
-/// Every `child_page` and `child_database` block in a tree, at whatever depth, as
-/// a directory name.
-///
-/// Depth is the whole point: a page whose sub-pages live in a two-column layout
-/// has columns as its immediate children and not one child page among them.
-/// Neither kind is ever descended into, so neither has `children` to walk.
+/// Every `child_page` and `child_database` block in a tree as a directory name, at any depth,
+/// since a two-column page's immediate children are columns.
 fn collect_child_dirs(blocks: &[Value], out: &mut Vec<String>) {
     for b in blocks {
         let btype = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1127,13 +1034,10 @@ fn rfc3339_to_systemtime(s: &str) -> Option<SystemTime> {
     (secs >= 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
-/// Whether `rendered` still describes `object`, which is the whole of what a revalidation
-/// decides.
+/// Whether `rendered` still describes `object`.
 ///
-/// `last_edited_time` is the only thing Notion offers that says so — there is no etag here, and
-/// a page's own edit stamp is what its blocks move with. An object without one is never treated
-/// as unchanged: two absent times comparing equal would keep a stale render forever, which is
-/// the one failure worth spending a block walk to avoid.
+/// Notion has no etag; `last_edited_time` moves with a page's blocks. An object without one is
+/// never unchanged: two absent times comparing equal would keep a stale render forever.
 fn still_current(rendered: &Rendered, object: &Value) -> bool {
     let edited = page_time(object, "last_edited_time");
     edited.is_some() && rendered.mtime == edited
@@ -1146,7 +1050,7 @@ fn page_time(v: &Value, key: &str) -> Option<SystemTime> {
 }
 
 /// Page metadata + markdown body + raw blocks. `child_page`/`child_database`
-/// blocks are excluded (they surface as subdirectories).
+/// blocks carry no content here (it surfaces in their subdirectories).
 fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
     let parent = page.get("parent").cloned().unwrap_or_else(|| json!({}));
     let parent_type = parent.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1164,10 +1068,8 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
         "parent_type": parent_type,
         "parent_id": parent_id,
         "archived": page.get("archived").and_then(|v| v.as_bool()).unwrap_or(false),
-        // Verbatim, and the whole of it. For a database row this *is* the row —
-        // the block body below is whatever was typed into the row's page — so a
-        // reader that has the render has the record, without a second shape to
-        // learn per property type.
+        // Verbatim: for a database row this *is* the record, so a reader needs no second
+        // shape per property type.
         "properties": page.get("properties").cloned().unwrap_or_else(|| json!({})),
         "markdown": blocks_to_markdown(blocks),
         "blocks": blocks,
@@ -1176,12 +1078,9 @@ fn normalize_page(page: &Value, blocks: &[Value]) -> Value {
 
 /// `database.json`: what the database is, its schema, and an index of its rows.
 ///
-/// The index carries each row's `dir` so a reader that has the index has the path
-/// to the row's body, rather than a name it has to rebuild the same way this module
-/// builds it. It carries the row's `icon` for the same reason the row's own page does:
-/// a reader that draws the index as a list has the row's name and nothing else to tell
-/// one row from the next, and reading every row's body to find out costs a request each.
-/// `properties` is Notion's own schema, unedited, for the reason a page's is.
+/// Each row carries its `dir`, so a reader need not rebuild the name, and its `icon`, so a
+/// list of rows is distinguishable without a request per row. `properties` is Notion's schema,
+/// verbatim.
 fn normalize_database(db: &Value, rows: &[Value], dirs: &[String]) -> Value {
     let parent = db.get("parent").cloned().unwrap_or_else(|| json!({}));
     let parent_type = parent.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -1229,11 +1128,9 @@ fn normalize_database(db: &Value, rows: &[Value], dirs: &[String]) -> Value {
 
 /// A page or database's icon, when it is an emoji, and `null` otherwise.
 ///
-/// Notion's `icon` is one of three shapes: `{"type":"emoji","emoji":"\u{1f4dd}"}`, or an
-/// `external`/`file` image behind a URL. Only the emoji travels. A reader of this
-/// filesystem has no way to fetch the other two — a `file` icon sits behind a signed URL
-/// that expires — and an icon it cannot render is worth no more than the absence it would
-/// fall back to anyway.
+/// Notion's `icon` is an emoji (`{"type":"emoji","emoji":"\u{1f4dd}"}`) or an
+/// `external`/`file` image behind a URL. Only the emoji travels: a reader cannot fetch the
+/// others (a `file` icon's signed URL expires), and an unrenderable icon is no better than none.
 fn emoji_icon(obj: &Value) -> Option<&str> {
     let icon = obj.get("icon")?;
     if icon.get("type").and_then(|t| t.as_str()) != Some("emoji") {
@@ -1395,9 +1292,8 @@ fn block_to_md(block: &Value, indent: usize) -> String {
             format!("$${expr}$$")
         }
         "table_of_contents" => "[TOC]".to_string(),
-        // The content is not here — a child page's is in its own directory, a
-        // database's stays behind a query this backend does not make — so the
-        // line says where it went rather than reading as a gap in the page.
+        // The content lives in the child's own directory; the line marks where it went
+        // rather than leaving a gap.
         "child_page" => format!("{prefix}[page: {}]", child_title(&content)),
         "child_database" => format!("{prefix}[database: {}]", child_title(&content)),
         _ => {
@@ -1439,7 +1335,7 @@ fn blocks_to_markdown(blocks: &[Value]) -> String {
 mod tests {
     use super::*;
 
-    /// A render carrying `edited` as the page's last edit, which is all the cache reads.
+    /// A render carrying `edited` as the page's last edit, the only field revalidation reads.
     fn rendered(edited: Option<&str>) -> Rendered {
         Rendered {
             bytes: Arc::new(b"{}".to_vec()),
@@ -1453,8 +1349,6 @@ mod tests {
     fn a_render_is_kept_only_while_the_page_says_it_has_not_moved() {
         let have = rendered(Some("2026-09-22T05:00:00.000Z"));
 
-        // The same edit stamp: the page is what the render was built from, so the block walk
-        // that would rebuild it is exactly the work worth skipping.
         assert!(still_current(
             &have,
             &json!({ "last_edited_time": "2026-09-22T05:00:00.000Z" })
@@ -1464,8 +1358,7 @@ mod tests {
             &json!({ "last_edited_time": "2026-09-22T06:00:00.000Z" })
         ));
 
-        // No stamp on either side is not agreement. Two absent times compare equal, and
-        // treating that as unchanged would keep a stale render for as long as the process runs.
+        // Absent stamps are not agreement, or a stale render would be kept forever.
         assert!(!still_current(&have, &json!({})));
         assert!(!still_current(&rendered(None), &json!({})));
         assert!(!still_current(
@@ -1488,8 +1381,7 @@ mod tests {
         assert!(renders.get("page-1", 0).is_none());
         assert!(renders.get(&format!("page-{}", CACHE_CAP + 1), 0).is_some());
 
-        // Re-rendering a page it already holds replaces it rather than queueing it twice,
-        // or the order would drop entries that are still in the map.
+        // Re-admitting replaces rather than queueing twice, or the order would drop live entries.
         let before = renders.order.len();
         renders.admit(format!("page-{}", CACHE_CAP + 1), rendered(None), true, 0);
         assert_eq!(renders.order.len(), before);
@@ -1520,7 +1412,7 @@ mod tests {
         let back = fs.kept_on_disk(ID).expect("an entry was written");
         assert_eq!(back.bytes, kept.bytes);
         assert_eq!(back.child_dirs, kept.child_dirs);
-        // The stamp is the whole point of keeping it: it is what the next run revalidates with.
+        // The stamp is what the next run revalidates with.
         assert_eq!(back.mtime, kept.mtime);
         assert!(still_current(
             &back,
@@ -1533,12 +1425,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let fs = store(Some(dir.path()));
 
-        // No edit stamp: an entry whose freshness can never be decided is worse than no entry,
-        // because the next run would serve it and have no way to find out it is wrong.
+        // No edit stamp: the next run could never find out the entry is wrong.
         fs.keep_on_disk(ID, &rendered(None));
         assert!(fs.kept_on_disk(ID).is_none());
 
-        // And an id that is not a Notion id is not a file name. `..` never reaches the path.
+        // A non-Notion id is not a file name, so `..` never reaches the path.
         fs.keep_on_disk(
             "../../etc/passwd",
             &rendered(Some("2026-09-22T05:00:00.000Z")),
@@ -1562,15 +1453,13 @@ mod tests {
         kept.child_dirs = Arc::new(vec!["child__38ac4175a910810ab4b6e1bda771cd38".into()]);
         fs.keep_on_disk(ID, &kept);
 
-        // No client, no server, no token that would work: reaching Notion here would fail, and
-        // the names come back all the same.
+        // The token is fake, so any request to Notion would fail.
         let names = fs
             .kept_child_dirs(ID)
             .expect("the entry answers the listing");
         assert_eq!(*names, *kept.child_dirs);
 
-        // And what it put in memory is *not* confirmed, so the next `stat` or read still asks.
-        // A listing may be a minute behind; a size may not be wrong at all.
+        // Not confirmed in memory, so the next `stat` or read still asks Notion.
         let in_memory = fs.renders.lock().unwrap().get(ID, 0).unwrap();
         assert!(in_memory.checked.is_none());
     }
@@ -1588,8 +1477,7 @@ mod tests {
             "kept, before the reader says otherwise"
         );
 
-        // What a reader means by Refresh: a page they deleted is still in a listing, and a
-        // listing is served from a render precisely so that it costs no request.
+        // A reader's Refresh, e.g. after deleting a page a kept listing still shows.
         fs.forget_kept();
 
         assert!(
@@ -1600,9 +1488,8 @@ mod tests {
             fs.roots_on_disk().is_none(),
             "and the top-level listing goes with it"
         );
-        // The renders themselves are still on disk — dropping them would make the next visit
-        // to every page a whole block walk — but nothing reaches them without asking Notion
-        // first, because the epoch has moved.
+        // Renders stay on disk (dropping them would cost the next run a block walk per page),
+        // but the moved epoch keeps them from answering in this one.
         assert!(fs.kept_on_disk(ID).is_some());
         assert!(fs.renders.lock().unwrap().get(ID, fs.epoch()).is_none());
     }
@@ -1617,7 +1504,6 @@ mod tests {
         fs.keep_roots_on_disk(&names);
         assert_eq!(fs.roots_on_disk().unwrap(), names);
 
-        // Without a directory there is nothing to read back, and nothing was written.
         assert!(store(None).roots_on_disk().is_none());
     }
 
@@ -1625,15 +1511,12 @@ mod tests {
     fn the_directory_stops_growing_at_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let fs = store(Some(dir.path()));
-        // Named as pages are: `valid_notion_id` takes the 32-character form, and the sweep
-        // only ever drops entries that are pages.
+        // 32-hex names pass `valid_notion_id`, so the sweep treats them as pages.
         for i in 0..DISK_CAP + 5 {
             std::fs::write(dir.path().join(format!("{i:032x}.json")), b"{}").unwrap();
         }
-        // Not a page, and not the sweep's to drop: the top-level listing lives here too.
         std::fs::write(dir.path().join(ROOTS_FILE), b"[]").unwrap();
 
-        // A sweep happens every `SWEEP_EVERY` writes, not on each one.
         for _ in 0..SWEEP_EVERY - 1 {
             fs.sweep(dir.path());
         }
@@ -1659,15 +1542,13 @@ mod tests {
             "a confirmed render is as good as a fresh one"
         );
 
-        // A render read back from disk is not confirmed: it may answer a listing, and
-        // `render_cached` asks Notion before it answers for content.
+        // One read from disk is unconfirmed: it answers listings, not content.
         renders.admit("from-disk".into(), rendered(None), false, 0);
         let kept = renders.get("from-disk", 0).unwrap();
         assert!(kept.checked.is_none());
         assert!(kept.seen.elapsed() < LISTING_TTL);
 
-        // Confirming something that is not there is not an insertion: the render is what
-        // carries the page's bytes, and there are none to carry.
+        // Confirming a missing id inserts nothing: there are no bytes to carry.
         renders.confirm("missing");
         assert!(renders.get("missing", 0).is_none());
     }
@@ -1676,8 +1557,7 @@ mod tests {
         json!({ "type": btype, "id": id, btype: { "title": title } })
     }
 
-    /// The emoji is the only icon a reader of this filesystem can act on, so it is the
-    /// only one that is carried.
+    /// Only an emoji icon is usable by a reader, so only it is carried.
     #[test]
     fn an_emoji_icon_travels_and_an_image_does_not() {
         let page = json!({ "icon": { "type": "emoji", "emoji": "\u{1f4dd}" } });
@@ -1691,8 +1571,7 @@ mod tests {
         assert_eq!(emoji_icon(&external), None);
     }
 
-    /// A page with no icon is the common case, and it has to read as an absence rather
-    /// than as a missing key a reader would have to tell apart from a malformed one.
+    /// No icon is `null`, not a missing key a reader would have to tell from a malformed one.
     #[test]
     fn a_page_without_an_icon_still_has_the_key() {
         let rendered = normalize_page(&json!({ "id": "abc" }), &[]);
@@ -1703,8 +1582,7 @@ mod tests {
         assert_eq!(rendered["icon"], json!("\u{1f4c1}"));
     }
 
-    /// A reader that draws the row index as a list never opens the rows, so an icon
-    /// the index drops is one it will not see.
+    /// A reader drawing the row index never opens the rows, so the index must carry icons.
     #[test]
     fn a_rows_icon_reaches_the_index_beside_its_dir() {
         let rows = [
@@ -1718,8 +1596,7 @@ mod tests {
         assert_eq!(rendered["rows"][1].get("icon"), Some(&Value::Null));
     }
 
-    /// A page directory and a database directory are told apart by the name alone,
-    /// which is what lets a path resolve without fetching its parent.
+    /// The name alone tells a page directory from a database's, so no parent is fetched.
     #[test]
     fn a_directory_name_says_which_kind_it_is() {
         let id = "2fd2589f-40ea-8115-95e3-c4970d29590c";
@@ -1729,8 +1606,7 @@ mod tests {
         );
     }
 
-    /// The marker cannot be forged by a title, because `sanitize_name` folds runs of
-    /// `_` to one and a sanitized title therefore never contains `__` at all.
+    /// A title cannot forge the marker: `sanitize_name` folds runs of `_`, so no `__` survives.
     #[test]
     fn a_title_cannot_forge_the_marker() {
         for title in ["vector db", "a__db", "db", "__db__", "x  db  y"] {
@@ -1742,7 +1618,7 @@ mod tests {
         assert!(matches!(node(&dir), Node::Page(x) if x == id));
     }
 
-    /// Both kinds are collected, at whatever depth a layout block buried them.
+    /// Both kinds are collected at any depth inside layout blocks.
     #[test]
     fn child_pages_and_databases_are_collected_at_depth() {
         let blocks = vec![json!({
@@ -1766,13 +1642,12 @@ mod tests {
                 "프로젝트_일정__db__bbbbbbbb-0000-0000-0000-000000000002",
             ]
         );
-        // And each round-trips to the id and kind it was built from.
+        // Each round-trips to its kind.
         assert!(matches!(node(&out[0]), Node::Page(_)));
         assert!(matches!(node(&out[1]), Node::Database(_)));
     }
 
-    /// A `child_page` is never descended into, so a database *below* one belongs to
-    /// that page's own directory and not to this listing.
+    /// A database below a `child_page` belongs to that page's directory, not this listing.
     #[test]
     fn a_collected_child_is_not_walked_through() {
         let blocks = vec![json!({

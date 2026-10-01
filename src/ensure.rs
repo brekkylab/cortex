@@ -1,18 +1,4 @@
 //! Fetching the console server when this host has none.
-//!
-//! cortex-krun's `cargo xtask upload` publishes one archive per platform, holding what its
-//! `cargo xtask install` would put in [`cache_root`]`/bin`: `cortex-krun`, the VM process
-//! beside it, the guest, the guest kernel, and `abin/`. The layout it writes, under the
-//! bucket's public HTTPS endpoint, is
-//!
-//! ```text
-//! cortex-krun/<ref>/cortex-krun-<os>-<arch>.tar.gz
-//! ```
-//!
-//! with `<os>` and `<arch>` spelled as [`std::env::consts`] spells them, and `<ref>` any name
-//! a release goes by: the git sha of cortex-krun it was built from, a version tag, or
-//! `latest`. Each is a directory of every platform's archive, so fetching is one URL whichever
-//! name it is given.
 
 use std::path::{Path, PathBuf};
 
@@ -30,18 +16,28 @@ const PINNED: Option<&str> = match option_env!("CORTEX_KRUN_PINNED_VERSION") {
 /// Where releases are fetched from unless `$CORTEX_DIST_URL` says otherwise.
 const DIST_URL: &str = "https://cortex-dist-044443350235-us-east-1-an.s3.us-east-1.amazonaws.com";
 
-/// Fetch the console server into [`cache_root`]`/bin` if it is not there, and answer that
-/// directory.
+/// Fetch the console server into [`cache_root`]`/bin` if absent, and return that directory.
 ///
-/// **Present is enough.** A `bin/` that already has `cortex-krun` is left alone, whether it
-/// came from here or from `cargo xtask install` -- this makes a host able to run a session,
-/// and does not keep one up to date.
+/// **Present is enough**: a `bin/` that already has `cortex-krun` (from here or from
+/// `cargo xtask install`) is left alone; this does not keep it up to date.
 ///
-/// The release is `$CORTEX_KRUN_VERSION` if set; else the one this build was pinned to, if it
-/// was built with `CORTEX_KRUN_PINNED_VERSION` -- which a published package is, so that one
-/// release of it always fetches the server it was tested with; else `latest`. `cortex-krun`
-/// itself is the last file put in place, so a fetch that fails partway leaves a `bin/` the
-/// next call fetches into again rather than one that looks complete.
+/// The release is `$CORTEX_KRUN_VERSION` if set; else the one this build was pinned to
+/// (`CORTEX_KRUN_PINNED_VERSION`, set for a published package so it fetches the server it was
+/// tested with); else `latest`. `cortex-krun` is placed last, so a partial fetch leaves a
+/// `bin/` the next call refetches rather than one that looks complete.
+///
+/// # Release layout
+///
+/// One archive per platform, holding what `bin/` needs, under the bucket's public HTTPS
+/// endpoint:
+///
+/// ```text
+/// cortex-krun/<ref>/cortex-krun-<os>-<arch>.tar.gz
+/// ```
+///
+/// `<os>`/`<arch>` are as [`std::env::consts`] spells them. `<ref>` is any name a release goes
+/// by (a cortex-krun git sha, a version tag, or `latest`), so fetching is one URL whichever
+/// name is given.
 pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     let root = cache_root();
     let bin = root.join("bin");
@@ -74,8 +70,8 @@ pub async fn ensure_cortex() -> anyhow::Result<PathBuf> {
     Ok(bin)
 }
 
-/// GET `url`, whole. An S3 bucket without public listing answers a missing key with 403
-/// rather than 404, so a status is reported as the URL that answered it and nothing more.
+/// GET `url`, whole. A bucket without public listing answers a missing key with 403, not 404,
+/// so a failure reports only the URL and status, without interpreting it.
 async fn fetch(url: &str) -> anyhow::Result<Vec<u8>> {
     let response = reqwest::get(url)
         .await
@@ -91,8 +87,8 @@ async fn fetch(url: &str) -> anyhow::Result<Vec<u8>> {
 
 /// Unpack `archive` beside `bin/` and move its entries in, `server` last.
 ///
-/// Beside rather than into: a directory of this process's own on the same filesystem, so
-/// every move is a rename and no reader of `bin/` sees a file half-written.
+/// The staging directory is per-process and on the same filesystem, so every move is a rename
+/// and no reader of `bin/` sees a half-written file.
 fn unpack(archive: &[u8], root: &Path, server: &str) -> anyhow::Result<()> {
     let part = root.join(format!(".bin.{}.part", std::process::id()));
     let _ = std::fs::remove_dir_all(&part);
@@ -120,8 +116,8 @@ fn unpack(archive: &[u8], root: &Path, server: &str) -> anyhow::Result<()> {
     moved
 }
 
-/// Rename `from` to `to`, over whatever is there. A file is replaced by the rename itself; a
-/// directory cannot be, so an old one is removed first.
+/// Rename `from` over `to`. A rename replaces a file but not a directory, so an old directory
+/// is removed first.
 fn replace(from: &Path, to: &Path) -> anyhow::Result<()> {
     if from.is_dir() && to.is_dir() {
         std::fs::remove_dir_all(to).with_context(|| format!("removing {}", to.display()))?;

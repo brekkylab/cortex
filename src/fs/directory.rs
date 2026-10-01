@@ -1,18 +1,4 @@
 //! A tree built from files held in memory and host directories grafted into it.
-//!
-//! A [`Directory`] is an [`InMemFs`] at the root with a longest-prefix mount table over it:
-//! each [`PassthroughFs`] is registered at a root-relative path and serves every request that
-//! falls under it, with the path re-based onto its own root. Everything no mount claims is the
-//! in-memory tree's.
-//!
-//! It is itself a [`FileSystem`], so it can be driven by the same bindings as any single
-//! store.
-//!
-//! **The `mount` here is the table's, not the operating system's.**
-//! [`mount`](Directory::mount) grafts a host directory onto a path in *this* tree and nothing
-//! outside the process learns of it. Putting the result where a kernel can see it is
-//! [`Mount`](crate::fs::Mount), which is what a binding hands back — so a `Directory` with ten
-//! mounts in it may still be mounted nowhere at all.
 
 use std::{
     collections::BTreeMap,
@@ -26,34 +12,25 @@ use crate::{
     fs::{Dirent, DirentKind, FileSystem, InMemFs, PassthroughFs, Stat},
 };
 
-/// A public API for using cortex's filesystem.
+/// A tree assembled from in-memory files and host directories, served as one namespace.
 ///
-/// A *context* is a tree a session is given to work in, as against its rootfs — the system's
-/// own tree — and this is what one is assembled out of: files the caller hands over, kept in
-/// memory, and host directories placed beside them, all behind one
-/// [`mount`](crate::console::ConsoleClientBuilder::mount).
+/// An [`InMemFs`] root under a longest-prefix mount table: each [`PassthroughFs`] serves every
+/// request under its root-relative mount point, re-based onto its own root; everything else is
+/// the in-memory tree's. Itself a [`FileSystem`], so bindings drive it like any single store.
 ///
-/// Which is a different question from the one the console protocol answers by taking a list
-/// of mounts, and both answers stand: this composes many sources into *one* namespace a
-/// command walks, where a session's mounts are separate namespaces the caller places itself.
-/// A tree assembled here is one entry in that list, whatever the caller means it for.
+/// Builds a session's *context* (as opposed to its rootfs): many sources in one namespace,
+/// where a session's mounts are separate namespaces.
 ///
-/// The two kinds of content do not nest. A file is added to the in-memory tree only, so a
-/// path under a mount is refused rather than written through to the host; and mounts are
-/// disjoint, so a host directory never hides another one or the files already added.
+/// The two kinds of content do not nest: files go to the in-memory tree only, so a path under a
+/// mount is refused rather than written to the host, and mounts are disjoint, so a host
+/// directory never hides another or files already added.
 pub struct Directory {
-    /// Where everything no mount claims lives, including the directories that lead to each
-    /// mount point — [`mount`](Self::mount) makes those, so every path above a mount is a
-    /// real directory here rather than one the table has to invent.
+    /// Everything no mount claims, including the directories leading to each mount point, which
+    /// [`mount`](Self::mount) creates so the table never has to invent them.
     root: InMemFs,
 
     /// Mount points keyed by their normalized, root-relative path. Never the empty path: the
     /// root is [`root`](Self::root)'s.
-    ///
-    /// `PathBuf`'s component-wise `Ord` guarantees that, among all keys that are a prefix of a
-    /// request, the longest is also the lexicographically greatest — so a longest-prefix lookup
-    /// is a reverse range scan (see [`Directory::mount_for`]), and all keys sharing a prefix
-    /// form one contiguous run (see [`Directory::descendant_mounts`]).
     mounts: BTreeMap<PathBuf, PassthroughFs>,
 }
 
@@ -85,15 +62,15 @@ impl Directory {
     /// Put a file at `path` holding everything `content` yields, making the directories on
     /// the way and replacing a file already there.
     ///
-    /// The file lives in memory, so `path` may not fall under a mount — that is
-    /// [`InvalidInput`](io::ErrorKind::InvalidInput), not a write to the host directory.
+    /// A `path` under a mount is [`InvalidInput`](io::ErrorKind::InvalidInput), not a write to
+    /// the host directory.
     pub fn add_file(&mut self, path: impl AsRef<Path>, content: impl io::Read) -> io::Result<()> {
         let key = self.in_memory_key(path.as_ref())?;
         self.root.put_file(&key, content)
     }
 
-    /// Remove a file [`add_file`](Self::add_file) put there, or one a command made since.
-    /// Refused under a mount, as `add_file` is.
+    /// Remove an in-memory file, whether added or made by a command since. Refused with
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput) under a mount.
     pub fn remove_file(&mut self, path: impl AsRef<Path>) -> io::Result<()> {
         let key = self.in_memory_key(path.as_ref())?;
         self.root.remove_file(&key)
@@ -102,11 +79,13 @@ impl Directory {
     /// Serve the host directory `host_dir` at `path` (root-relative), making the directories
     /// that lead to it.
     ///
-    /// Refused with [`InvalidInput`](io::ErrorKind::InvalidInput) at the root, inside another
-    /// mount or above one, and with [`AlreadyExists`](io::ErrorKind::AlreadyExists) where the
-    /// in-memory tree already has something — each of those would hide what is there.
-    /// `host_dir` is not checked: like [`PassthroughFs::new`], a missing directory fails at
-    /// first use.
+    /// Refused, since each would hide what is there, with
+    /// [`InvalidInput`](io::ErrorKind::InvalidInput) at the root, inside or above another mount,
+    /// and with [`AlreadyExists`](io::ErrorKind::AlreadyExists) where the in-memory tree has an
+    /// entry. `host_dir` is not checked; a missing one fails at first use.
+    ///
+    /// Registers in this tree's table only; the OS sees nothing until a binding yields a
+    /// [`Mount`](crate::fs::Mount).
     pub fn mount(
         &mut self,
         path: impl AsRef<Path>,
@@ -144,10 +123,8 @@ impl Directory {
     /// The store that owns `key` (longest-prefix match), with `key` re-based onto that store's
     /// root. Anything no mount claims is the in-memory tree's.
     ///
-    /// `key` must already be normalized — the caller does that once and reuses it for the
-    /// mount-table queries alongside this one. That is a correctness requirement, not a
-    /// convenience: [`Posix`](crate::fs::Posix) walks the tree as `/`-rooted paths, so a stray
-    /// `RootDir` component would miss every mount.
+    /// `key` must already be normalized: [`Posix`](crate::fs::Posix) passes `/`-rooted paths,
+    /// and a stray `RootDir` component would miss every mount.
     fn route(&self, key: &Path) -> (&dyn FileSystem, PathBuf) {
         match self.mount_for(key) {
             Some(mount) => {
@@ -169,12 +146,10 @@ impl Directory {
 
     /// The mount point that owns `key`, if a mount does.
     ///
-    /// Separate from [`route`](Self::route) because a move has to compare *which* mount each of
-    /// its two paths belongs to. Comparing the resolved stores instead would work by pointer
-    /// identity, which is a far more fragile thing to rest a correctness decision on.
+    /// Exposed separately so a move can compare *which* mount owns each path, rather than
+    /// comparing resolved stores by fragile pointer identity.
     fn mount_for(&self, key: &Path) -> Option<&Path> {
-        // Walk every key <= `key` from the greatest downward; the first that is a prefix of
-        // `key` is the longest match.
+        // Among keys <= `key`, the greatest that is a prefix is the longest match.
         self.mounts
             .range(..=key.to_path_buf())
             .rev()
@@ -184,10 +159,9 @@ impl Directory {
 
     /// Every mount *strictly* below `prefix`.
     ///
-    /// One contiguous run of the map, not a scan: component-wise `Ord` puts `["a"] <
-    /// ["a","b"]` (equal prefix, shorter first) and `["a","z"] < ["b"]` (they diverge at the
-    /// first component), so keys sharing a prefix are adjacent and a sibling like `ab` cannot
-    /// interleave. The bound is `Excluded`, so a mount is not below itself.
+    /// One contiguous run of the map: component-wise `Ord` puts `["a"] < ["a","b"]` and
+    /// `["a","z"] < ["b"]`, so keys sharing a prefix are adjacent and a sibling like `ab` cannot
+    /// interleave. `Excluded` keeps a mount from being below itself.
     fn descendant_mounts<'a>(&'a self, prefix: &'a Path) -> impl Iterator<Item = &'a PathBuf> {
         self.mounts
             .range((Excluded(prefix.to_path_buf()), Unbounded))
@@ -198,9 +172,8 @@ impl Directory {
     /// The child names of `prefix` that come from the mount table, each flagged with whether a
     /// mount sits at *exactly* that path.
     ///
-    /// The flag is what decides who wins a name collision with the in-memory tree: an exact
-    /// child is a mount point and shadows whatever the tree had there, while a name that
-    /// merely leads to a deeper mount keeps the tree's entry.
+    /// The flag settles name collisions with the in-memory tree: a mount point shadows the
+    /// tree's entry, while a name leading to a deeper mount keeps it.
     fn mount_children(&self, prefix: &Path) -> BTreeMap<String, bool> {
         let mut out = BTreeMap::new();
         for mount in self.descendant_mounts(prefix) {
@@ -219,8 +192,7 @@ impl Directory {
         out
     }
 
-    /// Whether any mount lies strictly below `prefix` — i.e. whether `prefix` is a directory
-    /// on the way to one.
+    /// Whether `prefix` is a directory on the way to some mount.
     fn spans_mounts(&self, prefix: &Path) -> bool {
         self.descendant_mounts(prefix).next().is_some()
     }
@@ -228,18 +200,16 @@ impl Directory {
     /// Whether `key` belongs to the mount table rather than to a store — a mount point itself,
     /// or a directory on the way to one.
     ///
-    /// Neither is the filesystem's to move. A mount point is a real path its own store serves,
-    /// but not one a `rename` may relocate, because doing so would rewrite the mount table
-    /// through a file operation.
+    /// Neither may be renamed: that would rewrite the mount table through a file operation.
     fn is_mount_table_owned(&self, key: &Path) -> bool {
         self.mounts.contains_key(key) || self.spans_mounts(key)
     }
 
     /// Refuse a mutation aimed at a directory on the way to a mount.
     ///
-    /// Checked *before* the store is consulted, because the in-memory tree holds only the
-    /// directory, not what is mounted below it — asked first it would let `rmdir` take away
-    /// a directory the mount table still needs, which is how a mount ends up detached.
+    /// Checked *before* the store: the in-memory tree holds only the directory, not what is
+    /// mounted below, so it would let `rmdir` remove a directory the table needs and detach
+    /// the mount.
     fn guard_spans_mounts(&self, key: &Path, refusal: io::ErrorKind) -> io::Result<()> {
         if self.spans_mounts(key) {
             Err(refusal.into())
@@ -262,11 +232,8 @@ fn not_found() -> io::Error {
 /// Normalize a path for use as a mount key, additionally refusing components that are not valid
 /// UTF-8.
 ///
-/// Only *mount* paths carry this restriction, not request paths: a request may legitimately
-/// name a non-UTF-8 file inside a passthrough store. But a mount point's own name gets
-/// *listed* — reported through [`Dirent::name`], which is a `String` — so a non-UTF-8 component
-/// could only be shown lossily, and a lossy name does not round-trip. That would produce an
-/// entry visible in a listing whose `lookup` then fails.
+/// Request paths may be non-UTF-8, but a mount point's name is listed through the `String`
+/// [`Dirent::name`], and a lossy name would list an entry whose `lookup` then fails.
 fn mount_key(path: &Path) -> io::Result<PathBuf> {
     let key = normalize(path)?;
     if key
@@ -314,8 +281,7 @@ impl FileSystem for Directory {
             let (store, sub) = self.route(&key);
             let entries = store.list(&sub).await?;
 
-            // Split the store's entries by whether the mount table also names them, so each
-            // name is emitted exactly once.
+            // Split off entries the mount table also names, so each name is emitted once.
             let (mut named_by_mounts, store_only): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .partition(|entry| children.contains_key(&entry.name));
@@ -324,22 +290,17 @@ impl FileSystem for Directory {
                 .map(|entry| (entry.name.clone(), entry))
                 .collect();
 
-            // Mount-derived names go first, in sorted order, so their positions depend only on
-            // the mount table. `readdir`'s cursor is a position in this list and the kernel
-            // resumes by quoting one, so putting them last would let a single file appearing in
-            // the store shift every mount point — dropping a whole mount out of an in-progress
-            // listing.
+            // Mount-derived names go first, sorted, so their positions depend only on the table.
+            // `readdir` resumes at a position in this list, so with them last a new store file
+            // would shift every mount point and drop one from an in-progress listing.
             let mut out = Vec::with_capacity(children.len() + store_only.len());
             for (name, mounted_here) in children {
                 let store_entry = claimed.remove(&name);
                 out.push(match (mounted_here, store_entry) {
-                    // A mount at this exact path shadows whatever the tree had, the way any
-                    // mount hides the directory it is mounted over. No stat: the kernel will
-                    // `lookup` for metadata, and that lookup routes to the mount, so the two
-                    // answers cannot disagree.
+                    // A mount point shadows the tree's entry. No stat: the kernel's `lookup`
+                    // for metadata routes to the mount, so the answers cannot disagree.
                     (true, _) => Dirent::new(name, DirentKind::Dir),
-                    // On the way to a deeper mount — the tree's own directory, which carries
-                    // metadata a made-up entry would lack.
+                    // On the way to a deeper mount: keep the tree's directory for its metadata.
                     (false, Some(entry)) => entry,
                     (false, None) => Dirent::new(name, DirentKind::Dir),
                 });
@@ -365,8 +326,8 @@ impl FileSystem for Directory {
     fn create<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<Stat>> {
         Box::pin(async move {
             let key = normalize(path)?;
-            // The name is taken by a directory the mount table needs, which is what
-            // `AlreadyExists` says — and what an exclusive create owes its caller.
+            // The name is taken by a directory the mount table needs; an exclusive create
+            // answers `AlreadyExists`.
             self.guard_spans_mounts(&key, io::ErrorKind::AlreadyExists)?;
             let (store, sub) = self.route(&key);
             store.create(&sub).await
@@ -394,8 +355,7 @@ impl FileSystem for Directory {
     fn rmdir<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, io::Result<()>> {
         Box::pin(async move {
             let key = normalize(path)?;
-            // Not empty: it holds the mount points below it, and those are not the caller's to
-            // remove through the filesystem.
+            // Not empty: it holds mount points, which the filesystem may not remove.
             self.guard_spans_mounts(&key, io::ErrorKind::DirectoryNotEmpty)?;
             let (store, sub) = self.route(&key);
             store.rmdir(&sub).await
@@ -435,17 +395,14 @@ impl FileSystem for Directory {
         Box::pin(async move {
             let (from_key, to_key) = (normalize(from)?, normalize(to)?);
 
-            // Neither end may be something the mount table owns. Checked before the stores are
-            // consulted, because a refusal has to leave the tree untouched and a store asked
-            // about its own root would answer something arbitrary.
+            // Checked before the stores: a refusal must leave the tree untouched, and a store
+            // asked about its own root would answer arbitrarily.
             if self.is_mount_table_owned(&from_key) || self.is_mount_table_owned(&to_key) {
                 return Err(io::ErrorKind::ReadOnlyFilesystem.into());
             }
 
-            // Two stores cannot hand an object to each other, so this is `EXDEV` — and `mv`
-            // reads that as "copy, then delete", which is the right recovery across a store
-            // boundary. Doing the copy here instead could not be made atomic on partial
-            // failure, and `mv` already knows how to deal with that.
+            // `EXDEV` makes `mv` copy then delete; copying here could not be atomic on
+            // partial failure, which `mv` already handles.
             if self.mount_for(&from_key) != self.mount_for(&to_key) {
                 return Err(io::ErrorKind::CrossesDevices.into());
             }
@@ -523,12 +480,12 @@ mod tests {
         assert_eq!(read_all(&dir, "deep/project/on-disk.txt").await, "disk");
         assert_eq!(read_all(&dir, "readme.md").await, "memory");
 
-        // The directory on the way to the mount is the table's, not the caller's to remove.
+        // A directory on the way to a mount is the table's.
         assert_eq!(
             dir.rmdir(Path::new("deep")).await.unwrap_err().kind(),
             io::ErrorKind::DirectoryNotEmpty
         );
-        // A move between the two is a move between stores.
+        // Memory to mount crosses stores.
         assert_eq!(
             dir.rename(Path::new("readme.md"), Path::new("deep/project/readme.md"))
                 .await

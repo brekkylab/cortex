@@ -1,19 +1,13 @@
-//! How cortex's failures arrive in JavaScript, from a console and an image client alike.
-//!
-//! As an `Error` whose `code` says what kind, the way Node's own errors carry `ENOENT`. A
-//! server that refused answers with a number, and the code is that number's name in cortex
-//! — `TIMED_OUT`, `NOT_FOUND` — so a caller compares against a string it can read; a number
-//! this cortex has no name for is `CONSOLE_REFUSED`, with the number in the message. A
-//! channel that broke is `CONSOLE_BROKEN`, after which nothing more will be heard. Anything
-//! else — building a console, say — is `CORTEX_ERROR`.
-//!
-//! The filesystem half answers in [`std::io::Error`], and its code is the
-//! [`ErrorKind`](std::io::ErrorKind)'s name.
+//! How cortex failures reach JavaScript, from consoles and image clients alike: an `Error`
+//! whose `code` names the kind, as Node's own errors carry `ENOENT`.
 
 use cortex::protocol::{Error, Failure};
 
 pub type Result<T> = napi::Result<T, String>;
 
+/// A refusal's code is cortex's name for its number (`TIMED_OUT`, `NOT_FOUND`), so callers
+/// compare readable strings; a number with no name is `CONSOLE_REFUSED`, with the number in the
+/// message. A broken channel, on which nothing more will be heard, is `CONSOLE_BROKEN`.
 pub fn failure(failure: Failure) -> napi::Error<String> {
     match failure {
         Failure::Refused(error) => match name(error.code) {
@@ -29,8 +23,8 @@ pub fn failure(failure: Failure) -> napi::Error<String> {
     }
 }
 
-/// What building a console answers in, which may be a [`Failure`] underneath: the server
-/// refusing `init` is as much a refusal as it refusing an `exec`, and carries its code.
+/// Building a console may fail with a [`Failure`] underneath (the server refusing `init`),
+/// which keeps its code as any refusal does. Anything else is `CORTEX_ERROR`.
 pub fn anyhow(error: anyhow::Error) -> napi::Error<String> {
     match error.downcast::<Failure>() {
         Ok(f) => failure(f),
@@ -38,6 +32,7 @@ pub fn anyhow(error: anyhow::Error) -> napi::Error<String> {
     }
 }
 
+/// Coded by the error's [`ErrorKind`](std::io::ErrorKind) name.
 pub fn io(error: std::io::Error) -> napi::Error<String> {
     napi::Error::new(format!("{:?}", error.kind()), error.to_string())
 }
@@ -68,10 +63,10 @@ fn name(code: i64) -> Option<&'static str> {
     })
 }
 
-/// A JavaScript number where cortex takes a `u64`: an offset, a length, a timeout.
+/// A JavaScript number where cortex takes a `u64` (offset, length, timeout).
 ///
-/// `i64` on the way in because that is what napi converts a number to; a negative one is a
-/// caller's mistake and is said so here rather than wrapped into a very large length.
+/// napi converts numbers to `i64`; a negative one is rejected here rather than wrapped into a
+/// huge length.
 pub fn unsigned(value: Option<i64>, what: &str) -> Result<Option<u64>> {
     value
         .map(|v| u64::try_from(v).map_err(|_| invalid(format!("{what} must not be negative"))))
