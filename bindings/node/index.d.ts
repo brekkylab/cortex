@@ -99,8 +99,8 @@ export type JsHostMount = HostMount
 
 export declare class ImageClient {
   /**
-   * `virtx-uvm` under the stdio server directory, settling with the client once the
-   * server has answered.
+   * Start `virtx-uvm` from virtx's cache `bin`, fetching it there first if missing; settles
+   * once the server answers.
    */
   static tryNew(): Promise<ImageClient>
   static tryFromCmd(cmd: Array<string>): Promise<ImageClient>
@@ -152,7 +152,9 @@ export interface BuildImageResult {
  * Fetch the console server into virtx's cache if it is not there, and settle with the
  * directory it is in.
  *
- * A server already there is left alone, whether it was fetched or installed by hand.
+ * Console builders and `ImageClient` fetch it themselves when it is missing, so this is
+ * needed only to fetch ahead of time, or to know where the server is. A server already
+ * there is left alone, whether it was fetched or installed by hand.
  */
 export declare function ensureVirtx(): Promise<string>
 

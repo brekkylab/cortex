@@ -12,7 +12,7 @@ use futures_core::future::BoxFuture;
 use tokio::process::Command;
 
 use crate::{
-    cache_root,
+    default_server,
     fs::Mount,
     image::ImageSource,
     protocol::{
@@ -39,8 +39,9 @@ pub struct ConsoleClientBuilder {
     /// A factory, not a client, because starting a program can fail; deferring that to
     /// [`build`](Self::build) keeps every setter infallible.
     ///
-    /// Defaults to `virtx-uvm` under the cache's `bin` directory.
-    client_factory: ClientFactory,
+    /// `None` is the default server, `virtx-uvm` under the cache's `bin` directory, which
+    /// [`build`](Self::build) fetches first if this host has none (the `ensure` feature).
+    client_factory: Option<ClientFactory>,
 
     /// `None` leaves it to the server: a host backend needs none, and a VM backend refuses
     /// rather than guess a base.
@@ -73,7 +74,7 @@ pub struct ConsoleClientBuilder {
 impl Default for ConsoleClientBuilder {
     fn default() -> Self {
         ConsoleClientBuilder {
-            client_factory: stdio_factory(&[cache_root().join("bin").join("virtx-uvm")]),
+            client_factory: None,
             image: None,
             snapshot: None,
             mounts: Vec::new(),
@@ -99,7 +100,7 @@ impl ConsoleClientBuilder {
     /// started, a virtio port into a guest, or both ends in one process for a test. The
     /// client owns whatever the channel needs, including a process.
     pub fn client(mut self, client: impl Client + 'static) -> Self {
-        self.client_factory = Box::new(move || Ok(Box::new(client)));
+        self.client_factory = Some(Box::new(move || Ok(Box::new(client))));
         self
     }
 
@@ -112,7 +113,7 @@ impl ConsoleClientBuilder {
     /// Started by [`build`](Self::build), which fails if it cannot be (including an empty
     /// `cmd`).
     pub fn cmd(mut self, cmd: &[impl AsRef<OsStr>]) -> Self {
-        self.client_factory = stdio_factory(cmd);
+        self.client_factory = Some(stdio_factory(cmd));
         self
     }
 
@@ -316,6 +317,9 @@ impl ConsoleClientBuilder {
 
     /// Opens the channel (starting the server process over stdio) and sends `init`.
     ///
+    /// On the default server, first fetches it if this host has none (see
+    /// [`ensure_virtx`](crate::ensure_virtx), with the `ensure` feature).
+    ///
     /// Panics outside a Tokio runtime when it starts a process (the default, or
     /// [`cmd`](Self::cmd)), since the runtime reaps the child.
     ///
@@ -398,6 +402,10 @@ impl ConsoleClient {
             disk_gib,
         } = builder;
 
+        let client_factory = match client_factory {
+            Some(factory) => factory,
+            None => stdio_factory(&[default_server().await?]),
+        };
         let mut client = client_factory()?;
 
         // Name every tree before sending anything: an unnameable mount is this end's own

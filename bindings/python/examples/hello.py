@@ -2,7 +2,7 @@
 
     uv run python examples/hello.py
 
-Needs `virtx-uvm` in the virtx cache `bin` (`$VIRTX_HOME/bin` if set); `ensure_virtx()` fetches it.
+Starts `virtx-uvm` from the virtx cache `bin` (`$VIRTX_HOME/bin` if set), fetching it there first if missing.
 """
 
 import asyncio

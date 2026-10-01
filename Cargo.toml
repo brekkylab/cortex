@@ -203,12 +203,13 @@ mount = [
     "tokio/rt-multi-thread",
 ]
 # `ensure_virtx`: fetch the console server virtx-uvm publishes, over HTTPS, into
-# `cache_root()/bin` when a host has none. Brings in an HTTP and TLS stack.
+# `cache_root()/bin` when a host has none -- which building a console or an image client on
+# the default server does by itself. Brings in an HTTP and TLS stack.
 #
 # On by default, because a consumer that runs commands needs a server. virtx-uvm opts
 # out: it takes this crate for the protocol, and its static musl guest's TLS stack would
 # need a C cross-compiler.
-ensure = ["dep:reqwest", "dep:flate2", "dep:tar", "tokio/net"]
+ensure = ["dep:reqwest", "dep:flate2", "dep:tar", "tokio/net", "tokio/sync"]
 s3 = ["dep:object_store", "tokio/net", "tokio/rt-multi-thread"]
 # Google Drive as a read-only backend: the folder tree as directories, and the
 # Docs-editors types served as their own APIs' JSON rather than as an export.

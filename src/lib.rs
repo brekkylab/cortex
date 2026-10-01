@@ -86,6 +86,19 @@ pub use futures_core::future::BoxFuture;
 #[cfg(feature = "ensure")]
 pub use ensure::ensure_virtx;
 
+/// The server a console or an image client starts unless told another: `virtx-uvm` under
+/// [`cache_root`]`/bin`, fetched there first by [`ensure_virtx`] when this host has none.
+///
+/// Without the `ensure` feature it is only the path, and a host without the server fails to
+/// start it.
+pub(crate) async fn default_server() -> anyhow::Result<std::path::PathBuf> {
+    #[cfg(feature = "ensure")]
+    let bin = ensure_virtx().await?;
+    #[cfg(not(feature = "ensure"))]
+    let bin = cache_root().join("bin");
+    Ok(bin.join("virtx-uvm"))
+}
+
 /// Everything virtx keeps on this host, under one root: `$VIRTX_HOME`, or
 /// `virtx` under the user's cache directory.
 ///

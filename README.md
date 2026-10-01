@@ -19,12 +19,11 @@ pip install virtx
 ```python
 import asyncio
 
-from virtx import ConsoleClient, Recipe, ensure_virtx
+from virtx import ConsoleClient, Recipe
 
 
 async def main() -> None:
-    # Fetches the console server into virtx's cache the first time; a no-op after.
-    await ensure_virtx()
+    # The first build fetches the console server into virtx's cache; later ones find it there.
     console = await (
         ConsoleClient.builder()
         .image(Recipe("alpine:latest").step("apk add --no-cache jq"))
@@ -49,10 +48,9 @@ npm install @brekkylab/virtx
 ```
 
 ```js
-import { ConsoleClient, Recipe, ensureVirtx } from '@brekkylab/virtx'
+import { ConsoleClient, Recipe } from '@brekkylab/virtx'
 
-// Fetches the console server into virtx's cache the first time; a no-op after.
-await ensureVirtx()
+// The first build fetches the console server into virtx's cache; later ones find it there.
 const console_ = await ConsoleClient.builder()
   .image(new Recipe('alpine:latest').step('apk add --no-cache jq'))
   .build()
@@ -117,11 +115,10 @@ Turn it on with the builder's `gpu` option, and install the guest's half of Vulk
 ```python
 import asyncio
 
-from virtx import ConsoleClient, Recipe, ensure_virtx
+from virtx import ConsoleClient, Recipe
 
 
 async def main() -> None:
-    await ensure_virtx()
     console = await (
         ConsoleClient.builder()
         .image(

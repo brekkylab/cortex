@@ -3,7 +3,8 @@
 // Run from a project that installed `virtx`, so it resolves the way that
 // project's code would. What this platform can do is said in the environment:
 //   SMOKE_MOUNT   1 if a FUSE provider is installed here, else 0
-//   SMOKE_SERVER  1 if a virtx-uvm release is published for this platform, else 0
+//   SMOKE_SERVER  1 if a virtx-uvm release is published for this platform, else 0 --
+//                 fetched by the first client built on it, into $VIRTX_HOME
 //   SMOKE_VM      1 if this machine can boot one (KVM or HVF), else 0
 import { execFileSync, spawn } from 'node:child_process'
 import fs from 'node:fs'
@@ -65,23 +66,26 @@ if (fuse) {
   }
 }
 
-let server = null
+// The server, fetched by the first client built on it: no `ensureVirtx()` first.
+let images = null
 try {
-  server = await virtx.ensureVirtx()
-  console.log(`  ensureVirtx: ${server}`)
+  images = await virtx.ImageClient.tryNew()
 } catch (e) {
-  console.log(`  ensureVirtx: ${e.message}`)
-  check(!want('SMOKE_SERVER') && e.message.includes('no virtx-uvm release is published'), 'ensureVirtx says no release is published here')
+  console.log(`  ImageClient.tryNew: ${e.message}`)
+  check(!want('SMOKE_SERVER') && e.message.includes('no virtx-uvm release is published'), 'building on the server says no release is published here')
 }
-if (server) {
-  check(want('SMOKE_SERVER'), 'ensureVirtx fetched the server')
-  const exe = process.platform === 'win32' ? '.exe' : ''
-  check(fs.existsSync(path.join(server, `virtx-uvm${exe}`)), `virtx-uvm${exe} is in ${server}`)
+let server = null
+if (images) {
+  check(want('SMOKE_SERVER'), 'building an ImageClient fetched the server')
   // The server runs on this machine, and answers -- no VM needed to ask its version.
-  const images = await virtx.ImageClient.tryNew()
   const version = await images.version()
   await images.close()
   check(typeof version === 'string' && version.length > 0, `the server answers (protocol ${version})`)
+  // `ensureVirtx` finds it there, and says where.
+  server = await virtx.ensureVirtx()
+  console.log(`  ensureVirtx: ${server}`)
+  const exe = process.platform === 'win32' ? '.exe' : ''
+  check(fs.existsSync(path.join(server, `virtx-uvm${exe}`)), `virtx-uvm${exe} is in ${server}`)
   // And the VM process it would spawn starts, and says what it can make here.
   let caps = null
   try {

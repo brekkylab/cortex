@@ -59,17 +59,18 @@ async fn main() -> anyhow::Result<()> {
     }
     let _ = std::fs::remove_dir_all(&point);
 
-    // The release this crate was packed with, unless the environment says otherwise -- see
-    // `build.rs`.
-    let bin = virtx::ensure_virtx().await?;
-    println!("  ensure_virtx: {}", bin.display());
-    let exe = if cfg!(windows) { ".exe" } else { "" };
-    check(bin.join(format!("virtx-uvm{exe}")).is_file(), "ensure_virtx fetched the server");
-
+    // The server, fetched by the first client built on it -- the release this crate was
+    // packed with, unless the environment says otherwise (see `build.rs`).
     let mut images = ImageClient::try_new().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     let version = images.version().await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
     drop(images);
     check(!version.is_empty(), &format!("the server answers (protocol {version})"));
+
+    // `ensure_virtx` finds it there, and says where.
+    let bin = virtx::ensure_virtx().await?;
+    println!("  ensure_virtx: {}", bin.display());
+    let exe = if cfg!(windows) { ".exe" } else { "" };
+    check(bin.join(format!("virtx-uvm{exe}")).is_file(), "building an ImageClient fetched the server");
 
     if want("SMOKE_VM") {
         let host = std::env::temp_dir().join(format!("virtx-smoke-rust-{}", std::process::id()));

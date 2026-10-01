@@ -232,7 +232,8 @@ impl Drop for PyImageClient {
 
 #[pymethods]
 impl PyImageClient {
-    /// Start `virtx-uvm` from virtx's cache `bin`; the awaitable resolves to the client.
+    /// Start `virtx-uvm` from virtx's cache `bin`, fetching it there first if missing; the
+    /// awaitable resolves to the client.
     #[staticmethod]
     fn try_new(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
         future_into_py(py, async move {

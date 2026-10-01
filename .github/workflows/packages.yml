@@ -465,6 +465,14 @@ jobs:
           "$py" -m pip show virtx
           echo "SMOKE_PYTHON=$py" >> "$GITHUB_ENV"
 
+      # Each binding with a VIRTX_HOME of its own, so that each fetches the server the first
+      # time it builds on it, rather than finding the one another smoke left.
+      - name: A VIRTX_HOME for each binding
+        shell: bash
+        run: |
+          echo "VIRTX_HOME_NODE=$RUNNER_TEMP/virtx-home-node" >> "$GITHUB_ENV"
+          echo "VIRTX_HOME_PYTHON=$RUNNER_TEMP/virtx-home-python" >> "$GITHUB_ENV"
+
       # On macOS, first without FUSE-T, which a user may not have: the import and every
       # call but a mount must work, and a mount must say what to install.
       - name: Smoke, without FUSE-T
@@ -473,8 +481,8 @@ jobs:
         env:
           SMOKE_MOUNT: "0"
         run: |
-          cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
-          "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"
+          cd "$RUNNER_TEMP/project" && VIRTX_HOME="$VIRTX_HOME_NODE" node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
+          VIRTX_HOME="$VIRTX_HOME_PYTHON" "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"
 
       - name: FUSE-T
         if: runner.os == 'macOS'
@@ -494,22 +502,22 @@ jobs:
         shell: bash
         env:
           SMOKE_MOUNT: ${{ matrix.mount }}
-        run: cd "$RUNNER_TEMP/project" && node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
+        run: cd "$RUNNER_TEMP/project" && VIRTX_HOME="$VIRTX_HOME_NODE" node "$GITHUB_WORKSPACE/scripts/packages/smoke/node.mjs"
 
       - name: Smoke, Python
         shell: bash
         env:
           SMOKE_MOUNT: ${{ matrix.mount }}
-        run: '"$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"'
+        run: VIRTX_HOME="$VIRTX_HOME_PYTHON" "$SMOKE_PYTHON" "$GITHUB_WORKSPACE/scripts/packages/smoke/python.py"
 
       - uses: dtolnay/rust-toolchain@stable
 
       # A registry on localhost holding only the packed crate, published from that archive
       # as it is, and a project of its own that takes `virtx` from it -- built here, with
       # this platform's toolchain, as a user's would be. A CARGO_HOME of its own, so that no
-      # crates.io token is within reach, and a VIRTX_HOME of its own, so that
-      # `ensure_virtx` fetches the release the crate pins rather than finding the one the
-      # other smokes left. After FUSE-T, so that on macOS the smoke mounts as well.
+      # crates.io token is within reach, and a VIRTX_HOME of its own, so that building on the
+      # server fetches the release the crate pins rather than finding one the other smokes
+      # left. After FUSE-T, so that on macOS the smoke mounts as well.
       - name: Smoke, Rust
         shell: bash
         env:

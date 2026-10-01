@@ -244,7 +244,8 @@ impl Drop for JsImageClient {
 
 #[napi]
 impl JsImageClient {
-    /// Start `virtx-uvm` from virtx's cache `bin`; settles once the server answers.
+    /// Start `virtx-uvm` from virtx's cache `bin`, fetching it there first if missing; settles
+    /// once the server answers.
     #[napi(ts_return_type = "Promise<ImageClient>")]
     pub fn try_new(env: &Env) -> napi::Result<PromiseRaw<'_, JsImageClient>> {
         promise(env, async move {

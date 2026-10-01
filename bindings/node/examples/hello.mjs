@@ -2,7 +2,7 @@
 //
 //     node examples/hello.mjs
 //
-// Needs `virtx-uvm` in the virtx cache `bin` (`$VIRTX_HOME/bin` if set); `ensureVirtx()` fetches it.
+// Starts `virtx-uvm` from the virtx cache `bin` (`$VIRTX_HOME/bin` if set), fetching it there first if missing.
 
 import { createRequire } from 'node:module'
 

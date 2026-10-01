@@ -7,9 +7,9 @@ use crate::{console::promise, error};
 
 /// Fetch the console server into virtx's cache if missing, and settle with its directory.
 ///
-/// Console builders and `ImageClient` start `virtx-uvm` from that cache, which a host that
-/// installed only this package lacks, so such a host calls this first. An existing server,
-/// fetched or installed by hand, is left alone.
+/// Console builders and `ImageClient` start `virtx-uvm` from that cache, and fetch it there
+/// themselves when it is missing, so this is needed only to fetch ahead of time, or to know
+/// where the server is. An existing server, fetched or installed by hand, is left alone.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn ensure_virtx(env: &Env) -> napi::Result<PromiseRaw<'_, String>> {
     promise(env, async move {

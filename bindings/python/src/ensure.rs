@@ -8,9 +8,9 @@ use crate::error;
 /// Fetch the console server into virtx's cache if missing; the awaitable resolves to its
 /// directory.
 ///
-/// Console builders and `ImageClient` start `virtx-uvm` from that cache, which a host that
-/// installed only this package lacks, so such a host calls this first. An existing server,
-/// fetched or installed by hand, is left alone.
+/// Console builders and `ImageClient` start `virtx-uvm` from that cache, and fetch it there
+/// themselves when it is missing, so this is needed only to fetch ahead of time, or to know
+/// where the server is. An existing server, fetched or installed by hand, is left alone.
 #[pyfunction]
 fn ensure_virtx(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {

@@ -4,7 +4,7 @@
 //! cargo run --example hello
 //! ```
 //!
-//! Needs `virtx-uvm` in `cache_root()/bin` (`$VIRTX_HOME/bin` if set); `ensure_virtx` fetches it.
+//! Starts `virtx-uvm` from `cache_root()/bin` (`$VIRTX_HOME/bin` if set), fetching it there first if missing.
 
 use virtx::{console::ConsoleClient, image::Recipe};
 

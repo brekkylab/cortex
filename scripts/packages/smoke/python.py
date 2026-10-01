@@ -59,22 +59,25 @@ async def main():
             p.wait()
             check(until(lambda: not os.path.exists(os.path.join(child, "a.txt")), 5), "the mount of a SIGKILLed process came down")
 
-    server = None
+    # The server, fetched by the first client built on it: no `ensure_virtx()` first.
+    images = None
     try:
-        server = await virtx.ensure_virtx()
-        print(f"  ensure_virtx: {server}")
-    except Exception as e:
-        print(f"  ensure_virtx: {e}")
-        check(not want("SMOKE_SERVER") and "no virtx-uvm release is published" in str(e), "ensure_virtx says no release is published here")
-    if server:
-        check(want("SMOKE_SERVER"), "ensure_virtx fetched the server")
-        exe = ".exe" if sys.platform == "win32" else ""
-        check(os.path.isfile(os.path.join(server, f"virtx-uvm{exe}")), f"virtx-uvm{exe} is in {server}")
-        # The server runs on this machine, and answers -- no VM needed to ask its version.
         images = await virtx.ImageClient.try_new()
+    except Exception as e:
+        print(f"  ImageClient.try_new: {e}")
+        check(not want("SMOKE_SERVER") and "no virtx-uvm release is published" in str(e), "building on the server says no release is published here")
+    server = None
+    if images:
+        check(want("SMOKE_SERVER"), "building an ImageClient fetched the server")
+        # The server runs on this machine, and answers -- no VM needed to ask its version.
         version = await images.version()
         await images.close()
         check(bool(version), f"the server answers (protocol {version})")
+        # `ensure_virtx` finds it there, and says where.
+        server = await virtx.ensure_virtx()
+        print(f"  ensure_virtx: {server}")
+        exe = ".exe" if sys.platform == "win32" else ""
+        check(os.path.isfile(os.path.join(server, f"virtx-uvm{exe}")), f"virtx-uvm{exe} is in {server}")
         # And the VM process it would spawn starts, and says what it can make here.
         caps = subprocess.run([os.path.join(server, f"virtx-uvm-host{exe}"), "--capabilities"], capture_output=True, text=True)
         print(f"  virtx-uvm-host --capabilities: [{' '.join(caps.stdout.split())}]")

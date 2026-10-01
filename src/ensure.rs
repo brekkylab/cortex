@@ -18,6 +18,10 @@ const DIST_URL: &str = "https://virtx-dist.s3.us-east-1.amazonaws.com";
 
 /// Fetch the console server into [`cache_root`]`/bin` if absent, and return that directory.
 ///
+/// Building a [`ConsoleClient`](crate::console::ConsoleClient) or an
+/// [`ImageClient`](crate::image::ImageClient) on the default server calls this first, so it
+/// is needed only to fetch ahead of time, or to know where the server is.
+///
 /// **Present is enough**: a `bin/` that already has `virtx-uvm` (from here or from
 /// `cargo xtask install`) is left alone; this does not keep it up to date.
 ///
@@ -42,6 +46,15 @@ pub async fn ensure_virtx() -> anyhow::Result<PathBuf> {
     let root = cache_root();
     let bin = root.join("bin");
     let server = format!("virtx-uvm{}", std::env::consts::EXE_SUFFIX);
+    if bin.join(&server).is_file() {
+        return Ok(bin);
+    }
+
+    // One fetch at a time in this process: every console built at once on a fresh host
+    // lands here, and they would share one staging directory (see [`unpack`]). Whoever waited
+    // finds the server the first one placed. Other processes stage apart and rename into place.
+    static FETCHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _fetching = FETCHING.lock().await;
     if bin.join(&server).is_file() {
         return Ok(bin);
     }

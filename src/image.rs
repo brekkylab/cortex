@@ -12,8 +12,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::process::Command;
 
 use crate::{
-    cache_root,
     console::hang_up,
+    default_server,
     protocol::{
         BuildImageCall, BuildImageResp, Client, Failure, RemoveImageCall, stdio::StdioClient,
     },
@@ -50,8 +50,11 @@ pub struct ImageClient {
 }
 
 impl ImageClient {
+    /// Start the default server: `virtx-uvm` under the cache's `bin` directory, fetched
+    /// there first if this host has none (the `ensure` feature).
     pub async fn try_new() -> Result<Self, Failure> {
-        Self::try_from_cmd(&[cache_root().join("bin").join("virtx-uvm")]).await
+        let server = default_server().await.map_err(Failure::Broken)?;
+        Self::try_from_cmd(&[server]).await
     }
 
     pub async fn try_from_cmd(cmd: &[impl AsRef<OsStr>]) -> Result<Self, Failure> {
