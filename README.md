@@ -105,9 +105,9 @@ virtx
 
 | | Supported |
 |---|---|
-| **Languages** | 🐍 Python · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/nodejs/nodejs-original.svg" height="14" alt=""> Node · 🦀 Rust |
-| **Hosts** | 🐧 Linux · 🍎 macOS (Apple silicon) · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/windows11/windows11-original.svg" height="14" alt=""> Windows 11 or later |
-| **Guest** | 🐧 Linux, always |
+| **Languages** | <img src="https://cdn.simpleicons.org/python" width="16"/> Python · <img src="https://cdn.simpleicons.org/nodedotjs" width="16"/> Node · <img src="https://cdn.simpleicons.org/rust/000000/ffffff" width="16"/> Rust |
+| **Hosts** | <img src="https://cdn.simpleicons.org/linux/000000/ffffff" width="16"/> Linux · <img src="https://cdn.simpleicons.org/apple/000000/ffffff" width="16"/> macOS (Apple silicon) · <img src="https://cdn.jsdelivr.net/gh/devicons/devicon/icons/windows11/windows11-original.svg" width="16"/> Windows 11 or later |
+| **Guest** | <img src="https://cdn.simpleicons.org/linux/000000/ffffff" width="16"/> Linux, always |
 
 ### GPU support
 
@@ -312,6 +312,52 @@ And for windows
 ```powershell
 winget install --id dokan-dev.Dokany
 ```
+
+### Images
+
+`.image()` takes any of these:
+
+| Kind | Example | Runs on |
+|---|---|---|
+| Recipe | `Recipe::new("alpine:latest").step("apk add jq")` | The base, pulled, with the steps built on it for this session only |
+| Ref | `ImageSource::reference("jq:latest")` | The build stored under that name, looked up when the VM starts |
+| Digest | `ImageSource::digest("sha256:3d75…")` | Exactly that build |
+
+Build an image ahead of time with `ImageClient`, then start any number of VMs on it by its ref or digest:
+
+```rust
+use virtx::{
+    console::ConsoleClient,
+    ensure_virtx,
+    image::{ImageClient, ImageSource, Recipe},
+};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    ensure_virtx().await?;
+    let mut images = ImageClient::try_new().await?;
+    let built = images
+        .build(
+            Recipe::new("alpine:latest").step("apk add --no-cache jq"),
+            Some("jq:latest"), // the ref to store the build under
+        )
+        .await?;
+    println!("{} {}", built.reference, built.digest);
+
+    let mut console = ConsoleClient::builder()
+        .image(ImageSource::reference("jq:latest")) // the build stored above
+        .build()
+        .await?;
+
+    let result = console.exec(["jq", "--version"], None).await?;
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+
+    Ok(())
+}
+```
+
+Rebuilding under the same ref moves it to the new build, while `ImageSource::digest(&built.digest)` stays on this one.  
+`images.list()` shows what's built, and `images.remove(...)` deletes an image by its ref or digest.
 
 ## Cache
 
