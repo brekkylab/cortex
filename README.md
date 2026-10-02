@@ -313,6 +313,52 @@ And for windows
 winget install --id dokan-dev.Dokany
 ```
 
+### Images
+
+`.image()` takes any of these:
+
+| Kind | Example | Runs on |
+|---|---|---|
+| Recipe | `Recipe::new("alpine:latest").step("apk add jq")` | The base, pulled, with the steps built on it for this session only |
+| Ref | `ImageSource::reference("jq:latest")` | The build stored under that name, looked up when the VM starts |
+| Digest | `ImageSource::digest("sha256:3d75…")` | Exactly that build |
+
+Build an image ahead of time with `ImageClient`, then start any number of VMs on it by its ref or digest:
+
+```rust
+use virtx::{
+    console::ConsoleClient,
+    ensure_virtx,
+    image::{ImageClient, ImageSource, Recipe},
+};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    ensure_virtx().await?;
+    let mut images = ImageClient::try_new().await?;
+    let built = images
+        .build(
+            Recipe::new("alpine:latest").step("apk add --no-cache jq"),
+            Some("jq:latest"), // the ref to store the build under
+        )
+        .await?;
+    println!("{} {}", built.reference, built.digest);
+
+    let mut console = ConsoleClient::builder()
+        .image(ImageSource::reference("jq:latest")) // the build stored above
+        .build()
+        .await?;
+
+    let result = console.exec(["jq", "--version"], None).await?;
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+
+    Ok(())
+}
+```
+
+Rebuilding under the same ref moves it to the new build, while `ImageSource::digest(&built.digest)` stays on this one.  
+`images.list()` shows what's built, and `images.remove(...)` deletes an image by its ref or digest.
+
 ## Cache
 
 virtx keeps all persistent state in a single cache directory that you can safely delete at any time:
