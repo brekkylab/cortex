@@ -7,13 +7,13 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use pyo3::prelude::*;
+use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
+use tokio::sync::Mutex;
 use virtx::{
     image::{ImageClient, ImageEntry, ImageSource, Recipe, Step},
     protocol::BuildImageResp,
 };
-use pyo3::prelude::*;
-use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
-use tokio::sync::Mutex;
 
 use crate::error::{self, VirtxError};
 

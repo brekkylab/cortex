@@ -2,13 +2,13 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use pyo3::{exceptions::PyValueError, prelude::*};
+use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
+use tokio::sync::Mutex;
 use virtx::{
     console::{ConsoleClient, ConsoleClientBuilder},
     protocol::{ExecResp, Port, ReadResp},
 };
-use pyo3::{exceptions::PyValueError, prelude::*};
-use pyo3_async_runtimes::tokio::{future_into_py, get_runtime};
-use tokio::sync::Mutex;
 
 use crate::{
     error::{self, VirtxError},

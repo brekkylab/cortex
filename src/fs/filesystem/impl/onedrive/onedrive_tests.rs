@@ -1,15 +1,17 @@
-use std::collections::HashMap;
-use std::ops::Range;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
+use std::{
+    collections::HashMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex as StdMutex},
+};
 
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::super::accessor::encode_path;
-use super::super::{OnedriveConfig, OnedriveOrigins};
-use super::*;
+use super::{
+    super::{OnedriveConfig, OnedriveOrigins, accessor::encode_path},
+    *,
+};
 
 // Each test says what it pins. Why the behaviour is what it is lives once, on the code it
 // points to.

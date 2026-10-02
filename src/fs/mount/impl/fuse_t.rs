@@ -104,8 +104,7 @@ struct Ops {
     write: unsafe extern "C" fn(*mut c_void, u64, u64, u64, *const c_char) -> c_long,
     flush: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
     release: unsafe extern "C" fn(*mut c_void, u64) -> c_int,
-    mkdir:
-        unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut VirtxStat) -> c_int,
+    mkdir: unsafe extern "C" fn(*mut c_void, u64, *const c_char, *mut u64, *mut VirtxStat) -> c_int,
     unlink: unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> c_int,
     rmdir: unsafe extern "C" fn(*mut c_void, u64, *const c_char) -> c_int,
     rename: unsafe extern "C" fn(*mut c_void, u64, *const c_char, u64, *const c_char) -> c_int,

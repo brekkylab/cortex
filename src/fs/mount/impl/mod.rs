@@ -16,8 +16,6 @@ mod fuse;
 mod fuse_t;
 
 // `self::` because a bare `dokan::` in a `use` names the crate, not this module.
-#[cfg(all(feature = "mount", windows))]
-pub use self::dokan::DokanMount;
 // Re-exported so callers need no direct dependency on `dokan`.
 #[cfg(all(feature = "mount", windows))]
 pub use ::dokan::MountFlags;
@@ -28,6 +26,9 @@ pub use fuse_t::{FuseTBackend, FuseTMount};
 // Re-exported so callers need no direct dependency on `fuser`.
 #[cfg(all(feature = "mount", unix, not(target_os = "macos")))]
 pub use fuser::MountOption;
+
+#[cfg(all(feature = "mount", windows))]
+pub use self::dokan::DokanMount;
 
 /// Drive an async [`Posix`](crate::fs::Posix) operation to completion from a binding's
 /// *synchronous* callback.

@@ -8,7 +8,6 @@ use std::{
 
 use serde_json::Value;
 use tokio::sync::Mutex;
-
 use unicode_normalization::UnicodeNormalization;
 
 use super::accessor::{GdriveAccessor, GdriveConfig, MAX_DOCUMENT_BYTES};

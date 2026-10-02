@@ -75,6 +75,8 @@ pub mod image;
 mod lock;
 pub mod protocol;
 
+#[cfg(feature = "ensure")]
+pub use ensure::ensure_virtx;
 /// What every waiting method of a [`Client`] or [`Server`] returns.
 ///
 /// Re-exported so implementors can name it without depending on `futures_core`.
@@ -82,9 +84,6 @@ pub mod protocol;
 /// [`Client`]: protocol::Client
 /// [`Server`]: protocol::Server
 pub use futures_core::future::BoxFuture;
-
-#[cfg(feature = "ensure")]
-pub use ensure::ensure_virtx;
 
 /// Everything virtx keeps on this host, under one root: `$VIRTX_HOME`, or
 /// `virtx` under the user's cache directory.

@@ -4,14 +4,10 @@ use std::{io, path::PathBuf};
 #[cfg(feature = "mount")]
 use std::{path::Path, sync::Arc};
 
-use virtx::fs::{Directory, Mount};
 #[cfg(feature = "mount")]
 use napi::bindgen_prelude::ClassInstance;
 use napi::bindgen_prelude::{Buffer, Either, This};
 use napi_derive::napi;
-
-use crate::error::{self, Result};
-
 // `HostMount` wraps whichever guard this platform compiles, so callers need not know which.
 #[cfg(all(feature = "mount", windows))]
 use virtx::fs::DokanMount as Platform;
@@ -19,6 +15,9 @@ use virtx::fs::DokanMount as Platform;
 use virtx::fs::FuseMount as Platform;
 #[cfg(all(feature = "mount", target_os = "macos"))]
 use virtx::fs::FuseTMount as Platform;
+use virtx::fs::{Directory, Mount};
+
+use crate::error::{self, Result};
 
 /// File content as a caller may spell it: a `Buffer` as it is, a string as its UTF-8.
 pub type Content = Either<Buffer, String>;

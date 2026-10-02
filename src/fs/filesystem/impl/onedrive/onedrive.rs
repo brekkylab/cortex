@@ -1,8 +1,10 @@
-use std::collections::HashMap;
-use std::io;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::{
+    collections::HashMap,
+    io,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime},
+};
 
 use serde_json::Value;
 use tokio::sync::Mutex;

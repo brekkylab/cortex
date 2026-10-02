@@ -2,16 +2,16 @@
 
 use std::{future::Future, sync::Arc};
 
-use virtx::{
-    console::{ConsoleClient, ConsoleClientBuilder},
-    protocol::{ExecResp, Port, ReadResp},
-};
 use napi::{
     Env, JsError,
     bindgen_prelude::{Buffer, PromiseRaw, This, ToNapiValue},
 };
 use napi_derive::napi;
 use tokio::{runtime::Handle, sync::Mutex};
+use virtx::{
+    console::{ConsoleClient, ConsoleClientBuilder},
+    protocol::{ExecResp, Port, ReadResp},
+};
 
 use crate::{
     error::{self, Result, unsigned},
